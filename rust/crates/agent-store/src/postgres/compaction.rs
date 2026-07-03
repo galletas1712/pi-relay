@@ -884,8 +884,8 @@ fn compaction_context_for_scope(
             // replaying the whole open-turn suffix is a no-op for context
             // size, because the large tool outputs are exactly the suffix. The
             // compaction request must summarize the full model-visible
-            // context; the daemon will resume from the compacted root instead
-            // of reinstalling the raw open-turn suffix.
+            // context; the daemon will reinstall only the open turn's user
+            // instructions, not its generated/tool output.
             model_context.clone()
         }
     }

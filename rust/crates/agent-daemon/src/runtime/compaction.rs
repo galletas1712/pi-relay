@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use agent_core::AgentInput;
 use agent_session::{AgentSession, SessionAction, TranscriptStorageNode};
 use agent_store::{
@@ -42,9 +44,7 @@ impl SessionDriver {
         else {
             return Ok(true);
         };
-        // Just-compacted contexts always start with a CompactionSummary as the
-        // last item; the next dispatch is the resumed model action that
-        // shouldn't immediately compact again.
+        // A bare compacted root is already the smallest possible transcript.
         if matches!(
             model_context.transcript_items().last(),
             Some(TranscriptItem::CompactionSummary(_))
@@ -509,19 +509,54 @@ async fn run_compaction_job(
     Ok(())
 }
 
-fn continuation_suffix_for_scope(
+pub(crate) fn continuation_suffix_for_scope(
     job: &CompactionJob,
 ) -> std::result::Result<Vec<TranscriptStorageNode>, RpcError> {
     match &job.scope {
         CompactionScope::Boundary { .. } => Ok(Vec::new()),
-        // Mid-turn auto-compaction is used to recover from provider
-        // context-overflow. Reinstalling the raw open-turn suffix would put
-        // the same large tool outputs back into the next request and can
-        // produce an endless compact/retry/overflow loop. The compaction
-        // summary is the replacement checkpoint; resume the blocked model from
-        // that compacted root without appending the pre-compaction suffix.
-        CompactionScope::MidTurn { .. } => Ok(Vec::new()),
+        CompactionScope::MidTurn { .. } => {
+            let Some((_, open_turn)) = job.model_context.split_before_open_turn() else {
+                return if matches!(
+                    job.model_context.transcript_items(),
+                    [TranscriptItem::CompactionSummary(_)]
+                ) {
+                    // A blocked action remains MidTurn across immediate
+                    // recompaction even when its checkpoint is a bare summary.
+                    Ok(Vec::new())
+                } else {
+                    Err(RpcError::new(
+                        "invalid_compaction",
+                        "mid-turn compaction source has no open turn",
+                    ))
+                };
+            };
+            let timestamp_ms = now_ms();
+            let mut parent_id = None;
+            Ok(open_turn
+                .into_iter()
+                .filter(|entry| matches!(&entry.item, TranscriptItem::UserMessage(_)))
+                .enumerate()
+                .map(|(index, entry)| {
+                    let node = TranscriptStorageNode {
+                        id: format!("entry_{}", uuid::Uuid::new_v4()),
+                        parent_id: parent_id.clone(),
+                        timestamp_ms: timestamp_ms.saturating_add(index as u64),
+                        item: entry.item,
+                        provider_replay: entry.provider_replay,
+                    };
+                    parent_id = Some(node.id.clone());
+                    node
+                })
+                .collect())
+        }
     }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }
 
 async fn install_runtime_compaction_checkpoint(
@@ -638,14 +673,14 @@ pub(super) async fn recover_model_context_overflow_with_compaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_session::ModelContext;
-    use agent_vocab::{ActionId, TurnId, UserMessage};
+    use agent_session::{ModelContext, ModelContextEntry};
+    use agent_vocab::{
+        ActionId, AssistantItem, AssistantMessage, CompactionSummary, DaemonToolObservation,
+        ProviderKind, ProviderReplayItem, ToolCall, ToolCallId, ToolResultMessage,
+        ToolResultStatus, TurnId, UserMessage,
+    };
 
-    fn mid_turn_job_with_open_suffix() -> CompactionJob {
-        let model_context = ModelContext::from_transcript_items(vec![
-            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::UserMessage(UserMessage::text("large current turn")),
-        ]);
+    fn compaction_job(model_context: ModelContext, scope: CompactionScope) -> CompactionJob {
         CompactionJob {
             action_row_id: "compaction_action".to_string(),
             attempt_id: "compaction_attempt".to_string(),
@@ -660,22 +695,222 @@ mod tests {
                 reason: "provider context overflow before model completion".to_string(),
             },
             reason: Some("provider context overflow before model completion".to_string()),
-            scope: CompactionScope::MidTurn {
-                source_leaf_id: "leaf".to_string(),
-                turn_id: TurnId(1),
-                blocked_model_action_id: ActionId(1),
-                blocked_model_action_row_id: "model_action".to_string(),
-                blocked_model_attempt_id: "model_attempt".to_string(),
-            },
+            scope,
+        }
+    }
+
+    fn mid_turn_scope() -> CompactionScope {
+        CompactionScope::MidTurn {
+            source_leaf_id: "leaf".to_string(),
+            turn_id: TurnId(1),
+            blocked_model_action_id: ActionId(1),
+            blocked_model_action_row_id: "model_action".to_string(),
+            blocked_model_attempt_id: "model_attempt".to_string(),
+        }
+    }
+
+    fn replay(raw_json: &str) -> ProviderReplayItem {
+        ProviderReplayItem {
+            provider: ProviderKind::Claude,
+            raw_json: raw_json.to_string(),
+            display: None,
+        }
+    }
+
+    fn entry(item: TranscriptItem, provider_replay: Vec<ProviderReplayItem>) -> ModelContextEntry {
+        ModelContextEntry {
+            item,
+            provider_replay,
+        }
+    }
+
+    fn tool_call() -> ToolCall {
+        ToolCall {
+            id: ToolCallId::from_u64(7),
+            tool_name: "Bash".to_string(),
+            args_json: r#"{"command":"printf large-output"}"#.to_string(),
         }
     }
 
     #[test]
-    fn mid_turn_overflow_compaction_does_not_reinstall_raw_open_turn_suffix() {
-        let suffix =
-            continuation_suffix_for_scope(&mid_turn_job_with_open_suffix()).expect("suffix builds");
+    fn boundary_compaction_has_no_continuation_suffix() {
+        let job = compaction_job(
+            ModelContext::from_transcript_items(vec![TranscriptItem::UserMessage(
+                UserMessage::text("finished history"),
+            )]),
+            CompactionScope::Boundary {
+                source_leaf_id: "leaf".to_string(),
+            },
+        );
+
+        let suffix = continuation_suffix_for_scope(&job).expect("suffix builds");
+        assert!(suffix.is_empty());
+    }
+
+    #[test]
+    fn proactive_mid_turn_compaction_retains_only_user_message_and_sidecar() {
+        let user = UserMessage::text("answer with the requested sentinels");
+        let user_replay = replay(r#"{"type":"user_replay"}"#);
+        let job = compaction_job(
+            ModelContext::from_entries(vec![
+                entry(
+                    TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                    vec![replay(r#"{"type":"turn_replay"}"#)],
+                ),
+                entry(
+                    TranscriptItem::UserMessage(user.clone()),
+                    vec![user_replay.clone()],
+                ),
+            ]),
+            mid_turn_scope(),
+        );
+
+        let suffix = continuation_suffix_for_scope(&job).expect("suffix builds");
+
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].item, TranscriptItem::UserMessage(user));
+        assert_eq!(suffix[0].provider_replay, vec![user_replay]);
+        assert!(suffix[0].id.starts_with("entry_"));
+        assert_eq!(suffix[0].parent_id, None);
+    }
+
+    #[test]
+    fn tool_heavy_mid_turn_retains_user_messages_without_generated_output() {
+        let tool_call = tool_call();
+        let initial = UserMessage::text("initial instruction");
+        let steering = UserMessage::text("later steering instruction");
+        let initial_replay = replay(r#"{"type":"initial_user"}"#);
+        let steering_replay = replay(r#"{"type":"steering_user"}"#);
+        let job = compaction_job(
+            ModelContext::from_entries(vec![
+                entry(
+                    TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                    Vec::new(),
+                ),
+                entry(
+                    TranscriptItem::UserMessage(initial.clone()),
+                    vec![initial_replay.clone()],
+                ),
+                entry(
+                    TranscriptItem::AssistantMessage(AssistantMessage {
+                        items: vec![AssistantItem::ToolCall(tool_call.clone())],
+                    }),
+                    vec![replay(r#"{"type":"assistant"}"#)],
+                ),
+                entry(
+                    TranscriptItem::ToolCallStarted {
+                        turn_id: TurnId(1),
+                        tool_call: tool_call.clone(),
+                    },
+                    Vec::new(),
+                ),
+                entry(
+                    TranscriptItem::ToolResult(ToolResultMessage {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.tool_name.clone(),
+                        output: "very large generated output".to_string(),
+                        status: ToolResultStatus::Success,
+                    }),
+                    vec![replay(r#"{"type":"tool_result"}"#)],
+                ),
+                entry(
+                    TranscriptItem::DaemonToolObservation(DaemonToolObservation::new(
+                        ToolCallId::from_u64(8),
+                        "delegate",
+                        "{}",
+                        serde_json::json!({"output": "generated observation"}),
+                        ToolResultStatus::Success,
+                        None,
+                    )),
+                    Vec::new(),
+                ),
+                entry(
+                    TranscriptItem::UserMessage(steering.clone()),
+                    vec![steering_replay.clone()],
+                ),
+            ]),
+            mid_turn_scope(),
+        );
+
+        let suffix = continuation_suffix_for_scope(&job).expect("suffix builds");
+
+        assert_eq!(
+            suffix
+                .iter()
+                .map(|node| node.item.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                TranscriptItem::UserMessage(initial),
+                TranscriptItem::UserMessage(steering),
+            ]
+        );
+        assert_eq!(suffix[0].provider_replay, vec![initial_replay]);
+        assert_eq!(suffix[1].provider_replay, vec![steering_replay]);
+        assert_eq!(suffix[1].parent_id.as_deref(), Some(suffix[0].id.as_str()));
+        assert_eq!(
+            suffix[1].timestamp_ms,
+            suffix[0].timestamp_ms.saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn repeated_compaction_reads_users_from_summary_rooted_open_turn() {
+        let user = UserMessage::text("instruction retained by the first compaction");
+        let job = compaction_job(
+            ModelContext::from_entries(vec![
+                entry(
+                    TranscriptItem::CompactionSummary(CompactionSummary::new(
+                        "session",
+                        "old_leaf",
+                        "first summary",
+                        None,
+                        TurnId(1),
+                    )),
+                    Vec::new(),
+                ),
+                entry(TranscriptItem::UserMessage(user.clone()), Vec::new()),
+                entry(
+                    TranscriptItem::AssistantMessage(AssistantMessage {
+                        items: vec![AssistantItem::Text("generated output".to_string())],
+                    }),
+                    Vec::new(),
+                ),
+            ]),
+            mid_turn_scope(),
+        );
+
+        let suffix = continuation_suffix_for_scope(&job).expect("suffix builds");
+
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].item, TranscriptItem::UserMessage(user));
+    }
+
+    #[test]
+    fn repeated_compaction_from_bare_summary_has_no_suffix() {
+        let job = compaction_job(
+            ModelContext::from_transcript_items(vec![TranscriptItem::CompactionSummary(
+                CompactionSummary::new("session", "old_leaf", "first summary", None, TurnId(1)),
+            )]),
+            mid_turn_scope(),
+        );
+
+        let suffix = continuation_suffix_for_scope(&job).expect("suffix builds");
 
         assert!(suffix.is_empty());
+    }
+
+    #[test]
+    fn mid_turn_compaction_without_open_turn_is_invalid() {
+        let job = compaction_job(
+            ModelContext::from_transcript_items(vec![TranscriptItem::UserMessage(
+                UserMessage::text("missing turn anchor"),
+            )]),
+            mid_turn_scope(),
+        );
+
+        let error = continuation_suffix_for_scope(&job).expect_err("invalid source must fail");
+
+        assert_eq!(error.code, "invalid_compaction");
     }
 
     #[test]

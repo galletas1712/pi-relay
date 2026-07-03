@@ -27,6 +27,8 @@ use crate::codec::transcript_store_from_stored;
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
+#[cfg(test)]
+pub(crate) use compaction::continuation_suffix_for_scope;
 pub(crate) use compaction::spawn_compaction;
 use dispatch::dispatch_all;
 #[cfg(test)]

@@ -50,6 +50,9 @@ impl TempDir {
     }
 }
 
+const BLOCKED_USER_INSTRUCTION: &str =
+    "Return the exact requested sentinel facts from this instruction.";
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
@@ -62,7 +65,8 @@ use crate::provider_runtime::{
     SessionTitleScheduler,
 };
 use crate::runtime::{
-    apply_model_response, recover_post_compaction_dispatches_on_boot, take_tasks, SessionDriver,
+    apply_model_response, continuation_suffix_for_scope,
+    recover_post_compaction_dispatches_on_boot, take_tasks, SessionDriver,
 };
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart,
@@ -375,7 +379,7 @@ async fn commit_post_compaction_dispatch_with_faults(
             id: format!("{session_id}_user"),
             parent_id: Some(format!("{session_id}_turn")),
             timestamp_ms: 1_700_000_000_001,
-            item: TranscriptItem::UserMessage(UserMessage::text("large request")),
+            item: TranscriptItem::UserMessage(UserMessage::text(BLOCKED_USER_INSTRUCTION)),
             provider_replay: Vec::new(),
         },
     ];
@@ -403,7 +407,7 @@ async fn commit_post_compaction_dispatch_with_faults(
             &[],
             &[action],
             InputPriority::FollowUp,
-            &UserMessage::text("large request"),
+            &UserMessage::text(BLOCKED_USER_INSTRUCTION),
             None,
         )
         .await
@@ -432,13 +436,13 @@ async fn commit_post_compaction_dispatch_with_faults(
         )
         .await
         .expect("overflow blocks model");
+    let mut completion = successful_compaction("restart-safe summary");
+    completion.continuation_suffix =
+        continuation_suffix_for_scope(&compaction.job).expect("continuation suffix builds");
     let completed = env
         .state
         .repo
-        .complete_compaction_action(
-            &compaction.job,
-            successful_compaction("restart-safe summary"),
-        )
+        .complete_compaction_action(&compaction.job, completion)
         .await
         .expect("compaction success transaction commits");
     let resumed = completed
@@ -448,6 +452,120 @@ async fn commit_post_compaction_dispatch_with_faults(
         .active_leaf_id
         .expect("success transaction installs compacted leaf");
     (resumed, compacted_leaf)
+}
+
+#[tokio::test]
+async fn auto_compaction_resumes_exact_user_instruction_on_compacted_branch() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "mid-turn instruction continuity",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    let session_id = "mid_turn_instruction_continuity";
+    let (resumed, _) = commit_post_compaction_dispatch_with_faults(
+        &env,
+        project_id,
+        session_id,
+        json!({
+            "pause_model_dispatch_before_provider": false,
+            "model_result": "complete"
+        }),
+    )
+    .await;
+
+    let SessionAction::RequestModel { model_context, .. } = &resumed.action else {
+        panic!("compaction must resume the blocked model action");
+    };
+    assert_eq!(model_context.transcript_items().len(), 2);
+    assert!(matches!(
+        model_context.transcript_items()[0],
+        TranscriptItem::CompactionSummary(_)
+    ));
+    assert_eq!(
+        model_context.transcript_items()[1],
+        TranscriptItem::UserMessage(UserMessage::text(BLOCKED_USER_INSTRUCTION))
+    );
+
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .expect("resumed model dispatch starts"),
+        1
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !env
+                .state
+                .repo
+                .has_unfinished_actions(session_id)
+                .await
+                .expect("unfinished action state loads")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("resumed model action completes");
+
+    assert_eq!(
+        crate::provider_runtime::injected_provider_start_count(session_id),
+        1,
+        "the same blocked model action is dispatched once"
+    );
+    let stored = env
+        .state
+        .repo
+        .load_stored_session(session_id)
+        .await
+        .expect("completed session reloads");
+    let active_leaf = stored.active_leaf_id.expect("completed branch has a leaf");
+    let context = env
+        .state
+        .repo
+        .model_context_for_leaf(session_id, &active_leaf)
+        .await
+        .expect("active compacted branch loads");
+    let items = context.transcript_items();
+    assert_eq!(items.len(), 4);
+    assert!(matches!(items[0], TranscriptItem::CompactionSummary(_)));
+    assert_eq!(
+        items[1],
+        TranscriptItem::UserMessage(UserMessage::text(BLOCKED_USER_INSTRUCTION))
+    );
+    assert!(matches!(items[2], TranscriptItem::AssistantMessage(_)));
+    assert!(matches!(
+        items[3],
+        TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Graceful
+        }
+    ));
+    let pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+        .await
+        .expect("connect action assertion pool");
+    let status: String =
+        sqlx::query_scalar("select status from actions where session_id=$1 and id=$2")
+            .bind(session_id)
+            .bind(&resumed.row_id)
+            .fetch_one(&pool)
+            .await
+            .expect("completed action remains observable");
+    assert_eq!(status, ActionStatus::Completed.as_str());
+    pool.close().await;
+
+    env.cleanup().await;
 }
 
 #[tokio::test]
