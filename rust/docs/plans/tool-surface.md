@@ -1,6 +1,6 @@
 # Tool Surface Evolution
 
-Status: planned. Last reviewed 2026-06-07.
+Status: partially implemented. Last reviewed 2026-07-02.
 
 ## Motivation
 
@@ -103,7 +103,7 @@ they fit:
   "high" }`), which emits `web_search_call` items with `search`, `open_page`,
   and `find_in_page` actions plus citations. OpenAI has no separate top-level
   `web_fetch`; page open / in-page find are hosted `web_search` actions.
-- Anthropic `web_search_20250305` and `web_fetch_20250910`
+- Anthropic `web_search_20260318` and `web_fetch_20260318`
   (`citations.enabled: true`), which emit `server_tool_use` and
   `web_search_tool_result` / `web_fetch_tool_result` blocks.
 
@@ -123,6 +123,14 @@ replay data and never enter the session FSM as pending actions. Keeping the
 local `web_fetch` runtime is still worthwhile as a fallback for parity or for
 authenticated / local-network fetches, but it should not be the default once
 hosted tools are wired.
+
+The current Anthropic web sidecar already uses the 2026-03-18 tools with
+`allowed_callers: ["direct"]`, keeping execution on the direct hosted-tool path
+instead of enabling code-execution callers and their different retention
+semantics. It sends the documented `response_inclusion: "excluded"` enum; direct
+calls still return their full results, while the field prevents accidental
+inclusion if the sidecar later enables indirect callers. Request-shape tests pin
+both fields. No obsolete web-fetch beta header is sent.
 
 Effort defaults stay high and stable, set by pi-relay at render time, not by the
 model: OpenAI `search_context_size: high`; Anthropic web tools omit `max_uses` /

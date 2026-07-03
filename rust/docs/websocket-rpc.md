@@ -159,9 +159,11 @@ set an OpenAI output cap.
 
 `reasoning_effort` defaults to `medium`. OpenAI currently accepts `none`,
 `minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay; `gpt-5.6-sol` also
-accepts `max`. Claude accepts `low`, `medium`, `high`, `xhigh`, and `max`;
-Claude Opus 4.8 requests are sent with adaptive thinking and
-`output_config.effort`.
+accepts `max`. Claude Sonnet 5, Fable 5, and Opus 4.8 accept `low`, `medium`,
+`high`, `xhigh`, and `max`. Sonnet 5 and Fable 5 default to adaptive thinking,
+while Opus 4.8 requests it explicitly; all three carry effort in
+`output_config.effort`. Fable 5 requires 30-day retention and is not available
+under Zero Data Retention, so it is an explicit opt-in UI choice.
 
 ### `daemon_config`
 

@@ -100,6 +100,17 @@ pub struct ProviderTokenCountResponse {
     pub input_tokens: usize,
 }
 
+/// Provider-reported model limits used by the daemon for runtime safety.
+///
+/// This is deliberately transient: providers may cache discovery in memory,
+/// while callers must retain static fallbacks for operation during API or
+/// network failures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderModelMetadata {
+    pub max_input_tokens: Option<usize>,
+    pub max_output_tokens: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderToolProfile {
     None,
@@ -260,6 +271,31 @@ pub struct ModelResponse {
     pub provider_replay: Vec<ProviderReplayItem>,
     pub usage: Option<ProviderUsage>,
     pub stop_reason: ModelStopReason,
+    pub stop_details: Option<ModelStopDetails>,
+}
+
+impl ModelResponse {
+    /// Return the terminal refusal message callers should surface instead of
+    /// persisting this response as an assistant completion.
+    pub fn refusal_error(&self) -> Option<String> {
+        (self.stop_reason == ModelStopReason::Refusal).then(|| {
+            let Some(details) = self.stop_details.as_ref() else {
+                return "provider refused the request".to_string();
+            };
+            match (&details.category, &details.explanation) {
+                (Some(category), Some(explanation)) => {
+                    format!("provider refused the request ({category}): {explanation}")
+                }
+                (Some(category), None) => {
+                    format!("provider refused the request ({category})")
+                }
+                (None, Some(explanation)) => {
+                    format!("provider refused the request: {explanation}")
+                }
+                (None, None) => "provider refused the request".to_string(),
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +303,15 @@ pub struct ModelResponse {
 pub enum ModelStopReason {
     Complete,
     MaxOutputTokens,
+    Refusal,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStopDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +443,10 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 pub trait ModelProvider: Send + Sync {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse>;
 
+    async fn model_metadata(&self, _model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
+        Ok(None)
+    }
+
     fn supports_remote_compaction(&self) -> bool {
         false
     }
@@ -452,7 +501,7 @@ mod provider_error_tests {
         assert!(!ProviderError::Status {
             status: 400,
             message:
-                "invalid_request_error: Server tools are not supported in the count_tokens endpoint: web_fetch_20250910, web_search_20250305."
+                "invalid_request_error: Server tools are not supported in the count_tokens endpoint: web_fetch_20260318, web_search_20260318."
                     .to_string(),
         }
         .is_context_overflow());

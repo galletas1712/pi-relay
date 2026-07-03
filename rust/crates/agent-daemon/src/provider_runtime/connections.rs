@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use agent_provider::{
-    anthropic::AnthropicProvider,
+    anthropic::{AnthropicModelCache, AnthropicProvider},
     openai::{OpenAiCodexSessionState, OpenAiProvider},
 };
 use agent_vocab::ProviderKind;
@@ -15,6 +15,7 @@ use super::provider::ProviderHandle;
 #[derive(Clone)]
 pub(crate) struct ProviderConnectionRegistry {
     client: reqwest::Client,
+    anthropic_model_cache: AnthropicModelCache,
     connections: Arc<Mutex<HashMap<ProviderConnectionKey, Arc<ProviderConnection>>>>,
 }
 
@@ -36,12 +37,14 @@ struct OpenAiCodexConnection {
 
 struct AnthropicConnection {
     client: reqwest::Client,
+    model_cache: AnthropicModelCache,
 }
 
 impl ProviderConnectionRegistry {
     pub(crate) fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
+            anthropic_model_cache: AnthropicModelCache::default(),
             connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -100,6 +103,7 @@ impl ProviderConnectionRegistry {
                     }),
                     ProviderKind::Claude => ProviderConnection::Anthropic(AnthropicConnection {
                         client: self.client.clone(),
+                        model_cache: self.anthropic_model_cache.clone(),
                     }),
                 })
             })
@@ -145,11 +149,12 @@ impl OpenAiCodexConnection {
 impl AnthropicConnection {
     fn provider_handle(&self, credentials: &Credentials) -> Result<ProviderHandle> {
         Ok(ProviderHandle {
-            provider: Box::new(AnthropicProvider::new_with_client(
+            provider: Box::new(AnthropicProvider::new_with_client_and_cache(
                 self.client.clone(),
                 credentials.anthropic_api_key.clone().ok_or_else(|| {
                     anyhow!("ANTHROPIC_API_KEY not found in env or Claude Code config")
                 })?,
+                self.model_cache.clone(),
             )),
             uses_codex_auth: false,
         })

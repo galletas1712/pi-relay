@@ -4,8 +4,14 @@ use agent_vocab::{
     ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{watch, Mutex};
 
 #[cfg(test)]
 use crate::sse::read_json_sse_text;
@@ -15,20 +21,20 @@ use crate::{
     },
     http::send_provider_generation_request,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
-    ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
-    ProviderError, ProviderResult, ProviderTokenCountRequest, ProviderTokenCountResponse,
-    ProviderToolProfile, ProviderUsage,
+    ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
+    ModelTranscriptEntry, ProviderError, ProviderModelMetadata, ProviderResult,
+    ProviderTokenCountRequest, ProviderTokenCountResponse, ProviderToolProfile, ProviderUsage,
 };
 
-const DEFAULT_MAX_TOKENS: u32 = 64_000;
-const BASE_ANTHROPIC_BETA_HEADER: &str =
-    "claude-code-20250219,fine-grained-tool-streaming-2025-05-14,extended-cache-ttl-2025-04-11,web-fetch-2025-09-10";
-const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
-const EFFORT_BETA: &str = "effort-2025-11-24";
-const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const DEFAULT_MAX_OUTPUT_BUDGET: u32 = 64_000;
+const UNKNOWN_MODEL_MAX_OUTPUT_TOKENS: u32 = 64_000;
+const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
 const CLAUDE_CODE_VERSION: &str = "2.1.75";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75 (external, cli)";
 const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
+const MODEL_CACHE_CAPACITY: usize = 64;
+const MODEL_CACHE_SUCCESS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const MODEL_CACHE_FAILURE_TTL: Duration = Duration::from_secs(60);
 
 // Anthropic's documented per-breakpoint backward lookback when matching a new
 // request against existing cache entries. We use this to decide when the tail
@@ -45,6 +51,211 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    model_cache: AnthropicModelCache,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AnthropicModelCache {
+    state: Arc<Mutex<AnthropicModelCacheState>>,
+}
+
+#[derive(Debug, Default)]
+struct AnthropicModelCacheState {
+    entries: HashMap<String, CachedAnthropicModel>,
+    next_generation: u64,
+    access_counter: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedAnthropicModel {
+    fetched_at: Option<Instant>,
+    retry_after: Option<Instant>,
+    model: Option<AnthropicModelMetadata>,
+    refresh: Option<ModelRefresh>,
+    last_access: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ModelRefresh {
+    generation: u64,
+    receiver: watch::Receiver<ModelRefreshStatus>,
+}
+
+#[derive(Debug, Clone)]
+enum ModelRefreshStatus {
+    Pending,
+    Finished(Option<AnthropicModelMetadata>),
+}
+
+enum ModelCacheDecision {
+    Return(Option<AnthropicModelMetadata>),
+    Wait(ModelRefresh),
+    Start {
+        refresh: ModelRefresh,
+        sender: watch::Sender<ModelRefreshStatus>,
+    },
+}
+
+impl AnthropicModelCache {
+    async fn decision(&self, model: &str, now: Instant) -> ModelCacheDecision {
+        let mut state = self.state.lock().await;
+        state.access_counter = state.access_counter.saturating_add(1);
+        let last_access = state.access_counter;
+
+        if let Some(cached) = state.entries.get_mut(model) {
+            cached.last_access = last_access;
+            if cached
+                .model
+                .as_ref()
+                .zip(cached.fetched_at)
+                .is_some_and(|(_, fetched_at)| {
+                    now.saturating_duration_since(fetched_at) < MODEL_CACHE_SUCCESS_TTL
+                })
+            {
+                return ModelCacheDecision::Return(cached.model.clone());
+            }
+            if cached
+                .retry_after
+                .is_some_and(|retry_after| now < retry_after)
+            {
+                return ModelCacheDecision::Return(cached.model.clone());
+            }
+            if let Some(refresh) = cached.refresh.as_ref() {
+                return ModelCacheDecision::Wait(refresh.clone());
+            }
+        } else {
+            state.evict_for_insert();
+            state.entries.insert(
+                model.to_string(),
+                CachedAnthropicModel {
+                    fetched_at: None,
+                    retry_after: None,
+                    model: None,
+                    refresh: None,
+                    last_access,
+                },
+            );
+        }
+
+        state.next_generation = state.next_generation.saturating_add(1);
+        let generation = state.next_generation;
+        let (sender, receiver) = watch::channel(ModelRefreshStatus::Pending);
+        let refresh = ModelRefresh {
+            generation,
+            receiver,
+        };
+        let cached = state
+            .entries
+            .get_mut(model)
+            .expect("model cache entry exists before refresh");
+        cached.retry_after = None;
+        cached.refresh = Some(refresh.clone());
+        ModelCacheDecision::Start { refresh, sender }
+    }
+
+    async fn commit_refresh(
+        &self,
+        model: &str,
+        generation: u64,
+        resolved: Option<AnthropicModelMetadata>,
+        now: Instant,
+    ) -> Option<AnthropicModelMetadata> {
+        let mut state = self.state.lock().await;
+        state.access_counter = state.access_counter.saturating_add(1);
+        let last_access = state.access_counter;
+        let Some(cached) = state.entries.get_mut(model) else {
+            // An explicitly abandoned generation may have become eligible for
+            // eviction. Do not recreate or overwrite newer cache state.
+            return resolved;
+        };
+        if cached
+            .refresh
+            .as_ref()
+            .is_none_or(|refresh| refresh.generation != generation)
+        {
+            return cached.model.clone();
+        }
+
+        cached.refresh = None;
+        cached.last_access = last_access;
+        if let Some(resolved) = resolved {
+            cached.model = Some(resolved);
+            cached.fetched_at = Some(now);
+            cached.retry_after = None;
+        } else {
+            // Keep last-known-good metadata, including its original fetched_at,
+            // but independently back off the failed refresh. If no success has
+            // ever existed, this same timestamp is a cold negative entry.
+            cached.retry_after = Some(now + MODEL_CACHE_FAILURE_TTL);
+        }
+        let effective = cached.model.clone();
+        state.trim_to_capacity();
+        effective
+    }
+
+    async fn abandon_refresh(&self, model: &str, generation: u64) {
+        let mut state = self.state.lock().await;
+        let Some(cached) = state.entries.get_mut(model) else {
+            return;
+        };
+        if cached
+            .refresh
+            .as_ref()
+            .is_some_and(|refresh| refresh.generation == generation)
+        {
+            cached.refresh = None;
+            state.trim_to_capacity();
+        }
+    }
+}
+
+impl AnthropicModelCacheState {
+    fn evict_for_insert(&mut self) {
+        while self.entries.len() >= MODEL_CACHE_CAPACITY {
+            if !self.evict_oldest_settled() {
+                break;
+            }
+        }
+    }
+
+    fn trim_to_capacity(&mut self) {
+        while self.entries.len() > MODEL_CACHE_CAPACITY {
+            if !self.evict_oldest_settled() {
+                break;
+            }
+        }
+    }
+
+    fn evict_oldest_settled(&mut self) -> bool {
+        if let Some(oldest) = self
+            .entries
+            .iter()
+            .filter(|(_, cached)| cached.refresh.is_none())
+            .min_by_key(|(_, cached)| cached.last_access)
+            .map(|(model, _)| model.clone())
+        {
+            self.entries.remove(&oldest);
+            true
+        } else {
+            // Every entry is refreshing. Preserve their single-flight state
+            // and allow temporary overflow until a refresh settles.
+            false
+        }
+    }
+}
+
+async fn wait_for_model_refresh(
+    mut refresh: ModelRefresh,
+) -> Option<Option<AnthropicModelMetadata>> {
+    loop {
+        let status = refresh.receiver.borrow_and_update().clone();
+        if let ModelRefreshStatus::Finished(metadata) = status {
+            return Some(metadata);
+        }
+        if refresh.receiver.changed().await.is_err() {
+            return None;
+        }
+    }
 }
 
 fn anthropic_error_message(
@@ -84,43 +295,167 @@ fn anthropic_stream_provider_error(error_type: Option<&str>, message: String) ->
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AnthropicModelCapabilities {
     adaptive_thinking: bool,
-    context_management: bool,
+    adaptive_thinking_default: bool,
     effort: bool,
-    interleaved_thinking: bool,
+    low_effort: bool,
+    medium_effort: bool,
+    high_effort: bool,
+    xhigh_effort: bool,
+    max_effort: bool,
 }
 
-fn anthropic_capabilities(model: &str) -> AnthropicModelCapabilities {
-    let model = model.to_ascii_lowercase();
-    let is_claude_4 = model.contains("claude-")
-        && (model.contains("opus-4") || model.contains("sonnet-4") || model.contains("haiku-4"));
-    let is_adaptive = model.contains("opus-4-6")
-        || model.contains("sonnet-4-6")
-        || model.contains("opus-4-7")
-        || model.contains("opus-4-8");
-    AnthropicModelCapabilities {
-        adaptive_thinking: is_adaptive,
-        context_management: is_claude_4,
-        effort: is_adaptive,
-        interleaved_thinking: is_claude_4 && !is_adaptive,
+impl AnthropicModelCapabilities {
+    fn adaptive_with_all_efforts(adaptive_thinking_default: bool) -> Self {
+        Self {
+            adaptive_thinking: true,
+            adaptive_thinking_default,
+            effort: true,
+            low_effort: true,
+            medium_effort: true,
+            high_effort: true,
+            xhigh_effort: true,
+            max_effort: true,
+        }
+    }
+
+    fn supports_effort(self, effort: ReasoningEffort) -> bool {
+        match effort {
+            ReasoningEffort::Low => self.low_effort,
+            ReasoningEffort::Medium => self.medium_effort,
+            ReasoningEffort::High => self.high_effort,
+            ReasoningEffort::XHigh => self.xhigh_effort,
+            ReasoningEffort::Max => self.max_effort,
+            ReasoningEffort::None | ReasoningEffort::Minimal => false,
+        }
     }
 }
 
-fn anthropic_beta_header(model: &str) -> String {
-    let capabilities = anthropic_capabilities(model);
-    let mut betas = BASE_ANTHROPIC_BETA_HEADER
-        .split(',')
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if capabilities.interleaved_thinking {
-        betas.push(INTERLEAVED_THINKING_BETA.to_string());
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnthropicModelMetadata {
+    id: String,
+    max_input_tokens: Option<usize>,
+    max_tokens: u32,
+    capabilities: AnthropicModelCapabilities,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsApiModel {
+    id: String,
+    max_input_tokens: Option<usize>,
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    capabilities: Option<ModelsApiCapabilities>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsApiCapabilities {
+    effort: ModelsApiEffortCapability,
+    thinking: ModelsApiThinkingCapability,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsApiCapability {
+    supported: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsApiEffortCapability {
+    supported: bool,
+    low: ModelsApiCapability,
+    medium: ModelsApiCapability,
+    high: ModelsApiCapability,
+    xhigh: Option<ModelsApiCapability>,
+    max: ModelsApiCapability,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsApiThinkingCapability {
+    supported: bool,
+    types: ModelsApiThinkingTypes,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsApiThinkingTypes {
+    adaptive: ModelsApiCapability,
+}
+
+fn static_anthropic_model_metadata(model: &str) -> AnthropicModelMetadata {
+    let normalized = model.to_ascii_lowercase();
+    let (max_input_tokens, max_tokens, capabilities) = match normalized.as_str() {
+        "claude-sonnet-5" | "claude-fable-5" => (
+            Some(1_000_000),
+            128_000,
+            AnthropicModelCapabilities::adaptive_with_all_efforts(true),
+        ),
+        "claude-opus-4-8" | "claude-opus-4-7" => (
+            Some(1_000_000),
+            128_000,
+            AnthropicModelCapabilities::adaptive_with_all_efforts(false),
+        ),
+        "claude-opus-4-6" | "claude-sonnet-4-6" => (
+            None,
+            UNKNOWN_MODEL_MAX_OUTPUT_TOKENS,
+            AnthropicModelCapabilities::adaptive_with_all_efforts(false),
+        ),
+        _ => (
+            None,
+            UNKNOWN_MODEL_MAX_OUTPUT_TOKENS,
+            AnthropicModelCapabilities {
+                adaptive_thinking: false,
+                adaptive_thinking_default: false,
+                effort: false,
+                low_effort: false,
+                medium_effort: false,
+                high_effort: false,
+                xhigh_effort: false,
+                max_effort: false,
+            },
+        ),
+    };
+    AnthropicModelMetadata {
+        id: model.to_string(),
+        max_input_tokens,
+        max_tokens,
+        capabilities,
     }
-    if capabilities.context_management {
-        betas.push(CONTEXT_MANAGEMENT_BETA.to_string());
+}
+
+fn merge_models_api_metadata(
+    fallback: AnthropicModelMetadata,
+    discovered: ModelsApiModel,
+) -> AnthropicModelMetadata {
+    let mut capabilities = fallback.capabilities;
+    if let Some(discovered_capabilities) = discovered.capabilities {
+        let effort = discovered_capabilities.effort;
+        capabilities.effort = effort.supported;
+        capabilities.low_effort = effort.low.supported;
+        capabilities.medium_effort = effort.medium.supported;
+        capabilities.high_effort = effort.high.supported;
+        capabilities.xhigh_effort = effort.xhigh.is_some_and(|value| value.supported);
+        capabilities.max_effort = effort.max.supported;
+
+        let thinking = discovered_capabilities.thinking;
+        capabilities.adaptive_thinking = thinking.supported && thinking.types.adaptive.supported;
     }
-    if capabilities.effort {
-        betas.push(EFFORT_BETA.to_string());
+    AnthropicModelMetadata {
+        id: discovered.id,
+        max_input_tokens: discovered
+            .max_input_tokens
+            .filter(|value| *value > 0)
+            .or(fallback.max_input_tokens),
+        max_tokens: discovered
+            .max_tokens
+            .filter(|value| *value > 0)
+            .unwrap_or(fallback.max_tokens),
+        capabilities,
     }
-    betas.join(",")
+}
+
+fn anthropic_beta_header() -> &'static str {
+    // Keep the Claude Code identity beta required by the existing API-key
+    // transport. Effort, one-hour cache TTL, fine-grained streaming, adaptive
+    // thinking, and the current web tools are GA and must not add stale betas.
+    CLAUDE_CODE_BETA
 }
 
 fn anthropic_wire_tool_name(canonical_name: &str) -> &str {
@@ -154,11 +489,107 @@ fn parse_anthropic_count_tokens(text: &str) -> ProviderResult<ProviderTokenCount
 
 impl AnthropicProvider {
     pub fn new_with_client(client: reqwest::Client, api_key: impl Into<String>) -> Self {
+        Self::new_with_client_and_cache(client, api_key, AnthropicModelCache::default())
+    }
+
+    pub fn new_with_client_and_cache(
+        client: reqwest::Client,
+        api_key: impl Into<String>,
+        model_cache: AnthropicModelCache,
+    ) -> Self {
         Self {
             client,
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
+            model_cache,
         }
+    }
+
+    async fn resolved_model_metadata(&self, model: &str) -> AnthropicModelMetadata {
+        let fallback = static_anthropic_model_metadata(model);
+        loop {
+            let decision = self.model_cache.decision(model, Instant::now()).await;
+            let refresh = match decision {
+                ModelCacheDecision::Return(metadata) => return metadata.unwrap_or(fallback),
+                ModelCacheDecision::Wait(refresh) => refresh,
+                ModelCacheDecision::Start { refresh, sender } => {
+                    self.spawn_model_refresh(
+                        model.to_string(),
+                        fallback.clone(),
+                        refresh.generation,
+                        sender,
+                    );
+                    refresh
+                }
+            };
+            if let Some(metadata) = wait_for_model_refresh(refresh.clone()).await {
+                return metadata.unwrap_or(fallback);
+            }
+            // A refresh task that is aborted or panics closes its watch channel.
+            // Clear only that generation and retry so waiters cannot remain
+            // permanently attached to an abandoned in-flight entry.
+            self.model_cache
+                .abandon_refresh(model, refresh.generation)
+                .await;
+        }
+    }
+
+    fn spawn_model_refresh(
+        &self,
+        model: String,
+        fallback: AnthropicModelMetadata,
+        generation: u64,
+        sender: watch::Sender<ModelRefreshStatus>,
+    ) {
+        let provider = self.clone();
+        tokio::spawn(async move {
+            let resolved = match provider.retrieve_model(&model).await {
+                Ok(discovered) => Some(merge_models_api_metadata(fallback, discovered)),
+                Err(error) => {
+                    eprintln!(
+                        "Anthropic Models API lookup failed for {model}; using cached/static fallback: {error}"
+                    );
+                    None
+                }
+            };
+            let effective = provider
+                .model_cache
+                .commit_refresh(&model, generation, resolved, Instant::now())
+                .await;
+            let _ = sender.send(ModelRefreshStatus::Finished(effective));
+        });
+    }
+
+    async fn retrieve_model(&self, model: &str) -> ProviderResult<ModelsApiModel> {
+        let mut url =
+            reqwest::Url::parse(&format!("{}/models", self.base_url.trim_end_matches('/')))
+                .map_err(|error| {
+                    ProviderError::Provider(format!("invalid Anthropic models URL: {error}"))
+                })?;
+        url.path_segments_mut()
+            .map_err(|_| ProviderError::Provider("invalid Anthropic models URL".to_string()))?
+            .push(model);
+        let response = self
+            .client
+            .get(url)
+            .header("accept", "application/json")
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("User-Agent", CLAUDE_CODE_USER_AGENT)
+            .header("x-app", "cli")
+            .header("x-client-request-id", client_request_id())
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        let (status, text) = response_text(response).await?;
+        ensure_success(status, &text, response_error_message)?;
+        serde_json::from_str(&text).map_err(|error| {
+            ProviderError::Provider(format!(
+                "failed to parse Anthropic model response JSON: {error}; body: {}",
+                response_excerpt(&text)
+            ))
+        })
     }
 }
 
@@ -170,8 +601,8 @@ impl ModelProvider for AnthropicProvider {
             .clone()
             .or_else(|| request.prompt_cache_key.clone())
             .unwrap_or_else(|| "pi-relay".to_string());
-        let beta_header = anthropic_beta_header(&request.model);
-        let body = messages_body(request)?;
+        let metadata = self.resolved_model_metadata(&request.model).await;
+        let body = messages_body_with_metadata(request, &metadata)?;
 
         let response = send_provider_generation_request(
             self.client
@@ -179,7 +610,7 @@ impl ModelProvider for AnthropicProvider {
                 .header("accept", "text/event-stream")
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", beta_header)
+                .header("anthropic-beta", anthropic_beta_header())
                 .header("anthropic-dangerous-direct-browser-access", "true")
                 .header("User-Agent", CLAUDE_CODE_USER_AGENT)
                 .header("x-app", "cli")
@@ -192,6 +623,14 @@ impl ModelProvider for AnthropicProvider {
         parse_anthropic_stream(response).await
     }
 
+    async fn model_metadata(&self, model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
+        let metadata = self.resolved_model_metadata(model).await;
+        Ok(Some(ProviderModelMetadata {
+            max_input_tokens: metadata.max_input_tokens,
+            max_output_tokens: Some(metadata.max_tokens),
+        }))
+    }
+
     async fn count_tokens(
         &self,
         request: ProviderTokenCountRequest,
@@ -201,8 +640,8 @@ impl ModelProvider for AnthropicProvider {
             .clone()
             .or_else(|| request.prompt_cache_key.clone())
             .unwrap_or_else(|| "pi-relay".to_string());
-        let beta_header = anthropic_beta_header(&request.model);
-        let body = count_tokens_body(request)?;
+        let metadata = self.resolved_model_metadata(&request.model).await;
+        let body = count_tokens_body_with_metadata(request, &metadata)?;
 
         let response = self
             .client
@@ -213,7 +652,7 @@ impl ModelProvider for AnthropicProvider {
             .header("accept", "application/json")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", beta_header)
+            .header("anthropic-beta", anthropic_beta_header())
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("User-Agent", CLAUDE_CODE_USER_AGENT)
             .header("x-app", "cli")
@@ -228,22 +667,48 @@ impl ModelProvider for AnthropicProvider {
     }
 }
 
+#[cfg(test)]
 fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
+    let metadata = static_anthropic_model_metadata(&request.model);
+    messages_body_with_metadata(request, &metadata)
+}
+
+fn messages_body_with_metadata(
+    request: ModelRequest,
+    metadata: &AnthropicModelMetadata,
+) -> ProviderResult<Value> {
     let tool_profile = request.tool_profile;
+    // The Messages API requires `max_tokens`. Keep 64k as the ordinary-turn
+    // target recommended for xhigh/max agentic work, but clamp both defaults
+    // and explicit overrides to the model's authoritative output ceiling.
+    let max_tokens = request
+        .max_tokens
+        .unwrap_or(DEFAULT_MAX_OUTPUT_BUDGET)
+        .min(metadata.max_tokens);
     anthropic_request_body(AnthropicRequestBodyInput {
         model: request.model,
         prompt: request.prompt,
         transcript: request.transcript,
         tool_profile,
         tools: crate::effective_provider_tools(tool_profile, request.tools),
-        max_tokens: Some(request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
+        max_tokens: Some(max_tokens),
         reasoning_effort: Some(request.reasoning_effort),
+        capabilities: metadata.capabilities,
         cache_transcript: true,
         transcript_cache_prefix_len: request.transcript_cache_prefix_len,
     })
 }
 
+#[cfg(test)]
 fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value> {
+    let metadata = static_anthropic_model_metadata(&request.model);
+    count_tokens_body_with_metadata(request, &metadata)
+}
+
+fn count_tokens_body_with_metadata(
+    request: ProviderTokenCountRequest,
+    metadata: &AnthropicModelMetadata,
+) -> ProviderResult<Value> {
     // Keep this as close as possible to `messages_body`: Anthropic's token
     // count endpoint accepts the same input-shaping fields (system, tools,
     // thinking/output config) but does not need a generation budget.
@@ -259,6 +724,7 @@ fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value
         // generation-only budgets such as max_tokens.
         max_tokens: None,
         reasoning_effort: Some(request.reasoning_effort),
+        capabilities: metadata.capabilities,
         cache_transcript: false,
         transcript_cache_prefix_len: None,
     })
@@ -272,12 +738,13 @@ struct AnthropicRequestBodyInput {
     tools: Vec<ProviderTool>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
+    capabilities: AnthropicModelCapabilities,
     cache_transcript: bool,
     transcript_cache_prefix_len: Option<usize>,
 }
 
 fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Value> {
-    let capabilities = anthropic_capabilities(&input.model);
+    let capabilities = input.capabilities;
     let messages = transcript_to_messages_for_request(&input)?;
     let mut body = json!({
         "model": input.model,
@@ -286,18 +753,20 @@ fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Va
     if let Some(max_tokens) = input.max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }
-    if let Some(reasoning_effort) = input
-        .reasoning_effort
-        .filter(|_| capabilities.adaptive_thinking)
-    {
-        let effort = anthropic_reasoning_effort(input.model.as_str(), reasoning_effort)?;
+    if let Some(reasoning_effort) = input.reasoning_effort.filter(|_| capabilities.effort) {
+        let effort = anthropic_reasoning_effort(capabilities, reasoning_effort)?;
         // Adaptive thinking is intentionally hard-coded and must not become a
         // per-request toggle: Anthropic invalidates the message-content cache
         // whenever the `thinking` parameter changes (enabling/disabling or
         // budget changes). Reasoning effort lives in `output_config` instead,
         // which is documented not to affect the messages-level cache.
         // See: https://docs.claude.com/en/docs/build-with-claude/prompt-caching
-        body["thinking"] = json!({ "type": "adaptive" });
+        // Fable 5 always thinks and Sonnet 5 defaults to adaptive thinking, so
+        // their canonical shape omits the redundant `thinking` field. Opus
+        // 4.8 requires an explicit adaptive mode; omission turns thinking off.
+        if capabilities.adaptive_thinking && !capabilities.adaptive_thinking_default {
+            body["thinking"] = json!({ "type": "adaptive" });
+        }
         body["output_config"] = json!({ "effort": effort });
     }
     if let Some(system_blocks) = anthropic_system_blocks(&input.prompt, &input.transcript) {
@@ -366,23 +835,16 @@ fn client_request_id() -> String {
 }
 
 fn anthropic_reasoning_effort(
-    model: &str,
+    capabilities: AnthropicModelCapabilities,
     effort: ReasoningEffort,
 ) -> ProviderResult<&'static str> {
-    let model = model.to_ascii_lowercase();
-    match effort {
-        ReasoningEffort::Low
-        | ReasoningEffort::Medium
-        | ReasoningEffort::High
-        | ReasoningEffort::Max => Ok(effort.as_str()),
-        ReasoningEffort::XHigh if model.contains("opus-4-7") || model.contains("opus-4-8") => {
-            Ok(effort.as_str())
-        }
-        ReasoningEffort::XHigh => Ok("high"),
-        ReasoningEffort::None | ReasoningEffort::Minimal => Err(ProviderError::Provider(
-            "reasoning effort is not supported by Claude".to_string(),
-        )),
+    if capabilities.supports_effort(effort) {
+        return Ok(effort.as_str());
     }
+    Err(ProviderError::Provider(format!(
+        "reasoning effort {} is not supported by this Claude model",
+        effort.as_str()
+    )))
 }
 
 fn response_error_message(body: &str) -> String {
@@ -782,6 +1244,17 @@ fn anthropic_user_content(message: &UserMessage) -> Value {
 
 #[cfg(test)]
 fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
+    let stop_reason = anthropic_stop_reason(response);
+    let stop_details = anthropic_stop_details(response.get("stop_details"));
+    if stop_reason == ModelStopReason::Refusal {
+        return Ok(ModelResponse {
+            assistant: AssistantMessage { items: Vec::new() },
+            provider_replay: Vec::new(),
+            usage: response.get("usage").and_then(anthropic_usage),
+            stop_reason,
+            stop_details,
+        });
+    }
     let content = response
         .get("content")
         .and_then(Value::as_array)
@@ -830,7 +1303,8 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
         assistant: AssistantMessage { items },
         provider_replay,
         usage: response.get("usage").and_then(anthropic_usage),
-        stop_reason: anthropic_stop_reason(response),
+        stop_reason,
+        stop_details,
     })
 }
 
@@ -860,6 +1334,7 @@ struct AnthropicStreamState {
     items: Vec<AssistantItem>,
     usage: Option<ProviderUsage>,
     stop_reason: ModelStopReason,
+    stop_details: Option<ModelStopDetails>,
 }
 
 impl Default for AnthropicStreamState {
@@ -871,6 +1346,7 @@ impl Default for AnthropicStreamState {
             items: Vec::new(),
             usage: None,
             stop_reason: ModelStopReason::Complete,
+            stop_details: None,
         }
     }
 }
@@ -921,9 +1397,16 @@ impl AnthropicStreamState {
                 if let Some(usage) = event.get("usage").and_then(anthropic_usage) {
                     merge_anthropic_usage(&mut self.usage, usage);
                 }
-                if event.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens")
-                {
-                    self.stop_reason = ModelStopReason::MaxOutputTokens;
+                match event.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    Some("max_tokens") => {
+                        self.stop_reason = ModelStopReason::MaxOutputTokens;
+                    }
+                    Some("refusal") => {
+                        self.stop_reason = ModelStopReason::Refusal;
+                        self.stop_details =
+                            anthropic_stop_details(event.pointer("/delta/stop_details"));
+                    }
+                    _ => {}
                 }
                 Ok(SseControl::Continue)
             }
@@ -989,18 +1472,28 @@ impl AnthropicStreamState {
     }
 
     fn finish(mut self) -> ProviderResult<ModelResponse> {
-        for block in std::mem::take(&mut self.content_blocks)
-            .into_iter()
-            .flatten()
-            .map(finalize_stream_content_block)
-        {
-            push_anthropic_content_block(&block, &mut self.items, &mut self.provider_replay)?;
+        if self.stop_reason == ModelStopReason::Refusal {
+            // Anthropic can classify a Fable response after streaming partial
+            // text, thinking, or tool blocks. The entire partial attempt is
+            // incomplete and must not be persisted or replayed.
+            self.content_blocks.clear();
+            self.items.clear();
+            self.provider_replay.clear();
+        } else {
+            for block in std::mem::take(&mut self.content_blocks)
+                .into_iter()
+                .flatten()
+                .map(finalize_stream_content_block)
+            {
+                push_anthropic_content_block(&block, &mut self.items, &mut self.provider_replay)?;
+            }
         }
         Ok(ModelResponse {
             assistant: AssistantMessage { items: self.items },
             provider_replay: self.provider_replay,
             usage: self.usage,
             stop_reason: self.stop_reason,
+            stop_details: self.stop_details,
         })
     }
 }
@@ -1098,8 +1591,23 @@ fn push_anthropic_content_block(
 fn anthropic_stop_reason(response: &Value) -> ModelStopReason {
     match response.get("stop_reason").and_then(Value::as_str) {
         Some("max_tokens") => ModelStopReason::MaxOutputTokens,
+        Some("refusal") => ModelStopReason::Refusal,
         _ => ModelStopReason::Complete,
     }
+}
+
+fn anthropic_stop_details(value: Option<&Value>) -> Option<ModelStopDetails> {
+    let value = value?.as_object()?;
+    Some(ModelStopDetails {
+        category: value
+            .get("category")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        explanation: value
+            .get("explanation")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
 }
 
 fn canonical_anthropic_tool_name(name: &str) -> &str {
@@ -1169,6 +1677,7 @@ mod tests {
     use super::*;
     use crate::PromptSections;
     use agent_vocab::ToolResultMessage;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_tool(
         provider: ProviderKind,
@@ -1246,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_body_enables_adaptive_thinking_for_adaptive_models() {
+    fn messages_body_enables_adaptive_thinking_for_opus_48() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-8".to_string(),
             transcript_cache_prefix_len: None,
@@ -1278,16 +1787,758 @@ mod tests {
     }
 
     #[test]
-    fn beta_header_is_gated_by_model_capabilities() {
-        let legacy = anthropic_beta_header("claude-sonnet-4-5");
-        assert!(legacy.contains(INTERLEAVED_THINKING_BETA));
-        assert!(legacy.contains(CONTEXT_MANAGEMENT_BETA));
-        assert!(!legacy.contains(EFFORT_BETA));
+    fn sonnet_5_and_fable_5_use_default_on_adaptive_thinking_and_all_efforts() {
+        for model in ["claude-sonnet-5", "claude-fable-5"] {
+            for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
+                let body =
+                    messages_body(ModelRequest {
+                        model: model.to_string(),
+                        transcript_cache_prefix_len: None,
+                        prompt: PromptSections::stable("stable rules"),
+                        transcript: vec![
+                            TranscriptItem::UserMessage(UserMessage::text("hello")).into()
+                        ],
+                        tool_profile: ProviderToolProfile::None,
+                        tools: Vec::new(),
+                        max_tokens: None,
+                        reasoning_effort: effort,
+                        prompt_cache_key: None,
+                        session_id: None,
+                        turn_id: None,
+                    })
+                    .expect("body renders");
 
-        let adaptive = anthropic_beta_header("claude-opus-4-8");
-        assert!(!adaptive.contains(INTERLEAVED_THINKING_BETA));
-        assert!(adaptive.contains(CONTEXT_MANAGEMENT_BETA));
-        assert!(adaptive.contains(EFFORT_BETA));
+                assert!(
+                    body.get("thinking").is_none(),
+                    "{model} defaults to adaptive thinking and should omit redundant configuration"
+                );
+                assert_eq!(body["output_config"]["effort"], effort.as_str());
+                assert_eq!(body["max_tokens"], DEFAULT_MAX_OUTPUT_BUDGET);
+            }
+        }
+    }
+
+    #[test]
+    fn discovered_output_limit_clamps_default_and_explicit_budgets() {
+        let mut metadata = static_anthropic_model_metadata("claude-sonnet-5");
+        metadata.max_tokens = 32_000;
+        let request = |max_tokens| ModelRequest {
+            model: "claude-sonnet-5".to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens,
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        };
+
+        assert_eq!(
+            messages_body_with_metadata(request(None), &metadata).unwrap()["max_tokens"],
+            32_000
+        );
+        assert_eq!(
+            messages_body_with_metadata(request(Some(100_000)), &metadata).unwrap()["max_tokens"],
+            32_000
+        );
+        assert_eq!(
+            messages_body_with_metadata(request(Some(8_192)), &metadata).unwrap()["max_tokens"],
+            8_192
+        );
+    }
+
+    fn models_api_capabilities(xhigh: Value) -> Value {
+        json!({
+            "batch": { "supported": true },
+            "citations": { "supported": true },
+            "code_execution": { "supported": true },
+            "context_management": {
+                "clear_thinking_20251015": null,
+                "clear_tool_uses_20250919": null,
+                "compact_20260112": null,
+                "supported": false
+            },
+            "effort": {
+                "supported": true,
+                "low": { "supported": true },
+                "medium": { "supported": true },
+                "high": { "supported": true },
+                "xhigh": xhigh,
+                "max": { "supported": true }
+            },
+            "image_input": { "supported": true },
+            "pdf_input": { "supported": true },
+            "structured_outputs": { "supported": true },
+            "thinking": {
+                "supported": true,
+                "types": {
+                    "adaptive": { "supported": true },
+                    "enabled": { "supported": false }
+                }
+            }
+        })
+    }
+
+    fn test_model_metadata(id: &str, max_tokens: u32) -> AnthropicModelMetadata {
+        let mut metadata = static_anthropic_model_metadata(id);
+        metadata.max_tokens = max_tokens;
+        metadata
+    }
+
+    #[test]
+    fn models_api_null_capabilities_preserves_authoritative_limits() {
+        let discovered: ModelsApiModel = serde_json::from_value(json!({
+            "id": "claude-future",
+            "max_input_tokens": 200_000,
+            "max_tokens": 8_192,
+            "capabilities": null
+        }))
+        .expect("nullable capabilities parse");
+        let metadata =
+            merge_models_api_metadata(static_anthropic_model_metadata("claude-future"), discovered);
+
+        assert_eq!(metadata.max_input_tokens, Some(200_000));
+        assert_eq!(metadata.max_tokens, 8_192);
+        assert!(!metadata.capabilities.effort);
+    }
+
+    #[test]
+    fn authoritative_null_xhigh_is_unsupported_and_rejected_locally() {
+        let discovered: ModelsApiModel = serde_json::from_value(json!({
+            "id": "claude-sonnet-5",
+            "max_input_tokens": 1_000_000,
+            "max_tokens": 128_000,
+            "capabilities": models_api_capabilities(Value::Null)
+        }))
+        .expect("nullable xhigh parses");
+        let metadata = merge_models_api_metadata(
+            static_anthropic_model_metadata("claude-sonnet-5"),
+            discovered,
+        );
+
+        assert!(!metadata
+            .capabilities
+            .supports_effort(ReasoningEffort::XHigh));
+        assert!(metadata.capabilities.supports_effort(ReasoningEffort::Low));
+        assert!(metadata
+            .capabilities
+            .supports_effort(ReasoningEffort::Medium));
+        assert!(metadata.capabilities.supports_effort(ReasoningEffort::High));
+        assert!(metadata.capabilities.supports_effort(ReasoningEffort::Max));
+
+        let request = ModelRequest {
+            model: "claude-sonnet-5".to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::XHigh,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        };
+        let error = messages_body_with_metadata(request, &metadata)
+            .expect_err("authoritative unsupported xhigh must fail locally");
+        assert!(error.to_string().contains("xhigh"));
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn beta_header_keeps_identity_only_and_drops_ga_feature_betas() {
+        let header = anthropic_beta_header();
+        assert_eq!(header, CLAUDE_CODE_BETA);
+        for stale in [
+            "effort-",
+            "extended-cache-ttl-",
+            "fine-grained-tool-streaming-",
+            "web-fetch-",
+            "interleaved-thinking-",
+        ] {
+            assert!(!header.contains(stale));
+        }
+    }
+
+    #[tokio::test]
+    async fn models_api_metadata_is_authoritative_and_cached() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request accepted");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = socket.read(&mut buffer).await.expect("request reads");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).expect("request is utf8");
+            assert!(request.starts_with("GET /v1/models/claude-sonnet-5 HTTP/1.1\r\n"));
+            let lower = request.to_ascii_lowercase();
+            assert!(lower.contains("anthropic-version: 2023-06-01\r\n"));
+            assert!(!lower.contains("anthropic-beta:"));
+            assert!(lower.contains("x-api-key: test-key\r\n"));
+
+            let mut capabilities = models_api_capabilities(json!({ "supported": true }));
+            capabilities["effort"]["max"] = json!({ "supported": false });
+            let body = json!({
+                "id": "claude-sonnet-5",
+                "type": "model",
+                "display_name": "Claude Sonnet 5",
+                "created_at": "2026-06-30T00:00:00Z",
+                "max_input_tokens": 444_444,
+                "max_tokens": 32_000,
+                "capabilities": capabilities
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response writes");
+        });
+
+        let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
+        provider.base_url = base_url;
+        let first = provider.resolved_model_metadata("claude-sonnet-5").await;
+        server.await.expect("server completes");
+        // The listener is now gone. A second successful authoritative result
+        // proves that no second network request was attempted.
+        let second = provider.resolved_model_metadata("claude-sonnet-5").await;
+
+        assert_eq!(first, second);
+        assert_eq!(first.max_input_tokens, Some(444_444));
+        assert_eq!(first.max_tokens, 32_000);
+        assert!(first.capabilities.supports_effort(ReasoningEffort::XHigh));
+        assert!(!first.capabilities.supports_effort(ReasoningEffort::Max));
+
+        let request = |effort| ModelRequest {
+            model: "claude-sonnet-5".to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: effort,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        };
+        let xhigh = messages_body_with_metadata(request(ReasoningEffort::XHigh), &first)
+            .expect("discovered xhigh is accepted");
+        assert_eq!(xhigh["max_tokens"], 32_000);
+        assert_eq!(xhigh["output_config"]["effort"], "xhigh");
+        assert!(messages_body_with_metadata(request(ReasoningEffort::Max), &first).is_err());
+    }
+
+    #[tokio::test]
+    async fn models_api_failure_uses_and_negative_caches_static_safety_metadata() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request accepted");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = socket.read(&mut buffer).await.expect("request reads");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"type":"error","error":{"type":"api_error","message":"nope"}}"#;
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response writes");
+            drop(socket);
+
+            // A negative cache entry must suppress an immediate second fetch.
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        });
+
+        let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
+        provider.base_url = base_url;
+        let first = provider.resolved_model_metadata("claude-fable-5").await;
+        let second = provider.resolved_model_metadata("claude-fable-5").await;
+
+        assert!(
+            server.await.expect("server completes"),
+            "failure result should be negative-cached"
+        );
+        assert_eq!(first, second);
+        assert_eq!(first.max_input_tokens, Some(1_000_000));
+        assert_eq!(first.max_tokens, 128_000);
+        assert!(first.capabilities.adaptive_thinking_default);
+        assert!(first.capabilities.supports_effort(ReasoningEffort::Max));
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_model_cache_callers_issue_one_get() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        const CALLERS: usize = 16;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("request accepted");
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 1024];
+                    loop {
+                        let read = socket.read(&mut buffer).await.expect("request reads");
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let body = json!({
+                        "id": "claude-future",
+                        "max_input_tokens": 200_000,
+                        "max_tokens": 8_192,
+                        "capabilities": null
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("response writes");
+                });
+            }
+        });
+
+        let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
+        provider.base_url = base_url;
+        let provider = Arc::new(provider);
+        let barrier = Arc::new(Barrier::new(CALLERS));
+        let mut callers = Vec::new();
+        for _ in 0..CALLERS {
+            let provider = Arc::clone(&provider);
+            let barrier = Arc::clone(&barrier);
+            callers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                provider.resolved_model_metadata("claude-future").await
+            }));
+        }
+        for caller in callers {
+            let metadata = caller.await.expect("caller completes");
+            assert_eq!(metadata.max_input_tokens, Some(200_000));
+            assert_eq!(metadata.max_tokens, 8_192);
+        }
+        server.abort();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_refresh_leader_does_not_strand_waiters() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let (request_started_tx, request_started_rx) = oneshot::channel();
+        let (respond_tx, respond_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request accepted");
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = socket.read(&mut buffer).await.expect("request reads");
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = request_started_tx.send(());
+            let _ = respond_rx.await;
+            let body = json!({
+                "id": "claude-future",
+                "max_input_tokens": 200_000,
+                "max_tokens": 8_192,
+                "capabilities": null
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response writes");
+        });
+
+        let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
+        provider.base_url = base_url;
+        let provider = Arc::new(provider);
+        let leader_provider = Arc::clone(&provider);
+        let leader = tokio::spawn(async move {
+            leader_provider
+                .resolved_model_metadata("claude-future")
+                .await
+        });
+        request_started_rx
+            .await
+            .expect("detached refresh starts its GET");
+        leader.abort();
+        let _ = leader.await;
+
+        let waiter_provider = Arc::clone(&provider);
+        let waiter = tokio::spawn(async move {
+            waiter_provider
+                .resolved_model_metadata("claude-future")
+                .await
+        });
+        respond_tx.send(()).expect("server may finish response");
+        let metadata = waiter.await.expect("waiter completes");
+        server.await.expect("server completes");
+
+        assert_eq!(metadata.max_input_tokens, Some(200_000));
+        assert_eq!(metadata.max_tokens, 8_192);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn late_failed_generation_cannot_overwrite_newer_success() {
+        let cache = AnthropicModelCache::default();
+        let now = Instant::now();
+        let first = match cache.decision("model", now).await {
+            ModelCacheDecision::Start { refresh, .. } => refresh,
+            _ => panic!("cold cache should start a refresh"),
+        };
+        cache.abandon_refresh("model", first.generation).await;
+        let second = match cache.decision("model", now).await {
+            ModelCacheDecision::Start { refresh, .. } => refresh,
+            _ => panic!("abandoned refresh should allow a newer generation"),
+        };
+        let success = test_model_metadata("model", 8_192);
+        assert_eq!(
+            cache
+                .commit_refresh("model", second.generation, Some(success.clone()), now)
+                .await,
+            Some(success.clone())
+        );
+        assert_eq!(
+            cache
+                .commit_refresh("model", first.generation, None, now)
+                .await,
+            Some(success.clone())
+        );
+        match cache.decision("model", now).await {
+            ModelCacheDecision::Return(Some(cached)) => assert_eq!(cached, success),
+            _ => panic!("newer success must remain cached"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_success_survives_failed_refresh_with_retry_backoff() {
+        let cache = AnthropicModelCache::default();
+        let now = Instant::now();
+        let initial = match cache.decision("model", now).await {
+            ModelCacheDecision::Start { refresh, .. } => refresh,
+            _ => panic!("cold cache should start a refresh"),
+        };
+        let success = test_model_metadata("model", 8_192);
+        cache
+            .commit_refresh("model", initial.generation, Some(success.clone()), now)
+            .await;
+
+        let expired = now + MODEL_CACHE_SUCCESS_TTL;
+        let refresh = match cache.decision("model", expired).await {
+            ModelCacheDecision::Start { refresh, .. } => refresh,
+            _ => panic!("expired success should refresh"),
+        };
+        assert_eq!(
+            cache
+                .commit_refresh("model", refresh.generation, None, expired)
+                .await,
+            Some(success.clone())
+        );
+        match cache
+            .decision("model", expired + MODEL_CACHE_FAILURE_TTL / 2)
+            .await
+        {
+            ModelCacheDecision::Return(Some(cached)) => assert_eq!(cached, success),
+            _ => panic!("failed refresh should serve stale success during backoff"),
+        }
+        assert!(matches!(
+            cache
+                .decision(
+                    "model",
+                    expired + MODEL_CACHE_FAILURE_TTL + Duration::from_nanos(1)
+                )
+                .await,
+            ModelCacheDecision::Start { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cold_failure_is_negative_cached_until_retry_backoff_expires() {
+        let cache = AnthropicModelCache::default();
+        let now = Instant::now();
+        let initial = match cache.decision("model", now).await {
+            ModelCacheDecision::Start { refresh, .. } => refresh,
+            _ => panic!("cold cache should start a refresh"),
+        };
+        assert_eq!(
+            cache
+                .commit_refresh("model", initial.generation, None, now)
+                .await,
+            None
+        );
+        assert!(matches!(
+            cache
+                .decision("model", now + MODEL_CACHE_FAILURE_TTL / 2)
+                .await,
+            ModelCacheDecision::Return(None)
+        ));
+        assert!(matches!(
+            cache
+                .decision(
+                    "model",
+                    now + MODEL_CACHE_FAILURE_TTL + Duration::from_nanos(1)
+                )
+                .await,
+            ModelCacheDecision::Start { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_cache_remains_bounded_to_64_entries() {
+        let cache = AnthropicModelCache::default();
+        let now = Instant::now();
+        for index in 0..=MODEL_CACHE_CAPACITY {
+            let model = format!("model-{index}");
+            let refresh = match cache.decision(&model, now).await {
+                ModelCacheDecision::Start { refresh, .. } => refresh,
+                _ => panic!("new model should start a refresh"),
+            };
+            cache
+                .commit_refresh(
+                    &model,
+                    refresh.generation,
+                    Some(test_model_metadata(&model, 8_192)),
+                    now,
+                )
+                .await;
+        }
+
+        let state = cache.state.lock().await;
+        assert_eq!(state.entries.len(), MODEL_CACHE_CAPACITY);
+        assert!(!state.entries.contains_key("model-0"));
+        assert!(state
+            .entries
+            .contains_key(&format!("model-{MODEL_CACHE_CAPACITY}")));
+    }
+
+    #[tokio::test]
+    async fn capacity_pressure_preserves_in_flight_refresh_and_waiters() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::oneshot;
+
+        const MODEL: &str = "claude-capacity-pressure";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let (request_started_tx, request_started_rx) = oneshot::channel();
+        let (respond_tx, respond_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request accepted");
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = socket.read(&mut buffer).await.expect("request reads");
+                if read == 0 {
+                    return false;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).expect("request is utf8");
+            assert!(request.starts_with(&format!("GET /v1/models/{MODEL} HTTP/1.1\r\n")));
+            let _ = request_started_tx.send(());
+            let _ = respond_rx.await;
+
+            let body = json!({
+                "id": MODEL,
+                "max_input_tokens": 321_000,
+                "max_tokens": 12_345,
+                "capabilities": null
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response writes");
+            drop(socket);
+
+            match tokio::time::timeout(Duration::from_millis(200), listener.accept()).await {
+                Err(_) => true,
+                Ok(Ok((_socket, _))) => {
+                    server_requests.fetch_add(1, Ordering::SeqCst);
+                    false
+                }
+                Ok(Err(error)) => panic!("duplicate request check failed: {error}"),
+            }
+        });
+
+        let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
+        provider.base_url = base_url;
+        let provider = Arc::new(provider);
+        let cache = provider.model_cache.clone();
+        let leader_provider = Arc::clone(&provider);
+        let leader =
+            tokio::spawn(async move { leader_provider.resolved_model_metadata(MODEL).await });
+        request_started_rx
+            .await
+            .expect("model refresh starts its GET");
+
+        let original_generation = {
+            let state = cache.state.lock().await;
+            state.entries[MODEL]
+                .refresh
+                .as_ref()
+                .expect("model refresh remains in flight")
+                .generation
+        };
+
+        // All pressure entries remain in flight, so there is no settled entry
+        // to evict. The cache must temporarily hold 65 entries rather than
+        // discard MODEL's refresh state.
+        let mut pressure_refreshes = Vec::new();
+        for index in 0..MODEL_CACHE_CAPACITY {
+            let pressure_model = format!("pressure-{index}");
+            match cache.decision(&pressure_model, Instant::now()).await {
+                ModelCacheDecision::Start { refresh, sender } => {
+                    pressure_refreshes.push((pressure_model, refresh, sender));
+                }
+                _ => panic!("new pressure model should start a refresh"),
+            }
+        }
+        {
+            let state = cache.state.lock().await;
+            assert_eq!(state.entries.len(), MODEL_CACHE_CAPACITY + 1);
+            assert!(state.entries.values().all(|entry| entry.refresh.is_some()));
+        }
+
+        let before_waiter = {
+            let state = cache.state.lock().await;
+            state.access_counter
+        };
+        let waiter_provider = Arc::clone(&provider);
+        let waiter =
+            tokio::spawn(async move { waiter_provider.resolved_model_metadata(MODEL).await });
+
+        // Wait until the second provider request has consulted the cache, then
+        // prove it attached to the original generation rather than starting a
+        // replacement GET.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let attached = {
+                    let state = cache.state.lock().await;
+                    let cached = state.entries.get(MODEL).expect("in-flight model retained");
+                    cached.last_access > before_waiter
+                        && cached
+                            .refresh
+                            .as_ref()
+                            .is_some_and(|refresh| refresh.generation == original_generation)
+                };
+                if attached {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second request attaches to original refresh");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        respond_tx.send(()).expect("server may finish response");
+        let first = leader.await.expect("leader completes");
+        let second = waiter.await.expect("waiter completes");
+        assert!(
+            server.await.expect("server completes"),
+            "no duplicate model GET should be accepted"
+        );
+        for metadata in [&first, &second] {
+            assert_eq!(metadata.id, MODEL);
+            assert_eq!(metadata.max_input_tokens, Some(321_000));
+            assert_eq!(metadata.max_tokens, 12_345);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        for (model, refresh, sender) in pressure_refreshes {
+            let effective = cache
+                .commit_refresh(
+                    &model,
+                    refresh.generation,
+                    Some(test_model_metadata(&model, 8_192)),
+                    Instant::now(),
+                )
+                .await;
+            let _ = sender.send(ModelRefreshStatus::Finished(effective));
+        }
+        let state = cache.state.lock().await;
+        assert_eq!(state.entries.len(), MODEL_CACHE_CAPACITY);
+        assert!(state.entries.values().all(|entry| entry.refresh.is_none()));
     }
 
     #[test]
@@ -1747,6 +2998,121 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
         assert_eq!(response.stop_reason, ModelStopReason::MaxOutputTokens);
         assert_eq!(usage.input_tokens, Some(8));
         assert_eq!(usage.output_tokens, Some(64));
+    }
+
+    #[test]
+    fn anthropic_sse_maps_refusal_before_output_with_details() {
+        let sse = r#"
+data: {"type":"message_start","message":{"id":"msg_refused","type":"message","role":"assistant","model":"claude-fable-5","content":[],"stop_reason":null,"stop_details":null,"usage":{"input_tokens":412,"output_tokens":0}}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"cyber","explanation":"This request was declined because it could enable cyber harm."}},"usage":{"output_tokens":0}}
+
+data: {"type":"message_stop"}
+"#;
+
+        let response = parse_anthropic_sse(sse).expect("refusal is a terminal response");
+
+        assert_eq!(response.stop_reason, ModelStopReason::Refusal);
+        assert!(response.assistant.items.is_empty());
+        assert!(response.provider_replay.is_empty());
+        assert_eq!(
+            response.stop_details,
+            Some(ModelStopDetails {
+                category: Some("cyber".to_string()),
+                explanation: Some(
+                    "This request was declined because it could enable cyber harm.".to_string()
+                ),
+            })
+        );
+        assert_eq!(
+            response.refusal_error().as_deref(),
+            Some(
+                "provider refused the request (cyber): This request was declined because it could enable cyber harm."
+            )
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_refusal_discards_partial_text_tool_and_replay() {
+        let sse = r#"
+data: {"type":"message_start","message":{"id":"msg_refused","type":"message","role":"assistant","model":"claude-fable-5","content":[],"stop_reason":null,"stop_details":null,"usage":{"input_tokens":12,"output_tokens":1}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private partial"}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"unsafe partial"}}
+
+data: {"type":"content_block_stop","index":1}
+
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_partial","name":"str_replace_based_edit_tool","input":{}}}
+
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"README.md\"}"}}
+
+data: {"type":"content_block_stop","index":2}
+
+data: {"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"unfinished partial"}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":null,"explanation":null}},"usage":{"output_tokens":22}}
+
+data: {"type":"message_stop"}
+"#;
+
+        let response = parse_anthropic_sse(sse).expect("refusal is a terminal response");
+
+        assert_eq!(response.stop_reason, ModelStopReason::Refusal);
+        assert!(response.assistant.items.is_empty());
+        assert!(response.provider_replay.is_empty());
+        assert_eq!(response.stop_details, Some(ModelStopDetails::default()));
+        assert_eq!(
+            response.refusal_error().as_deref(),
+            Some("provider refused the request")
+        );
+        assert_eq!(
+            response.usage.and_then(|usage| usage.output_tokens),
+            Some(22)
+        );
+    }
+
+    #[test]
+    fn anthropic_nonstream_refusal_discards_content_and_replay() {
+        let response = parse_anthropic_message(&json!({
+            "content": [
+                { "type": "text", "text": "partial" },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_partial",
+                    "name": "str_replace_based_edit_tool",
+                    "input": { "path": "README.md" }
+                }
+            ],
+            "stop_reason": "refusal",
+            "stop_details": {
+                "type": "refusal",
+                "category": "reasoning_extraction",
+                "explanation": "The request asks for internal reasoning."
+            }
+        }))
+        .expect("refusal parses");
+
+        assert_eq!(response.stop_reason, ModelStopReason::Refusal);
+        assert!(response.assistant.items.is_empty());
+        assert!(response.provider_replay.is_empty());
+        assert_eq!(
+            response
+                .stop_details
+                .as_ref()
+                .and_then(|details| details.category.as_deref()),
+            Some("reasoning_extraction")
+        );
     }
 
     #[test]

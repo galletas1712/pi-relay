@@ -52,6 +52,9 @@ pub(crate) async fn build_model_request(
             config.provider.kind,
             effective_prompt_profile(state, config, session_id).await?,
         ),
+        // Provider adapters apply authoritative discovered/static output
+        // ceilings. Do not pre-clamp here or stale daemon metadata could
+        // override a newer Models API result.
         max_tokens: config.provider.max_tokens,
         reasoning_effort: model_metadata::normalize_reasoning_effort(
             config.provider.kind,

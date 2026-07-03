@@ -7,7 +7,8 @@ use agent_store::{
 use agent_vocab::{ProviderReplayItem, TranscriptItem};
 
 use crate::provider_runtime::{
-    auto_limit_tokens, compaction_auto_state, compaction_config, model_input_tokens_for_gate,
+    auto_limit_tokens, compaction_auto_explicitly_disabled, compaction_auto_state,
+    compaction_config_with_model_metadata, model_input_tokens_for_gate, model_metadata_for_config,
     run_compaction,
 };
 use crate::state::{AppState, RunningTask};
@@ -23,7 +24,9 @@ impl SessionDriver {
         &self,
         dispatch: &DispatchAction,
     ) -> std::result::Result<bool, RpcError> {
-        let Some(eligible) = check_compaction_eligible(dispatch) else {
+        let Some(eligible) =
+            check_compaction_eligible(&self.state, &self.session_id, dispatch).await
+        else {
             return Ok(true);
         };
         let Some(limit) = eligible.limit else {
@@ -96,7 +99,11 @@ struct CompactionEligible {
     limit: Option<usize>,
 }
 
-fn check_compaction_eligible(dispatch: &DispatchAction) -> Option<CompactionEligible> {
+async fn check_compaction_eligible(
+    state: &AppState,
+    session_id: &str,
+    dispatch: &DispatchAction,
+) -> Option<CompactionEligible> {
     let SessionAction::RequestModel {
         context_leaf_id, ..
     } = &dispatch.action
@@ -106,13 +113,24 @@ fn check_compaction_eligible(dispatch: &DispatchAction) -> Option<CompactionElig
     if session_uses_harness(&dispatch.config) {
         return None;
     }
-    let config = compaction_config(&dispatch.config);
-    if !config.auto_enabled {
-        return None;
-    }
     let source_leaf_id = context_leaf_id.as_deref()?;
     let auto_state = compaction_auto_state(&dispatch.config);
     if auto_state.suppressed || auto_state.last_failure_leaf_id.as_deref() == Some(source_leaf_id) {
+        return None;
+    }
+    if compaction_auto_explicitly_disabled(&dispatch.config) {
+        return None;
+    }
+    let discovered = if dispatch.config.provider.kind == agent_vocab::ProviderKind::Claude {
+        model_metadata_for_config(state, &dispatch.config, session_id)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let config = compaction_config_with_model_metadata(&dispatch.config, discovered);
+    if !config.auto_enabled {
         return None;
     }
     Some(CompactionEligible {
@@ -418,7 +436,7 @@ pub(super) async fn recover_model_context_overflow_with_compaction(
     if !provider_error.is_context_overflow() {
         return Ok(false);
     }
-    let Some(eligible) = check_compaction_eligible(dispatch) else {
+    let Some(eligible) = check_compaction_eligible(state, session_id, dispatch).await else {
         return Ok(false);
     };
 

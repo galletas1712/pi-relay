@@ -12,6 +12,7 @@ pub(crate) fn context_window(provider: ProviderKind, model: &str) -> Option<usiz
             _ => None,
         },
         ProviderKind::Claude => match model {
+            "claude-sonnet-5" | "claude-fable-5" => Some(1_000_000),
             "claude-opus-4-8" => Some(1_000_000),
             "claude-opus-4-7" => Some(1_000_000),
             "claude-sonnet-4-5" => Some(200_000),
@@ -79,7 +80,8 @@ pub(crate) fn supported_reasoning_efforts(
             _ => OPENAI_GPT5_EFFORTS,
         },
         ProviderKind::Claude => match model {
-            "claude-opus-4-8" | "claude-opus-4-7" | "claude-sonnet-4-5" => CLAUDE_ADAPTIVE_EFFORTS,
+            "claude-sonnet-5" | "claude-fable-5" | "claude-opus-4-8" | "claude-opus-4-7"
+            | "claude-sonnet-4-5" => CLAUDE_ADAPTIVE_EFFORTS,
             // Unknown Claude model: assume the adaptive set.
             _ => CLAUDE_ADAPTIVE_EFFORTS,
         },
@@ -149,14 +151,13 @@ mod tests {
 
     #[test]
     fn known_claude_models_have_defaults() {
-        assert_eq!(
-            context_window(ProviderKind::Claude, "claude-opus-4-8"),
-            Some(1_000_000)
-        );
-        assert_eq!(
-            default_auto_limit(ProviderKind::Claude, "claude-sonnet-4-5"),
-            Some(170_000)
-        );
+        for model in ["claude-sonnet-5", "claude-fable-5", "claude-opus-4-8"] {
+            assert_eq!(context_window(ProviderKind::Claude, model), Some(1_000_000));
+            assert_eq!(
+                default_auto_limit(ProviderKind::Claude, model),
+                Some(850_000)
+            );
+        }
     }
 
     #[test]
@@ -236,7 +237,13 @@ mod tests {
     #[test]
     fn claude_adaptive_normalizes_to_probed_supported_set() {
         use ReasoningEffort::*;
-        for model in ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-5"] {
+        for model in [
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-4-5",
+        ] {
             let normalize =
                 |effort| normalize_reasoning_effort(ProviderKind::Claude, model, effort);
             // Probed support: low, medium, high, xhigh, max.

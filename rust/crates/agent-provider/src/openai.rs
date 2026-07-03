@@ -1017,6 +1017,7 @@ impl ResponsesStreamState {
             provider_replay: self.provider_replay,
             usage: self.usage,
             stop_reason: self.stop_reason,
+            stop_details: None,
         }
     }
 
