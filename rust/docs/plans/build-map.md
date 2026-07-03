@@ -642,7 +642,7 @@ auth.rs:21-35). A fresh empty DB needs NOTHING seeded for auth.
 | rust/crates/agent-daemon/src/provider_runtime/requests.rs | complete_model_request | 65-74 | Real dispatch: Credentials::load() then provider_for_config then complete_with_auth_retry (creds re-read every time). |
 | rust/crates/agent-daemon/src/config.rs | Config::from_env_and_args | 11-46 | --database-url (or DATABASE_URL, required), --bind (or PI_AGENTD_BIND, default 127.0.0.1:8787). NO API-key flag. |
 | rust/crates/agent-daemon/src/main.rs | main | 55-82 | Boot: Config → connect → migrate → ProviderConnectionRegistry::new → TcpListener::bind. WebSocket RPC server. |
-| rust/crates/agent-daemon/src/model_metadata.rs | context_window / supported_reasoning_efforts | 6-72 | Model IDs (below). |
+| rust/crates/agent-daemon/src/model_metadata.rs | context_window / default_auto_limit_for_window / supported_reasoning_efforts / normalize_reasoning_effort | 6-146 | Model IDs, compaction thresholds, and reasoning normalization (below). |
 | rust/crates/agent-store/src/postgres/sessions_tests.rs | test_store / TestDb | 14-63 | Integration-test convention: gate PI_RELAY_TEST_DATABASE_URL, create unique DB, migrate, drop. |
 | rust/crates/agent-store/src/postgres/schema.rs | migrate | 21-125 | Idempotent create-table-if-not-exists. Fresh DB fully provisioned by store.migrate(); no auth tables. |
 | rust/crates/agent-vocab/src/provider.rs | ProviderConfig | 79-85 | session.start: {kind:ProviderKind(OpenAi|Claude), model, reasoning_effort, max_tokens}. No default model. |

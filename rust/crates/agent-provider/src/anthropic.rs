@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -59,35 +59,121 @@ pub struct AnthropicProvider {
     model_cache: AnthropicModelCache,
 }
 
-fn transcript_contains_anthropic_compaction(transcript: &[ModelTranscriptEntry]) -> bool {
-    transcript.iter().any(|entry| {
-        entry.provider_replay.iter().any(|item| {
-            if item.provider != ProviderKind::Claude {
-                return false;
-            }
-            let Ok(raw) = item.raw_value() else {
-                return false;
-            };
-            raw.get("type").and_then(Value::as_str) == Some("compaction")
-                && raw
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|content| !content.is_empty())
-                && matches!(
-                    raw.get("encrypted_content"),
-                    None | Some(Value::Null | Value::String(_))
-                )
-        })
-    })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicCompactionBlockError {
+    WrongType,
+    MissingContent,
+    NullContent,
+    EmptyContent,
+    NonStringContent,
+    InvalidEncryptedContent,
 }
 
-fn apply_compaction_replay_strategy(body: &mut Value, replays_compaction: bool) {
+impl AnthropicCompactionBlockError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::WrongType => "type was not compaction",
+            Self::MissingContent => "content was missing",
+            Self::NullContent => "content was null",
+            Self::EmptyContent => "content was empty",
+            Self::NonStringContent => "content was not a string",
+            Self::InvalidEncryptedContent => "encrypted_content was not string or null",
+        }
+    }
+}
+
+/// The one validity rule used for persisted Anthropic compaction replay.
+///
+/// Unknown fields are deliberately allowed and retained verbatim.
+fn validate_anthropic_compaction_block(block: &Value) -> Result<(), AnthropicCompactionBlockError> {
+    if block.get("type").and_then(Value::as_str) != Some("compaction") {
+        return Err(AnthropicCompactionBlockError::WrongType);
+    }
+    let content = block
+        .get("content")
+        .ok_or(AnthropicCompactionBlockError::MissingContent)?;
+    if content.is_null() {
+        return Err(AnthropicCompactionBlockError::NullContent);
+    }
+    let content = content
+        .as_str()
+        .ok_or(AnthropicCompactionBlockError::NonStringContent)?;
+    if content.is_empty() {
+        return Err(AnthropicCompactionBlockError::EmptyContent);
+    }
+    if !matches!(
+        block.get("encrypted_content"),
+        None | Some(Value::Null | Value::String(_))
+    ) {
+        return Err(AnthropicCompactionBlockError::InvalidEncryptedContent);
+    }
+    Ok(())
+}
+
+fn reject_ordinary_anthropic_compaction(block_type: &str) -> ProviderResult<()> {
+    if block_type == "compaction" {
+        return Err(ProviderError::Provider(
+            "Anthropic ordinary response unexpectedly contained a compaction block; refusing to persist partial or opaque response content"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn transcript_contains_anthropic_compaction(
+    transcript: &[ModelTranscriptEntry],
+) -> ProviderResult<bool> {
+    for entry in transcript.iter().filter(|entry| {
+        matches!(
+            entry.item(),
+            TranscriptItem::CompactionSummary(_) | TranscriptItem::AssistantMessage(_)
+        )
+    }) {
+        if anthropic_replay_blocks(&entry.provider_replay_for(ProviderKind::Claude))?
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("compaction"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn apply_messages_compaction_replay_strategy(
+    body: &mut Value,
+    replays_compaction: bool,
+    metadata: &AnthropicModelMetadata,
+) -> ProviderResult<()> {
     if replays_compaction {
-        // Anthropic requires the strategy that produced a replayed compaction
-        // block to participate in every request that applies that block. Keep
-        // this edit bare: it is the minimum shape proven for replay and avoids
-        // supplying a second trigger, pause flag, or instructions outside
-        // pi-relay's explicit compact operation.
+        let trigger = metadata.max_input_tokens.ok_or_else(|| {
+            ProviderError::Provider(format!(
+                "safe Anthropic compaction replay for {} requires a resolved max_input_tokens ceiling",
+                metadata.id
+            ))
+        })?;
+        // There is no documented apply-only mode. Supplying the model's input
+        // ceiling suppresses Anthropic's 150k default trigger while leaving a
+        // paused emergency compaction at the hard ceiling. pi-relay's durable
+        // scheduler remains responsible for normal compaction below it.
+        body["context_management"] = json!({
+            "edits": [{
+                "type": "compact_20260112",
+                "trigger": {
+                    "type": "input_tokens",
+                    "value": trigger.max(COMPACTION_TRIGGER_TOKENS),
+                },
+                "pause_after_compaction": true,
+            }],
+        });
+    }
+    Ok(())
+}
+
+fn apply_count_compaction_replay_strategy(body: &mut Value, replays_compaction: bool) {
+    if replays_compaction {
+        // count_tokens applies existing compaction blocks but, unlike Messages,
+        // is documented not to trigger new compactions. Retain the bare shape
+        // proven by live count replay.
         body["context_management"] = json!({
             "edits": [{ "type": "compact_20260112" }],
         });
@@ -155,22 +241,61 @@ fn ensure_compaction_terminal_user_message(body: &mut Value) {
     let messages = body["messages"]
         .as_array_mut()
         .expect("Anthropic request bodies always contain a messages array");
-    if messages
-        .last()
-        .and_then(|message| message.get("role"))
-        .and_then(Value::as_str)
-        == Some("user")
-    {
-        return;
-    }
-    let mut content = messages
-        .last()
+    let last_assistant = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("assistant"));
+    let mut missing_tool_results = last_assistant
+        .and_then(|index| messages.get(index))
         .and_then(|message| message.get("content"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
         .filter_map(|block| block.get("id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let mut seen_tool_uses = HashSet::new();
+    missing_tool_results.retain(|id| seen_tool_uses.insert(id.clone()));
+
+    let trailing_user_start = last_assistant.map(|index| index + 1).unwrap_or(0);
+    let has_trailing_user = trailing_user_start < messages.len()
+        && messages[trailing_user_start..]
+            .iter()
+            .all(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+    if has_trailing_user {
+        let existing_results = messages[trailing_user_start..]
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect::<HashSet<_>>();
+        missing_tool_results.retain(|id| !existing_results.contains(id));
+        if missing_tool_results.is_empty() {
+            return;
+        }
+        let content = messages[trailing_user_start]["content"]
+            .as_array_mut()
+            .expect("Anthropic user messages always contain content arrays");
+        let mut synthetic = missing_tool_results
+            .into_iter()
+            .map(|tool_use_id| {
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": "Tool result unavailable at the compaction boundary.",
+                    "is_error": true,
+                })
+            })
+            .collect::<Vec<_>>();
+        synthetic.append(content);
+        *content = synthetic;
+        return;
+    }
+
+    let mut content = missing_tool_results
+        .into_iter()
         .map(|tool_use_id| {
             json!({
                 "type": "tool_result",
@@ -194,11 +319,13 @@ fn anthropic_compaction_beta_header() -> String {
     format!("{CLAUDE_CODE_BETA},{COMPACTION_BETA}")
 }
 
-fn anthropic_beta_header_for_transcript(transcript: &[ModelTranscriptEntry]) -> String {
-    if transcript_contains_anthropic_compaction(transcript) {
-        anthropic_compaction_beta_header()
+fn anthropic_beta_header_for_transcript(
+    transcript: &[ModelTranscriptEntry],
+) -> ProviderResult<String> {
+    if transcript_contains_anthropic_compaction(transcript)? {
+        Ok(anthropic_compaction_beta_header())
     } else {
-        anthropic_beta_header().to_string()
+        Ok(anthropic_beta_header().to_string())
     }
 }
 
@@ -769,7 +896,7 @@ impl AnthropicProvider {
 #[async_trait]
 impl ModelProvider for AnthropicProvider {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
-        let beta_header = anthropic_beta_header_for_transcript(&request.transcript);
+        let beta_header = anthropic_beta_header_for_transcript(&request.transcript)?;
         let session_id = request
             .session_id
             .clone()
@@ -844,7 +971,7 @@ impl ModelProvider for AnthropicProvider {
         &self,
         request: ProviderTokenCountRequest,
     ) -> ProviderResult<ProviderTokenCountResponse> {
-        let beta_header = anthropic_beta_header_for_transcript(&request.transcript);
+        let beta_header = anthropic_beta_header_for_transcript(&request.transcript)?;
         let session_id = request
             .session_id
             .clone()
@@ -887,7 +1014,7 @@ fn messages_body_with_metadata(
     request: ModelRequest,
     metadata: &AnthropicModelMetadata,
 ) -> ProviderResult<Value> {
-    let replays_compaction = transcript_contains_anthropic_compaction(&request.transcript);
+    let replays_compaction = transcript_contains_anthropic_compaction(&request.transcript)?;
     let tool_profile = request.tool_profile;
     // The Messages API requires `max_tokens`. Keep 64k as the ordinary-turn
     // target recommended for xhigh/max agentic work, but clamp both defaults
@@ -908,9 +1035,7 @@ fn messages_body_with_metadata(
         cache_transcript: true,
         transcript_cache_prefix_len: request.transcript_cache_prefix_len,
     })?;
-    if replays_compaction {
-        apply_compaction_replay_strategy(&mut body, replays_compaction);
-    }
+    apply_messages_compaction_replay_strategy(&mut body, replays_compaction, metadata)?;
     Ok(body)
 }
 
@@ -927,7 +1052,7 @@ fn count_tokens_body_with_metadata(
     // Keep this as close as possible to `messages_body`: Anthropic's token
     // count endpoint accepts the same input-shaping fields (system, tools,
     // thinking/output config) but does not need a generation budget.
-    let replays_compaction = transcript_contains_anthropic_compaction(&request.transcript);
+    let replays_compaction = transcript_contains_anthropic_compaction(&request.transcript)?;
     let tool_profile = request.tool_profile;
     let mut body = anthropic_request_body(AnthropicRequestBodyInput {
         model: request.model,
@@ -944,7 +1069,7 @@ fn count_tokens_body_with_metadata(
         cache_transcript: false,
         transcript_cache_prefix_len: None,
     })?;
-    apply_compaction_replay_strategy(&mut body, replays_compaction);
+    apply_count_compaction_replay_strategy(&mut body, replays_compaction);
     Ok(body)
 }
 
@@ -1419,7 +1544,18 @@ fn anthropic_replay_blocks(replay: &[ProviderReplayItem]) -> ProviderResult<Vec<
     replay
         .iter()
         .filter(|record| record.provider == ProviderKind::Claude)
-        .map(|record| record.raw_value().map_err(ProviderError::Json))
+        .map(|record| {
+            let block = record.raw_value().map_err(ProviderError::Json)?;
+            if block.get("type").and_then(Value::as_str) == Some("compaction") {
+                validate_anthropic_compaction_block(&block).map_err(|error| {
+                    ProviderError::Provider(format!(
+                        "refusing malformed persisted Anthropic compaction replay: {}",
+                        error.message()
+                    ))
+                })?;
+            }
+            Ok(block)
+        })
         .collect()
 }
 
@@ -1469,6 +1605,19 @@ fn anthropic_user_content(message: &UserMessage) -> Value {
 fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
     let stop_reason = anthropic_stop_reason(response);
     let stop_details = anthropic_stop_details(response.get("stop_details"));
+    let content = response
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderError::Provider("missing content array".to_string()))?;
+    if content
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("compaction"))
+    {
+        return Err(ProviderError::Provider(
+            "Anthropic ordinary response unexpectedly contained a compaction block; refusing to persist it"
+                .to_string(),
+        ));
+    }
     if stop_reason == ModelStopReason::Refusal {
         return Ok(ModelResponse {
             assistant: AssistantMessage { items: Vec::new() },
@@ -1478,16 +1627,13 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
             stop_details,
         });
     }
-    let content = response
-        .get("content")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ProviderError::Provider("missing content array".to_string()))?;
     let mut items = Vec::new();
     let mut provider_replay = Vec::new();
     for block in content {
         let Some(block_type) = block.get("type").and_then(Value::as_str) else {
             continue;
         };
+        reject_ordinary_anthropic_compaction(block_type)?;
         let display = anthropic_provider_replay_display(block);
         provider_replay.push(ProviderReplayItem::new_with_display(
             ProviderKind::Claude,
@@ -1640,39 +1786,22 @@ fn validate_anthropic_compaction_response(
             "terminal compaction response did not contain a compaction block",
         )
     })?;
-    let content = compaction.get("content").ok_or_else(|| {
+    validate_anthropic_compaction_block(&compaction).map_err(|error| {
+        let kind = match error {
+            AnthropicCompactionBlockError::NullContent => NativeCompactionErrorKind::NullBlock,
+            AnthropicCompactionBlockError::EmptyContent => NativeCompactionErrorKind::EmptyBlock,
+            AnthropicCompactionBlockError::WrongType
+            | AnthropicCompactionBlockError::MissingContent
+            | AnthropicCompactionBlockError::NonStringContent
+            | AnthropicCompactionBlockError::InvalidEncryptedContent => {
+                NativeCompactionErrorKind::MalformedStream
+            }
+        };
         ProviderError::native_compaction(
-            NativeCompactionErrorKind::MalformedStream,
-            "compaction block missing content",
+            kind,
+            format!("invalid Anthropic compaction block: {}", error.message()),
         )
     })?;
-    if content.is_null() {
-        return Err(ProviderError::native_compaction(
-            NativeCompactionErrorKind::NullBlock,
-            "compaction block content was null",
-        ));
-    }
-    let content = content.as_str().ok_or_else(|| {
-        ProviderError::native_compaction(
-            NativeCompactionErrorKind::MalformedStream,
-            "compaction block content was not a string",
-        )
-    })?;
-    if content.is_empty() {
-        return Err(ProviderError::native_compaction(
-            NativeCompactionErrorKind::EmptyBlock,
-            "compaction block content was empty",
-        ));
-    }
-    if !matches!(
-        compaction.get("encrypted_content"),
-        None | Some(Value::Null) | Some(Value::String(_))
-    ) {
-        return Err(ProviderError::native_compaction(
-            NativeCompactionErrorKind::MalformedStream,
-            "compaction block encrypted_content was not string or null",
-        ));
-    }
     Ok(ProviderCompactionResponse {
         summary: None,
         provider_replay: response.provider_replay,
@@ -1998,12 +2127,37 @@ impl AnthropicStreamState {
     fn process_event(&mut self, event: &Value) -> ProviderResult<SseControl> {
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
+                if event
+                    .pointer("/message/content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| {
+                        content.iter().any(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("compaction")
+                        })
+                    })
+                {
+                    return Err(ProviderError::Provider(
+                        "Anthropic ordinary response unexpectedly included compaction content at message start; refusing to persist it"
+                            .to_string(),
+                    ));
+                }
                 self.saw_message_start = true;
                 self.message = event.get("message").cloned().unwrap_or_else(|| json!({}));
                 self.usage = self.message.get("usage").and_then(anthropic_usage);
                 Ok(SseControl::Continue)
             }
             Some("content_block_start") => {
+                if event
+                    .get("content_block")
+                    .and_then(|block| block.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("compaction")
+                {
+                    return Err(ProviderError::Provider(
+                        "Anthropic ordinary response unexpectedly started a compaction block; refusing to persist it"
+                            .to_string(),
+                    ));
+                }
                 if let (Some(index), Some(content_block)) = (
                     event.get("index").and_then(Value::as_u64),
                     event.get("content_block"),
@@ -2020,6 +2174,12 @@ impl AnthropicStreamState {
                     return Ok(SseControl::Continue);
                 };
                 if let Some(delta) = event.get("delta") {
+                    if delta.get("type").and_then(Value::as_str) == Some("compaction_delta") {
+                        return Err(ProviderError::Provider(
+                            "Anthropic ordinary response unexpectedly contained a compaction delta; refusing to persist it"
+                                .to_string(),
+                        ));
+                    }
                     self.apply_content_delta(index as usize, delta);
                 }
                 Ok(SseControl::Continue)
@@ -2044,7 +2204,10 @@ impl AnthropicStreamState {
                             anthropic_stop_details(event.pointer("/delta/stop_details"));
                     }
                     Some("compaction") => {
-                        self.stop_reason = ModelStopReason::Compaction;
+                        return Err(ProviderError::Provider(
+                            "Anthropic ordinary response unexpectedly stopped for compaction; refusing to persist it"
+                                .to_string(),
+                        ));
                     }
                     _ => {}
                 }
@@ -2200,6 +2363,7 @@ fn push_anthropic_content_block(
     let Some(block_type) = block.get("type").and_then(Value::as_str) else {
         return Ok(());
     };
+    reject_ordinary_anthropic_compaction(block_type)?;
     let display = anthropic_provider_replay_display(block);
     provider_replay.push(ProviderReplayItem::new_with_display(
         ProviderKind::Claude,
@@ -2419,6 +2583,92 @@ mod tests {
         }
     }
 
+    fn test_model_request(model: &str, transcript: Vec<ModelTranscriptEntry>) -> ModelRequest {
+        ModelRequest {
+            model: model.to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::stable("stable rules"),
+            transcript,
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: Some(1024),
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+            session_id: Some("session-1".to_string()),
+            turn_id: None,
+        }
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> (String, Value) {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        let (header_end, content_length) = loop {
+            let read = socket.read(&mut buffer).await.expect("request reads");
+            assert!(read > 0, "request closed before headers");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            break (header_end, content_length);
+        };
+        let body_end = header_end + 4 + content_length;
+        while request.len() < body_end {
+            let read = socket.read(&mut buffer).await.expect("request body reads");
+            assert!(read > 0, "request closed before body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let headers = String::from_utf8(request[..header_end].to_vec()).expect("headers are utf8");
+        let body = if content_length == 0 {
+            Value::Null
+        } else {
+            serde_json::from_slice(&request[header_end + 4..body_end])
+                .expect("request body is JSON")
+        };
+        (headers, body)
+    }
+
+    async fn write_json_response(socket: &mut tokio::net::TcpStream, body: &Value) {
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("JSON response writes");
+    }
+
+    async fn write_ordinary_sse_response(socket: &mut tokio::net::TcpStream) {
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+            sse.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("SSE response writes");
+    }
+
     fn native_compaction_error_kind(error: &ProviderError) -> NativeCompactionErrorKind {
         match error {
             ProviderError::NativeCompaction { kind, .. } => *kind,
@@ -2625,6 +2875,113 @@ mod tests {
                 }])
             );
         }
+    }
+
+    #[test]
+    fn compaction_body_repairs_missing_tool_results_in_existing_user_tail() {
+        let tool_call = |id: &str| ToolCall {
+            id: ToolCallId::new(id),
+            tool_name: "read".to_string(),
+            args_json: r#"{"path":"README.md"}"#.to_string(),
+        };
+
+        let user_text = compaction_body(test_compaction_request(vec![
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call("toolu_missing"))],
+            })
+            .into(),
+            TranscriptItem::UserMessage(UserMessage::text("Keep this user text.")).into(),
+        ]))
+        .expect("user-ended missing result is repaired");
+        assert_eq!(
+            user_text["messages"][1]["content"],
+            json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_missing",
+                    "content": "Tool result unavailable at the compaction boundary.",
+                    "is_error": true,
+                },
+                {
+                    "type": "text",
+                    "text": "Keep this user text.",
+                    "cache_control": { "type": "ephemeral" },
+                },
+            ])
+        );
+
+        let partial = compaction_body(test_compaction_request(vec![
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![
+                    AssistantItem::ToolCall(tool_call("toolu_present")),
+                    AssistantItem::ToolCall(tool_call("toolu_missing")),
+                ],
+            })
+            .into(),
+            TranscriptItem::ToolResult(ToolResultMessage::success(
+                ToolCallId::new("toolu_present"),
+                "read",
+                "existing result",
+            ))
+            .into(),
+            TranscriptItem::UserMessage(UserMessage::text("Preserved after results.")).into(),
+        ]))
+        .expect("partial results are repaired");
+        let rendered = partial["messages"].as_array().unwrap();
+        let all_results = rendered
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(all_results, vec!["toolu_missing", "toolu_present"]);
+        assert_eq!(
+            rendered[2]["content"][0]["text"],
+            "Preserved after results."
+        );
+
+        let mut dynamic_request =
+            test_compaction_request(vec![TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call("toolu_dynamic"))],
+            })
+            .into()]);
+        dynamic_request.prompt = PromptSections::new(
+            Some("stable rules".to_string()),
+            Some("volatile dynamic context".to_string()),
+        );
+        let dynamic = compaction_body(dynamic_request).expect("dynamic user tail is repaired");
+        assert_eq!(
+            dynamic["messages"][1]["content"],
+            json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_dynamic",
+                    "content": "Tool result unavailable at the compaction boundary.",
+                    "is_error": true,
+                },
+                { "type": "text", "text": "volatile dynamic context" },
+            ])
+        );
+
+        let matched = compaction_body(test_compaction_request(vec![
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call("toolu_matched"))],
+            })
+            .into(),
+            TranscriptItem::ToolResult(ToolResultMessage::success(
+                ToolCallId::new("toolu_matched"),
+                "read",
+                "existing result",
+            ))
+            .into(),
+            TranscriptItem::UserMessage(UserMessage::text("No repair needed.")).into(),
+        ]))
+        .expect("fully matched tail remains valid");
+        let matched_json = matched["messages"].to_string();
+        assert_eq!(matched_json.matches("toolu_matched").count(), 2);
+        assert!(!matched_json.contains("unavailable"));
+        assert!(matched_json.contains("No repair needed."));
     }
 
     #[test]
@@ -2978,6 +3335,107 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ordinary_replay_wire_request_pairs_strategy_with_beta_and_precompaction_omits_both() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for expect_replay in [true, false] {
+                let (mut socket, _) = listener.accept().await.expect("model lookup accepted");
+                let (headers, body) = read_http_request(&mut socket).await;
+                assert!(headers.starts_with("GET /v1/models/claude-opus-4-8 HTTP/1.1\r\n"));
+                assert_eq!(body, Value::Null);
+                let mut capabilities = models_api_capabilities(json!({ "supported": true }));
+                capabilities["context_management"] = json!({
+                    "compact_20260112": { "supported": true },
+                    "supported": true
+                });
+                write_json_response(
+                    &mut socket,
+                    &json!({
+                        "id": "claude-opus-4-8",
+                        "max_input_tokens": 444_444,
+                        "max_tokens": 128_000,
+                        "capabilities": capabilities
+                    }),
+                )
+                .await;
+
+                let (mut socket, _) = listener.accept().await.expect("messages request accepted");
+                let (headers, body) = read_http_request(&mut socket).await;
+                assert!(headers.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+                let beta = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find_map(|(name, value)| {
+                        name.eq_ignore_ascii_case("anthropic-beta")
+                            .then(|| value.trim())
+                    })
+                    .expect("beta header present");
+                if expect_replay {
+                    assert!(beta.contains(COMPACTION_BETA));
+                    assert_eq!(
+                        body["context_management"],
+                        json!({
+                            "edits": [{
+                                "type": "compact_20260112",
+                                "trigger": {
+                                    "type": "input_tokens",
+                                    "value": 444_444,
+                                },
+                                "pause_after_compaction": true,
+                            }]
+                        })
+                    );
+                    assert_eq!(body["messages"][0]["content"][0]["type"], "compaction");
+                } else {
+                    assert!(!beta.contains(COMPACTION_BETA));
+                    assert!(body.get("context_management").is_none());
+                    assert!(!body["messages"].to_string().contains("\"compaction\""));
+                }
+                write_ordinary_sse_response(&mut socket).await;
+            }
+        });
+
+        let block = json!({
+            "type": "compaction",
+            "content": "opaque summary",
+            "encrypted_content": "opaque",
+        });
+        let checkpoint = ModelTranscriptEntry {
+            item: TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+                "session-1",
+                "leaf-1",
+                "checkpoint",
+                Some(80_000),
+                agent_vocab::TurnId(7),
+            )),
+            provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &block).unwrap()],
+        };
+
+        let mut replay_provider =
+            AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
+        replay_provider.base_url = base_url.clone();
+        replay_provider
+            .complete(test_model_request("claude-opus-4-8", vec![checkpoint]))
+            .await
+            .expect("wire replay request succeeds");
+
+        let mut ordinary_provider =
+            AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
+        ordinary_provider.base_url = base_url;
+        ordinary_provider
+            .complete(test_model_request(
+                "claude-opus-4-8",
+                vec![TranscriptItem::UserMessage(UserMessage::text("ordinary")).into()],
+            ))
+            .await
+            .expect("wire precompaction request succeeds");
+        server.await.expect("server completes");
+    }
+
     fn test_model_metadata(id: &str, max_tokens: u32) -> AnthropicModelMetadata {
         let mut metadata = static_anthropic_model_metadata(id);
         metadata.max_tokens = max_tokens;
@@ -3065,7 +3523,7 @@ mod tests {
     fn compaction_beta_header_follows_transcript_replay_state() {
         let ordinary = vec![TranscriptItem::UserMessage(UserMessage::text("ordinary turn")).into()];
         assert_eq!(
-            anthropic_beta_header_for_transcript(&ordinary),
+            anthropic_beta_header_for_transcript(&ordinary).unwrap(),
             CLAUDE_CODE_BETA
         );
 
@@ -3084,7 +3542,9 @@ mod tests {
             provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &block).unwrap()],
         }];
         assert!(
-            anthropic_beta_header_for_transcript(&checkpoint).contains(COMPACTION_BETA),
+            anthropic_beta_header_for_transcript(&checkpoint)
+                .unwrap()
+                .contains(COMPACTION_BETA),
             "replaying provider compaction state requires the matching beta"
         );
     }
@@ -3760,7 +4220,7 @@ mod tests {
         assert!(ordinary.get("context_management").is_none());
         assert!(count.get("context_management").is_none());
         assert_eq!(
-            anthropic_beta_header_for_transcript(&transcript),
+            anthropic_beta_header_for_transcript(&transcript).unwrap(),
             CLAUDE_CODE_BETA
         );
     }
@@ -3770,6 +4230,7 @@ mod tests {
         let raw = json!({
             "type": "compaction",
             "content": "opaque summary",
+            "name": "str_replace_based_edit_tool",
             "provider_extension": {
                 "must_survive": ["byte", "for", "byte"]
             }
@@ -3812,7 +4273,14 @@ mod tests {
             .contains("Fresh delegation ledger."));
         assert_eq!(
             ordinary["context_management"]["edits"],
-            json!([{ "type": "compact_20260112" }])
+            json!([{
+                "type": "compact_20260112",
+                "trigger": {
+                    "type": "input_tokens",
+                    "value": 1_000_000,
+                },
+                "pause_after_compaction": true,
+            }])
         );
 
         let count = count_tokens_body(ProviderTokenCountRequest {
@@ -3842,13 +4310,101 @@ mod tests {
     }
 
     #[test]
-    fn compaction_replay_detection_ignores_malformed_and_wrong_provider_state() {
+    fn messages_replay_uses_resolved_model_ceiling_while_count_stays_bare() {
+        let raw = json!({
+            "type": "compaction",
+            "content": "opaque summary",
+        });
+        let entry = ModelTranscriptEntry {
+            item: TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+                "session-1",
+                "leaf-1",
+                "checkpoint",
+                Some(80_000),
+                agent_vocab::TurnId(7),
+            )),
+            provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
+        };
+        let mut metadata = static_anthropic_model_metadata("claude-sonnet-4-6");
+        metadata.max_input_tokens = Some(200_000);
+        let ordinary = messages_body_with_metadata(
+            ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![entry.clone()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            },
+            &metadata,
+        )
+        .expect("non-1M ordinary replay renders");
+        assert_eq!(
+            ordinary["context_management"],
+            json!({
+                "edits": [{
+                    "type": "compact_20260112",
+                    "trigger": {
+                        "type": "input_tokens",
+                        "value": 200_000,
+                    },
+                    "pause_after_compaction": true,
+                }]
+            })
+        );
+
+        metadata.max_input_tokens = Some(20_000);
+        let clamped = messages_body_with_metadata(
+            ModelRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![entry.clone()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            },
+            &metadata,
+        )
+        .expect("defensively clamped ordinary replay renders");
+        assert_eq!(
+            clamped["context_management"]["edits"][0]["trigger"]["value"],
+            50_000
+        );
+
+        let count = count_tokens_body_with_metadata(
+            ProviderTokenCountRequest {
+                model: "claude-sonnet-4-6".to_string(),
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![entry],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+            },
+            &metadata,
+        )
+        .expect("count replay renders");
+        assert_eq!(
+            count["context_management"],
+            json!({ "edits": [{ "type": "compact_20260112" }] })
+        );
+    }
+
+    #[test]
+    fn compaction_replay_detection_ignores_wrong_provider_and_nonemitted_sidecars() {
         for provider_replay in [
-            vec![ProviderReplayItem {
-                provider: ProviderKind::Claude,
-                raw_json: "{not-json".to_string(),
-                display: None,
-            }],
             vec![ProviderReplayItem::new(
                 ProviderKind::OpenAi,
                 &json!({ "type": "compaction", "content": "opaque" }),
@@ -3859,20 +4415,6 @@ mod tests {
                 &json!({ "type": "text", "text": "ordinary replay" }),
             )
             .unwrap()],
-            vec![ProviderReplayItem::new(
-                ProviderKind::Claude,
-                &json!({ "type": "compaction", "content": "" }),
-            )
-            .unwrap()],
-            vec![ProviderReplayItem::new(
-                ProviderKind::Claude,
-                &json!({
-                    "type": "compaction",
-                    "content": "opaque",
-                    "encrypted_content": { "malformed": true },
-                }),
-            )
-            .unwrap()],
         ] {
             let entry = ModelTranscriptEntry {
                 item: TranscriptItem::AssistantMessage(AssistantMessage {
@@ -3881,7 +4423,7 @@ mod tests {
                 provider_replay,
             };
             assert_eq!(
-                anthropic_beta_header_for_transcript(std::slice::from_ref(&entry)),
+                anthropic_beta_header_for_transcript(std::slice::from_ref(&entry)).unwrap(),
                 CLAUDE_CODE_BETA
             );
             let ordinary = messages_body(ModelRequest {
@@ -3913,6 +4455,90 @@ mod tests {
 
             assert!(ordinary.get("context_management").is_none());
             assert!(count.get("context_management").is_none());
+        }
+
+        for item in [
+            TranscriptItem::UserMessage(UserMessage::text("user")),
+            TranscriptItem::ToolResult(ToolResultMessage::success(
+                ToolCallId::new("toolu_1"),
+                "read",
+                "result",
+            )),
+            TranscriptItem::TurnFinished {
+                turn_id: agent_vocab::TurnId(1),
+                outcome: agent_vocab::TurnOutcome::Graceful,
+            },
+        ] {
+            let entry = ModelTranscriptEntry {
+                item,
+                provider_replay: vec![ProviderReplayItem::new(
+                    ProviderKind::Claude,
+                    &json!({ "type": "compaction", "content": "opaque" }),
+                )
+                .unwrap()],
+            };
+            assert_eq!(
+                anthropic_beta_header_for_transcript(std::slice::from_ref(&entry)).unwrap(),
+                CLAUDE_CODE_BETA,
+                "sidecars on non-emitted entry kinds must not enroll"
+            );
+            let body = messages_body(ModelRequest {
+                model: "claude-opus-4-8".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![entry],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            })
+            .expect("non-emitted sidecar is ignored");
+            assert!(body.get("context_management").is_none());
+            assert!(!body["messages"].to_string().contains("\"compaction\""));
+        }
+    }
+
+    #[test]
+    fn malformed_emitted_compaction_replay_fails_request_building_locally() {
+        for raw in [
+            json!({ "type": "compaction" }),
+            json!({ "type": "compaction", "content": null }),
+            json!({ "type": "compaction", "content": "" }),
+            json!({ "type": "compaction", "content": { "malformed": true } }),
+            json!({
+                "type": "compaction",
+                "content": "opaque",
+                "encrypted_content": { "malformed": true },
+            }),
+        ] {
+            let entry = ModelTranscriptEntry {
+                item: TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::Text("visible".to_string())],
+                }),
+                provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
+            };
+            assert!(
+                anthropic_beta_header_for_transcript(std::slice::from_ref(&entry)).is_err(),
+                "{raw}"
+            );
+            let error = messages_body(ModelRequest {
+                model: "claude-opus-4-8".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![entry],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            })
+            .expect_err("malformed replay must not render");
+            assert!(error.to_string().contains("malformed persisted"));
         }
     }
 
@@ -4190,6 +4816,128 @@ mod tests {
                 .map(|display| display.pretty_name.as_str()),
             Some("Edit")
         );
+    }
+
+    #[test]
+    fn ordinary_nonstream_parser_rejects_every_compaction_response_shape() {
+        for response in [
+            json!({
+                "content": [
+                    {
+                        "type": "compaction",
+                        "content": "automatic summary",
+                        "encrypted_content": "opaque",
+                        "provider_extension": { "future": true }
+                    },
+                    { "type": "text", "text": "continued answer" }
+                ],
+                "stop_reason": "end_turn"
+            }),
+            json!({
+                "content": [
+                    { "type": "compaction", "content": "automatic summary" },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "read",
+                        "input": {}
+                    }
+                ],
+                "stop_reason": "tool_use"
+            }),
+            json!({
+                "content": [{ "type": "compaction", "content": null }],
+                "stop_reason": "end_turn"
+            }),
+            json!({
+                "content": [{ "type": "compaction", "content": "" }],
+                "stop_reason": "end_turn"
+            }),
+            json!({
+                "content": [{
+                    "type": "compaction",
+                    "content": { "malformed": true },
+                    "encrypted_content": { "also": "malformed" }
+                }],
+                "stop_reason": "end_turn"
+            }),
+            json!({
+                "content": [{ "type": "compaction" }],
+                "stop_reason": "compaction"
+            }),
+        ] {
+            let error = parse_anthropic_message(&response)
+                .expect_err("ordinary compaction content must never become a ModelResponse");
+            assert!(error.to_string().contains("compaction"));
+            assert!(error.to_string().contains("refusing to persist"));
+        }
+    }
+
+    #[test]
+    fn ordinary_sse_parser_rejects_inline_and_paused_compaction() {
+        for sse in [
+            r#"
+data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":150000,"output_tokens":0}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"compaction","content":null,"encrypted_content":null,"provider_extension":{"future":true}}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"compaction_delta","content":"automatic summary","encrypted_content":"opaque"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"continued answer"}}
+
+data: {"type":"content_block_stop","index":1}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+data: {"type":"message_stop"}
+"#,
+            r#"
+data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":150000,"output_tokens":0}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"compaction","content":null}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"compaction_delta","content":"automatic summary"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}
+
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}
+
+data: {"type":"content_block_stop","index":1}
+
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
+
+data: {"type":"message_stop"}
+"#,
+            r#"
+data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":150000,"output_tokens":0}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"compaction","content":null}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"message_delta","delta":{"stop_reason":"compaction"}}
+
+data: {"type":"message_stop"}
+"#,
+            r#"
+data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":150000,"output_tokens":0}}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"compaction"}}
+
+data: {"type":"message_stop"}
+"#,
+        ] {
+            let error = parse_anthropic_sse(sse)
+                .expect_err("ordinary compaction stream must not return a persistable response");
+            assert!(error.to_string().contains("compaction"));
+            assert!(error.to_string().contains("refusing to persist"));
+        }
     }
 
     #[test]

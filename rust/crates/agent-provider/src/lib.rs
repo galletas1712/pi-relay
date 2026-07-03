@@ -229,6 +229,14 @@ fn canonical_provider_replay(
     provider: ProviderKind,
 ) -> Option<ProviderReplayItem> {
     let mut raw = record.raw_value().ok()?;
+    // Anthropic compaction blocks are opaque provider checkpoints, not tool
+    // calls. Preserve every provider extension (including a top-level `name`)
+    // without applying local tool-name canonicalization.
+    if provider == ProviderKind::Claude
+        && raw.get("type").and_then(Value::as_str) == Some("compaction")
+    {
+        return ProviderReplayItem::new_with_display(provider, &raw, record.display.clone()).ok();
+    }
     if let Some(name) = raw.get("name").and_then(Value::as_str) {
         let canonical = canonical_tool_name_for_provider(provider, name);
         // Local client-tool calls are stored internally under canonical
@@ -603,7 +611,7 @@ mod provider_error_tests {
     }
 
     #[test]
-    fn provider_replay_canonicalizes_local_tool_names_only() {
+    fn provider_replay_canonicalizes_local_tool_names_only_and_preserves_compaction() {
         let local = ProviderReplayItem::new(
             ProviderKind::OpenAi,
             &json!({
@@ -640,5 +648,19 @@ mod provider_error_tests {
             .raw_value()
             .unwrap();
         assert_eq!(hosted["name"], "web_fetch");
+
+        let compaction = json!({
+            "type": "compaction",
+            "content": "opaque",
+            "name": "web_fetch",
+            "provider_extension": { "must_survive": true },
+        });
+        let record =
+            ProviderReplayItem::new(ProviderKind::Claude, &compaction).expect("record builds");
+        let replayed = canonical_provider_replay(&record, ProviderKind::Claude)
+            .expect("compaction replay remains valid")
+            .raw_value()
+            .expect("compaction replay JSON parses");
+        assert_eq!(replayed, compaction);
     }
 }

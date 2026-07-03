@@ -116,8 +116,9 @@ Implemented user-facing behavior:
   while Anthropic defaults to a local text summary and requires a versioned
   `compact_20260112` opt-in for its provider-native beta pilot. Compaction is a
   typed transcript root, not a session boundary. Replayed Anthropic compaction
-  blocks remain opaque and require the matching bare strategy edit on both
-  Messages and token-count requests.
+  blocks remain opaque and require the matching strategy edit: ordinary
+  Messages uses a paused emergency trigger at the resolved model input ceiling,
+  while token counting uses the documented non-triggering bare edit.
 - Provider/model-aware compaction thresholds: verified 1M Claude windows
   default to 500k; hosted GPT-5.6 Sol/Terra/Luna use 372k windows and a 334.8k
   threshold; older OpenAI and other windows retain the generic 85% policy.
