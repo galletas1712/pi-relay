@@ -793,8 +793,8 @@ fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
 // session effort to a model-supported value before building the request (see
 // `model_metadata::normalize_reasoning_effort`), so this should always receive a
 // value OpenAI accepts. Defensively clamp `minimal` (all current gpt-5.x) and
-// `max` (all current gpt-5.x except gpt-5.6-sol) rather than letting a stray
-// direct adapter call produce a 400.
+// `max` (all current gpt-5.x except the verified GPT-5.6 hosted family) rather
+// than letting a stray direct adapter call produce a 400.
 fn openai_reasoning_effort(model: &str, effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::None
@@ -803,7 +803,11 @@ fn openai_reasoning_effort(model: &str, effort: ReasoningEffort) -> &'static str
         | ReasoningEffort::High
         | ReasoningEffort::XHigh => effort.as_str(),
         ReasoningEffort::Minimal => ReasoningEffort::Low.as_str(),
-        ReasoningEffort::Max if model == "gpt-5.6-sol" => ReasoningEffort::Max.as_str(),
+        ReasoningEffort::Max
+            if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna") =>
+        {
+            ReasoningEffort::Max.as_str()
+        }
         ReasoningEffort::Max => ReasoningEffort::XHigh.as_str(),
     }
 }
@@ -1811,33 +1815,38 @@ mod tests {
     }
 
     #[test]
-    fn responses_body_sends_sol_max_reasoning() {
-        let body = responses_body(
-            ModelRequest {
-                model: "gpt-5.6-sol".to_string(),
-                transcript_cache_prefix_len: None,
-                prompt: PromptSections::default(),
-                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-                tool_profile: ProviderToolProfile::None,
-                tools: Vec::new(),
-                max_tokens: None,
-                reasoning_effort: ReasoningEffort::Max,
-                prompt_cache_key: None,
-                session_id: None,
-                turn_id: None,
-            },
-            "test-session",
-        )
-        .expect("responses body renders");
+    fn responses_body_sends_gpt56_max_reasoning() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let body =
+                responses_body(
+                    ModelRequest {
+                        model: model.to_string(),
+                        transcript_cache_prefix_len: None,
+                        prompt: PromptSections::default(),
+                        transcript: vec![
+                            TranscriptItem::UserMessage(UserMessage::text("hello")).into()
+                        ],
+                        tool_profile: ProviderToolProfile::None,
+                        tools: Vec::new(),
+                        max_tokens: None,
+                        reasoning_effort: ReasoningEffort::Max,
+                        prompt_cache_key: None,
+                        session_id: None,
+                        turn_id: None,
+                    },
+                    "test-session",
+                )
+                .expect("responses body renders");
 
-        assert_eq!(body["reasoning"]["effort"], "max");
+            assert_eq!(body["reasoning"]["effort"], "max", "{model}");
+        }
     }
 
     #[test]
-    fn responses_body_clamps_non_sol_max_reasoning() {
+    fn responses_body_clamps_older_model_max_reasoning() {
         let body = responses_body(
             ModelRequest {
-                model: "gpt-5.6-terra".to_string(),
+                model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::default(),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],

@@ -234,8 +234,8 @@ Sonnet 5 is the normal Claude default at `high` effort. Fable 5 is listed last a
 and tooltip state Anthropic's required 30-day retention and lack of Zero Data Retention. The provider/model is locked
 once the session has any transcript history, because both providers carry provider-shaped replay state across turns.
 Reasoning effort is a per-request knob and can change during or between turns (applying to subsequently created
-requests). Effort options differ by provider/model: OpenAI generally offers `none…xhigh`, `gpt-5.6-sol` also offers
-`max`, and these Claude models offer `low…max`. Changing model/effort calls `session.configure` and patches the cached
+requests). Effort options differ by provider/model: OpenAI generally offers `none…xhigh`, all three hosted GPT-5.6
+models also offer `max`, and these Claude models offer `low…max`. Changing model/effort calls `session.configure` and patches the cached
 list/snapshot. The list is a seeded offline-safe fallback; the daemon's cached Anthropic Models API metadata remains
 authoritative for runtime limits and capabilities without adding transient model records to the database.
 

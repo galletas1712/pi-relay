@@ -6,9 +6,9 @@ use agent_vocab::{ProviderKind, ReasoningEffort};
 pub(crate) fn context_window(provider: ProviderKind, model: &str) -> Option<usize> {
     match provider {
         ProviderKind::OpenAi => match model {
-            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.5" | "gpt-5.1"
-            | "gpt-5.1-codex-max" | "gpt-5.1-codex-mini" | "gpt-5.2" | "gpt-5.2-codex"
-            | "gpt-5.3-codex" => Some(272_000),
+            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => Some(372_000),
+            "gpt-5.5" | "gpt-5.1" | "gpt-5.1-codex-max" | "gpt-5.1-codex-mini" | "gpt-5.2"
+            | "gpt-5.2-codex" | "gpt-5.3-codex" => Some(272_000),
             _ => None,
         },
         ProviderKind::Claude => match model {
@@ -21,8 +21,26 @@ pub(crate) fn context_window(provider: ProviderKind, model: &str) -> Option<usiz
     }
 }
 
-pub(crate) fn default_auto_limit(provider: ProviderKind, model: &str) -> Option<usize> {
-    context_window(provider, model).map(|window| window * 85 / 100)
+pub(crate) fn default_auto_limit_for_window(
+    provider: ProviderKind,
+    model: &str,
+    window: usize,
+) -> usize {
+    match provider {
+        // Anthropic's current verified 1M input models should compact halfway
+        // through the window. Key this to authoritative window metadata, not a
+        // static id list, so newly discovered 1M Claude models get the same
+        // policy while changed/non-1M models retain the generic safe default.
+        ProviderKind::Claude if window == 1_000_000 => 500_000,
+        // Codex derives this family-specific raw threshold as 90% of the live
+        // 372k context window. Older OpenAI models retain the existing 85%.
+        ProviderKind::OpenAi
+            if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna") =>
+        {
+            window.saturating_mul(90) / 100
+        }
+        ProviderKind::OpenAi | ProviderKind::Claude => window.saturating_mul(85) / 100,
+    }
 }
 
 // Per-model reasoning-effort support, encoded from a live provider probe on
@@ -34,8 +52,7 @@ pub(crate) fn default_auto_limit(provider: ProviderKind, model: &str) -> Option<
 //   gpt-5.5 ("Supported values are: 'none', 'low', 'medium', 'high', and
 //   'xhigh'."). `minimal` and `max` are rejected. Only gpt-5.5 was authorized
 //   on the probe account; the rest of the family is assumed to share this set.
-//   The announced GPT-5.6 Sol preview adds `max`; Terra/Luna stay on the common
-//   gpt-5.x set until probed otherwise.
+//   Live GPT-5.6 metadata confirms Sol, Terra, and Luna add `max`.
 // Claude opus-4-7/opus-4-8 (adaptive thinking): low/medium/high/xhigh/max all
 //   accepted on the wire; `none`/`minimal` are refused. sonnet-4-5 is
 //   non-adaptive, so the Anthropic adapter drops effort entirely; its table is
@@ -48,7 +65,7 @@ const OPENAI_GPT5_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::XHigh,
 ];
 
-const OPENAI_GPT56_SOL_EFFORTS: &[ReasoningEffort] = &[
+const OPENAI_GPT56_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::None,
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
@@ -71,11 +88,9 @@ pub(crate) fn supported_reasoning_efforts(
 ) -> &'static [ReasoningEffort] {
     match provider {
         ProviderKind::OpenAi => match model {
-            "gpt-5.6-sol" => OPENAI_GPT56_SOL_EFFORTS,
-            "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.5" | "gpt-5.1" | "gpt-5.1-codex-max"
-            | "gpt-5.1-codex-mini" | "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.3-codex" => {
-                OPENAI_GPT5_EFFORTS
-            }
+            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => OPENAI_GPT56_EFFORTS,
+            "gpt-5.5" | "gpt-5.1" | "gpt-5.1-codex-max" | "gpt-5.1-codex-mini" | "gpt-5.2"
+            | "gpt-5.2-codex" | "gpt-5.3-codex" => OPENAI_GPT5_EFFORTS,
             // Unknown OpenAI model: assume the gpt-5.x family's common set.
             _ => OPENAI_GPT5_EFFORTS,
         },
@@ -136,17 +151,21 @@ mod tests {
 
     #[test]
     fn known_openai_models_have_defaults() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(context_window(ProviderKind::OpenAi, model), Some(372_000));
+            assert_eq!(
+                default_auto_limit_for_window(ProviderKind::OpenAi, model, 372_000),
+                334_800
+            );
+        }
         assert_eq!(
-            context_window(ProviderKind::OpenAi, "gpt-5.6-sol"),
+            context_window(ProviderKind::OpenAi, "gpt-5.3-codex"),
             Some(272_000)
         );
         assert_eq!(
-            default_auto_limit(ProviderKind::OpenAi, "gpt-5.6-sol"),
-            Some(231_200)
+            default_auto_limit_for_window(ProviderKind::OpenAi, "gpt-5.3-codex", 272_000),
+            231_200
         );
-        for model in ["gpt-5.6-terra", "gpt-5.6-luna"] {
-            assert_eq!(context_window(ProviderKind::OpenAi, model), Some(272_000));
-        }
     }
 
     #[test]
@@ -154,16 +173,40 @@ mod tests {
         for model in ["claude-sonnet-5", "claude-fable-5", "claude-opus-4-8"] {
             assert_eq!(context_window(ProviderKind::Claude, model), Some(1_000_000));
             assert_eq!(
-                default_auto_limit(ProviderKind::Claude, model),
-                Some(850_000)
+                default_auto_limit_for_window(ProviderKind::Claude, model, 1_000_000),
+                500_000
             );
         }
     }
 
     #[test]
+    fn discovered_window_policy_is_provider_and_model_aware() {
+        assert_eq!(
+            default_auto_limit_for_window(
+                ProviderKind::Claude,
+                "claude-newly-discovered",
+                1_000_000
+            ),
+            500_000
+        );
+        assert_eq!(
+            default_auto_limit_for_window(ProviderKind::Claude, "claude-newly-discovered", 500_000),
+            425_000
+        );
+        assert_eq!(
+            default_auto_limit_for_window(ProviderKind::OpenAi, "gpt-5.6-luna", 372_000),
+            334_800
+        );
+        assert_eq!(
+            default_auto_limit_for_window(ProviderKind::OpenAi, "gpt-5.3-codex", 272_000),
+            231_200
+        );
+    }
+
+    #[test]
     fn unknown_models_have_no_automatic_limit() {
         assert_eq!(context_window(ProviderKind::OpenAi, "mystery"), None);
-        assert_eq!(default_auto_limit(ProviderKind::Claude, "mystery"), None);
+        assert_eq!(context_window(ProviderKind::Claude, "mystery"), None);
     }
 
     #[test]
@@ -185,11 +228,9 @@ mod tests {
     }
 
     #[test]
-    fn gpt5_family_shares_gpt55_support() {
+    fn older_gpt5_family_shares_gpt55_support() {
         use ReasoningEffort::*;
         for model in [
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
             "gpt-5.1",
             "gpt-5.1-codex-max",
             "gpt-5.1-codex-mini",
@@ -209,16 +250,18 @@ mod tests {
     }
 
     #[test]
-    fn gpt56_sol_accepts_max_reasoning() {
+    fn gpt56_family_accepts_max_reasoning() {
         use ReasoningEffort::*;
-        assert_eq!(
-            normalize_reasoning_effort(ProviderKind::OpenAi, "gpt-5.6-sol", Max),
-            Max
-        );
-        assert_eq!(
-            normalize_reasoning_effort(ProviderKind::OpenAi, "gpt-5.6-sol", Minimal),
-            Low
-        );
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(
+                normalize_reasoning_effort(ProviderKind::OpenAi, model, Max),
+                Max
+            );
+            assert_eq!(
+                normalize_reasoning_effort(ProviderKind::OpenAi, model, Minimal),
+                Low
+            );
+        }
     }
 
     #[test]
@@ -265,8 +308,9 @@ mod tests {
         assert!(openai.contains(&None));
         assert!(!openai.contains(&Minimal));
         assert!(!openai.contains(&Max));
-        let sol = supported_reasoning_efforts(ProviderKind::OpenAi, "gpt-5.6-sol");
-        assert!(sol.contains(&Max));
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(supported_reasoning_efforts(ProviderKind::OpenAi, model).contains(&Max));
+        }
         let claude = supported_reasoning_efforts(ProviderKind::Claude, "claude-opus-4-8");
         assert!(claude.contains(&Max));
         assert!(!claude.contains(&None));

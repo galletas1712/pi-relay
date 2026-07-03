@@ -32,6 +32,8 @@ const UNKNOWN_MODEL_MAX_OUTPUT_TOKENS: u32 = 64_000;
 const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
 const COMPACTION_BETA: &str = "compact-2026-01-12";
 const COMPACTION_TRIGGER_TOKENS: usize = 50_000;
+const COMPACTION_TERMINAL_USER_INSTRUCTION: &str =
+    "Proceed with the configured context-management compaction.";
 const CLAUDE_CODE_VERSION: &str = "2.1.75";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75 (external, cli)";
 const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
@@ -59,11 +61,37 @@ pub struct AnthropicProvider {
 
 fn transcript_contains_anthropic_compaction(transcript: &[ModelTranscriptEntry]) -> bool {
     transcript.iter().any(|entry| {
-        entry
-            .provider_replay_for(ProviderKind::Claude)
-            .iter()
-            .any(|item| item.raw_type().as_deref() == Some("compaction"))
+        entry.provider_replay.iter().any(|item| {
+            if item.provider != ProviderKind::Claude {
+                return false;
+            }
+            let Ok(raw) = item.raw_value() else {
+                return false;
+            };
+            raw.get("type").and_then(Value::as_str) == Some("compaction")
+                && raw
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| !content.is_empty())
+                && matches!(
+                    raw.get("encrypted_content"),
+                    None | Some(Value::Null | Value::String(_))
+                )
+        })
     })
+}
+
+fn apply_compaction_replay_strategy(body: &mut Value, replays_compaction: bool) {
+    if replays_compaction {
+        // Anthropic requires the strategy that produced a replayed compaction
+        // block to participate in every request that applies that block. Keep
+        // this edit bare: it is the minimum shape proven for replay and avoids
+        // supplying a second trigger, pause flag, or instructions outside
+        // pi-relay's explicit compact operation.
+        body["context_management"] = json!({
+            "edits": [{ "type": "compact_20260112" }],
+        });
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +136,7 @@ fn compaction_body_with_metadata(
         cache_transcript: true,
         transcript_cache_prefix_len: None,
     })?;
+    ensure_compaction_terminal_user_message(&mut body);
     body["context_management"] = json!({
         "edits": [{
             "type": "compact_20260112",
@@ -120,6 +149,45 @@ fn compaction_body_with_metadata(
         }],
     });
     Ok(body)
+}
+
+fn ensure_compaction_terminal_user_message(body: &mut Value) {
+    let messages = body["messages"]
+        .as_array_mut()
+        .expect("Anthropic request bodies always contain a messages array");
+    if messages
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("user")
+    {
+        return;
+    }
+    let mut content = messages
+        .last()
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|block| block.get("id").and_then(Value::as_str))
+        .map(|tool_use_id| {
+            json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": "Tool result unavailable at the compaction boundary.",
+                "is_error": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    content.push(json!({
+        "type": "text",
+        "text": COMPACTION_TERMINAL_USER_INSTRUCTION,
+    }));
+    messages.push(json!({
+        "role": "user",
+        "content": content,
+    }));
 }
 
 fn anthropic_compaction_beta_header() -> String {
@@ -819,6 +887,7 @@ fn messages_body_with_metadata(
     request: ModelRequest,
     metadata: &AnthropicModelMetadata,
 ) -> ProviderResult<Value> {
+    let replays_compaction = transcript_contains_anthropic_compaction(&request.transcript);
     let tool_profile = request.tool_profile;
     // The Messages API requires `max_tokens`. Keep 64k as the ordinary-turn
     // target recommended for xhigh/max agentic work, but clamp both defaults
@@ -827,7 +896,7 @@ fn messages_body_with_metadata(
         .max_tokens
         .unwrap_or(DEFAULT_MAX_OUTPUT_BUDGET)
         .min(metadata.max_tokens);
-    anthropic_request_body(AnthropicRequestBodyInput {
+    let mut body = anthropic_request_body(AnthropicRequestBodyInput {
         model: request.model,
         prompt: request.prompt,
         transcript: request.transcript,
@@ -838,7 +907,11 @@ fn messages_body_with_metadata(
         capabilities: metadata.capabilities,
         cache_transcript: true,
         transcript_cache_prefix_len: request.transcript_cache_prefix_len,
-    })
+    })?;
+    if replays_compaction {
+        apply_compaction_replay_strategy(&mut body, replays_compaction);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -871,13 +944,7 @@ fn count_tokens_body_with_metadata(
         cache_transcript: false,
         transcript_cache_prefix_len: None,
     })?;
-    if replays_compaction {
-        // Counting applies an existing compaction block but, per Anthropic's
-        // contract, never triggers a new compaction.
-        body["context_management"] = json!({
-            "edits": [{ "type": "compact_20260112" }],
-        });
-    }
+    apply_compaction_replay_strategy(&mut body, replays_compaction);
     Ok(body)
 }
 
@@ -2383,8 +2450,181 @@ mod tests {
         );
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+        assert_eq!(
+            body["messages"],
+            json!([{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "history",
+                    "cache_control": { "type": "ephemeral" },
+                }],
+            }])
+        );
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn compaction_body_never_sends_an_assistant_prefill() {
+        let assistant_ended = compaction_body(test_compaction_request(vec![
+            TranscriptItem::UserMessage(UserMessage::text("question")).into(),
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("answer".to_string())],
+            })
+            .into(),
+        ]))
+        .expect("assistant-ended compaction body renders");
+        assert_eq!(
+            assistant_ended["messages"],
+            json!([
+                {
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "question" }],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": "answer",
+                        "cache_control": { "type": "ephemeral" },
+                    }],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": COMPACTION_TERMINAL_USER_INSTRUCTION,
+                    }],
+                },
+            ])
+        );
+
+        let user_ended =
+            compaction_body(test_compaction_request(vec![TranscriptItem::UserMessage(
+                UserMessage::text("already user-ended"),
+            )
+            .into()]))
+            .expect("user-ended compaction body renders");
+        assert_eq!(user_ended["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            user_ended["messages"][0]["content"][0]["text"],
+            "already user-ended"
+        );
+
+        let tool_call = ToolCall {
+            id: ToolCallId::new("toolu_1"),
+            tool_name: "read".to_string(),
+            args_json: r#"{"path":"README.md"}"#.to_string(),
+        };
+        let tool_ended = compaction_body(test_compaction_request(vec![
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call.clone())],
+            })
+            .into(),
+            TranscriptItem::ToolResult(ToolResultMessage::success(
+                tool_call.id,
+                "read",
+                "contents",
+            ))
+            .into(),
+        ]))
+        .expect("tool-ended compaction body renders");
+        assert_eq!(
+            tool_ended["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "read",
+                        "input": { "path": "README.md" },
+                    }],
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "contents",
+                        "is_error": false,
+                        "cache_control": { "type": "ephemeral" },
+                    }],
+                },
+            ])
+        );
+
+        let unmatched_tool = ToolCall {
+            id: ToolCallId::new("toolu_unmatched"),
+            tool_name: "read".to_string(),
+            args_json: r#"{"path":"missing.md"}"#.to_string(),
+        };
+        let unmatched_tool_ended = compaction_body(test_compaction_request(vec![
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(unmatched_tool)],
+            })
+            .into(),
+        ]))
+        .expect("unmatched tool-ended compaction body renders");
+        assert_eq!(
+            unmatched_tool_ended["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_unmatched",
+                        "name": "read",
+                        "input": { "path": "missing.md" },
+                        "cache_control": { "type": "ephemeral" },
+                    }],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_unmatched",
+                            "content": "Tool result unavailable at the compaction boundary.",
+                            "is_error": true,
+                        },
+                        {
+                            "type": "text",
+                            "text": COMPACTION_TERMINAL_USER_INSTRUCTION,
+                        },
+                    ],
+                },
+            ])
+        );
+
+        for transcript in [
+            Vec::new(),
+            vec![
+                TranscriptItem::TurnStarted {
+                    turn_id: agent_vocab::TurnId(1),
+                }
+                .into(),
+                TranscriptItem::TurnFinished {
+                    turn_id: agent_vocab::TurnId(1),
+                    outcome: agent_vocab::TurnOutcome::Graceful,
+                }
+                .into(),
+            ],
+        ] {
+            let degenerate = compaction_body(test_compaction_request(transcript))
+                .expect("degenerate compaction body renders");
+            assert_eq!(
+                degenerate["messages"],
+                json!([{
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": COMPACTION_TERMINAL_USER_INSTRUCTION,
+                    }],
+                }])
+            );
+        }
     }
 
     #[test]
@@ -3463,6 +3703,7 @@ mod tests {
         assert!(body["messages"][0]["content"][0]
             .get("cache_control")
             .is_none());
+        assert!(body.get("context_management").is_none());
     }
 
     #[test]
@@ -3486,7 +3727,46 @@ mod tests {
     }
 
     #[test]
-    fn compaction_checkpoint_replays_exact_block_and_counting_applies_it() {
+    fn ordinary_precompaction_messages_and_count_omit_replay_strategy() {
+        let transcript =
+            vec![TranscriptItem::UserMessage(UserMessage::text("ordinary turn")).into()];
+        let ordinary = messages_body(ModelRequest {
+            model: "claude-opus-4-8".to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::stable("stable rules"),
+            transcript: transcript.clone(),
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        })
+        .expect("ordinary body renders");
+        let count = count_tokens_body(ProviderTokenCountRequest {
+            model: "claude-opus-4-8".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: transcript.clone(),
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+            session_id: None,
+        })
+        .expect("count body renders");
+
+        assert!(ordinary.get("context_management").is_none());
+        assert!(count.get("context_management").is_none());
+        assert_eq!(
+            anthropic_beta_header_for_transcript(&transcript),
+            CLAUDE_CODE_BETA
+        );
+    }
+
+    #[test]
+    fn compaction_checkpoint_replays_exact_block_and_applies_strategy_consistently() {
         let raw = json!({
             "type": "compaction",
             "content": "opaque summary",
@@ -3530,9 +3810,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Fresh delegation ledger."));
-        // Ordinary continuation only replays provider state; it must not
-        // silently enable automatic compaction/continuation.
-        assert!(ordinary.get("context_management").is_none());
+        assert_eq!(
+            ordinary["context_management"]["edits"],
+            json!([{ "type": "compact_20260112" }])
+        );
 
         let count = count_tokens_body(ProviderTokenCountRequest {
             model: "claude-opus-4-8".to_string(),
@@ -3558,6 +3839,81 @@ mod tests {
         .expect("count response parses");
         assert_eq!(parsed.input_tokens, 23_456);
         assert_eq!(parsed.original_input_tokens, Some(187_654));
+    }
+
+    #[test]
+    fn compaction_replay_detection_ignores_malformed_and_wrong_provider_state() {
+        for provider_replay in [
+            vec![ProviderReplayItem {
+                provider: ProviderKind::Claude,
+                raw_json: "{not-json".to_string(),
+                display: None,
+            }],
+            vec![ProviderReplayItem::new(
+                ProviderKind::OpenAi,
+                &json!({ "type": "compaction", "content": "opaque" }),
+            )
+            .unwrap()],
+            vec![ProviderReplayItem::new(
+                ProviderKind::Claude,
+                &json!({ "type": "text", "text": "ordinary replay" }),
+            )
+            .unwrap()],
+            vec![ProviderReplayItem::new(
+                ProviderKind::Claude,
+                &json!({ "type": "compaction", "content": "" }),
+            )
+            .unwrap()],
+            vec![ProviderReplayItem::new(
+                ProviderKind::Claude,
+                &json!({
+                    "type": "compaction",
+                    "content": "opaque",
+                    "encrypted_content": { "malformed": true },
+                }),
+            )
+            .unwrap()],
+        ] {
+            let entry = ModelTranscriptEntry {
+                item: TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::Text("visible".to_string())],
+                }),
+                provider_replay,
+            };
+            assert_eq!(
+                anthropic_beta_header_for_transcript(std::slice::from_ref(&entry)),
+                CLAUDE_CODE_BETA
+            );
+            let ordinary = messages_body(ModelRequest {
+                model: "claude-opus-4-8".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![entry.clone()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            })
+            .expect("ordinary body renders");
+            let count = count_tokens_body(ProviderTokenCountRequest {
+                model: "claude-opus-4-8".to_string(),
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![entry],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+            })
+            .expect("count body renders");
+
+            assert!(ordinary.get("context_management").is_none());
+            assert!(count.get("context_management").is_none());
+        }
     }
 
     #[test]

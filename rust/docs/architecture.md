@@ -115,7 +115,12 @@ Implemented user-facing behavior:
 - Manual and automatic compaction; OpenAI uses provider-native compaction,
   while Anthropic defaults to a local text summary and requires a versioned
   `compact_20260112` opt-in for its provider-native beta pilot. Compaction is a
-  typed transcript root, not a session boundary.
+  typed transcript root, not a session boundary. Replayed Anthropic compaction
+  blocks remain opaque and require the matching bare strategy edit on both
+  Messages and token-count requests.
+- Provider/model-aware compaction thresholds: verified 1M Claude windows
+  default to 500k; hosted GPT-5.6 Sol/Terra/Luna use 372k windows and a 334.8k
+  threshold; older OpenAI and other windows retain the generic 85% policy.
 - Turn-oriented selected-session loading: collapsed turn cards plus lazy
   per-turn detail, so normal loads do not scale with transcript size, and raw
   `provider_replay` never reaches any UI/RPC response.

@@ -34,7 +34,7 @@ runtime/           SessionDriver facade plus concrete lifecycle phases:
 workspaces/        workspace base refresh, local/git source handling, sanitization,
                    and session instantiation (btrfs/reflink/copy fallback)
 rpc_views.rs       response shaping (snapshots, queue state, transcript views, server_time_ms)
-model_metadata.rs  per-model context windows + 85% auto-compaction default limit
+model_metadata.rs  per-model context windows + provider/model-aware auto-compaction defaults
 provider_runtime/  provider selection, model/web-tool execution, compaction, token accounting
 subagents.rs       delegation subagent spawn core: role resolution, full vs
                    read-only workspace handling, child prompt + lifecycle events
@@ -178,7 +178,7 @@ Two retry layers exist:
 
 ### Auto-compaction with circuit breaker
 
-Before a model action dispatches, `gate_model_dispatch` measures input tokens and blocks the action if it would exceed the model's auto limit. `model_metadata.rs` supplies per-model context windows; the default auto limit is 85% of the window (`window * 85 / 100`). Token accounting differs by provider: Claude uses the authoritative remote token-count preflight; OpenAI/Codex has no usable remote count endpoint, so it anchors on the latest provider-reported usage and estimates only the local transcript suffix appended after that point.
+Before a model action dispatches, `gate_model_dispatch` measures input tokens and blocks the action if it would exceed the model's auto limit. `model_metadata.rs` supplies per-model context windows and provider/model-aware defaults. A verified 1,000,000-token Claude window defaults to 500,000 tokens, including an unknown Claude id whose authoritative Models API metadata discovers that window. Hosted GPT-5.6 Sol/Terra/Luna use the live Codex 372,000-token window and Codex's 90% raw threshold, 334,800. Older OpenAI models and other discovered/static windows retain the generic 85% default. Explicit session `context_window` / `auto_limit_tokens` settings still win; the effective limit is clamped to the configured/discovered window and the existing anti-churn floor. Token accounting differs by provider: Claude uses the authoritative remote token-count preflight; OpenAI/Codex has no usable remote count endpoint, so it anchors on the latest provider-reported usage and estimates only the local transcript suffix appended after that point.
 
 ```
 RequestModel ready to dispatch

@@ -42,7 +42,7 @@ export const MODEL_OPTIONS: ModelOption[] = [
 ];
 
 export const OPENAI_REASONING_EFFORTS: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
-export const OPENAI_SOL_REASONING_EFFORTS: ReasoningEffort[] = [...OPENAI_REASONING_EFFORTS, "max"];
+export const OPENAI_GPT56_REASONING_EFFORTS: ReasoningEffort[] = [...OPENAI_REASONING_EFFORTS, "max"];
 export const CLAUDE_REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
 
 export const DEFAULT_PROVIDER: ProviderConfig = {
@@ -75,7 +75,9 @@ export function providerFromModelKey(modelKey: string, current: ProviderConfig):
 
 export function reasoningEffortsForProvider(provider: ProviderConfig): ReasoningEffort[] {
 	if (provider.kind === "claude") return CLAUDE_REASONING_EFFORTS;
-	return provider.model === "gpt-5.6-sol" ? OPENAI_SOL_REASONING_EFFORTS : OPENAI_REASONING_EFFORTS;
+	return ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].includes(provider.model)
+		? OPENAI_GPT56_REASONING_EFFORTS
+		: OPENAI_REASONING_EFFORTS;
 }
 
 export function newSessionCompactionConfig(provider: ProviderConfig) {

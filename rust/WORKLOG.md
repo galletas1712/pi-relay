@@ -2,6 +2,57 @@
 
 ## 2026-07-02
 
+### Native Compaction Live-E2E Corrections And Model Defaults
+
+- Corrected two request-shape failures found by a billed, sanitized Anthropic
+  E2E without running another live request in this implementation:
+  - Native compact requests now append one minimal text-only user instruction
+    when the provider-visible transcript is assistant-ended or empty. Existing
+    user-ended transcripts are unchanged, tools remain omitted, and the
+    authoritative PI compaction instructions remain solely in
+    `context_management.edits`.
+  - Ordinary Messages and token-count requests that replay a valid Claude
+    `compaction` block now both send the compaction beta and the required bare
+    `context_management.edits = [{ "type": "compact_20260112" }]` strategy.
+    The opaque block is not mutated. The edit intentionally omits trigger,
+    pause, and instructions; it is the minimum replay shape proven by live
+    token counting. Anthropic exposes no verified apply-only field, so an
+    unexpected ordinary in-band compaction stop remains a terminal model error
+    and is not persisted. Pre-compaction, malformed, and wrong-provider replay
+    requests opt into neither the edit nor beta.
+- Added exact provider request-shape regressions for assistant-ended,
+  user-ended, tool-ended, empty, and marker-only compact histories; consistent
+  replay strategy on Messages/count-token requests; ordinary pre-compaction
+  omission; and malformed/wrong-provider non-enrollment.
+- Sanitized live evidence: the successful attempt had 541,529
+  pre-compaction tokens, returned a valid 14,987-byte compaction block, and
+  counted 22,159 effective tokens after daemon restart. All three injected
+  sentinel facts were found locally inside the opaque block. The semantic
+  continuation failed before this fix because its ordinary Messages request
+  omitted the required context-management edit; no raw sentinel, transcript,
+  provider payload, or credential content is recorded here.
+- Updated auto-compaction defaults from current provider metadata. Any
+  authoritative 1,000,000-token Claude window defaults to 500,000 tokens,
+  including newly discovered Claude ids; non-1M Claude discoveries retain the
+  generic 85% policy. GPT-5.6 Sol/Terra/Luna now use the live Codex
+  372,000-token context window and 90% raw threshold (334,800). Older OpenAI
+  models retain 272,000/231,200. Explicit context/limit settings still win and
+  the existing effective-limit clamps remain.
+- Live GPT-5.6 metadata also confirms Sol, Terra, and Luna accept `max`
+  reasoning. Daemon normalization, provider serialization safeguards, web
+  choices, tests, and docs now expose `max` for all three without adding a new
+  reasoning enum.
+- GPT-5.6 evidence was cross-checked against `openai/codex` commit
+  `1f17e7512f0e47625f2cad416f14870688a99814` and a sanitized authenticated
+  models response: `context_window` / `max_context_window` were 372,000,
+  `auto_compact_token_limit` was omitted (Codex derives 90% = 334,800), and
+  `effective_context_window_percent` was omitted (the 95% serde default gives
+  an informational usable ceiling of 353,400). The external reference clone is
+  not part of this repository.
+- The native-compaction opt-in and fallback policy is unchanged: Claude
+  `auto` may use the documented local fallbacks, while `always` remains strict
+  and surfaces native failures.
+
 ### Anthropic Model and Hosted-Tool Refresh
 
 - Added Claude Sonnet 5 as the normal Claude UI option (`high` effort), retained
@@ -1523,8 +1574,8 @@ results are operational breadcrumbs, not fallback-removal evidence.
 | `always` exposes native failures | Any native failure under explicitly marked `remote_mode = "always"` | Operators selecting strict native behavior need failures visible, not silently converted to local output | Never by default; remove only if the config mode itself is removed | Injected production policy seam proves Claude Auto local fallback and Always typed-error propagation |
 | Compaction beta header follows replayed compaction state | Special compact request and later Messages/count-token requests containing a compaction block | Anthropic requires the beta to interpret the opaque block; ordinary pre-compaction calls should not be enrolled | Anthropic makes compaction and replay GA without a beta header | Wire/body tests prove model discovery and ordinary calls omit it while compact/replay paths carry it |
 
-Validation: `cargo fmt --all -- --check`, `cargo test --workspace` (442 tests
-across the Rust targets, including 101 provider and 180 daemon tests),
+Validation: `cargo fmt --all -- --check`, `cargo test --workspace` (449 tests
+across the Rust targets, including 104 provider and 184 daemon tests),
 `cargo clippy --workspace --all-targets -- -A clippy::too-many-arguments
 -D warnings`, `npm run test --workspace @pi-relay/web` (192 tests),
 `npm run build --workspace @pi-relay/web`, and `git diff --check` pass. The

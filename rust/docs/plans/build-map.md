@@ -651,7 +651,10 @@ auth.rs:21-35). A fresh empty DB needs NOTHING seeded for auth.
 gpt-5.1-codex-max, gpt-5.1-codex-mini, gpt-5.2, gpt-5.2-codex, gpt-5.3-codex`. Claude `claude-sonnet-5`,
 `claude-fable-5`, `claude-opus-4-8`, and `claude-opus-4-7` have 1M static context fallbacks; the Anthropic Models API
 can authoritatively refine runtime input/output limits and capabilities. Fable 5 requires 30-day retention and is not
-available under Zero Data Retention.
+available under Zero Data Retention. Current metadata policy gives all three
+hosted GPT-5.6 models a 372k context window, 334.8k auto-compaction threshold,
+and `max` reasoning. Verified/discovered 1M Claude windows default to a 500k
+threshold; unknown non-1M Claude windows retain the generic 85% policy.
 
 ### build_seams
 **Deterministic harness tests:** session.start with `metadata:{"harness":true}` → runtime stops at spawn_model_dispatch:34

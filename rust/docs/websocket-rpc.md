@@ -167,12 +167,21 @@ OpenAI request path. `max_tokens` is optional; when omitted the daemon does not
 set an OpenAI output cap.
 
 `reasoning_effort` defaults to `medium`. OpenAI currently accepts `none`,
-`minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay; `gpt-5.6-sol` also
-accepts `max`. Claude Sonnet 5, Fable 5, and Opus 4.8 accept `low`, `medium`,
+`minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay; GPT-5.6 Sol,
+Terra, and Luna also accept `max`. Claude Sonnet 5, Fable 5, and Opus 4.8 accept `low`, `medium`,
 `high`, `xhigh`, and `max`. Sonnet 5 and Fable 5 default to adaptive thinking,
 while Opus 4.8 requests it explicitly; all three carry effort in
 `output_config.effort`. Fable 5 requires 30-day retention and is not available
 under Zero Data Retention, so it is an explicit opt-in UI choice.
+
+Compaction defaults are provider/model aware. GPT-5.6 Sol/Terra/Luna use a
+372,000-token context window and auto-compact at 334,800 tokens (Codex's 90%
+raw threshold). Verified 1,000,000-token Claude models auto-compact at 500,000
+tokens, including newly discovered Claude ids whose authoritative Models API
+metadata reports that window. Older OpenAI models retain their existing
+272,000-token window and 231,200-token (85%) limit; other windows use the
+generic 85% default. Explicit session metadata overrides these defaults and the
+effective limit is clamped safely to the context window.
 
 ### `daemon_config`
 

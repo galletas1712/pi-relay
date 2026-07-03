@@ -219,15 +219,13 @@ pub(crate) fn resolve_compaction_config(
         resolved.context_window = default_window;
     }
     if !auto_limit_configured {
-        resolved.auto_limit_tokens = discovered
-            .and_then(|metadata| {
-                metadata
-                    .max_input_tokens
-                    .map(|window| window.saturating_mul(85) / 100)
-            })
-            .or_else(|| {
-                model_metadata::default_auto_limit(config.provider.kind, &config.provider.model)
-            });
+        resolved.auto_limit_tokens = resolved.context_window.map(|window| {
+            model_metadata::default_auto_limit_for_window(
+                config.provider.kind,
+                &config.provider.model,
+                window,
+            )
+        });
     }
 
     resolved.anthropic_native_compaction = match config.provider.kind {
@@ -840,6 +838,36 @@ mod tests {
     }
 
     #[test]
+    fn gpt56_defaults_use_live_codex_window_and_raw_threshold() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let config = test_config(ProviderKind::OpenAi, model, serde_json::json!({}));
+            let resolved = resolve_compaction_config(&config, None);
+
+            assert!(resolved.auto_enabled);
+            assert_eq!(resolved.context_window, Some(372_000));
+            assert_eq!(resolved.auto_limit_tokens, Some(334_800));
+        }
+    }
+
+    #[test]
+    fn discovered_one_million_claude_window_defaults_to_half() {
+        for model in ["claude-sonnet-5", "claude-future"] {
+            let config = test_config(ProviderKind::Claude, model, serde_json::json!({}));
+            let resolved = resolve_compaction_config(
+                &config,
+                Some(ProviderModelMetadata {
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(128_000),
+                }),
+            );
+
+            assert!(resolved.auto_enabled);
+            assert_eq!(resolved.context_window, Some(1_000_000));
+            assert_eq!(resolved.auto_limit_tokens, Some(500_000));
+        }
+    }
+
+    #[test]
     fn claude_remote_compaction_remains_opt_in_and_auto_falls_back() {
         let default = test_config(
             ProviderKind::Claude,
@@ -1241,6 +1269,46 @@ mod tests {
         );
         assert_eq!(discovered.context_window, Some(123));
         assert_eq!(discovered.auto_limit_tokens, Some(77));
+    }
+
+    #[test]
+    fn explicit_context_window_drives_default_limit_but_explicit_limit_wins() {
+        let context_only = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-5",
+            serde_json::json!({
+                "compaction": {
+                    "config": {
+                        "context_window": 600_000
+                    }
+                }
+            }),
+        );
+        let resolved = resolve_compaction_config(
+            &context_only,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(1_000_000),
+                max_output_tokens: Some(128_000),
+            }),
+        );
+        assert_eq!(resolved.context_window, Some(600_000));
+        assert_eq!(resolved.auto_limit_tokens, Some(510_000));
+
+        let explicit_limit = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-5",
+            serde_json::json!({
+                "compaction": {
+                    "config": {
+                        "context_window": 600_000,
+                        "auto_limit_tokens": 700_000
+                    }
+                }
+            }),
+        );
+        let resolved = resolve_compaction_config(&explicit_limit, None);
+        assert_eq!(resolved.auto_limit_tokens, Some(700_000));
+        assert_eq!(auto_limit_tokens(&resolved), Some(600_000));
     }
 
     #[test]

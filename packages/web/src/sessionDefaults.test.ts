@@ -46,10 +46,11 @@ describe("session defaults", () => {
 		});
 	});
 
-	it("offers Sol max reasoning while keeping Terra/Luna on the common OpenAI set", () => {
-		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.6-sol" })).toContain("max");
-		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.6-terra" })).not.toContain("max");
-		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.6-luna" })).not.toContain("max");
+	it("offers max reasoning for all hosted GPT-5.6 models but not older models", () => {
+		for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+			expect(reasoningEffortsForProvider({ kind: "openai", model })).toContain("max");
+		}
+		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.5" })).not.toContain("max");
 	});
 
 	it("keeps Anthropic native compaction opt-in", () => {
