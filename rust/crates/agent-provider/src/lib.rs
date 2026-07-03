@@ -228,14 +228,18 @@ fn canonical_provider_replay(
     record: &ProviderReplayItem,
     provider: ProviderKind,
 ) -> Option<ProviderReplayItem> {
-    let mut raw = record.raw_value().ok()?;
+    let raw = canonical_provider_replay_value(record.raw_value().ok()?, provider);
+    ProviderReplayItem::new_with_display(provider, &raw, record.display.clone()).ok()
+}
+
+pub(crate) fn canonical_provider_replay_value(mut raw: Value, provider: ProviderKind) -> Value {
     // Anthropic compaction blocks are opaque provider checkpoints, not tool
     // calls. Preserve every provider extension (including a top-level `name`)
     // without applying local tool-name canonicalization.
     if provider == ProviderKind::Claude
         && raw.get("type").and_then(Value::as_str) == Some("compaction")
     {
-        return ProviderReplayItem::new_with_display(provider, &raw, record.display.clone()).ok();
+        return raw;
     }
     if let Some(name) = raw.get("name").and_then(Value::as_str) {
         let canonical = canonical_tool_name_for_provider(provider, name);
@@ -251,7 +255,7 @@ fn canonical_provider_replay(
             raw["name"] = Value::String(canonical.to_string());
         }
     }
-    ProviderReplayItem::new_with_display(provider, &raw, record.display.clone()).ok()
+    raw
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

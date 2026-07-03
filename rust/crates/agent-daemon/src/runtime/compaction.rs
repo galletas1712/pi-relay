@@ -7,7 +7,7 @@ use agent_store::{
 use agent_vocab::TranscriptItem;
 
 use crate::provider_runtime::{
-    auto_limit_tokens, compaction_auto_explicitly_disabled, compaction_auto_state,
+    compaction_auto_explicitly_disabled, compaction_auto_state,
     compaction_config_with_model_metadata, model_input_tokens_for_gate, model_metadata_for_config,
     run_compaction,
 };
@@ -163,7 +163,7 @@ async fn check_compaction_eligible(
         return None;
     }
     Some(CompactionEligible {
-        limit: auto_limit_tokens(&config),
+        limit: config.auto_limit_tokens,
     })
 }
 

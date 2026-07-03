@@ -18,7 +18,7 @@ pub(crate) use compaction::{
     CompactionOutput, CompactionSummaryKind,
 };
 pub(crate) use compaction::{
-    auto_limit_tokens, compaction_auto_explicitly_disabled, compaction_auto_state,
+    compaction_auto_explicitly_disabled, compaction_auto_state,
     compaction_config_with_model_metadata, run_compaction, CompactionAutoState,
 };
 pub(crate) use connections::ProviderConnectionRegistry;

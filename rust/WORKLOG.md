@@ -8,27 +8,33 @@
   E2E without running another live request in this implementation:
   - Native compact requests now append one minimal text-only user instruction
     when the provider-visible transcript is assistant-ended or empty. Before
-    compaction, unresolved assistant tool calls are repaired even when an
-    ordinary or dynamic-context user message already follows: synthetic error
-    results are prepended for only the missing ids, while existing results and
-    user text remain intact. Tools remain omitted, and the authoritative PI
-    compaction instructions remain solely in `context_management.edits`.
+    compaction, the consecutive user run after an assistant tool-use tail is
+    normalized once: required real/synthetic results are emitted in tool-use
+    order, followed by non-result user content in original order, with
+    duplicate results and redundant empty user messages removed. Tools remain
+    omitted, and the authoritative PI compaction instructions remain solely in
+    `context_management.edits`.
   - Ordinary Messages and token-count requests that replay a valid Claude
     `compaction` block send the compaction beta and the strategy that applies
     that block. Messages sets an explicit trigger at the resolved model's
     authoritative input ceiling (defensively clamped to Anthropic's documented
     50K minimum) and `pause_after_compaction = true`; this suppresses the
     provider's 150K default trigger but is not an apply-only mode. The daemon's
-    durable scheduler still owns normal compaction at its lower policy limit,
-    while the provider trigger is a paused emergency ceiling. Token counting
-    keeps the live-proven bare strategy because Anthropic documents that it
-    applies existing blocks without triggering new compactions.
-  - The replay block is validated once (`type = "compaction"`, nonempty string
-    `content`, absent/null/string `encrypted_content`) and otherwise retained
-    unchanged, including arbitrary extension fields. Detection is limited to
-    sidecars on transcript kinds that actually emit replay; malformed emitted
-    replay fails locally, while wrong-provider and non-emitted sidecars do not
-    enroll. Any compaction block, compaction delta, or compaction stop returned
+    durable scheduler still owns normal compaction at its lower policy limit.
+    Anthropic documents only the 50K minimum, so the ceiling value is
+    schema-valid, but provider acceptance and trigger behavior there remain
+    live-unverified; fail-closed parsing protects durable state, not
+    availability. Token counting keeps the live-proven bare strategy because
+    Anthropic documents that it applies existing blocks without triggering new
+    compactions.
+  - Emitted replay rendering parses every Claude sidecar once. A local
+    `CompactionSummary` may have none; otherwise it requires exactly one valid
+    compaction block (`type = "compaction"`, nonempty string `content`,
+    absent/null/string `encrypted_content`). Assistant replay permits ordinary
+    Claude blocks but rejects corrupt JSON and malformed exact compaction.
+    Valid compaction remains opaque, including arbitrary extension fields.
+    Wrong-provider and non-emitted sidecars do not enroll. Any compaction block,
+    compaction delta, or compaction stop returned
     by an ordinary Messages call is rejected at the provider parser boundary,
     before it can become persistable replay. Pre-compaction requests opt into
     neither the edit nor beta.
@@ -51,11 +57,12 @@
   including newly discovered Claude ids; non-1M Claude discoveries retain the
   generic 85% policy. GPT-5.6 Sol/Terra/Luna now use the live Codex
   372,000-token context window and 90% raw threshold (334,800). Older OpenAI
-  models retain 272,000/231,200. Nested `compaction.config`, when present,
-  wholly precedes legacy fields; successfully selected type-valid overrides
-  still win, null/malformed limits safely use provider-aware defaults, and the
-  existing effective-limit clamps remain. A malformed selected object still
-  fails closed for Claude native enrollment.
+  models retain 272,000/231,200. Only nested `/compaction/config` is read,
+  including the real markerless legacy web format. It is parsed once into a
+  small policy and resolved to one effective limit. Valid explicit limits win
+  and clamp to the selected window; windows below the anti-churn floor disable
+  auto-compaction. A malformed known field disables auto, resolves Claude
+  native mode to Never, and preserves OpenAI's provider-native baseline.
 - Live GPT-5.6 metadata also confirms Sol, Terra, and Luna accept `max`
   reasoning. Daemon normalization, provider serialization safeguards, web
   choices, tests, and docs now expose `max` for all three without adding a new
@@ -1591,30 +1598,20 @@ results are operational breadcrumbs, not fallback-removal evidence.
 | Remote context-overflow trimming/retry remains before fallback | Native compact call returns a clearly classified context overflow | Existing large transcripts can exceed the endpoint/model limit before compaction executes | Native compaction accepts all supported full-window inputs or the API provides a guaranteed pre-compaction path | Group-trimming unit tests prove compaction-root/newer-history preservation; the full network overflow → trim → retry → fallback sequence is not integration-tested |
 | `always` exposes native failures | Any native failure under explicitly marked `remote_mode = "always"` | Operators selecting strict native behavior need failures visible, not silently converted to local output | Never by default; remove only if the config mode itself is removed | Injected production policy seam proves Claude Auto local fallback and Always typed-error propagation |
 | Compaction beta header follows replayed compaction state | Special compact request and later Messages/count-token requests containing a compaction block | Anthropic requires the beta to interpret the opaque block; ordinary pre-compaction calls should not be enrolled | Anthropic makes compaction and replay GA without a beta header | Wire/body tests prove model discovery and ordinary calls omit it while compact/replay paths carry it |
-| Replaying Messages use a paused emergency trigger at the resolved model input ceiling | An ordinary Messages request contains a valid persisted Anthropic compaction block | Anthropic has no documented apply-only mode; omitting the trigger activates an unsafe 150K default below pi-relay's normal 500K scheduler threshold | Anthropic documents and integration tests an apply-only/no-trigger replay mode, or replay becomes GA with equivalent provider guarantees | Exact 1M/non-1M/50K-clamp body tests and a wire mock assert ceiling trigger + pause + beta; the billed 500K continuation remains pending independent review |
-| Ordinary Anthropic responses reject every compaction block/delta/stop | A replaying Messages call unexpectedly performs paused or non-paused automatic compaction | In-band compaction mixed with text/tool output has no safe ordinary durable-checkpoint lifecycle and may contain null/opaque state | A separately reviewed durable automatic-compaction lifecycle validates and atomically installs the full provider checkpoint before any continuation output is persisted | Stream/non-stream tests cover compaction+text, compaction+tool use, null/malformed blocks, extensions, paused compaction, and stop mismatch; no live request is claimed |
+| Replaying Messages use a paused emergency trigger at the resolved model input ceiling | An ordinary Messages request contains a valid persisted Anthropic compaction block | Anthropic has no documented apply-only mode; omitting the trigger activates an unsafe 150K default below pi-relay's normal 500K scheduler threshold. The ceiling is schema-valid under the documented minimum-only rule, but live acceptance/behavior is unverified | Anthropic documents and integration tests an apply-only/no-trigger replay mode, or replay becomes GA with equivalent provider guarantees | Exact 1M/non-1M/50K-clamp body tests and a wire mock assert ceiling trigger + pause + beta; the billed 500K continuation must verify acceptance and behavior. Parser rejection protects durable data, not availability |
+| Ordinary Anthropic responses reject every compaction block/delta/stop | A replaying Messages call unexpectedly performs paused or non-paused automatic compaction | In-band compaction mixed with text/tool output has no safe ordinary durable-checkpoint lifecycle and may contain null/opaque state | A separately reviewed durable automatic-compaction lifecycle validates and atomically installs the full provider checkpoint before any continuation output is persisted | SSE tests cover message-start/block/delta/stop rejection, compaction+text, compaction+tool use, null/paused forms, and stop mismatch; no live request is claimed |
 
-Validation for these corrections: `cargo fmt --all -- --check`, `cargo test
---workspace` (459 tests across the Rust targets, including 110 provider and 188
-daemon tests),
-`cargo clippy --workspace --all-targets -- -A clippy::too-many-arguments
--D warnings`, `npm run test --workspace @pi-relay/web` (192 tests),
+Validation for this simplification: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -A clippy::too-many-arguments -D
+warnings`, all 106 `agent-provider` tests, the non-daemon workspace tests, the
+15 focused compaction-policy tests, the 10 model-metadata tests,
+`npm run test --workspace @pi-relay/web` (192 tests),
 `npm run build --workspace @pi-relay/web`, and `git diff --check` pass. The
-focused ordinary compaction/refusal lifecycle command also reports success, but
-its real-Postgres body explicitly skipped because
-`PI_RELAY_TEST_DATABASE_URL` is unset. Earlier durable-recovery validation
-recorded a passing serial real-Postgres store suite and focused regressions for
-expired leased-claim recovery after complete volatile-state recreation, live
-lease duplicate suppression, simultaneous boot recovery across two independent
-stores/states, heartbeat-loss recovery without process restart, transient
-scheduler database-error retry, terminal marker cleanup, corrupt-intent
-terminal recovery, generation-aware task compare-remove, and ordinary
-compaction/refusal stops with a genuinely live model action. That earlier full
-serial daemon Postgres suite retained five pre-existing delegation/steering
-fixture failures, also reproduced individually from detached baseline
-`d296e3f`; this correction did not rerun those DB-backed cases. No live
-Anthropic request is part of this change; special Messages requests remain
-covered by in-process wire mocks.
+isolated-Postgres full workspace command ran 177 daemon tests successfully and
+reproduced the same five pre-existing delegation/steering fixture failures
+(`Store(NotTurnBoundary)`) previously reproduced from detached baseline
+`d296e3f`. No live Anthropic request is part of this change; special Messages
+requests remain covered by in-process wire mocks.
 
 ### Lease/watchdog blocker interleavings
 

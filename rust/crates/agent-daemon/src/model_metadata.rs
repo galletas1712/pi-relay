@@ -1,20 +1,26 @@
 use agent_vocab::{ProviderKind, ReasoningEffort};
 
+const HOSTED_GPT56_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+
+fn is_hosted_gpt56(model: &str) -> bool {
+    HOSTED_GPT56_MODELS.contains(&model)
+}
+
 /// Canonical Rust-side model metadata used for safety-critical context-window
 /// decisions. Web/session metadata can override these values, but the runtime
 /// must not depend on the UI supplying them.
 pub(crate) fn context_window(provider: ProviderKind, model: &str) -> Option<usize> {
     match provider {
+        ProviderKind::OpenAi if is_hosted_gpt56(model) => Some(372_000),
         ProviderKind::OpenAi => match model {
-            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => Some(372_000),
             "gpt-5.5" | "gpt-5.1" | "gpt-5.1-codex-max" | "gpt-5.1-codex-mini" | "gpt-5.2"
             | "gpt-5.2-codex" | "gpt-5.3-codex" => Some(272_000),
             _ => None,
         },
         ProviderKind::Claude => match model {
-            "claude-sonnet-5" | "claude-fable-5" => Some(1_000_000),
-            "claude-opus-4-8" => Some(1_000_000),
-            "claude-opus-4-7" => Some(1_000_000),
+            "claude-sonnet-5" | "claude-fable-5" | "claude-opus-4-8" | "claude-opus-4-7" => {
+                Some(1_000_000)
+            }
             "claude-sonnet-4-5" => Some(200_000),
             _ => None,
         },
@@ -34,11 +40,7 @@ pub(crate) fn default_auto_limit_for_window(
         ProviderKind::Claude if window == 1_000_000 => 500_000,
         // Codex derives this family-specific raw threshold as 90% of the live
         // 372k context window. Older OpenAI models retain the existing 85%.
-        ProviderKind::OpenAi
-            if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna") =>
-        {
-            window.saturating_mul(90) / 100
-        }
+        ProviderKind::OpenAi if is_hosted_gpt56(model) => window.saturating_mul(90) / 100,
         ProviderKind::OpenAi | ProviderKind::Claude => window.saturating_mul(85) / 100,
     }
 }
@@ -87,8 +89,8 @@ pub(crate) fn supported_reasoning_efforts(
     model: &str,
 ) -> &'static [ReasoningEffort] {
     match provider {
+        ProviderKind::OpenAi if is_hosted_gpt56(model) => OPENAI_GPT56_EFFORTS,
         ProviderKind::OpenAi => match model {
-            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => OPENAI_GPT56_EFFORTS,
             "gpt-5.5" | "gpt-5.1" | "gpt-5.1-codex-max" | "gpt-5.1-codex-mini" | "gpt-5.2"
             | "gpt-5.2-codex" | "gpt-5.3-codex" => OPENAI_GPT5_EFFORTS,
             // Unknown OpenAI model: assume the gpt-5.x family's common set.
@@ -151,7 +153,7 @@ mod tests {
 
     #[test]
     fn known_openai_models_have_defaults() {
-        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        for model in HOSTED_GPT56_MODELS {
             assert_eq!(context_window(ProviderKind::OpenAi, model), Some(372_000));
             assert_eq!(
                 default_auto_limit_for_window(ProviderKind::OpenAi, model, 372_000),

@@ -795,6 +795,10 @@ fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
 // value OpenAI accepts. Defensively clamp `minimal` (all current gpt-5.x) and
 // `max` (all current gpt-5.x except the verified GPT-5.6 hosted family) rather
 // than letting a stray direct adapter call produce a 400.
+fn is_hosted_gpt56(model: &str) -> bool {
+    ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].contains(&model)
+}
+
 fn openai_reasoning_effort(model: &str, effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::None
@@ -803,11 +807,7 @@ fn openai_reasoning_effort(model: &str, effort: ReasoningEffort) -> &'static str
         | ReasoningEffort::High
         | ReasoningEffort::XHigh => effort.as_str(),
         ReasoningEffort::Minimal => ReasoningEffort::Low.as_str(),
-        ReasoningEffort::Max
-            if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna") =>
-        {
-            ReasoningEffort::Max.as_str()
-        }
+        ReasoningEffort::Max if is_hosted_gpt56(model) => ReasoningEffort::Max.as_str(),
         ReasoningEffort::Max => ReasoningEffort::XHigh.as_str(),
     }
 }
