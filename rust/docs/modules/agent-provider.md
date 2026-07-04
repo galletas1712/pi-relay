@@ -134,9 +134,10 @@ The attribution `system[0]` fingerprint is derived from the **stable prefix** (n
 
 Because OpenAI runs stateless (`store = false`) and Anthropic preserves thinking blocks across tool calls, both adapters store every parsed output item as a `ProviderReplayItem` sidecar attached to the transcript entry. On the next request these raw blocks are replayed verbatim ahead of any synthesized representation:
 
-- OpenAI replays every stored output item, including `reasoning` (encrypted via
-  `reasoning.encrypted_content`), messages, local/hosted tool items, and unknown
-  passive extensions.
+- OpenAI replays every validated stored output item, including `reasoning`
+  (encrypted via `reasoning.encrypted_content`), messages, server-originated
+  agent messages/context compaction, and local/hosted tool items. Unknown items
+  are retained only inside canonical `/responses/compact` output.
 - Anthropic replays the stored `thinking` / `redacted_thinking`, `text`, `tool_use`, and `server_tool_use` blocks.
 
 When replay items exist for an assistant/compaction entry, `transcript_to_messages` / `transcript_to_response_items` emit them instead of reconstructing from `AssistantMessage`. Thinking blocks are intentionally **discarded** at the parse layer (they never become `AssistantItem`s — `AssistantItem` is `Text`/`ToolCall` only); they survive solely in the replay sidecar, keeping reasoning continuity without polluting the typed transcript.
@@ -237,9 +238,12 @@ duplicate/conflicting terminal reasons and trailing known frames are
 observable, and rejects missing fields, wrong indices/types/order, multiple or
 mixed blocks, pre-populated start content, malformed JSON, `[DONE]`, and
 truncation. `http.rs` enforces a 45-second response-headers timeout; the SSE
-reader enforces a 5-minute idle timeout. The ordinary Anthropic parser assembles
-`content_block_start`/`_delta`/`_stop` events and accumulates streamed
-`input_json_delta`/`text_delta`/`thinking_delta`/`signature_delta`, but
+reader enforces a 5-minute idle timeout. The ordinary Anthropic parser requires
+contiguous, checked content-block indices and an explicit `content_block_stop`
+for every start. It validates the known start/delta schemas, rejects duplicate,
+gapped, nonexistent, or mismatched block transitions, and fails malformed
+accumulated tool-input JSON instead of substituting arguments. It accumulates valid
+`input_json_delta`/`text_delta`/`thinking_delta`/`signature_delta` content and
 defensively rejects all compaction content/deltas/stops before producing a
 `ModelResponse`.
 

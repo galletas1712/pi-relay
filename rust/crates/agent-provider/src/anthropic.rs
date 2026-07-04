@@ -59,6 +59,288 @@ pub struct AnthropicProvider {
     model_cache: AnthropicModelCache,
 }
 
+fn validate_anthropic_stream_citation(citation: &Value) -> ProviderResult<()> {
+    let citation_type = citation
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("citation type validated");
+    let required_string = |field: &str| -> ProviderResult<()> {
+        citation
+            .get(field)
+            .and_then(Value::as_str)
+            .map(|_| ())
+            .ok_or_else(|| {
+                ProviderError::Provider(format!(
+                    "Anthropic {citation_type} citation missing string {field}"
+                ))
+            })
+    };
+    let required_index = |field: &str| -> ProviderResult<()> {
+        citation
+            .get(field)
+            .and_then(Value::as_u64)
+            .map(|_| ())
+            .ok_or_else(|| {
+                ProviderError::Provider(format!(
+                    "Anthropic {citation_type} citation missing unsigned integer {field}"
+                ))
+            })
+    };
+    let required_nullable_string = |field: &str| -> ProviderResult<()> {
+        if citation
+            .get(field)
+            .is_some_and(|value| matches!(value, Value::Null | Value::String(_)))
+        {
+            Ok(())
+        } else {
+            Err(ProviderError::Provider(format!(
+                "Anthropic {citation_type} citation missing string or null {field}"
+            )))
+        }
+    };
+    required_string("cited_text")?;
+    match citation_type {
+        "web_search_result_location" => {
+            required_string("encrypted_index")?;
+            required_string("url")?;
+            required_nullable_string("title")?;
+        }
+        "char_location" => {
+            for field in ["document_index", "start_char_index", "end_char_index"] {
+                required_index(field)?;
+            }
+            required_nullable_string("document_title")?;
+            required_nullable_string("file_id")?;
+        }
+        "page_location" => {
+            for field in ["document_index", "start_page_number", "end_page_number"] {
+                required_index(field)?;
+            }
+            required_nullable_string("document_title")?;
+            required_nullable_string("file_id")?;
+        }
+        "content_block_location" => {
+            for field in ["document_index", "start_block_index", "end_block_index"] {
+                required_index(field)?;
+            }
+            required_nullable_string("document_title")?;
+            required_nullable_string("file_id")?;
+        }
+        "search_result_location" => {
+            for field in [
+                "search_result_index",
+                "start_block_index",
+                "end_block_index",
+            ] {
+                required_index(field)?;
+            }
+            required_string("source")?;
+            required_nullable_string("title")?;
+        }
+        _ => {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic citations_delta had unsupported citation type {citation_type}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn validate_anthropic_hosted_tool_result(block_type: &str, content: &Value) -> ProviderResult<()> {
+    match (block_type, content) {
+        ("web_search_tool_result", Value::Array(results)) => {
+            for result in results {
+                if anthropic_block_type(result, "Anthropic web search result")?
+                    != "web_search_result"
+                {
+                    return Err(ProviderError::Provider(
+                        "Anthropic web_search_tool_result contained unsupported result type"
+                            .to_string(),
+                    ));
+                }
+                for field in ["title", "url", "encrypted_content"] {
+                    if result.get(field).and_then(Value::as_str).is_none() {
+                        return Err(ProviderError::Provider(format!(
+                            "Anthropic web_search_result missing string {field}"
+                        )));
+                    }
+                }
+                if !result
+                    .get("page_age")
+                    .is_some_and(|value| matches!(value, Value::Null | Value::String(_)))
+                {
+                    return Err(ProviderError::Provider(
+                        "Anthropic web_search_result missing string or null page_age".to_string(),
+                    ));
+                }
+            }
+        }
+        ("web_search_tool_result", Value::Object(_)) => {
+            if anthropic_block_type(content, "Anthropic web search result error")?
+                != "web_search_tool_result_error"
+                || content.get("error_code").and_then(Value::as_str).is_none()
+            {
+                return Err(ProviderError::Provider(
+                    "Anthropic web_search_tool_result contained malformed error".to_string(),
+                ));
+            }
+        }
+        ("web_fetch_tool_result", Value::Object(_)) => {
+            match anthropic_block_type(content, "Anthropic web fetch result")? {
+                "web_fetch_result" => {
+                    if content.get("url").and_then(Value::as_str).is_none()
+                        || !content.get("content").is_some_and(Value::is_object)
+                        || !content
+                            .get("retrieved_at")
+                            .is_some_and(|value| matches!(value, Value::Null | Value::String(_)))
+                    {
+                        return Err(ProviderError::Provider(
+                            "Anthropic web_fetch_tool_result contained malformed result"
+                                .to_string(),
+                        ));
+                    }
+                    let document = &content["content"];
+                    if document.get("type").and_then(Value::as_str) != Some("document")
+                        || !document.get("source").is_some_and(Value::is_object)
+                        || !document
+                            .get("citations")
+                            .is_some_and(|value| matches!(value, Value::Null | Value::Object(_)))
+                        || !document
+                            .get("title")
+                            .is_some_and(|value| matches!(value, Value::Null | Value::String(_)))
+                    {
+                        return Err(ProviderError::Provider(
+                            "Anthropic web_fetch_result contained malformed document".to_string(),
+                        ));
+                    }
+                }
+                "web_fetch_tool_result_error"
+                    if content.get("error_code").and_then(Value::as_str).is_some() => {}
+                _ => {
+                    return Err(ProviderError::Provider(
+                        "Anthropic web_fetch_tool_result contained malformed error".to_string(),
+                    ))
+                }
+            }
+        }
+        _ => {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic {block_type} content had invalid type"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn anthropic_stream_index(event: &Value, event_type: &str) -> ProviderResult<usize> {
+    event
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| {
+            ProviderError::Provider(format!(
+                "Anthropic {event_type} missing valid representable index"
+            ))
+        })
+}
+
+fn validate_anthropic_stream_content_start(block: &Value) -> ProviderResult<()> {
+    let block_type = anthropic_block_type(block, "Anthropic content_block_start content_block")?;
+    let required_string = |field: &str| -> ProviderResult<&str> {
+        block.get(field).and_then(Value::as_str).ok_or_else(|| {
+            ProviderError::Provider(format!(
+                "Anthropic {block_type} content block missing string {field}"
+            ))
+        })
+    };
+    let required_nonempty_string = |field: &str| -> ProviderResult<&str> {
+        required_string(field)?
+            .is_empty()
+            .then_some(())
+            .map_or_else(
+                || required_string(field),
+                |_| {
+                    Err(ProviderError::Provider(format!(
+                        "Anthropic {block_type} content block had empty {field}"
+                    )))
+                },
+            )
+    };
+
+    match block_type {
+        "text" => {
+            if !required_string("text")?.is_empty() {
+                return Err(ProviderError::Provider(
+                    "Anthropic streamed text content block had pre-populated text".to_string(),
+                ));
+            }
+            if !matches!(
+                block.get("citations"),
+                None | Some(Value::Null | Value::Array(_))
+            ) {
+                return Err(ProviderError::Provider(
+                    "Anthropic text content block citations was not an array or null".to_string(),
+                ));
+            }
+            if block
+                .get("citations")
+                .and_then(Value::as_array)
+                .is_some_and(|citations| !citations.is_empty())
+            {
+                return Err(ProviderError::Provider(
+                    "Anthropic streamed text content block had pre-populated citations".to_string(),
+                ));
+            }
+        }
+        "thinking" => {
+            if !required_string("thinking")?.is_empty() || !required_string("signature")?.is_empty()
+            {
+                return Err(ProviderError::Provider(
+                    "Anthropic streamed thinking content block had pre-populated content"
+                        .to_string(),
+                ));
+            }
+        }
+        "redacted_thinking" => {
+            required_nonempty_string("data")?;
+        }
+        "tool_use" | "server_tool_use" => {
+            required_nonempty_string("id")?;
+            required_nonempty_string("name")?;
+            match block.get("input").and_then(Value::as_object) {
+                Some(input) if input.is_empty() => {}
+                Some(_) => {
+                    return Err(ProviderError::Provider(format!(
+                        "Anthropic streamed {block_type} content block had pre-populated input"
+                    )))
+                }
+                None => {
+                    return Err(ProviderError::Provider(format!(
+                        "Anthropic {block_type} content block missing input object"
+                    )))
+                }
+            }
+        }
+        "web_search_tool_result" | "web_fetch_tool_result" => {
+            required_nonempty_string("tool_use_id")?;
+            validate_anthropic_hosted_tool_result(
+                block_type,
+                block.get("content").ok_or_else(|| {
+                    ProviderError::Provider(format!(
+                        "Anthropic {block_type} content block missing content"
+                    ))
+                })?,
+            )?;
+        }
+        _ => {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_start had unsupported content block type {block_type}"
+            )))
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnthropicCompactionBlockError {
     WrongType,
@@ -1998,12 +2280,15 @@ impl AnthropicCompactionStreamState {
 }
 
 struct AnthropicStreamState {
-    content_blocks: Vec<Option<Value>>,
+    active_content_block: Option<(usize, Value)>,
+    next_content_block_index: usize,
     provider_replay: Vec<ProviderReplayItem>,
     items: Vec<AssistantItem>,
     usage: Option<ProviderUsage>,
     stop_reason: ModelStopReason,
     stop_details: Option<ModelStopDetails>,
+    message_started: bool,
+    terminal_delta_seen: bool,
     saw_stop_reason: bool,
     message_stopped: bool,
 }
@@ -2011,12 +2296,15 @@ struct AnthropicStreamState {
 impl Default for AnthropicStreamState {
     fn default() -> Self {
         Self {
-            content_blocks: Vec::new(),
+            active_content_block: None,
+            next_content_block_index: 0,
             provider_replay: Vec::new(),
             items: Vec::new(),
             usage: None,
             stop_reason: ModelStopReason::Complete,
             stop_details: None,
+            message_started: false,
+            terminal_delta_seen: false,
             saw_stop_reason: false,
             message_stopped: false,
         }
@@ -2024,6 +2312,20 @@ impl Default for AnthropicStreamState {
 }
 
 impl AnthropicStreamState {
+    fn require_content_phase(&self, event_type: &str) -> ProviderResult<()> {
+        if !self.message_started {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic {event_type} arrived before message_start"
+            )));
+        }
+        if self.terminal_delta_seen {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic {event_type} arrived after message_delta"
+            )));
+        }
+        Ok(())
+    }
+
     fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
         match event {
             SseEvent::Json(event) => self.process_event(&event),
@@ -2038,6 +2340,12 @@ impl AnthropicStreamState {
         reject_ordinary_compaction_event(event)?;
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
+                if self.message_started {
+                    return Err(ProviderError::Provider(
+                        "Anthropic response stream contained duplicate message_start".to_string(),
+                    ));
+                }
+                self.message_started = true;
                 self.usage = event
                     .get("message")
                     .and_then(|message| message.get("usage"))
@@ -2045,33 +2353,57 @@ impl AnthropicStreamState {
                 Ok(SseControl::Continue)
             }
             Some("content_block_start") => {
-                if let (Some(index), Some(content_block)) = (
-                    event.get("index").and_then(Value::as_u64),
-                    event.get("content_block"),
-                ) {
-                    self.set_content_block(
-                        index as usize,
-                        normalize_stream_content_start(content_block),
-                    );
-                }
+                self.require_content_phase("content_block_start")?;
+                let index = anthropic_stream_index(event, "content_block_start")?;
+                let content_block = event
+                    .get("content_block")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "Anthropic content_block_start missing content_block object"
+                                .to_string(),
+                        )
+                    })?;
+                self.start_content_block(index, &Value::Object(content_block.clone()))?;
                 Ok(SseControl::Continue)
             }
             Some("content_block_delta") => {
-                let Some(index) = event.get("index").and_then(Value::as_u64) else {
-                    return Ok(SseControl::Continue);
-                };
-                if let Some(delta) = event.get("delta") {
-                    self.apply_content_delta(index as usize, delta);
-                }
+                self.require_content_phase("content_block_delta")?;
+                let index = anthropic_stream_index(event, "content_block_delta")?;
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "Anthropic content_block_delta missing delta object".to_string(),
+                        )
+                    })?;
+                self.apply_content_delta(index, &Value::Object(delta.clone()))?;
                 Ok(SseControl::Continue)
             }
             Some("content_block_stop") => {
-                if let Some(index) = event.get("index").and_then(Value::as_u64) {
-                    self.finish_content_block(index as usize)?;
-                }
+                self.require_content_phase("content_block_stop")?;
+                let index = anthropic_stream_index(event, "content_block_stop")?;
+                self.finish_content_block(index)?;
                 Ok(SseControl::Continue)
             }
             Some("message_delta") => {
+                if !self.message_started {
+                    return Err(ProviderError::Provider(
+                        "Anthropic message_delta arrived before message_start".to_string(),
+                    ));
+                }
+                if let Some((index, _)) = self.active_content_block.as_ref() {
+                    return Err(ProviderError::Provider(format!(
+                        "Anthropic message_delta arrived before content_block_stop for index {index}"
+                    )));
+                }
+                if self.terminal_delta_seen {
+                    return Err(ProviderError::Provider(
+                        "Anthropic response stream contained duplicate message_delta".to_string(),
+                    ));
+                }
+                self.terminal_delta_seen = true;
                 if let Some(usage) = event.get("usage").and_then(anthropic_usage) {
                     merge_anthropic_usage(&mut self.usage, usage);
                 }
@@ -2119,6 +2451,16 @@ impl AnthropicStreamState {
                 Ok(SseControl::Continue)
             }
             Some("message_stop") => {
+                if !self.message_started {
+                    return Err(ProviderError::Provider(
+                        "Anthropic message_stop arrived before message_start".to_string(),
+                    ));
+                }
+                if let Some((index, _)) = self.active_content_block.as_ref() {
+                    return Err(ProviderError::Provider(format!(
+                        "Anthropic message_stop arrived before content_block_stop for index {index}"
+                    )));
+                }
                 self.message_stopped = true;
                 Ok(SseControl::Stop)
             }
@@ -2139,50 +2481,153 @@ impl AnthropicStreamState {
         }
     }
 
-    fn set_content_block(&mut self, index: usize, block: Value) {
-        if self.content_blocks.len() <= index {
-            self.content_blocks.resize_with(index + 1, || None);
+    fn start_content_block(&mut self, index: usize, block: &Value) -> ProviderResult<()> {
+        if let Some((active_index, _)) = self.active_content_block.as_ref() {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_start for index {index} arrived before content_block_stop for index {active_index}"
+            )));
         }
-        self.content_blocks[index] = Some(block);
+        if index != self.next_content_block_index {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_start index was not contiguous: expected {}, found {index}",
+                self.next_content_block_index
+            )));
+        }
+        validate_anthropic_stream_content_start(block)?;
+        self.active_content_block = Some((index, normalize_stream_content_start(block)));
+        Ok(())
     }
 
-    fn apply_content_delta(&mut self, index: usize, delta: &Value) {
-        let Some(Some(block)) = self.content_blocks.get_mut(index) else {
-            return;
+    fn apply_content_delta(&mut self, index: usize, delta: &Value) -> ProviderResult<()> {
+        let Some((active_index, block)) = self.active_content_block.as_mut() else {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_delta referenced nonexistent block index {index}"
+            )));
         };
-        match delta.get("type").and_then(Value::as_str) {
-            Some("input_json_delta") => {
-                append_json_string_field(block, "input", delta.get("partial_json"));
+        if index != *active_index {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_delta index {index} did not match active block index {active_index}"
+            )));
+        }
+        let block_type = anthropic_block_type(block, "Anthropic streamed content block")?;
+        let delta_type = delta
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|delta_type| !delta_type.is_empty())
+            .ok_or_else(|| {
+                ProviderError::Provider(
+                    "Anthropic content_block_delta missing nonempty delta type".to_string(),
+                )
+            })?;
+        match delta_type {
+            "input_json_delta" if matches!(block_type, "tool_use" | "server_tool_use") => {
+                append_required_json_string_field(block, "input", delta, "partial_json")?;
             }
-            Some("text_delta") => {
-                append_json_string_field(block, "text", delta.get("text"));
+            "text_delta" if block_type == "text" => {
+                append_required_json_string_field(block, "text", delta, "text")?;
             }
-            Some("thinking_delta") => {
-                append_json_string_field(block, "thinking", delta.get("thinking"));
+            "thinking_delta" if block_type == "thinking" => {
+                if block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .is_some_and(|signature| !signature.is_empty())
+                {
+                    return Err(ProviderError::Provider(
+                        "Anthropic thinking_delta arrived after signature_delta".to_string(),
+                    ));
+                }
+                append_required_json_string_field(block, "thinking", delta, "thinking")?;
             }
-            Some("signature_delta") => {
-                if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
-                    block["signature"] = Value::String(signature.to_string());
+            "signature_delta" if block_type == "thinking" => {
+                let signature = required_anthropic_delta_string(delta, "signature")?;
+                if signature.is_empty() {
+                    return Err(ProviderError::Provider(
+                        "Anthropic signature_delta contained an empty signature".to_string(),
+                    ));
+                }
+                if block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .is_some_and(|signature| !signature.is_empty())
+                {
+                    return Err(ProviderError::Provider(
+                        "Anthropic thinking block received duplicate signature_delta".to_string(),
+                    ));
+                }
+                block["signature"] = Value::String(signature.to_string());
+            }
+            "citations_delta" if block_type == "text" => {
+                let citation = delta
+                    .get("citation")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "Anthropic citations_delta missing citation object".to_string(),
+                        )
+                    })?;
+                citation
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .filter(|citation_type| !citation_type.is_empty())
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "Anthropic citations_delta citation missing nonempty type".to_string(),
+                        )
+                    })?;
+                validate_anthropic_stream_citation(&Value::Object(citation.clone()))?;
+                match block.get_mut("citations") {
+                    Some(Value::Array(citations)) => {
+                        citations.push(Value::Object(citation.clone()));
+                    }
+                    Some(Value::Null) | None => {
+                        block["citations"] = Value::Array(vec![Value::Object(citation.clone())]);
+                    }
+                    Some(_) => {
+                        return Err(ProviderError::Provider(
+                            "Anthropic text content block citations was not an array or null"
+                                .to_string(),
+                        ))
+                    }
                 }
             }
-            Some("citations_delta") | None => {}
-            Some(_) => {}
-        }
+            "input_json_delta" | "text_delta" | "thinking_delta" | "signature_delta"
+            | "citations_delta" => {
+                return Err(ProviderError::Provider(format!(
+                    "Anthropic {delta_type} was invalid for content block type {block_type}"
+                )))
+            }
+            _ => {
+                return Err(ProviderError::Provider(format!(
+                    "Anthropic content_block_delta had unsupported delta type {delta_type}"
+                )))
+            }
+        };
+        Ok(())
     }
 
     fn finish_content_block(&mut self, index: usize) -> ProviderResult<()> {
-        let Some(block) = self
-            .content_blocks
-            .get_mut(index)
-            .and_then(Option::take)
-            .map(finalize_stream_content_block)
-        else {
-            return Ok(());
+        let Some((active_index, block)) = self.active_content_block.take() else {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_stop referenced nonexistent block index {index}"
+            )));
         };
+        if index != active_index {
+            self.active_content_block = Some((active_index, block));
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_stop index {index} did not match active block index {active_index}"
+            )));
+        }
+        let block = finalize_stream_content_block(block)?;
         push_anthropic_content_block(&block, &mut self.items, &mut self.provider_replay)
+            .map(|()| self.next_content_block_index += 1)
     }
 
     fn finish(mut self) -> ProviderResult<ModelResponse> {
+        if !self.message_started {
+            return Err(ProviderError::Provider(
+                "Anthropic response stream ended without message_start".to_string(),
+            ));
+        }
         if !self.message_stopped {
             return Err(ProviderError::Provider(
                 "Anthropic response stream ended before message_stop".to_string(),
@@ -2197,17 +2642,9 @@ impl AnthropicStreamState {
             // Anthropic can classify a Fable response after streaming partial
             // text, thinking, or tool blocks. The entire partial attempt is
             // incomplete and must not be persisted or replayed.
-            self.content_blocks.clear();
+            self.active_content_block = None;
             self.items.clear();
             self.provider_replay.clear();
-        } else {
-            for block in std::mem::take(&mut self.content_blocks)
-                .into_iter()
-                .flatten()
-                .map(finalize_stream_content_block)
-            {
-                push_anthropic_content_block(&block, &mut self.items, &mut self.provider_replay)?;
-            }
         }
         if self.stop_reason == ModelStopReason::Compaction
             || self
@@ -2274,30 +2711,69 @@ fn normalize_stream_content_start(block: &Value) -> Value {
     block
 }
 
-fn finalize_stream_content_block(mut block: Value) -> Value {
+fn finalize_stream_content_block(mut block: Value) -> ProviderResult<Value> {
     if let Some("tool_use" | "server_tool_use") = block.get("type").and_then(Value::as_str) {
-        if let Some(input) = block.get("input").and_then(Value::as_str) {
-            block["input"] = parse_streamed_json_object(input);
-        }
+        let input = block.get("input").and_then(Value::as_str).ok_or_else(|| {
+            ProviderError::Provider(
+                "Anthropic streamed tool content block input was not a string".to_string(),
+            )
+        })?;
+        block["input"] = parse_streamed_json_object(input)?;
     }
-    block
+    if block.get("type").and_then(Value::as_str) == Some("thinking")
+        && block
+            .get("signature")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(ProviderError::Provider(
+            "Anthropic thinking content block ended without signature_delta".to_string(),
+        ));
+    }
+    Ok(block)
 }
 
-fn parse_streamed_json_object(input: &str) -> Value {
+fn parse_streamed_json_object(input: &str) -> ProviderResult<Value> {
     if input.is_empty() {
-        return json!({});
+        return Ok(json!({}));
     }
-    serde_json::from_str(input).unwrap_or_else(|_| json!({}))
+    let value = serde_json::from_str::<Value>(input).map_err(|error| {
+        ProviderError::Provider(format!(
+            "Anthropic streamed tool input was malformed JSON: {error}"
+        ))
+    })?;
+    if !value.is_object() {
+        return Err(ProviderError::Provider(
+            "Anthropic streamed tool input was not a JSON object".to_string(),
+        ));
+    }
+    Ok(value)
 }
 
-fn append_json_string_field(block: &mut Value, field: &str, delta: Option<&Value>) {
-    let Some(delta) = delta.and_then(Value::as_str) else {
-        return;
-    };
-    match block.get_mut(field) {
-        Some(Value::String(value)) => value.push_str(delta),
-        _ => block[field] = Value::String(delta.to_string()),
+fn required_anthropic_delta_string<'a>(delta: &'a Value, field: &str) -> ProviderResult<&'a str> {
+    delta.get(field).and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::Provider(format!(
+            "Anthropic {} missing string {field}",
+            delta
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("content block delta")
+        ))
+    })
+}
+
+fn append_required_json_string_field(
+    block: &mut Value,
+    block_field: &str,
+    delta: &Value,
+    delta_field: &str,
+) -> ProviderResult<()> {
+    let value = required_anthropic_delta_string(delta, delta_field)?;
+    match block.get_mut(block_field) {
+        Some(Value::String(current)) => current.push_str(value),
+        _ => block[block_field] = Value::String(value.to_string()),
     }
+    Ok(())
 }
 
 fn push_anthropic_content_block(
@@ -5712,6 +6188,486 @@ data: {"type":"content_block_start","index":2,"content_block":{"type":"text","te
     }
 
     #[test]
+    fn anthropic_sse_preserves_valid_reasoning_server_tool_citation_multiblock_stream() {
+        let sse = r#"
+data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private"}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-signature"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}
+
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"rust\"}"}}
+
+data: {"type":"content_block_stop","index":1}
+
+data: {"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","title":"Rust","url":"https://www.rust-lang.org","encrypted_content":"opaque","page_age":null}]}}
+
+data: {"type":"content_block_stop","index":2}
+
+data: {"type":"content_block_start","index":3,"content_block":{"type":"text","text":"","citations":[]}}
+
+data: {"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"Rust"}}
+
+data: {"type":"content_block_delta","index":3,"delta":{"type":"citations_delta","citation":{"type":"web_search_result_location","cited_text":"Rust","encrypted_index":"opaque-index","title":"Rust","url":"https://www.rust-lang.org"}}}
+
+data: {"type":"content_block_stop","index":3}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+data: {"type":"message_stop"}
+"#;
+
+        let response = parse_anthropic_sse(sse).expect("valid multiblock stream parses");
+        assert_eq!(response.assistant.text(), "Rust");
+        assert_eq!(response.provider_replay.len(), 4);
+        let replay = response
+            .provider_replay
+            .iter()
+            .map(ProviderReplayItem::raw_value)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("replay remains valid JSON");
+        assert_eq!(replay[0]["signature"], "opaque-signature");
+        assert_eq!(replay[1]["input"], json!({ "query": "rust" }));
+        assert_eq!(replay[2]["tool_use_id"], "srvtoolu_1");
+        assert_eq!(
+            replay[3]["citations"][0]["type"],
+            "web_search_result_location"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_rejects_malformed_known_content_sequences_and_huge_indices() {
+        let cases = [
+            (
+                "missing start index",
+                vec![json!({
+                    "type": "content_block_start",
+                    "content_block": { "type": "text", "text": "" },
+                })],
+            ),
+            (
+                "content block missing type",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "text": "" },
+                })],
+            ),
+            (
+                "unsupported content block type",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "future_content" },
+                })],
+            ),
+            (
+                "tool content block missing id",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "name": "read",
+                        "input": {},
+                    },
+                })],
+            ),
+            (
+                "hosted result scalar content",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": "invalid",
+                    },
+                })],
+            ),
+            (
+                "hosted result missing encrypted content",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": [{
+                            "type": "web_search_result",
+                            "title": "Rust",
+                            "url": "https://www.rust-lang.org",
+                        }],
+                    },
+                })],
+            ),
+            (
+                "wrong start index type",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": "0",
+                    "content_block": { "type": "text", "text": "" },
+                })],
+            ),
+            (
+                "huge start index",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": u64::MAX,
+                    "content_block": { "type": "text", "text": "" },
+                })],
+            ),
+            (
+                "gapped start index",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": { "type": "text", "text": "" },
+                })],
+            ),
+            (
+                "missing content block",
+                vec![json!({ "type": "content_block_start", "index": 0 })],
+            ),
+            (
+                "scalar content block",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": "text",
+                })],
+            ),
+            (
+                "prepopulated text",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "text", "text": "already here" },
+                })],
+            ),
+            (
+                "prepopulated tool input",
+                vec![json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "read",
+                        "input": { "path": "README.md" },
+                    },
+                })],
+            ),
+            (
+                "duplicate start",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                ],
+            ),
+            (
+                "citation delta missing required title",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {
+                            "type": "citations_delta",
+                            "citation": {
+                                "type": "web_search_result_location",
+                                "cited_text": "Rust",
+                                "encrypted_index": "opaque",
+                                "url": "https://www.rust-lang.org",
+                            },
+                        },
+                    }),
+                ],
+            ),
+            (
+                "delta missing index",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "delta": { "type": "text_delta", "text": "hello" },
+                    }),
+                ],
+            ),
+            (
+                "delta missing object",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({ "type": "content_block_delta", "index": 0 }),
+                ],
+            ),
+            (
+                "delta for nonexistent block",
+                vec![json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": "hello" },
+                })],
+            ),
+            (
+                "delta wrong active index",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 1,
+                        "delta": { "type": "text_delta", "text": "hello" },
+                    }),
+                ],
+            ),
+            (
+                "delta missing type",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "text": "hello" },
+                    }),
+                ],
+            ),
+            (
+                "unknown delta type",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "future_delta", "text": "hello" },
+                    }),
+                ],
+            ),
+            (
+                "delta missing required text",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "text_delta" },
+                    }),
+                ],
+            ),
+            (
+                "delta block type mismatch",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "input_json_delta", "partial_json": "{}" },
+                    }),
+                ],
+            ),
+            (
+                "malformed streamed tool json",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "read",
+                            "input": {},
+                        },
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "input_json_delta", "partial_json": "{" },
+                    }),
+                    json!({ "type": "content_block_stop", "index": 0 }),
+                ],
+            ),
+            (
+                "nonobject streamed tool json",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_1",
+                            "name": "web_search",
+                            "input": {},
+                        },
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "input_json_delta", "partial_json": "[]" },
+                    }),
+                    json!({ "type": "content_block_stop", "index": 0 }),
+                ],
+            ),
+            (
+                "thinking missing signature",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": "",
+                        },
+                    }),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": { "type": "thinking_delta", "thinking": "private" },
+                    }),
+                    json!({ "type": "content_block_stop", "index": 0 }),
+                ],
+            ),
+            (
+                "stop missing index",
+                vec![json!({ "type": "content_block_stop" })],
+            ),
+            (
+                "stop nonexistent block",
+                vec![json!({ "type": "content_block_stop", "index": 0 })],
+            ),
+            (
+                "stop wrong active index",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({ "type": "content_block_stop", "index": 1 }),
+                ],
+            ),
+            (
+                "duplicate stop",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({ "type": "content_block_stop", "index": 0 }),
+                    json!({ "type": "content_block_stop", "index": 0 }),
+                ],
+            ),
+            (
+                "duplicate completed index",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({ "type": "content_block_stop", "index": 0 }),
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                ],
+            ),
+            (
+                "message stop with open block",
+                vec![
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                    json!({ "type": "message_stop" }),
+                ],
+            ),
+            (
+                "content after terminal delta",
+                vec![
+                    json!({
+                        "type": "message_delta",
+                        "delta": { "stop_reason": "end_turn" },
+                    }),
+                    json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": { "type": "text", "text": "" },
+                    }),
+                ],
+            ),
+        ];
+
+        for (name, events) in cases {
+            let mut all_events = vec![json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "content": [] },
+            })];
+            all_events.extend(events);
+            all_events.extend([
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn" },
+                }),
+                json!({ "type": "message_stop" }),
+            ]);
+            let sse = all_events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            assert!(parse_anthropic_sse(&sse).is_err(), "{name}");
+        }
+    }
+
+    #[test]
     fn anthropic_sse_maps_max_tokens_after_required_message_stop() {
         let sse = r#"
 data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-7","content":[],"stop_reason":null,"usage":{"input_tokens":8,"output_tokens":1}}}
@@ -5889,6 +6845,8 @@ data: {"type":"content_block_stop","index":2}
 data: {"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}
 
 data: {"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"unfinished partial"}}
+
+data: {"type":"content_block_stop","index":3}
 
 data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":null,"explanation":null}},"usage":{"output_tokens":22}}
 
