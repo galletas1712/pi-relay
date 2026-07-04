@@ -1349,6 +1349,7 @@ fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<Mod
     state.finish()
 }
 
+#[cfg_attr(test, derive(Debug, Clone, PartialEq, Eq))]
 struct ResponsesStreamState {
     provider: ProviderKind,
     added_items: BTreeMap<usize, Value>,
@@ -1374,8 +1375,7 @@ impl ResponsesStreamState {
                 "OpenAI response stream ended before response.completed".to_string(),
             ));
         }
-        self.validate_output_indices()?;
-        self.validate_output_identities()?;
+        Self::validate_output_items(&self.output_items)?;
 
         let mut items = Vec::new();
         let mut provider_replay = Vec::new();
@@ -1405,8 +1405,13 @@ impl ResponsesStreamState {
         })
     }
 
-    fn validate_output_indices(&self) -> ProviderResult<()> {
-        for (expected, actual) in self.output_items.keys().copied().enumerate() {
+    fn validate_output_items(output_items: &BTreeMap<usize, Value>) -> ProviderResult<()> {
+        Self::validate_output_indices(output_items)?;
+        Self::validate_output_identities(output_items)
+    }
+
+    fn validate_output_indices(output_items: &BTreeMap<usize, Value>) -> ProviderResult<()> {
+        for (expected, actual) in output_items.keys().copied().enumerate() {
             if actual != expected {
                 return Err(ProviderError::Provider(format!(
                     "OpenAI response output indices were not contiguous: expected {expected}, found {actual}"
@@ -1416,9 +1421,9 @@ impl ResponsesStreamState {
         Ok(())
     }
 
-    fn validate_output_identities(&self) -> ProviderResult<()> {
+    fn validate_output_identities(output_items: &BTreeMap<usize, Value>) -> ProviderResult<()> {
         let mut identities = BTreeMap::new();
-        for (index, item) in &self.output_items {
+        for (index, item) in output_items {
             let item_type = openai_replay_item_type(item, "OpenAI output item")?;
             for field in ["id", "call_id"] {
                 let Some(identity) = item
@@ -1502,7 +1507,7 @@ impl ResponsesStreamState {
         Ok(())
     }
 
-    fn reconcile_terminal_output(&mut self, output: &Value) -> ProviderResult<()> {
+    fn reconcile_terminal_output(&self, output: &Value) -> ProviderResult<BTreeMap<usize, Value>> {
         let output = output.as_array().ok_or_else(|| {
             ProviderError::Provider(
                 "OpenAI response.completed response.output was not an array".to_string(),
@@ -1518,8 +1523,8 @@ impl ResponsesStreamState {
                 reconciled_items.insert(index, item.clone());
             }
         }
-        self.output_items = reconciled_items;
-        Ok(())
+        Self::validate_output_items(&reconciled_items)?;
+        Ok(reconciled_items)
     }
 
     fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
@@ -1595,12 +1600,18 @@ impl ResponsesStreamState {
                     }
                 }
                 self.reconcile_added_items()?;
-                if let Some(output) = response.get("output") {
-                    self.reconcile_terminal_output(output)?;
+                let reconciled_items = if let Some(output) = response.get("output") {
+                    Some(self.reconcile_terminal_output(output)?)
+                } else {
+                    Self::validate_output_items(&self.output_items)?;
+                    None
+                };
+                let usage = response.get("usage").and_then(openai_usage);
+
+                if let Some(output_items) = reconciled_items {
+                    self.output_items = output_items;
                 }
-                self.validate_output_indices()?;
-                self.validate_output_identities()?;
-                self.usage = response.get("usage").and_then(openai_usage);
+                self.usage = usage;
                 self.completed = true;
                 Ok(SseControl::Stop)
             }
@@ -3493,7 +3504,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
     }
 
     #[test]
-    fn responses_sse_accepts_live_derived_terminal_output_omitting_done_item() {
+    fn responses_state_accepts_live_derived_terminal_output_omitting_done_item() {
         // Sanitized from the private Codex SSE shape observed in a credentialed
         // daemon smoke: the done item is authoritative even though the terminal
         // response carries an output array that does not repeat it.
@@ -3508,30 +3519,135 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
                 "annotations": [],
             }],
         });
-        let sse = [
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": done,
-            }),
-            json!({
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_sanitized",
-                    "status": "completed",
-                    "output": [],
-                },
-            }),
-        ]
-        .into_iter()
-        .map(|event| format!("data: {event}\n\n"))
-        .collect::<String>();
+        let mut state = ResponsesStreamState::new(ProviderKind::OpenAi);
+        assert_eq!(
+            state
+                .process_event(&json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": done,
+                }))
+                .expect("done item records"),
+            SseControl::Continue
+        );
+        assert_eq!(
+            state
+                .process_event(&json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_sanitized",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 2,
+                            "total_tokens": 3,
+                        },
+                    },
+                }))
+                .expect("terminal output may omit a fully received done item"),
+            SseControl::Stop
+        );
 
-        let response = parse_responses_sse(&sse, ProviderKind::OpenAi)
-            .expect("terminal output may omit a fully received done item");
+        assert!(state.completed);
+        assert_eq!(state.output_items.len(), 1);
+        assert_eq!(state.output_items.get(&0), Some(&done));
+        assert_eq!(
+            state.usage.as_ref().and_then(|usage| usage.total_tokens),
+            Some(3)
+        );
+
+        let response = state.finish().expect("completed state finishes");
         assert_eq!(response.assistant.text(), "ok");
         assert_eq!(response.provider_replay.len(), 1);
         assert_eq!(response.provider_replay[0].raw_value().unwrap(), done);
+    }
+
+    #[test]
+    fn responses_state_rejects_duplicate_terminal_identity_without_mutation() {
+        let message = |text| {
+            json!({
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": text }],
+            })
+        };
+        let mut state = ResponsesStreamState::new(ProviderKind::OpenAi);
+        state
+            .process_event(&json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": message("done"),
+            }))
+            .expect("done item records");
+        let before = state.clone();
+
+        let error = state
+            .process_event(&json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [message("terminal")],
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "total_tokens": 120,
+                    },
+                },
+            }))
+            .expect_err("the same stable item cannot occupy two output indices");
+
+        assert!(
+            error.to_string().contains("duplicated stable id"),
+            "{error}"
+        );
+        assert_eq!(state, before, "failed reconciliation must be atomic");
+        assert!(state.usage.is_none());
+        assert!(!state.completed);
+    }
+
+    #[test]
+    fn responses_state_rejects_sparse_terminal_candidate_without_mutation() {
+        let mut state = ResponsesStreamState::new(ProviderKind::OpenAi);
+        state
+            .process_event(&json!({
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": {
+                    "type": "reasoning",
+                    "encrypted_content": "done",
+                },
+            }))
+            .expect("done item records");
+        let before = state.clone();
+
+        let error = state
+            .process_event(&json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "terminal" }],
+                    }],
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 20,
+                        "total_tokens": 120,
+                    },
+                },
+            }))
+            .expect_err("terminal reconciliation cannot leave a sparse candidate");
+
+        assert!(error.to_string().contains("not contiguous"), "{error}");
+        assert_eq!(state, before, "failed reconciliation must be atomic");
+        assert!(state.usage.is_none());
+        assert!(!state.completed);
     }
 
     #[test]
@@ -3583,43 +3699,6 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
                 Some("message".to_string()),
                 Some("function_call".to_string())
             ]
-        );
-    }
-
-    #[test]
-    fn responses_sse_rejects_duplicate_stable_identity_after_reconciliation() {
-        let message = |text| {
-            json!({
-                "type": "message",
-                "id": "msg_1",
-                "role": "assistant",
-                "content": [{ "type": "output_text", "text": text }],
-            })
-        };
-        let sse = [
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 1,
-                "item": message("done"),
-            }),
-            json!({
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_1",
-                    "status": "completed",
-                    "output": [message("terminal")],
-                },
-            }),
-        ]
-        .into_iter()
-        .map(|event| format!("data: {event}\n\n"))
-        .collect::<String>();
-
-        let error = parse_responses_sse(&sse, ProviderKind::OpenAi)
-            .expect_err("the same stable item cannot occupy two output indices");
-        assert!(
-            error.to_string().contains("duplicated stable id"),
-            "{error}"
         );
     }
 
