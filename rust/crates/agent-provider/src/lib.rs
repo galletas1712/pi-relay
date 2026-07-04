@@ -180,11 +180,14 @@ fn effective_provider_tools(
 }
 
 impl ModelTranscriptEntry {
-    pub fn provider_replay_for(&self, provider: ProviderKind) -> Vec<ProviderReplayItem> {
+    pub(crate) fn provider_replay_values_for(
+        &self,
+        provider: ProviderKind,
+    ) -> serde_json::Result<Vec<Value>> {
         self.provider_replay
             .iter()
             .filter(|record| record.provider == provider)
-            .cloned()
+            .map(ProviderReplayItem::raw_value)
             .collect()
     }
 
@@ -576,7 +579,7 @@ mod provider_error_tests {
     }
 
     #[test]
-    fn provider_replay_filter_clones_raw_records_without_rewriting_or_parsing() {
+    fn provider_replay_filter_parses_raw_values_without_rewriting() {
         let openai = ProviderReplayItem {
             provider: ProviderKind::OpenAi,
             raw_json: r#"{"type":"function_call","name":"web_search"}"#.to_string(),
@@ -597,12 +600,14 @@ mod provider_error_tests {
         };
 
         assert_eq!(
-            entry.provider_replay_for(ProviderKind::OpenAi),
-            vec![openai]
+            entry
+                .provider_replay_values_for(ProviderKind::OpenAi)
+                .unwrap(),
+            vec![openai.raw_value().unwrap()]
         );
-        assert_eq!(
-            entry.provider_replay_for(ProviderKind::Claude),
-            vec![corrupt_claude]
-        );
+        assert!(entry
+            .provider_replay_values_for(ProviderKind::Claude)
+            .is_err());
+        assert_eq!(entry.provider_replay, vec![openai, corrupt_claude]);
     }
 }

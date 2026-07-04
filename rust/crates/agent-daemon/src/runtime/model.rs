@@ -407,4 +407,23 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn typed_incomplete_survives_model_failure_result_boundary() {
+        let failure = ModelProviderFailure {
+            error: agent_provider::ProviderError::Incomplete {
+                status: "incomplete".to_string(),
+                reason: "pause_turn".to_string(),
+            },
+            attempts: MODEL_PROVIDER_MAX_ATTEMPTS,
+        };
+
+        assert_eq!(
+            model_failure_update_result(&failure),
+            json!({
+                "error": "provider response was incomplete (status: incomplete, reason: pause_turn)",
+                "provider_retry_attempts": MODEL_PROVIDER_MAX_ATTEMPTS,
+            })
+        );
+    }
 }

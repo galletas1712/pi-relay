@@ -1581,11 +1581,8 @@ fn emitted_anthropic_replay(
     compaction_summary: bool,
 ) -> ProviderResult<(Vec<Value>, bool)> {
     let blocks = entry
-        .provider_replay
-        .iter()
-        .filter(|record| record.provider == ProviderKind::Claude)
-        .map(|record| record.raw_value().map_err(ProviderError::Json))
-        .collect::<ProviderResult<Vec<_>>>()?;
+        .provider_replay_values_for(ProviderKind::Claude)
+        .map_err(ProviderError::Json)?;
     if compaction_summary {
         if blocks.len() != 1 {
             return Err(ProviderError::Provider(
@@ -1604,7 +1601,8 @@ fn emitted_anthropic_replay(
 
     let mut has_compaction = false;
     for block in &blocks {
-        if block.get("type").and_then(Value::as_str) == Some("compaction") {
+        let block_type = anthropic_block_type(block, "persisted Anthropic replay block")?;
+        if block_type == "compaction" {
             validate_anthropic_compaction_block(block).map_err(|error| {
                 ProviderError::Provider(format!(
                     "refusing malformed persisted Anthropic compaction replay: {}",
@@ -1615,6 +1613,17 @@ fn emitted_anthropic_replay(
         }
     }
     Ok((blocks, has_compaction))
+}
+
+fn anthropic_block_type<'a>(block: &'a Value, context: &str) -> ProviderResult<&'a str> {
+    let object = block
+        .as_object()
+        .ok_or_else(|| ProviderError::Provider(format!("{context} was not an object")))?;
+    object
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|block_type| !block_type.is_empty())
+        .ok_or_else(|| ProviderError::Provider(format!("{context} missing nonempty string type")))
 }
 
 fn anthropic_daemon_tool_use_id(tool_call_id: &str) -> String {
@@ -1995,6 +2004,7 @@ struct AnthropicStreamState {
     usage: Option<ProviderUsage>,
     stop_reason: ModelStopReason,
     stop_details: Option<ModelStopDetails>,
+    saw_stop_reason: bool,
     message_stopped: bool,
 }
 
@@ -2007,6 +2017,7 @@ impl Default for AnthropicStreamState {
             usage: None,
             stop_reason: ModelStopReason::Complete,
             stop_details: None,
+            saw_stop_reason: false,
             message_stopped: false,
         }
     }
@@ -2064,16 +2075,46 @@ impl AnthropicStreamState {
                 if let Some(usage) = event.get("usage").and_then(anthropic_usage) {
                     merge_anthropic_usage(&mut self.usage, usage);
                 }
-                match event.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                    Some("max_tokens") => {
-                        self.stop_reason = ModelStopReason::MaxOutputTokens;
+                match event.pointer("/delta/stop_reason") {
+                    Some(Value::String(reason))
+                        if matches!(reason.as_str(), "end_turn" | "stop_sequence" | "tool_use") =>
+                    {
+                        self.stop_reason = ModelStopReason::Complete;
+                        self.saw_stop_reason = true;
                     }
-                    Some("refusal") => {
+                    Some(Value::String(reason)) if reason == "max_tokens" => {
+                        self.stop_reason = ModelStopReason::MaxOutputTokens;
+                        self.saw_stop_reason = true;
+                    }
+                    Some(Value::String(reason)) if reason == "refusal" => {
                         self.stop_reason = ModelStopReason::Refusal;
                         self.stop_details =
                             anthropic_stop_details(event.pointer("/delta/stop_details"));
+                        self.saw_stop_reason = true;
                     }
-                    _ => {}
+                    Some(Value::String(reason))
+                        if matches!(
+                            reason.as_str(),
+                            "pause_turn" | "model_context_window_exceeded"
+                        ) =>
+                    {
+                        return Err(ProviderError::Incomplete {
+                            status: "incomplete".to_string(),
+                            reason: reason.clone(),
+                        });
+                    }
+                    Some(Value::String(reason)) if !reason.is_empty() => {
+                        return Err(ProviderError::Incomplete {
+                            status: "unknown_stop_reason".to_string(),
+                            reason: reason.clone(),
+                        });
+                    }
+                    None | Some(Value::Null | Value::String(_)) => {}
+                    Some(reason) => {
+                        return Err(ProviderError::Provider(format!(
+                            "Anthropic message_delta stop_reason was not a string or null: {reason}"
+                        )))
+                    }
                 }
                 Ok(SseControl::Continue)
             }
@@ -2145,6 +2186,11 @@ impl AnthropicStreamState {
         if !self.message_stopped {
             return Err(ProviderError::Provider(
                 "Anthropic response stream ended before message_stop".to_string(),
+            ));
+        }
+        if !self.saw_stop_reason {
+            return Err(ProviderError::Provider(
+                "Anthropic response stream ended without a recognized stop_reason".to_string(),
             ));
         }
         if self.stop_reason == ModelStopReason::Refusal {
@@ -2259,9 +2305,7 @@ fn push_anthropic_content_block(
     items: &mut Vec<AssistantItem>,
     provider_replay: &mut Vec<ProviderReplayItem>,
 ) -> ProviderResult<()> {
-    let Some(block_type) = block.get("type").and_then(Value::as_str) else {
-        return Ok(());
-    };
+    let block_type = anthropic_block_type(block, "Anthropic response content block")?;
     let display = anthropic_provider_replay_display(block);
     provider_replay.push(ProviderReplayItem::new_with_display(
         ProviderKind::Claude,
@@ -4597,6 +4641,12 @@ mod tests {
                 raw_json: "{".to_string(),
                 display: None,
             },
+            ProviderReplayItem::new(ProviderKind::Claude, &Value::Null).unwrap(),
+            ProviderReplayItem::new(ProviderKind::Claude, &json!(7)).unwrap(),
+            ProviderReplayItem::new(ProviderKind::Claude, &json!({})).unwrap(),
+            ProviderReplayItem::new(ProviderKind::Claude, &json!({ "type": null })).unwrap(),
+            ProviderReplayItem::new(ProviderKind::Claude, &json!({ "type": 7 })).unwrap(),
+            ProviderReplayItem::new(ProviderKind::Claude, &json!({ "type": "" })).unwrap(),
             ProviderReplayItem::new(
                 ProviderKind::Claude,
                 &json!({ "type": "compaction", "content": null }),
@@ -5689,6 +5739,56 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
     }
 
     #[test]
+    fn anthropic_sse_rejects_incomplete_and_unknown_stop_reasons_without_partial_replay() {
+        for (status, reason) in [
+            ("incomplete", "pause_turn"),
+            ("incomplete", "model_context_window_exceeded"),
+            ("unknown_stop_reason", "future_stop_reason"),
+        ] {
+            let sse = format!(
+                r#"
+data: {{"type":"message_start","message":{{"id":"msg_1","content":[],"usage":{{"input_tokens":8,"output_tokens":1}}}}}}
+
+data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}
+
+data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"partial"}}}}
+
+data: {{"type":"content_block_stop","index":0}}
+
+data: {{"type":"message_delta","delta":{{"stop_reason":"{reason}"}},"usage":{{"output_tokens":2}}}}
+
+data: {{"type":"message_stop"}}
+"#
+            );
+            let error = parse_anthropic_sse(&sse).expect_err(reason);
+            match error {
+                ProviderError::Incomplete {
+                    status: actual_status,
+                    reason: actual_reason,
+                } => {
+                    assert_eq!(actual_status, status);
+                    assert_eq!(actual_reason, reason);
+                }
+                other => panic!("expected typed incomplete for {reason}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_sse_requires_an_explicit_known_stop_reason() {
+        let error = parse_anthropic_sse(
+            r#"
+data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
+
+data: {"type":"message_stop"}
+"#,
+        )
+        .expect_err("missing stop reason must not default to success");
+
+        assert!(error.to_string().contains("stop_reason"), "{error}");
+    }
+
+    #[test]
     fn anthropic_sse_requires_message_stop_not_done_or_eof() {
         let prefix = r#"
 data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
@@ -5718,6 +5818,8 @@ data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
 data: {"type":"future_progress","opaque":{"value":1}}
 
 data: {"type":"ping"}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
 
 data: {"type":"message_stop"}
 "#,

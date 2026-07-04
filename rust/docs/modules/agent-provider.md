@@ -145,9 +145,12 @@ Provider replay is provider-filtered and parsed for request construction, but
 its JSON values and provider order are otherwise unchanged. This includes local
 client-tool names such as `apply_patch` and
 `str_replace_based_edit_tool`, hosted blocks such as `server_tool_use` and
-`web_search_call`, and unknown passive output items. Tool-name canonicalization
-is confined to the separate semantic transcript/UI projection. Corrupt raw
-replay fails request construction rather than being silently dropped.
+`web_search_call`, and opaque extension items inside canonical OpenAI compact
+output. Ordinary OpenAI output/replay uses an explicit known-item allowlist;
+unknown types fail closed because the adapter cannot assume that a future item
+requires no client response. Tool-name canonicalization is confined to the
+separate semantic transcript/UI projection. Corrupt raw replay fails request
+construction rather than being silently dropped.
 
 Daemon-authored observations, such as delegation completion wakeups carrying an
 `inspect_delegation`-equivalent snapshot, are not provider replay and are not
@@ -176,19 +179,23 @@ support alone does not imply that every Claude model supports native
 compaction.
 
 - **OpenAI** posts a unary `ProviderCompactionRequest` to `/responses/compact`
-  (JSON, 20-minute timeout). The body matches Codex's `CompactionInput` —
+  (JSON, 20-minute timeout). The body is a valid subset of Codex's current
+  `CompactionInput` —
   `model`, `instructions`, `input`, `tools`, `parallel_tool_calls`,
   `reasoning.effort`, `service_tier`, `prompt_cache_key` — and omits
-  streaming-only fields. The complete returned `output` array is canonical
+  streaming-only fields. Codex also forwards optional `text` controls; pi-relay
+  has no model verbosity/text control yet, so it has no such value to forward.
+  The complete returned `output` array is canonical
   replacement history: every item is retained unchanged and in provider order,
   including user/developer messages, reasoning, tool/hosted-tool items, and
-  unknown extensions. The response must be nonempty and contain a
-  `type = "compaction"` item with string `encrypted_content`. The current Codex
-  compatibility alias `compaction_summary` is also accepted and retained
-  without rewriting. Assistant text may be projected separately as display
-  summary, but is never substituted into replay. Missing, corrupt, or
-  non-native replay on a persisted OpenAI `CompactionSummary` fails request
-  construction rather than synthesizing a user summary.
+  unknown extensions. Every item must be an object with a nonempty string
+  `type`, and the response must contain exactly one native checkpoint across
+  `type = "compaction"` and the currently evidenced Codex schema alias
+  `compaction_summary`; its `encrypted_content` must be a string. The alias is
+  retained without rewriting. Assistant text may be projected separately as
+  display summary, but is never substituted into replay. Missing, corrupt,
+  duplicate, or non-native replay on a persisted OpenAI `CompactionSummary`
+  fails request construction rather than synthesizing a user summary.
 - **Anthropic** uses the Messages API with the provider-required beta `compact-2026-01-12`, `context_management.edits[0].type = "compact_20260112"`, the minimum valid 50K input-token trigger, and `pause_after_compaction = true`. It supplies the PI compaction prompt as replacement custom instructions, explicitly forbids tool calls, and supplies no tools. Because Anthropic rejects an assistant prefill for this operation, the adapter appends one minimal synthetic user instruction when the rendered transcript is assistant-ended or empty. For an assistant tool-use tail, it normalizes the complete following user run once: real results are retained in tool-use order, only missing results are synthesized, then all non-result user content follows in original order; duplicates and redundant empty user messages are dropped. The authoritative custom instructions remain in the context-management edit. Static support is limited to the documented model ids `claude-fable-5`, `claude-mythos-5`, `claude-mythos-preview`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, and `claude-sonnet-4-6`; when Models API metadata includes `capabilities.context_management.compact_20260112`, that authoritative value overrides the static fallback. This static metadata remains necessary when authoritative model metadata is unavailable. Unknown and known-unsupported ids return a typed terminal native-compaction `unsupported` error before network dispatch. The compact call accepts only an eventual terminal `stop_reason = "compaction"` with one index-zero compaction block whose `content` is a non-null/non-empty string; ordinary completion, tools, refusal, max tokens, malformed/truncated streams, and missing/null/empty content are typed native-compaction errors.
 
 The Anthropic compaction block is stored as opaque provider replay on the new `CompactionSummary` root. One strict rule defines valid replay: `type` is `compaction`, `content` is a nonempty string, and `encrypted_content` is absent, null, or a string. `content` is copied from the compaction delta; opaque encryption and all start/delta extension fields (including a top-level `name`) are retained unchanged. No cache fields or daemon metadata are injected into the provider block. Request rendering parses every Claude sidecar on the only transcript kinds that can emit it, `CompactionSummary` and `AssistantMessage`. Every `CompactionSummary` must have exactly one valid Claude compaction replay block; zero or multiple Claude blocks fail locally. Assistant replay may contain ordinary Claude block types, but corrupt JSON and malformed exact compaction blocks fail locally. Wrong-provider and non-emitted sidecars have no effect.
@@ -204,11 +211,21 @@ Subsequent Messages and token-count requests replay the complete block unchanged
 reports `[DONE]` and malformed JSON frames to the adapter. Ordinary OpenAI
 success requires `response.completed`; `response.incomplete` is a typed
 non-success retaining status/reason, and refusal content produces a refusal
-terminal that discards partial assistant output/replay. Ordinary Anthropic
-success requires `message_stop`. For both providers, EOF or `[DONE]` alone and
-malformed JSON are failures. Unknown future event types remain ignorable but
-never imply success. Unsupported OpenAI client-executed action types fail
-closed; hosted and unknown passive output items remain opaque replay.
+terminal that discards partial assistant output/replay. Completed output items
+must carry unique, contiguous `output_index` values and are materialized in that
+provider order rather than event-arrival order. Known messages and content
+parts are shape-validated. Supported `function_call`/`custom_tool_call` items
+become pi-relay tool calls; unsupported client actions and arbitrary unknown
+output item types fail closed. Known hosted/passive item types remain opaque
+replay.
+
+Ordinary Anthropic success requires `message_stop` after an explicit
+`end_turn`, `stop_sequence`, or `tool_use` reason. `max_tokens` and `refusal`
+retain their existing typed terminal behavior. `pause_turn`,
+`model_context_window_exceeded`, and unknown nonempty stop reasons are
+non-successes retaining the provider reason; partial assistant output/replay is
+not returned. For both providers, EOF or `[DONE]` alone and malformed JSON are
+failures. Unknown future event types remain ignorable but never imply success.
 
 The special Anthropic compact call uses separate strict state and requires
 `message_start`, one index-zero compaction `content_block_start`, one matching
@@ -230,7 +247,7 @@ Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire �
 
 ### Token estimation
 
-`token_estimator.rs` serializes each prompt section and transcript entry to its provider wire JSON and approximates tokens as `ceil(bytes / 4)`. Entries with replay sidecars are estimated from the raw replay JSON. Base64 image data URLs are discounted to a fixed `~7373`-byte resized-image estimate (Codex-style) so large inline images don't inflate the count.
+`token_estimator.rs` serializes each prompt section and transcript entry to its provider wire JSON and approximates tokens as `ceil(bytes / 4)`. Entries with replay sidecars are estimated from the exact serialized raw replay JSON. Replay rendering/serialization errors propagate instead of being masked as zero tokens. Base64 image data URLs are discounted to a fixed `~7373`-byte resized-image estimate (Codex-style) so large inline images don't inflate the count.
 
 ## Notes
 
