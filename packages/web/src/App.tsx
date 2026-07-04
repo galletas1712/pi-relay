@@ -1669,7 +1669,7 @@ export function App() {
 					title,
 					created_by: "web",
 					compaction: {
-						config: newSessionCompactionConfig(newSessionProvider),
+						config: newSessionCompactionConfig(),
 					},
 				},
 				clientInputId: randomId("web_start"),
@@ -2524,11 +2524,9 @@ function compactionRequestedNotice(data: Record<string, unknown>): string {
 function compactionCompletedNotice(data: Record<string, unknown>): string {
 	const trigger = typeof data.trigger === "string" ? data.trigger : null;
 	const provider = typeof data.provider === "string" ? data.provider : null;
-	const remote = data.remote === true;
 	const prefix = trigger === "auto" ? "auto-compaction" : "compaction";
-	if (provider === "openai" && remote) return `${prefix} completed with OpenAI provider-native compaction`;
-	if (provider === "claude" && remote) return `${prefix} completed with Anthropic provider-native compaction`;
-	if (provider === "claude") return `${prefix} completed with Claude summary`;
+	if (provider === "openai") return `${prefix} completed with OpenAI provider-native compaction`;
+	if (provider === "claude") return `${prefix} completed with Anthropic provider-native compaction`;
 	return `${prefix} completed`;
 }
 

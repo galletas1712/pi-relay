@@ -53,16 +53,9 @@ describe("session defaults", () => {
 		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.5" })).not.toContain("max");
 	});
 
-	it("keeps Anthropic native compaction opt-in", () => {
-		expect(newSessionCompactionConfig({ kind: "claude", model: "claude-sonnet-5" })).toEqual({
+	it("uses provider-independent native compaction scheduler defaults", () => {
+		expect(newSessionCompactionConfig()).toEqual({
 			auto_enabled: true,
-			remote_mode: "never",
-			anthropic_native_compaction: null,
-			max_consecutive_failures: 3,
-		});
-		expect(newSessionCompactionConfig({ kind: "openai", model: "gpt-5.6-sol" })).toEqual({
-			auto_enabled: true,
-			remote_mode: "auto",
 			max_consecutive_failures: 3,
 		});
 	});

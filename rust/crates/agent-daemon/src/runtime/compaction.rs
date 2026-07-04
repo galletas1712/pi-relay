@@ -357,7 +357,6 @@ async fn run_compaction_job(
                 summary: output.summary,
                 summary_kind: output.summary_kind.as_str().to_string(),
                 provider_replay: output.provider_replay,
-                remote: output.remote,
                 provider: output.provider,
                 usage: output.usage,
                 continuation_suffix,

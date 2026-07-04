@@ -60,9 +60,8 @@ impl Drop for TempDir {
 }
 
 use crate::provider_runtime::{
-    append_delegation_ledger_to_output, build_model_request, local_summary_request,
-    remote_compaction_request, CompactionOutput, CompactionSummaryKind, ProviderConnectionRegistry,
-    SessionTitleScheduler,
+    append_delegation_ledger_to_output, build_model_request, native_compaction_request,
+    CompactionOutput, CompactionSummaryKind, ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::{
     apply_model_response, recover_post_compaction_dispatches_on_boot, take_tasks, SessionDriver,
@@ -327,7 +326,6 @@ fn successful_compaction(summary: &str) -> CompactionCompletion {
         summary: summary.to_string(),
         summary_kind: "provider_text".to_string(),
         provider_replay: Vec::new(),
-        remote: false,
         provider: ProviderKind::OpenAi,
         usage: None,
         continuation_suffix: vec![ModelContextEntry {
@@ -1046,8 +1044,7 @@ async fn unknown_model_explicit_auto_recovers_overflow_across_heartbeat_loss() {
             "provider_model": "unknown-reactive-only-model",
             "compaction": {
                 "config": {
-                    "auto_enabled": true,
-                    "remote_mode": "never"
+                    "auto_enabled": true
                 }
             }
         }),
@@ -2986,13 +2983,6 @@ fn user_texts(entries: &[ModelTranscriptEntry]) -> Vec<&str> {
         .collect()
 }
 
-fn last_user_text(entries: &[ModelTranscriptEntry]) -> &str {
-    user_texts(entries)
-        .into_iter()
-        .last()
-        .expect("request has a final user message")
-}
-
 fn compaction_input_texts(entries: &[ModelTranscriptEntry]) -> Vec<&str> {
     entries
         .iter()
@@ -3009,7 +2999,6 @@ fn test_compaction_output(summary: &str) -> CompactionOutput {
         summary: summary.to_string(),
         summary_kind: CompactionSummaryKind::ProviderText,
         provider_replay: Vec::new(),
-        remote: true,
         provider: ProviderKind::OpenAi,
         usage: None,
     }
@@ -3362,40 +3351,39 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         })
         .into(),
     ];
-    let remote_request =
-        remote_compaction_request(&env.state, &config, "parent", transcript.clone())
-            .await
-            .expect("build remote compaction request");
+    let native_request = native_compaction_request(&env.state, &config, "parent", transcript)
+        .await
+        .expect("build native compaction request");
 
     assert_eq!(
-        remote_request.prompt.stable_prefix.as_deref(),
+        native_request.prompt.stable_prefix.as_deref(),
         Some("PI stable prompt")
     );
     assert!(
-        remote_request.prompt.dynamic_context.is_none(),
+        native_request.prompt.dynamic_context.is_none(),
         "compaction ledger must not be PromptSections.dynamic_context"
     );
-    let remote_input_texts = compaction_input_texts(&remote_request.transcript);
-    assert!(remote_input_texts
+    let native_input_texts = compaction_input_texts(&native_request.transcript);
+    assert!(native_input_texts
         .iter()
         .any(|text| text.contains("older provider summary")));
     assert!(
-        remote_input_texts
+        native_input_texts
             .iter()
             .any(|text| text.contains("old prior delegation ledger")),
-        "remote compaction input should preserve prior summary text, including old ledgers: {remote_input_texts:?}"
+        "native compaction input should preserve prior summary text, including old ledgers: {native_input_texts:?}"
     );
-    assert!(remote_input_texts.contains(&"history before compaction"));
+    assert!(native_input_texts.contains(&"history before compaction"));
     assert!(
-        remote_input_texts
+        native_input_texts
             .iter()
             .any(|text| text.contains("## Delegation state at compaction time")),
-        "remote compaction input should preserve old ledger text only as ordinary prior summary text: {remote_input_texts:?}"
+        "native compaction input should preserve old ledger text only as ordinary prior summary text: {native_input_texts:?}"
     );
-    let remote_joined = remote_input_texts.join("\n\n");
-    assert!(!remote_joined.contains(&format!("delegation_id: `{}`", running.id)));
-    assert!(!remote_joined.contains(&format!("delegation_id: `{}`", failed.id)));
-    assert!(!remote_joined.contains("## Current delegations"));
+    let native_joined = native_input_texts.join("\n\n");
+    assert!(!native_joined.contains(&format!("delegation_id: `{}`", running.id)));
+    assert!(!native_joined.contains(&format!("delegation_id: `{}`", failed.id)));
+    assert!(!native_joined.contains("## Current delegations"));
 
     let output = append_delegation_ledger_to_output(
         &env.state,
@@ -3452,30 +3440,6 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
     assert!(!ledger.contains("## User"));
     assert!(!ledger.contains("## Assistant"));
     assert!(!ledger.contains("transcript body"));
-
-    let local_request = local_summary_request(
-        &env.state,
-        &config,
-        "parent",
-        "parent:compaction",
-        transcript,
-    )
-    .await
-    .expect("build local compaction request");
-    assert!(local_request.prompt.dynamic_context.is_none());
-    let local_tail = last_user_text(&local_request.transcript);
-    let local_joined = compaction_input_texts(&local_request.transcript).join("\n\n");
-    assert!(
-        local_joined.contains("old prior delegation ledger"),
-        "local compaction input should preserve prior summary text, including old ledgers: {local_joined}"
-    );
-    assert!(local_tail.contains("Produce a compact continuation summary."));
-    assert!(
-        !local_tail.contains("## Delegation state at compaction time"),
-        "local compaction input should not include live delegation ledger: {local_tail}"
-    );
-    assert!(!local_tail.contains(&format!("delegation_id: `{}`", running.id)));
-    assert!(!local_tail.contains(&format!("delegation_id: `{}`", failed.id)));
 
     env.cleanup().await;
 }
@@ -3558,44 +3522,26 @@ async fn subagent_compaction_excludes_parent_delegation_ledger_and_sibling_state
         .into(),
     ];
 
-    let remote_request = remote_compaction_request(
+    let native_request = native_compaction_request(
         &env.state,
         &subagent_config,
         "subagent_under_compaction",
-        own_transcript.clone(),
-    )
-    .await
-    .expect("build remote subagent compaction request");
-    assert_eq!(
-        remote_request.transcript.len(),
-        own_transcript.len(),
-        "subagent remote compaction should not append parent delegation state"
-    );
-    let remote_joined = user_texts(&remote_request.transcript).join("\n\n");
-    assert!(remote_joined.contains("delegated task context"));
-    assert!(!remote_joined.contains("## Delegation state at compaction time"));
-    assert!(!remote_joined.contains("## Current delegations"));
-    assert!(!remote_joined.contains(&parent_delegation.id));
-    assert!(!remote_joined.contains("sibling_subagent"));
-    assert!(!remote_joined.contains("workflow-explore"));
-
-    let local_request = local_summary_request(
-        &env.state,
-        &subagent_config,
-        "subagent_under_compaction",
-        "subagent_under_compaction:compaction",
         own_transcript,
     )
     .await
-    .expect("build local subagent compaction request");
-    let local_joined = user_texts(&local_request.transcript).join("\n\n");
-    assert!(local_joined.contains("delegated task context"));
-    assert!(local_joined.contains("Produce a subagent continuation summary."));
-    assert!(!local_joined.contains("## Delegation state at compaction time"));
-    assert!(!local_joined.contains("## Current delegations"));
-    assert!(!local_joined.contains(&parent_delegation.id));
-    assert!(!local_joined.contains("sibling_subagent"));
-    assert!(!local_joined.contains("workflow-explore"));
+    .expect("build native subagent compaction request");
+    assert_eq!(
+        native_request.transcript.len(),
+        2,
+        "subagent native compaction should not append parent delegation state"
+    );
+    let native_joined = user_texts(&native_request.transcript).join("\n\n");
+    assert!(native_joined.contains("delegated task context"));
+    assert!(!native_joined.contains("## Delegation state at compaction time"));
+    assert!(!native_joined.contains("## Current delegations"));
+    assert!(!native_joined.contains(&parent_delegation.id));
+    assert!(!native_joined.contains("sibling_subagent"));
+    assert!(!native_joined.contains("workflow-explore"));
 
     let output = append_delegation_ledger_to_output(
         &env.state,

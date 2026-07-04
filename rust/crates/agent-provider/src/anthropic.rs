@@ -4496,12 +4496,12 @@ mod tests {
     }
 
     #[test]
-    fn compaction_summary_replay_is_strict_but_local_summary_needs_no_sidecar() {
+    fn compaction_summary_replay_is_strict_but_historical_summary_needs_no_sidecar() {
         let summary = || {
             TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
                 "session-1",
                 "leaf-1",
-                "local checkpoint",
+                "replay-free historical checkpoint",
                 Some(80_000),
                 agent_vocab::TurnId(7),
             ))
@@ -4520,16 +4520,16 @@ mod tests {
             turn_id: None,
         };
 
-        let local = prepare_messages_request(
+        let historical = prepare_messages_request(
             request(ModelTranscriptEntry {
                 item: summary(),
                 provider_replay: Vec::new(),
             }),
             &static_anthropic_model_metadata("claude-opus-4-8"),
         )
-        .expect("local summary without replay renders");
-        assert_eq!(local.beta_header, CLAUDE_CODE_BETA);
-        assert_eq!(local.body["messages"].as_array().unwrap().len(), 1);
+        .expect("historical summary without replay renders");
+        assert_eq!(historical.beta_header, CLAUDE_CODE_BETA);
+        assert_eq!(historical.body["messages"].as_array().unwrap().len(), 1);
 
         let invalid_replays = [
             vec![ProviderReplayItem {

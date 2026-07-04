@@ -115,7 +115,7 @@ driver loop after its durable store update. The narrow extension precedent
 remains `ToolRegistry`/`ToolExtension`, where the variation point is real and
 does not own session durability.
 
-`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (remote/local compaction and parent-only post-compaction delegation ledger append), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery + stable prompt sections), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization). The adjacent `delegation_context.rs` builds the bounded compaction ledger for top-level parent sessions.
+`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (provider-native compaction and parent-only post-compaction delegation ledger append), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery + stable prompt sections), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization). The adjacent `delegation_context.rs` builds the bounded compaction ledger for top-level parent sessions.
 
 ## Key types
 
@@ -178,7 +178,7 @@ Two retry layers exist:
 
 ### Auto-compaction with circuit breaker
 
-Before a model action dispatches, `gate_model_dispatch` measures input tokens and blocks the action if it would exceed the model's auto limit. `model_metadata.rs` supplies per-model context windows and provider/model-aware defaults. A verified 1,000,000-token Claude window defaults to 500,000 tokens, including an unknown Claude id whose authoritative Models API metadata discovers that window. Hosted GPT-5.6 Sol/Terra/Luna use the live Codex 372,000-token window and Codex's 90% threshold, 334,800. Older OpenAI models and other discovered/static windows retain the generic 85% default. The daemon selects and parses one whole persisted policy once per eligibility decision: `/compaction/config` when its `config` key exists, otherwise the direct `/compaction` object. The direct layout is pre-existing read compatibility; no current producer writes it, and fields are never merged across layouts. Remove that reader only after persisted rows have been inventoried and every direct-layout row has been migrated. The markerless nested web format remains valid but does not opt Claude into native compaction. Unknown fields, including the store-owned `max_consecutive_failures`, are ignored. Any malformed daemon-owned field disables automatic compaction and resolves Claude native mode to `never`; OpenAI retains its established provider-native baseline. A valid explicit limit wins and is clamped to the selected window. The effective limit is floored at 8,000 without exceeding that window; a smaller known window disables automatic compaction. Explicit auto-compaction without a known window or limit remains eligible only for reactive provider-overflow recovery; it does not run proactive token gating. Token accounting differs by provider: Claude uses the authoritative remote token-count preflight; OpenAI/Codex has no usable remote count endpoint, so it anchors on the latest provider-reported usage and estimates only the local transcript suffix appended after that point.
+Before a model action dispatches, `gate_model_dispatch` measures input tokens and blocks the action if it would exceed the model's auto limit. `model_metadata.rs` supplies per-model context windows and provider/model-aware defaults. A verified 1,000,000-token Claude window defaults to 500,000 tokens, including an unknown Claude id whose authoritative Models API metadata discovers that window. Hosted GPT-5.6 Sol/Terra/Luna use the live Codex 372,000-token window and Codex's 90% threshold, 334,800. Older OpenAI models and other discovered/static windows retain the generic 85% default. The daemon reads scheduler controls only from `/compaction/config`; sibling fields on `/compaction` are ordinary metadata and have no scheduler effect. Unknown nested fields, including the store-owned `max_consecutive_failures`, are ignored. A malformed active scheduler field disables automatic compaction. A valid explicit limit wins and is clamped to the selected window. The effective limit is floored at 8,000 without exceeding that window; a smaller known window disables automatic compaction. Explicit auto-compaction without a known window or limit remains eligible only for reactive provider-overflow recovery; it does not run proactive token gating. These scheduler controls never select the compaction algorithm: manual and automatic jobs always call `ModelProvider::compact` once with the full selected transcript. Token accounting differs by provider: Claude uses the authoritative remote token-count preflight; OpenAI/Codex has no usable remote count endpoint, so it anchors on the latest provider-reported usage and estimates only the local transcript suffix appended after that point.
 
 ```
 RequestModel ready to dispatch
@@ -242,30 +242,12 @@ A compaction that blocks a concrete model action remains `MidTurn` even when its
 source leaf is itself a `CompactionSummary`; the scope records the blocked
 row/attempt so both completion and failure must resume or terminally fail it.
 
-Remote compaction policy is provider-specific. OpenAI keeps its existing native-compaction default. Claude remains local by default, including legacy web rows whose old metadata says only `remote_mode = "auto"` and new web sessions, which store `remote_mode = "never"` plus a null enrollment marker. To opt a Claude session into the current native beta, an operator must set both fields in persisted/session-configured metadata:
-
-```json
-{
-  "compaction": {
-    "config": {
-      "remote_mode": "auto",
-      "anthropic_native_compaction": "compact_20260112"
-    }
-  }
-}
-```
-
-For Claude, `auto` and `always` differ only as persisted selection-policy
-values: both select native compaction when paired with the valid versioned
-marker, and both use the same failure behavior after selection. Unsupported
-model/capability, below-minimum or unexpected-stop, transport/HTTP,
-protocol/content, and context overflow are typed terminal failures; neither mode
-silently converts one into a local checkpoint or retries with transcript
-history omitted. Missing, mismatched, null, unknown, wrong-type, or otherwise
-malformed enrollment, as well as explicit `never`, resolves to local compaction
-before any native request. That is a pre-request policy choice, not
-after-failure recovery. OpenAI retains its established native baseline and
-ignores the Claude-only enrollment field.
+Both supported providers use native compaction unconditionally. Unsupported
+model/capability, Anthropic's below-50K minimum, unexpected stop,
+transport/HTTP, protocol/content, and context overflow are typed terminal
+failures. A failed native request is not replaced by another algorithm and is
+not retried with transcript history omitted. Persisted unknown metadata cannot
+change execution.
 
 The circuit breaker lives in compaction auto-state on session metadata. Each auto-compaction failure increments a consecutive-failure counter and records the failing leaf id; the eligibility check skips a leaf that just failed, skips when `suppressed`, and a successful ordinary model completion (including a max-output response with usage, but not refusal or an unexpected compaction stop) resets the failure counter. Compaction success commits the updated breaker/recompaction state with checkpoint installation and blocked-model resumption; failure commits failure metadata while terminally failing both blocked model and compaction actions. One immediate recompaction is allowed after a successful compacted request still overflows. If the request still overflows after a second successful compaction, recovery falls through to the ordinary terminal model-error path instead of starting an infinite loop. After success commits, the daemon reloads the compacted runtime and persisted config before claiming the pending model action. An installation/config/workspace/claim error compensates by terminally failing the unfinished action. After a successful claim, the daemon verifies that spawn synchronously registered a runner and applies the same fenced compensation if it did not; if another path already owns that exact lease generation, the live-runner check avoids a same-generation concurrent dispatch or false failure. Task-wrapper errors evict the stale live projection and re-run durable recovery after unregistering the compaction task. This prevents both endless compact/retry/overflow cycles and stranded blocked, pending, or unowned running model actions.
 

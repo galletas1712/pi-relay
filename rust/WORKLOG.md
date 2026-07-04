@@ -26,13 +26,14 @@
     completed the continuation. Token counting keeps the live-proven bare
     strategy because Anthropic documents that it applies existing blocks
     without triggering new compactions.
-  - Emitted replay rendering parses every Claude sidecar once. A local
-    `CompactionSummary` may have none; otherwise it requires exactly one valid
-    compaction block (`type = "compaction"`, nonempty string `content`,
-    absent/null/string `encrypted_content`). Assistant replay permits ordinary
-    Claude blocks but rejects corrupt JSON and malformed exact compaction.
-    Valid compaction remains opaque, including arbitrary extension fields.
-    Wrong-provider and non-emitted sidecars do not enroll. Any compaction block,
+  - Emitted replay rendering parses every Claude sidecar once. A replay-free
+    historical `CompactionSummary` remains renderable; a summary with Claude
+    replay requires exactly one valid compaction block (`type = "compaction"`,
+    nonempty string `content`, absent/null/string `encrypted_content`).
+    Assistant replay permits ordinary Claude blocks but rejects corrupt JSON
+    and malformed exact compaction. Valid compaction remains opaque, including
+    arbitrary extension fields. Wrong-provider and non-emitted sidecars have no
+    effect. Any compaction block,
     compaction delta, or compaction stop returned
     by an ordinary Messages call is rejected at the provider parser boundary,
     before it can become persistable replay. Pre-compaction requests opt into
@@ -49,7 +50,7 @@
   threshold, ran exactly one native compaction, retained the exact user
   instruction, resumed the same blocked model action, returned the exact
   three-key sentinel JSON, and counted 15,628 tokens afterward. There was no
-  local fallback result, duplicate action/attempt, or retry. Estimated
+  alternate result, duplicate action/attempt, or retry. Estimated
   observable generation cost was $1.350969. No sentinel plaintext, transcript,
   provider payload, or credential content is recorded here.
 - Updated auto-compaction defaults from current provider metadata. Any
@@ -57,14 +58,11 @@
   including newly discovered Claude ids; non-1M Claude discoveries retain the
   generic 85% policy. GPT-5.6 Sol/Terra/Luna now use the live Codex
   372,000-token context window and 90% raw threshold (334,800). Older OpenAI
-  models retain 272,000/231,200. Nested `/compaction/config` is preferred; the
-  direct `/compaction` object is read atomically only when the nested object is
-  absent, and fields are never merged between layouts. The selected object is
-  parsed once into a small policy and resolved to one effective limit. Valid
+  models retain 272,000/231,200. The daemon reads scheduler controls only from
+  nested `/compaction/config` and resolves them to one effective limit. Valid
   explicit limits win and clamp to the selected window; windows below the
-  anti-churn floor disable auto-compaction. A malformed known field disables
-  auto, resolves Claude native mode to Never, and preserves OpenAI's
-  provider-native baseline.
+  anti-churn floor disable auto-compaction. A malformed active field disables
+  automatic scheduling without changing provider-native execution.
 - Live GPT-5.6 metadata also confirms Sol, Terra, and Luna accept `max`
   reasoning. Daemon normalization, provider serialization safeguards, web
   choices, tests, and docs now expose `max` for all three without adding a new
@@ -76,12 +74,11 @@
   `effective_context_window_percent` was omitted (the 95% serde default gives
   an informational usable ceiling of 353,400). The external reference clone is
   not part of this repository.
-- Final Claude policy is selection-only: native compaction requires the valid
-  versioned marker plus `remote_mode = "auto"` or `"always"`; missing,
-  mismatched, malformed, and `never` policies select local compaction before a
-  request. Once native is selected, both modes surface typed terminal failures
-  directly rather than omitting transcript history, retrying, or converting
-  them to a local checkpoint.
+- Both supported providers now use native compaction unconditionally for
+  manual and automatic jobs. Persisted unknown metadata has no execution
+  effect. Native failures remain typed and terminal rather than omitting
+  transcript history, retrying with a trimmed transcript, or substituting a
+  different algorithm.
 
 ### Anthropic Model and Hosted-Tool Refresh
 
@@ -1518,9 +1515,9 @@ paths. Changes made from that review:
   `cargo test --manifest-path rust/Cargo.toml -p agent-daemon` (4 tests), and
   `cargo check --manifest-path rust/Cargo.toml`.
 
-### Anthropic Native Compaction Pilot
+### Anthropic Provider-Native Compaction
 
-- Added opt-in Anthropic server-side compaction through the existing
+- Added Anthropic server-side compaction through the required
   `ModelProvider::compact` seam. The adapter sends a special streaming
   `/messages` request with beta `compact-2026-01-12`,
   `compact_20260112`, a 50K trigger, `pause_after_compaction`, replacement PI
@@ -1538,15 +1535,13 @@ paths. Changes made from that review:
   root and replayed unchanged on later Messages/count-token calls. The daemon's
   fresh delegation ledger stays outside that opaque block as the following
   synthetic user summary.
-- Added the explicit enrollment marker
-  `anthropic_native_compaction = "compact_20260112"`. Claude `auto`/`always`
-  requires that marker and wholly valid compaction metadata; old web
-  `remote_mode = "auto"` rows, malformed config, and new Claude web sessions
-  remain local. OpenAI's legacy policy is unchanged.
+- Manual and automatic compaction call the selected provider's native
+  implementation unconditionally. New web sessions store only scheduler and
+  store-owned circuit-breaker controls; unknown persisted metadata cannot
+  select another execution path.
 - Validate Anthropic native compaction against a static supported-model list
   and Models API `context_management` capability when advertised.
-  Unknown/unsupported models return typed terminal `unsupported` failures in
-  both Claude `auto` and `always`.
+  Unknown/unsupported models return typed terminal `unsupported` failures.
 - Preserve active-action lifecycle independently from transcript-root shape:
   reactive overflow compactions are always mid-turn, including immediately
   after a prior compaction. One successful immediate recompaction is allowed;
@@ -1571,8 +1566,8 @@ paths. Changes made from that review:
   process death after provider acceptance but before terminal commit can cause
   another provider call after expiry. Current OpenAI/Codex and Anthropic model
   requests expose no provider idempotency key, so exactly-once calls are not
-  claimed. The replacement criterion for this narrow payload protocol is
-  listed below.
+  claimed. The narrow payload protocol remains required for at-least-once
+  post-compaction continuation.
 - Retain Anthropic's complete raw usage object alongside normalized top-level
   counts. This preserves compaction/message iterations, cache-creation TTL
   detail, and thinking-token detail without adding compaction iterations to
@@ -1580,32 +1575,19 @@ paths. Changes made from that review:
 - Token counting applies existing compaction state, reports effective
   `input_tokens`, and retains `context_management.original_input_tokens`.
 
-#### Final policy and temporary compatibility removal
+#### Current native-compaction protocol and durability requirements
 
-- Claude native compaction is selected only by the valid
-  `anthropic_native_compaction = "compact_20260112"` marker plus
-  `remote_mode = "auto"` or `"always"`. A missing, mismatched, malformed, or
-  `never` policy selects local compaction before any native request; this is a
-  policy choice, not a failure fallback.
-- Once native is selected, unsupported model/capability, below-minimum or
-  unexpected-stop, transport/HTTP, protocol/content, and context overflow
-  are typed terminal failures. Native compaction sends the selected full model
-  context once and does not retry with transcript history omitted. `auto` and
-  `always` have identical selected native execution; only `never` selects local
-  execution. There is no native after-failure recovery or silent local
-  checkpoint installation.
-- Direct `/compaction` is an atomic read-compatibility layout only when nested
-  `/compaction/config` is absent. Fields are never merged, and current
-  producers write the nested layout. Remove the direct-layout reader after an
-  inventory and migration leave no direct-layout rows.
-- Remove the Anthropic compaction beta header when compact and replay are GA
-  and Anthropic no longer requires the beta.
-- Remove the replaying-Messages ceiling-trigger workaround when Anthropic
-  documents and tests apply-only/no-trigger replay, or provides equivalent GA
-  behavior.
-- Replace the narrow `post_compaction_dispatch` payload outbox/lease only when
-  general durable dispatch provides atomic intent, heartbeat, startup reclaim,
-  and terminal clear. Dispatch remains at least once: a crash after provider
+- Both providers always run native compaction. Unsupported model/capability,
+  Anthropic's below-minimum input, unexpected stop, transport/HTTP,
+  protocol/content, and context overflow are typed terminal failures. Native
+  compaction sends the selected full model context once and does not retry with
+  transcript history omitted or substitute another algorithm.
+- Anthropic compact and replay requests send the provider-required compaction
+  beta header. Replay Messages use a paused trigger at the resolved model
+  ceiling because Anthropic does not provide an apply-only/no-trigger mode.
+- The `post_compaction_dispatch` payload outbox/lease supplies atomic intent,
+  heartbeat, startup reclaim, and terminal clear for crash-durable
+  continuation. Dispatch remains at least once: a crash after provider
   acceptance but before terminal commit can still cause a repeated call.
 - Ordinary Messages still reject every inline compaction block, delta, or stop
   at the provider boundary; the successful automatic E2E does not turn those
@@ -1625,12 +1607,11 @@ production E2E is summarized above.
 
 ### Final native-compaction policy correction
 
-- Restored the pre-existing direct `/compaction` policy reader as an atomic
-  compatibility layout only when `/compaction/config` is absent. Nested null
-  or malformed values fail closed and never merge with direct siblings.
+- Scheduler controls are read only from `/compaction/config`; sibling
+  compaction metadata is not an execution or scheduling policy.
 - The daemon now ignores store-owned `max_consecutive_failures`, carries one
   parsed policy through the cheap explicit-disable gate and optional model
-  metadata discovery, and keeps explicit auto enrollment without a known
+  metadata discovery, and keeps explicit automatic scheduling without a known
   threshold available for reactive overflow recovery only. Known windows below
   the 8K floor still disable auto-compaction.
 - Anthropic native SSE finish validates its single state-machine-owned block

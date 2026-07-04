@@ -112,14 +112,14 @@ Implemented user-facing behavior:
   model request; follow-ups remain next-turn work.
 - Turn-level interrupt; idle-only retry/continue (`turn.resume`) for terminal
   model turns; idle-only active-branch switch; idle-only `session.delete`.
-- Manual and automatic compaction; OpenAI uses provider-native compaction,
-  while Anthropic defaults to a local text summary and requires a versioned
-  `compact_20260112` opt-in for its provider-native beta pilot. Compaction is a
-  typed transcript root, not a session boundary. Replayed Anthropic compaction
-  blocks remain opaque and require the matching strategy edit: ordinary
-  Messages uses a temporary paused trigger at the resolved model input ceiling,
-  while token counting uses the documented non-triggering bare edit. The
-  ceiling value is schema-valid under Anthropic's documented minimum-only rule.
+- Manual and automatic compaction always use the selected provider's native
+  compaction API. Compaction is a typed transcript root, not a session boundary.
+  Replayed Anthropic compaction blocks remain opaque and require the provider's
+  compaction beta header plus matching strategy edit. Because Anthropic has no
+  apply-only mode, ordinary Messages uses a paused trigger at the resolved model
+  input ceiling, while token counting uses the documented non-triggering bare
+  edit. The ceiling value is schema-valid under Anthropic's documented
+  minimum-only rule.
   A paid production Sonnet 5 automatic E2E accepted that replay shape, resumed
   the same blocked action after one native checkpoint, and reduced the
   effective count from the 541,564-token gate to 15,628. Ordinary inline

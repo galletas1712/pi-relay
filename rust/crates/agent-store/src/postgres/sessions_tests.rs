@@ -300,6 +300,62 @@ async fn persist_turn(store: &PostgresAgentStore, session_id: &str, timestamp_ms
 }
 
 #[tokio::test]
+async fn manual_compaction_failure_terminalizes_without_installing_a_checkpoint() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    let session_id = "manual_compaction_failure";
+    store
+        .create_project(project_id, "manual compaction failure", &[], json!({}))
+        .await
+        .expect("project creates");
+    create_project_session(store, project_id, session_id).await;
+    persist_turn(store, session_id, 1_700_000_000_000, "compact me").await;
+    let before = store
+        .session_snapshot(session_id)
+        .await
+        .expect("snapshot before compaction");
+    let created = store
+        .create_compaction_action(session_id, crate::CompactionTrigger::Manual)
+        .await
+        .expect("manual compaction action creates");
+
+    let events = store
+        .fail_compaction_action(
+            &created.job,
+            &session_config(project_id),
+            "typed provider failure".to_string(),
+        )
+        .await
+        .expect("manual compaction failure commits");
+
+    let after = store
+        .session_snapshot(session_id)
+        .await
+        .expect("snapshot after compaction failure");
+    assert_eq!(after.active_leaf_id, before.active_leaf_id);
+    assert!(
+        after
+            .pending_actions
+            .iter()
+            .all(|action| action.action_row_id != created.job.action_row_id),
+        "failed manual compaction must not remain unfinished"
+    );
+    assert_eq!(after.metadata.pointer("/compaction/auto_state"), None);
+    let error = events
+        .iter()
+        .find(|event| event.event == crate::EventType::CompactionError)
+        .expect("compaction error event persists");
+    assert_eq!(error.data["trigger"], "manual");
+    assert_eq!(error.data["error"], "typed provider failure");
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn compaction_provider_replay_round_trips_nullable_and_omitted_encrypted_content() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -344,7 +400,6 @@ async fn compaction_provider_replay_round_trips_nullable_and_omitted_encrypted_c
                     summary: String::new(),
                     summary_kind: "provider_native".to_string(),
                     provider_replay: vec![replay],
-                    remote: true,
                     provider: ProviderKind::Claude,
                     usage: None,
                     continuation_suffix: Vec::new(),
