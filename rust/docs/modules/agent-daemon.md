@@ -191,11 +191,15 @@ RequestModel ready to dispatch
 
 Compaction runs as its own background task (`run_compaction_job`). On success
 it records the new compacted root, marks the provider connection compacted
-(bumping the OpenAI window generation), and resumes the blocked model action
-from the compacted root. The success transaction also leaves an attempt-fenced
-durable dispatch intent on that exact pending action. Claim retains that intent
-and atomically assigns a unique owner, incrementing generation, and a 30-second
-lease; the registered runner renews it every 10 seconds. Daemon startup
+(bumping the OpenAI window generation), and resumes the blocked model action.
+Boundary compaction installs only the summary root. Mid-turn compaction appends
+the open turn's exact user instructions after that root while leaving summarized
+assistant/tool/daemon output out of the new branch; the final retained user is
+therefore the resumed context leaf. The success transaction also leaves an
+attempt-fenced durable dispatch intent on that exact pending action. Claim
+retains that intent and atomically assigns a unique owner, incrementing
+generation, and a 30-second lease; the registered runner renews it every 10
+seconds. Daemon startup
 preserves marked pending and running rows, validates the row/attempt/compacted
 leaf, reconstructs the runtime even though `CompactionSummary` is a transcript
 boundary, and claims pending or expired work. An unexpired lease is not

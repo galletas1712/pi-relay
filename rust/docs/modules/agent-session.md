@@ -109,7 +109,7 @@ TurnStarted ... TurnFinished   --->     CompactionSummary  (parent_id = None)
    (old branch stays durable)              + continuation suffix...
 ```
 
-Compaction appends a typed `TranscriptItem::CompactionSummary` as a new **root** (`parent_id = null`) carrying the summary text, `tokens_before`, the last turn id, and the source session/leaf it summarizes. Any continuation suffix (e.g. an open tool loop that must not be summarized away) is re-parented onto the new root so the active trajectory is preserved intact. The summary root is a turn boundary, so `last_turn_id` and downstream context resolve from it. The old branch remains available for same-session active-leaf switching and tree inspection. Compaction is not a session boundary. The durable install itself is a single Postgres transaction in [agent-store](./agent-store.md).
+Compaction appends a typed `TranscriptItem::CompactionSummary` as a new **root** (`parent_id = null`) carrying the summary text, `tokens_before`, the last turn id, and the source session/leaf it summarizes. Boundary compaction installs no continuation suffix. Mid-turn compaction summarizes the complete model-visible context, then re-parents only the open turn's exact `UserMessage` instructions onto the new root. Assistant output, tool calls/results, and daemon observations remain represented by the summary rather than being reinstalled. The summary root is a turn boundary, so `last_turn_id` and downstream context resolve from it. The old branch remains available for same-session active-leaf switching and tree inspection. Compaction is not a session boundary. The durable install itself is a single Postgres transaction in [agent-store](./agent-store.md).
 
 ## Notes
 
