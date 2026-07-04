@@ -233,11 +233,19 @@ offers `gpt-5.6-sol` (default), `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude offe
 Sonnet 5 is the normal Claude default at `high` effort. Fable 5 is listed last as an explicit opt-in, and its option text
 and tooltip state Anthropic's required 30-day retention and lack of Zero Data Retention. The provider/model is locked
 once the session has any transcript history, because both providers carry provider-shaped replay state across turns.
-Reasoning effort is a per-request knob and can change during or between turns (applying to subsequently created
-requests). Effort options differ by provider/model: OpenAI generally offers `none…xhigh`, all three hosted GPT-5.6
-models also offer `max`, and these Claude models offer `low…max`. Changing model/effort calls `session.configure` and patches the cached
-list/snapshot. The list is a seeded offline-safe fallback; the daemon's cached Anthropic Models API metadata remains
-authoritative for runtime limits and capabilities without adding transient model records to the database.
+Reasoning effort is a per-request knob and can change during or between turns
+(applying to subsequently created requests). The picker remains a static seeded
+convenience in this PR: its existing hosted GPT-5.6 choices remain `none`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, while the Claude
+entries expose `low…max`; it does not dynamically advertise catalog-only
+`ultra`. Some seeded OpenAI choices can be rejected when the active account's
+catalog does not advertise them. Changing model/effort calls
+`session.configure` and patches the cached list/snapshot. Runtime validation is
+authoritative:
+OpenAI exact-resolves the model and configured effort from its account-scoped
+private Codex catalog before every ordinary and compact request, while
+Anthropic uses discovered/static adapter capabilities. No transient catalog
+records are added to the database and there is no model-picker RPC in this PR.
 
 ## Notes
 

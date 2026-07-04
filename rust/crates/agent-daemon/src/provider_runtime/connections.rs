@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use agent_provider::{
     anthropic::{AnthropicModelCache, AnthropicProvider},
-    openai::{OpenAiCodexSessionState, OpenAiProvider},
+    openai::{OpenAiCodexSessionState, OpenAiModelCatalogCache, OpenAiProvider},
 };
 use agent_vocab::ProviderKind;
 use anyhow::{anyhow, Result};
@@ -16,6 +16,7 @@ use super::provider::ProviderHandle;
 pub(crate) struct ProviderConnectionRegistry {
     client: reqwest::Client,
     anthropic_model_cache: AnthropicModelCache,
+    openai_model_catalog_cache: OpenAiModelCatalogCache,
     connections: Arc<Mutex<HashMap<ProviderConnectionKey, Arc<ProviderConnection>>>>,
 }
 
@@ -33,6 +34,7 @@ enum ProviderConnection {
 struct OpenAiCodexConnection {
     state: Arc<OpenAiCodexSessionState>,
     client: reqwest::Client,
+    model_catalog_cache: OpenAiModelCatalogCache,
 }
 
 struct AnthropicConnection {
@@ -45,6 +47,7 @@ impl ProviderConnectionRegistry {
         Self {
             client: reqwest::Client::new(),
             anthropic_model_cache: AnthropicModelCache::default(),
+            openai_model_catalog_cache: OpenAiModelCatalogCache::default(),
             connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -100,6 +103,7 @@ impl ProviderConnectionRegistry {
                     ProviderKind::OpenAi => ProviderConnection::OpenAi(OpenAiCodexConnection {
                         state: Arc::new(OpenAiCodexSessionState::new(session_id)),
                         client: self.client.clone(),
+                        model_catalog_cache: self.openai_model_catalog_cache.clone(),
                     }),
                     ProviderKind::Claude => ProviderConnection::Anthropic(AnthropicConnection {
                         client: self.client.clone(),
@@ -132,7 +136,7 @@ impl ProviderConnection {
 impl OpenAiCodexConnection {
     fn provider_handle(&self, credentials: &Credentials) -> Result<ProviderHandle> {
         Ok(ProviderHandle {
-            provider: Box::new(OpenAiProvider::codex_with_client_and_session(
+            provider: Box::new(OpenAiProvider::codex_with_client_session_and_cache(
                 self.client.clone(),
                 self.state.clone(),
                 credentials.codex_access_token.clone().ok_or_else(|| {
@@ -140,6 +144,7 @@ impl OpenAiCodexConnection {
                 })?,
                 credentials.codex_account_id.clone(),
                 credentials.codex_installation_id.clone(),
+                self.model_catalog_cache.clone(),
             )),
             uses_codex_auth: true,
         })

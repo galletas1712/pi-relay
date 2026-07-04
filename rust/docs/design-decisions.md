@@ -325,11 +325,12 @@ ChatGPT/Codex subscription transport; pi-relay no longer supports plain OpenAI
 API-key auth.
 
 Provider config supports `prompt_cache.key`, which the daemon forwards on the
-OpenAI request path. The Codex Responses request hardcodes the low-variance
-request policy we want for personal use: `parallel_tool_calls = true`,
-`service_tier = "priority"`, and `store = false`. It intentionally omits
-`prompt_cache_retention` because pi-relay does not use the plain OpenAI API-key
-path. OpenAI prompt-cache cohort selection is explicit
+OpenAI request path. The Codex Responses request uses the selected private
+catalog entry's `supports_parallel_tool_calls` value and hardcodes the
+low-variance personal-use policy `service_tier = "priority"` and
+`store = false`. It intentionally omits `prompt_cache_retention` because
+pi-relay does not use the plain OpenAI API-key path. OpenAI prompt-cache cohort
+selection is explicit
 `ProviderConfig.prompt_cache.key` first, then the pi-relay session id (matching
 Codex CLI's `thread_id`/`prompt_cache_key` behavior), then a fresh UUID fallback
 for CLI/test paths that do not carry a session. The actual system prompt remains

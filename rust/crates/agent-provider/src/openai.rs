@@ -5,17 +5,19 @@ use agent_vocab::{
 };
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, ACCEPT, CONTENT_ENCODING, CONTENT_TYPE};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     io::Cursor,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
+use tokio::sync::{watch, Mutex as AsyncMutex};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -26,7 +28,7 @@ use crate::{
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
     ModelTranscriptEntry, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
-    ProviderResult, ProviderToolProfile, ProviderUsage,
+    ProviderModelMetadata, ProviderResult, ProviderToolProfile, ProviderUsage,
 };
 
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
@@ -56,11 +58,20 @@ const HEADER_REASONING_INCLUDED: &str = "x-reasoning-included";
 // and rate-limit accounting (see `is_first_party_originator` in the Codex
 // source). Diverging from this label is what causes throttling.
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+pub const CODEX_CLIENT_VERSION: &str = "0.142.3";
 const CODEX_RESIDENCY_US: &str = "us";
 const CODEX_REQUEST_COMPRESSION_LEVEL: i32 = 3;
 const CODEX_COMPACT_REQUEST_TIMEOUT_SECS: u64 = 20 * 60;
+const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_MODELS_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+const CODEX_MODELS_MAX_MODELS: usize = 256;
+const CODEX_MODELS_MAX_SLUG_BYTES: usize = 256;
+const CODEX_MODELS_MAX_EFFORTS: usize = 16;
+const CODEX_MODELS_MAX_EFFORT_BYTES: usize = 64;
+const CODEX_MODELS_SUCCESS_TTL: Duration = Duration::from_secs(5 * 60);
+const CODEX_MODELS_FAILURE_TTL: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiProvider {
     client: reqwest::Client,
     session_state: Option<Arc<OpenAiCodexSessionState>>,
@@ -72,6 +83,1228 @@ pub struct OpenAiProvider {
     /// tests may not have a Codex install.
     installation_id: Option<String>,
     base_url: String,
+    model_catalog_cache: OpenAiModelCatalogCache,
+    models_request_timeout: Duration,
+}
+
+#[derive(Clone, Default)]
+pub struct OpenAiModelCatalogCache {
+    state: Arc<AsyncMutex<OpenAiModelCatalogCacheState>>,
+}
+
+#[derive(Default)]
+struct OpenAiModelCatalogCacheState {
+    active_key: Option<OpenAiCatalogKey>,
+    catalog: Option<Arc<OpenAiModelCatalog>>,
+    fetched_at: Option<Instant>,
+    failure: Option<CachedCatalogFailure>,
+    refresh: Option<CatalogRefresh>,
+    next_generation: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct OpenAiCatalogKey {
+    base_url: String,
+    identity: OpenAiCatalogIdentity,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum OpenAiCatalogIdentity {
+    Account(String),
+    TokenFingerprint([u8; 32]),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogError {
+    status: Option<u16>,
+    message: String,
+}
+
+impl CatalogError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            status: None,
+            message: message.into(),
+        }
+    }
+
+    fn into_provider_error(self) -> ProviderError {
+        ProviderError::ModelCatalog {
+            status: self.status,
+            message: self.message,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedCatalogFailure {
+    retry_after: Instant,
+    error: CatalogError,
+}
+
+#[derive(Clone)]
+struct CatalogRefresh {
+    key: OpenAiCatalogKey,
+    generation: u64,
+    receiver: watch::Receiver<CatalogRefreshStatus>,
+}
+
+#[derive(Clone)]
+enum CatalogRefreshStatus {
+    Pending,
+    Finished(Result<Arc<OpenAiModelCatalog>, CatalogError>),
+}
+
+enum CatalogCacheDecision {
+    Return(Result<Arc<OpenAiModelCatalog>, CatalogError>),
+    Wait(CatalogRefresh),
+    Start {
+        refresh: CatalogRefresh,
+        sender: watch::Sender<CatalogRefreshStatus>,
+    },
+}
+
+#[derive(Debug)]
+struct OpenAiModelCatalog {
+    models: HashMap<String, Arc<OpenAiModelMetadata>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenAiModelMetadata {
+    slug: String,
+    max_input_tokens: Option<usize>,
+    recommended_auto_compact_tokens: Option<usize>,
+    supported_reasoning_efforts: HashSet<String>,
+    supports_parallel_tool_calls: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexModelsResponse {
+    models: Vec<CodexModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexModel {
+    slug: String,
+    #[serde(default)]
+    context_window: Option<i64>,
+    #[serde(default)]
+    max_context_window: Option<i64>,
+    #[serde(default)]
+    auto_compact_token_limit: Option<i64>,
+    supported_reasoning_levels: Vec<CodexReasoningLevel>,
+    supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    supports_search_tool: Option<bool>,
+    #[serde(default)]
+    web_search_tool_type: Option<String>,
+    #[serde(default)]
+    apply_patch_tool_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexReasoningLevel {
+    effort: String,
+}
+
+impl std::fmt::Debug for OpenAiModelCatalogCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiModelCatalogCache")
+            .finish_non_exhaustive()
+    }
+}
+
+impl OpenAiModelCatalogCache {
+    async fn decision(&self, key: &OpenAiCatalogKey, now: Instant) -> CatalogCacheDecision {
+        let mut state = self.state.lock().await;
+        if state.active_key.as_ref() != Some(key) {
+            state.active_key = Some(key.clone());
+            state.catalog = None;
+            state.fetched_at = None;
+            state.failure = None;
+            state.refresh = None;
+        }
+
+        if state
+            .catalog
+            .as_ref()
+            .zip(state.fetched_at)
+            .is_some_and(|(_, fetched_at)| {
+                now.saturating_duration_since(fetched_at) < CODEX_MODELS_SUCCESS_TTL
+            })
+        {
+            return CatalogCacheDecision::Return(Ok(state
+                .catalog
+                .as_ref()
+                .expect("fresh catalog exists")
+                .clone()));
+        }
+        if let Some(failure) = state
+            .failure
+            .as_ref()
+            .filter(|failure| now < failure.retry_after)
+        {
+            // A stale snapshot may remain in `catalog` for diagnostics, but it
+            // must never shape a new request after a failed refresh.
+            return CatalogCacheDecision::Return(Err(failure.error.clone()));
+        }
+        if let Some(refresh) = state.refresh.as_ref() {
+            return CatalogCacheDecision::Wait(refresh.clone());
+        }
+
+        state.next_generation = state.next_generation.saturating_add(1);
+        let generation = state.next_generation;
+        let (sender, receiver) = watch::channel(CatalogRefreshStatus::Pending);
+        let refresh = CatalogRefresh {
+            key: key.clone(),
+            generation,
+            receiver,
+        };
+        state.failure = None;
+        state.refresh = Some(refresh.clone());
+        CatalogCacheDecision::Start { refresh, sender }
+    }
+
+    async fn commit_refresh(
+        &self,
+        key: &OpenAiCatalogKey,
+        generation: u64,
+        result: &Result<Arc<OpenAiModelCatalog>, CatalogError>,
+        now: Instant,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        if state.active_key.as_ref() != Some(key)
+            || state
+                .refresh
+                .as_ref()
+                .is_none_or(|refresh| refresh.generation != generation || &refresh.key != key)
+        {
+            return false;
+        }
+
+        state.refresh = None;
+        match result {
+            Ok(catalog) => {
+                // Install the complete catalog atomically. A model omitted by
+                // this valid response is no longer available.
+                state.catalog = Some(catalog.clone());
+                state.fetched_at = Some(now);
+                state.failure = None;
+            }
+            Err(error) if error.status == Some(401) => {
+                // The daemon owns one credential-refresh retry. Do not hide a
+                // 401 behind either stale success or negative caching.
+                state.failure = None;
+            }
+            Err(error) => {
+                state.failure = Some(CachedCatalogFailure {
+                    retry_after: now + CODEX_MODELS_FAILURE_TTL,
+                    error: error.clone(),
+                });
+            }
+        }
+        true
+    }
+
+    async fn abandon_refresh(&self, key: &OpenAiCatalogKey, generation: u64) {
+        let mut state = self.state.lock().await;
+        if state.active_key.as_ref() == Some(key)
+            && state
+                .refresh
+                .as_ref()
+                .is_some_and(|refresh| refresh.generation == generation && &refresh.key == key)
+        {
+            state.refresh = None;
+        }
+    }
+}
+
+async fn wait_for_catalog_refresh(
+    mut refresh: CatalogRefresh,
+) -> Option<Result<Arc<OpenAiModelCatalog>, CatalogError>> {
+    loop {
+        match refresh.receiver.borrow_and_update().clone() {
+            CatalogRefreshStatus::Pending => {}
+            CatalogRefreshStatus::Finished(result) => return Some(result),
+        }
+        if refresh.receiver.changed().await.is_err() {
+            return None;
+        }
+    }
+}
+
+fn positive_limit(
+    value: Option<i64>,
+    field: &str,
+    slug: &str,
+) -> Result<Option<usize>, CatalogError> {
+    value
+        .map(|value| {
+            if value <= 0 {
+                return Err(CatalogError::new(format!(
+                    "Codex model {slug} has non-positive {field}"
+                )));
+            }
+            usize::try_from(value).map_err(|_| {
+                CatalogError::new(format!("Codex model {slug} has unrepresentable {field}"))
+            })
+        })
+        .transpose()
+}
+
+fn ninety_percent(value: usize) -> usize {
+    value / 10 * 9 + value % 10 * 9 / 10
+}
+
+fn validate_optional_catalog_selector(
+    value: Option<&str>,
+    field: &str,
+    slug: &str,
+) -> Result<(), CatalogError> {
+    if let Some(value) = value {
+        if value.is_empty() || value.len() > CODEX_MODELS_MAX_EFFORT_BYTES {
+            return Err(CatalogError::new(format!(
+                "Codex model {slug} has invalid {field}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_codex_models_response(bytes: &[u8]) -> Result<OpenAiModelCatalog, CatalogError> {
+    if bytes.len() > CODEX_MODELS_MAX_BODY_BYTES {
+        return Err(CatalogError::new(format!(
+            "Codex models response exceeded {} bytes",
+            CODEX_MODELS_MAX_BODY_BYTES
+        )));
+    }
+    let response: CodexModelsResponse = serde_json::from_slice(bytes).map_err(|error| {
+        CatalogError::new(format!(
+            "failed to parse Codex models response JSON: {error}"
+        ))
+    })?;
+    if response.models.len() > CODEX_MODELS_MAX_MODELS {
+        return Err(CatalogError::new(format!(
+            "Codex models response contained more than {} models",
+            CODEX_MODELS_MAX_MODELS
+        )));
+    }
+
+    let mut models = HashMap::with_capacity(response.models.len());
+    for model in response.models {
+        let CodexModel {
+            slug,
+            context_window,
+            max_context_window,
+            auto_compact_token_limit,
+            supported_reasoning_levels,
+            supports_parallel_tool_calls,
+            supports_search_tool,
+            web_search_tool_type,
+            apply_patch_tool_type,
+        } = model;
+        if slug.trim().is_empty() || slug.len() > CODEX_MODELS_MAX_SLUG_BYTES {
+            return Err(CatalogError::new(
+                "Codex models response contained an invalid slug",
+            ));
+        }
+        if models.contains_key(&slug) {
+            return Err(CatalogError::new(format!(
+                "Codex models response contained duplicate slug {slug}"
+            )));
+        }
+
+        let context_window = positive_limit(context_window, "context_window", &slug)?;
+        let max_context_window = positive_limit(max_context_window, "max_context_window", &slug)?;
+        let explicit_auto_limit =
+            positive_limit(auto_compact_token_limit, "auto_compact_token_limit", &slug)?;
+        let max_input_tokens = context_window.or(max_context_window);
+        let context_policy_limit = max_input_tokens.map(ninety_percent);
+        let recommended_auto_compact_tokens = match (explicit_auto_limit, context_policy_limit) {
+            (Some(explicit), Some(derived)) => Some(explicit.min(derived)),
+            (Some(explicit), None) => Some(explicit),
+            (None, derived) => derived,
+        };
+
+        if supported_reasoning_levels.len() > CODEX_MODELS_MAX_EFFORTS {
+            return Err(CatalogError::new(format!(
+                "Codex model {slug} advertised more than {} reasoning efforts",
+                CODEX_MODELS_MAX_EFFORTS
+            )));
+        }
+        let mut supported_reasoning_efforts =
+            HashSet::with_capacity(supported_reasoning_levels.len());
+        for level in supported_reasoning_levels {
+            if level.effort.is_empty() || level.effort.len() > CODEX_MODELS_MAX_EFFORT_BYTES {
+                return Err(CatalogError::new(format!(
+                    "Codex model {slug} advertised an invalid reasoning effort"
+                )));
+            }
+            if !supported_reasoning_efforts.insert(level.effort.clone()) {
+                return Err(CatalogError::new(format!(
+                    "Codex model {slug} advertised duplicate reasoning effort {}",
+                    level.effort
+                )));
+            }
+        }
+
+        // Retain strict type/size validation for the catalog evidence already
+        // relevant to pi-relay's local tool surface, but do not use these
+        // provider-native selectors to enable shell/patch actions or claim
+        // hosted-search support in this PR.
+        let _ = supports_search_tool;
+        validate_optional_catalog_selector(
+            web_search_tool_type.as_deref(),
+            "web_search_tool_type",
+            &slug,
+        )?;
+        validate_optional_catalog_selector(
+            apply_patch_tool_type.as_deref(),
+            "apply_patch_tool_type",
+            &slug,
+        )?;
+
+        models.insert(
+            slug.clone(),
+            Arc::new(OpenAiModelMetadata {
+                slug,
+                max_input_tokens,
+                recommended_auto_compact_tokens,
+                supported_reasoning_efforts,
+                supports_parallel_tool_calls,
+            }),
+        );
+    }
+    Ok(OpenAiModelCatalog { models })
+}
+
+async fn read_bounded_catalog_response(mut response: reqwest::Response) -> ProviderResult<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > CODEX_MODELS_MAX_BODY_BYTES as u64)
+    {
+        return Err(ProviderError::ModelCatalog {
+            status: Some(response.status().as_u16()),
+            message: format!(
+                "Codex models response exceeded {} bytes",
+                CODEX_MODELS_MAX_BODY_BYTES
+            ),
+        });
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| ProviderError::ModelCatalog {
+            status: error.status().map(|status| status.as_u16()),
+            message: format!("failed to read Codex models response: {error}"),
+        })?
+    {
+        if body.len().saturating_add(chunk.len()) > CODEX_MODELS_MAX_BODY_BYTES {
+            return Err(ProviderError::ModelCatalog {
+                status: Some(response.status().as_u16()),
+                message: format!(
+                    "Codex models response exceeded {} bytes",
+                    CODEX_MODELS_MAX_BODY_BYTES
+                ),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
+fn test_openai_model_metadata(model: &str) -> OpenAiModelMetadata {
+    OpenAiModelMetadata {
+        slug: model.to_string(),
+        max_input_tokens: Some(272_000),
+        recommended_auto_compact_tokens: Some(244_800),
+        supported_reasoning_efforts: [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
+        ]
+        .into_iter()
+        .map(|effort| effort.as_str().to_string())
+        .collect(),
+        supports_parallel_tool_calls: true,
+    }
+}
+
+#[cfg(test)]
+fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Value> {
+    let metadata = test_openai_model_metadata(&request.model);
+    responses_body_with_metadata(request, session_id, &metadata)
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use crate::PromptSections;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn model_fixture(
+        slug: &str,
+        context_window: Option<i64>,
+        max_context_window: Option<i64>,
+        auto_compact_token_limit: Option<i64>,
+        efforts: &[&str],
+        supports_parallel_tool_calls: bool,
+    ) -> Value {
+        json!({
+            "slug": slug,
+            "context_window": context_window,
+            "max_context_window": max_context_window,
+            "auto_compact_token_limit": auto_compact_token_limit,
+            "supported_reasoning_levels": efforts
+                .iter()
+                .map(|effort| json!({ "effort": effort, "description": "ignored" }))
+                .collect::<Vec<_>>(),
+            "supports_parallel_tool_calls": supports_parallel_tool_calls,
+            "supports_search_tool": true,
+            "web_search_tool_type": "text",
+            "apply_patch_tool_type": "freeform",
+            "base_instructions": "ignored product copy",
+            "future_field": { "ignored": true },
+        })
+    }
+
+    fn parse_models(models: Vec<Value>) -> Result<OpenAiModelCatalog, CatalogError> {
+        parse_codex_models_response(
+            &serde_json::to_vec(&json!({ "models": models })).expect("fixture serializes"),
+        )
+    }
+
+    fn fixture_catalog(slug: &str) -> Arc<OpenAiModelCatalog> {
+        Arc::new(
+            parse_models(vec![model_fixture(
+                slug,
+                Some(372_000),
+                Some(372_000),
+                None,
+                &["low", "medium", "high", "xhigh", "max", "ultra"],
+                true,
+            )])
+            .expect("fixture parses"),
+        )
+    }
+
+    fn model_request(model: &str, effort: ReasoningEffort) -> ModelRequest {
+        ModelRequest {
+            model: model.to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::default(),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: effort,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        }
+    }
+
+    fn compact_request(model: &str, effort: ReasoningEffort) -> ProviderCompactionRequest {
+        ProviderCompactionRequest {
+            model: model.to_string(),
+            prompt: PromptSections::default(),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            reasoning_effort: effort,
+            prompt_cache_key: None,
+            session_id: None,
+            compaction_instructions: None,
+        }
+    }
+
+    fn test_provider(
+        base_url: String,
+        account_id: Option<&str>,
+        token: &str,
+        cache: OpenAiModelCatalogCache,
+    ) -> OpenAiProvider {
+        let mut provider = OpenAiProvider::codex_with_client_and_cache(
+            reqwest::Client::new(),
+            token,
+            account_id.map(str::to_string),
+            Some("installation-id".to_string()),
+            cache,
+        );
+        provider.base_url = base_url;
+        provider
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.expect("request reads");
+            assert!(read > 0, "request closed before headers");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return request;
+            }
+        }
+    }
+
+    async fn write_json_response(stream: &mut tokio::net::TcpStream, status: &str, body: &[u8]) {
+        let headers = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("response headers write");
+        stream.write_all(body).await.expect("response body writes");
+    }
+
+    async fn start_single_response_server(
+        status: &'static str,
+        body: Vec<u8>,
+        delay: Duration,
+        requests: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}", listener.local_addr().expect("local address"));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request accepted");
+            requests.fetch_add(1, Ordering::Relaxed);
+            let request = read_request(&mut stream).await;
+            tokio::time::sleep(delay).await;
+            write_json_response(&mut stream, status, &body).await;
+            request
+        });
+        (base_url, server)
+    }
+
+    #[test]
+    fn catalog_resolves_current_window_before_max_and_derives_ninety_percent() {
+        let catalog = parse_models(vec![
+            model_fixture(
+                "gpt-5.4",
+                Some(272_000),
+                Some(1_000_000),
+                None,
+                &["low", "medium", "high", "xhigh"],
+                true,
+            ),
+            model_fixture(
+                "gpt-5.6-sol",
+                Some(372_000),
+                Some(372_000),
+                None,
+                &["low", "medium", "high", "xhigh", "max", "ultra"],
+                true,
+            ),
+        ])
+        .expect("catalog parses");
+
+        let gpt54 = catalog.models.get("gpt-5.4").expect("gpt-5.4 exists");
+        assert_eq!(gpt54.max_input_tokens, Some(272_000));
+        assert_eq!(gpt54.recommended_auto_compact_tokens, Some(244_800));
+        let sol = catalog
+            .models
+            .get("gpt-5.6-sol")
+            .expect("gpt-5.6-sol exists");
+        assert_eq!(sol.max_input_tokens, Some(372_000));
+        assert_eq!(sol.recommended_auto_compact_tokens, Some(334_800));
+    }
+
+    #[test]
+    fn catalog_explicit_auto_limit_is_clamped_to_ninety_percent() {
+        let catalog = parse_models(vec![
+            model_fixture("below", Some(100_000), None, Some(80_000), &["low"], false),
+            model_fixture("above", Some(100_000), None, Some(95_000), &["low"], false),
+        ])
+        .expect("catalog parses");
+        assert_eq!(
+            catalog.models["below"].recommended_auto_compact_tokens,
+            Some(80_000)
+        );
+        assert_eq!(
+            catalog.models["above"].recommended_auto_compact_tokens,
+            Some(90_000)
+        );
+    }
+
+    #[test]
+    fn catalog_missing_optional_limits_derives_from_the_resolved_window() {
+        let catalog = parse_codex_models_response(
+            br#"{
+                "models": [{
+                    "slug": "missing-optionals",
+                    "context_window": 272000,
+                    "supported_reasoning_levels": [{"effort": "medium"}],
+                    "supports_parallel_tool_calls": true
+                }]
+            }"#,
+        )
+        .expect("missing optional limits parse");
+        let metadata = &catalog.models["missing-optionals"];
+        assert_eq!(metadata.max_input_tokens, Some(272_000));
+        assert_eq!(metadata.recommended_auto_compact_tokens, Some(244_800));
+    }
+
+    #[test]
+    fn catalog_accepts_empty_and_unknown_fields_but_rejects_malformed_entries_atomically() {
+        assert!(parse_models(Vec::new())
+            .expect("empty catalog is authoritative")
+            .models
+            .is_empty());
+        assert!(parse_models(vec![model_fixture(
+            "valid",
+            Some(272_000),
+            None,
+            None,
+            &["low"],
+            true,
+        )])
+        .is_ok());
+
+        let valid = model_fixture("valid", Some(272_000), None, None, &["low"], true);
+        let cases = [
+            vec![
+                valid.clone(),
+                model_fixture("valid", Some(1), None, None, &["low"], true),
+            ],
+            vec![model_fixture("", Some(1), None, None, &["low"], true)],
+            vec![model_fixture(
+                &"s".repeat(CODEX_MODELS_MAX_SLUG_BYTES + 1),
+                Some(1),
+                None,
+                None,
+                &["low"],
+                true,
+            )],
+            vec![model_fixture("zero", Some(0), None, None, &["low"], true)],
+            vec![model_fixture(
+                "efforts",
+                Some(1),
+                None,
+                None,
+                &vec!["low"; CODEX_MODELS_MAX_EFFORTS + 1],
+                true,
+            )],
+        ];
+        for models in cases {
+            assert!(parse_models(models).is_err());
+        }
+
+        assert!(parse_codex_models_response(&vec![b' '; CODEX_MODELS_MAX_BODY_BYTES + 1]).is_err());
+        assert!(parse_models(
+            (0..=CODEX_MODELS_MAX_MODELS)
+                .map(|index| {
+                    model_fixture(
+                        &format!("model-{index}"),
+                        Some(1),
+                        None,
+                        None,
+                        &["low"],
+                        true,
+                    )
+                })
+                .collect()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn exact_slug_and_reasoning_capabilities_are_authoritative() {
+        let catalog = parse_models(vec![
+            model_fixture(
+                "gpt-5.6-sol",
+                Some(372_000),
+                None,
+                None,
+                &["low", "medium", "high", "xhigh", "max", "ultra"],
+                true,
+            ),
+            model_fixture(
+                "gpt-5.6-terra",
+                Some(372_000),
+                None,
+                None,
+                &["low", "medium", "high", "xhigh", "max", "ultra"],
+                true,
+            ),
+            model_fixture(
+                "gpt-5.6-luna",
+                Some(372_000),
+                None,
+                None,
+                &["low", "medium", "high", "xhigh", "max"],
+                false,
+            ),
+        ])
+        .expect("catalog parses");
+        assert!(!catalog.models.contains_key("gpt-5.6"));
+        assert!(
+            openai_reasoning_effort(&catalog.models["gpt-5.6-sol"], ReasoningEffort::Ultra).is_ok()
+        );
+        assert!(
+            openai_reasoning_effort(&catalog.models["gpt-5.6-terra"], ReasoningEffort::Ultra)
+                .is_ok()
+        );
+        for effort in [ReasoningEffort::Ultra, ReasoningEffort::None] {
+            let error = openai_reasoning_effort(&catalog.models["gpt-5.6-luna"], effort)
+                .expect_err("unsupported effort must not be normalized");
+            assert!(error.to_string().contains(effort.as_str()));
+        }
+    }
+
+    #[test]
+    fn ordinary_and_compact_bodies_use_catalog_parallel_capability_and_keep_priority() {
+        let metadata = OpenAiModelMetadata {
+            slug: "gpt-5.6-luna".to_string(),
+            max_input_tokens: Some(372_000),
+            recommended_auto_compact_tokens: Some(334_800),
+            supported_reasoning_efforts: ["high".to_string()].into_iter().collect(),
+            supports_parallel_tool_calls: false,
+        };
+        let ordinary = responses_body_with_metadata(
+            model_request("gpt-5.6-luna", ReasoningEffort::High),
+            "session",
+            &metadata,
+        )
+        .expect("ordinary body renders");
+        let compact = compact_body_with_metadata(
+            compact_request("gpt-5.6-luna", ReasoningEffort::High),
+            "session",
+            &metadata,
+        )
+        .expect("compact body renders");
+        for body in [ordinary, compact] {
+            assert_eq!(body["parallel_tool_calls"], false);
+            assert_eq!(body["service_tier"], "priority");
+        }
+    }
+
+    #[tokio::test]
+    async fn models_request_uses_exact_get_query_and_common_headers_only() {
+        let body = serde_json::to_vec(&json!({
+            "models": [model_fixture(
+                "gpt-5.6-sol",
+                Some(372_000),
+                None,
+                None,
+                &["low"],
+                true
+            )]
+        }))
+        .expect("fixture serializes");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) =
+            start_single_response_server("200 OK", body, Duration::ZERO, requests.clone()).await;
+        let provider = test_provider(
+            base_url,
+            Some("account-id"),
+            "access-token",
+            OpenAiModelCatalogCache::default(),
+        );
+
+        assert_eq!(provider.models_request_timeout, Duration::from_secs(5));
+        assert!(provider
+            .model_metadata("gpt-5.6-sol")
+            .await
+            .expect("metadata lookup succeeds")
+            .is_some());
+        let raw = server.await.expect("server joins");
+        let request = String::from_utf8(raw).expect("request is utf-8");
+        let request_lower = request.to_ascii_lowercase();
+        let first_line = request.lines().next().expect("request line");
+        assert_eq!(first_line, "GET /models?client_version=0.142.3 HTTP/1.1");
+        assert!(request_lower.contains("authorization: bearer access-token\r\n"));
+        assert!(request_lower.contains("chatgpt-account-id: account-id\r\n"));
+        assert!(request_lower.contains("originator: codex_cli_rs\r\n"));
+        assert!(request_lower.contains("user-agent: codex_cli_rs/0.142.3"));
+        assert!(request_lower.contains("x-codex-installation-id: installation-id\r\n"));
+        assert!(request_lower.contains("x-openai-internal-codex-residency: us\r\n"));
+        for forbidden in [
+            "x-codex-window-id:",
+            "x-client-request-id:",
+            "x-codex-turn-state:",
+            "session_id:",
+            "session-id:",
+            "thread_id:",
+            "thread-id:",
+        ] {
+            assert!(!request_lower.contains(forbidden), "{forbidden}");
+        }
+        let header_end = request.find("\r\n\r\n").expect("headers end") + 4;
+        assert_eq!(request.len(), header_end, "models request has no body");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_empty_catalog_is_authoritative_and_exact_lookup_fails() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = start_single_response_server(
+            "200 OK",
+            br#"{"models":[]}"#.to_vec(),
+            Duration::ZERO,
+            requests.clone(),
+        )
+        .await;
+        let provider = test_provider(
+            base_url,
+            Some("account-id"),
+            "access-token",
+            OpenAiModelCatalogCache::default(),
+        );
+
+        for _ in 0..2 {
+            let error = provider
+                .model_metadata("gpt-5.6-sol")
+                .await
+                .expect_err("empty authoritative catalog has no matching slug");
+            assert!(matches!(error, ProviderError::ModelCatalog { .. }));
+            assert!(error.to_string().contains("exact model slug gpt-5.6-sol"));
+        }
+        server.await.expect("server joins");
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "fresh authoritative empty catalog must not trigger a fallback GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_request_honors_five_second_timeout_configuration() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let body = br#"{"models":[]}"#.to_vec();
+        let (base_url, server) =
+            start_single_response_server("200 OK", body, Duration::from_millis(100), requests)
+                .await;
+        let mut provider = test_provider(
+            base_url,
+            Some("account-id"),
+            "access-token",
+            OpenAiModelCatalogCache::default(),
+        );
+        assert_eq!(provider.models_request_timeout, Duration::from_secs(5));
+        provider.models_request_timeout = Duration::from_millis(10);
+
+        let error = provider
+            .model_metadata("anything")
+            .await
+            .expect_err("test timeout must surface");
+        assert!(matches!(
+            error,
+            ProviderError::ModelCatalog { status: None, .. }
+        ));
+        assert!(error.to_string().contains("timed out"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_catalog_lookups_singleflight_and_fresh_reuse() {
+        let body = serde_json::to_vec(&json!({
+            "models": [model_fixture(
+                "gpt-5.6-sol",
+                Some(372_000),
+                None,
+                None,
+                &["low"],
+                true
+            )]
+        }))
+        .expect("fixture serializes");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = start_single_response_server(
+            "200 OK",
+            body,
+            Duration::from_millis(30),
+            requests.clone(),
+        )
+        .await;
+        let provider = Arc::new(test_provider(
+            base_url,
+            Some("account-id"),
+            "access-token",
+            OpenAiModelCatalogCache::default(),
+        ));
+        let barrier = Arc::new(tokio::sync::Barrier::new(21));
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let provider = provider.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                provider.model_metadata("gpt-5.6-sol").await
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            assert!(task
+                .await
+                .expect("lookup joins")
+                .expect("lookup succeeds")
+                .is_some());
+        }
+        assert!(provider
+            .model_metadata("gpt-5.6-sol")
+            .await
+            .expect("fresh cache lookup succeeds")
+            .is_some());
+        server.await.expect("server joins");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_expiry_failure_is_explicit_never_stale_and_backed_off() {
+        let cache = OpenAiModelCatalogCache::default();
+        let key = OpenAiCatalogKey {
+            base_url: "https://example.invalid".to_string(),
+            identity: OpenAiCatalogIdentity::Account("account".to_string()),
+        };
+        let now = Instant::now();
+        let CatalogCacheDecision::Start { refresh, .. } = cache.decision(&key, now).await else {
+            panic!("cold cache starts refresh");
+        };
+        let catalog = fixture_catalog("old");
+        cache
+            .commit_refresh(&key, refresh.generation, &Ok(catalog), now)
+            .await;
+
+        let expired = now + CODEX_MODELS_SUCCESS_TTL;
+        let CatalogCacheDecision::Start { refresh, .. } = cache.decision(&key, expired).await
+        else {
+            panic!("expired cache starts refresh");
+        };
+        let failure = CatalogError::new("refresh failed");
+        cache
+            .commit_refresh(&key, refresh.generation, &Err(failure.clone()), expired)
+            .await;
+
+        match cache.decision(&key, expired + Duration::from_secs(1)).await {
+            CatalogCacheDecision::Return(Err(error)) => assert_eq!(error, failure),
+            _ => panic!("failure backoff returns the same explicit error"),
+        }
+        assert!(cache
+            .state
+            .lock()
+            .await
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| { catalog.models.contains_key("old") }));
+    }
+
+    #[tokio::test]
+    async fn cold_failure_backoff_401_and_account_switch_have_safe_cache_semantics() {
+        let cache = OpenAiModelCatalogCache::default();
+        let key_a = OpenAiCatalogKey {
+            base_url: "https://example.invalid".to_string(),
+            identity: OpenAiCatalogIdentity::Account("a".to_string()),
+        };
+        let key_b = OpenAiCatalogKey {
+            base_url: "https://example.invalid".to_string(),
+            identity: OpenAiCatalogIdentity::Account("b".to_string()),
+        };
+        let now = Instant::now();
+        let CatalogCacheDecision::Start {
+            refresh: refresh_a, ..
+        } = cache.decision(&key_a, now).await
+        else {
+            panic!("account a starts");
+        };
+        let CatalogCacheDecision::Start {
+            refresh: refresh_b, ..
+        } = cache.decision(&key_b, now).await
+        else {
+            panic!("account switch starts a distinct refresh");
+        };
+        assert!(
+            !cache
+                .commit_refresh(
+                    &key_a,
+                    refresh_a.generation,
+                    &Ok(fixture_catalog("wrong-account")),
+                    now,
+                )
+                .await
+        );
+        assert!(cache.state.lock().await.catalog.is_none());
+
+        let failure = CatalogError::new("cold failure");
+        assert!(
+            cache
+                .commit_refresh(&key_b, refresh_b.generation, &Err(failure.clone()), now)
+                .await
+        );
+        match cache.decision(&key_b, now + Duration::from_secs(1)).await {
+            CatalogCacheDecision::Return(Err(error)) => assert_eq!(error, failure),
+            _ => panic!("cold failure is negatively cached briefly"),
+        }
+
+        let after_backoff = now + CODEX_MODELS_FAILURE_TTL;
+        let CatalogCacheDecision::Start { refresh, .. } =
+            cache.decision(&key_b, after_backoff).await
+        else {
+            panic!("backoff expiry starts refresh");
+        };
+        let unauthorized = CatalogError {
+            status: Some(401),
+            message: "unauthorized".to_string(),
+        };
+        cache
+            .commit_refresh(
+                &key_b,
+                refresh.generation,
+                &Err(unauthorized),
+                after_backoff,
+            )
+            .await;
+        assert!(matches!(
+            cache.decision(&key_b, after_backoff).await,
+            CatalogCacheDecision::Start { .. }
+        ));
+    }
+
+    #[test]
+    fn catalog_identity_uses_account_or_noncredential_token_fingerprint() {
+        let cache = OpenAiModelCatalogCache::default();
+        let account_a = test_provider(
+            "https://example.invalid".to_string(),
+            Some("account"),
+            "token-a",
+            cache.clone(),
+        );
+        let account_b = test_provider(
+            "https://example.invalid".to_string(),
+            Some("account"),
+            "token-b",
+            cache.clone(),
+        );
+        assert!(
+            account_a.catalog_key() == account_b.catalog_key(),
+            "a refreshed token for the same account reuses the catalog"
+        );
+
+        let anonymous_a = test_provider(
+            "https://example.invalid".to_string(),
+            None,
+            "token-a",
+            cache.clone(),
+        );
+        let anonymous_b = test_provider(
+            "https://example.invalid".to_string(),
+            None,
+            "token-b",
+            cache,
+        );
+        assert!(
+            anonymous_a.catalog_key() != anonymous_b.catalog_key(),
+            "accounts without an id are isolated by token fingerprint"
+        );
+        assert!(
+            !format!("{:?}", anonymous_a.model_catalog_cache).contains("token-a"),
+            "cache debug output must not expose credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_atomically_replaces_catalog_and_removes_omissions() {
+        let cache = OpenAiModelCatalogCache::default();
+        let key = OpenAiCatalogKey {
+            base_url: "https://example.invalid".to_string(),
+            identity: OpenAiCatalogIdentity::Account("account".to_string()),
+        };
+        let now = Instant::now();
+        let CatalogCacheDecision::Start { refresh, .. } = cache.decision(&key, now).await else {
+            panic!("cold cache starts");
+        };
+        let first = Arc::new(OpenAiModelCatalog {
+            models: [
+                (
+                    "old".to_string(),
+                    fixture_catalog("old").models["old"].clone(),
+                ),
+                (
+                    "keep".to_string(),
+                    fixture_catalog("keep").models["keep"].clone(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        cache
+            .commit_refresh(&key, refresh.generation, &Ok(first), now)
+            .await;
+
+        let expired = now + CODEX_MODELS_SUCCESS_TTL;
+        let CatalogCacheDecision::Start { refresh, .. } = cache.decision(&key, expired).await
+        else {
+            panic!("expired cache starts");
+        };
+        cache
+            .commit_refresh(
+                &key,
+                refresh.generation,
+                &Ok(fixture_catalog("keep")),
+                expired,
+            )
+            .await;
+        let state = cache.state.lock().await;
+        let catalog = state.catalog.as_ref().expect("new catalog installed");
+        assert!(!catalog.models.contains_key("old"));
+        assert!(catalog.models.contains_key("keep"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_cancel_detached_refresh() {
+        let body = serde_json::to_vec(&json!({
+            "models": [model_fixture(
+                "gpt-5.6-sol",
+                Some(372_000),
+                None,
+                None,
+                &["low"],
+                true
+            )]
+        }))
+        .expect("fixture serializes");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = start_single_response_server(
+            "200 OK",
+            body,
+            Duration::from_millis(50),
+            requests.clone(),
+        )
+        .await;
+        let provider = Arc::new(test_provider(
+            base_url,
+            Some("account-id"),
+            "access-token",
+            OpenAiModelCatalogCache::default(),
+        ));
+        let first_provider = provider.clone();
+        let first = tokio::spawn(async move { first_provider.model_metadata("gpt-5.6-sol").await });
+        while requests.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+
+        assert!(provider
+            .model_metadata("gpt-5.6-sol")
+            .await
+            .expect("second waiter receives detached refresh")
+            .is_some());
+        server.await.expect("server joins");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
 }
 
 #[derive(Debug)]
@@ -541,6 +1774,12 @@ fn response_daemon_tool_result_item(
     }))
 }
 
+#[cfg(test)]
+fn compact_body(request: ProviderCompactionRequest, session_id: &str) -> ProviderResult<Value> {
+    let metadata = test_openai_model_metadata(&request.model);
+    compact_body_with_metadata(request, session_id, &metadata)
+}
+
 fn openai_daemon_observation_call_id(observation: &agent_vocab::DaemonToolObservation) -> String {
     let original = observation.tool_call_id.as_str();
     if original.len() <= OPENAI_MAX_CALL_ID_LEN {
@@ -753,6 +1992,22 @@ impl OpenAiProvider {
         account_id: Option<String>,
         installation_id: Option<String>,
     ) -> Self {
+        Self::codex_with_client_and_cache(
+            client,
+            access_token,
+            account_id,
+            installation_id,
+            OpenAiModelCatalogCache::default(),
+        )
+    }
+
+    pub fn codex_with_client_and_cache(
+        client: reqwest::Client,
+        access_token: impl Into<String>,
+        account_id: Option<String>,
+        installation_id: Option<String>,
+        model_catalog_cache: OpenAiModelCatalogCache,
+    ) -> Self {
         Self {
             client,
             session_state: None,
@@ -760,6 +2015,8 @@ impl OpenAiProvider {
             account_id,
             installation_id,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            model_catalog_cache,
+            models_request_timeout: CODEX_MODELS_REQUEST_TIMEOUT,
         }
     }
 
@@ -770,6 +2027,24 @@ impl OpenAiProvider {
         account_id: Option<String>,
         installation_id: Option<String>,
     ) -> Self {
+        Self::codex_with_client_session_and_cache(
+            client,
+            session_state,
+            access_token,
+            account_id,
+            installation_id,
+            OpenAiModelCatalogCache::default(),
+        )
+    }
+
+    pub fn codex_with_client_session_and_cache(
+        client: reqwest::Client,
+        session_state: Arc<OpenAiCodexSessionState>,
+        access_token: impl Into<String>,
+        account_id: Option<String>,
+        installation_id: Option<String>,
+        model_catalog_cache: OpenAiModelCatalogCache,
+    ) -> Self {
         Self {
             client,
             session_state: Some(session_state),
@@ -777,7 +2052,159 @@ impl OpenAiProvider {
             account_id,
             installation_id,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            model_catalog_cache,
+            models_request_timeout: CODEX_MODELS_REQUEST_TIMEOUT,
         }
+    }
+
+    fn catalog_key(&self) -> OpenAiCatalogKey {
+        let identity = match self.account_id.as_ref() {
+            Some(account_id) => OpenAiCatalogIdentity::Account(account_id.clone()),
+            None => {
+                let mut hasher = Sha256::new();
+                hasher.update(b"pi-relay codex model catalog identity\0");
+                hasher.update(self.access_token.as_bytes());
+                OpenAiCatalogIdentity::TokenFingerprint(hasher.finalize().into())
+            }
+        };
+        OpenAiCatalogKey {
+            base_url: self.base_url.trim_end_matches('/').to_string(),
+            identity,
+        }
+    }
+
+    async fn resolved_catalog(&self) -> ProviderResult<Arc<OpenAiModelCatalog>> {
+        let key = self.catalog_key();
+        loop {
+            let decision = self
+                .model_catalog_cache
+                .decision(&key, Instant::now())
+                .await;
+            let refresh = match decision {
+                CatalogCacheDecision::Return(result) => {
+                    return result.map_err(CatalogError::into_provider_error)
+                }
+                CatalogCacheDecision::Wait(refresh) => refresh,
+                CatalogCacheDecision::Start { refresh, sender } => {
+                    self.spawn_catalog_refresh(key.clone(), refresh.generation, sender);
+                    refresh
+                }
+            };
+            if let Some(result) = wait_for_catalog_refresh(refresh.clone()).await {
+                return result.map_err(CatalogError::into_provider_error);
+            }
+            // Detached refresh normally outlives cancelled callers. If it
+            // panics or is aborted, clear only that generation and retry.
+            self.model_catalog_cache
+                .abandon_refresh(&key, refresh.generation)
+                .await;
+        }
+    }
+
+    async fn resolved_model_metadata(
+        &self,
+        model: &str,
+    ) -> ProviderResult<Arc<OpenAiModelMetadata>> {
+        self.resolved_catalog()
+            .await?
+            .models
+            .get(model)
+            .cloned()
+            .ok_or_else(|| ProviderError::ModelCatalog {
+                status: None,
+                message: format!("Codex model catalog does not contain exact model slug {model}"),
+            })
+    }
+
+    fn spawn_catalog_refresh(
+        &self,
+        key: OpenAiCatalogKey,
+        generation: u64,
+        sender: watch::Sender<CatalogRefreshStatus>,
+    ) {
+        let provider = self.clone();
+        tokio::spawn(async move {
+            let result =
+                provider
+                    .retrieve_catalog()
+                    .await
+                    .map(Arc::new)
+                    .map_err(|error| match error {
+                        ProviderError::ModelCatalog { status, message } => {
+                            CatalogError { status, message }
+                        }
+                        error => CatalogError::new(error.to_string()),
+                    });
+            let committed = provider
+                .model_catalog_cache
+                .commit_refresh(&key, generation, &result, Instant::now())
+                .await;
+            let published = if committed {
+                result
+            } else {
+                Err(CatalogError::new(
+                    "Codex model catalog refresh was superseded by an account identity change",
+                ))
+            };
+            let _ = sender.send(CatalogRefreshStatus::Finished(published));
+        });
+    }
+
+    async fn retrieve_catalog(&self) -> ProviderResult<OpenAiModelCatalog> {
+        let response = self
+            .add_codex_common_headers(
+                self.client
+                    .get(format!("{}/models", self.base_url.trim_end_matches('/')))
+                    .query(&[("client_version", CODEX_CLIENT_VERSION)])
+                    .header(ACCEPT, "application/json"),
+            )
+            .timeout(self.models_request_timeout)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ProviderError::ModelCatalog {
+                        status: None,
+                        message: format!(
+                            "Codex models request timed out after {} seconds",
+                            self.models_request_timeout.as_secs_f64()
+                        ),
+                    }
+                } else {
+                    ProviderError::ModelCatalog {
+                        status: error.status().map(|status| status.as_u16()),
+                        message: format!("Codex models request failed: {error}"),
+                    }
+                }
+            })?;
+        let status = response.status();
+        let bytes = read_bounded_catalog_response(response).await?;
+        if !status.is_success() {
+            let text = String::from_utf8_lossy(&bytes);
+            return Err(ProviderError::ModelCatalog {
+                status: Some(status.as_u16()),
+                message: response_error_message(&text),
+            });
+        }
+        parse_codex_models_response(&bytes).map_err(CatalogError::into_provider_error)
+    }
+
+    fn add_codex_common_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        let mut request = request
+            .header(HEADER_ORIGINATOR, CODEX_ORIGINATOR)
+            .header(HEADER_USER_AGENT, codex_user_agent())
+            .header(HEADER_RESIDENCY, CODEX_RESIDENCY_US)
+            .bearer_auth(&self.access_token);
+        if let Some(installation_id) = &self.installation_id {
+            request = request.header(HEADER_INSTALLATION_ID, installation_id);
+        }
+        if let Some(account_id) = &self.account_id {
+            request = request.header(HEADER_CHATGPT_ACCOUNT, account_id);
+        }
+        request
     }
 
     /// Apply the full Codex CLI request envelope: auth, identity, and the
@@ -792,13 +2219,8 @@ impl OpenAiProvider {
         window_id: &str,
         turn_state: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        let mut request = request
-            // Identity (default_headers in Codex CLI).
-            .header(HEADER_ORIGINATOR, CODEX_ORIGINATOR)
-            .header(HEADER_USER_AGENT, codex_user_agent())
-            .header(HEADER_RESIDENCY, CODEX_RESIDENCY_US)
-            // Auth (BearerAuthProvider in Codex CLI).
-            .bearer_auth(&self.access_token)
+        let mut request = self
+            .add_codex_common_headers(request)
             // Codex installation + window identity. Both are documented as
             // observability/routing hints in core/src/client.rs.
             .header(HEADER_WINDOW_ID, window_id)
@@ -814,12 +2236,6 @@ impl OpenAiProvider {
             .header("thread_id", session_id)
             .header("thread-id", session_id);
 
-        if let Some(installation_id) = &self.installation_id {
-            request = request.header(HEADER_INSTALLATION_ID, installation_id);
-        }
-        if let Some(account_id) = &self.account_id {
-            request = request.header(HEADER_CHATGPT_ACCOUNT, account_id);
-        }
         if let Some(turn_state) = turn_state {
             request = request.header(HEADER_CODEX_TURN_STATE, turn_state);
         }
@@ -842,11 +2258,10 @@ fn codex_user_agent() -> &'static str {
         // intentionally do NOT use pi-relay's own crate version here — the
         // originator+UA pair has to look like a Codex CLI build to clear
         // anti-abuse heuristics, same as the Anthropic attribution mimicry.
-        let codex_version = "0.130.0";
         format!(
             "{}/{} ({} {}; {})",
             CODEX_ORIGINATOR,
-            codex_version,
+            CODEX_CLIENT_VERSION,
             info.os_type(),
             info.version(),
             info.architecture().unwrap_or("unknown"),
@@ -861,6 +2276,14 @@ impl ModelProvider for OpenAiProvider {
         self.complete_responses(request).await
     }
 
+    async fn model_metadata(&self, model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
+        let metadata = self.resolved_model_metadata(model).await?;
+        Ok(Some(ProviderModelMetadata {
+            max_input_tokens: metadata.max_input_tokens,
+            recommended_auto_compact_tokens: metadata.recommended_auto_compact_tokens,
+        }))
+    }
+
     async fn compact(
         &self,
         request: ProviderCompactionRequest,
@@ -871,8 +2294,8 @@ impl ModelProvider for OpenAiProvider {
     // No `count_tokens` impl: the codex backend has no `/responses/input_tokens`
     // route (Cloudflare responds 403 with a challenge interstitial). pi-relay
     // reads `usage.input_tokens` off the streaming `response.completed` event
-    // and the runtime gate falls through to the reactive overflow recovery
-    // path for OpenAI sessions.
+    // and estimates only the local suffix for proactive scheduling. Reactive
+    // overflow recovery remains available when no trustworthy count exists.
 }
 
 impl OpenAiProvider {
@@ -895,7 +2318,8 @@ impl OpenAiProvider {
             .as_deref()
             .filter(|state| state.session_id() == session_id)
             .and_then(|state| state.turn_state_for_request(turn_id));
-        let body = responses_body(request, &session_id)?;
+        let metadata = self.resolved_model_metadata(&request.model).await?;
+        let body = responses_body_with_metadata(request, &session_id, &metadata)?;
 
         let response = send_provider_generation_request(
             zstd_json_request(
@@ -939,7 +2363,8 @@ impl OpenAiProvider {
             self.session_state.as_deref(),
             &request.transcript,
         );
-        let body = compact_body(request, &session_id)?;
+        let metadata = self.resolved_model_metadata(&request.model).await?;
+        let body = compact_body_with_metadata(request, &session_id, &metadata)?;
 
         let response = self
             .add_codex_headers(
@@ -1041,8 +2466,12 @@ fn response_error_message(body: &str) -> String {
         .unwrap_or_else(|| response_excerpt(body))
 }
 
-fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Value> {
-    let reasoning_effort = openai_reasoning_effort(&request.model, request.reasoning_effort);
+fn responses_body_with_metadata(
+    request: ModelRequest,
+    session_id: &str,
+    metadata: &OpenAiModelMetadata,
+) -> ProviderResult<Value> {
+    let reasoning_effort = openai_reasoning_effort(metadata, request.reasoning_effort)?;
     let tool_profile = request.tool_profile;
     let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
     let tools = response_tools(tool_profile, &request_tools)?;
@@ -1065,7 +2494,7 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
         "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
         "tools": tools,
         "tool_choice": "auto",
-        "parallel_tool_calls": true,
+        "parallel_tool_calls": metadata.supports_parallel_tool_calls,
         "reasoning": {
             "effort": reasoning_effort,
         },
@@ -1084,8 +2513,12 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
 // The compaction endpoint is unary, so keep streaming-only `/responses` fields
 // out. This is a valid subset of Codex CLI's current `CompactionInput`: pi-relay
 // has no text/verbosity request control to forward yet.
-fn compact_body(request: ProviderCompactionRequest, session_id: &str) -> ProviderResult<Value> {
-    let reasoning_effort = openai_reasoning_effort(&request.model, request.reasoning_effort);
+fn compact_body_with_metadata(
+    request: ProviderCompactionRequest,
+    session_id: &str,
+    metadata: &OpenAiModelMetadata,
+) -> ProviderResult<Value> {
+    let reasoning_effort = openai_reasoning_effort(metadata, request.reasoning_effort)?;
     let tool_profile = request.tool_profile;
     let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
     let tools = response_tools(tool_profile, &request_tools)?;
@@ -1097,7 +2530,7 @@ fn compact_body(request: ProviderCompactionRequest, session_id: &str) -> Provide
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
         "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
         "tools": tools,
-        "parallel_tool_calls": true,
+        "parallel_tool_calls": metadata.supports_parallel_tool_calls,
         "reasoning": {
             "effort": reasoning_effort,
         },
@@ -1133,26 +2566,21 @@ fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
     tools.iter().map(|tool| tool.declaration.clone()).collect()
 }
 
-// Map a reasoning effort to the OpenAI wire string. The daemon normalizes the
-// session effort to a model-supported value before building the request (see
-// `model_metadata::normalize_reasoning_effort`), so this should always receive a
-// value OpenAI accepts. Defensively clamp `minimal` (all current gpt-5.x) and
-// `max` (all current gpt-5.x except the verified GPT-5.6 hosted family) rather
-// than letting a stray direct adapter call produce a 400.
-fn is_hosted_gpt56(model: &str) -> bool {
-    ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"].contains(&model)
-}
-
-fn openai_reasoning_effort(model: &str, effort: ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::None
-        | ReasoningEffort::Low
-        | ReasoningEffort::Medium
-        | ReasoningEffort::High
-        | ReasoningEffort::XHigh => effort.as_str(),
-        ReasoningEffort::Minimal => ReasoningEffort::Low.as_str(),
-        ReasoningEffort::Max if is_hosted_gpt56(model) => ReasoningEffort::Max.as_str(),
-        ReasoningEffort::Max => ReasoningEffort::XHigh.as_str(),
+fn openai_reasoning_effort(
+    metadata: &OpenAiModelMetadata,
+    effort: ReasoningEffort,
+) -> ProviderResult<&'static str> {
+    if metadata
+        .supported_reasoning_efforts
+        .contains(effort.as_str())
+    {
+        Ok(effort.as_str())
+    } else {
+        Err(ProviderError::Provider(format!(
+            "reasoning effort {} is not supported by Codex model {}",
+            effort.as_str(),
+            metadata.slug
+        )))
     }
 }
 
@@ -2300,6 +3728,7 @@ mod tests {
         });
 
         let session_state = Arc::new(OpenAiCodexSessionState::new("session-1"));
+        let model_catalog_cache = OpenAiModelCatalogCache::default();
         let provider = OpenAiProvider {
             client: reqwest::Client::new(),
             session_state: Some(session_state),
@@ -2307,7 +3736,27 @@ mod tests {
             account_id: None,
             installation_id: None,
             base_url,
+            model_catalog_cache: model_catalog_cache.clone(),
+            models_request_timeout: CODEX_MODELS_REQUEST_TIMEOUT,
         };
+        let key = provider.catalog_key();
+        let now = Instant::now();
+        let CatalogCacheDecision::Start { refresh, .. } =
+            model_catalog_cache.decision(&key, now).await
+        else {
+            panic!("empty test cache starts a refresh");
+        };
+        let metadata = Arc::new(test_openai_model_metadata("gpt-5.5"));
+        model_catalog_cache
+            .commit_refresh(
+                &key,
+                refresh.generation,
+                &Ok(Arc::new(OpenAiModelCatalog {
+                    models: [("gpt-5.5".to_string(), metadata)].into_iter().collect(),
+                })),
+                now,
+            )
+            .await;
         let make_request = |turn_id| ModelRequest {
             model: "gpt-5.5".to_string(),
             transcript_cache_prefix_len: None,
@@ -2699,8 +4148,10 @@ mod tests {
     }
 
     #[test]
-    fn responses_body_clamps_older_model_max_reasoning() {
-        let body = responses_body(
+    fn responses_body_rejects_unsupported_reasoning_without_normalizing() {
+        let mut metadata = test_openai_model_metadata("gpt-5.5");
+        metadata.supported_reasoning_efforts.remove("max");
+        let error = responses_body_with_metadata(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
@@ -2715,10 +4166,12 @@ mod tests {
                 turn_id: None,
             },
             "test-session",
+            &metadata,
         )
-        .expect("responses body renders");
+        .expect_err("unsupported effort must fail locally");
 
-        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert!(error.to_string().contains("max"));
+        assert!(error.to_string().contains("gpt-5.5"));
     }
 
     #[test]

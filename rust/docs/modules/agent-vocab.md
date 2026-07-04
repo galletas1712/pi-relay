@@ -68,7 +68,7 @@ TurnOutcome = Graceful | Interrupted | Crashed
 ### Provider config (`provider.rs`)
 
 - `ProviderKind = OpenAi | Claude`. `FromStr` accepts `"openai"`, `"claude"`, and the legacy alias `"anthropic"`; it serializes back to `"openai"` / `"claude"`. `"codex"` is rejected — Codex is an auth transport, not a provider kind. See [design decisions](../design-decisions.md) for why OpenAI always routes through the ChatGPT/Codex subscription transport.
-- `ReasoningEffort = None | Minimal | Low | Medium | High | XHigh | Max`, default `Medium`. Round-trips through lowercase strings (`"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`).
+- `ReasoningEffort = None | Minimal | Low | Medium | High | XHigh | Max | Ultra`, default `Medium`. Round-trips through lowercase strings (`"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, `"ultra"`). Provider adapters still validate whether the selected model accepts the configured value.
 - `ProviderConfig { kind, model, reasoning_effort, max_tokens?, prompt_cache? }`. `reasoning_effort` defaults to `Medium`; `max_tokens` and `prompt_cache` (a raw `Value`) are omitted when absent.
 - `ProviderReplayItem { provider, raw_json, display? }` carries a provider's raw response payload as a JSON string plus an optional display hint. `ReplayDisplay { kind: LocalTool | HostedTool, pretty_name, input_summary? }` describes how to render hosted/local tool replay entries. Helpers: `new`/`new_with_display`, `raw_value()`, and `raw_type()` (reads the `type` field of the raw payload).
 

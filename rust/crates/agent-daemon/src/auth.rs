@@ -1,6 +1,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use anyhow::{anyhow, Result};
@@ -139,6 +140,11 @@ struct CodexRefreshResponse {
 }
 
 pub(crate) async fn refresh_codex_credentials() -> Result<Credentials> {
+    static REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    let _guard = REFRESH_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     let snapshot = read_codex_auth();
     let refresh_token = env::var("CODEX_REFRESH_TOKEN")
         .ok()

@@ -34,8 +34,8 @@ runtime/           SessionDriver facade plus concrete lifecycle phases:
 workspaces/        workspace base refresh, local/git source handling, sanitization,
                    and session instantiation (btrfs/reflink/copy fallback)
 rpc_views.rs       response shaping (snapshots, queue state, transcript views, server_time_ms)
-model_metadata.rs  per-model context windows + provider/model-aware auto-compaction defaults
-provider_runtime/  provider selection, model/web-tool execution, compaction, token accounting
+provider_runtime/  provider selection, model metadata scheduling, model/web-tool
+                   execution, compaction, token accounting
 subagents.rs       delegation subagent spawn core: role resolution, full vs
                    read-only workspace handling, child prompt + lifecycle events
 delegation_tools.rs     delegation tool surface (delegate_writing_task /
@@ -178,7 +178,40 @@ Two retry layers exist:
 
 ### Auto-compaction with circuit breaker
 
-Before a model action dispatches, `gate_model_dispatch` measures input tokens and blocks the action if it would exceed the model's auto limit. `model_metadata.rs` supplies per-model context windows and provider/model-aware defaults. A verified 1,000,000-token Claude window defaults to 500,000 tokens, including an unknown Claude id whose authoritative Models API metadata discovers that window. Hosted GPT-5.6 Sol/Terra/Luna use the live Codex 372,000-token window and Codex's 90% threshold, 334,800. Older OpenAI models and other discovered/static windows retain the generic 85% default. The daemon reads scheduler controls only from `/compaction/config`; sibling fields on `/compaction` are ordinary metadata and have no scheduler effect. Unknown nested fields, including the store-owned `max_consecutive_failures`, are ignored. A malformed active scheduler field disables automatic compaction. A valid explicit limit wins and is clamped to the selected window. The effective limit is floored at 8,000 without exceeding that window; a smaller known window disables automatic compaction. Explicit auto-compaction without a known window or limit remains eligible only for reactive provider-overflow recovery; it does not run proactive token gating. These scheduler controls never select the compaction algorithm: manual and automatic jobs always call `ModelProvider::compact` once with the full selected transcript. Token accounting differs by provider: Claude uses the authoritative remote token-count preflight; OpenAI/Codex has no usable remote count endpoint, so it anchors on the latest provider-reported usage and estimates only the local transcript suffix appended after that point.
+Before a model action dispatches, `gate_model_dispatch` asks every provider for
+`ModelProvider::model_metadata`, measures input tokens, and blocks the action if
+it would exceed the resolved automatic limit. Adapters own discovery and
+provider-specific threshold recommendations: OpenAI's authenticated catalog
+uses 90% of its resolved current/default context window (or a smaller explicit
+provider limit), while Anthropic preserves the verified 1M→500k policy and
+uses the generic 85% recommendation otherwise. The daemon no longer contains
+OpenAI model-id, effort, context-window, or threshold rows.
+
+The daemon reads scheduler controls only from `/compaction/config`; sibling
+fields on `/compaction` are ordinary metadata and have no scheduler effect.
+Unknown nested fields, including the store-owned
+`max_consecutive_failures`, are ignored. A malformed active scheduler field
+disables automatic compaction. Precedence is:
+
+1. a valid explicit session context/automatic limit, safely clamped;
+2. the adapter's recommended automatic limit;
+3. the neutral 85% policy only when the adapter returned an authoritative
+   resolved input window;
+4. no proactive threshold, with reactive provider-overflow recovery still
+   enabled.
+
+The effective limit is floored at 8,000 without exceeding the selected window;
+a smaller known window disables automatic compaction. Provider metadata lookup
+uses the same one-time Codex 401 refresh/rebuild path as generation. Other
+metadata errors do not invent a threshold: the ordinary OpenAI request
+exact-resolves the same catalog and surfaces its typed error before shaping,
+while reactive overflow remains available when a request can proceed without a
+proactive limit. These scheduler controls never select the compaction
+algorithm: manual and automatic jobs always call `ModelProvider::compact` once
+with the full selected transcript. Token accounting differs by provider:
+Claude uses the authoritative remote token-count preflight; OpenAI/Codex has no
+usable remote count endpoint, so it anchors on the latest provider-reported
+usage and estimates only the local transcript suffix appended after that point.
 
 ```
 RequestModel ready to dispatch

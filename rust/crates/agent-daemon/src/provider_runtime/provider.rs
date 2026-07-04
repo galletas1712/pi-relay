@@ -5,6 +5,8 @@ use anyhow::Result;
 use crate::auth::Credentials;
 use crate::state::AppState;
 
+use super::auth_retry::model_metadata_with_auth_retry;
+
 pub(super) struct ProviderHandle {
     pub(super) provider: Box<dyn ModelProvider>,
     pub(super) uses_codex_auth: bool,
@@ -29,9 +31,12 @@ pub(crate) async fn model_metadata_for_config(
 ) -> Result<Option<ProviderModelMetadata>> {
     let credentials = Credentials::load();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
-    provider
-        .provider
-        .model_metadata(&config.provider.model)
-        .await
-        .map_err(Into::into)
+    Ok(model_metadata_with_auth_retry(
+        state,
+        config,
+        session_id,
+        provider,
+        config.provider.model.clone(),
+    )
+    .await?)
 }

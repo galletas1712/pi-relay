@@ -68,6 +68,7 @@ text_enum! {
         High => "high",
         XHigh => "xhigh",
         Max => "max",
+        Ultra => "ultra",
     }
 }
 
@@ -149,6 +150,18 @@ impl ProviderReplayItem {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ultra_reasoning_effort_round_trips_as_wire_string() {
+        assert_eq!(
+            serde_json::to_value(ReasoningEffort::Ultra).unwrap(),
+            json!("ultra")
+        );
+        assert_eq!(
+            serde_json::from_value::<ReasoningEffort>(json!("ultra")).unwrap(),
+            ReasoningEffort::Ultra
+        );
+    }
 
     #[test]
     fn provider_kind_accepts_legacy_anthropic_alias() {

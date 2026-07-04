@@ -126,12 +126,16 @@ Implemented user-facing behavior:
   the same blocked action after one native checkpoint, and reduced the
   effective count from the 541,564-token gate to 15,628. Ordinary inline
   compaction blocks still fail closed at the provider boundary.
-- Provider/model-aware compaction thresholds: verified 1M Claude windows
-  default to 500k; hosted GPT-5.6 Sol/Terra/Luna currently use a historical
-  static 372k window and a 334.8k threshold; older OpenAI and other windows
-  retain the generic 85% policy. The authenticated-discovery discrepancy and
-  non-authoritative status of that GPT-5.6 value are documented in the
-  [provider API audit](provider-api-support.md#gpt-56-capability-discrepancy).
+- Provider/model-aware compaction thresholds through the provider-neutral
+  `ModelProvider::model_metadata` contract. OpenAI exact-resolves the selected
+  slug from an authenticated, account-scoped private Codex catalog before
+  ordinary and compact requests; verified 372k GPT-5.6 windows recommend
+  334.8k, while GPT-5.4's 272k current/default window recommends 244.8k rather
+  than using its 1M maximum. There is no static OpenAI runtime fallback.
+  Anthropic preserves its verified 1M→500k policy. Explicit session values
+  remain highest precedence, and absent authoritative metadata leaves only
+  reactive overflow recovery. See the
+  [provider API audit](provider-api-support.md#account--and-client-version-sensitive-codex-catalog).
 - Turn-oriented selected-session loading: collapsed turn cards plus lazy
   per-turn detail, so normal loads do not scale with transcript size, and raw
   `provider_replay` never reaches any UI/RPC response.

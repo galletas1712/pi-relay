@@ -5,7 +5,6 @@ use agent_vocab::TurnId;
 use anyhow::Result;
 
 use crate::auth::Credentials;
-use crate::model_metadata;
 use crate::state::AppState;
 
 use super::auth_retry::complete_with_auth_retry;
@@ -132,11 +131,7 @@ pub(crate) async fn build_model_request(
         // ceilings. Do not pre-clamp here or stale daemon metadata could
         // override a newer Models API result.
         max_tokens: config.provider.max_tokens,
-        reasoning_effort: model_metadata::normalize_reasoning_effort(
-            config.provider.kind,
-            &config.provider.model,
-            config.provider.reasoning_effort,
-        ),
+        reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: Some(model_prompt_cache_key(config, session_id)),
         session_id: Some(session_id.to_string()),
         turn_id,

@@ -133,15 +133,15 @@ pub struct ProviderTokenCountResponse {
     pub original_input_tokens: Option<usize>,
 }
 
-/// Provider-reported model limits used by the daemon for runtime safety.
+/// Provider-normalized model limits consumed by the daemon scheduler.
 ///
-/// This is deliberately transient: providers may cache discovery in memory,
-/// while callers must retain static fallbacks for operation during API or
-/// network failures.
+/// Provider adapters own discovery, caching, and provider-specific threshold
+/// policy. The daemon uses only the resolved current/default input window and
+/// an optional provider-recommended automatic compaction limit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProviderModelMetadata {
     pub max_input_tokens: Option<usize>,
-    pub max_output_tokens: Option<u32>,
+    pub recommended_auto_compact_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,6 +364,11 @@ pub enum ProviderError {
     Transient(String),
     #[error("provider returned an error: {0}")]
     Provider(String),
+    #[error("provider model catalog error: {message}")]
+    ModelCatalog {
+        status: Option<u16>,
+        message: String,
+    },
     #[error("provider returned HTTP {status}: {message}")]
     Status { status: u16, message: String },
     #[error("provider response was incomplete (status: {status}, reason: {reason})")]
@@ -388,6 +393,7 @@ impl ProviderError {
     pub fn status_code(&self) -> Option<u16> {
         match self {
             ProviderError::Status { status, .. } => Some(*status),
+            ProviderError::ModelCatalog { status, .. } => *status,
             ProviderError::Http(error) => error.status().map(|status| status.as_u16()),
             ProviderError::Timeout(_)
             | ProviderError::Transient(_)
@@ -427,6 +433,9 @@ impl ProviderError {
             }
             ProviderError::Timeout(message) => Some(format!("timeout={message}")),
             ProviderError::Transient(message) => Some(format!("transient={message}")),
+            ProviderError::ModelCatalog { status, .. } => status
+                .map(|status| format!("model_catalog_status={status}"))
+                .or_else(|| Some("model_catalog".to_string())),
             ProviderError::Status { status, .. } => Some(format!("status={status}")),
             ProviderError::Provider(_)
             | ProviderError::Incomplete { .. }
@@ -445,7 +454,9 @@ impl ProviderError {
             | ProviderError::Transient(message)
             | ProviderError::Provider(message) => message.clone(),
             ProviderError::Http(error) => error.to_string(),
-            ProviderError::Timeout(_) => return false,
+            // Catalog failures happen before request shaping and are never
+            // evidence that a generation exceeded its context window.
+            ProviderError::ModelCatalog { .. } | ProviderError::Timeout(_) => return false,
             ProviderError::Incomplete { .. }
             | ProviderError::Json(_)
             | ProviderError::NativeCompaction { .. } => return false,
@@ -542,6 +553,11 @@ mod provider_error_tests {
             status: 400,
             message: "invalid_request_error: messages: at least one message is required"
                 .to_string(),
+        }
+        .is_context_overflow());
+        assert!(!ProviderError::ModelCatalog {
+            status: Some(413),
+            message: "Codex model has invalid context_window".to_string(),
         }
         .is_context_overflow());
     }

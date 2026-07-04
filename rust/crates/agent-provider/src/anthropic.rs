@@ -233,6 +233,14 @@ impl AnthropicCompactionBlockError {
     }
 }
 
+fn anthropic_auto_compact_limit(window: usize) -> usize {
+    if window == 1_000_000 {
+        500_000
+    } else {
+        window / 100 * 85 + window % 100 * 85 / 100
+    }
+}
+
 /// The one validity rule used for persisted Anthropic compaction replay.
 ///
 /// Unknown fields are deliberately allowed and retained verbatim.
@@ -731,7 +739,7 @@ impl AnthropicModelCapabilities {
             ReasoningEffort::High => self.high_effort,
             ReasoningEffort::XHigh => self.xhigh_effort,
             ReasoningEffort::Max => self.max_effort,
-            ReasoningEffort::None | ReasoningEffort::Minimal => false,
+            ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::Ultra => false,
         }
     }
 }
@@ -1056,7 +1064,9 @@ impl ModelProvider for AnthropicProvider {
         let metadata = self.resolved_model_metadata(model).await;
         Ok(Some(ProviderModelMetadata {
             max_input_tokens: metadata.max_input_tokens,
-            max_output_tokens: Some(metadata.max_tokens),
+            recommended_auto_compact_tokens: metadata
+                .max_input_tokens
+                .map(anthropic_auto_compact_limit),
         }))
     }
 
@@ -1357,6 +1367,12 @@ fn anthropic_reasoning_effort(
     capabilities: AnthropicModelCapabilities,
     effort: ReasoningEffort,
 ) -> ProviderResult<&'static str> {
+    let effort = match effort {
+        // Preserve the daemon's historical Claude normalization inside the
+        // adapter now that provider-neutral core passes raw configured intent.
+        ReasoningEffort::None | ReasoningEffort::Minimal => ReasoningEffort::Low,
+        effort => effort,
+    };
     if capabilities.supports_effort(effort) {
         return Ok(effort.as_str());
     }
@@ -2967,6 +2983,12 @@ mod tests {
     use crate::PromptSections;
     use agent_vocab::ToolResultMessage;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn metadata_threshold_preserves_one_million_special_case_and_generic_policy() {
+        assert_eq!(anthropic_auto_compact_limit(1_000_000), 500_000);
+        assert_eq!(anthropic_auto_compact_limit(200_000), 170_000);
+    }
 
     fn test_tool(
         provider: ProviderKind,

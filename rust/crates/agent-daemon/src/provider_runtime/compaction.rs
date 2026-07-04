@@ -12,7 +12,6 @@ use std::future::Future;
 
 use crate::auth::Credentials;
 use crate::delegation_context::compaction_delegation_ledger;
-use crate::model_metadata;
 use crate::state::AppState;
 
 use super::auth_retry::compact_with_auth_retry;
@@ -31,6 +30,10 @@ fn generic_native_compaction_summary(provider: ProviderKind) -> String {
             "Conversation history before this point was compacted using provider-native compaction.".to_string()
         }
     }
+}
+
+fn generic_auto_limit_for_window(window: usize) -> usize {
+    window / 100 * 85 + window % 100 * 85 / 100
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,11 +149,10 @@ pub(crate) struct CompactionAutoState {
 }
 
 pub(crate) fn compaction_config_with_model_metadata(
-    config: &SessionConfig,
     discovered: Option<ProviderModelMetadata>,
     policy: &ParsedCompactionPolicy,
 ) -> CompactionConfig {
-    resolve_compaction_config_with_policy(config, discovered, policy)
+    resolve_compaction_config_with_policy(discovered, policy)
 }
 
 #[cfg(test)]
@@ -159,11 +161,10 @@ fn resolve_compaction_config(
     discovered: Option<ProviderModelMetadata>,
 ) -> CompactionConfig {
     let policy = parse_compaction_policy(config);
-    resolve_compaction_config_with_policy(config, discovered, &policy)
+    resolve_compaction_config_with_policy(discovered, &policy)
 }
 
 fn resolve_compaction_config_with_policy(
-    config: &SessionConfig,
     discovered: Option<ProviderModelMetadata>,
     parsed: &ParsedCompactionPolicy,
 ) -> CompactionConfig {
@@ -173,27 +174,21 @@ fn resolve_compaction_config_with_policy(
         ParsedCompactionPolicyState::Valid(policy) => policy,
         ParsedCompactionPolicyState::Invalid => return invalid_compaction_config(),
     };
-    let context_window = policy.context_window.get().or_else(|| {
-        discovered
-            .and_then(|metadata| metadata.max_input_tokens)
-            .or_else(|| {
-                model_metadata::context_window(config.provider.kind, &config.provider.model)
-            })
-    });
-    let requested_limit = policy.auto_limit_tokens.get().or_else(|| {
-        context_window.map(|window| {
-            model_metadata::default_auto_limit_for_window(
-                config.provider.kind,
-                &config.provider.model,
-                window,
-            )
-        })
-    });
-    let auto_limit_tokens = effective_auto_limit(context_window, requested_limit);
-    let auto_enabled = policy
-        .auto_enabled
+    let explicit_window = policy.context_window.get();
+    let context_window =
+        explicit_window.or_else(|| discovered.and_then(|metadata| metadata.max_input_tokens));
+    let requested_limit = policy
+        .auto_limit_tokens
         .get()
-        .unwrap_or(auto_limit_tokens.is_some())
+        .or_else(|| explicit_window.map(generic_auto_limit_for_window))
+        .or_else(|| discovered.and_then(|metadata| metadata.recommended_auto_compact_tokens))
+        .or_else(|| {
+            discovered
+                .and_then(|metadata| metadata.max_input_tokens)
+                .map(generic_auto_limit_for_window)
+        });
+    let auto_limit_tokens = effective_auto_limit(context_window, requested_limit);
+    let auto_enabled = policy.auto_enabled.get().unwrap_or(true)
         && (context_window.is_none() || auto_limit_tokens.is_some());
     CompactionConfig {
         auto_enabled,
@@ -336,11 +331,7 @@ pub(crate) async fn native_compaction_request(
             config.provider.kind,
             effective_prompt_profile(state, config, session_id).await?,
         ),
-        reasoning_effort: model_metadata::normalize_reasoning_effort(
-            config.provider.kind,
-            &config.provider.model,
-            config.provider.reasoning_effort,
-        ),
+        reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
         session_id: Some(session_id.to_string()),
         compaction_instructions,
@@ -515,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_compaction_config_uses_known_defaults() {
+    fn missing_metadata_has_no_static_proactive_threshold() {
         let config = test_config(
             ProviderKind::OpenAi,
             "gpt-5.1-codex-max",
@@ -524,18 +515,39 @@ mod tests {
         let resolved = resolve_compaction_config(&config, None);
 
         assert!(resolved.auto_enabled);
-        assert_eq!(resolved.auto_limit_tokens, Some(231_200));
+        assert_eq!(resolved.auto_limit_tokens, None);
     }
 
     #[test]
-    fn gpt56_defaults_use_live_codex_window_and_raw_threshold() {
+    fn gpt56_uses_provider_discovered_window_and_threshold() {
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let config = test_config(ProviderKind::OpenAi, model, serde_json::json!({}));
-            let resolved = resolve_compaction_config(&config, None);
+            let resolved = resolve_compaction_config(
+                &config,
+                Some(ProviderModelMetadata {
+                    max_input_tokens: Some(372_000),
+                    recommended_auto_compact_tokens: Some(334_800),
+                }),
+            );
 
             assert!(resolved.auto_enabled);
             assert_eq!(resolved.auto_limit_tokens, Some(334_800));
         }
+    }
+
+    #[test]
+    fn gpt54_uses_current_window_recommendation_not_maximum_window() {
+        let config = test_config(ProviderKind::OpenAi, "gpt-5.4", serde_json::json!({}));
+        let resolved = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(272_000),
+                recommended_auto_compact_tokens: Some(244_800),
+            }),
+        );
+
+        assert_eq!(resolved.auto_limit_tokens, Some(244_800));
+        assert_ne!(resolved.auto_limit_tokens, Some(900_000));
     }
 
     #[tokio::test]
@@ -545,7 +557,13 @@ mod tests {
             "claude-sonnet-5",
             serde_json::json!({}),
         );
-        let resolved = resolve_compaction_config(&config, None);
+        let resolved = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(1_000_000),
+                recommended_auto_compact_tokens: Some(500_000),
+            }),
+        );
         assert!(resolved.auto_enabled);
         assert_eq!(resolved.auto_limit_tokens, Some(500_000));
 
@@ -619,10 +637,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_policy_uses_provider_defaults() {
+    fn missing_policy_uses_provider_metadata_or_reactive_only() {
         let openai = resolve_compaction_config(
             &test_config(ProviderKind::OpenAi, "gpt-5.6-sol", serde_json::json!({})),
-            None,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(372_000),
+                recommended_auto_compact_tokens: Some(334_800),
+            }),
         );
         assert!(openai.auto_enabled);
         assert_eq!(openai.auto_limit_tokens, Some(334_800));
@@ -631,7 +652,7 @@ mod tests {
             &test_config(ProviderKind::OpenAi, "unknown", serde_json::json!({})),
             None,
         );
-        assert!(!unknown.auto_enabled);
+        assert!(unknown.auto_enabled);
         assert_eq!(unknown.auto_limit_tokens, None);
     }
 
@@ -654,7 +675,13 @@ mod tests {
             }),
         );
 
-        let resolved = resolve_compaction_config(&config, None);
+        let resolved = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(1_000_000),
+                recommended_auto_compact_tokens: Some(500_000),
+            }),
+        );
         assert!(resolved.auto_enabled);
         assert_eq!(resolved.auto_limit_tokens, Some(500_000));
     }
@@ -671,7 +698,13 @@ mod tests {
                 }
             }),
         );
-        let resolved = resolve_compaction_config(&config, None);
+        let resolved = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(372_000),
+                recommended_auto_compact_tokens: Some(334_800),
+            }),
+        );
 
         assert!(resolved.auto_enabled);
         assert_eq!(resolved.auto_limit_tokens, Some(334_800));
@@ -690,7 +723,7 @@ mod tests {
                 serde_json::json!({ "compaction": { "config": policy_value } }),
             );
             let policy = parse_compaction_policy(&config);
-            let resolved = resolve_compaction_config_with_policy(&config, None, &policy);
+            let resolved = resolve_compaction_config_with_policy(None, &policy);
 
             assert!(policy.explicitly_disables_auto());
             assert!(!resolved.auto_enabled);
@@ -709,7 +742,7 @@ mod tests {
         );
         let policy = parse_compaction_policy(&config);
         assert!(policy.explicitly_disables_auto());
-        assert!(!resolve_compaction_config_with_policy(&config, None, &policy).auto_enabled);
+        assert!(!resolve_compaction_config_with_policy(None, &policy).auto_enabled);
     }
 
     #[test]
@@ -785,11 +818,48 @@ mod tests {
             &config,
             Some(ProviderModelMetadata {
                 max_input_tokens: Some(500_000),
-                max_output_tokens: Some(96_000),
+                recommended_auto_compact_tokens: Some(425_000),
             }),
         );
         assert!(resolved.auto_enabled);
         assert_eq!(resolved.auto_limit_tokens, Some(425_000));
+    }
+
+    #[test]
+    fn explicit_session_policy_wins_and_is_clamped_against_explicit_window() {
+        let config = test_config(
+            ProviderKind::OpenAi,
+            "gpt-5.6-sol",
+            serde_json::json!({
+                "compaction": { "config": {
+                    "context_window": 100_000,
+                    "auto_limit_tokens": 120_000
+                }}
+            }),
+        );
+        let resolved = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(372_000),
+                recommended_auto_compact_tokens: Some(334_800),
+            }),
+        );
+
+        assert_eq!(resolved.auto_limit_tokens, Some(100_000));
+    }
+
+    #[test]
+    fn authoritative_window_without_recommendation_uses_generic_policy() {
+        let config = test_config(ProviderKind::OpenAi, "future-model", serde_json::json!({}));
+        let resolved = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(200_000),
+                recommended_auto_compact_tokens: None,
+            }),
+        );
+
+        assert_eq!(resolved.auto_limit_tokens, Some(170_000));
     }
 
     #[test]

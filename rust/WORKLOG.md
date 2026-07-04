@@ -1,5 +1,64 @@
 # Rust Rewrite Worklog
 
+## 2026-07-04
+
+### Authenticated Private-Codex Model Capability Discovery
+
+- Implemented authenticated private-Codex catalog discovery at
+  `GET /backend-api/codex/models?client_version=0.142.3`. The same
+  `CODEX_CLIENT_VERSION` constant now shapes the query and Codex-style
+  User-Agent; this removes the older embedded `0.130.0` identity drift. Models
+  GETs reuse bearer/account, originator, installation-id, and residency
+  identity without generation-only session/window/turn headers or a body.
+- Added one daemon-wide in-memory catalog cache shared by reconstructed OpenAI
+  providers. The whole catalog is scoped by base URL plus account id (or a
+  nonlogged token fingerprint), fresh for five minutes, single-flight, and
+  installed atomically only after every consumed entry validates. Responses are
+  bounded to 4 MiB, 256 unique nonempty slugs, positive representable limits,
+  and 16 bounded unique efforts per model. Account/generation guards prevent
+  late refreshes from installing after an identity switch.
+- OpenAI catalog failure is now explicit and fail-closed. Cold and expired
+  transport/auth/timeout/malformed failures do not use static or stale metadata
+  to shape a request. A short failure backoff reuses the same error without
+  converting it into success; 401 bypasses negative caching and flows through
+  the existing one-time credential refresh/provider rebuild. No bundled model
+  file, prefix/alias match, model substitution, public `/v1/models`, disk cache,
+  or conditional ETag path was added.
+- Ordinary and compact requests exact-resolve the selected slug before body
+  construction. The adapter validates configured known reasoning effort
+  exactly against the selected entry, uses discovered
+  `supports_parallel_tool_calls`, and continues to send hardcoded
+  `service_tier: "priority"` unconditionally. `ultra` was added to the shared
+  vocabulary and TypeScript wire type, but not to the static picker. The local
+  tool registry remains authoritative; parsed provider-native search/patch
+  selectors do not enable native actions.
+- Deleted the daemon's duplicate static OpenAI context/threshold/effort table.
+  `ProviderModelMetadata` now contains only scheduler-consumed normalized
+  values: resolved current/default input window and optional provider
+  automatic-compaction recommendation. OpenAI recommends at most 90% of
+  `context_window.or(max_context_window)`; Anthropic retains its adapter-local
+  1M→500k and generic policy. The daemon applies provider-neutral precedence:
+  valid explicit session values, provider recommendation, generic 85% from an
+  authoritative returned window, then reactive-overflow-only. The 8k floor and
+  persisted in-flight/circuit-breaker behavior are unchanged.
+- Sanitized probe evidence (no credentials, response payload, or account
+  identifiers retained here): the authenticated endpoint returned ten models
+  on 2026-07-04. GPT-5.6 appeared only with client versions at least `0.142.2`;
+  the installed Codex CLI was `0.142.3`. Sol/Terra/Luna reported
+  372,000 current/max context, null automatic limit (derived 334,800), and no
+  output-ceiling field. Sol/Terra advertised
+  `low,medium,high,xhigh,max,ultra`; Luna omitted `ultra`; none advertised
+  `none`. GPT-5.4 reported a 272,000 current/default window and 1,000,000
+  maximum, so its default recommendation is 244,800 rather than 900,000.
+  A weak ETag did not produce a 304 with `If-None-Match`.
+- Unit/wire validation covers exact request identity, timeout configuration,
+  parse/bounds, current-vs-maximum precedence, effort rejection, priority and
+  parallel shaping, 20-way cold single-flight, fresh/expired/failure/401/account
+  transitions, cancellation safety, atomic replacement, and provider-neutral
+  scheduler precedence. **This implementation has not yet been validated
+  against the live private endpoint; the authenticated probe above supplied
+  sanitized schema evidence only.**
+
 ## 2026-07-02
 
 ### Native Compaction Live-E2E Corrections And Model Defaults
