@@ -1350,11 +1350,20 @@ fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<Mod
 }
 
 #[cfg_attr(test, derive(Debug, Clone, PartialEq, Eq))]
+struct ResponsesMaterializedOutput {
+    items: Vec<AssistantItem>,
+    provider_replay: Vec<ProviderReplayItem>,
+    stop_reason: ModelStopReason,
+    stop_details: Option<ModelStopDetails>,
+}
+
+#[cfg_attr(test, derive(Debug, Clone, PartialEq, Eq))]
 struct ResponsesStreamState {
     provider: ProviderKind,
     added_items: BTreeMap<usize, Value>,
     output_items: BTreeMap<usize, Value>,
     usage: Option<ProviderUsage>,
+    materialized: Option<ResponsesMaterializedOutput>,
     completed: bool,
 }
 
@@ -1365,6 +1374,7 @@ impl ResponsesStreamState {
             added_items: BTreeMap::new(),
             output_items: BTreeMap::new(),
             usage: None,
+            materialized: None,
             completed: false,
         }
     }
@@ -1375,15 +1385,32 @@ impl ResponsesStreamState {
                 "OpenAI response stream ended before response.completed".to_string(),
             ));
         }
-        Self::validate_output_items(&self.output_items)?;
+        let materialized = self
+            .materialized
+            .expect("completed OpenAI response has staged materialized output");
+        Ok(ModelResponse {
+            assistant: AssistantMessage {
+                items: materialized.items,
+            },
+            provider_replay: materialized.provider_replay,
+            usage: self.usage,
+            stop_reason: materialized.stop_reason,
+            stop_details: materialized.stop_details,
+        })
+    }
 
+    fn materialize_output_items(
+        output_items: &BTreeMap<usize, Value>,
+        provider: ProviderKind,
+    ) -> ProviderResult<ResponsesMaterializedOutput> {
+        Self::validate_output_items(output_items)?;
         let mut items = Vec::new();
         let mut provider_replay = Vec::new();
         let mut stop_reason = ModelStopReason::Complete;
         let mut stop_details = None;
-        for item in self.output_items.values() {
+        for item in output_items.values() {
             if let Some(refusal) =
-                parse_response_output_item(item, &mut items, &mut provider_replay, self.provider)?
+                parse_response_output_item(item, &mut items, &mut provider_replay, provider)?
             {
                 stop_reason = ModelStopReason::Refusal;
                 stop_details = Some(ModelStopDetails {
@@ -1396,10 +1423,9 @@ impl ResponsesStreamState {
             items.clear();
             provider_replay.clear();
         }
-        Ok(ModelResponse {
-            assistant: AssistantMessage { items },
+        Ok(ResponsesMaterializedOutput {
+            items,
             provider_replay,
-            usage: self.usage,
             stop_reason,
             stop_details,
         })
@@ -1515,15 +1541,12 @@ impl ResponsesStreamState {
         })?;
         let mut reconciled_items = self.output_items.clone();
         for (index, item) in output.iter().enumerate() {
-            let item_type = openai_replay_item_type(item, "OpenAI response.completed output item")?;
             if let Some(done_item) = self.output_items.get(&index) {
                 reconcile_openai_item_identity(index, "done", done_item, "terminal", item)?;
             } else {
-                validate_openai_ordinary_item_policy(item_type, item)?;
                 reconciled_items.insert(index, item.clone());
             }
         }
-        Self::validate_output_items(&reconciled_items)?;
         Ok(reconciled_items)
     }
 
@@ -1600,18 +1623,17 @@ impl ResponsesStreamState {
                     }
                 }
                 self.reconcile_added_items()?;
-                let reconciled_items = if let Some(output) = response.get("output") {
-                    Some(self.reconcile_terminal_output(output)?)
+                let output_items = if let Some(output) = response.get("output") {
+                    self.reconcile_terminal_output(output)?
                 } else {
-                    Self::validate_output_items(&self.output_items)?;
-                    None
+                    self.output_items.clone()
                 };
+                let materialized = Self::materialize_output_items(&output_items, self.provider)?;
                 let usage = response.get("usage").and_then(openai_usage);
 
-                if let Some(output_items) = reconciled_items {
-                    self.output_items = output_items;
-                }
+                self.output_items = output_items;
                 self.usage = usage;
+                self.materialized = Some(materialized);
                 self.completed = true;
                 Ok(SseControl::Stop)
             }
@@ -3552,6 +3574,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
         assert!(state.completed);
         assert_eq!(state.output_items.len(), 1);
         assert_eq!(state.output_items.get(&0), Some(&done));
+        assert!(state.materialized.is_some());
         assert_eq!(
             state.usage.as_ref().and_then(|usage| usage.total_tokens),
             Some(3)
@@ -3606,6 +3629,89 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
         assert_eq!(state, before, "failed reconciliation must be atomic");
         assert!(state.usage.is_none());
         assert!(!state.completed);
+    }
+
+    #[test]
+    fn responses_state_rejects_unmaterializable_done_items_without_terminal_mutation() {
+        let cases = [
+            (
+                "malformed message",
+                json!({
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text" }],
+                }),
+                "output_text",
+            ),
+            (
+                "unsupported client action",
+                json!({
+                    "type": "local_shell_call",
+                    "call_id": "call_shell",
+                    "status": "completed",
+                    "action": { "type": "exec", "command": ["pwd"] },
+                }),
+                "local_shell_call",
+            ),
+            (
+                "malformed function arguments",
+                json!({
+                    "type": "function_call",
+                    "call_id": "call_function",
+                    "name": "Bash",
+                    "arguments": { "command": "pwd" },
+                }),
+                "arguments",
+            ),
+            (
+                "malformed custom input",
+                json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom",
+                    "name": "apply_patch",
+                    "input": ["*** Begin Patch", "*** End Patch"],
+                }),
+                "input",
+            ),
+        ];
+
+        for (name, item, expected_error) in cases {
+            let mut state = ResponsesStreamState::new(ProviderKind::OpenAi);
+            state
+                .process_event(&json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": item,
+                }))
+                .expect("done item records before terminal materialization");
+            let before = state.clone();
+
+            let error = state
+                .process_event(&json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 20,
+                            "total_tokens": 120,
+                        },
+                    },
+                }))
+                .expect_err(name);
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "{name}: {error}"
+            );
+            assert_eq!(state, before, "{name} terminal failure must be atomic");
+            assert!(state.usage.is_none(), "{name}");
+            assert!(state.materialized.is_none(), "{name}");
+            assert!(!state.completed, "{name}");
+        }
     }
 
     #[test]
