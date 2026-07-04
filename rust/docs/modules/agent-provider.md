@@ -229,9 +229,12 @@ terminal that discards partial assistant output/replay. Output-item `added`
 events, when present, must be followed by matching `done` events at the same
 unique index and type; no item may remain pending at the terminal. Done-only
 private streams remain compatible. Terminal `response.output`, when present,
-must exactly reconcile with the done-item map. Completed output indices are
-contiguous and materialized in provider order rather than event-arrival order.
-Known messages and content parts are shape-validated. Supported
+may omit fully received done items. Done items remain authoritative; terminal
+overlaps must have compatible type and stable identity, while terminal-only
+items cross the ordinary item safety boundary and fill their terminal array
+indices. The reconciled output indices are contiguous and materialized in
+provider order rather than event-arrival order. Known messages and content
+parts are shape-validated. Supported
 `function_call`/`custom_tool_call` items become pi-relay tool calls; unsupported
 client actions and arbitrary unknown output item types fail closed. Known
 hosted/passive item types remain opaque replay.

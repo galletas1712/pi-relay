@@ -485,28 +485,39 @@ fn validate_openai_added_item_policy(item_type: &str, item: &Value) -> ProviderR
     Ok(())
 }
 
-fn reconcile_openai_added_item(index: usize, added: &Value, done: &Value) -> ProviderResult<()> {
-    let added_type = openai_replay_item_type(added, "OpenAI added output item")?;
-    let done_type = openai_replay_item_type(done, "OpenAI completed output item")?;
-    if done_type != added_type {
+fn reconcile_openai_item_identity(
+    index: usize,
+    earlier_label: &str,
+    earlier: &Value,
+    later_label: &str,
+    later: &Value,
+) -> ProviderResult<()> {
+    let earlier_type =
+        openai_replay_item_type(earlier, &format!("OpenAI {earlier_label} output item"))?;
+    let later_type = openai_replay_item_type(later, &format!("OpenAI {later_label} output item"))?;
+    if later_type != earlier_type {
         return Err(ProviderError::Provider(format!(
-            "OpenAI output item type changed at output_index {index}: added {added_type}, done {done_type}"
+            "OpenAI output item type changed at output_index {index}: {earlier_label} {earlier_type}, {later_label} {later_type}"
         )));
     }
     for field in ["id", "call_id"] {
-        if let Some(added_id) = added
+        if let Some(earlier_id) = earlier
             .get(field)
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
         {
-            if done.get(field).and_then(Value::as_str) != Some(added_id) {
+            if later.get(field).and_then(Value::as_str) != Some(earlier_id) {
                 return Err(ProviderError::Provider(format!(
-                    "OpenAI output item {field} changed at output_index {index}"
+                    "OpenAI output item {field} changed at output_index {index} between {earlier_label} and {later_label}"
                 )));
             }
         }
     }
     Ok(())
+}
+
+fn reconcile_openai_added_item(index: usize, added: &Value, done: &Value) -> ProviderResult<()> {
+    reconcile_openai_item_identity(index, "added", added, "done", done)
 }
 
 fn response_daemon_tool_call_item(observation: &agent_vocab::DaemonToolObservation) -> Value {
@@ -1364,6 +1375,7 @@ impl ResponsesStreamState {
             ));
         }
         self.validate_output_indices()?;
+        self.validate_output_identities()?;
 
         let mut items = Vec::new();
         let mut provider_replay = Vec::new();
@@ -1404,6 +1416,29 @@ impl ResponsesStreamState {
         Ok(())
     }
 
+    fn validate_output_identities(&self) -> ProviderResult<()> {
+        let mut identities = BTreeMap::new();
+        for (index, item) in &self.output_items {
+            let item_type = openai_replay_item_type(item, "OpenAI output item")?;
+            for field in ["id", "call_id"] {
+                let Some(identity) = item
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                let key = (item_type.to_string(), field, identity.to_string());
+                if let Some(previous_index) = identities.insert(key, *index) {
+                    return Err(ProviderError::Provider(format!(
+                        "OpenAI output item type {item_type} duplicated stable {field} {identity} at output indices {previous_index} and {index}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn output_item_event<'a>(
         event: &'a Value,
         event_type: &str,
@@ -1426,15 +1461,10 @@ impl ResponsesStreamState {
         let (index, item, item_type) =
             Self::output_item_event(event, "response.output_item.added")?;
         validate_openai_added_item_policy(item_type, item)?;
-        if self
-            .output_items
-            .keys()
-            .any(|done_index| !self.added_items.contains_key(done_index))
-        {
-            return Err(ProviderError::Provider(
-                "OpenAI response.output_item.added arrived after an unreconciled done-only item"
-                    .to_string(),
-            ));
+        if self.output_items.contains_key(&index) {
+            return Err(ProviderError::Provider(format!(
+                "OpenAI response.output_item.added arrived after done at output_index {index}"
+            )));
         }
         if self.added_items.insert(index, item.clone()).is_some() {
             return Err(ProviderError::Provider(format!(
@@ -1446,12 +1476,7 @@ impl ResponsesStreamState {
 
     fn record_done_item(&mut self, event: &Value) -> ProviderResult<()> {
         let (index, item, _) = Self::output_item_event(event, "response.output_item.done")?;
-        if !self.added_items.is_empty() {
-            let added_item = self.added_items.get(&index).ok_or_else(|| {
-                ProviderError::Provider(format!(
-                    "OpenAI response.output_item.done at output_index {index} had no matching added item"
-                ))
-            })?;
+        if let Some(added_item) = self.added_items.get(&index) {
             reconcile_openai_added_item(index, added_item, item)?;
         }
         if self.output_items.insert(index, item.clone()).is_some() {
@@ -1474,15 +1499,6 @@ impl ResponsesStreamState {
             })?;
             reconcile_openai_added_item(*index, added_item, done_item)?;
         }
-        if let Some(index) = self
-            .output_items
-            .keys()
-            .find(|index| !self.added_items.contains_key(index))
-        {
-            return Err(ProviderError::Provider(format!(
-                "OpenAI done output item at output_index {index} had no matching added item"
-            )));
-        }
         Ok(())
     }
 
@@ -1492,33 +1508,17 @@ impl ResponsesStreamState {
                 "OpenAI response.completed response.output was not an array".to_string(),
             )
         })?;
-        let mut terminal_items = BTreeMap::new();
+        let mut reconciled_items = self.output_items.clone();
         for (index, item) in output.iter().enumerate() {
             let item_type = openai_replay_item_type(item, "OpenAI response.completed output item")?;
-            validate_openai_ordinary_item_policy(item_type, item)?;
-            terminal_items.insert(index, item.clone());
-        }
-        for (index, done_item) in &self.output_items {
-            let terminal_item = terminal_items.get(index).ok_or_else(|| {
-                ProviderError::Provider(format!(
-                    "OpenAI response.completed output omitted done item at output_index {index}"
-                ))
-            })?;
-            if terminal_item != done_item {
-                return Err(ProviderError::Provider(format!(
-                    "OpenAI response.completed output mismatched done item at output_index {index}"
-                )));
+            if let Some(done_item) = self.output_items.get(&index) {
+                reconcile_openai_item_identity(index, "done", done_item, "terminal", item)?;
+            } else {
+                validate_openai_ordinary_item_policy(item_type, item)?;
+                reconciled_items.insert(index, item.clone());
             }
         }
-        if let Some(index) = terminal_items
-            .keys()
-            .find(|index| !self.output_items.contains_key(index))
-        {
-            return Err(ProviderError::Provider(format!(
-                "OpenAI response.completed output contained item without matching done event at output_index {index}"
-            )));
-        }
-        self.output_items = terminal_items;
+        self.output_items = reconciled_items;
         Ok(())
     }
 
@@ -1595,10 +1595,11 @@ impl ResponsesStreamState {
                     }
                 }
                 self.reconcile_added_items()?;
-                self.validate_output_indices()?;
                 if let Some(output) = response.get("output") {
                     self.reconcile_terminal_output(output)?;
                 }
+                self.validate_output_indices()?;
+                self.validate_output_identities()?;
                 self.usage = response.get("usage").and_then(openai_usage);
                 self.completed = true;
                 Ok(SseControl::Stop)
@@ -3105,10 +3106,10 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     }
 
     #[test]
-    fn responses_sse_requires_added_client_action_to_finish() {
+    fn responses_sse_requires_added_client_action_done_when_terminal_output_omits_it() {
         let sse = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"read"}}
 
-data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}
 "#;
 
         let error = parse_responses_sse(sse, ProviderKind::OpenAi)
@@ -3117,10 +3118,10 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
     }
 
     #[test]
-    fn responses_sse_requires_added_hosted_item_to_finish() {
+    fn responses_sse_requires_added_hosted_item_done_when_terminal_output_omits_it() {
         let sse = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}
 
-data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}
 "#;
 
         let error = parse_responses_sse(sse, ProviderKind::OpenAi)
@@ -3174,7 +3175,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
                 ],
             ),
             (
-                "done without matching added",
+                "pending added with unrelated done",
                 vec![
                     json!({
                         "type": "response.output_item.added",
@@ -3185,6 +3186,10 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
                         "type": "response.output_item.done",
                         "output_index": 1,
                         "item": { "type": "reasoning" },
+                    }),
+                    json!({
+                        "type": "response.completed",
+                        "response": { "id": "resp_1" },
                     }),
                 ],
             ),
@@ -3246,13 +3251,82 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
     }
 
     #[test]
-    fn responses_sse_rejects_terminal_only_client_action() {
-        let call = json!({
+    fn responses_sse_allows_done_only_and_added_done_items_to_coexist() {
+        let message = json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "first" }],
+        });
+        let added_call = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read",
+        });
+        let done_call = json!({
             "type": "function_call",
             "call_id": "call_1",
             "name": "read",
             "arguments": "{\"path\":\"README.md\"}",
         });
+        let sse = [
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": message,
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": added_call,
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": done_call,
+            }),
+            json!({
+                "type": "response.completed",
+                "response": { "id": "resp_1", "status": "completed" },
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+
+        let response = parse_responses_sse(&sse, ProviderKind::OpenAi)
+            .expect("per-index lifecycles reconcile independently");
+        assert_eq!(response.assistant.text(), "first");
+        assert_eq!(response.assistant.tool_calls().count(), 1);
+        assert_eq!(response.provider_replay.len(), 2);
+    }
+
+    #[test]
+    fn responses_sse_materializes_terminal_only_semantic_and_action_items() {
+        let output = vec![
+            json!({
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "terminal text" }],
+            }),
+            json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{\"path\":\"README.md\"}",
+            }),
+            json!({
+                "type": "custom_tool_call",
+                "call_id": "call_2",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch\n",
+            }),
+            json!({
+                "type": "reasoning",
+                "encrypted_content": "opaque-terminal-reasoning",
+            }),
+        ];
         let sse = format!(
             "data: {}\n\n",
             json!({
@@ -3260,18 +3334,66 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
                 "response": {
                     "id": "resp_1",
                     "status": "completed",
-                    "output": [call],
+                    "output": output,
                 },
             })
         );
 
-        let error = parse_responses_sse(&sse, ProviderKind::OpenAi)
-            .expect_err("terminal output cannot invent an unobserved client action");
-        assert!(error.to_string().contains("matching done"), "{error}");
+        let response = parse_responses_sse(&sse, ProviderKind::OpenAi)
+            .expect("supported terminal-only items materialize");
+        assert_eq!(response.assistant.text(), "terminal text");
+        let calls = response.assistant.tool_calls().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id.as_str(), "call_1");
+        assert_eq!(calls[0].tool_name, "read");
+        assert_eq!(calls[1].id.as_str(), "call_2");
+        assert_eq!(calls[1].tool_name, "Edit");
+        assert_eq!(
+            response
+                .provider_replay
+                .iter()
+                .map(ProviderReplayItem::raw_value)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            output
+        );
     }
 
     #[test]
-    fn responses_sse_reconciles_matching_added_done_and_terminal_output() {
+    fn responses_sse_rejects_terminal_only_unsupported_or_unknown_actions() {
+        for item in [
+            json!({
+                "type": "local_shell_call",
+                "call_id": "call_1",
+                "status": "completed",
+                "action": { "type": "exec", "command": ["pwd"] },
+            }),
+            json!({
+                "type": "future_action",
+                "id": "action_1",
+            }),
+        ] {
+            let item_type = item["type"].as_str().unwrap();
+            let sse = format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "output": [item],
+                    },
+                })
+            );
+
+            let error = parse_responses_sse(&sse, ProviderKind::OpenAi)
+                .expect_err("terminal-only unsafe actions must fail closed");
+            assert!(error.to_string().contains(item_type), "{error}");
+        }
+    }
+
+    #[test]
+    fn responses_sse_reconciles_compatible_overlap_and_keeps_exact_done_item() {
         let added = json!({
             "type": "function_call",
             "call_id": "call_1",
@@ -3283,52 +3405,19 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
             "name": "read",
             "arguments": "{\"path\":\"README.md\"}",
         });
+        let terminal = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read",
+            "arguments": "{\"path\":\"terminal-copy.md\"}",
+            "status": "completed",
+        });
         let sse = [
             json!({
                 "type": "response.output_item.added",
                 "output_index": 0,
                 "item": added,
             }),
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": done,
-            }),
-            json!({
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_1",
-                    "status": "completed",
-                    "output": [done],
-                },
-            }),
-        ]
-        .into_iter()
-        .map(|event| format!("data: {event}\n\n"))
-        .collect::<String>();
-
-        let response =
-            parse_responses_sse(&sse, ProviderKind::OpenAi).expect("lifecycle reconciles");
-        let calls = response.assistant.tool_calls().collect::<Vec<_>>();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id.as_str(), "call_1");
-        assert_eq!(response.provider_replay.len(), 1);
-        assert_eq!(response.provider_replay[0].raw_value().unwrap(), done);
-    }
-
-    #[test]
-    fn responses_sse_rejects_terminal_output_reconciliation_mismatch() {
-        let done = json!({
-            "type": "message",
-            "role": "assistant",
-            "content": [{ "type": "output_text", "text": "done" }],
-        });
-        let terminal = json!({
-            "type": "message",
-            "role": "assistant",
-            "content": [{ "type": "output_text", "text": "different" }],
-        });
-        let sse = [
             json!({
                 "type": "response.output_item.done",
                 "output_index": 0,
@@ -3347,9 +3436,191 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
         .map(|event| format!("data: {event}\n\n"))
         .collect::<String>();
 
+        let response =
+            parse_responses_sse(&sse, ProviderKind::OpenAi).expect("lifecycle reconciles");
+        let calls = response.assistant.tool_calls().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_str(), "call_1");
+        assert_eq!(calls[0].args_value().unwrap()["path"], "README.md");
+        assert_eq!(response.provider_replay.len(), 1);
+        assert_eq!(response.provider_replay[0].raw_value().unwrap(), done);
+    }
+
+    #[test]
+    fn responses_sse_rejects_terminal_overlap_type_or_stable_identity_conflicts() {
+        let done = json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "done" }],
+        });
+        for terminal in [
+            json!({
+                "type": "reasoning",
+                "id": "msg_1",
+                "encrypted_content": "opaque",
+            }),
+            json!({
+                "type": "message",
+                "id": "msg_2",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "done" }],
+            }),
+        ] {
+            let sse = [
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": done,
+                }),
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "output": [terminal],
+                    },
+                }),
+            ]
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+
+            let error = parse_responses_sse(&sse, ProviderKind::OpenAi)
+                .expect_err("terminal overlap conflicts must fail");
+            assert!(error.to_string().contains("changed"), "{error}");
+        }
+    }
+
+    #[test]
+    fn responses_sse_accepts_live_derived_terminal_output_omitting_done_item() {
+        // Sanitized from the private Codex SSE shape observed in a credentialed
+        // daemon smoke: the done item is authoritative even though the terminal
+        // response carries an output array that does not repeat it.
+        let done = json!({
+            "type": "message",
+            "id": "msg_sanitized",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": "ok",
+                "annotations": [],
+            }],
+        });
+        let sse = [
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": done,
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_sanitized",
+                    "status": "completed",
+                    "output": [],
+                },
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+
+        let response = parse_responses_sse(&sse, ProviderKind::OpenAi)
+            .expect("terminal output may omit a fully received done item");
+        assert_eq!(response.assistant.text(), "ok");
+        assert_eq!(response.provider_replay.len(), 1);
+        assert_eq!(response.provider_replay[0].raw_value().unwrap(), done);
+    }
+
+    #[test]
+    fn responses_sse_orders_done_and_terminal_only_items_by_reconciled_index() {
+        let message = json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "first" }],
+        });
+        let call = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read",
+            "arguments": "{\"path\":\"README.md\"}",
+        });
+        let sse = [
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": call,
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [message],
+                },
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+
+        let response = parse_responses_sse(&sse, ProviderKind::OpenAi)
+            .expect("terminal-only item fills the done index gap");
+        assert_eq!(response.assistant.text(), "first");
+        let calls = response.assistant.tool_calls().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_str(), "call_1");
+        assert_eq!(
+            response
+                .provider_replay
+                .iter()
+                .map(ProviderReplayItem::raw_type)
+                .collect::<Vec<_>>(),
+            vec![
+                Some("message".to_string()),
+                Some("function_call".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn responses_sse_rejects_duplicate_stable_identity_after_reconciliation() {
+        let message = |text| {
+            json!({
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": text }],
+            })
+        };
+        let sse = [
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": message("done"),
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [message("terminal")],
+                },
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+
         let error = parse_responses_sse(&sse, ProviderKind::OpenAi)
-            .expect_err("terminal output must match done items");
-        assert!(error.to_string().contains("mismatched"), "{error}");
+            .expect_err("the same stable item cannot occupy two output indices");
+        assert!(
+            error.to_string().contains("duplicated stable id"),
+            "{error}"
+        );
     }
 
     #[test]

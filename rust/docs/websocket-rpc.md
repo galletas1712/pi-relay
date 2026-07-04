@@ -1939,27 +1939,7 @@ With `~/.codex/auth.json` or `CODEX_ACCESS_TOKEN` available:
       "model": "gpt-5.6-sol",
       "prompt_cache": { "key": "pi-relay-real-smoke" }
     },
-    "metadata": { "manual": "real-codex" }
-  }
-}
-```
-
-Inspect the prompt template if needed:
-
-```json
-{
-  "method": "system.prompt",
-  "params": { "session_id": "s1" }
-}
-```
-
-Then send:
-
-```json
-{
-  "method": "input.follow_up",
-  "params": {
-    "session_id": "manual_real_codex",
+    "metadata": { "manual": "real-codex" },
     "client_input_id": "ci-real-codex",
     "content": [
       { "type": "text", "text": "Reply with exactly: websocket real codex ok" }
@@ -1968,7 +1948,8 @@ Then send:
 }
 ```
 
-Verify a real `model.completed`, assistant transcript entry, prompt-cache key
+`session.start` creates the session and immediately starts this first turn.
+Verify a real `model.completed`, assistant transcript entry, prompt-cache-key
 request path, and `session.idle`.
 
 For image support, send a public image URL, for example:
