@@ -704,7 +704,7 @@ fn anthropic_stream_provider_error(error_type: Option<&str>, message: String) ->
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AnthropicModelCapabilities {
     adaptive_thinking: bool,
     adaptive_thinking_default: bool,
@@ -820,22 +820,20 @@ fn static_anthropic_model_metadata(model: &str) -> AnthropicModelMetadata {
             UNKNOWN_MODEL_MAX_OUTPUT_TOKENS,
             AnthropicModelCapabilities::adaptive_with_all_efforts(false),
         ),
+        "claude-sonnet-4-5" => (
+            Some(200_000),
+            UNKNOWN_MODEL_MAX_OUTPUT_TOKENS,
+            AnthropicModelCapabilities::default(),
+        ),
         _ => (
             None,
             UNKNOWN_MODEL_MAX_OUTPUT_TOKENS,
             AnthropicModelCapabilities {
-                adaptive_thinking: false,
-                adaptive_thinking_default: false,
-                effort: false,
-                low_effort: false,
-                medium_effort: false,
-                high_effort: false,
-                xhigh_effort: false,
-                max_effort: false,
                 native_compaction: matches!(
                     normalized.as_str(),
                     "claude-mythos-5" | "claude-mythos-preview"
                 ),
+                ..AnthropicModelCapabilities::default()
             },
         ),
     };
@@ -2990,6 +2988,19 @@ mod tests {
         assert_eq!(anthropic_auto_compact_limit(200_000), 170_000);
     }
 
+    #[test]
+    fn sonnet_45_static_metadata_preserves_input_output_and_capability_semantics() {
+        let metadata = static_anthropic_model_metadata("claude-sonnet-4-5");
+
+        assert_eq!(metadata.max_input_tokens, Some(200_000));
+        assert_eq!(metadata.max_tokens, UNKNOWN_MODEL_MAX_OUTPUT_TOKENS);
+        assert_eq!(metadata.capabilities, AnthropicModelCapabilities::default());
+        assert_eq!(
+            metadata.max_input_tokens.map(anthropic_auto_compact_limit),
+            Some(170_000)
+        );
+    }
+
     fn test_tool(
         provider: ProviderKind,
         name: &str,
@@ -3627,6 +3638,69 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_effort_normalization_is_adapter_owned_for_ordinary_sidecar_compact_and_count() {
+        for effort in [ReasoningEffort::None, ReasoningEffort::Minimal] {
+            // Sidecars call the same `complete` path and therefore use this
+            // ordinary Messages body builder without daemon-side shaping.
+            let ordinary = messages_body(ModelRequest {
+                model: "claude-opus-4-8".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: effort,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            })
+            .expect("ordinary adaptive request renders");
+            assert_eq!(ordinary["output_config"]["effort"], "low");
+
+            let mut compact_request = test_compaction_request(vec![TranscriptItem::UserMessage(
+                UserMessage::text("history"),
+            )
+            .into()]);
+            compact_request.reasoning_effort = effort;
+            let compact =
+                compaction_body(compact_request).expect("compact adaptive request renders");
+            assert_eq!(compact["output_config"]["effort"], "low");
+
+            let count = count_tokens_body(ProviderTokenCountRequest {
+                model: "claude-opus-4-8".to_string(),
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: effort,
+                prompt_cache_key: None,
+                session_id: None,
+            })
+            .expect("count adaptive request renders");
+            assert_eq!(count["output_config"]["effort"], "low");
+        }
+
+        let error = messages_body(ModelRequest {
+            model: "claude-opus-4-8".to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Ultra,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        })
+        .expect_err("current Anthropic adapter policy rejects ultra");
+        assert!(error.to_string().contains("ultra"));
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
     fn sonnet_5_and_fable_5_use_default_on_adaptive_thinking_and_all_efforts() {
         for model in ["claude-sonnet-5", "claude-fable-5"] {
             for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
@@ -4151,6 +4225,39 @@ mod tests {
         assert_eq!(first.max_tokens, 128_000);
         assert!(first.capabilities.adaptive_thinking_default);
         assert!(first.capabilities.supports_effort(ReasoningEffort::Max));
+    }
+
+    #[tokio::test]
+    async fn sonnet_45_models_api_failure_projects_200k_window_and_170k_recommendation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request accepted");
+            let _ = read_http_request(&mut socket).await;
+            let body = r#"{"type":"error","error":{"type":"api_error","message":"nope"}}"#;
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response writes");
+        });
+
+        let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
+        provider.base_url = base_url;
+        let metadata = provider
+            .model_metadata("claude-sonnet-4-5")
+            .await
+            .expect("static fallback metadata is returned")
+            .expect("Anthropic always projects model metadata");
+        server.await.expect("server completes");
+
+        assert_eq!(metadata.max_input_tokens, Some(200_000));
+        assert_eq!(metadata.recommended_auto_compact_tokens, Some(170_000));
     }
 
     #[tokio::test]

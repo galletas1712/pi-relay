@@ -2,14 +2,14 @@ use agent_provider::{ModelProvider, ProviderModelMetadata};
 use agent_store::SessionConfig;
 use anyhow::Result;
 
-use crate::auth::Credentials;
+use crate::auth::{CodexAccessTokenFingerprint, Credentials};
 use crate::state::AppState;
 
 use super::auth_retry::model_metadata_with_auth_retry;
 
 pub(super) struct ProviderHandle {
     pub(super) provider: Box<dyn ModelProvider>,
-    pub(super) uses_codex_auth: bool,
+    pub(super) codex_access_token_fingerprint: Option<CodexAccessTokenFingerprint>,
 }
 
 pub(super) async fn provider_for_config(

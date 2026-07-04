@@ -24,14 +24,25 @@
   the existing one-time credential refresh/provider rebuild. No bundled model
   file, prefix/alias match, model substitution, public `/v1/models`, disk cache,
   or conditional ETag path was added.
+- Codex HTTP clients now disable redirects for every fixed private endpoint, so
+  bearer and custom account/installation headers cannot be forwarded to a
+  redirect target. Catalog body-read failures retain the response status; a
+  malformed or truncated 401 therefore still bypasses failure backoff and
+  enters auth recovery.
+- Concurrent 401 recovery is coordinated by the nonlogged fingerprint of the
+  exact failed access-token generation. The first caller performs one bounded,
+  no-redirect OAuth refresh; waiters reload credentials and either reuse a
+  newer generation or the memoized outcome. Provider calls still retry at most
+  once.
 - Ordinary and compact requests exact-resolve the selected slug before body
   construction. The adapter validates configured known reasoning effort
   exactly against the selected entry, uses discovered
   `supports_parallel_tool_calls`, and continues to send hardcoded
   `service_tier: "priority"` unconditionally. `ultra` was added to the shared
   vocabulary and TypeScript wire type, but not to the static picker. The local
-  tool registry remains authoritative; parsed provider-native search/patch
-  selectors do not enable native actions.
+  tool registry remains authoritative; provider-native search/patch selector
+  fields are ignored as non-authoritative input and cannot invalidate the
+  catalog or enable native actions.
 - Deleted the daemon's duplicate static OpenAI context/threshold/effort table.
   `ProviderModelMetadata` now contains only scheduler-consumed normalized
   values: resolved current/default input window and optional provider
@@ -41,6 +52,10 @@
   valid explicit session values, provider recommendation, generic 85% from an
   authoritative returned window, then reactive-overflow-only. The 8k floor and
   persisted in-flight/circuit-breaker behavior are unchanged.
+- Preserved the Anthropic adapter's Sonnet 4.5 fallback at a 200k input window
+  and generic 170k recommendation. Adaptive Claude effort shaping remains
+  adapter-owned: `none`/`minimal` map to `low`, while unsupported `ultra`
+  rejects locally.
 - Sanitized probe evidence (no credentials, response payload, or account
   identifiers retained here): the authenticated endpoint returned ten models
   on 2026-07-04. GPT-5.6 appeared only with client versions at least `0.142.2`;

@@ -118,10 +118,10 @@ account replacing the active catalog.
 Cold or expired refresh failures surface `ProviderError::ModelCatalog`; an old
 snapshot is never used to shape a new request. A 30-second backoff may reuse the
 same explicit failure so the daemon's broad retry loop does not hammer
-`/models`. HTTP 401 is not negative-cached and enters the daemon's existing
-one-time Codex credential refresh/rebuild path. There is no static/bundled
-OpenAI fallback, alias/prefix match, model substitution, public `/v1/models`
-fallback, ETag request, or disk cache.
+`/models`. HTTP 401 is not negative-cached and enters the daemon's
+generation-coordinated, one-retry Codex credential refresh/rebuild path. There
+is no static/bundled OpenAI fallback, alias/prefix match, model substitution,
+public `/v1/models` fallback, ETag request, or disk cache.
 
 The Responses body hardcodes the low-variance personal-use policy:
 
@@ -151,9 +151,10 @@ includes `ultra`; the sanitized fixture advertises it for Sol/Terra but not
 Luna, and advertises no `none` for those models. An explicitly configured known
 effort absent from the selected model fails locally rather than being clamped
 or translated. The static web model/effort picker is unchanged and does not
-advertise `ultra`. Provider-native search and patch selector fields are parsed
-for bounded evidence only; they do not enable native shell/patch actions or
-change the local tool registry. `service_tier: "priority"` remains
+advertise `ultra`. Provider-native search and patch selector fields are ignored
+as non-authoritative input; unknown future values cannot invalidate the
+catalog, enable native shell/patch actions, or change the local tool registry.
+`service_tier: "priority"` remains
 unconditional for ordinary and compact calls even when the selected catalog
 entry does not advertise priority.
 
@@ -169,7 +170,7 @@ reactive overflow recovery.
 
 Requests go to `https://api.anthropic.com/v1/messages`, streamed, authenticated with `x-api-key`, `anthropic-version: 2023-06-01`, and a Claude-Code-style User-Agent/`x-app: cli`/`X-Claude-Code-Session-Id` envelope. The only unconditional `anthropic-beta` value is the existing `claude-code-20250219` identity header required by that transport. Effort, one-hour cache TTL, fine-grained tool streaming, text editor, and the current hosted web tools are GA and do not send their retired beta headers. Any future beta header must be added only with the beta body/tool that needs it.
 
-The provider retrieves model metadata from `GET /v1/models/{model_id}` through custom `reqwest` code (there is no official Rust SDK in this stack). Models GETs use the documented API version and credentials but do not copy the Messages-only Claude Code beta header. A process-wide cache shared by all reconstructed Anthropic provider handles holds at most 64 settled model ids and coalesces each model's refresh into one in-flight GET without holding the cache mutex during network I/O. In-flight entries are never evicted; if all eviction candidates are refreshing, they may temporarily exceed the bound until completion trims settled entries back to 64. Successful metadata is fresh for six hours. A refresh failure preserves stale last-known-good metadata and starts a separate one-minute retry backoff; the same backoff is a negative cache only when that model has never had a successful value. API-reported `max_input_tokens`, `max_tokens`, effort levels, and adaptive-thinking support shape requests and the daemon's proactive compaction threshold. `capabilities: null` still preserves authoritative token limits, and an authoritative `effort.xhigh: null` disables xhigh rather than inheriting static support. Static metadata keeps known options safe and available when discovery fails: Sonnet 5 and Fable 5 are 1M-input/128K-output models, as are the retained Opus 4.8/4.7 entries. Unknown models conservatively retain the old 64K output ceiling and no assumed input window/capabilities; without a resolved input window they receive no automatic compaction threshold, and unsupported request fields remain disabled.
+The provider retrieves model metadata from `GET /v1/models/{model_id}` through custom `reqwest` code (there is no official Rust SDK in this stack). Models GETs use the documented API version and credentials but do not copy the Messages-only Claude Code beta header. A process-wide cache shared by all reconstructed Anthropic provider handles holds at most 64 settled model ids and coalesces each model's refresh into one in-flight GET without holding the cache mutex during network I/O. In-flight entries are never evicted; if all eviction candidates are refreshing, they may temporarily exceed the bound until completion trims settled entries back to 64. Successful metadata is fresh for six hours. A refresh failure preserves stale last-known-good metadata and starts a separate one-minute retry backoff; the same backoff is a negative cache only when that model has never had a successful value. API-reported `max_input_tokens`, `max_tokens`, effort levels, and adaptive-thinking support shape requests and the daemon's proactive compaction threshold. `capabilities: null` still preserves authoritative token limits, and an authoritative `effort.xhigh: null` disables xhigh rather than inheriting static support. Static metadata keeps known options safe and available when discovery fails: Sonnet 5 and Fable 5 are 1M-input/128K-output models, as are the retained Opus 4.8/4.7 entries. Sonnet 4.5 retains its compatibility fallback of a 200K input window, a generic 170K compaction recommendation, the existing 64K output ceiling, and no assumed adaptive/effort capability. Unknown models conservatively retain the old 64K output ceiling and no assumed input window/capabilities; without a resolved input window they receive no automatic compaction threshold, and unsupported request fields remain disabled.
 
 `max_tokens` is required by the Messages API. Explicit session limits are clamped to the discovered/static model ceiling. When a session has no explicit limit, pi-relay requests `min(64_000, model ceiling)`: this preserves the existing ordinary-turn budget instead of unexpectedly asking every 128K-capable model for its pathological maximum, while still respecting lower limits reported by the API.
 
@@ -351,7 +352,8 @@ Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire â
 - The single Codex **401 token-refresh retry** is *not* in this crate. The
   daemon (`provider_runtime/auth_retry.rs`) wraps
   `model_metadata`/`complete`/`compact`/`count_tokens`: on a 401 from a
-  Codex-auth provider it refreshes credentials once, rebuilds the provider, and
+  Codex-auth provider it shares at most one bounded OAuth attempt per failed
+  access-token generation, rebuilds from the current/refreshed credentials, and
   retries exactly once inside that provider call. The provider surfaces the
   status through either `ProviderError::ModelCatalog` or the ordinary HTTP
   error path.

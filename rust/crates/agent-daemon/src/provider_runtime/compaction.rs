@@ -550,6 +550,25 @@ mod tests {
         assert_ne!(resolved.auto_limit_tokens, Some(900_000));
     }
 
+    #[test]
+    fn sonnet_45_provider_fallback_keeps_generic_170k_scheduler_threshold() {
+        let config = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-4-5",
+            serde_json::json!({}),
+        );
+        let resolved = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(200_000),
+                recommended_auto_compact_tokens: Some(170_000),
+            }),
+        );
+
+        assert!(resolved.auto_enabled);
+        assert_eq!(resolved.auto_limit_tokens, Some(170_000));
+    }
+
     #[tokio::test]
     async fn default_claude_uses_half_window_scheduler_and_native_execution() {
         let config = test_config(

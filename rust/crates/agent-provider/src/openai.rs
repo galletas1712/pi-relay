@@ -5,6 +5,7 @@ use agent_vocab::{
 };
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, ACCEPT, CONTENT_ENCODING, CONTENT_TYPE};
+use reqwest::redirect::Policy;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -73,7 +74,7 @@ const CODEX_MODELS_FAILURE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
-    client: reqwest::Client,
+    client: OpenAiCodexHttpClient,
     session_state: Option<Arc<OpenAiCodexSessionState>>,
     access_token: String,
     account_id: Option<String>,
@@ -85,6 +86,43 @@ pub struct OpenAiProvider {
     base_url: String,
     model_catalog_cache: OpenAiModelCatalogCache,
     models_request_timeout: Duration,
+}
+
+/// Shared HTTP client for fixed private Codex endpoints.
+///
+/// The wrapper deliberately has no constructor from a raw `reqwest::Client`,
+/// so provider users cannot accidentally re-enable cross-origin redirects for
+/// requests carrying Codex identity headers.
+#[derive(Clone)]
+pub struct OpenAiCodexHttpClient(reqwest::Client);
+
+impl OpenAiCodexHttpClient {
+    pub fn new() -> Self {
+        Self(
+            reqwest::Client::builder()
+                .redirect(Policy::none())
+                .build()
+                .expect("static Codex HTTP client configuration is valid"),
+        )
+    }
+
+    pub fn reqwest_client(&self) -> reqwest::Client {
+        self.0.clone()
+    }
+
+    fn get(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        self.0.get(url)
+    }
+
+    fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        self.0.post(url)
+    }
+}
+
+impl Default for OpenAiCodexHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -194,12 +232,6 @@ struct CodexModel {
     auto_compact_token_limit: Option<i64>,
     supported_reasoning_levels: Vec<CodexReasoningLevel>,
     supports_parallel_tool_calls: bool,
-    #[serde(default)]
-    supports_search_tool: Option<bool>,
-    #[serde(default)]
-    web_search_tool_type: Option<String>,
-    #[serde(default)]
-    apply_patch_tool_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,21 +389,6 @@ fn ninety_percent(value: usize) -> usize {
     value / 10 * 9 + value % 10 * 9 / 10
 }
 
-fn validate_optional_catalog_selector(
-    value: Option<&str>,
-    field: &str,
-    slug: &str,
-) -> Result<(), CatalogError> {
-    if let Some(value) = value {
-        if value.is_empty() || value.len() > CODEX_MODELS_MAX_EFFORT_BYTES {
-            return Err(CatalogError::new(format!(
-                "Codex model {slug} has invalid {field}"
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn parse_codex_models_response(bytes: &[u8]) -> Result<OpenAiModelCatalog, CatalogError> {
     if bytes.len() > CODEX_MODELS_MAX_BODY_BYTES {
         return Err(CatalogError::new(format!(
@@ -400,9 +417,6 @@ fn parse_codex_models_response(bytes: &[u8]) -> Result<OpenAiModelCatalog, Catal
             auto_compact_token_limit,
             supported_reasoning_levels,
             supports_parallel_tool_calls,
-            supports_search_tool,
-            web_search_tool_type,
-            apply_patch_tool_type,
         } = model;
         if slug.trim().is_empty() || slug.len() > CODEX_MODELS_MAX_SLUG_BYTES {
             return Err(CatalogError::new(
@@ -449,22 +463,6 @@ fn parse_codex_models_response(bytes: &[u8]) -> Result<OpenAiModelCatalog, Catal
             }
         }
 
-        // Retain strict type/size validation for the catalog evidence already
-        // relevant to pi-relay's local tool surface, but do not use these
-        // provider-native selectors to enable shell/patch actions or claim
-        // hosted-search support in this PR.
-        let _ = supports_search_tool;
-        validate_optional_catalog_selector(
-            web_search_tool_type.as_deref(),
-            "web_search_tool_type",
-            &slug,
-        )?;
-        validate_optional_catalog_selector(
-            apply_patch_tool_type.as_deref(),
-            "apply_patch_tool_type",
-            &slug,
-        )?;
-
         models.insert(
             slug.clone(),
             Arc::new(OpenAiModelMetadata {
@@ -480,12 +478,13 @@ fn parse_codex_models_response(bytes: &[u8]) -> Result<OpenAiModelCatalog, Catal
 }
 
 async fn read_bounded_catalog_response(mut response: reqwest::Response) -> ProviderResult<Vec<u8>> {
+    let status = response.status().as_u16();
     if response
         .content_length()
         .is_some_and(|length| length > CODEX_MODELS_MAX_BODY_BYTES as u64)
     {
         return Err(ProviderError::ModelCatalog {
-            status: Some(response.status().as_u16()),
+            status: Some(status),
             message: format!(
                 "Codex models response exceeded {} bytes",
                 CODEX_MODELS_MAX_BODY_BYTES
@@ -497,13 +496,13 @@ async fn read_bounded_catalog_response(mut response: reqwest::Response) -> Provi
         .chunk()
         .await
         .map_err(|error| ProviderError::ModelCatalog {
-            status: error.status().map(|status| status.as_u16()),
+            status: Some(status),
             message: format!("failed to read Codex models response: {error}"),
         })?
     {
         if body.len().saturating_add(chunk.len()) > CODEX_MODELS_MAX_BODY_BYTES {
             return Err(ProviderError::ModelCatalog {
-                status: Some(response.status().as_u16()),
+                status: Some(status),
                 message: format!(
                     "Codex models response exceeded {} bytes",
                     CODEX_MODELS_MAX_BODY_BYTES
@@ -634,7 +633,7 @@ mod catalog_tests {
         cache: OpenAiModelCatalogCache,
     ) -> OpenAiProvider {
         let mut provider = OpenAiProvider::codex_with_client_and_cache(
-            reqwest::Client::new(),
+            OpenAiCodexHttpClient::new(),
             token,
             account_id.map(str::to_string),
             Some("installation-id".to_string()),
@@ -822,6 +821,26 @@ mod catalog_tests {
     }
 
     #[test]
+    fn catalog_ignores_non_authoritative_search_and_patch_selectors() {
+        let mut model = model_fixture(
+            "future-selectors",
+            Some(272_000),
+            None,
+            None,
+            &["low"],
+            true,
+        );
+        model["supports_search_tool"] = json!({ "future": "shape" });
+        model["web_search_tool_type"] = json!(["future", "values"]);
+        model["apply_patch_tool_type"] = json!({ "nested": { "value": 42 } });
+
+        let catalog = parse_models(vec![model])
+            .expect("ignored provider-native selector fields cannot invalidate the catalog");
+
+        assert!(catalog.models.contains_key("future-selectors"));
+    }
+
+    #[test]
     fn exact_slug_and_reasoning_capabilities_are_authoritative() {
         let catalog = parse_models(vec![
             model_fixture(
@@ -946,6 +965,134 @@ mod catalog_tests {
         let header_end = request.find("\r\n\r\n").expect("headers end") + 4;
         assert_eq!(request.len(), header_end, "models request has no body");
         assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn codex_models_redirect_is_an_explicit_error_and_never_reaches_destination() {
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("destination listener binds");
+        let destination_url = format!(
+            "http://{}/stolen",
+            destination.local_addr().expect("destination address")
+        );
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("source listener binds");
+        let base_url = format!("http://{}", source.local_addr().expect("source address"));
+
+        let source_server = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.expect("source request accepted");
+            let request = read_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nlocation: {destination_url}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("redirect response writes");
+            request
+        });
+        let provider = test_provider(
+            base_url,
+            Some("account-id"),
+            "access-token",
+            OpenAiModelCatalogCache::default(),
+        );
+
+        let error = provider
+            .model_metadata("gpt-5.6-sol")
+            .await
+            .expect_err("redirect must remain an explicit provider error");
+        assert!(matches!(
+            error,
+            ProviderError::ModelCatalog {
+                status: Some(302),
+                ..
+            }
+        ));
+        let source_request = String::from_utf8(source_server.await.expect("source server joins"))
+            .expect("source request is utf8")
+            .to_ascii_lowercase();
+        assert!(source_request.contains("authorization: bearer access-token\r\n"));
+        assert!(source_request.contains("chatgpt-account-id: account-id\r\n"));
+        assert!(source_request.contains("x-codex-installation-id: installation-id\r\n"));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), destination.accept())
+                .await
+                .is_err(),
+            "redirect destination must receive no request or Codex headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_401_body_preserves_status_and_bypasses_failure_cache() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("first request accepted");
+            server_requests.fetch_add(1, Ordering::Relaxed);
+            let _ = read_request(&mut first).await;
+            first
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{\"error\":",
+                )
+                .await
+                .expect("truncated response writes");
+            drop(first);
+
+            let (mut second, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("401 must not be negative-cached")
+                .expect("second request accepted");
+            server_requests.fetch_add(1, Ordering::Relaxed);
+            let _ = read_request(&mut second).await;
+            let body = serde_json::to_vec(&json!({
+                "models": [model_fixture(
+                    "gpt-5.6-sol",
+                    Some(372_000),
+                    None,
+                    None,
+                    &["low"],
+                    true
+                )]
+            }))
+            .expect("fixture serializes");
+            write_json_response(&mut second, "200 OK", &body).await;
+        });
+        let provider = test_provider(
+            base_url,
+            Some("account-id"),
+            "access-token",
+            OpenAiModelCatalogCache::default(),
+        );
+
+        let error = provider
+            .model_metadata("gpt-5.6-sol")
+            .await
+            .expect_err("truncated 401 must remain an error");
+        assert!(matches!(
+            error,
+            ProviderError::ModelCatalog {
+                status: Some(401),
+                ..
+            }
+        ));
+        assert!(provider
+            .model_metadata("gpt-5.6-sol")
+            .await
+            .expect("immediate retry performs another GET")
+            .is_some());
+        server.await.expect("server joins");
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -1979,7 +2126,7 @@ impl OpenAiProvider {
         installation_id: Option<String>,
     ) -> Self {
         Self::codex_with_client(
-            reqwest::Client::new(),
+            OpenAiCodexHttpClient::new(),
             access_token,
             account_id,
             installation_id,
@@ -1987,7 +2134,7 @@ impl OpenAiProvider {
     }
 
     pub fn codex_with_client(
-        client: reqwest::Client,
+        client: OpenAiCodexHttpClient,
         access_token: impl Into<String>,
         account_id: Option<String>,
         installation_id: Option<String>,
@@ -2002,7 +2149,7 @@ impl OpenAiProvider {
     }
 
     pub fn codex_with_client_and_cache(
-        client: reqwest::Client,
+        client: OpenAiCodexHttpClient,
         access_token: impl Into<String>,
         account_id: Option<String>,
         installation_id: Option<String>,
@@ -2021,7 +2168,7 @@ impl OpenAiProvider {
     }
 
     pub fn codex_with_client_and_session(
-        client: reqwest::Client,
+        client: OpenAiCodexHttpClient,
         session_state: Arc<OpenAiCodexSessionState>,
         access_token: impl Into<String>,
         account_id: Option<String>,
@@ -2038,7 +2185,7 @@ impl OpenAiProvider {
     }
 
     pub fn codex_with_client_session_and_cache(
-        client: reqwest::Client,
+        client: OpenAiCodexHttpClient,
         session_state: Arc<OpenAiCodexSessionState>,
         access_token: impl Into<String>,
         account_id: Option<String>,
@@ -3730,7 +3877,7 @@ mod tests {
         let session_state = Arc::new(OpenAiCodexSessionState::new("session-1"));
         let model_catalog_cache = OpenAiModelCatalogCache::default();
         let provider = OpenAiProvider {
-            client: reqwest::Client::new(),
+            client: OpenAiCodexHttpClient::new(),
             session_state: Some(session_state),
             access_token: "token".to_string(),
             account_id: None,
