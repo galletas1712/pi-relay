@@ -106,10 +106,6 @@ impl OpenAiCodexHttpClient {
         )
     }
 
-    pub fn reqwest_client(&self) -> reqwest::Client {
-        self.0.clone()
-    }
-
     fn get(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
         self.0.get(url)
     }

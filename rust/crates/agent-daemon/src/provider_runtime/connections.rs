@@ -16,7 +16,8 @@ use super::provider::ProviderHandle;
 
 #[derive(Clone)]
 pub(crate) struct ProviderConnectionRegistry {
-    client: OpenAiCodexHttpClient,
+    codex_client: OpenAiCodexHttpClient,
+    anthropic_client: reqwest::Client,
     anthropic_model_cache: AnthropicModelCache,
     openai_model_catalog_cache: OpenAiModelCatalogCache,
     connections: Arc<Mutex<HashMap<ProviderConnectionKey, Arc<ProviderConnection>>>>,
@@ -47,7 +48,8 @@ struct AnthropicConnection {
 impl ProviderConnectionRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            client: OpenAiCodexHttpClient::new(),
+            codex_client: OpenAiCodexHttpClient::new(),
+            anthropic_client: reqwest::Client::new(),
             anthropic_model_cache: AnthropicModelCache::default(),
             openai_model_catalog_cache: OpenAiModelCatalogCache::default(),
             connections: Arc::new(Mutex::new(HashMap::new())),
@@ -104,11 +106,11 @@ impl ProviderConnectionRegistry {
                 Arc::new(match provider {
                     ProviderKind::OpenAi => ProviderConnection::OpenAi(OpenAiCodexConnection {
                         state: Arc::new(OpenAiCodexSessionState::new(session_id)),
-                        client: self.client.clone(),
+                        client: self.codex_client.clone(),
                         model_catalog_cache: self.openai_model_catalog_cache.clone(),
                     }),
                     ProviderKind::Claude => ProviderConnection::Anthropic(AnthropicConnection {
-                        client: self.client.reqwest_client(),
+                        client: self.anthropic_client.clone(),
                         model_cache: self.anthropic_model_cache.clone(),
                     }),
                 })
@@ -137,21 +139,18 @@ impl ProviderConnection {
 
 impl OpenAiCodexConnection {
     fn provider_handle(&self, credentials: &Credentials) -> Result<ProviderHandle> {
-        let access_token = credentials.codex_access_token.clone().ok_or_else(|| {
-            anyhow!("~/.codex ChatGPT token not found for OpenAI subscription transport")
-        })?;
         Ok(ProviderHandle {
             provider: Box::new(OpenAiProvider::codex_with_client_session_and_cache(
                 self.client.clone(),
                 self.state.clone(),
-                access_token.clone(),
+                credentials.codex_access_token.clone().ok_or_else(|| {
+                    anyhow!("~/.codex ChatGPT token not found for OpenAI subscription transport")
+                })?,
                 credentials.codex_account_id.clone(),
                 credentials.codex_installation_id.clone(),
                 self.model_catalog_cache.clone(),
             )),
-            codex_access_token_fingerprint: Some(crate::auth::CodexAccessTokenFingerprint::new(
-                &access_token,
-            )),
+            uses_codex_auth: true,
         })
     }
 }
@@ -166,7 +165,7 @@ impl AnthropicConnection {
                 })?,
                 self.model_cache.clone(),
             )),
-            codex_access_token_fingerprint: None,
+            uses_codex_auth: false,
         })
     }
 }

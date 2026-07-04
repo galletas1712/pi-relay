@@ -1,37 +1,14 @@
 use std::{
-    collections::HashMap,
     env,
-    future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
-    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
-use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const CODEX_REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Equality-only identifier for the access token used by a Codex request.
-///
-/// Deliberately omit `Debug`/`Display`: the daemon only compares generations
-/// and must never emit a stable credential correlation identifier.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CodexAccessTokenFingerprint([u8; 32]);
-
-impl CodexAccessTokenFingerprint {
-    pub(crate) fn new(access_token: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"pi-relay codex access-token generation\0");
-        hasher.update(access_token.as_bytes());
-        Self(hasher.finalize().into())
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Credentials {
@@ -54,12 +31,6 @@ impl Credentials {
                 .ok()
                 .or_else(read_claude_code_config_api_key),
         }
-    }
-
-    pub(crate) fn codex_access_token_fingerprint(&self) -> Option<CodexAccessTokenFingerprint> {
-        self.codex_access_token
-            .as_deref()
-            .map(CodexAccessTokenFingerprint::new)
     }
 }
 
@@ -167,80 +138,7 @@ struct CodexRefreshResponse {
     refresh_token: Option<String>,
 }
 
-#[derive(Clone)]
-enum CodexRefreshOutcome {
-    Success(Credentials),
-    Failure(String),
-}
-
-impl CodexRefreshOutcome {
-    fn result(&self) -> Result<Credentials> {
-        match self {
-            Self::Success(credentials) => Ok(credentials.clone()),
-            Self::Failure(message) => Err(anyhow!(message.clone())),
-        }
-    }
-}
-
-#[derive(Default)]
-struct CodexCredentialRefreshState {
-    attempts: HashMap<CodexAccessTokenFingerprint, CodexRefreshOutcome>,
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct CodexCredentialRefreshCoordinator {
-    state: Arc<tokio::sync::Mutex<CodexCredentialRefreshState>>,
-}
-
-impl CodexCredentialRefreshCoordinator {
-    pub(crate) async fn credentials_after_401_with<Load, Refresh, RefreshFuture>(
-        &self,
-        failed_fingerprint: CodexAccessTokenFingerprint,
-        load: Load,
-        refresh: Refresh,
-    ) -> Result<Credentials>
-    where
-        Load: FnOnce() -> Result<Credentials>,
-        Refresh: FnOnce() -> RefreshFuture,
-        RefreshFuture: Future<Output = Result<Credentials>>,
-    {
-        let mut state = self.state.lock().await;
-        let current = load()?;
-        let current_fingerprint = current
-            .codex_access_token_fingerprint()
-            .ok_or_else(|| anyhow!("Codex credentials no longer contain an access token"))?;
-        if current_fingerprint != failed_fingerprint {
-            return Ok(current);
-        }
-        if let Some(outcome) = state.attempts.get(&failed_fingerprint) {
-            return outcome.result();
-        }
-
-        let result = refresh().await;
-        let outcome = match &result {
-            Ok(credentials) => CodexRefreshOutcome::Success(credentials.clone()),
-            Err(error) => CodexRefreshOutcome::Failure(error.to_string()),
-        };
-        state.attempts.insert(failed_fingerprint, outcome);
-        result
-    }
-}
-
-pub(crate) async fn refresh_codex_credentials(
-    failed_fingerprint: CodexAccessTokenFingerprint,
-) -> Result<Credentials> {
-    static REFRESH_COORDINATOR: OnceLock<CodexCredentialRefreshCoordinator> = OnceLock::new();
-    REFRESH_COORDINATOR
-        .get_or_init(CodexCredentialRefreshCoordinator::default)
-        .credentials_after_401_with(
-            failed_fingerprint,
-            || Ok(Credentials::load()),
-            perform_codex_refresh,
-        )
-        .await
-}
-
-async fn perform_codex_refresh() -> Result<Credentials> {
+pub(crate) async fn refresh_codex_credentials() -> Result<Credentials> {
     let snapshot = read_codex_auth();
     let refresh_token = env::var("CODEX_REFRESH_TOKEN")
         .ok()
@@ -249,11 +147,7 @@ async fn perform_codex_refresh() -> Result<Credentials> {
             anyhow!("Codex provider returned 401 and no ChatGPT refresh token was found")
         })?;
 
-    let client = reqwest::Client::builder()
-        .redirect(Policy::none())
-        .timeout(CODEX_REFRESH_REQUEST_TIMEOUT)
-        .build()?;
-    let response = client
+    let response = reqwest::Client::new()
         .post(CODEX_REFRESH_TOKEN_URL)
         .header("Content-Type", "application/json")
         .json(&CodexRefreshRequest {

@@ -24,16 +24,12 @@
   the existing one-time credential refresh/provider rebuild. No bundled model
   file, prefix/alias match, model substitution, public `/v1/models`, disk cache,
   or conditional ETag path was added.
-- Codex HTTP clients now disable redirects for every fixed private endpoint, so
-  bearer and custom account/installation headers cannot be forwarded to a
-  redirect target. Catalog body-read failures retain the response status; a
-  malformed or truncated 401 therefore still bypasses failure backoff and
-  enters auth recovery.
-- Concurrent 401 recovery is coordinated by the nonlogged fingerprint of the
-  exact failed access-token generation. The first caller performs one bounded,
-  no-redirect OAuth refresh; waiters reload credentials and either reuse a
-  newer generation or the memoized outcome. Provider calls still retry at most
-  once.
+- The Codex provider HTTP client now disables redirects for fixed private
+  catalog/Responses endpoints, so bearer and custom account/installation
+  headers cannot be forwarded to a redirect target. Catalog body-read failures
+  retain the response status; a malformed or truncated 401 therefore still
+  bypasses failure backoff and enters the existing one-refresh/provider-rebuild
+  path.
 - Ordinary and compact requests exact-resolve the selected slug before body
   construction. The adapter validates configured known reasoning effort
   exactly against the selected entry, uses discovered

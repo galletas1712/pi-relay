@@ -134,15 +134,14 @@ authentication, transport, timeout, malformed-response, unknown-model, and
 expired-refresh failures surface a typed catalog error. A short failure backoff
 may return the same error without another GET, but a retained old snapshot is
 never used as stale success. A 401 bypasses negative caching and enters the
-daemon's one-time credential refresh/rebuild path. Concurrent 401s from the same
-failed access-token generation share one bounded OAuth outcome, while callers
-that reload a newer generation rebuild without another refresh. Codex clients
-disable redirects, and body-read failures retain the received status so a
-truncated 401 cannot enter failure backoff. The endpoint's weak ETag was not
-useful (`If-None-Match` still returned 200), so no conditional or disk cache is
-implemented. Provider-native search/patch selector fields are ignored as
-non-authoritative input; only consumed capability fields such as
-`supports_parallel_tool_calls` are deserialized.
+daemon's existing one-time credential refresh/rebuild path used by ordinary
+Codex calls. The Codex provider client disables redirects, and body-read
+failures retain the received status so a truncated 401 cannot enter failure
+backoff. The endpoint's weak ETag was not useful (`If-None-Match` still returned
+200), so no conditional or disk cache is implemented. Provider-native
+search/patch selector fields are ignored as non-authoritative input; only
+consumed capability fields such as `supports_parallel_tool_calls` are
+deserialized.
 
 ## Streaming, terminal behavior, compaction, and counting
 

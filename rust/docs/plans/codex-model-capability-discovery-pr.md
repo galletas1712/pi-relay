@@ -88,9 +88,7 @@ Important cache invariants:
 - A stale snapshot never shapes a new request after TTL expiry or refresh
   failure.
 - A 401 is not negative-cached and enters the daemon's existing one-time
-  credential refresh/rebuild path. Concurrent failures for one access-token
-  generation share one bounded OAuth outcome; callers that observe a newer
-  credential generation rebuild without another refresh.
+  credential refresh/rebuild path used by ordinary Codex provider calls.
 
 ## Request shaping
 
@@ -108,7 +106,8 @@ Important cache invariants:
   invalidate the catalog or enable native shell/patch actions.
 - `service_tier: "priority"` remains unconditional for ordinary and compact
   requests.
-- Redirects are disabled for all fixed private Codex endpoints.
+- Redirects are disabled for the fixed private Codex catalog and Responses
+  provider endpoints.
 - The catalog has no output ceiling, so existing explicit
   `max_output_tokens` behavior is unchanged.
 
