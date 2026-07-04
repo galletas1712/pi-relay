@@ -119,9 +119,11 @@ Implemented user-facing behavior:
   blocks remain opaque and require the matching strategy edit: ordinary
   Messages uses a temporary paused trigger at the resolved model input ceiling,
   while token counting uses the documented non-triggering bare edit. The
-  ceiling value is schema-valid under Anthropic's documented minimum-only rule,
-  but its live acceptance/behavior is unverified; fail-closed parsing protects
-  durable state, not request availability.
+  ceiling value is schema-valid under Anthropic's documented minimum-only rule.
+  A paid production Sonnet 5 automatic E2E accepted that replay shape, resumed
+  the same blocked action after one native checkpoint, and reduced the
+  effective count from the 541,564-token gate to 15,628. Ordinary inline
+  compaction blocks still fail closed at the provider boundary.
 - Provider/model-aware compaction thresholds: verified 1M Claude windows
   default to 500k; hosted GPT-5.6 Sol/Terra/Luna use 372k windows and a 334.8k
   threshold; older OpenAI and other windows retain the generic 85% policy.

@@ -251,21 +251,17 @@ Remote compaction policy is provider-specific. OpenAI keeps its existing native-
 }
 ```
 
-Use `always` instead of `auto` only when native failures should be visible
-rather than locally recovered. Claude `auto` logs and falls back to local
-summary on unsupported-model, provider, malformed-stream, unexpected-stop, or
-invalid-block failures; `always` propagates them. Null, unknown, wrong-type, or
-otherwise malformed Claude config fails closed to `never`, while an explicit
-`never` remains authoritative even if a sibling field is malformed. OpenAI's
-legacy whole-object serde fallback and Auto-to-Always normalization remain
-unchanged: a malformed legacy OpenAI sibling discards the complete config
-object, so even a sibling `remote_mode = "never"` falls back to Auto and
-resolves to Always; the Claude-only enrollment field remains an ignored unknown
-field for OpenAI. The transcript-group trimming/retry loop handles clear native
-context-overflow failures before `auto` considers local fallback. A manual or
-early compaction below Anthropic's 50K minimum cannot produce a native block,
-so `auto` intentionally falls back to local summary and `always` intentionally
-fails.
+For Claude, `auto` and `always` differ only as persisted selection-policy
+values: both select native compaction when paired with the valid versioned
+marker, and both use the same failure behavior after selection. Unsupported
+model/capability, below-minimum or unexpected-stop, transport/HTTP,
+protocol/content, and context overflow remaining after bounded transcript-group
+trimming are typed terminal failures; neither mode silently converts one into
+a local checkpoint. Missing, mismatched, null, unknown, wrong-type, or otherwise
+malformed enrollment, as well as explicit `never`, resolves to local compaction
+before any native request. That is a pre-request policy choice, not a failure
+fallback. OpenAI retains its established native baseline and ignores the
+Claude-only enrollment field.
 
 The circuit breaker lives in compaction auto-state on session metadata. Each auto-compaction failure increments a consecutive-failure counter and records the failing leaf id; the eligibility check skips a leaf that just failed, skips when `suppressed`, and a successful ordinary model completion (including a max-output response with usage, but not refusal or an unexpected compaction stop) resets the failure counter. Compaction success commits the updated breaker/recompaction state with checkpoint installation and blocked-model resumption; failure commits failure metadata while terminally failing both blocked model and compaction actions. One immediate recompaction is allowed after a successful compacted request still overflows. If the request still overflows after a second successful compaction, recovery falls through to the ordinary terminal model-error path instead of starting an infinite loop. After success commits, the daemon reloads the compacted runtime and persisted config before claiming the pending model action. An installation/config/workspace/claim error compensates by terminally failing the unfinished action. After a successful claim, the daemon verifies that spawn synchronously registered a runner and applies the same fenced compensation if it did not; if another path already owns that exact lease generation, the live-runner check avoids a same-generation concurrent dispatch or false failure. Task-wrapper errors evict the stale live projection and re-run durable recovery after unregistering the compaction task. This prevents both endless compact/retry/overflow cycles and stranded blocked, pending, or unowned running model actions.
 
