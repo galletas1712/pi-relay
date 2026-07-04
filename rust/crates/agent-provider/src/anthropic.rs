@@ -1328,8 +1328,8 @@ fn attribution_header(
 /// same stable system prompt produces the same fingerprint and therefore the
 /// same cached prefix, enabling true cross-session reuse of the stable-system
 /// cache. We fall back to a digest of the first user text only when a caller
-/// truly supplies no stable prefix; normal daemon requests and both local and
-/// provider-native compaction prompts supply stable prompt sections.
+/// truly supplies no stable prefix; normal daemon and provider-native
+/// compaction requests supply stable prompt sections.
 fn attribution_fingerprint(
     prompt: &crate::PromptSections,
     transcript: &[ModelTranscriptEntry],
@@ -1587,9 +1587,6 @@ fn emitted_anthropic_replay(
         .map(|record| record.raw_value().map_err(ProviderError::Json))
         .collect::<ProviderResult<Vec<_>>>()?;
     if compaction_summary {
-        if blocks.is_empty() {
-            return Ok((blocks, false));
-        }
         if blocks.len() != 1 {
             return Err(ProviderError::Provider(
                 "refusing malformed persisted Anthropic compaction replay: expected exactly one Claude block"
@@ -4496,12 +4493,12 @@ mod tests {
     }
 
     #[test]
-    fn compaction_summary_replay_is_strict_but_historical_summary_needs_no_sidecar() {
+    fn compaction_summary_requires_exactly_one_valid_compaction_replay_block() {
         let summary = || {
             TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
                 "session-1",
                 "leaf-1",
-                "replay-free historical checkpoint",
+                "provider-native checkpoint",
                 Some(80_000),
                 agent_vocab::TurnId(7),
             ))
@@ -4520,18 +4517,27 @@ mod tests {
             turn_id: None,
         };
 
-        let historical = prepare_messages_request(
+        let block = json!({
+            "type": "compaction",
+            "content": "opaque",
+            "encrypted_content": "ciphertext",
+        });
+        let valid = prepare_messages_request(
             request(ModelTranscriptEntry {
                 item: summary(),
-                provider_replay: Vec::new(),
+                provider_replay: vec![
+                    ProviderReplayItem::new(ProviderKind::Claude, &block).unwrap()
+                ],
             }),
             &static_anthropic_model_metadata("claude-opus-4-8"),
         )
-        .expect("historical summary without replay renders");
-        assert_eq!(historical.beta_header, CLAUDE_CODE_BETA);
-        assert_eq!(historical.body["messages"].as_array().unwrap().len(), 1);
+        .expect("summary with exactly one valid compaction replay renders");
+        assert!(valid.beta_header.contains(CLAUDE_CODE_BETA));
+        assert!(valid.beta_header.contains(COMPACTION_BETA));
+        assert_eq!(valid.body["messages"][0]["content"][0], block);
 
         let invalid_replays = [
+            Vec::new(),
             vec![ProviderReplayItem {
                 provider: ProviderKind::Claude,
                 raw_json: "{".to_string(),

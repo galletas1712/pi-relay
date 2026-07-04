@@ -26,10 +26,10 @@
     completed the continuation. Token counting keeps the live-proven bare
     strategy because Anthropic documents that it applies existing blocks
     without triggering new compactions.
-  - Emitted replay rendering parses every Claude sidecar once. A replay-free
-    historical `CompactionSummary` remains renderable; a summary with Claude
-    replay requires exactly one valid compaction block (`type = "compaction"`,
-    nonempty string `content`, absent/null/string `encrypted_content`).
+  - Emitted replay rendering parses every Claude sidecar once. Every
+    `CompactionSummary` requires exactly one valid Claude compaction block
+    (`type = "compaction"`, nonempty string `content`, absent/null/string
+    `encrypted_content`); zero or multiple Claude blocks fail locally.
     Assistant replay permits ordinary Claude blocks but rejects corrupt JSON
     and malformed exact compaction. Valid compaction remains opaque, including
     arbitrary extension fields. Wrong-provider and non-emitted sidecars have no
@@ -285,8 +285,8 @@ Implemented the cleaner split:
 - `ModelContext` materializes `ModelContextEntry` values and preserves replay
   sidecars along fork/switch/compact branches.
 - `ModelRequest` now passes `Vec<ModelTranscriptEntry>` to providers.
-  Providers serialize replay sidecars when present and fall back to semantic
-  transcript items for older or replay-free history.
+  Providers serialize replay sidecars when present and otherwise render
+  ordinary semantic transcript items directly.
 - Postgres has a sibling `transcript_entries.provider_replay` JSONB column.
   The schema migration lifts legacy `provider_replay_record` assistant items
   into that column and removes them from assistant message JSON.
