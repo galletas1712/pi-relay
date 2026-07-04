@@ -80,7 +80,8 @@
   versioned marker plus `remote_mode = "auto"` or `"always"`; missing,
   mismatched, malformed, and `never` policies select local compaction before a
   request. Once native is selected, both modes surface typed terminal failures
-  after bounded handling rather than converting them to a local checkpoint.
+  directly rather than omitting transcript history, retrying, or converting
+  them to a local checkpoint.
 
 ### Anthropic Model and Hosted-Tool Refresh
 
@@ -1588,10 +1589,10 @@ paths. Changes made from that review:
   policy choice, not a failure fallback.
 - Once native is selected, unsupported model/capability, below-minimum or
   unexpected-stop, transport/HTTP, protocol/content, and context overflow
-  remaining after bounded group-trim handling are typed terminal failures.
-  `auto` and `always` share this failure behavior: the mode affects selection
-  policy, not after-failure recovery, and neither silently installs a local
-  checkpoint.
+  are typed terminal failures. Native compaction sends the selected full model
+  context once and does not retry with transcript history omitted. `auto` and
+  `always` share this failure behavior: the mode affects selection policy, not
+  after-failure recovery, and neither silently installs a local checkpoint.
 - Direct `/compaction` is an atomic read-compatibility layout only when nested
   `/compaction/config` is absent. Fields are never merged, and current
   producers write the nested layout. Remove the direct-layout reader after an

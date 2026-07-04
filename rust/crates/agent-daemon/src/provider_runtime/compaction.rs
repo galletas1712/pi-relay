@@ -329,8 +329,7 @@ impl CompactionRunner for LiveCompactionRunner<'_> {
     }
 
     async fn run_remote(&self, model_context: ModelContext) -> Result<CompactionOutput> {
-        run_remote_compaction_with_trimming(self.state, self.config, self.session_id, model_context)
-            .await
+        run_remote_compaction(self.state, self.config, self.session_id, model_context).await
     }
 
     async fn run_local(&self, model_context: ModelContext) -> Result<CompactionOutput> {
@@ -345,69 +344,40 @@ async fn run_compaction_with_runner(
     model_context: ModelContext,
     runner: &dyn CompactionRunner,
 ) -> Result<CompactionOutput> {
-    if remote_mode != RemoteCompactionMode::Never && runner.supports_remote() {
-        eprintln!(
-            "attempting provider-native compaction for {session_id} with {}",
-            provider
-        );
-        match runner.run_remote(model_context.clone()).await {
-            Ok(output) => return Ok(output),
-            Err(error) if should_fallback_after_remote_failure(provider, remote_mode) => {
-                eprintln!(
-                    "provider-native compaction failed for {session_id}; falling back to local summary (provider={provider}, reason={error})"
-                );
+    match remote_mode {
+        RemoteCompactionMode::Never => runner.run_local(model_context).await,
+        RemoteCompactionMode::Auto | RemoteCompactionMode::Always => {
+            if !runner.supports_remote() {
+                return Err(anyhow::Error::new(
+                    agent_provider::ProviderError::native_compaction(
+                        agent_provider::NativeCompactionErrorKind::Unsupported,
+                        format!("provider {provider} does not support provider-native compaction"),
+                    ),
+                ));
             }
-            Err(error) => return Err(error),
+            eprintln!("attempting provider-native compaction for {session_id} with {provider}");
+            runner.run_remote(model_context).await
         }
-    } else if remote_mode == RemoteCompactionMode::Always {
-        return Err(anyhow!(
-            "remote compaction unsupported for provider {}",
-            provider
-        ));
-    } else if remote_mode == RemoteCompactionMode::Auto {
-        eprintln!(
-            "provider-native compaction unavailable for {session_id}; falling back to local summary (provider={provider}, reason=provider does not advertise remote compaction support)"
-        );
     }
-
-    runner.run_local(model_context).await
 }
 
-async fn run_remote_compaction_with_trimming(
+async fn run_remote_compaction(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<CompactionOutput> {
-    let base_transcript = provider_transcript(model_context);
-    let mut groups = transcript_groups(base_transcript);
-    let mut last_context_error = None;
-    for attempt in 0..MAX_COMPACTION_CONTEXT_ATTEMPTS {
-        let request =
-            remote_compaction_request(state, config, session_id, entries_from_groups(&groups))
-                .await?;
-        let credentials = Credentials::load();
-        let provider = provider_for_config(state, config, &credentials, session_id).await?;
-        match compact_with_auth_retry(state, config, session_id, provider, request).await {
-            Ok(result) => return Ok(remote_compaction_output(config.provider.kind, result)),
-            Err(error)
-                if attempt + 1 < MAX_COMPACTION_CONTEXT_ATTEMPTS
-                    && error.is_context_overflow()
-                    && trim_oldest_complete_group(&mut groups) =>
-            {
-                last_context_error = Some(error.to_string());
-                eprintln!(
-                    "remote compaction for {session_id} exceeded context; retrying with older transcript group trimmed"
-                );
-                continue;
-            }
-            Err(error) => return Err(anyhow::Error::from(error)),
-        }
-    }
-    Err(anyhow!(
-        "remote compaction still exceeded context limits after trimming: {}",
-        last_context_error.unwrap_or_else(|| "unknown context-length error".to_string())
-    ))
+    let request = remote_compaction_request(
+        state,
+        config,
+        session_id,
+        provider_transcript(model_context),
+    )
+    .await?;
+    let credentials = Credentials::load();
+    let provider = provider_for_config(state, config, &credentials, session_id).await?;
+    let result = compact_with_auth_retry(state, config, session_id, provider, request).await?;
+    Ok(remote_compaction_output(config.provider.kind, result))
 }
 
 fn remote_compaction_output(
@@ -473,13 +443,6 @@ pub(crate) async fn remote_compaction_request(
         session_id: Some(session_id.to_string()),
         compaction_instructions,
     })
-}
-
-fn should_fallback_after_remote_failure(
-    provider: ProviderKind,
-    remote_mode: RemoteCompactionMode,
-) -> bool {
-    remote_mode == RemoteCompactionMode::Auto && provider != ProviderKind::OpenAi
 }
 
 pub(crate) async fn append_delegation_ledger_to_output(
@@ -699,10 +662,7 @@ fn trim_oldest_complete_group(groups: &mut Vec<TranscriptGroup>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_config(kind: ProviderKind, model: &str, metadata: Value) -> SessionConfig {
         SessionConfig {
@@ -722,31 +682,38 @@ mod tests {
     }
 
     struct TestCompactionRunner {
-        remote_error: String,
-        remote_calls: Arc<AtomicUsize>,
-        local_calls: Arc<AtomicUsize>,
+        supports_remote: bool,
+        context_overflow: bool,
+        remote_calls: AtomicUsize,
+        local_calls: AtomicUsize,
     }
 
     #[async_trait]
     impl CompactionRunner for TestCompactionRunner {
         fn supports_remote(&self) -> bool {
-            true
+            self.supports_remote
         }
 
         async fn run_remote(&self, _model_context: ModelContext) -> Result<CompactionOutput> {
             self.remote_calls.fetch_add(1, Ordering::Relaxed);
-            Err(anyhow::Error::new(
+            let error = if self.context_overflow {
+                agent_provider::ProviderError::Status {
+                    status: 413,
+                    message: "context length exceeded".to_string(),
+                }
+            } else {
                 agent_provider::ProviderError::native_compaction(
                     agent_provider::NativeCompactionErrorKind::Unsupported,
-                    self.remote_error.clone(),
-                ),
-            ))
+                    "model is unsupported",
+                )
+            };
+            Err(anyhow::Error::new(error))
         }
 
         async fn run_local(&self, _model_context: ModelContext) -> Result<CompactionOutput> {
             self.local_calls.fetch_add(1, Ordering::Relaxed);
             Ok(CompactionOutput {
-                summary: "local fallback".to_string(),
+                summary: "local summary".to_string(),
                 summary_kind: CompactionSummaryKind::ProviderText,
                 provider_replay: Vec::new(),
                 remote: false,
@@ -757,17 +724,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_compaction_auto_falls_back_but_always_exposes_native_error() {
-        for (mode, expect_fallback) in [
-            (RemoteCompactionMode::Auto, true),
-            (RemoteCompactionMode::Always, false),
-        ] {
-            let remote_calls = Arc::new(AtomicUsize::new(0));
-            let local_calls = Arc::new(AtomicUsize::new(0));
+    async fn selected_native_modes_expose_the_same_typed_error_without_local_compaction() {
+        for mode in [RemoteCompactionMode::Auto, RemoteCompactionMode::Always] {
             let runner = TestCompactionRunner {
-                remote_error: "model is unsupported".to_string(),
-                remote_calls: remote_calls.clone(),
-                local_calls: local_calls.clone(),
+                supports_remote: true,
+                context_overflow: false,
+                remote_calls: AtomicUsize::new(0),
+                local_calls: AtomicUsize::new(0),
             };
             let result = run_compaction_with_runner(
                 ProviderKind::Claude,
@@ -778,24 +741,98 @@ mod tests {
             )
             .await;
 
-            assert_eq!(remote_calls.load(Ordering::Relaxed), 1);
-            if expect_fallback {
-                let output = result.expect("Auto uses local fallback");
-                assert!(!output.remote);
-                assert_eq!(output.summary, "local fallback");
-                assert_eq!(local_calls.load(Ordering::Relaxed), 1);
-            } else {
-                let error = result.expect_err("Always exposes native error");
-                assert!(matches!(
-                    error.downcast_ref::<agent_provider::ProviderError>(),
-                    Some(agent_provider::ProviderError::NativeCompaction {
-                        kind: agent_provider::NativeCompactionErrorKind::Unsupported,
-                        ..
-                    })
-                ));
-                assert_eq!(local_calls.load(Ordering::Relaxed), 0);
-            }
+            assert_eq!(runner.remote_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(runner.local_calls.load(Ordering::Relaxed), 0);
+            let error = result.expect_err("selected native errors are terminal");
+            assert!(matches!(
+                error.downcast_ref::<agent_provider::ProviderError>(),
+                Some(agent_provider::ProviderError::NativeCompaction {
+                    kind: agent_provider::NativeCompactionErrorKind::Unsupported,
+                    message,
+                }) if message == "model is unsupported"
+            ));
         }
+    }
+
+    #[tokio::test]
+    async fn selected_native_modes_require_provider_support_without_running_local_compaction() {
+        for mode in [RemoteCompactionMode::Auto, RemoteCompactionMode::Always] {
+            let runner = TestCompactionRunner {
+                supports_remote: false,
+                context_overflow: false,
+                remote_calls: AtomicUsize::new(0),
+                local_calls: AtomicUsize::new(0),
+            };
+            let error = run_compaction_with_runner(
+                ProviderKind::Claude,
+                mode,
+                "test-session",
+                ModelContext::default(),
+                &runner,
+            )
+            .await
+            .expect_err("unsupported native selection must fail");
+
+            assert_eq!(runner.remote_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(runner.local_calls.load(Ordering::Relaxed), 0);
+            assert!(matches!(
+                error.downcast_ref::<agent_provider::ProviderError>(),
+                Some(agent_provider::ProviderError::NativeCompaction {
+                    kind: agent_provider::NativeCompactionErrorKind::Unsupported,
+                    ..
+                })
+            ));
+            assert!(error.to_string().contains("does not support"));
+        }
+    }
+
+    #[tokio::test]
+    async fn never_runs_only_local_compaction() {
+        let runner = TestCompactionRunner {
+            supports_remote: true,
+            context_overflow: false,
+            remote_calls: AtomicUsize::new(0),
+            local_calls: AtomicUsize::new(0),
+        };
+        let output = run_compaction_with_runner(
+            ProviderKind::Claude,
+            RemoteCompactionMode::Never,
+            "test-session",
+            ModelContext::default(),
+            &runner,
+        )
+        .await
+        .expect("Never selects local summary");
+
+        assert_eq!(runner.remote_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(runner.local_calls.load(Ordering::Relaxed), 1);
+        assert!(!output.remote);
+        assert_eq!(output.summary, "local summary");
+    }
+
+    #[tokio::test]
+    async fn native_context_overflow_is_not_retried_or_run_locally() {
+        let runner = TestCompactionRunner {
+            supports_remote: true,
+            context_overflow: true,
+            remote_calls: AtomicUsize::new(0),
+            local_calls: AtomicUsize::new(0),
+        };
+        let error = run_compaction_with_runner(
+            ProviderKind::Claude,
+            RemoteCompactionMode::Auto,
+            "test-session",
+            ModelContext::default(),
+            &runner,
+        )
+        .await
+        .expect_err("native context overflow must surface");
+
+        assert_eq!(runner.remote_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runner.local_calls.load(Ordering::Relaxed), 0);
+        assert!(error
+            .downcast_ref::<agent_provider::ProviderError>()
+            .is_some_and(agent_provider::ProviderError::is_context_overflow));
     }
 
     #[test]
@@ -841,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_remote_compaction_remains_opt_in_and_auto_falls_back() {
+    fn claude_remote_compaction_remains_opt_in() {
         let default = test_config(
             ProviderKind::Claude,
             "claude-sonnet-5",
@@ -889,19 +926,43 @@ mod tests {
                 expected
             );
         }
-
-        assert!(should_fallback_after_remote_failure(
+        for marker in [
+            serde_json::json!("compact_different_version"),
+            serde_json::json!({ "malformed": true }),
+        ] {
+            let invalid_enrollment = test_config(
+                ProviderKind::Claude,
+                "claude-sonnet-5",
+                serde_json::json!({
+                    "compaction": {
+                        "config": {
+                            "remote_mode": "auto",
+                            "anthropic_native_compaction": marker
+                        }
+                    }
+                }),
+            );
+            assert_eq!(
+                resolve_compaction_config(&invalid_enrollment, None).remote_mode,
+                RemoteCompactionMode::Never
+            );
+        }
+        let explicit_never = test_config(
             ProviderKind::Claude,
-            RemoteCompactionMode::Auto
-        ));
-        assert!(!should_fallback_after_remote_failure(
-            ProviderKind::Claude,
-            RemoteCompactionMode::Always
-        ));
-        assert!(!should_fallback_after_remote_failure(
-            ProviderKind::OpenAi,
-            RemoteCompactionMode::Auto
-        ));
+            "claude-sonnet-5",
+            serde_json::json!({
+                "compaction": {
+                    "config": {
+                        "remote_mode": "never",
+                        "anthropic_native_compaction": "compact_20260112"
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            resolve_compaction_config(&explicit_never, None).remote_mode,
+            RemoteCompactionMode::Never
+        );
     }
 
     #[test]
@@ -951,56 +1012,6 @@ mod tests {
                 .and_then(|usage| usage.get("raw_provider_usage")),
             Some(&raw_usage)
         );
-    }
-
-    #[test]
-    fn remote_retry_trimming_keeps_compaction_root_and_newer_history() {
-        let entry = |item| ModelTranscriptEntry {
-            item,
-            provider_replay: Vec::new(),
-        };
-        let mut groups = transcript_groups(vec![
-            entry(TranscriptItem::CompactionSummary(
-                agent_vocab::CompactionSummary::new(
-                    "session",
-                    "old-leaf",
-                    "prior checkpoint",
-                    None,
-                    agent_vocab::TurnId(1),
-                ),
-            )),
-            entry(TranscriptItem::TurnStarted {
-                turn_id: agent_vocab::TurnId(2),
-            }),
-            entry(TranscriptItem::UserMessage(UserMessage::text("old turn"))),
-            entry(TranscriptItem::TurnFinished {
-                turn_id: agent_vocab::TurnId(2),
-                outcome: agent_vocab::TurnOutcome::Graceful,
-            }),
-            entry(TranscriptItem::TurnStarted {
-                turn_id: agent_vocab::TurnId(3),
-            }),
-            entry(TranscriptItem::UserMessage(UserMessage::text("new turn"))),
-            entry(TranscriptItem::TurnFinished {
-                turn_id: agent_vocab::TurnId(3),
-                outcome: agent_vocab::TurnOutcome::Graceful,
-            }),
-        ]);
-
-        assert!(trim_oldest_complete_group(&mut groups));
-        let remaining = entries_from_groups(&groups);
-        assert!(matches!(
-            remaining.first().map(|entry| &entry.item),
-            Some(TranscriptItem::CompactionSummary(_))
-        ));
-        let visible = remaining
-            .iter()
-            .filter_map(|entry| match &entry.item {
-                TranscriptItem::UserMessage(message) => message.as_text(),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(visible, vec!["new turn"]);
     }
 
     #[test]

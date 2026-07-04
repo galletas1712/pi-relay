@@ -129,10 +129,9 @@ fn apply_messages_compaction_replay_strategy(
                 metadata.id
             ))
         })?;
-        // Anthropic documents only a 50k minimum, so the model ceiling is
-        // schema-valid, but provider acceptance/behavior at that value remains
-        // live-unverified. There is no apply-only mode; pause and fail-closed
-        // parsing protect durable data, not request availability.
+        // A paid Sonnet 5 continuation accepted the model-ceiling trigger and
+        // resumed the blocked action after native compaction; see the worklog.
+        // There is no documented apply-only mode.
         body["context_management"] = json!({
             "edits": [{
                 "type": "compact_20260112",
