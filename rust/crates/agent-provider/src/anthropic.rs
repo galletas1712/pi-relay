@@ -4245,6 +4245,43 @@ mod tests {
     }
 
     #[test]
+    fn compacted_model_request_renders_summary_before_exact_user_instruction() {
+        let replay = json!({
+            "type": "compaction",
+            "content": "Claude's opaque compacted context",
+            "encrypted_content": "opaque-ciphertext",
+        });
+        let summary = ModelTranscriptEntry {
+            item: TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+                "session-1",
+                "large-open-turn-leaf",
+                "Visible checkpoint preserving prior work.",
+                Some(180_000),
+                agent_vocab::TurnId(7),
+            )),
+            provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &replay).unwrap()],
+        };
+        let instruction = "Return exactly: RETAINED-USER-INSTRUCTION";
+        let request = test_model_request(
+            "claude-opus-4-8",
+            vec![
+                summary,
+                TranscriptItem::UserMessage(UserMessage::text(instruction)).into(),
+            ],
+        );
+
+        let body = messages_body(request).expect("compacted model request renders");
+        assert_eq!(body["messages"][0]["role"], "assistant");
+        assert_eq!(body["messages"][0]["content"][0], replay);
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert!(body["messages"][1]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Visible checkpoint")));
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert_eq!(body["messages"][2]["content"][0]["text"], instruction);
+    }
+
+    #[test]
     fn messages_replay_uses_resolved_model_ceiling_while_count_stays_bare() {
         let raw = json!({
             "type": "compaction",

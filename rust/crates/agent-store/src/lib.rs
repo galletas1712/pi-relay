@@ -4,7 +4,9 @@ mod postgres;
 
 use std::{fmt, time::Duration};
 
-use agent_session::{ModelContext, SessionAction, SessionEvent, TranscriptStorageNode};
+use agent_session::{
+    ModelContext, ModelContextEntry, SessionAction, SessionEvent, TranscriptStorageNode,
+};
 use agent_vocab::{
     text_enum, ActionId, DaemonToolObservation, ProviderConfig, ProviderKind, ProviderReplayItem,
     TranscriptItem, TurnId, TurnOutcome, UserMessage,
@@ -542,7 +544,7 @@ pub struct CompactionCompletion {
     pub remote: bool,
     pub provider: ProviderKind,
     pub usage: Option<Value>,
-    pub continuation_suffix: Vec<TranscriptStorageNode>,
+    pub continuation_suffix: Vec<ModelContextEntry>,
 }
 
 pub struct CreateCompactionResult {

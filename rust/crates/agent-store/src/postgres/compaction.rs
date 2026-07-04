@@ -493,10 +493,11 @@ impl PostgresAgentStore {
         }
 
         let new_root_id = format!("entry_{}", Uuid::new_v4());
+        let root_timestamp_ms = now_ms();
         let root_entry = StoredTranscriptEntry {
             id: new_root_id.clone(),
             parent_id: None,
-            timestamp_ms: now_ms(),
+            timestamp_ms: root_timestamp_ms,
             item: TranscriptItem::CompactionSummary(
                 CompactionSummary::new(
                     job.source_session_id.clone(),
@@ -513,10 +514,15 @@ impl PostgresAgentStore {
 
         let mut installed_entries = vec![root_entry.clone()];
         let mut parent_id = new_root_id.clone();
-        for mut suffix in completion.continuation_suffix {
-            suffix.parent_id = Some(parent_id.clone());
-            parent_id = suffix.id.clone();
-            let stored = StoredTranscriptEntry::from(suffix);
+        for (index, suffix) in completion.continuation_suffix.into_iter().enumerate() {
+            let stored = StoredTranscriptEntry {
+                id: format!("entry_{}", Uuid::new_v4()),
+                parent_id: Some(parent_id),
+                timestamp_ms: root_timestamp_ms.saturating_add(index as u64 + 1),
+                item: suffix.item,
+                provider_replay: suffix.provider_replay,
+            };
+            parent_id = stored.id.clone();
             let _ = insert_stored_entry_tx(&mut tx, &job.source_session_id, &stored).await?;
             installed_entries.push(stored);
         }
@@ -633,7 +639,7 @@ impl PostgresAgentStore {
         let metadata = next_compaction_success_metadata(
             session_metadata_tx(&mut tx, &job.source_session_id).await?,
             &job.source_leaf_id,
-            &new_root_id,
+            &installed_active_leaf_id,
             matches!(job.trigger, CompactionTrigger::Manual),
         );
         sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")

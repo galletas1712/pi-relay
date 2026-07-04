@@ -159,7 +159,7 @@ pub(crate) struct CompactionAutoState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_leaf_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_success_root_id: Option<String>,
+    pub last_success_leaf_id: Option<String>,
     #[serde(default)]
     pub consecutive_recompactions: usize,
 }

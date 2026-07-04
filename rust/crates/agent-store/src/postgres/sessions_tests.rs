@@ -98,13 +98,13 @@ fn compaction_auto_state_transitions_are_deterministic() {
             "config": { "max_consecutive_failures": 2 },
             "auto_state": {
                 "consecutive_failures": 1,
-                "last_success_root_id": "root-1",
+                "last_success_leaf_id": "leaf-1",
                 "consecutive_recompactions": 0
             }
         }
     });
     let failed =
-        next_auto_compaction_failure_metadata(metadata, 99, "root-1", "provider unavailable");
+        next_auto_compaction_failure_metadata(metadata, 99, "leaf-1", "provider unavailable");
     assert_eq!(
         failed.pointer("/compaction/auto_state/consecutive_failures"),
         Some(&json!(2))
@@ -115,11 +115,11 @@ fn compaction_auto_state_transitions_are_deterministic() {
     );
     assert_eq!(
         failed.pointer("/compaction/auto_state/last_failure_leaf_id"),
-        Some(&json!("root-1"))
+        Some(&json!("leaf-1"))
     );
     assert_eq!(failed.pointer("/unrelated/preserved"), Some(&json!(true)));
 
-    let first_recompaction = next_compaction_success_metadata(failed, "root-1", "root-2", false);
+    let first_recompaction = next_compaction_success_metadata(failed, "leaf-1", "leaf-2", false);
     assert_eq!(
         first_recompaction.pointer("/compaction/auto_state/consecutive_recompactions"),
         Some(&json!(1))
@@ -129,11 +129,11 @@ fn compaction_auto_state_transitions_are_deterministic() {
         Some(&json!(0))
     );
     assert_eq!(
-        first_recompaction.pointer("/compaction/auto_state/last_success_root_id"),
-        Some(&json!("root-2"))
+        first_recompaction.pointer("/compaction/auto_state/last_success_leaf_id"),
+        Some(&json!("leaf-2"))
     );
 
-    let manual = next_compaction_success_metadata(first_recompaction, "root-2", "root-3", true);
+    let manual = next_compaction_success_metadata(first_recompaction, "leaf-2", "leaf-3", true);
     assert_eq!(
         manual.pointer("/compaction/auto_state/consecutive_recompactions"),
         Some(&json!(0)),
@@ -162,7 +162,7 @@ fn compaction_auto_state_counters_saturate() {
         json!({
             "compaction": {
                 "auto_state": {
-                    "last_success_root_id": "leaf",
+                    "last_success_leaf_id": "leaf",
                     "consecutive_recompactions": u64::MAX
                 }
             }

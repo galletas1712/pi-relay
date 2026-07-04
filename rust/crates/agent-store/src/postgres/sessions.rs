@@ -56,16 +56,16 @@ pub(super) fn next_auto_compaction_failure_metadata(
 pub(super) fn next_compaction_success_metadata(
     mut metadata: Value,
     source_leaf_id: &str,
-    new_root_id: &str,
+    new_leaf_id: &str,
     manual: bool,
 ) -> Value {
     let state = ensure_compaction_auto_state_object(&mut metadata);
-    let previous_root = state.get("last_success_root_id").and_then(Value::as_str);
+    let previous_leaf = state.get("last_success_leaf_id").and_then(Value::as_str);
     let previous_recompactions = state
         .get("consecutive_recompactions")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let consecutive_recompactions = if !manual && previous_root == Some(source_leaf_id) {
+    let consecutive_recompactions = if !manual && previous_leaf == Some(source_leaf_id) {
         previous_recompactions.saturating_add(1)
     } else {
         0
@@ -78,7 +78,7 @@ pub(super) fn next_compaction_success_metadata(
         "consecutive_recompactions".to_string(),
         json!(consecutive_recompactions),
     );
-    state.insert("last_success_root_id".to_string(), json!(new_root_id));
+    state.insert("last_success_leaf_id".to_string(), json!(new_leaf_id));
     metadata
 }
 

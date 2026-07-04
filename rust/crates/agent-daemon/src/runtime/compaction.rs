@@ -1,7 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use agent_core::AgentInput;
-use agent_session::{AgentSession, SessionAction, TranscriptStorageNode};
+use agent_session::{AgentSession, ModelContextEntry, SessionAction};
 use agent_store::{
     ActionKind, ActionStatus, CompactionCompletion, CompactionJob, CompactionScope,
     CompactionTrigger, SessionConfig,
@@ -104,7 +102,7 @@ fn recompaction_limit_reached(
     auto_state: &crate::provider_runtime::CompactionAutoState,
     source_leaf_id: &str,
 ) -> bool {
-    auto_state.last_success_root_id.as_deref() == Some(source_leaf_id)
+    auto_state.last_success_leaf_id.as_deref() == Some(source_leaf_id)
         && auto_state.consecutive_recompactions >= 1
 }
 
@@ -336,19 +334,25 @@ async fn run_compaction_job(
     job: CompactionJob,
     config: SessionConfig,
 ) -> std::result::Result<(), RpcError> {
-    #[cfg(test)]
-    if config
-        .metadata
-        .pointer("/fault_injection/pause_compaction_dispatch_before_provider")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
-        std::future::pending::<()>().await;
-    }
-    let result = run_compaction(&state, &config, &session_id, job.compaction_context.clone()).await;
+    let result = match continuation_suffix_for_scope(&job) {
+        Ok(continuation_suffix) => {
+            #[cfg(test)]
+            if config
+                .metadata
+                .pointer("/fault_injection/pause_compaction_dispatch_before_provider")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                std::future::pending::<()>().await;
+            }
+            run_compaction(&state, &config, &session_id, job.compaction_context.clone())
+                .await
+                .map(|output| (output, continuation_suffix))
+        }
+        Err(error) => Err(anyhow::anyhow!(error.message)),
+    };
     let (events, resumed, failure) = match result {
-        Ok(output) => {
-            let continuation_suffix = continuation_suffix_for_scope(&job)?;
+        Ok((output, continuation_suffix)) => {
             let completion = CompactionCompletion {
                 summary: output.summary,
                 summary_kind: output.summary_kind.as_str().to_string(),
@@ -509,13 +513,13 @@ async fn run_compaction_job(
     Ok(())
 }
 
-pub(crate) fn continuation_suffix_for_scope(
+fn continuation_suffix_for_scope(
     job: &CompactionJob,
-) -> std::result::Result<Vec<TranscriptStorageNode>, RpcError> {
+) -> std::result::Result<Vec<ModelContextEntry>, RpcError> {
     match &job.scope {
         CompactionScope::Boundary { .. } => Ok(Vec::new()),
         CompactionScope::MidTurn { .. } => {
-            let Some((_, open_turn)) = job.model_context.split_before_open_turn() else {
+            let Some(open_turn) = job.model_context.open_turn_entries() else {
                 return if matches!(
                     job.model_context.transcript_items(),
                     [TranscriptItem::CompactionSummary(_)]
@@ -530,33 +534,19 @@ pub(crate) fn continuation_suffix_for_scope(
                     ))
                 };
             };
-            let timestamp_ms = now_ms();
-            let mut parent_id = None;
             Ok(open_turn
-                .into_iter()
-                .filter(|entry| matches!(&entry.item, TranscriptItem::UserMessage(_)))
-                .enumerate()
-                .map(|(index, entry)| {
-                    let node = TranscriptStorageNode {
-                        id: format!("entry_{}", uuid::Uuid::new_v4()),
-                        parent_id: parent_id.clone(),
-                        timestamp_ms: timestamp_ms.saturating_add(index as u64),
-                        item: entry.item,
-                        provider_replay: entry.provider_replay,
+                .filter_map(|(item, provider_replay)| {
+                    let TranscriptItem::UserMessage(message) = item else {
+                        return None;
                     };
-                    parent_id = Some(node.id.clone());
-                    node
+                    Some(ModelContextEntry {
+                        item: TranscriptItem::UserMessage(message.clone()),
+                        provider_replay: provider_replay.to_vec(),
+                    })
                 })
                 .collect())
         }
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or_default()
 }
 
 async fn install_runtime_compaction_checkpoint(
@@ -673,11 +663,10 @@ pub(super) async fn recover_model_context_overflow_with_compaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_session::{ModelContext, ModelContextEntry};
+    use agent_session::ModelContext;
     use agent_vocab::{
         ActionId, AssistantItem, AssistantMessage, CompactionSummary, DaemonToolObservation,
-        ProviderKind, ProviderReplayItem, ToolCall, ToolCallId, ToolResultMessage,
-        ToolResultStatus, TurnId, UserMessage,
+        ToolCall, ToolCallId, ToolResultMessage, ToolResultStatus, TurnId, UserMessage,
     };
 
     fn compaction_job(model_context: ModelContext, scope: CompactionScope) -> CompactionJob {
@@ -709,21 +698,6 @@ mod tests {
         }
     }
 
-    fn replay(raw_json: &str) -> ProviderReplayItem {
-        ProviderReplayItem {
-            provider: ProviderKind::Claude,
-            raw_json: raw_json.to_string(),
-            display: None,
-        }
-    }
-
-    fn entry(item: TranscriptItem, provider_replay: Vec<ProviderReplayItem>) -> ModelContextEntry {
-        ModelContextEntry {
-            item,
-            provider_replay,
-        }
-    }
-
     fn tool_call() -> ToolCall {
         ToolCall {
             id: ToolCallId::from_u64(7),
@@ -748,19 +722,12 @@ mod tests {
     }
 
     #[test]
-    fn proactive_mid_turn_compaction_retains_only_user_message_and_sidecar() {
+    fn proactive_mid_turn_compaction_retains_user_message() {
         let user = UserMessage::text("answer with the requested sentinels");
-        let user_replay = replay(r#"{"type":"user_replay"}"#);
         let job = compaction_job(
-            ModelContext::from_entries(vec![
-                entry(
-                    TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                    vec![replay(r#"{"type":"turn_replay"}"#)],
-                ),
-                entry(
-                    TranscriptItem::UserMessage(user.clone()),
-                    vec![user_replay.clone()],
-                ),
+            ModelContext::from_transcript_items(vec![
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage(user.clone()),
             ]),
             mid_turn_scope(),
         );
@@ -769,9 +736,7 @@ mod tests {
 
         assert_eq!(suffix.len(), 1);
         assert_eq!(suffix[0].item, TranscriptItem::UserMessage(user));
-        assert_eq!(suffix[0].provider_replay, vec![user_replay]);
-        assert!(suffix[0].id.starts_with("entry_"));
-        assert_eq!(suffix[0].parent_id, None);
+        assert!(suffix[0].provider_replay.is_empty());
     }
 
     #[test]
@@ -779,55 +744,32 @@ mod tests {
         let tool_call = tool_call();
         let initial = UserMessage::text("initial instruction");
         let steering = UserMessage::text("later steering instruction");
-        let initial_replay = replay(r#"{"type":"initial_user"}"#);
-        let steering_replay = replay(r#"{"type":"steering_user"}"#);
         let job = compaction_job(
-            ModelContext::from_entries(vec![
-                entry(
-                    TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                    Vec::new(),
-                ),
-                entry(
-                    TranscriptItem::UserMessage(initial.clone()),
-                    vec![initial_replay.clone()],
-                ),
-                entry(
-                    TranscriptItem::AssistantMessage(AssistantMessage {
-                        items: vec![AssistantItem::ToolCall(tool_call.clone())],
-                    }),
-                    vec![replay(r#"{"type":"assistant"}"#)],
-                ),
-                entry(
-                    TranscriptItem::ToolCallStarted {
-                        turn_id: TurnId(1),
-                        tool_call: tool_call.clone(),
-                    },
-                    Vec::new(),
-                ),
-                entry(
-                    TranscriptItem::ToolResult(ToolResultMessage {
-                        tool_call_id: tool_call.id.clone(),
-                        tool_name: tool_call.tool_name.clone(),
-                        output: "very large generated output".to_string(),
-                        status: ToolResultStatus::Success,
-                    }),
-                    vec![replay(r#"{"type":"tool_result"}"#)],
-                ),
-                entry(
-                    TranscriptItem::DaemonToolObservation(DaemonToolObservation::new(
-                        ToolCallId::from_u64(8),
-                        "delegate",
-                        "{}",
-                        serde_json::json!({"output": "generated observation"}),
-                        ToolResultStatus::Success,
-                        None,
-                    )),
-                    Vec::new(),
-                ),
-                entry(
-                    TranscriptItem::UserMessage(steering.clone()),
-                    vec![steering_replay.clone()],
-                ),
+            ModelContext::from_transcript_items(vec![
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage(initial.clone()),
+                TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::ToolCall(tool_call.clone())],
+                }),
+                TranscriptItem::ToolCallStarted {
+                    turn_id: TurnId(1),
+                    tool_call: tool_call.clone(),
+                },
+                TranscriptItem::ToolResult(ToolResultMessage {
+                    tool_call_id: tool_call.id.clone(),
+                    tool_name: tool_call.tool_name.clone(),
+                    output: "very large generated output".to_string(),
+                    status: ToolResultStatus::Success,
+                }),
+                TranscriptItem::DaemonToolObservation(DaemonToolObservation::new(
+                    ToolCallId::from_u64(8),
+                    "delegate",
+                    "{}",
+                    serde_json::json!({"output": "generated observation"}),
+                    ToolResultStatus::Success,
+                    None,
+                )),
+                TranscriptItem::UserMessage(steering.clone()),
             ]),
             mid_turn_scope(),
         );
@@ -844,37 +786,25 @@ mod tests {
                 TranscriptItem::UserMessage(steering),
             ]
         );
-        assert_eq!(suffix[0].provider_replay, vec![initial_replay]);
-        assert_eq!(suffix[1].provider_replay, vec![steering_replay]);
-        assert_eq!(suffix[1].parent_id.as_deref(), Some(suffix[0].id.as_str()));
-        assert_eq!(
-            suffix[1].timestamp_ms,
-            suffix[0].timestamp_ms.saturating_add(1)
-        );
+        assert!(suffix.iter().all(|entry| entry.provider_replay.is_empty()));
     }
 
     #[test]
     fn repeated_compaction_reads_users_from_summary_rooted_open_turn() {
         let user = UserMessage::text("instruction retained by the first compaction");
         let job = compaction_job(
-            ModelContext::from_entries(vec![
-                entry(
-                    TranscriptItem::CompactionSummary(CompactionSummary::new(
-                        "session",
-                        "old_leaf",
-                        "first summary",
-                        None,
-                        TurnId(1),
-                    )),
-                    Vec::new(),
-                ),
-                entry(TranscriptItem::UserMessage(user.clone()), Vec::new()),
-                entry(
-                    TranscriptItem::AssistantMessage(AssistantMessage {
-                        items: vec![AssistantItem::Text("generated output".to_string())],
-                    }),
-                    Vec::new(),
-                ),
+            ModelContext::from_transcript_items(vec![
+                TranscriptItem::CompactionSummary(CompactionSummary::new(
+                    "session",
+                    "old_leaf",
+                    "first summary",
+                    None,
+                    TurnId(1),
+                )),
+                TranscriptItem::UserMessage(user.clone()),
+                TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::Text("generated output".to_string())],
+                }),
             ]),
             mid_turn_scope(),
         );
@@ -916,15 +846,15 @@ mod tests {
     #[test]
     fn repeated_successful_recompaction_is_bounded() {
         let state = crate::provider_runtime::CompactionAutoState {
-            last_success_root_id: Some("current-compaction-root".to_string()),
+            last_success_leaf_id: Some("current-compaction-leaf".to_string()),
             consecutive_recompactions: 1,
             ..Default::default()
         };
 
         assert!(recompaction_limit_reached(
             &state,
-            "current-compaction-root"
+            "current-compaction-leaf"
         ));
-        assert!(!recompaction_limit_reached(&state, "older-root"));
+        assert!(!recompaction_limit_reached(&state, "older-leaf"));
     }
 }
