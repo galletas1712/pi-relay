@@ -59,93 +59,6 @@ pub struct AnthropicProvider {
     model_cache: AnthropicModelCache,
 }
 
-fn validate_anthropic_stream_citation(citation: &Value) -> ProviderResult<()> {
-    let citation_type = citation
-        .get("type")
-        .and_then(Value::as_str)
-        .expect("citation type validated");
-    let required_string = |field: &str| -> ProviderResult<()> {
-        citation
-            .get(field)
-            .and_then(Value::as_str)
-            .map(|_| ())
-            .ok_or_else(|| {
-                ProviderError::Provider(format!(
-                    "Anthropic {citation_type} citation missing string {field}"
-                ))
-            })
-    };
-    let required_index = |field: &str| -> ProviderResult<()> {
-        citation
-            .get(field)
-            .and_then(Value::as_u64)
-            .map(|_| ())
-            .ok_or_else(|| {
-                ProviderError::Provider(format!(
-                    "Anthropic {citation_type} citation missing unsigned integer {field}"
-                ))
-            })
-    };
-    let required_nullable_string = |field: &str| -> ProviderResult<()> {
-        if citation
-            .get(field)
-            .is_some_and(|value| matches!(value, Value::Null | Value::String(_)))
-        {
-            Ok(())
-        } else {
-            Err(ProviderError::Provider(format!(
-                "Anthropic {citation_type} citation missing string or null {field}"
-            )))
-        }
-    };
-    required_string("cited_text")?;
-    match citation_type {
-        "web_search_result_location" => {
-            required_string("encrypted_index")?;
-            required_string("url")?;
-            required_nullable_string("title")?;
-        }
-        "char_location" => {
-            for field in ["document_index", "start_char_index", "end_char_index"] {
-                required_index(field)?;
-            }
-            required_nullable_string("document_title")?;
-            required_nullable_string("file_id")?;
-        }
-        "page_location" => {
-            for field in ["document_index", "start_page_number", "end_page_number"] {
-                required_index(field)?;
-            }
-            required_nullable_string("document_title")?;
-            required_nullable_string("file_id")?;
-        }
-        "content_block_location" => {
-            for field in ["document_index", "start_block_index", "end_block_index"] {
-                required_index(field)?;
-            }
-            required_nullable_string("document_title")?;
-            required_nullable_string("file_id")?;
-        }
-        "search_result_location" => {
-            for field in [
-                "search_result_index",
-                "start_block_index",
-                "end_block_index",
-            ] {
-                required_index(field)?;
-            }
-            required_string("source")?;
-            required_nullable_string("title")?;
-        }
-        _ => {
-            return Err(ProviderError::Provider(format!(
-                "Anthropic citations_delta had unsupported citation type {citation_type}"
-            )))
-        }
-    }
-    Ok(())
-}
-
 fn validate_anthropic_hosted_tool_result(block_type: &str, content: &Value) -> ProviderResult<()> {
     match (block_type, content) {
         ("web_search_tool_result", Value::Array(results)) => {
@@ -158,27 +71,11 @@ fn validate_anthropic_hosted_tool_result(block_type: &str, content: &Value) -> P
                             .to_string(),
                     ));
                 }
-                for field in ["title", "url", "encrypted_content"] {
-                    if result.get(field).and_then(Value::as_str).is_none() {
-                        return Err(ProviderError::Provider(format!(
-                            "Anthropic web_search_result missing string {field}"
-                        )));
-                    }
-                }
-                if !result
-                    .get("page_age")
-                    .is_some_and(|value| matches!(value, Value::Null | Value::String(_)))
-                {
-                    return Err(ProviderError::Provider(
-                        "Anthropic web_search_result missing string or null page_age".to_string(),
-                    ));
-                }
             }
         }
         ("web_search_tool_result", Value::Object(_)) => {
             if anthropic_block_type(content, "Anthropic web search result error")?
                 != "web_search_tool_result_error"
-                || content.get("error_code").and_then(Value::as_str).is_none()
             {
                 return Err(ProviderError::Provider(
                     "Anthropic web_search_tool_result contained malformed error".to_string(),
@@ -187,35 +84,7 @@ fn validate_anthropic_hosted_tool_result(block_type: &str, content: &Value) -> P
         }
         ("web_fetch_tool_result", Value::Object(_)) => {
             match anthropic_block_type(content, "Anthropic web fetch result")? {
-                "web_fetch_result" => {
-                    if content.get("url").and_then(Value::as_str).is_none()
-                        || !content.get("content").is_some_and(Value::is_object)
-                        || !content
-                            .get("retrieved_at")
-                            .is_some_and(|value| matches!(value, Value::Null | Value::String(_)))
-                    {
-                        return Err(ProviderError::Provider(
-                            "Anthropic web_fetch_tool_result contained malformed result"
-                                .to_string(),
-                        ));
-                    }
-                    let document = &content["content"];
-                    if document.get("type").and_then(Value::as_str) != Some("document")
-                        || !document.get("source").is_some_and(Value::is_object)
-                        || !document
-                            .get("citations")
-                            .is_some_and(|value| matches!(value, Value::Null | Value::Object(_)))
-                        || !document
-                            .get("title")
-                            .is_some_and(|value| matches!(value, Value::Null | Value::String(_)))
-                    {
-                        return Err(ProviderError::Provider(
-                            "Anthropic web_fetch_result contained malformed document".to_string(),
-                        ));
-                    }
-                }
-                "web_fetch_tool_result_error"
-                    if content.get("error_code").and_then(Value::as_str).is_some() => {}
+                "web_fetch_result" | "web_fetch_tool_result_error" => {}
                 _ => {
                     return Err(ProviderError::Provider(
                         "Anthropic web_fetch_tool_result contained malformed error".to_string(),
@@ -2595,16 +2464,10 @@ impl AnthropicStreamState {
                             "Anthropic citations_delta missing citation object".to_string(),
                         )
                     })?;
-                citation
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .filter(|citation_type| !citation_type.is_empty())
-                    .ok_or_else(|| {
-                        ProviderError::Provider(
-                            "Anthropic citations_delta citation missing nonempty type".to_string(),
-                        )
-                    })?;
-                validate_anthropic_stream_citation(&Value::Object(citation.clone()))?;
+                anthropic_block_type(
+                    &Value::Object(citation.clone()),
+                    "Anthropic citations_delta citation",
+                )?;
                 match block.get_mut("citations") {
                     Some(Value::Array(citations)) => {
                         citations.push(Value::Object(citation.clone()));
@@ -2900,7 +2763,7 @@ fn anthropic_provider_replay_display(block: &Value) -> Option<ReplayDisplay> {
 }
 
 fn anthropic_usage(value: &Value) -> Option<ProviderUsage> {
-    let input_tokens = value
+    let provider_input_tokens = value
         .get("input_tokens")
         .and_then(Value::as_u64)
         .map(|value| value as usize);
@@ -2908,23 +2771,30 @@ fn anthropic_usage(value: &Value) -> Option<ProviderUsage> {
         .get("output_tokens")
         .and_then(Value::as_u64)
         .map(|value| value as usize);
+    let cache_read_input_tokens = value
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let cache_creation_input_tokens = value
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let input_tokens = provider_input_tokens.map(|input| {
+        input
+            .saturating_add(cache_read_input_tokens.unwrap_or_default())
+            .saturating_add(cache_creation_input_tokens.unwrap_or_default())
+    });
     Some(ProviderUsage {
         input_tokens,
         output_tokens,
-        // Anthropic top-level counts explicitly exclude compaction
-        // iterations. Preserve that normalized meaning and retain billable
-        // per-iteration detail only in raw_provider_usage.
+        // Anthropic's top-level input components exclude compaction
+        // iterations. Normalize message input as uncached + cache read +
+        // cache creation, while retaining each provider-native field below.
         total_tokens: input_tokens
             .zip(output_tokens)
             .map(|(input, output)| input.saturating_add(output)),
-        cache_read_input_tokens: value
-            .get("cache_read_input_tokens")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
-        cache_creation_input_tokens: value
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
         raw_provider_usage: Some(value.clone()),
         ..ProviderUsage::default()
     })
@@ -2990,22 +2860,26 @@ fn merge_anthropic_stop_details(
 
 fn merge_anthropic_usage(current: &mut Option<ProviderUsage>, update: ProviderUsage) {
     let current = current.get_or_insert_with(ProviderUsage::default);
-    if update.input_tokens.unwrap_or_default() > 0 {
-        current.input_tokens = update.input_tokens;
-    }
-    if update.output_tokens.is_some() {
-        current.output_tokens = update.output_tokens;
-    }
-    if update.cache_read_input_tokens.unwrap_or_default() > 0 {
-        current.cache_read_input_tokens = update.cache_read_input_tokens;
-    }
-    if update.cache_creation_input_tokens.unwrap_or_default() > 0 {
-        current.cache_creation_input_tokens = update.cache_creation_input_tokens;
-    }
-    current.total_tokens = current
-        .input_tokens
-        .zip(current.output_tokens)
-        .map(|(input, output)| input.saturating_add(output));
+    let previous_raw = current.raw_provider_usage.as_ref();
+    let previous_input_tokens = previous_raw
+        .and_then(|raw| raw.get("input_tokens"))
+        .and_then(Value::as_u64);
+    let previous_cache_read = previous_raw
+        .and_then(|raw| raw.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64);
+    let previous_cache_creation = previous_raw
+        .and_then(|raw| raw.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64);
+    let update_raw = update.raw_provider_usage.as_ref();
+    let update_input_tokens = update_raw
+        .and_then(|raw| raw.get("input_tokens"))
+        .and_then(Value::as_u64);
+    let update_cache_read = update_raw
+        .and_then(|raw| raw.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64);
+    let update_cache_creation = update_raw
+        .and_then(|raw| raw.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64);
     if let Some(update) = update.raw_provider_usage {
         merge_json_object(&mut current.raw_provider_usage, update);
     }
@@ -3014,20 +2888,52 @@ fn merge_anthropic_usage(current: &mut Option<ProviderUsage>, update: ProviderUs
         .as_mut()
         .and_then(Value::as_object_mut)
     {
-        for (key, value) in [
-            ("input_tokens", current.input_tokens),
-            ("output_tokens", current.output_tokens),
-            ("cache_read_input_tokens", current.cache_read_input_tokens),
+        for (key, previous, update) in [
+            ("input_tokens", previous_input_tokens, update_input_tokens),
+            (
+                "cache_read_input_tokens",
+                previous_cache_read,
+                update_cache_read,
+            ),
             (
                 "cache_creation_input_tokens",
-                current.cache_creation_input_tokens,
+                previous_cache_creation,
+                update_cache_creation,
             ),
         ] {
-            if let Some(value) = value {
-                raw.insert(key.to_string(), json!(value));
+            // Input accounting is cumulative across stream fragments. A zero
+            // in a later delta does not erase a nonzero component reported at
+            // message_start; a present nonzero value replaces the old value.
+            if update == Some(0) && previous.is_some_and(|value| value > 0) {
+                raw.insert(key.to_string(), json!(previous.expect("checked")));
             }
         }
+        let provider_input_tokens = raw
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        current.output_tokens = raw
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        current.cache_read_input_tokens = raw
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        current.cache_creation_input_tokens = raw
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        current.input_tokens = provider_input_tokens.map(|input| {
+            input
+                .saturating_add(current.cache_read_input_tokens.unwrap_or_default())
+                .saturating_add(current.cache_creation_input_tokens.unwrap_or_default())
+        });
     }
+    current.total_tokens = current
+        .input_tokens
+        .zip(current.output_tokens)
+        .map(|(input, output)| input.saturating_add(output));
 }
 
 fn merge_json_object(current: &mut Option<Value>, update: Value) {
@@ -5564,9 +5470,9 @@ data: {"type":"message_stop"}
         }))
         .expect("usage should be parsed");
 
-        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.input_tokens, Some(200));
         assert_eq!(usage.output_tokens, Some(20));
-        assert_eq!(usage.total_tokens, Some(120));
+        assert_eq!(usage.total_tokens, Some(220));
         assert_eq!(usage.cache_read_input_tokens, Some(75));
         assert_eq!(usage.cache_creation_input_tokens, Some(25));
         assert_eq!(
@@ -6281,8 +6187,9 @@ data: {"type":"content_block_start","index":2,"content_block":{"type":"text","te
         );
         assert_eq!(response.provider_replay.len(), 2);
         let usage = response.usage.expect("usage should be parsed");
-        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.input_tokens, Some(200));
         assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.total_tokens, Some(220));
         assert_eq!(usage.cache_read_input_tokens, Some(75));
         assert_eq!(usage.cache_creation_input_tokens, Some(25));
         assert_eq!(response.stop_reason, ModelStopReason::Complete);
@@ -6315,9 +6222,9 @@ data: {"type":"message_stop"}
 
         assert_eq!(response.assistant.text(), "still streaming");
         assert_eq!(response.stop_reason, ModelStopReason::Complete);
-        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.input_tokens, Some(155));
         assert_eq!(usage.output_tokens, Some(10));
-        assert_eq!(usage.total_tokens, Some(110));
+        assert_eq!(usage.total_tokens, Some(165));
         assert_eq!(usage.cache_read_input_tokens, Some(40));
         assert_eq!(usage.cache_creation_input_tokens, Some(15));
         assert_eq!(
@@ -6326,6 +6233,27 @@ data: {"type":"message_stop"}
                 .as_ref()
                 .and_then(|usage| usage.get("output_tokens")),
             Some(&json!(10))
+        );
+        assert_eq!(
+            usage
+                .raw_provider_usage
+                .as_ref()
+                .and_then(|usage| usage.get("input_tokens")),
+            Some(&json!(100))
+        );
+        assert_eq!(
+            usage
+                .raw_provider_usage
+                .as_ref()
+                .and_then(|usage| usage.get("cache_read_input_tokens")),
+            Some(&json!(40))
+        );
+        assert_eq!(
+            usage
+                .raw_provider_usage
+                .as_ref()
+                .and_then(|usage| usage.get("cache_creation_input_tokens")),
+            Some(&json!(15))
         );
     }
 
@@ -6384,6 +6312,123 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn anthropic_sse_preserves_omitted_optional_hosted_and_citation_metadata() {
+        let search_result = json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_search",
+            "content": [{
+                "type": "web_search_result",
+                "title": "Rust",
+                "url": "https://www.rust-lang.org",
+                "encrypted_content": "opaque",
+                "provider_extension": { "exact": true },
+            }],
+        });
+        let fetch_result = json!({
+            "type": "web_fetch_tool_result",
+            "tool_use_id": "srvtoolu_fetch",
+            "content": {
+                "type": "web_fetch_result",
+                "url": "https://www.rust-lang.org",
+                "content": {
+                    "type": "document",
+                    "source": {
+                        "type": "text",
+                        "media_type": "text/plain",
+                        "data": "Rust",
+                    },
+                },
+                "provider_extension": ["preserved"],
+            },
+        });
+        let web_citation = json!({
+            "type": "web_search_result_location",
+            "cited_text": "Rust",
+            "encrypted_index": "opaque-index",
+            "url": "https://www.rust-lang.org",
+        });
+        let document_citation = json!({
+            "type": "char_location",
+            "cited_text": "Rust",
+            "document_index": 0,
+            "start_char_index": 0,
+            "end_char_index": 4,
+            "provider_extension": { "opaque": true },
+        });
+        let text = json!({
+            "type": "text",
+            "text": "Rust",
+            "citations": [web_citation, document_citation],
+        });
+        let events = vec![
+            json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "content": [] },
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": search_result,
+            }),
+            json!({ "type": "content_block_stop", "index": 0 }),
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": fetch_result,
+            }),
+            json!({ "type": "content_block_stop", "index": 1 }),
+            json!({
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": { "type": "text", "text": "" },
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": { "type": "text_delta", "text": "Rust" },
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {
+                    "type": "citations_delta",
+                    "citation": web_citation,
+                },
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {
+                    "type": "citations_delta",
+                    "citation": document_citation,
+                },
+            }),
+            json!({ "type": "content_block_stop", "index": 2 }),
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+            }),
+            json!({ "type": "message_stop" }),
+        ];
+        let sse = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+
+        let response =
+            parse_anthropic_sse(&sse).expect("omitted optional passive metadata remains valid");
+        let replay = response
+            .provider_replay
+            .iter()
+            .map(ProviderReplayItem::raw_value)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("replay remains valid JSON");
+
+        assert_eq!(response.assistant.text(), "Rust");
+        assert_eq!(replay, vec![search_result, fetch_result, text]);
+    }
+
+    #[test]
     fn anthropic_sse_rejects_malformed_known_content_sequences_and_huge_indices() {
         let cases = [
             (
@@ -6430,22 +6475,6 @@ data: {"type":"message_stop"}
                         "type": "web_search_tool_result",
                         "tool_use_id": "srvtoolu_1",
                         "content": "invalid",
-                    },
-                })],
-            ),
-            (
-                "hosted result missing encrypted content",
-                vec![json!({
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {
-                        "type": "web_search_tool_result",
-                        "tool_use_id": "srvtoolu_1",
-                        "content": [{
-                            "type": "web_search_result",
-                            "title": "Rust",
-                            "url": "https://www.rust-lang.org",
-                        }],
                     },
                 })],
             ),
@@ -6518,29 +6547,6 @@ data: {"type":"message_stop"}
                         "type": "content_block_start",
                         "index": 0,
                         "content_block": { "type": "text", "text": "" },
-                    }),
-                ],
-            ),
-            (
-                "citation delta missing required title",
-                vec![
-                    json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": { "type": "text", "text": "" },
-                    }),
-                    json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {
-                            "type": "citations_delta",
-                            "citation": {
-                                "type": "web_search_result_location",
-                                "cited_text": "Rust",
-                                "encrypted_index": "opaque",
-                                "url": "https://www.rust-lang.org",
-                            },
-                        },
                     }),
                 ],
             ),

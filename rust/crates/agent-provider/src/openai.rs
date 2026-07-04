@@ -467,6 +467,48 @@ fn classify_openai_ordinary_item(
     Ok(class)
 }
 
+fn validate_openai_added_item_policy(item_type: &str, item: &Value) -> ProviderResult<()> {
+    let class = if item_type == "tool_search_call"
+        && item.get("execution").and_then(Value::as_str).is_none()
+    {
+        // Added items may be partial. The matching done item must provide the
+        // execution mode needed to distinguish hosted from client execution.
+        OpenAiOrdinaryItemClass::HostedOrPassive
+    } else {
+        classify_openai_ordinary_item(item_type, item)?
+    };
+    if class == OpenAiOrdinaryItemClass::ClientExecuted {
+        return Err(ProviderError::Provider(format!(
+            "OpenAI returned unsupported client-executed action type {item_type}"
+        )));
+    }
+    Ok(())
+}
+
+fn reconcile_openai_added_item(index: usize, added: &Value, done: &Value) -> ProviderResult<()> {
+    let added_type = openai_replay_item_type(added, "OpenAI added output item")?;
+    let done_type = openai_replay_item_type(done, "OpenAI completed output item")?;
+    if done_type != added_type {
+        return Err(ProviderError::Provider(format!(
+            "OpenAI output item type changed at output_index {index}: added {added_type}, done {done_type}"
+        )));
+    }
+    for field in ["id", "call_id"] {
+        if let Some(added_id) = added
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            if done.get(field).and_then(Value::as_str) != Some(added_id) {
+                return Err(ProviderError::Provider(format!(
+                    "OpenAI output item {field} changed at output_index {index}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn response_daemon_tool_call_item(observation: &agent_vocab::DaemonToolObservation) -> Value {
     let call_id = openai_daemon_observation_call_id(observation);
     json!({
@@ -1298,6 +1340,7 @@ fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<Mod
 
 struct ResponsesStreamState {
     provider: ProviderKind,
+    added_items: BTreeMap<usize, Value>,
     output_items: BTreeMap<usize, Value>,
     usage: Option<ProviderUsage>,
     completed: bool,
@@ -1307,6 +1350,7 @@ impl ResponsesStreamState {
     fn new(provider: ProviderKind) -> Self {
         Self {
             provider,
+            added_items: BTreeMap::new(),
             output_items: BTreeMap::new(),
             usage: None,
             completed: false,
@@ -1360,6 +1404,124 @@ impl ResponsesStreamState {
         Ok(())
     }
 
+    fn output_item_event<'a>(
+        event: &'a Value,
+        event_type: &str,
+    ) -> ProviderResult<(usize, &'a Value, &'a str)> {
+        let index = event
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or_else(|| {
+                ProviderError::Provider(format!("OpenAI {event_type} missing valid output_index"))
+            })?;
+        let item = event
+            .get("item")
+            .ok_or_else(|| ProviderError::Provider(format!("OpenAI {event_type} missing item")))?;
+        let item_type = openai_replay_item_type(item, &format!("OpenAI {event_type} item"))?;
+        Ok((index, item, item_type))
+    }
+
+    fn record_added_item(&mut self, event: &Value) -> ProviderResult<()> {
+        let (index, item, item_type) =
+            Self::output_item_event(event, "response.output_item.added")?;
+        validate_openai_added_item_policy(item_type, item)?;
+        if self
+            .output_items
+            .keys()
+            .any(|done_index| !self.added_items.contains_key(done_index))
+        {
+            return Err(ProviderError::Provider(
+                "OpenAI response.output_item.added arrived after an unreconciled done-only item"
+                    .to_string(),
+            ));
+        }
+        if self.added_items.insert(index, item.clone()).is_some() {
+            return Err(ProviderError::Provider(format!(
+                "OpenAI response.output_item.added duplicated output_index {index}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn record_done_item(&mut self, event: &Value) -> ProviderResult<()> {
+        let (index, item, _) = Self::output_item_event(event, "response.output_item.done")?;
+        if !self.added_items.is_empty() {
+            let added_item = self.added_items.get(&index).ok_or_else(|| {
+                ProviderError::Provider(format!(
+                    "OpenAI response.output_item.done at output_index {index} had no matching added item"
+                ))
+            })?;
+            reconcile_openai_added_item(index, added_item, item)?;
+        }
+        if self.output_items.insert(index, item.clone()).is_some() {
+            return Err(ProviderError::Provider(format!(
+                "OpenAI response.output_item.done duplicated output_index {index}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn reconcile_added_items(&self) -> ProviderResult<()> {
+        if self.added_items.is_empty() {
+            return Ok(());
+        }
+        for (index, added_item) in &self.added_items {
+            let done_item = self.output_items.get(index).ok_or_else(|| {
+                ProviderError::Provider(format!(
+                    "OpenAI response completed with pending output item at output_index {index}"
+                ))
+            })?;
+            reconcile_openai_added_item(*index, added_item, done_item)?;
+        }
+        if let Some(index) = self
+            .output_items
+            .keys()
+            .find(|index| !self.added_items.contains_key(index))
+        {
+            return Err(ProviderError::Provider(format!(
+                "OpenAI done output item at output_index {index} had no matching added item"
+            )));
+        }
+        Ok(())
+    }
+
+    fn reconcile_terminal_output(&mut self, output: &Value) -> ProviderResult<()> {
+        let output = output.as_array().ok_or_else(|| {
+            ProviderError::Provider(
+                "OpenAI response.completed response.output was not an array".to_string(),
+            )
+        })?;
+        let mut terminal_items = BTreeMap::new();
+        for (index, item) in output.iter().enumerate() {
+            let item_type = openai_replay_item_type(item, "OpenAI response.completed output item")?;
+            validate_openai_ordinary_item_policy(item_type, item)?;
+            terminal_items.insert(index, item.clone());
+        }
+        for (index, done_item) in &self.output_items {
+            let terminal_item = terminal_items.get(index).ok_or_else(|| {
+                ProviderError::Provider(format!(
+                    "OpenAI response.completed output omitted done item at output_index {index}"
+                ))
+            })?;
+            if terminal_item != done_item {
+                return Err(ProviderError::Provider(format!(
+                    "OpenAI response.completed output mismatched done item at output_index {index}"
+                )));
+            }
+        }
+        if let Some(index) = terminal_items
+            .keys()
+            .find(|index| !self.output_items.contains_key(index))
+        {
+            return Err(ProviderError::Provider(format!(
+                "OpenAI response.completed output contained item without matching done event at output_index {index}"
+            )));
+        }
+        self.output_items = terminal_items;
+        Ok(())
+    }
+
     fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
         match event {
             SseEvent::Json(event) => self.process_event(&event),
@@ -1372,27 +1534,12 @@ impl ResponsesStreamState {
 
     fn process_event(&mut self, event: &Value) -> ProviderResult<SseControl> {
         match event.get("type").and_then(Value::as_str) {
+            Some("response.output_item.added") => {
+                self.record_added_item(event)?;
+                Ok(SseControl::Continue)
+            }
             Some("response.output_item.done") => {
-                let index = event
-                    .get("output_index")
-                    .and_then(Value::as_u64)
-                    .and_then(|index| usize::try_from(index).ok())
-                    .ok_or_else(|| {
-                        ProviderError::Provider(
-                            "OpenAI response.output_item.done missing valid output_index"
-                                .to_string(),
-                        )
-                    })?;
-                let item = event.get("item").ok_or_else(|| {
-                    ProviderError::Provider(
-                        "OpenAI response.output_item.done missing item".to_string(),
-                    )
-                })?;
-                if self.output_items.insert(index, item.clone()).is_some() {
-                    return Err(ProviderError::Provider(format!(
-                        "OpenAI response.output_item.done duplicated output_index {index}"
-                    )));
-                }
+                self.record_done_item(event)?;
                 Ok(SseControl::Continue)
             }
             Some("response.failed") => {
@@ -1447,7 +1594,11 @@ impl ResponsesStreamState {
                         )));
                     }
                 }
+                self.reconcile_added_items()?;
                 self.validate_output_indices()?;
+                if let Some(output) = response.get("output") {
+                    self.reconcile_terminal_output(output)?;
+                }
                 self.usage = response.get("usage").and_then(openai_usage);
                 self.completed = true;
                 Ok(SseControl::Stop)
@@ -2954,6 +3105,267 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     }
 
     #[test]
+    fn responses_sse_requires_added_client_action_to_finish() {
+        let sse = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"read"}}
+
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}
+"#;
+
+        let error = parse_responses_sse(sse, ProviderKind::OpenAi)
+            .expect_err("an added client action cannot disappear");
+        assert!(error.to_string().contains("pending"), "{error}");
+    }
+
+    #[test]
+    fn responses_sse_requires_added_hosted_item_to_finish() {
+        let sse = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}
+
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}
+"#;
+
+        let error = parse_responses_sse(sse, ProviderKind::OpenAi)
+            .expect_err("an added hosted item cannot disappear");
+        assert!(error.to_string().contains("pending"), "{error}");
+    }
+
+    #[test]
+    fn responses_sse_rejects_malformed_duplicate_and_incoherent_added_lifecycles() {
+        let cases = [
+            (
+                "missing added index",
+                vec![
+                    json!({
+                        "type": "response.output_item.added",
+                        "item": { "type": "reasoning" },
+                    }),
+                    json!({
+                        "type": "response.completed",
+                        "response": { "id": "resp_1" },
+                    }),
+                ],
+            ),
+            (
+                "unknown added type",
+                vec![
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": { "type": "future_action" },
+                    }),
+                    json!({
+                        "type": "response.completed",
+                        "response": { "id": "resp_1" },
+                    }),
+                ],
+            ),
+            (
+                "duplicate added index",
+                vec![
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": { "type": "reasoning" },
+                    }),
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": { "type": "reasoning" },
+                    }),
+                ],
+            ),
+            (
+                "done without matching added",
+                vec![
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": { "type": "reasoning" },
+                    }),
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 1,
+                        "item": { "type": "reasoning" },
+                    }),
+                ],
+            ),
+            (
+                "added done type mismatch",
+                vec![
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": { "type": "reasoning" },
+                    }),
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    }),
+                ],
+            ),
+            (
+                "added done call id mismatch",
+                vec![
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "read",
+                        },
+                    }),
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "call_id": "call_2",
+                            "name": "read",
+                            "arguments": "{}",
+                        },
+                    }),
+                ],
+            ),
+        ];
+
+        for (name, events) in cases {
+            let sse = events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            assert!(
+                parse_responses_sse(&sse, ProviderKind::OpenAi).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_sse_rejects_terminal_only_client_action() {
+        let call = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read",
+            "arguments": "{\"path\":\"README.md\"}",
+        });
+        let sse = format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [call],
+                },
+            })
+        );
+
+        let error = parse_responses_sse(&sse, ProviderKind::OpenAi)
+            .expect_err("terminal output cannot invent an unobserved client action");
+        assert!(error.to_string().contains("matching done"), "{error}");
+    }
+
+    #[test]
+    fn responses_sse_reconciles_matching_added_done_and_terminal_output() {
+        let added = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read",
+        });
+        let done = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read",
+            "arguments": "{\"path\":\"README.md\"}",
+        });
+        let sse = [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": added,
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": done,
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [done],
+                },
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+
+        let response =
+            parse_responses_sse(&sse, ProviderKind::OpenAi).expect("lifecycle reconciles");
+        let calls = response.assistant.tool_calls().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_str(), "call_1");
+        assert_eq!(response.provider_replay.len(), 1);
+        assert_eq!(response.provider_replay[0].raw_value().unwrap(), done);
+    }
+
+    #[test]
+    fn responses_sse_rejects_terminal_output_reconciliation_mismatch() {
+        let done = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "done" }],
+        });
+        let terminal = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "different" }],
+        });
+        let sse = [
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": done,
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [terminal],
+                },
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+
+        let error = parse_responses_sse(&sse, ProviderKind::OpenAi)
+            .expect_err("terminal output must match done items");
+        assert!(error.to_string().contains("mismatched"), "{error}");
+    }
+
+    #[test]
+    fn responses_sse_accepts_private_minimal_completion_without_output() {
+        let response = parse_responses_sse(
+            r#"data: {"type":"response.completed","response":{"id":"resp_1"}}
+"#,
+            ProviderKind::OpenAi,
+        )
+        .expect("private minimal completion remains valid");
+
+        assert!(response.assistant.items.is_empty());
+        assert!(response.provider_replay.is_empty());
+    }
+
+    #[test]
     fn responses_sse_orders_output_by_output_index_not_event_arrival() {
         let message = json!({
             "type": "message",
@@ -3317,6 +3729,8 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
             "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\"}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":7}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":{}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[7]}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":\n",
         ] {
             assert!(

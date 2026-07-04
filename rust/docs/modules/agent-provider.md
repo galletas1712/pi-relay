@@ -39,7 +39,7 @@ It does **not** own auth acquisition/refresh, retry loops, compaction policy, or
 
 `ProviderCompactionRequest` / `ProviderCompactionResponse`, `ProviderTokenCountRequest` / `ProviderTokenCountResponse` mirror the same prompt/transcript/tool inputs for the non-`complete` methods. Compaction requests also carry optional provider-native custom instructions; token-count responses can retain provider-reported original input occupancy.
 
-`ProviderUsage` carries token counts (`input`, `output`, `total`, `cache_read_input_tokens`, `cache_creation_input_tokens`), provider-neutral raw provider usage JSON, and OpenAI debug metadata lifted off response headers (`upstream_request_id`, `cf_ray`, `server_model`, `codex_turn_state`, `reasoning_included`).
+`ProviderUsage` carries token counts (`input`, `output`, `total`, `cache_read_input_tokens`, `cache_creation_input_tokens`), provider-native merged usage fields, and OpenAI debug metadata lifted off response headers (`upstream_request_id`, `cf_ray`, `server_model`, `codex_turn_state`, `reasoning_included`).
 
 `ProviderError` variants: `Http`, `Timeout`, `Transient`, `Provider`,
 `Status { status, message }`, `Incomplete { status, reason }`, `Json`, and typed
@@ -209,7 +209,14 @@ The Anthropic compaction block is stored as opaque provider replay on the new `C
 
 Subsequent Messages and token-count requests replay the complete block unchanged as an assistant message; the synthetic user summary follows it and carries pi-relay's generic checkpoint label plus the daemon's fresh delegation ledger. Rendering prepares the body and required beta header together, so replay is not rescanned for headers. The two request types intentionally use different strategy shapes. Ordinary Messages sets `trigger = { type: "input_tokens", value: <resolved model max_input_tokens> }` (clamped to the documented 50K minimum) plus `pause_after_compaction = true`. Anthropic documents only the 50K minimum, so the exact model ceiling is schema-valid. A paid production Sonnet 5 automatic E2E accepted this replay shape, resumed the same blocked model action after one native checkpoint, returned the exact requested sentinel JSON, and reduced the effective count from the 541,564-token gate to 15,628 tokens. This proves the tested continuation path, not provider-generated inline compaction during an ordinary response. Anthropic has no documented apply-only mode, so the paused ceiling trigger plus fail-closed parsing is required to protect durable state while pi-relay schedules normal replacement checkpoints at its lower threshold. A model with no safely resolved input ceiling fails replay request construction locally. Token counting retains the live-proven bare `[{ "type": "compact_20260112" }]` edit because Anthropic documents that counting applies existing blocks but does not trigger new compactions. Any compaction block, delta, or compaction stop returned by an ordinary Messages call—including non-paused compaction followed by text/tool use and paused/null/malformed forms—is rejected at the provider parser boundary and cannot become successful persistable replay. Ordinary pre-compaction calls include neither the compaction beta nor the edit. Token counting uses returned `input_tokens` as effective occupancy and retains `context_management.original_input_tokens` as diagnostics.
 
-`ProviderUsage` keeps normalized top-level counts and `raw_provider_usage`. For Anthropic, normalized totals use only top-level message counts because those exclude compaction iterations. The raw object retains `usage.iterations`, nested cache-creation TTL fields, and `output_tokens_details.thinking_tokens` for billing/audit without double counting.
+`ProviderUsage` keeps normalized counts and provider-native merged usage fields
+in `raw_provider_usage`. For Anthropic, normalized input is raw
+`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`, and
+normalized total adds output tokens. Compaction iterations remain excluded from
+those normalized message totals. The raw fields retain the unaggregated input
+components, `usage.iterations`, nested cache-creation TTL fields, and
+`output_tokens_details.thinking_tokens` for billing/audit without double
+counting.
 
 ### Streaming, timeouts, and tool naming
 
@@ -218,13 +225,16 @@ Subsequent Messages and token-count requests replay the complete block unchanged
 reports `[DONE]` and malformed JSON frames to the adapter. Ordinary OpenAI
 success requires `response.completed`; `response.incomplete` is a typed
 non-success retaining status/reason, and refusal content produces a refusal
-terminal that discards partial assistant output/replay. Completed output items
-must carry unique, contiguous `output_index` values and are materialized in that
-provider order rather than event-arrival order. Known messages and content
-parts are shape-validated. Supported `function_call`/`custom_tool_call` items
-become pi-relay tool calls; unsupported client actions and arbitrary unknown
-output item types fail closed. Known hosted/passive item types remain opaque
-replay.
+terminal that discards partial assistant output/replay. Output-item `added`
+events, when present, must be followed by matching `done` events at the same
+unique index and type; no item may remain pending at the terminal. Done-only
+private streams remain compatible. Terminal `response.output`, when present,
+must exactly reconcile with the done-item map. Completed output indices are
+contiguous and materialized in provider order rather than event-arrival order.
+Known messages and content parts are shape-validated. Supported
+`function_call`/`custom_tool_call` items become pi-relay tool calls; unsupported
+client actions and arbitrary unknown output item types fail closed. Known
+hosted/passive item types remain opaque replay.
 
 Ordinary Anthropic success requires `message_stop` after one or more
 `message_delta` events eventually provide an explicit `end_turn`,

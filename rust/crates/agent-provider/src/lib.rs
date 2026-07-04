@@ -336,9 +336,10 @@ pub struct ProviderUsage {
     pub total_tokens: Option<usize>,
     pub cache_read_input_tokens: Option<usize>,
     pub cache_creation_input_tokens: Option<usize>,
-    /// Unmodified provider usage object. This retains provider-specific
+    /// Provider-native merged usage fields. This retains provider-specific
     /// accounting such as Anthropic compaction iterations, cache TTL detail,
-    /// and thinking-token detail without making normalized totals ambiguous.
+    /// and thinking-token detail without replacing raw counters with
+    /// normalized aggregates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_provider_usage: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
