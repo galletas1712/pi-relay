@@ -1580,7 +1580,7 @@ fn emitted_anthropic_replay(
     entry: &ModelTranscriptEntry,
     compaction_summary: bool,
 ) -> ProviderResult<(Vec<Value>, bool)> {
-    let mut blocks = entry
+    let blocks = entry
         .provider_replay
         .iter()
         .filter(|record| record.provider == ProviderKind::Claude)
@@ -1603,7 +1603,7 @@ fn emitted_anthropic_replay(
     }
 
     let mut has_compaction = false;
-    for block in &mut blocks {
+    for block in &blocks {
         if block.get("type").and_then(Value::as_str) == Some("compaction") {
             validate_anthropic_compaction_block(block).map_err(|error| {
                 ProviderError::Provider(format!(
@@ -1612,9 +1612,6 @@ fn emitted_anthropic_replay(
                 ))
             })?;
             has_compaction = true;
-        } else {
-            *block =
-                crate::canonical_provider_replay_value(std::mem::take(block), ProviderKind::Claude);
         }
     }
     Ok((blocks, has_compaction))
@@ -1998,6 +1995,7 @@ struct AnthropicStreamState {
     usage: Option<ProviderUsage>,
     stop_reason: ModelStopReason,
     stop_details: Option<ModelStopDetails>,
+    message_stopped: bool,
 }
 
 impl Default for AnthropicStreamState {
@@ -2009,6 +2007,7 @@ impl Default for AnthropicStreamState {
             usage: None,
             stop_reason: ModelStopReason::Complete,
             stop_details: None,
+            message_stopped: false,
         }
     }
 }
@@ -2017,8 +2016,10 @@ impl AnthropicStreamState {
     fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
         match event {
             SseEvent::Json(event) => self.process_event(&event),
-            SseEvent::MalformedJson => Ok(SseControl::Continue),
-            SseEvent::Done => Ok(SseControl::Stop),
+            SseEvent::MalformedJson => Err(ProviderError::Provider(
+                "Anthropic response stream contained malformed JSON event data".to_string(),
+            )),
+            SseEvent::Done => Ok(SseControl::Continue),
         }
     }
 
@@ -2076,7 +2077,10 @@ impl AnthropicStreamState {
                 }
                 Ok(SseControl::Continue)
             }
-            Some("message_stop") => Ok(SseControl::Stop),
+            Some("message_stop") => {
+                self.message_stopped = true;
+                Ok(SseControl::Stop)
+            }
             Some("error") => {
                 let error_type = event.pointer("/error/type").and_then(Value::as_str);
                 let message = anthropic_error_message(
@@ -2138,6 +2142,11 @@ impl AnthropicStreamState {
     }
 
     fn finish(mut self) -> ProviderResult<ModelResponse> {
+        if !self.message_stopped {
+            return Err(ProviderError::Provider(
+                "Anthropic response stream ended before message_stop".to_string(),
+            ));
+        }
         if self.stop_reason == ModelStopReason::Refusal {
             // Anthropic can classify a Fable response after streaming partial
             // text, thinking, or tool blocks. The entire partial attempt is
@@ -5653,7 +5662,7 @@ data: {"type":"content_block_start","index":2,"content_block":{"type":"text","te
     }
 
     #[test]
-    fn anthropic_sse_maps_max_tokens_stop_reason_and_done_sentinel() {
+    fn anthropic_sse_maps_max_tokens_after_required_message_stop() {
         let sse = r#"
 data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-7","content":[],"stop_reason":null,"usage":{"input_tokens":8,"output_tokens":1}}}
 
@@ -5665,7 +5674,7 @@ data: {"type":"content_block_stop","index":0}
 
 data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":64}}
 
-data: [DONE]
+data: {"type":"message_stop"}
 
 data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":"ignored"}}
 "#;
@@ -5677,6 +5686,45 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
         assert_eq!(response.stop_reason, ModelStopReason::MaxOutputTokens);
         assert_eq!(usage.input_tokens, Some(8));
         assert_eq!(usage.output_tokens, Some(64));
+    }
+
+    #[test]
+    fn anthropic_sse_requires_message_stop_not_done_or_eof() {
+        let prefix = r#"
+data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
+
+data: {"type":"content_block_stop","index":0}
+"#;
+        for (name, suffix) in [("EOF", ""), ("done sentinel", "\ndata: [DONE]\n\n")] {
+            let error = parse_anthropic_sse(&format!("{prefix}{suffix}")).expect_err(name);
+            assert!(error.to_string().contains("before message_stop"), "{name}");
+        }
+        assert!(parse_anthropic_sse(
+            "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {not-json}\n\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn anthropic_sse_tolerates_unknown_events_before_message_stop() {
+        let response = parse_anthropic_sse(
+            r#"
+data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
+
+data: {"type":"future_progress","opaque":{"value":1}}
+
+data: {"type":"ping"}
+
+data: {"type":"message_stop"}
+"#,
+        )
+        .expect("unknown nonterminal event is forward compatible");
+
+        assert_eq!(response.stop_reason, ModelStopReason::Complete);
     }
 
     #[test]
@@ -5788,6 +5836,32 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
             &[ModelTranscriptEntry {
                 item: TranscriptItem::AssistantMessage(AssistantMessage {
                     items: vec![AssistantItem::Text("visible".to_string())],
+                }),
+                provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
+            }],
+        )
+        .expect("messages render");
+
+        assert_eq!(messages[0]["content"], json!([raw]));
+    }
+
+    #[test]
+    fn anthropic_serializer_preserves_raw_replay_tool_names() {
+        let raw = json!({
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "str_replace_based_edit_tool",
+            "input": { "path": "README.md" },
+        });
+        let messages = transcript_to_messages(
+            &crate::PromptSections::default(),
+            &[ModelTranscriptEntry {
+                item: TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::ToolCall(ToolCall {
+                        id: ToolCallId::new("toolu_1"),
+                        tool_name: "Edit".to_string(),
+                        args_json: r#"{"path":"README.md"}"#.to_string(),
+                    })],
                 }),
                 provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
             }],

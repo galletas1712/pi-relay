@@ -20,14 +20,12 @@ use uuid::Uuid;
 #[cfg(test)]
 use crate::sse::read_json_sse_text;
 use crate::{
-    common::{
-        compaction_summary_text, ensure_success, push_text_item, response_excerpt, response_text,
-    },
+    common::{ensure_success, push_text_item, response_excerpt, response_text},
     http::send_provider_generation_request,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
-    ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
-    ProviderCompactionRequest, ProviderCompactionResponse, ProviderError, ProviderResult,
-    ProviderToolProfile, ProviderUsage,
+    ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
+    ModelTranscriptEntry, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
+    ProviderResult, ProviderToolProfile, ProviderUsage,
 };
 
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
@@ -257,23 +255,20 @@ fn parse_compact_response(text: &str) -> ProviderResult<ProviderCompactionRespon
             ProviderError::Provider("OpenAI compact response missing output array".to_string())
         })?;
 
-    let mut provider_replay = Vec::new();
+    if output.is_empty() {
+        return Err(ProviderError::Provider(
+            "OpenAI compact response had an empty output array".to_string(),
+        ));
+    }
+
     let mut has_compaction = false;
     let mut summary_parts = Vec::new();
     for item in output {
-        if keep_compact_output_item(item) {
-            if is_compaction_item(item) {
-                has_compaction = true;
-            }
-            collect_compact_summary_text(item, &mut summary_parts);
-            provider_replay.push(ProviderReplayItem::new(ProviderKind::OpenAi, item)?);
+        if is_openai_compaction_item(item) {
+            validate_openai_compaction_item(item)?;
+            has_compaction = true;
         }
-    }
-
-    if provider_replay.is_empty() {
-        return Err(ProviderError::Provider(
-            "OpenAI compact response had no usable replacement history".to_string(),
-        ));
+        collect_compact_summary_text(item, &mut summary_parts);
     }
     if !has_compaction {
         return Err(ProviderError::Provider(format!(
@@ -283,6 +278,12 @@ fn parse_compact_response(text: &str) -> ProviderResult<ProviderCompactionRespon
     }
 
     let summary = summary_parts.join("").trim().to_string();
+    let provider_replay = output
+        .iter()
+        .map(|item| {
+            ProviderReplayItem::new(ProviderKind::OpenAi, item).map_err(ProviderError::Json)
+        })
+        .collect::<ProviderResult<Vec<_>>>()?;
     Ok(ProviderCompactionResponse {
         summary: (!summary.is_empty()).then_some(summary),
         provider_replay,
@@ -314,46 +315,23 @@ fn compact_output_type_summary(output: &[Value]) -> String {
     }
 }
 
-// Codex's wire type for the opaque encrypted summary item has shifted over
-// time. The current backend emits `compaction_summary`; older builds emitted
-// `compaction`. Codex CLI's own `ResponseItem::Compaction` variant aliases
-// both (see `~/codex/codex-rs/protocol/src/models.rs`), so we accept either.
-fn is_compaction_item(item: &Value) -> bool {
+fn is_openai_compaction_item(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
-        Some("compaction") | Some("compaction_summary")
+        Some("compaction" | "compaction_summary")
     )
 }
 
-fn keep_compact_output_item(item: &Value) -> bool {
-    if is_compaction_item(item) {
-        return true;
+fn validate_openai_compaction_item(item: &Value) -> ProviderResult<()> {
+    match item.get("encrypted_content") {
+        Some(Value::String(_)) => Ok(()),
+        Some(_) => Err(ProviderError::Provider(
+            "OpenAI compaction item encrypted_content was not a string".to_string(),
+        )),
+        None => Err(ProviderError::Provider(
+            "OpenAI compaction item missing encrypted_content".to_string(),
+        )),
     }
-    match item.get("type").and_then(Value::as_str) {
-        Some("message") => match item.get("role").and_then(Value::as_str) {
-            Some("assistant") => true,
-            Some("user") => compact_user_message_is_real(item),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-fn compact_user_message_is_real(item: &Value) -> bool {
-    let text = message_text(item).trim().to_string();
-    if text.is_empty() {
-        return false;
-    }
-    !is_synthetic_compact_user_text(&text)
-}
-
-fn is_synthetic_compact_user_text(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.starts_with("starting working directory for this session:")
-        || lower.starts_with("current working directory:")
-        || lower.contains("the bash tool runs each command in a fresh shell rooted here")
-        || lower.starts_with("the conversation history before this point was compacted")
-        || lower.starts_with("x-anthropic-billing-header:")
 }
 
 fn collect_compact_summary_text(item: &Value, summary_parts: &mut Vec<String>) {
@@ -712,7 +690,7 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
     let prompt_cache_key = request
         .prompt_cache_key
         .unwrap_or_else(|| session_id.to_string());
-    let body = json!({
+    let mut body = json!({
         "model": request.model,
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
         "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
@@ -728,6 +706,9 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
         "prompt_cache_key": prompt_cache_key,
         "service_tier": OPENAI_PRIORITY_SERVICE_TIER,
     });
+    if let Some(max_output_tokens) = request.max_tokens {
+        body["max_output_tokens"] = json!(max_output_tokens);
+    }
     Ok(body)
 }
 
@@ -809,7 +790,7 @@ fn openai_reasoning_effort(model: &str, effort: ReasoningEffort) -> &'static str
 }
 
 pub(crate) fn transcript_to_response_items(
-    prompt: &crate::PromptSections,
+    _prompt: &crate::PromptSections,
     items: &[ModelTranscriptEntry],
 ) -> ProviderResult<Vec<Value>> {
     let mut responses = Vec::new();
@@ -822,25 +803,10 @@ pub(crate) fn transcript_to_response_items(
                     "content": responses_user_content(message),
                 }));
             }
-            TranscriptItem::CompactionSummary(summary) => {
-                let replay_items =
-                    openai_replay_items(&entry.provider_replay_for(ProviderKind::OpenAi))?;
-                if !replay_items.is_empty() {
-                    responses.extend(replay_items);
-                    if let Some(ledger) = appended_delegation_ledger(&summary.summary) {
-                        responses.push(json!({
-                            "type": "message",
-                            "role": "user",
-                            "content": [{ "type": "input_text", "text": ledger }],
-                        }));
-                    }
-                } else {
-                    responses.push(json!({
-                        "type": "message",
-                        "role": "user",
-                        "content": [{ "type": "input_text", "text": compaction_summary_text(summary, prompt) }],
-                    }));
-                }
+            TranscriptItem::CompactionSummary(_) => {
+                let replay = openai_replay_items(&entry.provider_replay_for(ProviderKind::OpenAi))?;
+                validate_openai_compaction_replay(&replay)?;
+                responses.extend(replay);
             }
             TranscriptItem::AssistantMessage(message) => {
                 let replay_items =
@@ -874,12 +840,6 @@ pub(crate) fn transcript_to_response_items(
         }
     }
     Ok(responses)
-}
-
-fn appended_delegation_ledger(summary: &str) -> Option<&str> {
-    const HEADING: &str = "## Delegation state at compaction time";
-    let index = summary.rfind(HEADING)?;
-    Some(summary[index..].trim()).filter(|value| !value.is_empty())
 }
 
 fn response_tool_call_item(call: &ToolCall) -> Value {
@@ -951,6 +911,32 @@ fn openai_replay_items(replay: &[ProviderReplayItem]) -> ProviderResult<Vec<Valu
         .collect()
 }
 
+fn validate_openai_compaction_replay(replay: &[Value]) -> ProviderResult<()> {
+    if replay.is_empty() {
+        return Err(ProviderError::Provider(
+            "refusing missing persisted OpenAI compaction replay".to_string(),
+        ));
+    }
+    let mut compaction_count = 0;
+    for item in replay {
+        if is_openai_compaction_item(item) {
+            validate_openai_compaction_item(item).map_err(|error| {
+                ProviderError::Provider(format!(
+                    "refusing malformed persisted OpenAI compaction replay: {error}"
+                ))
+            })?;
+            compaction_count += 1;
+        }
+    }
+    if compaction_count == 0 {
+        return Err(ProviderError::Provider(
+            "refusing malformed persisted OpenAI compaction replay: missing native compaction item"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn responses_user_content(message: &UserMessage) -> Vec<Value> {
     message
         .content
@@ -982,14 +968,14 @@ async fn parse_responses_stream(
         |event| state.process_sse_event(event),
     )
     .await?;
-    Ok(state.finish())
+    state.finish()
 }
 
 #[cfg(test)]
 fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<ModelResponse> {
     let mut state = ResponsesStreamState::new(provider);
     read_json_sse_text(text, |event| state.process_sse_event(event))?;
-    Ok(state.finish())
+    state.finish()
 }
 
 struct ResponsesStreamState {
@@ -998,6 +984,8 @@ struct ResponsesStreamState {
     provider_replay: Vec<ProviderReplayItem>,
     usage: Option<ProviderUsage>,
     stop_reason: ModelStopReason,
+    stop_details: Option<ModelStopDetails>,
+    completed: bool,
 }
 
 impl ResponsesStreamState {
@@ -1008,24 +996,37 @@ impl ResponsesStreamState {
             provider_replay: Vec::new(),
             usage: None,
             stop_reason: ModelStopReason::Complete,
+            stop_details: None,
+            completed: false,
         }
     }
 
-    fn finish(self) -> ModelResponse {
-        ModelResponse {
+    fn finish(mut self) -> ProviderResult<ModelResponse> {
+        if !self.completed {
+            return Err(ProviderError::Provider(
+                "OpenAI response stream ended before response.completed".to_string(),
+            ));
+        }
+        if self.stop_reason == ModelStopReason::Refusal {
+            self.items.clear();
+            self.provider_replay.clear();
+        }
+        Ok(ModelResponse {
             assistant: AssistantMessage { items: self.items },
             provider_replay: self.provider_replay,
             usage: self.usage,
             stop_reason: self.stop_reason,
-            stop_details: None,
-        }
+            stop_details: self.stop_details,
+        })
     }
 
     fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
         match event {
             SseEvent::Json(event) => self.process_event(&event),
-            SseEvent::MalformedJson => Ok(SseControl::Continue),
-            SseEvent::Done => Ok(SseControl::Stop),
+            SseEvent::MalformedJson => Err(ProviderError::Provider(
+                "OpenAI response stream contained malformed JSON event data".to_string(),
+            )),
+            SseEvent::Done => Ok(SseControl::Continue),
         }
     }
 
@@ -1033,12 +1034,18 @@ impl ResponsesStreamState {
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_item.done") => {
                 if let Some(item) = event.get("item") {
-                    parse_response_output_item(
+                    if let Some(refusal) = parse_response_output_item(
                         item,
                         &mut self.items,
                         &mut self.provider_replay,
                         self.provider,
-                    )?;
+                    )? {
+                        self.stop_reason = ModelStopReason::Refusal;
+                        self.stop_details = Some(ModelStopDetails {
+                            category: None,
+                            explanation: Some(refusal),
+                        });
+                    }
                 }
                 Ok(SseControl::Continue)
             }
@@ -1057,21 +1064,45 @@ impl ResponsesStreamState {
                 Err(openai_provider_error_from_code(code, message))
             }
             Some("response.incomplete") => {
-                let message = event
+                let reason = event
                     .pointer("/response/incomplete_details/reason")
-                    .and_then(Value::as_str);
-                if message == Some("max_output_tokens") {
-                    self.stop_reason = ModelStopReason::MaxOutputTokens;
-                    self.usage = event.pointer("/response/usage").and_then(openai_usage);
-                    return Ok(SseControl::Stop);
-                }
-                let message = message
-                    .map(|reason| format!("response incomplete: {reason}"))
-                    .unwrap_or_else(|| "response incomplete".to_string());
-                Err(ProviderError::Provider(message))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let status = event
+                    .pointer("/response/status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("incomplete")
+                    .to_string();
+                Err(ProviderError::Incomplete { status, reason })
             }
-            Some("response.completed" | "response.done") => {
-                self.usage = event.pointer("/response/usage").and_then(openai_usage);
+            Some("response.completed") => {
+                let response = event
+                    .get("response")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "OpenAI response.completed missing response object".to_string(),
+                        )
+                    })?;
+                if response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(ProviderError::Provider(
+                        "OpenAI response.completed missing response id".to_string(),
+                    ));
+                }
+                if let Some(status) = response.get("status") {
+                    if status.as_str() != Some("completed") {
+                        return Err(ProviderError::Provider(format!(
+                            "OpenAI response.completed had invalid status {status}"
+                        )));
+                    }
+                }
+                self.usage = response.get("usage").and_then(openai_usage);
+                self.completed = true;
                 Ok(SseControl::Stop)
             }
             Some("error") => {
@@ -1136,7 +1167,7 @@ fn parse_response_output_item(
     items: &mut Vec<AssistantItem>,
     provider_replay: &mut Vec<ProviderReplayItem>,
     provider: ProviderKind,
-) -> ProviderResult<()> {
+) -> ProviderResult<Option<String>> {
     let item_type = item
         .get("type")
         .and_then(Value::as_str)
@@ -1149,19 +1180,37 @@ fn parse_response_output_item(
     match item_type {
         "message" => {
             if item.get("role").and_then(Value::as_str) != Some("assistant") {
-                return Ok(());
+                return Ok(None);
             }
+            let mut refusal = None;
             if let Some(content) = item.get("content").and_then(Value::as_array) {
                 for part in content {
-                    if part.get("type").and_then(Value::as_str) == Some("output_text") {
-                        if let Some(text) = part.get("text").and_then(Value::as_str) {
-                            if !text.is_empty() {
-                                push_text_item(items, text);
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("output_text") => {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                if !text.is_empty() {
+                                    push_text_item(items, text);
+                                }
                             }
                         }
+                        Some("refusal") => {
+                            let message = part
+                                .get("refusal")
+                                .and_then(Value::as_str)
+                                .filter(|value| !value.is_empty())
+                                .ok_or_else(|| {
+                                    ProviderError::Provider(
+                                        "OpenAI refusal content missing nonempty refusal text"
+                                            .to_string(),
+                                    )
+                                })?;
+                            refusal = Some(message.to_string());
+                        }
+                        _ => {}
                     }
                 }
             }
+            return Ok(refusal);
         }
         "function_call" => {
             let call_id = item.get("call_id").and_then(Value::as_str).ok_or_else(|| {
@@ -1203,9 +1252,20 @@ fn parse_response_output_item(
             }));
         }
         "reasoning" | "reasoning_summary" => {}
+        "local_shell_call" | "computer_call" => {
+            return Err(ProviderError::Provider(format!(
+                "OpenAI returned unsupported client-executed action type {item_type}"
+            )))
+        }
+        "tool_search_call" if item.get("execution").and_then(Value::as_str) != Some("server") => {
+            return Err(ProviderError::Provider(
+                "OpenAI returned unsupported client-executed action type tool_search_call"
+                    .to_string(),
+            ));
+        }
         _ => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 fn openai_provider_replay_display(item: &Value) -> Option<ReplayDisplay> {
@@ -1702,36 +1762,153 @@ mod tests {
     }
 
     #[test]
-    fn compact_parser_accepts_compaction_summary_alias() {
-        // The current codex backend emits `compaction_summary`; codex CLI's
-        // `ResponseItem` aliases this to its `Compaction` variant. Pi-relay
-        // must accept it identically to avoid spurious "missing compaction
-        // item" errors after a successful 200 from /responses/compact.
+    fn compact_parser_accepts_current_compaction_summary_alias_without_rewriting_it() {
         let response = parse_compact_response(
-            r#"{"output":[{"id":"msg_1","type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"id":"cmp_1","type":"compaction_summary","encrypted_content":"opaque"}]}"#,
+            r#"{"output":[{"type":"compaction_summary","encrypted_content":"opaque"}]}"#,
         )
-        .expect("compaction_summary should be accepted");
-        assert_eq!(response.provider_replay.len(), 2);
-        assert!(response.summary.is_none());
+        .expect("current Codex compaction alias is valid");
+
+        assert_eq!(
+            response.provider_replay[0].raw_value().unwrap(),
+            json!({ "type": "compaction_summary", "encrypted_content": "opaque" })
+        );
     }
 
     #[test]
-    fn compact_parser_preserves_delegation_ledger_user_text() {
+    fn compact_parser_preserves_every_output_item_in_provider_order() {
+        let output = json!([
+            {
+                "id": "msg_user",
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "Current working directory: this is genuine user text"
+                }]
+            },
+            {
+                "id": "msg_user_starting_cwd",
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "Starting working directory for this session: genuine user text"
+                }]
+            },
+            {
+                "id": "msg_user_bash",
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "The Bash tool runs each command in a fresh shell rooted here; quote this text"
+                }]
+            },
+            {
+                "id": "msg_user_prior_compaction",
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "The conversation history before this point was compacted; explain that phrase"
+                }]
+            },
+            {
+                "id": "msg_user_billing",
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "X-Anthropic-Billing-Header: genuine user text"
+                }]
+            },
+            {
+                "id": "msg_developer",
+                "type": "message",
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": "retained developer rule" }]
+            },
+            {
+                "id": "rs_1",
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": "reasoning-ciphertext"
+            },
+            {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "web_search",
+                "arguments": "{\"query\":\"rust\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "result"
+            },
+            {
+                "id": "ws_1",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": { "type": "search", "query": "rust" }
+            },
+            {
+                "id": "future_1",
+                "type": "future_passive_item",
+                "extension": { "must_survive": true }
+            },
+            {
+                "id": "msg_assistant",
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "display summary" }]
+            },
+            {
+                "id": "cmp_1",
+                "type": "compaction",
+                "encrypted_content": "opaque-compaction"
+            }
+        ]);
         let response = parse_compact_response(
-            r###"{"output":[{"id":"msg_ledger","type":"message","role":"user","content":[{"type":"input_text","text":"## Delegation state at compaction time\n\n- delegation_id: `delegation_1`; status: running"}]},{"id":"msg_real","type":"message","role":"user","content":[{"type":"input_text","text":"real user fact"}]},{"id":"cmp_1","type":"compaction_summary","encrypted_content":"opaque"}]}"###,
+            &json!({ "output": output, "usage": { "input_tokens": 12 } }).to_string(),
         )
-        .expect("compaction response should parse");
-
-        assert_eq!(response.provider_replay.len(), 3);
-        assert!(response.summary.is_none());
-        let replay_text = response
+        .expect("canonical compact output parses");
+        let replay = response
             .provider_replay
             .iter()
-            .map(|item| item.raw_value().expect("replay raw").to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(replay_text.contains("real user fact"));
-        assert!(replay_text.contains("Delegation state at compaction time"));
+            .map(ProviderReplayItem::raw_value)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("replay remains valid JSON");
+
+        assert_eq!(replay, output.as_array().unwrap().clone());
+        assert_eq!(response.summary.as_deref(), Some("display summary"));
+
+        let rerendered = transcript_to_response_items(
+            &PromptSections::default(),
+            &[ModelTranscriptEntry {
+                item: TranscriptItem::CompactionSummary(CompactionSummary::new(
+                    "session",
+                    "leaf",
+                    "semantic display summary must not enter replay",
+                    Some(123),
+                    TurnId(3),
+                )),
+                provider_replay: response.provider_replay,
+            }],
+        )
+        .expect("canonical replay renders");
+        assert_eq!(rerendered, output.as_array().unwrap().clone());
+    }
+
+    #[test]
+    fn compact_parser_rejects_empty_output_or_invalid_native_compaction_schema() {
+        for body in [
+            r#"{"output":[]}"#,
+            r#"{"output":[{"type":"compaction"}]}"#,
+            r#"{"output":[{"type":"compaction","encrypted_content":7}]}"#,
+        ] {
+            assert!(parse_compact_response(body).is_err(), "{body}");
+        }
     }
 
     #[test]
@@ -1801,7 +1978,7 @@ mod tests {
         assert!(body.get("prompt_cache_retention").is_none());
         assert_eq!(body["include"][0], RESPONSES_REASONING_INCLUDE);
         assert_eq!(body["tool_choice"], "auto");
-        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["max_output_tokens"], 2048);
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["instructions"], "static system");
         assert_eq!(body["input"][0]["role"], "user");
@@ -2294,23 +2471,22 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     }
 
     #[test]
-    fn responses_sse_keeps_partial_output_on_max_output_tokens() {
+    fn responses_sse_rejects_incomplete_and_retains_status_and_reason() {
         let sse = r#"data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}}
 
-data: {"type":"response.incomplete","response":{"id":"resp_1","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":100,"output_tokens":64,"total_tokens":164,"input_tokens_details":{"cached_tokens":80}}}}
+data: {"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":100,"output_tokens":64,"total_tokens":164,"input_tokens_details":{"cached_tokens":80}}}}
 "#;
 
-        let response = parse_responses_sse(sse, ProviderKind::OpenAi)
-            .expect("max-output incomplete should parse as partial response");
+        let error = parse_responses_sse(sse, ProviderKind::OpenAi)
+            .expect_err("incomplete response is not a successful assistant turn");
 
-        assert_eq!(response.assistant.text(), "partial");
-        assert_eq!(response.provider_replay.len(), 1);
-        assert_eq!(response.stop_reason, ModelStopReason::MaxOutputTokens);
-        let usage = response.usage.expect("usage should be parsed");
-        assert_eq!(usage.input_tokens, Some(100));
-        assert_eq!(usage.output_tokens, Some(64));
-        assert_eq!(usage.total_tokens, Some(164));
-        assert_eq!(usage.cache_read_input_tokens, Some(80));
+        match error {
+            ProviderError::Incomplete { status, reason } => {
+                assert_eq!(status, "incomplete");
+                assert_eq!(reason, "max_output_tokens");
+            }
+            other => panic!("expected typed incomplete error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2330,16 +2506,85 @@ data: {"type":"response.output_item.done","item":{"type":"message","role":"assis
     }
 
     #[test]
-    fn responses_sse_accepts_done_sentinel() {
-        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+    fn responses_sse_requires_completed_not_done_or_eof() {
+        for (name, suffix) in [("EOF", ""), ("done sentinel", "\ndata: [DONE]\n\n")] {
+            let sse = format!(
+                "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"partial\"}}]}}}}\n\n{suffix}"
+            );
+            let error = parse_responses_sse(&sse, ProviderKind::OpenAi).expect_err(name);
+            assert!(
+                error.to_string().contains("before response.completed"),
+                "{name}"
+            );
+        }
+    }
 
-data: [DONE]
+    #[test]
+    fn responses_sse_tolerates_unknown_events_before_completed() {
+        let sse = r#"data: {"type":"response.future_progress","opaque":{"value":1}}
+
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}
 "#;
 
-        let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
+        let response = parse_responses_sse(sse, ProviderKind::OpenAi)
+            .expect("unknown nonterminal event is forward compatible");
+        assert_eq!(response.stop_reason, ModelStopReason::Complete);
+    }
 
-        assert_eq!(response.assistant.text(), "done");
-        assert_eq!(response.provider_replay.len(), 1);
+    #[test]
+    fn responses_sse_preserves_passive_hosted_and_unknown_output_as_opaque_replay() {
+        let hosted = json!({
+            "id": "ws_1",
+            "type": "web_search_call",
+            "status": "completed",
+            "action": { "type": "search", "query": "rust" },
+        });
+        let server_tool_search = json!({
+            "id": "ts_1",
+            "type": "tool_search_call",
+            "execution": "server",
+            "status": "completed",
+            "tools": [],
+        });
+        let future = json!({
+            "id": "future_1",
+            "type": "future_passive_item",
+            "extension": { "must_survive": true },
+        });
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"status\":\"completed\"}}}}\n\n",
+            json!({ "type": "response.output_item.done", "item": hosted }),
+            json!({ "type": "response.output_item.done", "item": server_tool_search }),
+            json!({ "type": "response.output_item.done", "item": future }),
+        );
+
+        let response = parse_responses_sse(&sse, ProviderKind::OpenAi)
+            .expect("passive output remains forward compatible");
+        let replay = response
+            .provider_replay
+            .iter()
+            .map(ProviderReplayItem::raw_value)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("replay remains valid JSON");
+
+        assert!(response.assistant.items.is_empty());
+        assert_eq!(replay, vec![hosted, server_tool_search, future]);
+    }
+
+    #[test]
+    fn responses_sse_rejects_malformed_completed_event() {
+        for sse in [
+            "data: {\"type\":\"response.completed\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":7}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":\n",
+        ] {
+            assert!(
+                parse_responses_sse(sse, ProviderKind::OpenAi).is_err(),
+                "{sse}"
+            );
+        }
     }
 
     #[test]
@@ -2376,6 +2621,56 @@ data: [DONE]
     }
 
     #[test]
+    fn responses_sse_refusal_discards_partial_output_and_replay() {
+        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"partial-reasoning"}}
+
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"unsafe partial"},{"type":"refusal","refusal":"I cannot help with that request."}]}}
+
+data: {"type":"response.completed","response":{"id":"resp_refusal","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}
+"#;
+
+        let response =
+            parse_responses_sse(sse, ProviderKind::OpenAi).expect("refusal terminal parses");
+
+        assert_eq!(response.stop_reason, ModelStopReason::Refusal);
+        assert!(response.assistant.items.is_empty());
+        assert!(response.provider_replay.is_empty());
+        assert_eq!(
+            response.stop_details,
+            Some(ModelStopDetails {
+                category: None,
+                explanation: Some("I cannot help with that request.".to_string()),
+            })
+        );
+        assert_eq!(
+            response.refusal_error().as_deref(),
+            Some("provider refused the request: I cannot help with that request.")
+        );
+        assert_eq!(
+            response.usage.and_then(|usage| usage.total_tokens),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn responses_sse_rejects_unsupported_client_executed_actions() {
+        for item_type in ["local_shell_call", "computer_call"] {
+            let sse = format!(
+                "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"{item_type}\"}}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n"
+            );
+            let error = parse_responses_sse(&sse, ProviderKind::OpenAi).expect_err(item_type);
+            assert!(error.to_string().contains(item_type), "{error}");
+        }
+        for execution in ["client", "future_execution"] {
+            let sse = format!(
+                "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"tool_search_call\",\"execution\":\"{execution}\"}}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n"
+            );
+            let error = parse_responses_sse(&sse, ProviderKind::OpenAi).expect_err(execution);
+            assert!(error.to_string().contains("tool_search_call"), "{error}");
+        }
+    }
+
+    #[test]
     fn responses_input_prefers_openai_replay_sidecar() {
         let raw = json!({
             "type": "message",
@@ -2398,11 +2693,30 @@ data: [DONE]
     }
 
     #[test]
-    fn responses_input_appends_delegation_ledger_after_compaction_replay() {
-        let raw = json!({
-            "type": "compaction_summary",
-            "encrypted_content": "opaque",
-        });
+    fn responses_input_rejects_corrupt_assistant_replay() {
+        let error = transcript_to_response_items(
+            &PromptSections::default(),
+            &[ModelTranscriptEntry {
+                item: TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::Text(
+                        "must not replace corrupt replay".to_string(),
+                    )],
+                }),
+                provider_replay: vec![ProviderReplayItem {
+                    provider: ProviderKind::OpenAi,
+                    raw_json: "{".to_string(),
+                    display: None,
+                }],
+            }],
+        )
+        .expect_err("corrupt durable replay must fail closed");
+
+        assert!(matches!(error, ProviderError::Json(_)));
+    }
+
+    #[test]
+    fn responses_input_replays_compaction_without_semantic_summary_injection() {
+        let raw = json!({ "type": "compaction", "encrypted_content": "opaque" });
         let items = transcript_to_response_items(
             &crate::PromptSections::default(),
             &[ModelTranscriptEntry {
@@ -2418,43 +2732,73 @@ data: [DONE]
         )
         .expect("responses input renders");
 
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0], raw);
-        assert_eq!(items[1]["role"], "user");
-        assert_eq!(
-            items[1]["content"][0]["text"],
-            "## Delegation state at compaction time\n\n- delegation_id: `delegation_1`; status: running"
-        );
+        assert_eq!(items, vec![raw]);
     }
 
     #[test]
-    fn responses_input_appends_latest_delegation_ledger_after_compaction_replay() {
+    fn responses_input_compaction_replay_fails_closed_when_missing_or_corrupt() {
+        let summary = || {
+            TranscriptItem::CompactionSummary(CompactionSummary::new(
+                "session",
+                "leaf",
+                "semantic summary",
+                Some(123),
+                TurnId(3),
+            ))
+        };
+        for provider_replay in [
+            Vec::new(),
+            vec![ProviderReplayItem {
+                provider: ProviderKind::OpenAi,
+                raw_json: "{".to_string(),
+                display: None,
+            }],
+            vec![ProviderReplayItem::new(
+                ProviderKind::OpenAi,
+                &json!({ "type": "message", "role": "assistant", "content": [] }),
+            )
+            .unwrap()],
+            vec![ProviderReplayItem::new(
+                ProviderKind::OpenAi,
+                &json!({ "type": "compaction", "encrypted_content": 7 }),
+            )
+            .unwrap()],
+        ] {
+            assert!(transcript_to_response_items(
+                &PromptSections::default(),
+                &[ModelTranscriptEntry {
+                    item: summary(),
+                    provider_replay,
+                }],
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn responses_input_preserves_raw_replay_tool_names() {
         let raw = json!({
-            "type": "compaction_summary",
-            "encrypted_content": "opaque",
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "web_search",
+            "arguments": "{\"query\":\"rust\"}",
         });
         let items = transcript_to_response_items(
-            &crate::PromptSections::default(),
+            &PromptSections::default(),
             &[ModelTranscriptEntry {
-                item: TranscriptItem::CompactionSummary(CompactionSummary::new(
-                    "session",
-                    "leaf",
-                    "provider summary\n\n## Delegation state at compaction time\n\nold ledger\n\nfresh summary bridge\n\n## Delegation state at compaction time\n\nlatest ledger",
-                    Some(123),
-                    TurnId(3),
-                )),
+                item: TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::ToolCall(ToolCall {
+                        id: ToolCallId::new("call_1"),
+                        tool_name: "WebSearch".to_string(),
+                        args_json: "{\"query\":\"rust\"}".to_string(),
+                    })],
+                }),
                 provider_replay: vec![ProviderReplayItem::new(ProviderKind::OpenAi, &raw).unwrap()],
             }],
         )
-        .expect("responses input renders");
+        .expect("raw replay renders");
 
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0], raw);
-        assert_eq!(items[1]["role"], "user");
-        assert_eq!(
-            items[1]["content"][0]["text"],
-            "## Delegation state at compaction time\n\nlatest ledger"
-        );
+        assert_eq!(items, vec![raw]);
     }
 
     #[test]

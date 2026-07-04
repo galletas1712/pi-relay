@@ -163,8 +163,9 @@ Supported provider kinds are exactly two (`ProviderKind = OpenAi | Claude`):
 `openai` kind. A request with `"kind": "codex"` is rejected at decode time.
 
 `prompt_cache.key` maps to `ModelRequest::prompt_cache_key` and is sent on the
-OpenAI request path. `max_tokens` is optional; when omitted the daemon does not
-set an OpenAI output cap.
+OpenAI request path. `max_tokens` is optional; when present it is emitted as
+OpenAI `max_output_tokens`, and when omitted the daemon does not set an OpenAI
+output cap.
 
 `reasoning_effort` defaults to `medium`. OpenAI currently accepts `none`,
 `minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay; GPT-5.6 Sol,

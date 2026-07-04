@@ -184,7 +184,7 @@ impl ModelTranscriptEntry {
         self.provider_replay
             .iter()
             .filter(|record| record.provider == provider)
-            .filter_map(|record| canonical_provider_replay(record, provider))
+            .cloned()
             .collect()
     }
 
@@ -220,40 +220,6 @@ pub fn canonical_tool_name_for_provider(provider: ProviderKind, name: &str) -> &
             other => other,
         },
     }
-}
-
-fn canonical_provider_replay(
-    record: &ProviderReplayItem,
-    provider: ProviderKind,
-) -> Option<ProviderReplayItem> {
-    let raw = canonical_provider_replay_value(record.raw_value().ok()?, provider);
-    ProviderReplayItem::new_with_display(provider, &raw, record.display.clone()).ok()
-}
-
-pub(crate) fn canonical_provider_replay_value(mut raw: Value, provider: ProviderKind) -> Value {
-    // Anthropic compaction blocks are opaque provider checkpoints, not tool
-    // calls. Preserve every provider extension (including a top-level `name`)
-    // without applying local tool-name canonicalization.
-    if provider == ProviderKind::Claude
-        && raw.get("type").and_then(Value::as_str) == Some("compaction")
-    {
-        return raw;
-    }
-    if let Some(name) = raw.get("name").and_then(Value::as_str) {
-        let canonical = canonical_tool_name_for_provider(provider, name);
-        // Local client-tool calls are stored internally under canonical
-        // pi-relay names. Provider-hosted/server replay blocks keep their
-        // provider-native names so a later stateless request can replay them
-        // byte-for-byte and the web UI can still pair provider result blocks.
-        let is_provider_hosted_replay = matches!(
-            raw.get("type").and_then(Value::as_str),
-            Some("server_tool_use" | "web_search_call")
-        );
-        if canonical != name && !is_provider_hosted_replay {
-            raw["name"] = Value::String(canonical.to_string());
-        }
-    }
-    raw
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +362,8 @@ pub enum ProviderError {
     Provider(String),
     #[error("provider returned HTTP {status}: {message}")]
     Status { status: u16, message: String },
+    #[error("provider response was incomplete (status: {status}, reason: {reason})")]
+    Incomplete { status: String, reason: String },
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("native compaction failed ({kind}): {message}")]
@@ -420,6 +388,7 @@ impl ProviderError {
             ProviderError::Timeout(_)
             | ProviderError::Transient(_)
             | ProviderError::Provider(_)
+            | ProviderError::Incomplete { .. }
             | ProviderError::Json(_)
             | ProviderError::NativeCompaction { .. } => None,
         }
@@ -456,6 +425,7 @@ impl ProviderError {
             ProviderError::Transient(message) => Some(format!("transient={message}")),
             ProviderError::Status { status, .. } => Some(format!("status={status}")),
             ProviderError::Provider(_)
+            | ProviderError::Incomplete { .. }
             | ProviderError::Json(_)
             | ProviderError::NativeCompaction { .. } => None,
         }
@@ -472,7 +442,9 @@ impl ProviderError {
             | ProviderError::Provider(message) => message.clone(),
             ProviderError::Http(error) => error.to_string(),
             ProviderError::Timeout(_) => return false,
-            ProviderError::Json(_) | ProviderError::NativeCompaction { .. } => return false,
+            ProviderError::Incomplete { .. }
+            | ProviderError::Json(_)
+            | ProviderError::NativeCompaction { .. } => return false,
         };
         let lower = message.to_ascii_lowercase();
         if status == Some(413) {
@@ -532,7 +504,6 @@ pub trait ModelProvider: Send + Sync {
 mod provider_error_tests {
     use super::*;
     use agent_vocab::{ReplayDisplay, ReplayDisplayKind};
-    use serde_json::json;
 
     #[test]
     fn context_overflow_classifier_matches_known_provider_messages() {
@@ -605,56 +576,33 @@ mod provider_error_tests {
     }
 
     #[test]
-    fn provider_replay_canonicalizes_local_tool_names_only_and_preserves_compaction() {
-        let local = ProviderReplayItem::new(
-            ProviderKind::OpenAi,
-            &json!({
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "web_search",
-                "arguments": "{\"query\":\"rust\"}",
-            }),
-        )
-        .unwrap();
-        let local = canonical_provider_replay(&local, ProviderKind::OpenAi)
-            .unwrap()
-            .raw_value()
-            .unwrap();
-        assert_eq!(local["name"], "WebSearch");
-
-        let hosted = ProviderReplayItem::new_with_display(
-            ProviderKind::Claude,
-            &json!({
-                "type": "server_tool_use",
-                "id": "srv_1",
-                "name": "web_fetch",
-                "input": { "url": "https://example.com" },
-            }),
-            Some(ReplayDisplay {
+    fn provider_replay_filter_clones_raw_records_without_rewriting_or_parsing() {
+        let openai = ProviderReplayItem {
+            provider: ProviderKind::OpenAi,
+            raw_json: r#"{"type":"function_call","name":"web_search"}"#.to_string(),
+            display: Some(ReplayDisplay {
                 kind: ReplayDisplayKind::HostedTool,
-                pretty_name: "WebFetch".to_string(),
-                input_summary: Some("https://example.com".to_string()),
+                pretty_name: "WebSearch".to_string(),
+                input_summary: None,
             }),
-        )
-        .unwrap();
-        let hosted = canonical_provider_replay(&hosted, ProviderKind::Claude)
-            .unwrap()
-            .raw_value()
-            .unwrap();
-        assert_eq!(hosted["name"], "web_fetch");
+        };
+        let corrupt_claude = ProviderReplayItem {
+            provider: ProviderKind::Claude,
+            raw_json: "{".to_string(),
+            display: None,
+        };
+        let entry = ModelTranscriptEntry {
+            item: TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            provider_replay: vec![openai.clone(), corrupt_claude.clone()],
+        };
 
-        let compaction = json!({
-            "type": "compaction",
-            "content": "opaque",
-            "name": "web_fetch",
-            "provider_extension": { "must_survive": true },
-        });
-        let record =
-            ProviderReplayItem::new(ProviderKind::Claude, &compaction).expect("record builds");
-        let replayed = canonical_provider_replay(&record, ProviderKind::Claude)
-            .expect("compaction replay remains valid")
-            .raw_value()
-            .expect("compaction replay JSON parses");
-        assert_eq!(replayed, compaction);
+        assert_eq!(
+            entry.provider_replay_for(ProviderKind::OpenAi),
+            vec![openai]
+        );
+        assert_eq!(
+            entry.provider_replay_for(ProviderKind::Claude),
+            vec![corrupt_claude]
+        );
     }
 }

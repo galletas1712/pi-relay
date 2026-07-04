@@ -387,8 +387,9 @@ value.
 
 The daemon also no longer imposes a default OpenAI/Codex output-token cap.
 `provider.max_tokens` remains an optional explicit cap if a particular session
-needs one. Anthropic's Messages API does require `max_tokens`, so its provider
-uses API-discovered/static per-model ceilings and clamps explicit limits to that
+needs one; OpenAI requests emit it as `max_output_tokens` and otherwise omit the
+field. Anthropic's Messages API does require `max_tokens`, so its provider uses
+API-discovered/static per-model ceilings and clamps explicit limits to that
 ceiling. With no explicit limit it requests at most 64k: enough headroom for
 high-effort work without making an ordinary turn reserve the full 128k supported
 by Sonnet 5, Fable 5, and Opus 4.8. Model discovery is cached and has a

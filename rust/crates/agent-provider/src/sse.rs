@@ -110,10 +110,8 @@ fn process_sse_frame(
     match sse_frame_data(frame) {
         Some(SseFrame::Json(data)) => {
             let Ok(event) = serde_json::from_str::<Value>(&data) else {
-                // Match the legacy TS parser, which skips malformed SSE data
-                // chunks for ordinary generation. Callers with stricter
-                // terminal contracts (native compaction) can reject this
-                // explicit marker.
+                // Keep framing separate from provider semantics. Adapters
+                // decide whether this explicit marker is fatal.
                 return on_event(SseEvent::MalformedJson);
             };
             on_event(SseEvent::Json(event))

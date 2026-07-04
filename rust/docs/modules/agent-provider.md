@@ -12,7 +12,8 @@ See [design decisions](../design-decisions.md) for *why* the provider scope is s
 - Render `ModelRequest` into provider-native request bodies and headers.
 - Stream and parse provider SSE into one `AssistantMessage` (`Text` / `ToolCall` items only).
 - Capture per-item `ProviderReplayItem` sidecars so encrypted reasoning / thinking blocks replay verbatim on the next request.
-- Map provider-native tool names to/from canonical pi-relay names.
+- Map provider-native tool names to canonical pi-relay names only in semantic
+  transcript/UI projections; opaque replay retains provider wire names.
 - Surface provider errors with diagnostics, including context-overflow classification for the daemon's recovery logic.
 - Estimate input tokens locally (`token_estimator`) for the runtime's pre-flight context gate.
 
@@ -27,7 +28,8 @@ It does **not** own auth acquisition/refresh, retry loops, compaction policy, or
 - `transcript: Vec<ModelTranscriptEntry>` — each entry is a `TranscriptItem` plus its `provider_replay: Vec<ProviderReplayItem>`
 - `tool_profile: ProviderToolProfile` — `None | CustomDefinitions | OpenAiCoding | AnthropicCoding`
 - `tools: Vec<ProviderTool>` — empty falls back to the builtin registry for the profile
-- `max_tokens: Option<u32>`
+- `max_tokens: Option<u32>` — emitted as OpenAI `max_output_tokens` when set;
+  omitted when unset
 - `reasoning_effort: ReasoningEffort` — default `Medium`
 - `prompt_cache_key: Option<String>` — explicit cache-cohort override
 - `session_id: Option<String>` — Codex `thread_id` analog; doubles as cache cohort + routing headers
@@ -39,7 +41,11 @@ It does **not** own auth acquisition/refresh, retry loops, compaction policy, or
 
 `ProviderUsage` carries token counts (`input`, `output`, `total`, `cache_read_input_tokens`, `cache_creation_input_tokens`), provider-neutral raw provider usage JSON, and OpenAI debug metadata lifted off response headers (`upstream_request_id`, `cf_ray`, `server_model`, `codex_turn_state`, `reasoning_included`).
 
-`ProviderError` variants: `Http`, `Timeout`, `Transient`, `Provider`, `Status { status, message }`, `Json`, and typed `NativeCompaction`. The daemon's model-dispatch loop retries every ordinary-turn `ProviderError` up to five attempts; the provider crate does not classify status codes as retryable or non-retryable.
+`ProviderError` variants: `Http`, `Timeout`, `Transient`, `Provider`,
+`Status { status, message }`, `Incomplete { status, reason }`, `Json`, and typed
+`NativeCompaction`. The daemon's model-dispatch loop retries every ordinary-turn
+`ProviderError` up to five attempts; the provider crate does not classify status
+codes as retryable or non-retryable.
 
 - `is_context_overflow()` — status `413`, or messages matching `prompt is too long` / `context_length_exceeded` / `context …(length|window|too large|exceed|maximum)`. A bare 400 is *not* treated as overflow (Anthropic `count_tokens` returns 400 for unsupported server tools).
 - `retry_diagnostic()` — returns status / timeout / reqwest diagnostic details that the daemon records after retry exhaustion.
@@ -87,7 +93,7 @@ reasoning.effort    = <ReasoningEffort, rejects Max>
 prompt_cache_key    = <cohort key>
 ```
 
-`store = false` makes every request stateless, so reasoning must be replayed from sidecars (see below). There is **no daemon-enforced output-token cap**: `max_tokens` is omitted unless the request supplies an explicit value.
+`store = false` makes every request stateless, so reasoning must be replayed from sidecars (see below). There is **no daemon-enforced output-token cap**: `max_output_tokens` is omitted unless `ModelRequest.max_tokens` supplies an explicit value.
 
 `x-codex-turn-state` is sticky routing state scoped to a single `turn_id`: a value returned by an upstream request is replayed on later requests for the same turn (held in `OpenAiCodexSessionState`) and never leaks into the next turn. The `x-codex-window-id` carries a per-session window generation that bumps after compaction, mirroring Codex's "new window after compaction" signal — derived from the latest compacted turn id in the transcript when no session state is attached.
 
@@ -128,12 +134,20 @@ The attribution `system[0]` fingerprint is derived from the **stable prefix** (n
 
 Because OpenAI runs stateless (`store = false`) and Anthropic preserves thinking blocks across tool calls, both adapters store every parsed output item as a `ProviderReplayItem` sidecar attached to the transcript entry. On the next request these raw blocks are replayed verbatim ahead of any synthesized representation:
 
-- OpenAI replays the stored `reasoning` (encrypted via `reasoning.encrypted_content`), `message`, `function_call`, and `custom_tool_call` items.
+- OpenAI replays every stored output item, including `reasoning` (encrypted via
+  `reasoning.encrypted_content`), messages, local/hosted tool items, and unknown
+  passive extensions.
 - Anthropic replays the stored `thinking` / `redacted_thinking`, `text`, `tool_use`, and `server_tool_use` blocks.
 
 When replay items exist for an assistant/compaction entry, `transcript_to_messages` / `transcript_to_response_items` emit them instead of reconstructing from `AssistantMessage`. Thinking blocks are intentionally **discarded** at the parse layer (they never become `AssistantItem`s — `AssistantItem` is `Text`/`ToolCall` only); they survive solely in the replay sidecar, keeping reasoning continuity without polluting the typed transcript.
 
-Replay records canonicalize local client-tool names to pi-relay names (e.g. `apply_patch`/`str_replace_based_edit_tool` → `Edit`, `web_search` → `WebSearch`) but keep provider-hosted blocks (`server_tool_use`, `web_search_call`) under their native wire names so a stateless replay is byte-for-byte and the web UI can still pair hosted result blocks.
+Provider replay is provider-filtered and parsed for request construction, but
+its JSON values and provider order are otherwise unchanged. This includes local
+client-tool names such as `apply_patch` and
+`str_replace_based_edit_tool`, hosted blocks such as `server_tool_use` and
+`web_search_call`, and unknown passive output items. Tool-name canonicalization
+is confined to the separate semantic transcript/UI projection. Corrupt raw
+replay fails request construction rather than being silently dropped.
 
 Daemon-authored observations, such as delegation completion wakeups carrying an
 `inspect_delegation`-equivalent snapshot, are not provider replay and are not
@@ -161,7 +175,20 @@ validates the selected model before constructing the compact request; adapter
 support alone does not imply that every Claude model supports native
 compaction.
 
-- **OpenAI** posts a unary `ProviderCompactionRequest` to `/responses/compact` (JSON, 20-minute timeout). The body matches Codex's `CompactionInput` — `model`, `instructions`, `input`, `tools`, `parallel_tool_calls`, `reasoning.effort`, `service_tier`, `prompt_cache_key` — and omits streaming-only fields. The response is parsed into replacement history: the opaque `compaction`/`compaction_summary` item (both wire types accepted) plus real assistant/user messages, surfaced as `ProviderCompactionResponse { summary, provider_replay, usage }`. Synthetic scaffolding messages (cwd preamble, prior compaction summaries, billing header) are dropped.
+- **OpenAI** posts a unary `ProviderCompactionRequest` to `/responses/compact`
+  (JSON, 20-minute timeout). The body matches Codex's `CompactionInput` —
+  `model`, `instructions`, `input`, `tools`, `parallel_tool_calls`,
+  `reasoning.effort`, `service_tier`, `prompt_cache_key` — and omits
+  streaming-only fields. The complete returned `output` array is canonical
+  replacement history: every item is retained unchanged and in provider order,
+  including user/developer messages, reasoning, tool/hosted-tool items, and
+  unknown extensions. The response must be nonempty and contain a
+  `type = "compaction"` item with string `encrypted_content`. The current Codex
+  compatibility alias `compaction_summary` is also accepted and retained
+  without rewriting. Assistant text may be projected separately as display
+  summary, but is never substituted into replay. Missing, corrupt, or
+  non-native replay on a persisted OpenAI `CompactionSummary` fails request
+  construction rather than synthesizing a user summary.
 - **Anthropic** uses the Messages API with the provider-required beta `compact-2026-01-12`, `context_management.edits[0].type = "compact_20260112"`, the minimum valid 50K input-token trigger, and `pause_after_compaction = true`. It supplies the PI compaction prompt as replacement custom instructions, explicitly forbids tool calls, and supplies no tools. Because Anthropic rejects an assistant prefill for this operation, the adapter appends one minimal synthetic user instruction when the rendered transcript is assistant-ended or empty. For an assistant tool-use tail, it normalizes the complete following user run once: real results are retained in tool-use order, only missing results are synthesized, then all non-result user content follows in original order; duplicates and redundant empty user messages are dropped. The authoritative custom instructions remain in the context-management edit. Static support is limited to the documented model ids `claude-fable-5`, `claude-mythos-5`, `claude-mythos-preview`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, and `claude-sonnet-4-6`; when Models API metadata includes `capabilities.context_management.compact_20260112`, that authoritative value overrides the static fallback. This static metadata remains necessary when authoritative model metadata is unavailable. Unknown and known-unsupported ids return a typed terminal native-compaction `unsupported` error before network dispatch. The compact call accepts only an eventual terminal `stop_reason = "compaction"` with one index-zero compaction block whose `content` is a non-null/non-empty string; ordinary completion, tools, refusal, max tokens, malformed/truncated streams, and missing/null/empty content are typed native-compaction errors.
 
 The Anthropic compaction block is stored as opaque provider replay on the new `CompactionSummary` root. One strict rule defines valid replay: `type` is `compaction`, `content` is a nonempty string, and `encrypted_content` is absent, null, or a string. `content` is copied from the compaction delta; opaque encryption and all start/delta extension fields (including a top-level `name`) are retained unchanged. No cache fields or daemon metadata are injected into the provider block. Request rendering parses every Claude sidecar on the only transcript kinds that can emit it, `CompactionSummary` and `AssistantMessage`. Every `CompactionSummary` must have exactly one valid Claude compaction replay block; zero or multiple Claude blocks fail locally. Assistant replay may contain ordinary Claude block types, but corrupt JSON and malformed exact compaction blocks fail locally. Wrong-provider and non-emitted sidecars have no effect.
@@ -172,7 +199,32 @@ Subsequent Messages and token-count requests replay the complete block unchanged
 
 ### Streaming, timeouts, and tool naming
 
-`sse.rs` parses provider SSE generically: it buffers chunks, splits on `\n\n`/`\r\n\r\n` frame boundaries, collects multi-line `data:` payloads, treats `[DONE]` as terminal, and reports malformed JSON frames to the adapter. Ordinary OpenAI/Anthropic generation retains the legacy behavior of skipping malformed JSON frames; the special Anthropic compact call uses separate strict state and requires `message_start`, one index-zero compaction `content_block_start`, one matching `compaction_delta`, matching `content_block_stop`, one or more `message_delta` frames with exactly one eventual `stop_reason = "compaction"`, and final `message_stop`. Pings and unknown future event types are ignored without advancing structural state. The parser consumes through EOF so duplicate/conflicting terminal reasons and trailing known frames are observable, and rejects missing fields, wrong indices/types/order, multiple or mixed blocks, pre-populated start content, malformed JSON, `[DONE]`, and truncation. `http.rs` enforces a 45-second response-headers timeout; the SSE reader enforces a 5-minute idle timeout. The ordinary parser assembles `content_block_start`/`_delta`/`_stop` events and accumulates streamed `input_json_delta`/`text_delta`/`thinking_delta`/`signature_delta`, but defensively rejects all compaction content/deltas/stops before producing a `ModelResponse`.
+`sse.rs` parses provider SSE generically: it buffers chunks, splits on
+`\n\n`/`\r\n\r\n` frame boundaries, collects multi-line `data:` payloads, and
+reports `[DONE]` and malformed JSON frames to the adapter. Ordinary OpenAI
+success requires `response.completed`; `response.incomplete` is a typed
+non-success retaining status/reason, and refusal content produces a refusal
+terminal that discards partial assistant output/replay. Ordinary Anthropic
+success requires `message_stop`. For both providers, EOF or `[DONE]` alone and
+malformed JSON are failures. Unknown future event types remain ignorable but
+never imply success. Unsupported OpenAI client-executed action types fail
+closed; hosted and unknown passive output items remain opaque replay.
+
+The special Anthropic compact call uses separate strict state and requires
+`message_start`, one index-zero compaction `content_block_start`, one matching
+`compaction_delta`, matching `content_block_stop`, one or more `message_delta`
+frames with exactly one eventual `stop_reason = "compaction"`, and final
+`message_stop`. Pings and unknown future event types are ignored without
+advancing structural state. The parser consumes through EOF so
+duplicate/conflicting terminal reasons and trailing known frames are
+observable, and rejects missing fields, wrong indices/types/order, multiple or
+mixed blocks, pre-populated start content, malformed JSON, `[DONE]`, and
+truncation. `http.rs` enforces a 45-second response-headers timeout; the SSE
+reader enforces a 5-minute idle timeout. The ordinary Anthropic parser assembles
+`content_block_start`/`_delta`/`_stop` events and accumulates streamed
+`input_json_delta`/`text_delta`/`thinking_delta`/`signature_delta`, but
+defensively rejects all compaction content/deltas/stops before producing a
+`ModelResponse`.
 
 Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire → pi-relay names; `openai_wire_tool_name` / `anthropic_wire_tool_name` map back. `transcript.rs::normalize_transcript_for_provider` canonicalizes historical tool-call names to the entry's recorded provider and bounds historical tool-result output via `agent-tools::limit_tool_output`.
 

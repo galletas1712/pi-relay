@@ -143,6 +143,7 @@ mod token_estimator_tests {
         AssistantItem, AssistantMessage, ContentBlock, ImageContent, ImageSource, ToolCall,
         ToolCallId, ToolResultMessage, ToolResultStatus, TranscriptItem, UserMessage,
     };
+    use serde_json::json;
 
     #[test]
     fn transcript_estimator_uses_serialized_model_visible_bytes() {
@@ -208,7 +209,7 @@ mod token_estimator_tests {
     }
 
     #[test]
-    fn compaction_summary_estimate_includes_pi_md_stable_prefix() {
+    fn compaction_summary_estimate_uses_native_replay() {
         let summary = agent_vocab::CompactionSummary::new(
             "session-1",
             "leaf-1",
@@ -216,16 +217,20 @@ mod token_estimator_tests {
             Some(1024),
             agent_vocab::TurnId(1),
         );
-        let transcript = vec![TranscriptItem::CompactionSummary(summary).into()];
+        let replay = agent_vocab::ProviderReplayItem::new(
+            agent_vocab::ProviderKind::OpenAi,
+            &json!({
+                "type": "compaction",
+                "encrypted_content": "opaque compacted context",
+            }),
+        )
+        .unwrap();
+        let transcript = vec![ModelTranscriptEntry {
+            item: TranscriptItem::CompactionSummary(summary),
+            provider_replay: vec![replay],
+        }];
 
-        let pi_prompt = "PI.md stable rules ".repeat(50);
-        let without_prefix = estimate_transcript_tokens(&PromptSections::default(), &transcript);
-        let with_prefix =
-            estimate_transcript_tokens(&PromptSections::stable(pi_prompt.clone()), &transcript);
-
-        assert!(
-            with_prefix.model_visible_bytes
-                >= without_prefix.model_visible_bytes + pi_prompt.trim().len()
-        );
+        let estimate = estimate_transcript_tokens(&PromptSections::default(), &transcript);
+        assert!(estimate.model_visible_bytes >= "opaque compacted context".len());
     }
 }
