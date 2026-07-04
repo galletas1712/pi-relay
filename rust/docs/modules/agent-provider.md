@@ -1,8 +1,8 @@
 # agent-provider
 
-> Part of the [Rust Agent Stack](../architecture.md) | [Design decisions](../design-decisions.md)
+> Part of the [Rust Agent Stack](../architecture.md) | [Provider API support](../provider-api-support.md) | [Design decisions](../design-decisions.md)
 
-`agent-provider` is the model-IO boundary. It defines the `ModelProvider` trait and two adapters: `OpenAiProvider` (ChatGPT/Codex Responses API) and `AnthropicProvider` (Messages API). Each adapter turns a provider-neutral `ModelRequest` — stable prompt prefix, dynamic context, transcript items, tool definitions — into the exact wire envelope the upstream backend expects, streams the SSE response, and returns a single normalized `ModelResponse` plus the opaque per-turn replay state needed to continue the conversation later. The crate forbids `unsafe`.
+`agent-provider` is the model-IO boundary. It defines the `ModelProvider` trait and two adapters: `OpenAiProvider` (the private ChatGPT/Codex Responses-compatible backend, not public OpenAI API-key transport) and `AnthropicProvider` (Messages API). Each adapter turns a provider-neutral `ModelRequest` — stable prompt prefix, dynamic context, transcript items, tool definitions — into the exact wire envelope the upstream backend expects, streams the SSE response, and returns a single normalized `ModelResponse` plus the opaque per-turn replay state needed to continue the conversation later. The crate forbids `unsafe`.
 
 See [design decisions](../design-decisions.md) for *why* the provider scope is small (two providers, ChatGPT/Codex subscription transport only, no plain OpenAI API key).
 
@@ -89,7 +89,7 @@ store               = false
 stream              = true
 include             = ["reasoning.encrypted_content"]
 tool_choice         = "auto"
-reasoning.effort    = <ReasoningEffort, rejects Max>
+reasoning.effort    = <model-normalized ReasoningEffort>
 prompt_cache_key    = <cohort key>
 ```
 
@@ -97,7 +97,11 @@ prompt_cache_key    = <cohort key>
 
 `x-codex-turn-state` is sticky routing state scoped to a single `turn_id`: a value returned by an upstream request is replayed on later requests for the same turn (held in `OpenAiCodexSessionState`) and never leaks into the next turn. The `x-codex-window-id` carries a per-session window generation that bumps after compaction, mirroring Codex's "new window after compaction" signal — derived from the latest compacted turn id in the transcript when no session state is attached.
 
-OpenAI has **no** `count_tokens` impl (the backend has no `/responses/input_tokens` route); the runtime reads `usage.input_tokens` off the `response.completed` event and otherwise falls back to reactive overflow recovery.
+OpenAI has **no** `count_tokens` impl. The public API has a
+`/responses/input_tokens` route, but the private backend route returned a
+Cloudflare 403 challenge in the audited probe. The runtime reads
+`usage.input_tokens` off `response.completed` and otherwise falls back to
+reactive overflow recovery.
 
 ### Anthropic (Messages API)
 
@@ -132,12 +136,14 @@ The attribution `system[0]` fingerprint is derived from the **stable prefix** (n
 
 ### Reasoning continuity (provider replay)
 
-Because OpenAI runs stateless (`store = false`) and Anthropic preserves thinking blocks across tool calls, both adapters store every parsed output item as a `ProviderReplayItem` sidecar attached to the transcript entry. On the next request these raw blocks are replayed verbatim ahead of any synthesized representation:
+Because OpenAI runs stateless (`store = false`) and Anthropic preserves thinking blocks across tool calls, both adapters store every accepted output item as a `ProviderReplayItem` sidecar attached to the transcript entry. On the next request these raw blocks are replayed verbatim ahead of any synthesized representation:
 
-- OpenAI replays every validated stored output item, including `reasoning`
-  (encrypted via `reasoning.encrypted_content`), messages, server-originated
-  agent messages/context compaction, and local/hosted tool items. Unknown items
-  are retained only inside canonical `/responses/compact` output.
+- OpenAI strictly validates semantic message/tool-call shapes and fails closed
+  on known unsupported client actions or unknown ordinary item types. Known
+  provider-hosted/passive items validate only the stable classification
+  boundary (object plus nonempty `type`) and otherwise replay unchanged.
+  Canonical `/responses/compact` items remain opaque after the same minimum
+  shape check and exactly one native-checkpoint invariant.
 - Anthropic replays the stored `thinking` / `redacted_thinking`, `text`, `tool_use`, and `server_tool_use` blocks.
 
 When replay items exist for an assistant/compaction entry, `transcript_to_messages` / `transcript_to_response_items` emit them instead of reconstructing from `AssistantMessage`. Thinking blocks are intentionally **discarded** at the parse layer (they never become `AssistantItem`s — `AssistantItem` is `Text`/`ToolCall` only); they survive solely in the replay sidecar, keeping reasoning continuity without polluting the typed transcript.
@@ -192,8 +198,8 @@ compaction.
   unknown extensions. Every item must be an object with a nonempty string
   `type`, and the response must contain exactly one native checkpoint across
   `type = "compaction"` and the currently evidenced Codex schema alias
-  `compaction_summary`; its `encrypted_content` must be a string. The alias is
-  retained without rewriting. Assistant text may be projected separately as
+  `compaction_summary`. Checkpoint and extension payloads are opaque; the alias
+  is retained without rewriting. Assistant text may be projected separately as
   display summary, but is never substituted into replay. Missing, corrupt,
   duplicate, or non-native replay on a persisted OpenAI `CompactionSummary`
   fails request construction rather than synthesizing a user summary.
@@ -220,13 +226,17 @@ become pi-relay tool calls; unsupported client actions and arbitrary unknown
 output item types fail closed. Known hosted/passive item types remain opaque
 replay.
 
-Ordinary Anthropic success requires `message_stop` after an explicit
-`end_turn`, `stop_sequence`, or `tool_use` reason. `max_tokens` and `refusal`
-retain their existing typed terminal behavior. `pause_turn`,
-`model_context_window_exceeded`, and unknown nonempty stop reasons are
-non-successes retaining the provider reason; partial assistant output/replay is
-not returned. For both providers, EOF or `[DONE]` alone and malformed JSON are
-failures. Unknown future event types remain ignorable but never imply success.
+Ordinary Anthropic success requires `message_stop` after one or more
+`message_delta` events eventually provide an explicit `end_turn`,
+`stop_sequence`, or `tool_use` reason. Cumulative usage and compatible stop
+details merge across deltas; a missing/null stop reason is nonterminal.
+Conflicting terminal reasons/details and content events after a terminal reason
+fail closed. `max_tokens` and `refusal` retain their existing typed terminal
+behavior. `pause_turn`, `model_context_window_exceeded`, and unknown nonempty
+stop reasons are non-successes retaining the provider reason; partial assistant
+output/replay is not returned. For both providers, EOF or `[DONE]` alone and
+malformed JSON are failures. Unknown future event types remain ignorable but
+never imply success.
 
 The special Anthropic compact call uses separate strict state and requires
 `message_start`, one index-zero compaction `content_block_start`, one matching

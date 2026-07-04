@@ -11,7 +11,9 @@ This document is the overview and map. Each crate has its own reference under
 [`design-decisions.md`](design-decisions.md); the frontend wire contract is in
 [`websocket-rpc.md`](websocket-rpc.md); the React client is documented in
 [`../../packages/web/docs/web-ui.md`](../../packages/web/docs/web-ui.md); and
-in-flight future work lives under [`plans/`](plans/).
+the audited provider capability matrix is in
+[`provider-api-support.md`](provider-api-support.md). In-flight future work
+lives under [`plans/`](plans/).
 
 ## Goals
 
@@ -125,8 +127,11 @@ Implemented user-facing behavior:
   effective count from the 541,564-token gate to 15,628. Ordinary inline
   compaction blocks still fail closed at the provider boundary.
 - Provider/model-aware compaction thresholds: verified 1M Claude windows
-  default to 500k; hosted GPT-5.6 Sol/Terra/Luna use 372k windows and a 334.8k
-  threshold; older OpenAI and other windows retain the generic 85% policy.
+  default to 500k; hosted GPT-5.6 Sol/Terra/Luna currently use a historical
+  static 372k window and a 334.8k threshold; older OpenAI and other windows
+  retain the generic 85% policy. The authenticated-discovery discrepancy and
+  non-authoritative status of that GPT-5.6 value are documented in the
+  [provider API audit](provider-api-support.md#gpt-56-capability-discrepancy).
 - Turn-oriented selected-session loading: collapsed turn cards plus lazy
   per-turn detail, so normal loads do not scale with transcript size, and raw
   `provider_replay` never reaches any UI/RPC response.
@@ -193,6 +198,8 @@ Anthropic real-provider websocket tests require a raw `ANTHROPIC_API_KEY`.
 ## Where To Read Next
 
 - Per-crate detail: [`modules/`](modules/).
+- Audited provider capabilities and limitations:
+  [provider-api-support.md](provider-api-support.md).
 - Why the visible/invisible choices were made: [design-decisions.md](design-decisions.md).
 - The frontend wire contract and manual exercise plan: [websocket-rpc.md](websocket-rpc.md).
 - The React client: [`../../packages/web/docs/web-ui.md`](../../packages/web/docs/web-ui.md).

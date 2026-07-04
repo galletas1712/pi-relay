@@ -101,21 +101,9 @@ impl OpenAiCodexSessionState {
 mod ordinary_policy_tests {
     use super::*;
 
-    fn assert_openai_output_item_rejected(item: Value) {
-        let sse = format!(
-            "data: {}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n",
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": item,
-            }),
-        );
-        assert!(parse_responses_sse(&sse, ProviderKind::OpenAi).is_err());
-    }
-
     #[test]
-    fn responses_sse_accepts_pinned_codex_messages_without_status_annotations_or_id() {
-        let messages = [
+    fn responses_sse_preserves_supported_semantic_and_passive_items() {
+        let items = vec![
             json!({
                 "type": "message",
                 "role": "assistant",
@@ -127,270 +115,61 @@ mod ordinary_policy_tests {
                 "role": "assistant",
                 "content": [{ "type": "output_text", "text": "with id" }],
             }),
-        ];
-        let sse = format!(
-            "data: {}\n\ndata: {}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n",
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": messages[0],
-            }),
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 1,
-                "item": messages[1],
-            }),
-        );
-
-        let response =
-            parse_responses_sse(&sse, ProviderKind::OpenAi).expect("pinned messages parse");
-        assert_eq!(response.assistant.text(), "without idwith id");
-        assert_eq!(
-            response
-                .provider_replay
-                .iter()
-                .map(ProviderReplayItem::raw_value)
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            messages
-        );
-    }
-
-    #[test]
-    fn responses_sse_translates_plaintext_agent_message_and_replays_encrypted_agent_message() {
-        let plaintext = json!({
-            "type": "agent_message",
-            "author": "/root/worker",
-            "recipient": "/root",
-            "content": [
-                { "type": "input_text", "text": "worker result" },
-                { "type": "input_text", "text": "continued" },
-            ],
-        });
-        let encrypted = json!({
-            "type": "agent_message",
-            "id": "amsg_2",
-            "author": "/root/worker",
-            "recipient": "/root",
-            "content": [{ "type": "encrypted_content", "encrypted_content": "opaque" }],
-        });
-        let sse = format!(
-            "data: {}\n\ndata: {}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n",
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": plaintext,
-            }),
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 1,
-                "item": encrypted,
-            }),
-        );
-
-        let response =
-            parse_responses_sse(&sse, ProviderKind::OpenAi).expect("agent messages parse");
-        assert_eq!(response.assistant.text(), "worker result\ncontinued");
-        assert_eq!(
-            response
-                .provider_replay
-                .iter()
-                .map(ProviderReplayItem::raw_value)
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![plaintext, encrypted]
-        );
-    }
-
-    #[test]
-    fn responses_sse_preserves_context_compaction_as_opaque_replay() {
-        let compacted = json!({
-            "type": "context_compaction",
-            "encrypted_content": "opaque-checkpoint",
-        });
-        let marker = json!({ "type": "context_compaction" });
-        let sse = format!(
-            "data: {}\n\ndata: {}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\"}}}}\n\n",
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": compacted,
-            }),
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 1,
-                "item": marker,
-            }),
-        );
-
-        let response =
-            parse_responses_sse(&sse, ProviderKind::OpenAi).expect("context compaction parses");
-        assert!(response.assistant.items.is_empty());
-        assert_eq!(
-            response
-                .provider_replay
-                .iter()
-                .map(ProviderReplayItem::raw_value)
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            vec![compacted, marker]
-        );
-    }
-
-    #[test]
-    fn responses_sse_rejects_malformed_agent_message_and_context_compaction() {
-        for item in [
-            json!({
-                "type": "agent_message",
-                "recipient": "/root",
-                "content": [],
-            }),
             json!({
                 "type": "agent_message",
                 "author": "/root/worker",
                 "recipient": "/root",
-                "content": "text",
+                "content": [
+                    { "type": "input_text", "text": "worker result" },
+                    { "type": "input_text", "text": "continued" },
+                ],
             }),
             json!({
                 "type": "agent_message",
+                "id": "amsg_2",
                 "author": "/root/worker",
                 "recipient": "/root",
-                "content": [{ "type": "input_text" }],
-            }),
-            json!({
-                "type": "agent_message",
-                "author": "/root/worker",
-                "recipient": "/root",
-                "content": [{ "type": "future_content", "text": "hello" }],
+                "content": [{ "type": "encrypted_content", "encrypted_content": "opaque" }],
             }),
             json!({
                 "type": "context_compaction",
-                "id": 7,
+                "encrypted_content": "opaque-checkpoint",
+                "future_extension": { "must_survive": true },
             }),
             json!({
                 "type": "context_compaction",
-                "encrypted_content": 7,
             }),
-        ] {
-            assert_openai_output_item_rejected(item);
-        }
-    }
-
-    #[test]
-    fn responses_sse_accepts_every_known_passive_item_with_real_schema() {
-        let items = vec![
-            json!({
-                "type": "reasoning",
-                "summary": [{ "type": "summary_text", "text": "summary" }],
-                "encrypted_content": "opaque",
-            }),
+            // Pinned Codex 98d28aa accepts all of these web-search shapes.
             json!({
                 "type": "web_search_call",
-                "id": "ws_1",
                 "status": "completed",
                 "action": { "type": "search", "query": "rust" },
             }),
             json!({
-                "type": "file_search_call",
-                "id": "fs_1",
-                "queries": ["rust"],
-                "status": "completed",
-                "results": [],
+                "type": "web_search_call",
+                "status": "open",
+                "action": { "type": "open_page", "url": "https://example.com" },
             }),
             json!({
-                "type": "code_interpreter_call",
-                "id": "ci_1",
-                "container_id": "container_1",
-                "status": "completed",
+                "type": "web_search_call",
+                "id": "ws_partial",
+                "status": "in_progress",
+            }),
+            // Current public Responses output permits failed image results to
+            // be null or absent. Neither shape requires a client response.
+            json!({
+                "type": "image_generation_call",
+                "status": "failed",
+                "result": null,
             }),
             json!({
                 "type": "image_generation_call",
-                "result": "opaque-image",
-                "status": "completed",
+                "status": "failed",
             }),
-            json!({
-                "type": "mcp_call",
-                "id": "mcp_1",
-                "arguments": "{}",
-                "name": "search",
-                "server_label": "docs",
-                "status": "completed",
-                "output": "ok",
-            }),
-            json!({
-                "type": "mcp_list_tools",
-                "id": "mcpl_1",
-                "server_label": "docs",
-                "tools": [{ "name": "search", "input_schema": {} }],
-            }),
+            // Hosted tool search is passive only when the provider executes it.
             json!({
                 "type": "tool_search_call",
                 "execution": "server",
-                "arguments": { "query": "search" },
-            }),
-            json!({
-                "type": "tool_search_output",
-                "tools": [],
-                "execution": "server",
-                "status": "completed",
-            }),
-            json!({
-                "type": "additional_tools",
-                "role": "developer",
-                "tools": [],
-            }),
-            json!({
-                "type": "compaction",
-                "encrypted_content": "opaque-compaction",
-            }),
-            json!({
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": "result",
-            }),
-            json!({
-                "type": "custom_tool_call_output",
-                "call_id": "call_2",
-                "output": [{ "type": "input_text", "text": "result" }],
-            }),
-            json!({
-                "type": "local_shell_call_output",
-                "id": "shell_1",
-                "output": "{\"stdout\":\"ok\"}",
-            }),
-            json!({
-                "type": "shell_call_output",
-                "id": "shell_output_2",
-                "call_id": "shell_2",
-                "output": [{
-                    "stdout": "ok",
-                    "stderr": "",
-                    "outcome": { "type": "exit", "exit_code": 0 },
-                }],
-                "status": "completed",
-            }),
-            json!({
-                "type": "apply_patch_call_output",
-                "id": "patch_output_1",
-                "call_id": "patch_1",
-                "status": "completed",
-                "output": "Done!",
-            }),
-            json!({
-                "type": "computer_call_output",
-                "id": "computer_output_1",
-                "call_id": "computer_1",
-                "output": {
-                    "type": "computer_screenshot",
-                    "image_url": "data:image/png;base64,abc",
-                },
-                "status": "completed",
-            }),
-            json!({
-                "type": "mcp_approval_response",
-                "id": "approval_response_1",
-                "approval_request_id": "approval_1",
-                "approve": true,
             }),
         ];
         let mut sse = String::new();
@@ -408,9 +187,12 @@ mod ordinary_policy_tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
         );
 
-        let response =
-            parse_responses_sse(&sse, ProviderKind::OpenAi).expect("known passive items parse");
-        assert!(response.assistant.items.is_empty());
+        let response = parse_responses_sse(&sse, ProviderKind::OpenAi)
+            .expect("supported semantic and passive items parse");
+        assert_eq!(
+            response.assistant.text(),
+            "without idwith idworker result\ncontinued"
+        );
         assert_eq!(
             response
                 .provider_replay
@@ -423,8 +205,8 @@ mod ordinary_policy_tests {
     }
 
     #[test]
-    fn responses_sse_rejects_type_only_or_malformed_known_passive_items() {
-        let item_types = [
+    fn responses_sse_accepts_known_passive_types_without_cloning_their_schemas() {
+        let mut items = [
             "reasoning",
             "web_search_call",
             "file_search_call",
@@ -432,7 +214,6 @@ mod ordinary_policy_tests {
             "image_generation_call",
             "mcp_call",
             "mcp_list_tools",
-            "tool_search_call",
             "tool_search_output",
             "additional_tools",
             "compaction",
@@ -443,114 +224,42 @@ mod ordinary_policy_tests {
             "apply_patch_call_output",
             "computer_call_output",
             "mcp_approval_response",
-        ];
-        for item_type in item_types {
-            assert_openai_output_item_rejected(json!({ "type": item_type }));
+            "context_compaction",
+        ]
+        .into_iter()
+        .map(|item_type| json!({ "type": item_type }))
+        .collect::<Vec<_>>();
+        items.push(json!({
+            "type": "tool_search_call",
+            "execution": "server",
+        }));
+
+        let mut sse = String::new();
+        for (output_index, item) in items.iter().enumerate() {
+            sse.push_str(&format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                })
+            ));
         }
-        for item in [
-            json!({
-                "type": "reasoning",
-                "summary": [{ "type": "summary_text" }],
-            }),
-            json!({
-                "type": "web_search_call",
-                "id": "ws_1",
-                "status": "future",
-                "action": { "type": "search", "query": "rust" },
-            }),
-            json!({
-                "type": "file_search_call",
-                "id": "fs_1",
-                "queries": [7],
-                "status": "completed",
-            }),
-            json!({
-                "type": "file_search_call",
-                "id": "fs_1",
-                "queries": ["rust"],
-                "status": "completed",
-                "results": [7],
-            }),
-            json!({
-                "type": "code_interpreter_call",
-                "id": "ci_1",
-                "code": null,
-                "container_id": "container_1",
-                "outputs": [{ "type": "logs" }],
-                "status": "completed",
-            }),
-            json!({
-                "type": "image_generation_call",
-                "id": "ig_1",
-                "status": "completed",
-            }),
-            json!({
-                "type": "image_generation_call",
-                "id": "ig_1",
-                "result": "opaque",
-                "status": "completed",
-                "revised_prompt": 7,
-            }),
-            json!({
-                "type": "tool_search_call",
-                "execution": "server",
-                "tools": [],
-            }),
-            json!({
-                "type": "tool_search_output",
-                "execution": "server",
-                "tools": [],
-            }),
-            json!({
-                "type": "tool_search_output",
-                "execution": "server",
-                "status": "completed",
-            }),
-            json!({
-                "type": "tool_search_output",
-                "execution": "future",
-                "status": "completed",
-                "tools": [],
-            }),
-            json!({
-                "type": "mcp_list_tools",
-                "id": "mcpl_1",
-                "server_label": "docs",
-                "tools": [{ "name": "search" }],
-            }),
-            json!({
-                "type": "shell_call_output",
-                "call_id": "shell_1",
-                "output": [{ "stdout": "ok", "stderr": "", "outcome": { "type": "exit" } }],
-                "status": "completed",
-            }),
-            json!({
-                "type": "apply_patch_call_output",
-                "call_id": "patch_1",
-                "status": "completed",
-            }),
-            json!({
-                "type": "computer_call_output",
-                "call_id": "computer_1",
-                "output": { "type": "future_screenshot" },
-                "status": "completed",
-            }),
-            json!({
-                "type": "mcp_approval_response",
-                "approval_request_id": "approval_1",
-                "approve": true,
-            }),
-            json!({
-                "type": "reasoning_summary",
-                "summary": "stale ordinary alias",
-            }),
-            json!({
-                "type": "compaction_summary",
-                "encrypted_content": "compact-only alias",
-            }),
-        ] {
-            assert_openai_output_item_rejected(item);
-        }
+        sse.push_str(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        );
+
+        let response =
+            parse_responses_sse(&sse, ProviderKind::OpenAi).expect("known passive types parse");
+        assert_eq!(
+            response
+                .provider_replay
+                .iter()
+                .map(ProviderReplayItem::raw_value)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            items
+        );
     }
 }
 
@@ -610,30 +319,6 @@ impl OpenAiCodexSessionState {
     }
 }
 
-fn validate_openai_optional_id(item: &Value, item_type: &str) -> ProviderResult<()> {
-    match item.get("id") {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(id)) if !id.is_empty() => Ok(()),
-        Some(_) => Err(ProviderError::Provider(format!(
-            "OpenAI {item_type} id was not a nonempty string"
-        ))),
-    }
-}
-
-fn validate_openai_optional_status(
-    item: &Value,
-    item_type: &str,
-    allowed: &[&str],
-) -> ProviderResult<()> {
-    match item.get("status") {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::String(status)) if allowed.contains(&status.as_str()) => Ok(()),
-        Some(status) => Err(ProviderError::Provider(format!(
-            "OpenAI {item_type} had invalid status {status}"
-        ))),
-    }
-}
-
 fn openai_required_string<'a>(
     item: &'a Value,
     item_type: &str,
@@ -661,7 +346,6 @@ fn openai_required_array<'a>(
 }
 
 fn validate_openai_agent_message(item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, "agent_message")?;
     openai_required_string(item, "agent_message", "author")?;
     openai_required_string(item, "agent_message", "recipient")?;
     for part in openai_required_array(item, "agent_message", "content")? {
@@ -691,12 +375,6 @@ fn validate_openai_agent_message(item: &Value) -> ProviderResult<()> {
 }
 
 fn validate_openai_function_call(item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, "function_call")?;
-    validate_openai_optional_status(
-        item,
-        "function_call",
-        &["in_progress", "completed", "incomplete"],
-    )?;
     openai_required_string(item, "function_call", "call_id")?;
     openai_required_string(item, "function_call", "name")?;
     if item.get("arguments").and_then(Value::as_str).is_none() {
@@ -704,17 +382,10 @@ fn validate_openai_function_call(item: &Value) -> ProviderResult<()> {
             "OpenAI function_call missing string arguments".to_string(),
         ));
     }
-    validate_openai_optional_nullable_string(item, "function_call", "namespace")?;
     Ok(())
 }
 
 fn validate_openai_custom_tool_call(item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, "custom_tool_call")?;
-    validate_openai_optional_status(
-        item,
-        "custom_tool_call",
-        &["in_progress", "completed", "incomplete"],
-    )?;
     openai_required_string(item, "custom_tool_call", "call_id")?;
     openai_required_string(item, "custom_tool_call", "name")?;
     if item.get("input").and_then(Value::as_str).is_none() {
@@ -722,615 +393,78 @@ fn validate_openai_custom_tool_call(item: &Value) -> ProviderResult<()> {
             "OpenAI custom_tool_call missing string input".to_string(),
         ));
     }
-    validate_openai_optional_nullable_string(item, "custom_tool_call", "namespace")?;
     Ok(())
 }
 
-fn validate_openai_reasoning(item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, "reasoning")?;
-    validate_openai_optional_status(
-        item,
-        "reasoning",
-        &["in_progress", "completed", "incomplete"],
-    )?;
-    for part in openai_required_array(item, "reasoning", "summary")? {
-        if openai_replay_item_type(part, "OpenAI reasoning summary part")? != "summary_text"
-            || part.get("text").and_then(Value::as_str).is_none()
-        {
-            return Err(ProviderError::Provider(
-                "OpenAI reasoning summary contained malformed summary_text".to_string(),
-            ));
-        }
-    }
-    if let Some(content) = item.get("content") {
-        let content = match content {
-            Value::Null => None,
-            Value::Array(content) => Some(content),
-            _ => {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiOrdinaryItemClass {
+    Message,
+    AgentMessage,
+    FunctionCall,
+    CustomToolCall,
+    HostedOrPassive,
+    ClientExecuted,
+}
+
+/// Classify ordinary Responses output at the adapter safety boundary.
+///
+/// Semantic items are validated only where pi-relay projects fields into its
+/// normalized response. Known hosted/passive items are replayed opaquely:
+/// cloning their evolving optional schemas here caused valid provider output
+/// to fail. Known client actions fail closed, as do unknown item types.
+fn classify_openai_ordinary_item(
+    item_type: &str,
+    item: &Value,
+) -> ProviderResult<OpenAiOrdinaryItemClass> {
+    let class = match item_type {
+        "message" => OpenAiOrdinaryItemClass::Message,
+        "agent_message" => OpenAiOrdinaryItemClass::AgentMessage,
+        "function_call" => OpenAiOrdinaryItemClass::FunctionCall,
+        "custom_tool_call" => OpenAiOrdinaryItemClass::CustomToolCall,
+        "tool_search_call" => match item.get("execution").and_then(Value::as_str) {
+            Some("server") => OpenAiOrdinaryItemClass::HostedOrPassive,
+            Some("client") => OpenAiOrdinaryItemClass::ClientExecuted,
+            Some(execution) => {
+                return Err(ProviderError::Provider(format!(
+                    "OpenAI tool_search_call had unknown execution mode {execution}"
+                )))
+            }
+            None => {
                 return Err(ProviderError::Provider(
-                    "OpenAI reasoning content was not an array or null".to_string(),
+                    "OpenAI tool_search_call missing string execution mode".to_string(),
                 ))
             }
-        };
-        for part in content.into_iter().flatten() {
-            if !matches!(
-                openai_replay_item_type(part, "OpenAI reasoning content part")?,
-                "reasoning_text" | "text"
-            ) || part.get("text").and_then(Value::as_str).is_none()
-            {
-                return Err(ProviderError::Provider(
-                    "OpenAI reasoning content contained malformed text".to_string(),
-                ));
-            }
-        }
-    }
-    if !matches!(
-        item.get("encrypted_content"),
-        None | Some(Value::Null | Value::String(_))
-    ) {
-        return Err(ProviderError::Provider(
-            "OpenAI reasoning encrypted_content was not a string or null".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_openai_web_search_call(item: &Value) -> ProviderResult<()> {
-    openai_required_string(item, "web_search_call", "id")?;
-    let status = openai_required_string(item, "web_search_call", "status")?;
-    if !matches!(status, "in_progress" | "searching" | "completed" | "failed") {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI web_search_call had invalid status {status}"
-        )));
-    }
-    let action = item
-        .get("action")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            ProviderError::Provider("OpenAI web_search_call missing action object".to_string())
-        })?;
-    let action = Value::Object(action.clone());
-    match openai_replay_item_type(&action, "OpenAI web_search_call action")? {
-        "search" => {
-            if let Some(queries) = action.get("queries") {
-                validate_openai_string_array(queries, "web_search_call search queries")?;
-            }
-            if !matches!(action.get("query"), None | Some(Value::String(_))) {
-                return Err(ProviderError::Provider(
-                    "OpenAI web_search_call search query was not a string".to_string(),
-                ));
-            }
-            if let Some(sources) = action.get("sources") {
-                for source in sources.as_array().ok_or_else(|| {
-                    ProviderError::Provider(
-                        "OpenAI web_search_call search sources was not an array".to_string(),
-                    )
-                })? {
-                    if openai_replay_item_type(source, "OpenAI web search source")? != "url" {
-                        return Err(ProviderError::Provider(
-                            "OpenAI web_search_call had unsupported source type".to_string(),
-                        ));
-                    }
-                    openai_required_string(source, "web_search_call source", "url")?;
-                }
-            }
-        }
-        "open_page" => {
-            if !matches!(
-                action.get("url"),
-                None | Some(Value::Null | Value::String(_))
-            ) {
-                return Err(ProviderError::Provider(
-                    "OpenAI web_search_call open_page url was not a string or null".to_string(),
-                ));
-            }
-        }
-        "find" | "find_in_page" => {
-            openai_required_string(&action, "web_search_call find action", "url")?;
-            openai_required_string(&action, "web_search_call find action", "pattern")?;
-        }
-        action_type => {
+        },
+        "local_shell_call"
+        | "shell_call"
+        | "apply_patch_call"
+        | "computer_call"
+        | "mcp_approval_request" => OpenAiOrdinaryItemClass::ClientExecuted,
+        "reasoning"
+        | "web_search_call"
+        | "file_search_call"
+        | "code_interpreter_call"
+        | "image_generation_call"
+        | "mcp_call"
+        | "mcp_list_tools"
+        | "tool_search_output"
+        | "additional_tools"
+        | "compaction"
+        | "context_compaction"
+        | "function_call_output"
+        | "custom_tool_call_output"
+        | "local_shell_call_output"
+        | "shell_call_output"
+        | "apply_patch_call_output"
+        | "computer_call_output"
+        | "mcp_approval_response" => OpenAiOrdinaryItemClass::HostedOrPassive,
+        _ => {
             return Err(ProviderError::Provider(format!(
-                "OpenAI web_search_call had unsupported action type {action_type}"
+                "OpenAI returned unknown output item type {item_type}; refusing to assume it requires no client response"
             )))
         }
-    }
-    Ok(())
-}
-
-fn validate_openai_file_search_call(item: &Value) -> ProviderResult<()> {
-    openai_required_string(item, "file_search_call", "id")?;
-    validate_openai_string_array(
-        item.get("queries").ok_or_else(|| {
-            ProviderError::Provider("OpenAI file_search_call missing queries".to_string())
-        })?,
-        "file_search_call queries",
-    )?;
-    let status = openai_required_string(item, "file_search_call", "status")?;
-    if !matches!(
-        status,
-        "in_progress" | "searching" | "completed" | "incomplete" | "failed"
-    ) {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI file_search_call had invalid status {status}"
-        )));
-    }
-    match item.get("results") {
-        None | Some(Value::Null) => {}
-        Some(Value::Array(results)) => {
-            for result in results {
-                if !result.is_object() {
-                    return Err(ProviderError::Provider(
-                        "OpenAI file_search_call contained a non-object result".to_string(),
-                    ));
-                }
-                if let Some(attributes) = result.get("attributes") {
-                    if !matches!(attributes, Value::Null | Value::Object(_)) {
-                        return Err(ProviderError::Provider(
-                            "OpenAI file_search_call result attributes was not an object or null"
-                                .to_string(),
-                        ));
-                    }
-                }
-                for field in ["file_id", "filename", "text"] {
-                    if !matches!(result.get(field), None | Some(Value::String(_))) {
-                        return Err(ProviderError::Provider(format!(
-                            "OpenAI file_search_call result {field} was not a string"
-                        )));
-                    }
-                }
-                if result.get("score").is_some_and(|score| !score.is_number()) {
-                    return Err(ProviderError::Provider(
-                        "OpenAI file_search_call result score was not a number".to_string(),
-                    ));
-                }
-            }
-        }
-        Some(_) => {
-            return Err(ProviderError::Provider(
-                "OpenAI file_search_call results was not an array or null".to_string(),
-            ))
-        }
-    }
-    Ok(())
-}
-
-fn validate_openai_code_interpreter_call(item: &Value) -> ProviderResult<()> {
-    openai_required_string(item, "code_interpreter_call", "id")?;
-    openai_required_string(item, "code_interpreter_call", "container_id")?;
-    if !matches!(
-        item.get("code"),
-        None | Some(Value::Null | Value::String(_))
-    ) {
-        return Err(ProviderError::Provider(
-            "OpenAI code_interpreter_call code was not a string or null".to_string(),
-        ));
-    }
-    if !matches!(
-        item.get("outputs"),
-        None | Some(Value::Null | Value::Array(_))
-    ) {
-        return Err(ProviderError::Provider(
-            "OpenAI code_interpreter_call outputs was not an array or null".to_string(),
-        ));
-    }
-    if let Some(Value::Array(outputs)) = item.get("outputs") {
-        for output in outputs {
-            match openai_replay_item_type(output, "OpenAI code_interpreter output")? {
-                "logs" if output.get("logs").and_then(Value::as_str).is_some() => {}
-                "image" if output.get("url").and_then(Value::as_str).is_some() => {}
-                output_type => {
-                    return Err(ProviderError::Provider(format!(
-                        "OpenAI code_interpreter_call had malformed {output_type} output"
-                    )))
-                }
-            }
-        }
-    }
-    let status = openai_required_string(item, "code_interpreter_call", "status")?;
-    if !matches!(
-        status,
-        "in_progress" | "completed" | "incomplete" | "interpreting" | "failed"
-    ) {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI code_interpreter_call had invalid status {status}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_openai_image_generation_call(item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, "image_generation_call")?;
-    if !matches!(item.get("result"), Some(Value::String(_))) {
-        return Err(ProviderError::Provider(
-            "OpenAI image_generation_call missing string result".to_string(),
-        ));
-    }
-    let status = openai_required_string(item, "image_generation_call", "status")?;
-    if !matches!(
-        status,
-        "in_progress" | "completed" | "generating" | "failed"
-    ) {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI image_generation_call had invalid status {status}"
-        )));
-    }
-    if !matches!(
-        item.get("revised_prompt"),
-        None | Some(Value::Null | Value::String(_))
-    ) {
-        return Err(ProviderError::Provider(
-            "OpenAI image_generation_call revised_prompt was not a string or null".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_openai_mcp_call(item: &Value) -> ProviderResult<()> {
-    for field in ["id", "arguments", "name", "server_label"] {
-        openai_required_string(item, "mcp_call", field)?;
-    }
-    validate_openai_optional_status(
-        item,
-        "mcp_call",
-        &[
-            "in_progress",
-            "completed",
-            "incomplete",
-            "calling",
-            "failed",
-        ],
-    )?;
-    for field in ["approval_request_id", "error", "output"] {
-        if !matches!(item.get(field), None | Some(Value::Null | Value::String(_))) {
-            return Err(ProviderError::Provider(format!(
-                "OpenAI mcp_call {field} was not a string or null"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_openai_mcp_list_tools(item: &Value) -> ProviderResult<()> {
-    openai_required_string(item, "mcp_list_tools", "id")?;
-    openai_required_string(item, "mcp_list_tools", "server_label")?;
-    for tool in openai_required_array(item, "mcp_list_tools", "tools")? {
-        openai_required_string(tool, "mcp_list_tools tool", "name")?;
-        if !tool.get("input_schema").is_some_and(Value::is_object) {
-            return Err(ProviderError::Provider(
-                "OpenAI mcp_list_tools tool missing input_schema object".to_string(),
-            ));
-        }
-        if !matches!(
-            tool.get("description"),
-            None | Some(Value::Null | Value::String(_))
-        ) {
-            return Err(ProviderError::Provider(
-                "OpenAI mcp_list_tools tool description was not a string or null".to_string(),
-            ));
-        }
-        if !matches!(
-            tool.get("annotations"),
-            None | Some(Value::Null | Value::Object(_))
-        ) {
-            return Err(ProviderError::Provider(
-                "OpenAI mcp_list_tools tool annotations was not an object or null".to_string(),
-            ));
-        }
-    }
-    if !matches!(
-        item.get("error"),
-        None | Some(Value::Null | Value::String(_))
-    ) {
-        return Err(ProviderError::Provider(
-            "OpenAI mcp_list_tools error was not a string or null".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_openai_server_tool_search_call(item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, "tool_search_call")?;
-    validate_openai_optional_nullable_string(item, "tool_search_call", "call_id")?;
-    if item.get("execution").and_then(Value::as_str) != Some("server") {
-        return Err(ProviderError::Provider(
-            "OpenAI returned unsupported client-executed action type tool_search_call".to_string(),
-        ));
-    }
-    if item.get("arguments").is_none() {
-        return Err(ProviderError::Provider(
-            "OpenAI tool_search_call missing arguments".to_string(),
-        ));
-    }
-    validate_openai_optional_status(
-        item,
-        "tool_search_call",
-        &["in_progress", "completed", "incomplete"],
-    )
-}
-
-fn validate_openai_tool_search_output(item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, "tool_search_output")?;
-    validate_openai_optional_nullable_string(item, "tool_search_output", "call_id")?;
-    openai_required_array(item, "tool_search_output", "tools")?;
-    let execution = openai_required_string(item, "tool_search_output", "execution")?;
-    if !matches!(execution, "server" | "client") {
-        return Err(ProviderError::Provider(
-            "OpenAI tool_search_output had invalid execution".to_string(),
-        ));
-    }
-    let status = openai_required_string(item, "tool_search_output", "status")?;
-    if !matches!(status, "in_progress" | "completed" | "incomplete") {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI tool_search_output had invalid status {status}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_openai_additional_tools(item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, "additional_tools")?;
-    openai_required_string(item, "additional_tools", "role")?;
-    openai_required_array(item, "additional_tools", "tools")?;
-    Ok(())
-}
-
-fn validate_openai_context_compaction(item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, "context_compaction")?;
-    if !matches!(
-        item.get("encrypted_content"),
-        None | Some(Value::Null | Value::String(_))
-    ) {
-        return Err(ProviderError::Provider(
-            "OpenAI context_compaction encrypted_content was not a string or null".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_openai_call_output(item_type: &str, item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, item_type)?;
-    openai_required_string(item, item_type, "call_id")?;
-    if !matches!(item.get("output"), Some(Value::String(_) | Value::Array(_))) {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI {item_type} missing string or array output"
-        )));
-    }
-    if let Some(Value::Array(output)) = item.get("output") {
-        for part in output {
-            let part_type = openai_replay_item_type(part, "OpenAI call output content part")?;
-            match part_type {
-                "input_text" => {
-                    if part.get("text").and_then(Value::as_str).is_none() {
-                        return Err(ProviderError::Provider(format!(
-                            "OpenAI {item_type} input_text output missing text"
-                        )));
-                    }
-                }
-                "input_image" => {
-                    let has_image_url = part.get("image_url").and_then(Value::as_str).is_some();
-                    let has_file_id = part.get("file_id").and_then(Value::as_str).is_some();
-                    if !has_image_url && !has_file_id {
-                        return Err(ProviderError::Provider(format!(
-                            "OpenAI {item_type} input_image output missing image_url or file_id"
-                        )));
-                    }
-                    match part.get("detail") {
-                        None if has_image_url => {}
-                        Some(Value::String(detail))
-                            if matches!(detail.as_str(), "low" | "high" | "auto" | "original") => {}
-                        _ => {
-                            return Err(ProviderError::Provider(format!(
-                                "OpenAI {item_type} input_image output had invalid detail"
-                            )))
-                        }
-                    }
-                }
-                "input_file" => {
-                    if part.get("file_id").and_then(Value::as_str).is_none()
-                        && part.get("file_data").and_then(Value::as_str).is_none()
-                        && part.get("file_url").and_then(Value::as_str).is_none()
-                    {
-                        return Err(ProviderError::Provider(format!(
-                            "OpenAI {item_type} input_file output missing file content"
-                        )));
-                    }
-                }
-                "encrypted_content" => {
-                    openai_required_string(
-                        part,
-                        "call output encrypted_content",
-                        "encrypted_content",
-                    )?;
-                }
-                _ => {
-                    return Err(ProviderError::Provider(format!(
-                        "OpenAI {item_type} had unsupported output part type {part_type}"
-                    )))
-                }
-            }
-        }
-    }
-    validate_openai_optional_nullable_string(item, item_type, "name")?;
-    validate_openai_optional_status(item, item_type, &["in_progress", "completed", "incomplete"])
-}
-
-fn validate_openai_local_shell_call_output(item: &Value) -> ProviderResult<()> {
-    openai_required_string(item, "local_shell_call_output", "id")?;
-    if item.get("output").and_then(Value::as_str).is_none() {
-        return Err(ProviderError::Provider(
-            "OpenAI local_shell_call_output missing string output".to_string(),
-        ));
-    }
-    validate_openai_optional_status(
-        item,
-        "local_shell_call_output",
-        &["in_progress", "completed", "incomplete"],
-    )
-}
-
-fn validate_openai_shell_call_output(item: &Value) -> ProviderResult<()> {
-    openai_required_string(item, "shell_call_output", "id")?;
-    openai_required_string(item, "shell_call_output", "call_id")?;
-    for output in openai_required_array(item, "shell_call_output", "output")? {
-        if output.get("stdout").and_then(Value::as_str).is_none()
-            || output.get("stderr").and_then(Value::as_str).is_none()
-        {
-            return Err(ProviderError::Provider(
-                "OpenAI shell_call_output chunk missing stdout or stderr".to_string(),
-            ));
-        }
-        let outcome = output
-            .get("outcome")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                ProviderError::Provider(
-                    "OpenAI shell_call_output chunk missing outcome object".to_string(),
-                )
-            })?;
-        match outcome.get("type").and_then(Value::as_str) {
-            Some("timeout") => {}
-            Some("exit") if outcome.get("exit_code").and_then(Value::as_i64).is_some() => {}
-            _ => {
-                return Err(ProviderError::Provider(
-                    "OpenAI shell_call_output chunk had malformed outcome".to_string(),
-                ))
-            }
-        }
-    }
-    if item
-        .get("max_output_length")
-        .is_some_and(|value| value.as_u64().is_none())
-    {
-        return Err(ProviderError::Provider(
-            "OpenAI shell_call_output max_output_length was not an unsigned integer".to_string(),
-        ));
-    }
-    let status = openai_required_string(item, "shell_call_output", "status")?;
-    if !matches!(status, "in_progress" | "completed" | "incomplete") {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI shell_call_output had invalid status {status}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_openai_apply_patch_call_output(item: &Value) -> ProviderResult<()> {
-    openai_required_string(item, "apply_patch_call_output", "id")?;
-    openai_required_string(item, "apply_patch_call_output", "call_id")?;
-    let status = openai_required_string(item, "apply_patch_call_output", "status")?;
-    if !matches!(status, "completed" | "failed") {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI apply_patch_call_output had invalid status {status}"
-        )));
-    }
-    if !matches!(
-        item.get("output"),
-        None | Some(Value::Null | Value::String(_))
-    ) {
-        return Err(ProviderError::Provider(
-            "OpenAI apply_patch_call_output output was not a string or null".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_openai_computer_call_output(item: &Value) -> ProviderResult<()> {
-    openai_required_string(item, "computer_call_output", "id")?;
-    openai_required_string(item, "computer_call_output", "call_id")?;
-    let output = item
-        .get("output")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            ProviderError::Provider("OpenAI computer_call_output missing output object".to_string())
-        })?;
-    if output.get("type").and_then(Value::as_str) != Some("computer_screenshot") {
-        return Err(ProviderError::Provider(
-            "OpenAI computer_call_output had invalid screenshot type".to_string(),
-        ));
-    }
-    for field in ["file_id", "image_url"] {
-        if !matches!(output.get(field), None | Some(Value::String(_))) {
-            return Err(ProviderError::Provider(format!(
-                "OpenAI computer_call_output {field} was not a string"
-            )));
-        }
-    }
-    if let Some(checks) = item.get("acknowledged_safety_checks") {
-        for check in checks.as_array().ok_or_else(|| {
-            ProviderError::Provider(
-                "OpenAI computer_call_output acknowledged_safety_checks was not an array"
-                    .to_string(),
-            )
-        })? {
-            openai_required_string(check, "computer_call_output safety check", "id")?;
-            for field in ["code", "message"] {
-                if !matches!(
-                    check.get(field),
-                    None | Some(Value::Null | Value::String(_))
-                ) {
-                    return Err(ProviderError::Provider(format!(
-                        "OpenAI computer_call_output safety check {field} was not a string or null"
-                    )));
-                }
-            }
-        }
-    }
-    let status = openai_required_string(item, "computer_call_output", "status")?;
-    if !matches!(
-        status,
-        "in_progress" | "completed" | "incomplete" | "failed"
-    ) {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI computer_call_output had invalid status {status}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_openai_mcp_approval_response(item: &Value) -> ProviderResult<()> {
-    openai_required_string(item, "mcp_approval_response", "id")?;
-    openai_required_string(item, "mcp_approval_response", "approval_request_id")?;
-    if item.get("approve").and_then(Value::as_bool).is_none() {
-        return Err(ProviderError::Provider(
-            "OpenAI mcp_approval_response missing boolean approve".to_string(),
-        ));
-    }
-    if !matches!(
-        item.get("reason"),
-        None | Some(Value::Null | Value::String(_))
-    ) {
-        return Err(ProviderError::Provider(
-            "OpenAI mcp_approval_response reason was not a string or null".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_openai_optional_nullable_string(
-    item: &Value,
-    item_type: &str,
-    field: &str,
-) -> ProviderResult<()> {
-    if matches!(item.get(field), None | Some(Value::Null | Value::String(_))) {
-        Ok(())
-    } else {
-        Err(ProviderError::Provider(format!(
-            "OpenAI {item_type} {field} was not a string or null"
-        )))
-    }
-}
-
-fn validate_openai_string_array(value: &Value, context: &str) -> ProviderResult<()> {
-    let values = value
-        .as_array()
-        .ok_or_else(|| ProviderError::Provider(format!("OpenAI {context} was not an array")))?;
-    if values.iter().any(|value| !value.is_string()) {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI {context} contained a non-string value"
-        )));
-    }
-    Ok(())
+    };
+    Ok(class)
 }
 
 fn response_daemon_tool_call_item(observation: &agent_vocab::DaemonToolObservation) -> Value {
@@ -1447,12 +581,8 @@ fn parse_compact_response(text: &str) -> ProviderResult<ProviderCompactionRespon
     let mut compaction_count = 0;
     let mut summary_parts = Vec::new();
     for item in output {
-        let item_type = openai_replay_item_type(item, "OpenAI compact output item")?;
-        if item_type == "message" {
-            validate_openai_compact_message(item)?;
-        }
+        openai_replay_item_type(item, "OpenAI compact output item")?;
         if is_openai_compaction_item(item) {
-            validate_openai_compaction_item(item)?;
             compaction_count += 1;
         }
         collect_compact_summary_text(item, &mut summary_parts);
@@ -1518,55 +648,6 @@ fn openai_replay_item_type<'a>(item: &'a Value, context: &str) -> ProviderResult
         .and_then(Value::as_str)
         .filter(|item_type| !item_type.is_empty())
         .ok_or_else(|| ProviderError::Provider(format!("{context} missing nonempty string type")))
-}
-
-fn validate_openai_compaction_item(item: &Value) -> ProviderResult<()> {
-    validate_openai_optional_id(item, "compaction")?;
-    match item.get("encrypted_content") {
-        Some(Value::String(_)) => Ok(()),
-        Some(_) => Err(ProviderError::Provider(
-            "OpenAI compaction item encrypted_content was not a string".to_string(),
-        )),
-        None => Err(ProviderError::Provider(
-            "OpenAI compaction item missing encrypted_content".to_string(),
-        )),
-    }
-}
-
-fn validate_openai_compact_message(item: &Value) -> ProviderResult<()> {
-    item.get("role")
-        .and_then(Value::as_str)
-        .filter(|role| !role.is_empty())
-        .ok_or_else(|| {
-            ProviderError::Provider(
-                "OpenAI compact message missing nonempty string role".to_string(),
-            )
-        })?;
-    let content = item
-        .get("content")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            ProviderError::Provider("OpenAI compact message missing content array".to_string())
-        })?;
-    for part in content {
-        let part_type = openai_replay_item_type(part, "OpenAI compact message content part")?;
-        let field = match part_type {
-            "input_text" | "output_text" => "text",
-            "input_image" => "image_url",
-            "refusal" => "refusal",
-            _ => {
-                return Err(ProviderError::Provider(format!(
-                    "OpenAI compact message contained unsupported content part type {part_type}"
-                )))
-            }
-        };
-        if part.get(field).and_then(Value::as_str).is_none() {
-            return Err(ProviderError::Provider(format!(
-                "OpenAI compact message {part_type} content missing {field}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn collect_compact_summary_text(item: &Value, summary_parts: &mut Vec<String>) {
@@ -2159,16 +1240,8 @@ fn validate_openai_compaction_replay(replay: &[Value]) -> ProviderResult<()> {
     }
     let mut compaction_count = 0;
     for item in replay {
-        let item_type = openai_replay_item_type(item, "persisted OpenAI compaction replay item")?;
-        if item_type == "message" {
-            validate_openai_compact_message(item)?;
-        }
+        openai_replay_item_type(item, "persisted OpenAI compaction replay item")?;
         if is_openai_compaction_item(item) {
-            validate_openai_compaction_item(item).map_err(|error| {
-                ProviderError::Provider(format!(
-                    "refusing malformed persisted OpenAI compaction replay: {error}"
-                ))
-            })?;
             compaction_count += 1;
         }
     }
@@ -2443,11 +1516,11 @@ fn parse_response_output_item(
     provider: ProviderKind,
 ) -> ProviderResult<Option<String>> {
     let item_type = openai_replay_item_type(item, "OpenAI output item")?;
-    validate_openai_ordinary_item_policy(item_type, item)?;
+    let class = validate_openai_ordinary_item_policy(item_type, item)?;
     let display = openai_provider_replay_display(item);
 
-    match item_type {
-        "message" => {
+    match class {
+        OpenAiOrdinaryItemClass::Message => {
             let content = item
                 .get("content")
                 .and_then(Value::as_array)
@@ -2473,7 +1546,7 @@ fn parse_response_output_item(
             )?);
             return Ok(refusal);
         }
-        "function_call" => {
+        OpenAiOrdinaryItemClass::FunctionCall => {
             let call_id = item
                 .get("call_id")
                 .and_then(Value::as_str)
@@ -2492,7 +1565,7 @@ fn parse_response_output_item(
                 args_json: arguments.to_string(),
             }));
         }
-        "custom_tool_call" => {
+        OpenAiOrdinaryItemClass::CustomToolCall => {
             let call_id = item
                 .get("call_id")
                 .and_then(Value::as_str)
@@ -2511,7 +1584,7 @@ fn parse_response_output_item(
                 args_json: json!({ "input": input }).to_string(),
             }));
         }
-        "agent_message" => {
+        OpenAiOrdinaryItemClass::AgentMessage => {
             let content = item["content"]
                 .as_array()
                 .expect("agent_message content validated");
@@ -2529,7 +1602,10 @@ fn parse_response_output_item(
                 }
             }
         }
-        _ => {}
+        OpenAiOrdinaryItemClass::HostedOrPassive => {}
+        OpenAiOrdinaryItemClass::ClientExecuted => {
+            unreachable!("client-executed output rejected by policy")
+        }
     }
     provider_replay.push(ProviderReplayItem::new_with_display(
         provider, item, display,
@@ -2538,21 +1614,9 @@ fn parse_response_output_item(
 }
 
 fn validate_openai_output_message(item: &Value) -> ProviderResult<&[Value]> {
-    validate_openai_optional_id(item, "message")?;
     if item.get("role").and_then(Value::as_str) != Some("assistant") {
         return Err(ProviderError::Provider(
             "OpenAI message output missing assistant role".to_string(),
-        ));
-    }
-    validate_openai_optional_status(item, "message", &["in_progress", "completed", "incomplete"])?;
-    let valid_phase = match item.get("phase") {
-        None | Some(Value::Null) => true,
-        Some(Value::String(phase)) => matches!(phase.as_str(), "commentary" | "final_answer"),
-        Some(_) => false,
-    };
-    if !valid_phase {
-        return Err(ProviderError::Provider(
-            "OpenAI message output had invalid phase".to_string(),
         ));
     }
     let content = item
@@ -2568,16 +1632,6 @@ fn validate_openai_output_message(item: &Value) -> ProviderResult<&[Value]> {
                     return Err(ProviderError::Provider(
                         "OpenAI output_text content missing text".to_string(),
                     ));
-                }
-                if !matches!(part.get("annotations"), None | Some(Value::Array(_))) {
-                    return Err(ProviderError::Provider(
-                        "OpenAI output_text content annotations was not an array".to_string(),
-                    ));
-                }
-                if let Some(annotations) = part.get("annotations").and_then(Value::as_array) {
-                    for annotation in annotations {
-                        validate_openai_output_text_annotation(annotation)?;
-                    }
                 }
             }
             "refusal"
@@ -2600,88 +1654,26 @@ fn validate_openai_output_message(item: &Value) -> ProviderResult<&[Value]> {
     Ok(content)
 }
 
-fn validate_openai_output_text_annotation(annotation: &Value) -> ProviderResult<()> {
-    let annotation_type = openai_replay_item_type(annotation, "OpenAI output_text annotation")?;
-    let required_index = |field: &str| -> ProviderResult<()> {
-        annotation
-            .get(field)
-            .and_then(Value::as_u64)
-            .map(|_| ())
-            .ok_or_else(|| {
-                ProviderError::Provider(format!(
-                    "OpenAI {annotation_type} annotation missing unsigned integer {field}"
-                ))
-            })
-    };
-    match annotation_type {
-        "file_citation" => {
-            openai_required_string(annotation, "file_citation annotation", "file_id")?;
-            openai_required_string(annotation, "file_citation annotation", "filename")?;
-            required_index("index")?;
+fn validate_openai_ordinary_item_policy(
+    item_type: &str,
+    item: &Value,
+) -> ProviderResult<OpenAiOrdinaryItemClass> {
+    let class = classify_openai_ordinary_item(item_type, item)?;
+    match class {
+        OpenAiOrdinaryItemClass::Message => {
+            validate_openai_output_message(item)?;
         }
-        "url_citation" => {
-            openai_required_string(annotation, "url_citation annotation", "title")?;
-            openai_required_string(annotation, "url_citation annotation", "url")?;
-            required_index("start_index")?;
-            required_index("end_index")?;
-        }
-        "container_file_citation" => {
-            for field in ["container_id", "file_id", "filename"] {
-                openai_required_string(annotation, "container_file_citation annotation", field)?;
-            }
-            required_index("start_index")?;
-            required_index("end_index")?;
-        }
-        "file_path" => {
-            openai_required_string(annotation, "file_path annotation", "file_id")?;
-            required_index("index")?;
-        }
-        _ => {
+        OpenAiOrdinaryItemClass::AgentMessage => validate_openai_agent_message(item)?,
+        OpenAiOrdinaryItemClass::FunctionCall => validate_openai_function_call(item)?,
+        OpenAiOrdinaryItemClass::CustomToolCall => validate_openai_custom_tool_call(item)?,
+        OpenAiOrdinaryItemClass::HostedOrPassive => {}
+        OpenAiOrdinaryItemClass::ClientExecuted => {
             return Err(ProviderError::Provider(format!(
-                "OpenAI output_text contained unsupported annotation type {annotation_type}"
+                "OpenAI returned unsupported client-executed action type {item_type}"
             )))
         }
     }
-    Ok(())
-}
-
-fn validate_openai_ordinary_item_policy(item_type: &str, item: &Value) -> ProviderResult<()> {
-    match item_type {
-        "message" => validate_openai_output_message(item).map(|_| ()),
-        "agent_message" => validate_openai_agent_message(item),
-        "function_call" => validate_openai_function_call(item),
-        "custom_tool_call" => validate_openai_custom_tool_call(item),
-        "reasoning" => validate_openai_reasoning(item),
-        "web_search_call" => validate_openai_web_search_call(item),
-        "file_search_call" => validate_openai_file_search_call(item),
-        "code_interpreter_call" => validate_openai_code_interpreter_call(item),
-        "image_generation_call" => validate_openai_image_generation_call(item),
-        "mcp_call" => validate_openai_mcp_call(item),
-        "mcp_list_tools" => validate_openai_mcp_list_tools(item),
-        "tool_search_call" => validate_openai_server_tool_search_call(item),
-        "tool_search_output" => validate_openai_tool_search_output(item),
-        "additional_tools" => validate_openai_additional_tools(item),
-        "compaction" => validate_openai_compaction_item(item),
-        "context_compaction" => validate_openai_context_compaction(item),
-        "function_call_output" | "custom_tool_call_output" => {
-            validate_openai_call_output(item_type, item)
-        }
-        "local_shell_call_output" => validate_openai_local_shell_call_output(item),
-        "shell_call_output" => validate_openai_shell_call_output(item),
-        "apply_patch_call_output" => validate_openai_apply_patch_call_output(item),
-        "computer_call_output" => validate_openai_computer_call_output(item),
-        "mcp_approval_response" => validate_openai_mcp_approval_response(item),
-        "local_shell_call"
-        | "shell_call"
-        | "apply_patch_call"
-        | "computer_call"
-        | "mcp_approval_request" => Err(ProviderError::Provider(format!(
-            "OpenAI returned unsupported client-executed action type {item_type}"
-        ))),
-        _ => Err(ProviderError::Provider(format!(
-            "OpenAI returned unknown output item type {item_type}; refusing to assume it requires no client response"
-        ))),
-    }
+    Ok(class)
 }
 
 fn openai_provider_replay_display(item: &Value) -> Option<ReplayDisplay> {
@@ -3246,8 +2238,8 @@ mod tests {
     }
 
     #[test]
-    fn compact_parser_rejects_malformed_known_message_content() {
-        for message in [
+    fn compact_parser_keeps_known_item_internals_opaque() {
+        let output = json!([
             json!({ "type": "message", "role": "assistant" }),
             json!({ "type": "message", "role": "assistant", "content": "summary" }),
             json!({ "type": "message", "role": "assistant", "content": [null] }),
@@ -3261,15 +2253,20 @@ mod tests {
                 "role": "assistant",
                 "content": [{ "type": "future_content", "text": "summary" }],
             }),
-        ] {
-            let body = json!({
-                "output": [
-                    message,
-                    { "type": "compaction", "encrypted_content": "opaque" },
-                ],
-            });
-            assert!(parse_compact_response(&body.to_string()).is_err(), "{body}");
-        }
+            json!({ "type": "compaction", "future_checkpoint_shape": 7 }),
+        ]);
+        let response = parse_compact_response(&json!({ "output": output }).to_string())
+            .expect("compact item internals are opaque");
+        assert_eq!(
+            response
+                .provider_replay
+                .iter()
+                .map(ProviderReplayItem::raw_value)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            output.as_array().unwrap().clone()
+        );
+        assert!(response.summary.is_none());
     }
 
     #[test]
@@ -3399,13 +2396,16 @@ mod tests {
     }
 
     #[test]
-    fn compact_parser_rejects_empty_output_or_invalid_native_compaction_schema() {
-        for body in [
-            r#"{"output":[]}"#,
-            r#"{"output":[{"type":"compaction"}]}"#,
-            r#"{"output":[{"type":"compaction","encrypted_content":7}]}"#,
+    fn compact_parser_rejects_empty_output_but_keeps_checkpoint_payload_opaque() {
+        assert!(parse_compact_response(r#"{"output":[]}"#).is_err());
+        for checkpoint in [
+            json!({ "type": "compaction" }),
+            json!({ "type": "compaction", "encrypted_content": 7 }),
         ] {
-            assert!(parse_compact_response(body).is_err(), "{body}");
+            let response =
+                parse_compact_response(&json!({ "output": [checkpoint.clone()] }).to_string())
+                    .expect("checkpoint payload remains opaque");
+            assert_eq!(response.provider_replay[0].raw_value().unwrap(), checkpoint);
         }
     }
 
@@ -4089,7 +3089,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     }
 
     #[test]
-    fn responses_sse_rejects_malformed_message_and_known_content_parts() {
+    fn responses_sse_rejects_malformed_semantic_items() {
         let valid = json!({
             "type": "message",
             "id": "msg_1",
@@ -4102,19 +3102,9 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
             }],
         });
         let malformed = [
-            ("empty id", {
-                let mut value = valid.clone();
-                value["id"] = json!("");
-                value
-            }),
             ("missing role", {
                 let mut value = valid.clone();
                 value.as_object_mut().unwrap().remove("role");
-                value
-            }),
-            ("invalid status", {
-                let mut value = valid.clone();
-                value["status"] = json!("future_status");
                 value
             }),
             ("missing content", {
@@ -4147,17 +3137,44 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
                 value["content"] = json!([{ "type": "output_text", "annotations": [] }]);
                 value
             }),
-            ("output_text scalar annotations", {
-                let mut value = valid.clone();
-                value["content"] =
-                    json!([{ "type": "output_text", "text": "hello", "annotations": 7 }]);
-                value
-            }),
             ("refusal missing text", {
                 let mut value = valid.clone();
                 value["content"] = json!([{ "type": "refusal" }]);
                 value
             }),
+            (
+                "agent message missing author",
+                json!({
+                    "type": "agent_message",
+                    "recipient": "/root",
+                    "content": [],
+                }),
+            ),
+            (
+                "agent message malformed content",
+                json!({
+                    "type": "agent_message",
+                    "author": "/root/worker",
+                    "recipient": "/root",
+                    "content": [{ "type": "input_text" }],
+                }),
+            ),
+            (
+                "function call missing arguments",
+                json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read",
+                }),
+            ),
+            (
+                "custom tool call missing input",
+                json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call_2",
+                    "name": "apply_patch",
+                }),
+            ),
         ];
 
         for (name, item) in malformed {
@@ -4396,6 +3413,13 @@ data: {"type":"response.completed","response":{"id":"resp_refusal","status":"com
             let error = parse_responses_sse(&sse, ProviderKind::OpenAi).expect_err(execution);
             assert!(error.to_string().contains("tool_search_call"), "{error}");
         }
+        let missing_execution = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"tool_search_call"}}
+
+data: {"type":"response.completed","response":{"id":"resp_1"}}
+"#;
+        let error = parse_responses_sse(missing_execution, ProviderKind::OpenAi)
+            .expect_err("tool search without an execution mode must fail closed");
+        assert!(error.to_string().contains("execution mode"), "{error}");
 
         let sse = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","summary":[],"encrypted_content":"partial"}}
 
@@ -4473,15 +3497,6 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
                 "status": "completed",
                 "content": [{ "type": "output_text", "annotations": [] }],
             }),
-            json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": "citation",
-                    "annotations": [{ "type": "url_citation", "url": "https://example.com" }],
-                }],
-            }),
         ] {
             assert!(
                 transcript_to_response_items(
@@ -4550,11 +3565,6 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
             vec![ProviderReplayItem::new(
                 ProviderKind::OpenAi,
                 &json!({ "type": "message", "role": "assistant", "content": [] }),
-            )
-            .unwrap()],
-            vec![ProviderReplayItem::new(
-                ProviderKind::OpenAi,
-                &json!({ "type": "compaction", "encrypted_content": 7 }),
             )
             .unwrap()],
             vec![

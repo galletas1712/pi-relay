@@ -2288,8 +2288,7 @@ struct AnthropicStreamState {
     stop_reason: ModelStopReason,
     stop_details: Option<ModelStopDetails>,
     message_started: bool,
-    terminal_delta_seen: bool,
-    saw_stop_reason: bool,
+    terminal_stop_reason: Option<String>,
     message_stopped: bool,
 }
 
@@ -2304,8 +2303,7 @@ impl Default for AnthropicStreamState {
             stop_reason: ModelStopReason::Complete,
             stop_details: None,
             message_started: false,
-            terminal_delta_seen: false,
-            saw_stop_reason: false,
+            terminal_stop_reason: None,
             message_stopped: false,
         }
     }
@@ -2318,9 +2316,9 @@ impl AnthropicStreamState {
                 "Anthropic {event_type} arrived before message_start"
             )));
         }
-        if self.terminal_delta_seen {
+        if self.terminal_stop_reason.is_some() {
             return Err(ProviderError::Provider(format!(
-                "Anthropic {event_type} arrived after message_delta"
+                "Anthropic {event_type} arrived after terminal stop_reason"
             )));
         }
         Ok(())
@@ -2398,55 +2396,81 @@ impl AnthropicStreamState {
                         "Anthropic message_delta arrived before content_block_stop for index {index}"
                     )));
                 }
-                if self.terminal_delta_seen {
-                    return Err(ProviderError::Provider(
-                        "Anthropic response stream contained duplicate message_delta".to_string(),
-                    ));
-                }
-                self.terminal_delta_seen = true;
-                if let Some(usage) = event.get("usage").and_then(anthropic_usage) {
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "Anthropic message_delta missing delta object".to_string(),
+                        )
+                    })?;
+                let has_usage = event.get("usage").is_some();
+                if let Some(usage) = anthropic_message_delta_usage(event.get("usage"))? {
                     merge_anthropic_usage(&mut self.usage, usage);
                 }
-                match event.pointer("/delta/stop_reason") {
-                    Some(Value::String(reason))
-                        if matches!(reason.as_str(), "end_turn" | "stop_sequence" | "tool_use") =>
-                    {
-                        self.stop_reason = ModelStopReason::Complete;
-                        self.saw_stop_reason = true;
+                let stop_details = anthropic_stop_details(delta.get("stop_details"))?;
+                let Some(stop_reason) = delta.get("stop_reason") else {
+                    if stop_details.is_some() {
+                        return Err(ProviderError::Provider(
+                            "Anthropic message_delta had stop_details without a terminal stop_reason"
+                                .to_string(),
+                        ));
                     }
-                    Some(Value::String(reason)) if reason == "max_tokens" => {
-                        self.stop_reason = ModelStopReason::MaxOutputTokens;
-                        self.saw_stop_reason = true;
+                    if !has_usage {
+                        return Err(ProviderError::Provider(
+                            "Anthropic message_delta had neither stop_reason nor usage".to_string(),
+                        ));
                     }
-                    Some(Value::String(reason)) if reason == "refusal" => {
-                        self.stop_reason = ModelStopReason::Refusal;
-                        self.stop_details =
-                            anthropic_stop_details(event.pointer("/delta/stop_details"));
-                        self.saw_stop_reason = true;
+                    return Ok(SseControl::Continue);
+                };
+                let Value::String(stop_reason) = stop_reason else {
+                    if stop_reason.is_null() {
+                        if stop_details.is_some() {
+                            return Err(ProviderError::Provider(
+                                "Anthropic message_delta had stop_details without a terminal stop_reason"
+                                    .to_string(),
+                            ));
+                        }
+                        return Ok(SseControl::Continue);
                     }
-                    Some(Value::String(reason))
-                        if matches!(
-                            reason.as_str(),
-                            "pause_turn" | "model_context_window_exceeded"
-                        ) =>
-                    {
+                    return Err(ProviderError::Provider(format!(
+                        "Anthropic message_delta stop_reason was not a string or null: {stop_reason}"
+                    )));
+                };
+                if stop_reason.is_empty() {
+                    return Err(ProviderError::Provider(
+                        "Anthropic message_delta stop_reason was empty".to_string(),
+                    ));
+                }
+                if let Some(existing) = self.terminal_stop_reason.as_deref() {
+                    if existing != stop_reason {
+                        return Err(ProviderError::Provider(format!(
+                            "Anthropic response stream contained conflicting terminal stop reasons: {existing:?} and {stop_reason:?}"
+                        )));
+                    }
+                }
+                if let Some(details) = stop_details {
+                    merge_anthropic_stop_details(&mut self.stop_details, details)?;
+                }
+                self.stop_reason = match stop_reason.as_str() {
+                    "end_turn" | "stop_sequence" | "tool_use" => ModelStopReason::Complete,
+                    "max_tokens" => ModelStopReason::MaxOutputTokens,
+                    "refusal" => ModelStopReason::Refusal,
+                    "pause_turn" | "model_context_window_exceeded" => {
                         return Err(ProviderError::Incomplete {
                             status: "incomplete".to_string(),
-                            reason: reason.clone(),
+                            reason: stop_reason.clone(),
                         });
                     }
-                    Some(Value::String(reason)) if !reason.is_empty() => {
+                    _ => {
                         return Err(ProviderError::Incomplete {
                             status: "unknown_stop_reason".to_string(),
-                            reason: reason.clone(),
+                            reason: stop_reason.clone(),
                         });
                     }
-                    None | Some(Value::Null | Value::String(_)) => {}
-                    Some(reason) => {
-                        return Err(ProviderError::Provider(format!(
-                            "Anthropic message_delta stop_reason was not a string or null: {reason}"
-                        )))
-                    }
+                };
+                if self.terminal_stop_reason.is_none() {
+                    self.terminal_stop_reason = Some(stop_reason.clone());
                 }
                 Ok(SseControl::Continue)
             }
@@ -2460,6 +2484,12 @@ impl AnthropicStreamState {
                     return Err(ProviderError::Provider(format!(
                         "Anthropic message_stop arrived before content_block_stop for index {index}"
                     )));
+                }
+                if self.terminal_stop_reason.is_none() {
+                    return Err(ProviderError::Provider(
+                        "Anthropic message_stop arrived without a recognized terminal stop_reason"
+                            .to_string(),
+                    ));
                 }
                 self.message_stopped = true;
                 Ok(SseControl::Stop)
@@ -2633,7 +2663,7 @@ impl AnthropicStreamState {
                 "Anthropic response stream ended before message_stop".to_string(),
             ));
         }
-        if !self.saw_stop_reason {
+        if self.terminal_stop_reason.is_none() {
             return Err(ProviderError::Provider(
                 "Anthropic response stream ended without a recognized stop_reason".to_string(),
             ));
@@ -2819,18 +2849,31 @@ fn push_anthropic_content_block(
     Ok(())
 }
 
-fn anthropic_stop_details(value: Option<&Value>) -> Option<ModelStopDetails> {
-    let value = value?.as_object()?;
-    Some(ModelStopDetails {
-        category: value
-            .get("category")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        explanation: value
-            .get("explanation")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-    })
+fn anthropic_stop_details(value: Option<&Value>) -> ProviderResult<Option<ModelStopDetails>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let value = value.as_object().ok_or_else(|| {
+        ProviderError::Provider(
+            "Anthropic message_delta stop_details was not an object or null".to_string(),
+        )
+    })?;
+    let optional_string = |field| -> ProviderResult<Option<String>> {
+        match value.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(value) => Err(ProviderError::Provider(format!(
+                "Anthropic message_delta stop_details.{field} was not a string or null: {value}"
+            ))),
+        }
+    };
+    Ok(Some(ModelStopDetails {
+        category: optional_string("category")?,
+        explanation: optional_string("explanation")?,
+    }))
 }
 
 fn canonical_anthropic_tool_name(name: &str) -> &str {
@@ -2885,6 +2928,64 @@ fn anthropic_usage(value: &Value) -> Option<ProviderUsage> {
         raw_provider_usage: Some(value.clone()),
         ..ProviderUsage::default()
     })
+}
+
+fn anthropic_message_delta_usage(value: Option<&Value>) -> ProviderResult<Option<ProviderUsage>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let usage = value.as_object().ok_or_else(|| {
+        ProviderError::Provider("Anthropic message_delta usage was not an object".to_string())
+    })?;
+    let mut has_token_count = false;
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ] {
+        if let Some(value) = usage.get(field) {
+            has_token_count = true;
+            let tokens = value.as_u64().ok_or_else(|| {
+                ProviderError::Provider(format!(
+                    "Anthropic message_delta usage.{field} was not an unsigned integer"
+                ))
+            })?;
+            usize::try_from(tokens).map_err(|_| {
+                ProviderError::Provider(format!(
+                    "Anthropic message_delta usage.{field} exceeded the platform limit"
+                ))
+            })?;
+        }
+    }
+    if !has_token_count {
+        return Err(ProviderError::Provider(
+            "Anthropic message_delta usage contained no cumulative token counts".to_string(),
+        ));
+    }
+    Ok(anthropic_usage(value))
+}
+
+fn merge_anthropic_stop_details(
+    current: &mut Option<ModelStopDetails>,
+    update: ModelStopDetails,
+) -> ProviderResult<()> {
+    let current = current.get_or_insert_with(ModelStopDetails::default);
+    for (field, current, update) in [
+        ("category", &mut current.category, update.category),
+        ("explanation", &mut current.explanation, update.explanation),
+    ] {
+        match (current.as_ref(), update) {
+            (Some(existing), Some(update)) if existing != &update => {
+                return Err(ProviderError::Provider(format!(
+                    "Anthropic response stream contained conflicting terminal stop_details.{field}"
+                )));
+            }
+            (None, Some(update)) => *current = Some(update),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn merge_anthropic_usage(current: &mut Option<ProviderUsage>, update: ProviderUsage) {
@@ -6188,6 +6289,47 @@ data: {"type":"content_block_start","index":2,"content_block":{"type":"text","te
     }
 
     #[test]
+    fn anthropic_sse_merges_repeated_cumulative_message_deltas() {
+        let sse = r#"
+data: {"type":"message_start","message":{"id":"msg_1","content":[],"usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":40}}}
+
+data: {"type":"message_delta","delta":{"stop_sequence":null},"usage":{"input_tokens":100,"output_tokens":2}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"still streaming"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"message_delta","delta":{"stop_reason":null,"stop_sequence":null},"usage":{"input_tokens":100,"output_tokens":7,"cache_creation_input_tokens":15}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":100,"output_tokens":9,"cache_read_input_tokens":40,"cache_creation_input_tokens":15}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":40,"cache_creation_input_tokens":15}}
+
+data: {"type":"message_stop"}
+"#;
+
+        let response = parse_anthropic_sse(sse).expect("repeated cumulative deltas parse");
+        let usage = response.usage.expect("cumulative usage is retained");
+
+        assert_eq!(response.assistant.text(), "still streaming");
+        assert_eq!(response.stop_reason, ModelStopReason::Complete);
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(10));
+        assert_eq!(usage.total_tokens, Some(110));
+        assert_eq!(usage.cache_read_input_tokens, Some(40));
+        assert_eq!(usage.cache_creation_input_tokens, Some(15));
+        assert_eq!(
+            usage
+                .raw_provider_usage
+                .as_ref()
+                .and_then(|usage| usage.get("output_tokens")),
+            Some(&json!(10))
+        );
+    }
+
+    #[test]
     fn anthropic_sse_preserves_valid_reasoning_server_tool_citation_multiblock_stream() {
         let sse = r#"
 data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
@@ -6644,6 +6786,92 @@ data: {"type":"message_stop"}
                     }),
                 ],
             ),
+            (
+                "message delta missing delta",
+                vec![json!({ "type": "message_delta" })],
+            ),
+            (
+                "message delta scalar delta",
+                vec![json!({
+                    "type": "message_delta",
+                    "delta": "end_turn",
+                })],
+            ),
+            (
+                "message delta without stop reason or usage",
+                vec![json!({
+                    "type": "message_delta",
+                    "delta": { "stop_sequence": null },
+                })],
+            ),
+            (
+                "message delta nonstring stop reason",
+                vec![json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": 1 },
+                })],
+            ),
+            (
+                "message delta empty stop reason",
+                vec![json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "" },
+                })],
+            ),
+            (
+                "message delta scalar usage",
+                vec![json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": null },
+                    "usage": 1,
+                })],
+            ),
+            (
+                "message delta malformed token count",
+                vec![json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": null },
+                    "usage": { "output_tokens": "1" },
+                })],
+            ),
+            (
+                "message delta empty usage",
+                vec![json!({
+                    "type": "message_delta",
+                    "delta": {},
+                    "usage": {},
+                })],
+            ),
+            (
+                "message delta scalar stop details",
+                vec![json!({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "refusal",
+                        "stop_details": "refused",
+                    },
+                })],
+            ),
+            (
+                "message delta malformed stop detail",
+                vec![json!({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "refusal",
+                        "stop_details": { "category": 1 },
+                    },
+                })],
+            ),
+            (
+                "message delta details without terminal reason",
+                vec![json!({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": null,
+                        "stop_details": { "category": "policy" },
+                    },
+                })],
+            ),
         ];
 
         for (name, events) in cases {
@@ -6664,6 +6892,84 @@ data: {"type":"message_stop"}
                 .map(|event| format!("data: {event}\n\n"))
                 .collect::<String>();
             assert!(parse_anthropic_sse(&sse).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn anthropic_sse_rejects_conflicting_terminal_deltas() {
+        let merged = parse_anthropic_sse(
+            r#"
+data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"category":"policy","explanation":null}}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"category":"policy","explanation":"cannot comply"}}}
+
+data: {"type":"message_stop"}
+"#,
+        )
+        .expect("nonconflicting terminal details merge");
+        assert_eq!(
+            merged.stop_details,
+            Some(ModelStopDetails {
+                category: Some("policy".to_string()),
+                explanation: Some("cannot comply".to_string()),
+            })
+        );
+
+        let cases = [
+            (
+                "stop reason",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn" },
+                }),
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "max_tokens" },
+                }),
+            ),
+            (
+                "stop details",
+                json!({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "refusal",
+                        "stop_details": {
+                            "category": "cyber",
+                            "explanation": "first",
+                        },
+                    },
+                }),
+                json!({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": "refusal",
+                        "stop_details": {
+                            "category": "privacy",
+                            "explanation": "second",
+                        },
+                    },
+                }),
+            ),
+        ];
+        for (name, first, second) in cases {
+            let events = [
+                json!({
+                    "type": "message_start",
+                    "message": { "id": "msg_1", "content": [] },
+                }),
+                first,
+                second,
+                json!({ "type": "message_stop" }),
+            ];
+            let sse = events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+
+            let error = parse_anthropic_sse(&sse).expect_err(name);
+            assert!(error.to_string().contains("conflicting"), "{name}: {error}");
         }
     }
 
@@ -6732,16 +7038,36 @@ data: {{"type":"message_stop"}}
 
     #[test]
     fn anthropic_sse_requires_an_explicit_known_stop_reason() {
-        let error = parse_anthropic_sse(
-            r#"
+        for (name, delta) in [
+            ("no delta", ""),
+            (
+                "null reason",
+                r#"data: {"type":"message_delta","delta":{"stop_reason":null}}
+
+"#,
+            ),
+            (
+                "usage-only delta",
+                r#"data: {"type":"message_delta","delta":{},"usage":{"output_tokens":1}}
+
+"#,
+            ),
+        ] {
+            let sse = [
+                r#"
 data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
 
-data: {"type":"message_stop"}
 "#,
-        )
-        .expect_err("missing stop reason must not default to success");
+                delta,
+                r#"data: {"type":"message_stop"}
 
-        assert!(error.to_string().contains("stop_reason"), "{error}");
+"#,
+            ]
+            .concat();
+            let error = parse_anthropic_sse(&sse).expect_err(name);
+
+            assert!(error.to_string().contains("stop_reason"), "{name}: {error}");
+        }
     }
 
     #[test]
