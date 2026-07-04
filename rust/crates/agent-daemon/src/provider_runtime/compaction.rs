@@ -639,12 +639,8 @@ mod tests {
     fn unknown_nested_metadata_does_not_change_scheduler_policy() {
         let mut policy = serde_json::Map::new();
         policy.insert(
-            concat!("remote", "_mode").to_string(),
-            serde_json::json!("never"),
-        );
-        policy.insert(
-            concat!("anthropic_native", "_compaction").to_string(),
-            serde_json::json!({ "invalid": true }),
+            "extra_metadata".to_string(),
+            serde_json::json!({ "ignored": true }),
         );
         policy.insert(
             "max_consecutive_failures".to_string(),

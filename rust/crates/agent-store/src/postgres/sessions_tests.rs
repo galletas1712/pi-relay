@@ -398,7 +398,7 @@ async fn compaction_provider_replay_round_trips_nullable_and_omitted_encrypted_c
                 &created.job,
                 crate::CompactionCompletion {
                     summary: String::new(),
-                    summary_kind: "provider_native".to_string(),
+                    summary_kind: "generic".to_string(),
                     provider_replay: vec![replay],
                     provider: ProviderKind::Claude,
                     usage: None,
