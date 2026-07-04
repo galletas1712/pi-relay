@@ -6,9 +6,9 @@ use agent_session::ModelContext;
 use agent_store::SessionConfig;
 use agent_vocab::{ProviderKind, ProviderReplayItem, TranscriptItem, UserMessage};
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::future::Future;
 
 use crate::auth::Credentials;
 use crate::delegation_context::compaction_delegation_ledger;
@@ -287,78 +287,19 @@ pub(crate) async fn run_compaction(
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<CompactionOutput> {
-    let compaction_config = compaction_config(config);
-    let remote_mode = compaction_config.remote_mode;
-    let credentials = Credentials::load();
-    let provider = provider_for_config(state, config, &credentials, session_id).await?;
-    let runner = LiveCompactionRunner {
-        state,
-        config,
-        session_id,
-        supports_remote: provider.provider.supports_remote_compaction(),
-    };
-    let output = run_compaction_with_runner(
-        config.provider.kind,
-        remote_mode,
-        session_id,
-        model_context,
-        &runner,
-    )
-    .await?;
-    append_delegation_ledger_to_output(state, session_id, output).await
-}
-
-#[async_trait]
-trait CompactionRunner: Send + Sync {
-    fn supports_remote(&self) -> bool;
-    async fn run_remote(&self, model_context: ModelContext) -> Result<CompactionOutput>;
-    async fn run_local(&self, model_context: ModelContext) -> Result<CompactionOutput>;
-}
-
-struct LiveCompactionRunner<'a> {
-    state: &'a AppState,
-    config: &'a SessionConfig,
-    session_id: &'a str,
-    supports_remote: bool,
-}
-
-#[async_trait]
-impl CompactionRunner for LiveCompactionRunner<'_> {
-    fn supports_remote(&self) -> bool {
-        self.supports_remote
-    }
-
-    async fn run_remote(&self, model_context: ModelContext) -> Result<CompactionOutput> {
-        run_remote_compaction(self.state, self.config, self.session_id, model_context).await
-    }
-
-    async fn run_local(&self, model_context: ModelContext) -> Result<CompactionOutput> {
-        run_local_summary_compaction(self.state, self.config, self.session_id, model_context).await
-    }
-}
-
-async fn run_compaction_with_runner(
-    provider: ProviderKind,
-    remote_mode: RemoteCompactionMode,
-    session_id: &str,
-    model_context: ModelContext,
-    runner: &dyn CompactionRunner,
-) -> Result<CompactionOutput> {
-    match remote_mode {
-        RemoteCompactionMode::Never => runner.run_local(model_context).await,
-        RemoteCompactionMode::Auto | RemoteCompactionMode::Always => {
-            if !runner.supports_remote() {
-                return Err(anyhow::Error::new(
-                    agent_provider::ProviderError::native_compaction(
-                        agent_provider::NativeCompactionErrorKind::Unsupported,
-                        format!("provider {provider} does not support provider-native compaction"),
-                    ),
-                ));
-            }
-            eprintln!("attempting provider-native compaction for {session_id} with {provider}");
-            runner.run_remote(model_context).await
+    let output = match compaction_config(config).remote_mode {
+        RemoteCompactionMode::Never => {
+            run_local_summary_compaction(state, config, session_id, model_context).await
         }
-    }
+        RemoteCompactionMode::Auto | RemoteCompactionMode::Always => {
+            eprintln!(
+                "attempting provider-native compaction for {session_id} with {}",
+                config.provider.kind
+            );
+            run_remote_compaction(state, config, session_id, model_context).await
+        }
+    }?;
+    append_delegation_ledger_to_output(state, session_id, output).await
 }
 
 async fn run_remote_compaction(
@@ -367,17 +308,32 @@ async fn run_remote_compaction(
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<CompactionOutput> {
-    let request = remote_compaction_request(
-        state,
-        config,
-        session_id,
-        provider_transcript(model_context),
+    run_remote_compaction_algorithm(
+        config.provider.kind,
+        model_context,
+        |transcript| async move {
+            let request = remote_compaction_request(state, config, session_id, transcript).await?;
+            let credentials = Credentials::load();
+            let provider = provider_for_config(state, config, &credentials, session_id).await?;
+            compact_with_auth_retry(state, config, session_id, provider, request)
+                .await
+                .map_err(Into::into)
+        },
     )
-    .await?;
-    let credentials = Credentials::load();
-    let provider = provider_for_config(state, config, &credentials, session_id).await?;
-    let result = compact_with_auth_retry(state, config, session_id, provider, request).await?;
-    Ok(remote_compaction_output(config.provider.kind, result))
+    .await
+}
+
+async fn run_remote_compaction_algorithm<F, Fut>(
+    provider: ProviderKind,
+    model_context: ModelContext,
+    compact: F,
+) -> Result<CompactionOutput>
+where
+    F: FnOnce(Vec<ModelTranscriptEntry>) -> Fut,
+    Fut: Future<Output = Result<ProviderCompactionResponse>>,
+{
+    let result = compact(provider_transcript(model_context)).await?;
+    Ok(remote_compaction_output(provider, result))
 }
 
 fn remote_compaction_output(
@@ -662,7 +618,11 @@ fn trim_oldest_complete_group(groups: &mut Vec<TranscriptGroup>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use agent_provider::{ModelProvider, ModelResponse, ProviderError, ProviderResult};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     fn test_config(kind: ProviderKind, model: &str, metadata: Value) -> SessionConfig {
         SessionConfig {
@@ -681,158 +641,109 @@ mod tests {
         }
     }
 
-    struct TestCompactionRunner {
-        supports_remote: bool,
-        context_overflow: bool,
-        remote_calls: AtomicUsize,
-        local_calls: AtomicUsize,
+    #[derive(Default)]
+    struct RecordingOverflowProvider {
+        compact_calls: AtomicUsize,
+        complete_calls: AtomicUsize,
+        compact_transcripts: Mutex<Vec<Vec<ModelTranscriptEntry>>>,
     }
 
-    #[async_trait]
-    impl CompactionRunner for TestCompactionRunner {
-        fn supports_remote(&self) -> bool {
-            self.supports_remote
+    #[async_trait::async_trait]
+    impl ModelProvider for RecordingOverflowProvider {
+        async fn complete(&self, _request: ModelRequest) -> ProviderResult<ModelResponse> {
+            self.complete_calls.fetch_add(1, Ordering::Relaxed);
+            Err(ProviderError::Provider(
+                "local summary compaction must not run".to_string(),
+            ))
         }
 
-        async fn run_remote(&self, _model_context: ModelContext) -> Result<CompactionOutput> {
-            self.remote_calls.fetch_add(1, Ordering::Relaxed);
-            let error = if self.context_overflow {
-                agent_provider::ProviderError::Status {
-                    status: 413,
-                    message: "context length exceeded".to_string(),
-                }
-            } else {
-                agent_provider::ProviderError::native_compaction(
-                    agent_provider::NativeCompactionErrorKind::Unsupported,
-                    "model is unsupported",
-                )
-            };
-            Err(anyhow::Error::new(error))
-        }
-
-        async fn run_local(&self, _model_context: ModelContext) -> Result<CompactionOutput> {
-            self.local_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(CompactionOutput {
-                summary: "local summary".to_string(),
-                summary_kind: CompactionSummaryKind::ProviderText,
-                provider_replay: Vec::new(),
-                remote: false,
-                provider: ProviderKind::Claude,
-                usage: None,
+        async fn compact(
+            &self,
+            request: ProviderCompactionRequest,
+        ) -> ProviderResult<ProviderCompactionResponse> {
+            self.compact_calls.fetch_add(1, Ordering::Relaxed);
+            self.compact_transcripts
+                .lock()
+                .expect("recorded transcripts lock")
+                .push(request.transcript);
+            Err(ProviderError::Status {
+                status: 413,
+                message: "context length exceeded".to_string(),
             })
         }
     }
 
     #[tokio::test]
-    async fn selected_native_modes_expose_the_same_typed_error_without_local_compaction() {
-        for mode in [RemoteCompactionMode::Auto, RemoteCompactionMode::Always] {
-            let runner = TestCompactionRunner {
-                supports_remote: true,
-                context_overflow: false,
-                remote_calls: AtomicUsize::new(0),
-                local_calls: AtomicUsize::new(0),
-            };
-            let result = run_compaction_with_runner(
-                ProviderKind::Claude,
-                mode,
-                "test-session",
-                ModelContext::default(),
-                &runner,
-            )
-            .await;
-
-            assert_eq!(runner.remote_calls.load(Ordering::Relaxed), 1);
-            assert_eq!(runner.local_calls.load(Ordering::Relaxed), 0);
-            let error = result.expect_err("selected native errors are terminal");
-            assert!(matches!(
-                error.downcast_ref::<agent_provider::ProviderError>(),
-                Some(agent_provider::ProviderError::NativeCompaction {
-                    kind: agent_provider::NativeCompactionErrorKind::Unsupported,
-                    message,
-                }) if message == "model is unsupported"
-            ));
+    async fn native_context_overflow_makes_one_compact_request_with_full_transcript() {
+        let mut items = Vec::new();
+        for (turn, text) in [
+            (1, "oldest retained user instruction"),
+            (2, "middle retained user instruction"),
+            (3, "newest retained user instruction"),
+        ] {
+            let turn_id = agent_vocab::TurnId(turn);
+            items.extend([
+                TranscriptItem::TurnStarted { turn_id },
+                TranscriptItem::UserMessage(UserMessage::text(text)),
+                TranscriptItem::TurnFinished {
+                    turn_id,
+                    outcome: agent_vocab::TurnOutcome::Graceful,
+                },
+            ]);
         }
-    }
-
-    #[tokio::test]
-    async fn selected_native_modes_require_provider_support_without_running_local_compaction() {
-        for mode in [RemoteCompactionMode::Auto, RemoteCompactionMode::Always] {
-            let runner = TestCompactionRunner {
-                supports_remote: false,
-                context_overflow: false,
-                remote_calls: AtomicUsize::new(0),
-                local_calls: AtomicUsize::new(0),
-            };
-            let error = run_compaction_with_runner(
-                ProviderKind::Claude,
-                mode,
-                "test-session",
-                ModelContext::default(),
-                &runner,
-            )
-            .await
-            .expect_err("unsupported native selection must fail");
-
-            assert_eq!(runner.remote_calls.load(Ordering::Relaxed), 0);
-            assert_eq!(runner.local_calls.load(Ordering::Relaxed), 0);
-            assert!(matches!(
-                error.downcast_ref::<agent_provider::ProviderError>(),
-                Some(agent_provider::ProviderError::NativeCompaction {
-                    kind: agent_provider::NativeCompactionErrorKind::Unsupported,
-                    ..
-                })
-            ));
-            assert!(error.to_string().contains("does not support"));
-        }
-    }
-
-    #[tokio::test]
-    async fn never_runs_only_local_compaction() {
-        let runner = TestCompactionRunner {
-            supports_remote: true,
-            context_overflow: false,
-            remote_calls: AtomicUsize::new(0),
-            local_calls: AtomicUsize::new(0),
-        };
-        let output = run_compaction_with_runner(
+        let original_len = items.len();
+        let provider = RecordingOverflowProvider::default();
+        let error = run_remote_compaction_algorithm(
             ProviderKind::Claude,
-            RemoteCompactionMode::Never,
-            "test-session",
-            ModelContext::default(),
-            &runner,
-        )
-        .await
-        .expect("Never selects local summary");
-
-        assert_eq!(runner.remote_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(runner.local_calls.load(Ordering::Relaxed), 1);
-        assert!(!output.remote);
-        assert_eq!(output.summary, "local summary");
-    }
-
-    #[tokio::test]
-    async fn native_context_overflow_is_not_retried_or_run_locally() {
-        let runner = TestCompactionRunner {
-            supports_remote: true,
-            context_overflow: true,
-            remote_calls: AtomicUsize::new(0),
-            local_calls: AtomicUsize::new(0),
-        };
-        let error = run_compaction_with_runner(
-            ProviderKind::Claude,
-            RemoteCompactionMode::Auto,
-            "test-session",
-            ModelContext::default(),
-            &runner,
+            ModelContext::from_transcript_items(items),
+            |transcript| async {
+                let request = ProviderCompactionRequest {
+                    model: "claude-opus-4-8".to_string(),
+                    prompt: PromptSections::stable("test prompt"),
+                    transcript,
+                    tool_profile: ProviderToolProfile::AnthropicCoding,
+                    tools: Vec::new(),
+                    reasoning_effort: agent_vocab::ReasoningEffort::High,
+                    prompt_cache_key: None,
+                    session_id: Some("test-session".to_string()),
+                    compaction_instructions: Some("compact".to_string()),
+                };
+                provider.compact(request).await.map_err(anyhow::Error::from)
+            },
         )
         .await
         .expect_err("native context overflow must surface");
 
-        assert_eq!(runner.remote_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(runner.local_calls.load(Ordering::Relaxed), 0);
         assert!(error
-            .downcast_ref::<agent_provider::ProviderError>()
-            .is_some_and(agent_provider::ProviderError::is_context_overflow));
+            .downcast_ref::<ProviderError>()
+            .is_some_and(ProviderError::is_context_overflow));
+        assert_eq!(
+            provider.compact_calls.load(Ordering::Relaxed),
+            1,
+            "restoring the internal native trim/retry loop would make another compact request"
+        );
+        assert_eq!(provider.complete_calls.load(Ordering::Relaxed), 0);
+        let transcripts = provider
+            .compact_transcripts
+            .lock()
+            .expect("recorded transcripts lock");
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(transcripts[0].len(), original_len);
+        let sent_user_text = transcripts[0]
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                TranscriptItem::UserMessage(message) => message.as_text(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent_user_text,
+            vec![
+                "oldest retained user instruction",
+                "middle retained user instruction",
+                "newest retained user instruction"
+            ]
+        );
     }
 
     #[test]

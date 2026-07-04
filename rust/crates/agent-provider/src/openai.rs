@@ -514,10 +514,6 @@ impl ModelProvider for OpenAiProvider {
         self.complete_responses(request).await
     }
 
-    fn supports_remote_compaction(&self) -> bool {
-        true
-    }
-
     async fn compact(
         &self,
         request: ProviderCompactionRequest,

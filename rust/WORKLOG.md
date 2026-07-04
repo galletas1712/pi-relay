@@ -1591,8 +1591,9 @@ paths. Changes made from that review:
   unexpected-stop, transport/HTTP, protocol/content, and context overflow
   are typed terminal failures. Native compaction sends the selected full model
   context once and does not retry with transcript history omitted. `auto` and
-  `always` share this failure behavior: the mode affects selection policy, not
-  after-failure recovery, and neither silently installs a local checkpoint.
+  `always` have identical selected native execution; only `never` selects local
+  execution. There is no native after-failure recovery or silent local
+  checkpoint installation.
 - Direct `/compaction` is an atomic read-compatibility layout only when nested
   `/compaction/config` is absent. Fields are never merged, and current
   producers write the nested layout. Remove the direct-layout reader after an

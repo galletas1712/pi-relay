@@ -909,10 +909,6 @@ impl ModelProvider for AnthropicProvider {
         }))
     }
 
-    fn supports_remote_compaction(&self) -> bool {
-        true
-    }
-
     async fn compact(
         &self,
         request: ProviderCompactionRequest,
@@ -1332,9 +1328,8 @@ fn attribution_header(
 /// same stable system prompt produces the same fingerprint and therefore the
 /// same cached prefix, enabling true cross-session reuse of the stable-system
 /// cache. We fall back to a digest of the first user text only when a caller
-/// truly supplies no stable prefix; normal daemon requests and local
-/// compaction prompts are stable, and Anthropic remote compaction is not
-/// supported.
+/// truly supplies no stable prefix; normal daemon requests and both local and
+/// provider-native compaction prompts supply stable prompt sections.
 fn attribution_fingerprint(
     prompt: &crate::PromptSections,
     transcript: &[ModelTranscriptEntry],
