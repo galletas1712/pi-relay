@@ -1,6 +1,6 @@
 use agent_provider::{
     ModelRequest, ModelTranscriptEntry, PromptSections, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderToolProfile,
+    ProviderCompactionResponse, ProviderModelMetadata, ProviderToolProfile,
 };
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
@@ -119,10 +119,20 @@ pub(crate) struct CompactionAutoState {
 }
 
 pub(crate) fn compaction_config(config: &SessionConfig) -> CompactionConfig {
-    resolve_compaction_config(config)
+    resolve_compaction_config(config, None)
 }
 
-pub(crate) fn resolve_compaction_config(config: &SessionConfig) -> CompactionConfig {
+pub(crate) fn compaction_config_with_model_metadata(
+    config: &SessionConfig,
+    discovered: Option<ProviderModelMetadata>,
+) -> CompactionConfig {
+    resolve_compaction_config(config, discovered)
+}
+
+pub(crate) fn resolve_compaction_config(
+    config: &SessionConfig,
+    discovered: Option<ProviderModelMetadata>,
+) -> CompactionConfig {
     let metadata_configured = config.metadata.pointer("/compaction/config").is_some()
         || config.metadata.get("compaction").is_some();
     let auto_enabled_configured = config
@@ -134,6 +144,22 @@ pub(crate) fn resolve_compaction_config(config: &SessionConfig) -> CompactionCon
             .get("compaction")
             .and_then(|value| value.get("auto_enabled"))
             .is_some();
+    let context_window_configured = config
+        .metadata
+        .pointer("/compaction/config/context_window")
+        .is_some_and(|value| !value.is_null())
+        || config
+            .metadata
+            .pointer("/compaction/context_window")
+            .is_some_and(|value| !value.is_null());
+    let auto_limit_configured = config
+        .metadata
+        .pointer("/compaction/config/auto_limit_tokens")
+        .is_some_and(|value| !value.is_null())
+        || config
+            .metadata
+            .pointer("/compaction/auto_limit_tokens")
+            .is_some_and(|value| !value.is_null());
 
     let mut resolved: CompactionConfig = config
         .metadata
@@ -143,14 +169,18 @@ pub(crate) fn resolve_compaction_config(config: &SessionConfig) -> CompactionCon
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
 
-    let default_window =
-        model_metadata::context_window(config.provider.kind, &config.provider.model);
-    if resolved.context_window.is_none() {
+    let default_window = discovered
+        .and_then(|metadata| metadata.max_input_tokens)
+        .or_else(|| model_metadata::context_window(config.provider.kind, &config.provider.model));
+    if !context_window_configured {
         resolved.context_window = default_window;
     }
-    if resolved.auto_limit_tokens.is_none() {
-        resolved.auto_limit_tokens =
-            model_metadata::default_auto_limit(config.provider.kind, &config.provider.model);
+    if !auto_limit_configured {
+        resolved.auto_limit_tokens = discovered
+            .and_then(|metadata| metadata.recommended_auto_compact_tokens)
+            .or_else(|| {
+                model_metadata::default_auto_limit(config.provider.kind, &config.provider.model)
+            });
     }
 
     if !metadata_configured {
@@ -182,6 +212,15 @@ pub(crate) fn compaction_auto_state(config: &SessionConfig) -> CompactionAutoSta
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default()
+}
+
+pub(crate) fn compaction_auto_explicitly_disabled(config: &SessionConfig) -> bool {
+    config
+        .metadata
+        .pointer("/compaction/config/auto_enabled")
+        .or_else(|| config.metadata.pointer("/compaction/auto_enabled"))
+        .and_then(Value::as_bool)
+        == Some(false)
 }
 
 /// Lower bound on the effective auto-compaction limit. A limit below the
@@ -579,7 +618,7 @@ mod tests {
             "gpt-5.1-codex-max",
             serde_json::json!({}),
         );
-        let resolved = resolve_compaction_config(&config);
+        let resolved = resolve_compaction_config(&config, None);
 
         assert!(resolved.auto_enabled);
         assert_eq!(resolved.context_window, Some(272_000));
@@ -623,11 +662,27 @@ mod tests {
     #[test]
     fn resolved_compaction_config_unknown_model_needs_explicit_limit() {
         let config = test_config(ProviderKind::OpenAi, "unknown", serde_json::json!({}));
-        let resolved = resolve_compaction_config(&config);
+        let resolved = resolve_compaction_config(&config, None);
 
         assert!(!resolved.auto_enabled);
         assert_eq!(resolved.context_window, None);
         assert_eq!(resolved.auto_limit_tokens, None);
+    }
+
+    #[test]
+    fn discovered_context_window_enables_unknown_claude_model_compaction() {
+        let config = test_config(ProviderKind::Claude, "claude-future", serde_json::json!({}));
+        let resolved = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(500_000),
+                recommended_auto_compact_tokens: Some(425_000),
+            }),
+        );
+
+        assert!(resolved.auto_enabled);
+        assert_eq!(resolved.context_window, Some(500_000));
+        assert_eq!(resolved.auto_limit_tokens, Some(425_000));
     }
 
     #[test]
@@ -646,12 +701,22 @@ mod tests {
                 }
             }),
         );
-        let resolved = resolve_compaction_config(&config);
+        let resolved = resolve_compaction_config(&config, None);
 
         assert!(resolved.auto_enabled);
         assert_eq!(resolved.context_window, Some(123));
         assert_eq!(resolved.auto_limit_tokens, Some(77));
         assert_eq!(resolved.remote_mode, RemoteCompactionMode::Auto);
+
+        let discovered = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(500_000),
+                recommended_auto_compact_tokens: Some(425_000),
+            }),
+        );
+        assert_eq!(discovered.context_window, Some(123));
+        assert_eq!(discovered.auto_limit_tokens, Some(77));
     }
 
     #[test]
@@ -661,10 +726,37 @@ mod tests {
             "claude-sonnet-4-5",
             serde_json::json!({ "compaction": { "config": { "auto_enabled": false } } }),
         );
-        let resolved = resolve_compaction_config(&config);
+        let resolved = resolve_compaction_config(&config, None);
 
         assert!(!resolved.auto_enabled);
         assert_eq!(resolved.context_window, Some(200_000));
         assert_eq!(resolved.auto_limit_tokens, Some(170_000));
+    }
+
+    #[test]
+    fn explicit_null_limits_preserve_safe_discovered_defaults() {
+        let config = test_config(
+            ProviderKind::Claude,
+            "claude-future",
+            serde_json::json!({
+                "compaction": {
+                    "config": {
+                        "context_window": null,
+                        "auto_limit_tokens": null
+                    }
+                }
+            }),
+        );
+        let resolved = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(500_000),
+                recommended_auto_compact_tokens: Some(425_000),
+            }),
+        );
+
+        assert!(resolved.auto_enabled);
+        assert_eq!(resolved.context_window, Some(500_000));
+        assert_eq!(resolved.auto_limit_tokens, Some(425_000));
     }
 }

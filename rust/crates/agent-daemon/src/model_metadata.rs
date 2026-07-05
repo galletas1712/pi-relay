@@ -100,16 +100,18 @@ fn effort_intensity(effort: ReasoningEffort) -> u8 {
     }
 }
 
-/// Normalize a requested reasoning effort to a value the model actually
-/// supports. If `requested` is already supported it is returned unchanged.
-/// Otherwise the nearest supported value by intensity is returned, preferring
-/// the HIGHER value on a tie (so `minimal`->`low` and `max`->`xhigh` for
-/// gpt-5.x, and `xhigh`->`high` for a model that lacks xhigh).
+/// Normalize OpenAI reasoning effort against the daemon's pre-discovery table.
+///
+/// Anthropic receives raw configured intent and owns normalization alongside
+/// its authoritative Models API/static capability resolution.
 pub(crate) fn normalize_reasoning_effort(
     provider: ProviderKind,
     model: &str,
     requested: ReasoningEffort,
 ) -> ReasoningEffort {
+    if provider == ProviderKind::Claude {
+        return requested;
+    }
     let supported = supported_reasoning_efforts(provider, model);
     if supported.contains(&requested) {
         return requested;
@@ -234,20 +236,13 @@ mod tests {
     }
 
     #[test]
-    fn claude_adaptive_normalizes_to_probed_supported_set() {
+    fn claude_reasoning_intent_is_left_for_the_adapter() {
         use ReasoningEffort::*;
-        for model in ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-5"] {
-            let normalize =
-                |effort| normalize_reasoning_effort(ProviderKind::Claude, model, effort);
-            // Probed support: low, medium, high, xhigh, max.
-            assert_eq!(normalize(Low), Low);
-            assert_eq!(normalize(Medium), Medium);
-            assert_eq!(normalize(High), High);
-            assert_eq!(normalize(XHigh), XHigh);
-            assert_eq!(normalize(Max), Max);
-            // none/minimal are not supported; nearest supported is low.
-            assert_eq!(normalize(None), Low);
-            assert_eq!(normalize(Minimal), Low);
+        for effort in [None, Minimal, Low, Medium, High, XHigh, Max] {
+            assert_eq!(
+                normalize_reasoning_effort(ProviderKind::Claude, "claude-future", effort),
+                effort
+            );
         }
     }
 

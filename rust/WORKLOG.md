@@ -1,5 +1,51 @@
 # Rust Rewrite Worklog
 
+## 2026-07-02
+
+### Anthropic Model and Hosted-Tool Refresh
+
+- Added Claude Sonnet 5 as the normal Claude UI option (`high` effort), retained
+  Opus 4.8, and added Fable 5 as an explicit opt-in whose label/tooltip and docs
+  call out Anthropic's required 30-day retention and lack of Zero Data
+  Retention.
+- Refreshed Messages request shaping from first-party Anthropic documentation:
+  Sonnet 5/Fable 5 rely on their default/always-on adaptive thinking and omit
+  manual thinking, while Opus 4.8 requests adaptive thinking explicitly. All
+  support `low…max` through `output_config.effort`. Removed retired GA feature
+  beta values while preserving `anthropic-version: 2023-06-01` and the existing
+  Claude Code identity beta/header envelope on Messages requests; Models API
+  discovery sends no undocumented beta.
+- Integrated `GET /v1/models/{id}` with a shared in-memory cache (64 settled
+  ids; six-hour success TTL and one-minute refresh-failure backoff). Per-model
+  refreshes are single-flight without holding the cache lock across network
+  I/O. In-flight records are never evicted and may temporarily exceed the
+  settled-entry bound under concurrent capacity pressure; completion trims the
+  cache back to 64. A failed refresh retains stale last-known-good metadata;
+  only a cold lookup failure creates a negative entry. Discovered input/output
+  limits and thinking/effort capabilities shape provider requests and
+  proactive compaction. Static 1M-input/128K-output metadata for Sonnet 5 and
+  Fable 5 keeps known models safe during discovery failure; unknown models
+  retain a conservative 64K output ceiling and no assumed context window.
+- Kept the ordinary Anthropic default output request at
+  `min(64K, model ceiling)` rather than automatically reserving each model's
+  full 128K. Explicit session limits are clamped to the discovered/static
+  ceiling.
+- Upgraded the Anthropic hosted web sidecar to `web_search_20260318` and
+  `web_fetch_20260318`, direct callers only, with the documented
+  `response_inclusion: "excluded"` shape and no obsolete web-fetch beta.
+- Kept discovery at the daemon/provider seam instead of adding UI RPC or
+  database storage: the UI's known options are deterministic offline fallbacks,
+  provider handles share transient metadata across session reconstruction, and
+  the compaction gate consults the same cached metadata.
+- Verified with
+  `cargo test --manifest-path rust/Cargo.toml -p agent-provider -p agent-daemon`
+  (89 provider and 157 daemon tests), `cargo clippy --manifest-path
+  rust/Cargo.toml -p agent-provider -p agent-daemon --all-targets` (strict
+  `-D warnings` stops only on the pre-existing
+  `agent-store::switch_active_leaf` argument-count warning),
+  `npm run test --workspace @pi-relay/web` (191 tests), and
+  `npm run build --workspace @pi-relay/web`.
+
 ## 2026-05-27
 
 ### Per-Session Workspace Subset And Git Branch Override

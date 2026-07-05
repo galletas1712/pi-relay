@@ -647,9 +647,11 @@ auth.rs:21-35). A fresh empty DB needs NOTHING seeded for auth.
 | rust/crates/agent-store/src/postgres/schema.rs | migrate | 21-125 | Idempotent create-table-if-not-exists. Fresh DB fully provisioned by store.migrate(); no auth tables. |
 | rust/crates/agent-vocab/src/provider.rs | ProviderConfig | 79-85 | session.start: {kind:ProviderKind(OpenAi|Claude), model, reasoning_effort, max_tokens}. No default model. |
 
-**Model IDs (model_metadata.rs:9-18):** OpenAI `gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.1,
-gpt-5.1-codex-max, gpt-5.1-codex-mini, gpt-5.2, gpt-5.2-codex, gpt-5.3-codex`. Claude `claude-opus-4-8` (1M),
-`claude-opus-4-7` (1M), `claude-sonnet-4-5` (200k).
+**Model IDs:** OpenAI daemon fallbacks in `model_metadata.rs` cover `gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.1,
+gpt-5.1-codex-max, gpt-5.1-codex-mini, gpt-5.2, gpt-5.2-codex, gpt-5.3-codex`. Claude `claude-sonnet-5`,
+`claude-fable-5`, `claude-opus-4-8`, and `claude-opus-4-7` have 1M static fallbacks owned by the Anthropic adapter; its
+Models API cache can authoritatively refine runtime input/output limits and capabilities. Fable 5 requires 30-day
+retention and is not available under Zero Data Retention.
 
 ### build_seams
 **Deterministic harness tests:** session.start with `metadata:{"harness":true}` → runtime stops at spawn_model_dispatch:34
@@ -833,7 +835,7 @@ is NO connections table, NO auth/login RPC, NO `--api-key` CLI flag (config.rs:1
    `primaryApiKey` **starting with `sk-ant-`** (keys without that prefix are silently dropped → surfaces as
    "ANTHROPIC_API_KEY not found").
 4. **Start the e2e session WITHOUT the harness flag** (omit `metadata.harness` or set false) so real dispatch runs. Pick
-   model IDs from model_metadata.rs — e.g. OpenAI `gpt-5.6-sol`, Claude `claude-opus-4-8`/`claude-sonnet-4-5`.
+   a seeded model ID — e.g. OpenAI `gpt-5.6-sol`, Claude `claude-sonnet-5`/`claude-opus-4-8`.
    session.start provider = `{ "kind": "open_ai"|"claude", "model": "<id>" }` (verify exact ProviderKind wire casing at
    `agent-vocab/src/provider.rs:9` before hardcoding).
 

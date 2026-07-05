@@ -100,6 +100,17 @@ pub struct ProviderTokenCountResponse {
     pub input_tokens: usize,
 }
 
+/// Provider-normalized model limits consumed by the daemon scheduler.
+///
+/// Provider adapters own discovery, caching, and provider-specific threshold
+/// policy. The daemon uses only the resolved current/default input window and
+/// an optional provider-recommended automatic compaction limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderModelMetadata {
+    pub max_input_tokens: Option<usize>,
+    pub recommended_auto_compact_tokens: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderToolProfile {
     None,
@@ -398,6 +409,10 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 pub trait ModelProvider: Send + Sync {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse>;
 
+    async fn model_metadata(&self, _model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
+        Ok(None)
+    }
+
     fn supports_remote_compaction(&self) -> bool {
         false
     }
@@ -452,7 +467,7 @@ mod provider_error_tests {
         assert!(!ProviderError::Status {
             status: 400,
             message:
-                "invalid_request_error: Server tools are not supported in the count_tokens endpoint: web_fetch_20250910, web_search_20250305."
+                "invalid_request_error: Server tools are not supported in the count_tokens endpoint: web_fetch_20260318, web_search_20260318."
                     .to_string(),
         }
         .is_context_overflow());

@@ -15,6 +15,20 @@ describe("session defaults", () => {
 		});
 	});
 
+	it("exposes current Claude models with model-appropriate defaults and a Fable retention warning", () => {
+		const claude = MODEL_OPTIONS.filter((option) => option.provider.kind === "claude");
+		expect(claude.map((option) => option.provider.model)).toEqual([
+			"claude-sonnet-5",
+			"claude-opus-4-8",
+			"claude-fable-5",
+		]);
+		expect(claude.find((option) => option.provider.model === "claude-sonnet-5")?.provider.reasoning_effort).toBe("high");
+		const fable = claude.find((option) => option.provider.model === "claude-fable-5");
+		expect(fable?.provider.reasoning_effort).toBe("high");
+		expect(`${fable?.label} ${fable?.description}`).toMatch(/30-day data retention|30-day retention/i);
+		expect(`${fable?.label} ${fable?.description}`).toMatch(/not ZDR|zero data retention is unavailable/i);
+	});
+
 	it("exposes exactly the supported OpenAI/Codex model options", () => {
 		expect(MODEL_OPTIONS.filter((option) => option.provider.kind === "openai").map((option) => option.provider.model)).toEqual([
 			"gpt-5.6-sol",

@@ -3,6 +3,7 @@ import type { ContentBlock, ProviderConfig, ReasoningEffort } from "./types.ts";
 export interface ModelOption {
 	id: string;
 	label: string;
+	description?: string;
 	provider: ProviderConfig;
 }
 
@@ -23,9 +24,20 @@ export const MODEL_OPTIONS: ModelOption[] = [
 		provider: { kind: "openai", model: "gpt-5.6-luna", reasoning_effort: "xhigh" }
 	},
 	{
+		id: "claude:claude-sonnet-5",
+		label: "Claude Sonnet 5",
+		provider: { kind: "claude", model: "claude-sonnet-5", reasoning_effort: "high" }
+	},
+	{
 		id: "claude:claude-opus-4-8",
 		label: "Claude Opus 4.8",
 		provider: { kind: "claude", model: "claude-opus-4-8", reasoning_effort: "xhigh" }
+	},
+	{
+		id: "claude:claude-fable-5",
+		label: "Claude Fable 5 — 30-day retention; not ZDR",
+		description: "Explicit opt-in: Anthropic requires 30-day data retention for Fable 5; zero data retention is unavailable.",
+		provider: { kind: "claude", model: "claude-fable-5", reasoning_effort: "high" }
 	}
 ];
 

@@ -357,11 +357,15 @@ transcript revision server-side, refreshing the picker if history changed undern
 ## Model and reasoning controls
 
 The chat header exposes a model picker and a provider-specific reasoning-effort picker (`sessionDefaults.ts`). OpenAI
-offers `gpt-5.6-sol` (default), `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude offers `claude-opus-4-8`. The provider/model
-is locked once the session has any transcript history, because both providers carry provider-shaped replay state across
-turns. Reasoning effort is a per-request knob and can change during or between turns (applying to subsequently created
+offers `gpt-5.6-sol` (default), `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude offers Sonnet 5, Opus 4.8, and Fable 5.
+Sonnet 5 is the normal Claude default at `high` effort. Fable 5 is listed last as an explicit opt-in, and its option text
+and tooltip state Anthropic's required 30-day retention and lack of Zero Data Retention. The provider/model is locked
+once the session has any transcript history, because both providers carry provider-shaped replay state across turns.
+Reasoning effort is a per-request knob and can change during or between turns (applying to subsequently created
 requests). Effort options differ by provider/model: OpenAI generally offers `none…xhigh`, `gpt-5.6-sol` also offers
-`max`, and Claude offers `low…max`. Changing model/effort calls `session.configure` and patches the cached list/snapshot.
+`max`, and these Claude models offer `low…max`. Changing model/effort calls `session.configure` and patches the cached
+list/snapshot. The list is a seeded offline-safe fallback; the daemon's cached Anthropic Models API metadata remains
+authoritative for runtime limits and capabilities without adding transient model records to the database.
 
 ## Notes
 
