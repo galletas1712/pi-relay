@@ -34,11 +34,13 @@
   construction. The adapter validates configured known reasoning effort
   exactly against the selected entry, uses discovered
   `supports_parallel_tool_calls`, and continues to send hardcoded
-  `service_tier: "priority"` unconditionally. `ultra` was added to the shared
-  vocabulary and TypeScript wire type, but not to the static picker. The local
-  tool registry remains authoritative; provider-native search/patch selector
-  fields are ignored as non-authoritative input and cannot invalidate the
-  catalog or enable native actions.
+  `service_tier: "priority"` unconditionally. The shared Rust/TypeScript wire
+  vocabulary ends at `max`; catalog-only `ultra` and future unknown effort
+  strings remain bounded metadata, cannot invalidate the catalog, and cannot
+  enter a request body. The local tool registry remains authoritative;
+  provider-native search/patch selector fields are ignored as
+  non-authoritative input and cannot invalidate the catalog or enable native
+  actions.
 - Deleted the daemon's duplicate static OpenAI context/threshold/effort table.
   `ProviderModelMetadata` now contains only scheduler-consumed normalized
   values: resolved current/default input window and optional provider
@@ -50,8 +52,7 @@
   persisted in-flight/circuit-breaker behavior are unchanged.
 - Preserved the Anthropic adapter's Sonnet 4.5 fallback at a 200k input window
   and generic 170k recommendation. Adaptive Claude effort shaping remains
-  adapter-owned: `none`/`minimal` map to `low`, while unsupported `ultra`
-  rejects locally.
+  adapter-owned: `none`/`minimal` map to `low`.
 - Sanitized probe evidence (no credentials, response payload, or account
   identifiers retained here): the authenticated endpoint returned ten models
   on 2026-07-04. GPT-5.6 appeared only with client versions at least `0.142.2`;
@@ -62,13 +63,24 @@
   `none`. GPT-5.4 reported a 272,000 current/default window and 1,000,000
   maximum, so its default recommendation is 244,800 rather than 900,000.
   A weak ETag did not produce a 304 with `If-None-Match`.
+- Corrected the initial interpretation of catalog `ultra` after pinned-source
+  review and a completed live release test. Codex revision
+  `98d28aab54ed86714901b6619400598598876dd0` parses Ultra internally but maps
+  it to Max before every Responses request; only MultiAgent V2 uses it to
+  select proactive multi-agent behavior. Literal Sol/Ultra and Terra/Ultra
+  passed the discovered catalog check but every `/responses` POST returned
+  HTTP 400. Sol/High, Terra/High, Luna/Max, and GPT-5.4/Medium succeeded on the
+  same account and request path. pi-relay does not implement Codex proactive
+  orchestration, so it neither exposes Ultra nor aliases it to Max.
 - Unit/wire validation covers exact request identity, timeout configuration,
   parse/bounds, current-vs-maximum precedence, effort rejection, priority and
   parallel shaping, 20-way cold single-flight, fresh/expired/failure/401/account
-  transitions, cancellation safety, atomic replacement, and provider-neutral
-  scheduler precedence. **This implementation has not yet been validated
-  against the live private endpoint; the authenticated probe above supplied
-  sanitized schema evidence only.**
+  transitions, cancellation safety, atomic replacement, catalog-only/future
+  effort tolerance, public-config Ultra rejection, non-emission of literal
+  Ultra, and provider-neutral scheduler precedence. Live validation observed
+  one catalog retrieval reused across all tested actions, correct metadata
+  resolution, successful ordinary exposed efforts, replay continuity, and the
+  literal-Ultra rejection described above.
 
 ## 2026-07-02
 

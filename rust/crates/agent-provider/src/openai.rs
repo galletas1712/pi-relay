@@ -208,6 +208,8 @@ struct OpenAiModelMetadata {
     slug: String,
     max_input_tokens: Option<usize>,
     recommended_auto_compact_tokens: Option<usize>,
+    // Keep bounded catalog strings verbatim. Values outside the public
+    // ReasoningEffort enum are harness metadata and cannot enter a request.
     supported_reasoning_efforts: HashSet<String>,
     supports_parallel_tool_calls: bool,
 }
@@ -524,7 +526,6 @@ fn test_openai_model_metadata(model: &str) -> OpenAiModelMetadata {
             ReasoningEffort::High,
             ReasoningEffort::XHigh,
             ReasoningEffort::Max,
-            ReasoningEffort::Ultra,
         ]
         .into_iter()
         .map(|effort| effort.as_str().to_string())
@@ -837,22 +838,22 @@ mod catalog_tests {
     }
 
     #[test]
-    fn exact_slug_and_reasoning_capabilities_are_authoritative() {
+    fn catalog_tolerates_non_wire_levels_and_exact_validates_wire_efforts() {
         let catalog = parse_models(vec![
             model_fixture(
                 "gpt-5.6-sol",
                 Some(372_000),
                 None,
                 None,
-                &["low", "medium", "high", "xhigh", "max", "ultra"],
-                true,
-            ),
-            model_fixture(
-                "gpt-5.6-terra",
-                Some(372_000),
-                None,
-                None,
-                &["low", "medium", "high", "xhigh", "max", "ultra"],
+                &[
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra",
+                    "future-harness-level",
+                ],
                 true,
             ),
             model_fixture(
@@ -863,21 +864,83 @@ mod catalog_tests {
                 &["low", "medium", "high", "xhigh", "max"],
                 false,
             ),
+            model_fixture(
+                "harness-only",
+                Some(372_000),
+                None,
+                None,
+                &["ultra", "future-harness-level"],
+                true,
+            ),
         ])
         .expect("catalog parses");
         assert!(!catalog.models.contains_key("gpt-5.6"));
-        assert!(
-            openai_reasoning_effort(&catalog.models["gpt-5.6-sol"], ReasoningEffort::Ultra).is_ok()
+        let sol = &catalog.models["gpt-5.6-sol"];
+        assert!(sol.supported_reasoning_efforts.contains("ultra"));
+        assert!(sol
+            .supported_reasoning_efforts
+            .contains("future-harness-level"));
+        assert_eq!(
+            openai_reasoning_effort(sol, ReasoningEffort::Max).unwrap(),
+            "max"
         );
-        assert!(
-            openai_reasoning_effort(&catalog.models["gpt-5.6-terra"], ReasoningEffort::Ultra)
-                .is_ok()
+        assert_eq!(
+            openai_reasoning_effort(&catalog.models["gpt-5.6-luna"], ReasoningEffort::Max).unwrap(),
+            "max"
         );
-        for effort in [ReasoningEffort::Ultra, ReasoningEffort::None] {
-            let error = openai_reasoning_effort(&catalog.models["gpt-5.6-luna"], effort)
-                .expect_err("unsupported effort must not be normalized");
+        for (model, effort) in [
+            ("gpt-5.6-luna", ReasoningEffort::None),
+            ("harness-only", ReasoningEffort::Max),
+        ] {
+            let error = openai_reasoning_effort(&catalog.models[model], effort)
+                .expect_err("unsupported public effort must not be normalized");
             assert!(error.to_string().contains(effort.as_str()));
+            assert!(error.to_string().contains(model));
         }
+    }
+
+    #[test]
+    fn request_bodies_never_select_catalog_only_reasoning_levels() {
+        let mut metadata = OpenAiModelMetadata {
+            slug: "gpt-5.6-sol".to_string(),
+            max_input_tokens: Some(372_000),
+            recommended_auto_compact_tokens: Some(334_800),
+            supported_reasoning_efforts: ["max", "ultra", "future-harness-level"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            supports_parallel_tool_calls: true,
+        };
+        let ordinary = responses_body_with_metadata(
+            model_request("gpt-5.6-sol", ReasoningEffort::Max),
+            "session",
+            &metadata,
+        )
+        .expect("ordinary body renders");
+        let compact = compact_body_with_metadata(
+            compact_request("gpt-5.6-sol", ReasoningEffort::Max),
+            "session",
+            &metadata,
+        )
+        .expect("compact body renders");
+        for body in [ordinary, compact] {
+            assert_eq!(body["reasoning"]["effort"], "max");
+            assert!(!serde_json::to_string(&body).unwrap().contains("\"ultra\""));
+        }
+
+        metadata.supported_reasoning_efforts.remove("max");
+        assert!(responses_body_with_metadata(
+            model_request("gpt-5.6-sol", ReasoningEffort::Max),
+            "session",
+            &metadata,
+        )
+        .is_err());
+        assert!(compact_body_with_metadata(
+            compact_request("gpt-5.6-sol", ReasoningEffort::Max),
+            "session",
+            &metadata,
+        )
+        .is_err());
     }
 
     #[test]

@@ -739,7 +739,7 @@ impl AnthropicModelCapabilities {
             ReasoningEffort::High => self.high_effort,
             ReasoningEffort::XHigh => self.xhigh_effort,
             ReasoningEffort::Max => self.max_effort,
-            ReasoningEffort::None | ReasoningEffort::Minimal | ReasoningEffort::Ultra => false,
+            ReasoningEffort::None | ReasoningEffort::Minimal => false,
         }
     }
 }
@@ -3681,23 +3681,6 @@ mod tests {
             .expect("count adaptive request renders");
             assert_eq!(count["output_config"]["effort"], "low");
         }
-
-        let error = messages_body(ModelRequest {
-            model: "claude-opus-4-8".to_string(),
-            transcript_cache_prefix_len: None,
-            prompt: PromptSections::stable("stable rules"),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::Ultra,
-            prompt_cache_key: None,
-            session_id: None,
-            turn_id: None,
-        })
-        .expect_err("current Anthropic adapter policy rejects ultra");
-        assert!(error.to_string().contains("ultra"));
-        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]

@@ -168,12 +168,22 @@ OpenAI `max_output_tokens`, and when omitted the daemon does not set an OpenAI
 output cap.
 
 `reasoning_effort` defaults to `medium`. The shared wire vocabulary is `none`,
-`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. For OpenAI,
-that vocabulary is not a promise that every model accepts every value: before
-ordinary and compact requests, the private Codex catalog must contain the exact
-selected slug and advertise the exact configured effort. Unsupported values
-fail locally without normalization. The sanitized GPT-5.6 catalog advertises
-`ultra` for Sol/Terra but not Luna, and advertises no `none` for those models.
+`minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; decoding any other
+string fails. For OpenAI, that vocabulary is not a promise that every model
+accepts every value: before ordinary and compact requests, the private Codex
+catalog must contain the exact selected slug and advertise the exact configured
+effort. Unsupported values fail locally without normalization.
+
+The account-scoped GPT-5.6 catalog advertises `ultra` for Sol/Terra but not
+Luna. That is Codex harness metadata, not an additional pi-relay wire effort:
+pinned Codex converts Ultra to Max before Responses requests and uses Ultra to
+select proactive behavior only with MultiAgent V2. Live literal
+`reasoning.effort = "ultra"` requests to Sol and Terra returned HTTP 400, while
+ordinary exposed efforts succeeded. pi-relay does not implement that proactive
+orchestration mode, so it neither exposes `ultra` nor silently aliases it to
+`max`. Catalog-only and future unknown levels remain tolerated as metadata and
+cannot enter a request body. The same catalog advertises no `none` for the
+reviewed GPT-5.6 models.
 Claude Sonnet 5, Fable 5, and Opus 4.8 accept `low`, `medium`, `high`, `xhigh`,
 and `max`; their provider-specific shaping remains inside the Anthropic
 adapter. Fable 5 requires 30-day retention and is not available under Zero Data

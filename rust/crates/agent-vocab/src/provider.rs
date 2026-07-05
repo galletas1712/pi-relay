@@ -68,7 +68,6 @@ text_enum! {
         High => "high",
         XHigh => "xhigh",
         Max => "max",
-        Ultra => "ultra",
     }
 }
 
@@ -152,15 +151,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn ultra_reasoning_effort_round_trips_as_wire_string() {
-        assert_eq!(
-            serde_json::to_value(ReasoningEffort::Ultra).unwrap(),
-            json!("ultra")
-        );
-        assert_eq!(
-            serde_json::from_value::<ReasoningEffort>(json!("ultra")).unwrap(),
-            ReasoningEffort::Ultra
-        );
+    fn provider_config_rejects_catalog_only_ultra_reasoning_effort() {
+        let error = serde_json::from_value::<ProviderConfig>(json!({
+            "kind": "openai",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "ultra",
+        }))
+        .expect_err("catalog-only Codex metadata is not a public wire effort");
+
+        assert!(error.to_string().contains("unknown ReasoningEffort: ultra"));
     }
 
     #[test]

@@ -237,9 +237,14 @@ Reasoning effort is a per-request knob and can change during or between turns
 (applying to subsequently created requests). The picker remains a static seeded
 convenience in this PR: its existing hosted GPT-5.6 choices remain `none`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, while the Claude
-entries expose `low…max`; it does not dynamically advertise catalog-only
-`ultra`. Some seeded OpenAI choices can be rejected when the active account's
-catalog does not advertise them. Changing model/effort calls
+entries expose `low…max`. `max` is the highest public wire effort; catalog-only
+values such as `ultra` are not exposed. The private catalog reports `ultra` for
+Sol/Terra, but pinned Codex maps that selector to `max` on Responses requests
+and uses it to select proactive MultiAgent V2 behavior. pi-relay implements no
+equivalent orchestration mode, and live literal-Ultra requests were rejected,
+so it neither exposes nor aliases the value. Some seeded OpenAI choices can be
+rejected when the active account's catalog does not advertise them. Changing
+model/effort calls
 `session.configure` and patches the cached list/snapshot. Runtime validation is
 authoritative:
 OpenAI exact-resolves the model and configured effort from its account-scoped

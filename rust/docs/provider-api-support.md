@@ -17,13 +17,13 @@ APIs.
   [Sources](#sources), viewed on the audited date.
 
 The OpenAI catalog implementation is based on a sanitized authenticated probe
-performed on 2026-07-04, but this implementation has **not yet** been exercised
-against the live backend. **Live** below means a sanitized provider run recorded
-in [`../WORKLOG.md`](../WORKLOG.md); **source** means current pi-relay code;
-**unit** means an in-process wire mock, fixture, or unit test; **pinned** means
-behavior evidenced in the pinned Codex source; and **official** means a current
-public provider contract. Public documentation is not evidence that the private
-Codex transport accepts a public OpenAI feature.
+and was exercised against the live backend on 2026-07-04. **Live** below means
+a sanitized provider run recorded in [`../WORKLOG.md`](../WORKLOG.md);
+**source** means current pi-relay code; **unit** means an in-process wire mock,
+fixture, or unit test; **pinned** means behavior evidenced in the pinned Codex
+source; and **official** means a current public provider contract. Public
+documentation or private catalog metadata is not evidence that the private
+Codex Responses transport accepts a literal wire value.
 
 Table statuses are deliberately narrow: **Supported** is implemented for the
 adapter, **Partial** implements only the described subset or passive replay,
@@ -95,11 +95,11 @@ replay.
 
 | Capability | OpenAI private Codex adapter | Anthropic Messages adapter | Evidence and limitations |
 | --- | --- | --- | --- |
-| Model discovery and capability metadata | **Supported.** Authenticated `GET /models?client_version=0.142.3` installs one bounded account-scoped catalog. Model lookup is exact by slug; every ordinary and compact request resolves the selected model before request shaping. There is no static catalog, alias, prefix match, substitution, public `/v1/models` fallback, disk cache, or stale-success fallback. | **Supported.** `GET /models/{id}` is cached and merged over conservative static fallback metadata for input/output limits, effort, adaptive thinking, and compaction capability. | OpenAI discovery/request/cache behavior is source/mock-tested from the sanitized probe schema; live implementation validation is pending. Anthropic discovery is source/mock-tested. `[source, unit, pinned]` |
+| Model discovery and capability metadata | **Supported.** Authenticated `GET /models?client_version=0.142.3` installs one bounded account-scoped catalog. Model lookup is exact by slug; every ordinary and compact request resolves the selected model before request shaping. There is no static catalog, alias, prefix match, substitution, public `/v1/models` fallback, disk cache, or stale-success fallback. | **Supported.** `GET /models/{id}` is cached and merged over conservative static fallback metadata for input/output limits, effort, adaptive thinking, and compaction capability. | OpenAI discovery/request/cache behavior is source/mock-tested from the sanitized probe schema and its retrieval/resolution path was observed live. Anthropic discovery is source/mock-tested. `[source, unit, live, pinned]` |
 | Context windows and automatic compaction thresholds | **Supported.** The adapter resolves `context_window` before `max_context_window` and recommends `min(auto_compact_token_limit, 90% of resolved context)`, deriving 90% when the explicit limit is null/missing. The daemon has no OpenAI static rows: without fresh authoritative metadata it has no proactive threshold, while reactive overflow recovery remains available. | **Supported.** Discovered/static windows drive policy; verified 1M windows default to a 500k threshold and other known windows use the generic policy. | The sanitized probe fixture yields 334,800 for a 372k GPT-5.6 window. GPT-5.4 uses its 272k current/default window (244,800), not 90% of its advertised 1M maximum. The paid Sonnet 5 E2E crossed the 500k gate. `[source, unit, live]` |
 | Instructions / system prompt | **Supported.** Stable prompt is Responses `instructions`; dynamic context is a final user item. | **Supported.** Claude Code attribution plus a stable cacheable `system` block; dynamic context is a final uncached user message. | Request-shape tests cover both. `[source, unit]` |
 | Maximum output | **Supported.** `max_output_tokens` is emitted only when configured; otherwise omitted. The private catalog advertises no output ceiling, so discovery does not invent or clamp one. | **Supported.** Messages requires `max_tokens`; pi-relay defaults to `min(64k, model ceiling)` and clamps explicit values to the resolved ceiling. | `[source, unit]` |
-| Reasoning controls | **Partial.** Sends the configured known `reasoning.effort` only when that exact string is advertised by the selected catalog entry, and requests encrypted reasoning replay; unsupported values fail locally without translation or clamping. The shared vocabulary includes `ultra`, but the static web picker does not advertise it. | **Partial.** Sends metadata-gated adaptive thinking and `output_config.effort`; historical `none`/`minimal`→`low` normalization is adapter-local. No legacy manual thinking budget is generated. | The sanitized catalog shows Sol/Terra supporting `low…ultra`, Luna supporting `low…max`, and none of them supporting `none`. OpenAI implementation live validation is pending. Anthropic capability shaping is mock-tested and ordinary adaptive thinking has historical live coverage. `[source, unit, live]` |
+| Reasoning controls | **Partial.** Sends a configured public `reasoning.effort` (`none` through `max`) only when that exact string is advertised by the selected catalog entry, and requests encrypted reasoning replay; unsupported values fail locally without translation or clamping. Catalog-only strings such as `ultra` are tolerated but cannot be configured or emitted. | **Partial.** Sends metadata-gated adaptive thinking and `output_config.effort`; historical `none`/`minimal`→`low` normalization is adapter-local. No legacy manual thinking budget is generated. | The catalog reports Ultra for Sol/Terra, but pinned Codex converts Ultra to Max before Responses and uses it as the proactive MultiAgent V2 selector. Live literal Sol/Ultra and Terra/Ultra returned HTTP 400; Sol/High, Terra/High, Luna/Max, and GPT-5.4/Medium succeeded. pi-relay exposes no proactive mode and does not alias the value. `[source, unit, live, pinned]` |
 | Parallel tool calls | **Supported.** Ordinary and compact request bodies use the selected catalog entry's exact `supports_parallel_tool_calls` value. | **Provider default.** No corresponding daemon-level control is exposed. | Catalog parsing and both OpenAI body paths are unit-tested. `[source, unit]` |
 | Text format / verbosity | **Unsupported.** No `text` or `verbosity` control is exposed, although pinned Codex `CompactionInput` has optional `text`. | **Unsupported.** No structured text format or verbosity control is exposed. | Public OpenAI-only and pinned-source capability, not an adapter feature. `[source, pinned, official]` |
 | Service tier | **Supported.** Hardcoded to `service_tier: "priority"` for ordinary and compact requests; it is intentionally not configurable and is sent even when the catalog does not advertise priority for that model. | **Unsupported.** The adapter omits `service_tier`, so Anthropic applies its default. | Catalog service-tier advertisement is not used as a downgrade/configuration mechanism. Anthropic publicly supports `auto` / `standard_only`, but pi-relay does not select or normalize it. `[source, unit, official]` |
@@ -128,6 +128,20 @@ limits, which derives a 334,800 recommendation. Sol and Terra advertised
 three omitted `none`. GPT-5.4 reported a 272,000 current/default window and a
 1,000,000 maximum, so the current window remains authoritative for its 244,800
 recommendation. The response had no maximum-output fields.
+
+Reasoning-level catalog strings are retained as bounded metadata even when
+pi-relay does not recognize them as wire efforts, so `ultra` and future unknown
+values cannot make the catalog unusable. This tolerance is not a capability
+claim. At pinned Codex revision
+`98d28aab54ed86714901b6619400598598876dd0`,
+`reasoning_effort_for_request` maps Ultra to Max before Responses request
+construction, while the MultiAgent V2 session policy uses Ultra to select
+`MultiAgentMode::Proactive`. A completed live release test confirmed why that
+distinction matters: literal Ultra passed catalog validation but every Sol and
+Terra `/responses` POST returned HTTP 400. The same run succeeded with
+Sol/High, Terra/High, Luna/Max, and GPT-5.4/Medium. pi-relay therefore exposes
+`max` as its highest raw effort and leaves proactive orchestration as a
+separate, unimplemented capability.
 
 A fresh catalog is mandatory for shaping a new OpenAI request. Cold,
 authentication, transport, timeout, malformed-response, unknown-model, and

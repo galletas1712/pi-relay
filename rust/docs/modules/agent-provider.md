@@ -146,14 +146,20 @@ the sanitized GPT-5.6 372k fixture yields 334,800, while GPT-5.4's 272k current
 window yields 244,800 even though it also advertises a 1M maximum. The catalog
 has no output-ceiling field, so the adapter does not invent one.
 
-Reasoning support is exact and model-specific. The shared known vocabulary
-includes `ultra`; the sanitized fixture advertises it for Sol/Terra but not
-Luna, and advertises no `none` for those models. An explicitly configured known
-effort absent from the selected model fails locally rather than being clamped
-or translated. The static web model/effort picker is unchanged and does not
-advertise `ultra`. Provider-native search and patch selector fields are ignored
-as non-authoritative input; unknown future values cannot invalidate the
-catalog, enable native shell/patch actions, or change the local tool registry.
+Reasoning support is exact and model-specific. The public wire vocabulary ends
+at `max`. An explicitly configured wire effort absent from the selected model
+fails locally rather than being clamped or translated. Catalog entries are
+kept as bounded strings so `ultra` and future unknown levels do not invalidate
+discovery, but those entries are non-wire harness metadata and cannot enter a
+request body. The account catalog advertises `ultra` for Sol/Terra but not
+Luna, and advertises no `none` for those models. Pinned Codex maps Ultra to Max
+before every Responses request and uses it to select proactive behavior only
+under MultiAgent V2; live literal-Ultra requests to Sol/Terra returned HTTP
+400. Because pi-relay implements no corresponding proactive orchestration, it
+does not expose or alias `ultra`. Provider-native search and patch selector
+fields are ignored as non-authoritative input; unknown future values cannot
+invalidate the catalog, enable native shell/patch actions, or change the local
+tool registry.
 `service_tier: "priority"` remains
 unconditional for ordinary and compact calls even when the selected catalog
 entry does not advertise priority.
@@ -342,8 +348,9 @@ Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire â
 ## Notes
 
 - `ReasoningEffort::default()` is `Medium`. OpenAI exact-validates the known
-  configured value against the selected catalog entry and never clamps it;
-  `Ultra` is currently evidenced for GPT-5.6 Sol/Terra but not Luna.
+  configured wire value against the selected catalog entry and never clamps
+  it. `Max` is the highest exposed value; catalog-only `ultra` is tolerated but
+  cannot be configured or emitted.
   Anthropic normalizes historical `None`/`Minimal` requests to `Low` inside its
   adapter; Models API capability metadata determines whether the selected
   `lowâ€¦max` effort is emitted. Sonnet 5, Fable 5, and Opus 4.8 support that
