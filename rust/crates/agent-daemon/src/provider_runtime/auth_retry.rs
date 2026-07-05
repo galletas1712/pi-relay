@@ -2,7 +2,7 @@ use std::future::Future;
 
 use agent_provider::{
     ModelRequest, ModelResponse, ProviderCompactionRequest, ProviderCompactionResponse,
-    ProviderError, ProviderTokenCountRequest, ProviderTokenCountResponse,
+    ProviderError, ProviderModelMetadata, ProviderTokenCountRequest, ProviderTokenCountResponse,
 };
 use agent_store::SessionConfig;
 
@@ -41,6 +41,24 @@ where
         }
         Err(error) => Err(error),
     }
+}
+
+pub(super) async fn model_metadata_with_auth_retry(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+    provider: ProviderHandle,
+    model: String,
+) -> std::result::Result<Option<ProviderModelMetadata>, ProviderError> {
+    with_codex_auth_retry(
+        state,
+        config,
+        session_id,
+        provider,
+        model,
+        |provider, model| async move { provider.provider.model_metadata(&model).await },
+    )
+    .await
 }
 
 pub(super) async fn count_tokens_with_auth_retry(

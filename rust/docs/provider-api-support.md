@@ -9,19 +9,20 @@ APIs.
 
 **Revisions audited:**
 
-- pi-relay provider correctness implementation at this branch;
+- pi-relay provider-modernization behavior through this branch;
 - pinned Codex source clone `../openai-codex` at
   `98d28aab54ed86714901b6619400598598876dd0`;
 - current OpenAI and Anthropic contracts linked under
   [Sources](#sources), viewed on the audited date.
 
-No authenticated provider call was made specifically for this audit. **Live**
-below means an earlier sanitized run recorded in [`../WORKLOG.md`](../WORKLOG.md);
+The OpenAI catalog implementation is based on a sanitized authenticated probe
+and was exercised against the live backend on 2026-07-04. **Live** below means
+a sanitized provider run recorded in [`../WORKLOG.md`](../WORKLOG.md);
 **source** means current pi-relay code; **unit** means an in-process wire mock,
 fixture, or unit test; **pinned** means behavior evidenced in the pinned Codex
 source; and **official** means a current public provider contract. Public
-documentation is not evidence that the private Codex transport accepts a public
-OpenAI feature.
+documentation or private catalog metadata is not evidence that the private
+Codex Responses transport accepts a literal wire value.
 
 Table statuses are deliberately narrow: **Supported** is implemented for the
 adapter, **Partial** implements only the described subset or passive replay,
@@ -93,13 +94,14 @@ replay.
 
 | Capability | OpenAI private Codex adapter | Anthropic Messages adapter | Evidence and limitations |
 | --- | --- | --- | --- |
-| Model discovery and capability metadata | **Partial.** The daemon uses a static model table; the adapter does not call the private `/models` endpoint. | **Supported.** `GET /models/{id}` is cached and merged over conservative static fallback metadata for input/output limits, effort, and adaptive thinking. | Anthropic discovery is source/mock-tested. Pinned Codex defines rich `/models` metadata, but pi-relay does not consume it. `[source, unit, pinned]` |
-| Context windows and automatic compaction thresholds | **Partial.** Known static windows drive policy; unknown models have no proactive threshold and rely on reactive overflow handling. | **Supported.** Discovered/static windows drive policy; verified 1M windows default to a 500k threshold and other known windows use the generic policy. | `[source, unit]` |
+| Model discovery and capability metadata | **Supported.** Authenticated `GET /models?client_version=0.142.3` installs one bounded account-scoped catalog. Model lookup is exact by slug; every ordinary and compact request resolves the selected model before request shaping. There is no static catalog, alias, prefix match, substitution, public `/v1/models` fallback, disk cache, or stale-success fallback. | **Supported.** `GET /models/{id}` is cached and merged over conservative static fallback metadata for input/output limits, effort, and adaptive thinking. | OpenAI discovery/request/cache behavior is source/mock-tested from the sanitized probe schema and its retrieval/resolution path was observed live. Anthropic discovery is source/mock-tested. `[source, unit, live, pinned]` |
+| Context windows and automatic compaction thresholds | **Supported.** The adapter resolves `context_window` before `max_context_window` and recommends `min(auto_compact_token_limit, 90% of resolved context)`, deriving 90% when the explicit limit is null/missing. The daemon has no OpenAI static rows: without fresh authoritative metadata it has no proactive threshold, while reactive overflow recovery remains available. | **Supported.** Discovered/static windows drive policy; verified 1M windows default to a 500k threshold and other known windows use the generic policy. | The sanitized probe fixture yields 334,800 for a 372k GPT-5.6 window. GPT-5.4 uses its 272k current/default window (244,800), not 90% of its advertised 1M maximum. `[source, unit, live]` |
 | Instructions / system prompt | **Supported.** Stable prompt is Responses `instructions`; dynamic context is a final user item. | **Supported.** Claude Code attribution plus a stable cacheable `system` block; dynamic context is a final uncached user message. | Request-shape tests cover both. `[source, unit]` |
-| Maximum output | **Supported.** `max_output_tokens` is emitted only when configured; otherwise omitted. | **Supported.** Messages requires `max_tokens`; pi-relay defaults to `min(64k, model ceiling)` and clamps explicit values to the resolved ceiling. | `[source, unit]` |
-| Reasoning controls | **Partial.** Sends model-normalized `reasoning.effort` and requests encrypted reasoning replay; no reasoning summary/context control is exposed. | **Partial.** Sends metadata-gated adaptive thinking and `output_config.effort`; no legacy manual thinking budget is generated. | OpenAI model normalization follows the retained daemon policy; Anthropic capability shaping is mock-tested and ordinary adaptive thinking has historical live coverage. `[source, unit, live]` |
+| Maximum output | **Supported.** `max_output_tokens` is emitted only when configured; otherwise omitted. The private catalog advertises no output ceiling, so discovery does not invent or clamp one. | **Supported.** Messages requires `max_tokens`; pi-relay defaults to `min(64k, model ceiling)` and clamps explicit values to the resolved ceiling. | `[source, unit]` |
+| Reasoning controls | **Partial.** Sends a configured public `reasoning.effort` (`none` through `max`) only when that exact string is advertised by the selected catalog entry, and requests encrypted reasoning replay; unsupported values fail locally without translation or clamping. Catalog-only strings such as `ultra` are tolerated but cannot be configured or emitted. | **Partial.** Sends metadata-gated adaptive thinking and `output_config.effort`; historical `none`/`minimal`→`low` normalization is adapter-local. No legacy manual thinking budget is generated. | The catalog reports Ultra for Sol/Terra, but pinned Codex converts Ultra to Max before Responses and uses it as the proactive MultiAgent V2 selector. Live literal Sol/Ultra and Terra/Ultra returned HTTP 400; Sol/High, Terra/High, Luna/Max, and GPT-5.4/Medium succeeded. pi-relay exposes no proactive mode and does not alias the value. `[source, unit, live, pinned]` |
+| Parallel tool calls | **Supported.** Ordinary and compact request bodies use the selected catalog entry's exact `supports_parallel_tool_calls` value. | **Provider default.** No corresponding daemon-level control is exposed. | Catalog parsing and both OpenAI body paths are unit-tested. `[source, unit]` |
 | Text format / verbosity | **Unsupported.** No `text` or `verbosity` control is exposed, although pinned Codex `CompactionInput` has optional `text`. | **Unsupported.** No structured text format or verbosity control is exposed. | Public OpenAI-only and pinned-source capability, not an adapter feature. `[source, pinned, official]` |
-| Service tier | **Supported.** Hardcoded to `service_tier: "priority"` for ordinary and compact requests; it is intentionally not configurable. | **Unsupported.** The adapter omits `service_tier`, so Anthropic applies its default. | Anthropic publicly supports `auto` / `standard_only`, but pi-relay does not select or normalize it. `[source, unit, official]` |
+| Service tier | **Supported.** Hardcoded to `service_tier: "priority"` for ordinary and compact requests; it is intentionally not configurable and is sent even when the catalog does not advertise priority for that model. | **Unsupported.** The adapter omits `service_tier`, so Anthropic applies its default. | Catalog service-tier advertisement is not used as a downgrade/configuration mechanism. Anthropic publicly supports `auto` / `standard_only`, but pi-relay does not select or normalize it. `[source, unit, official]` |
 | Prompt cache routing key | **Supported.** Sends explicit `prompt_cache_key`, else the stable pi-relay session/thread id. | **Unsupported.** Anthropic has no equivalent routing-key field. | OpenAI body behavior is unit-tested. `[source, unit]` |
 | Prompt cache retention / markers | **Unsupported.** No explicit retention setting is sent on the private transport. | **Supported.** Explicit 1-hour cache control on the stable system prefix and 5-minute transcript breakpoints, including a deep-history marker past the lookback window. | Public OpenAI supports `in_memory` / `24h`; that does not establish private support. Anthropic cache reads/writes were observed live. `[source, unit, live, official]` |
 | Safety identifier | **Unsupported.** Public `safety_identifier` is not sent. | **Unsupported.** No pi-relay request field is mapped. | `[source, official]` |
@@ -108,6 +110,51 @@ replay.
 | Provider-side `store` state | **Intentionally not used.** `store` is fixed false. | **Intentionally not used.** Messages requests are reconstructed from local state; pi-relay has no provider-side conversation object. | This keeps Postgres as the durable source of truth and avoids coupling recovery to provider state. `[source]` |
 | `previous_response_id` | **Intentionally not used.** Full manual replay is sent on HTTP SSE turns. | **Unsupported.** Messages has no Responses-style id chaining in this adapter. | Public Responses and pinned private Codex WebSocket code support this concept, but the pi-relay adapter does not. `[source, pinned, official]` |
 | Conversations API | **Intentionally not used.** No public Conversation object is created. | **Unsupported.** Messages has no equivalent object in this adapter. | Public OpenAI Conversations persist until deletion and are not ZDR eligible; local durable replay is the selected state model. `[source, official]` |
+
+### Account- and client-version-sensitive Codex catalog
+
+The private catalog is not a universal static model list. The sanitized
+2026-07-04 probe returned ten models for client version `0.142.3`; GPT-5.6 did
+not appear below `0.142.2`. The adapter therefore uses one
+`CODEX_CLIENT_VERSION = "0.142.3"` constant for both the query and
+Codex-shaped User-Agent. It caches the whole catalog in memory for five minutes,
+scoped by Codex base URL plus account id (or a nonlogged token fingerprint when
+the account id is absent). Concurrent cold callers share one detached refresh.
+
+Sol, Terra, and Luna reported current/max windows of 372,000 and null automatic
+limits, which derives a 334,800 recommendation. Sol and Terra advertised
+`low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; Luna omitted `ultra`; all
+three omitted `none`. GPT-5.4 reported a 272,000 current/default window and a
+1,000,000 maximum, so the current window remains authoritative for its 244,800
+recommendation. The response had no maximum-output fields.
+
+Reasoning-level catalog strings are retained as bounded metadata even when
+pi-relay does not recognize them as wire efforts, so `ultra` and future unknown
+values cannot make the catalog unusable. This tolerance is not a capability
+claim. At pinned Codex revision
+`98d28aab54ed86714901b6619400598598876dd0`,
+`reasoning_effort_for_request` maps Ultra to Max before Responses request
+construction, while the MultiAgent V2 session policy uses Ultra to select
+`MultiAgentMode::Proactive`. A completed live release test confirmed why that
+distinction matters: literal Ultra passed catalog validation but every Sol and
+Terra `/responses` POST returned HTTP 400. The same run succeeded with
+Sol/High, Terra/High, Luna/Max, and GPT-5.4/Medium. pi-relay therefore exposes
+`max` as its highest raw effort and leaves proactive orchestration as a
+separate, unimplemented capability.
+
+A fresh catalog is mandatory for shaping a new OpenAI request. Cold,
+authentication, transport, timeout, malformed-response, unknown-model, and
+expired-refresh failures surface a typed catalog error. A short failure backoff
+may return the same error without another GET, but a retained old snapshot is
+never used as stale success. A 401 bypasses negative caching and enters the
+daemon's existing one-time credential refresh/rebuild path used by ordinary
+Codex calls. The Codex provider client disables redirects, and body-read
+failures retain the received status so a truncated 401 cannot enter failure
+backoff. The endpoint's weak ETag was not useful (`If-None-Match` still returned
+200), so no conditional or disk cache is implemented. Provider-native
+search/patch selector fields are ignored as non-authoritative input; only
+consumed capability fields such as `supports_parallel_tool_calls` are
+deserialized.
 
 ## Streaming, terminal behavior, compaction, and counting
 
@@ -192,8 +239,8 @@ provider-side ZDR that has not been contractually or live verified.
   [`agent-provider/src/anthropic.rs`](../crates/agent-provider/src/anthropic.rs)
 - Shared SSE framing:
   [`agent-provider/src/sse.rs`](../crates/agent-provider/src/sse.rs)
-- Runtime model policy and counting:
-  [`agent-daemon/src/model_metadata.rs`](../crates/agent-daemon/src/model_metadata.rs),
+- Runtime model scheduling and counting:
+  [`agent-provider/src/openai.rs`](../crates/agent-provider/src/openai.rs),
   [`context_accounting.rs`](../crates/agent-daemon/src/provider_runtime/context_accounting.rs)
 - Hosted web sidecars:
   [`web_tools.rs`](../crates/agent-daemon/src/provider_runtime/web_tools.rs)

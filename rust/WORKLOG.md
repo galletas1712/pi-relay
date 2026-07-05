@@ -1,5 +1,92 @@
 # Rust Rewrite Worklog
 
+## 2026-07-04
+
+### Authenticated Private-Codex Model Capability Discovery
+
+- Implemented authenticated private-Codex catalog discovery at
+  `GET /backend-api/codex/models?client_version=0.142.3`. The same
+  `CODEX_CLIENT_VERSION` constant now shapes the query and Codex-style
+  User-Agent; this removes the older embedded `0.130.0` identity drift. Models
+  GETs reuse bearer/account, originator, installation-id, and residency
+  identity without generation-only session/window/turn headers or a body.
+- Added one daemon-wide in-memory catalog cache shared by reconstructed OpenAI
+  providers. The whole catalog is scoped by base URL plus account id (or a
+  nonlogged token fingerprint), fresh for five minutes, single-flight, and
+  installed atomically only after every consumed entry validates. Responses are
+  bounded to 4 MiB, 256 unique nonempty slugs, positive representable limits,
+  and 16 bounded unique efforts per model. Account/generation guards prevent
+  late refreshes from installing after an identity switch.
+- OpenAI catalog failure is now explicit and fail-closed. Cold and expired
+  transport/auth/timeout/malformed failures do not use static or stale metadata
+  to shape a request. A short failure backoff reuses the same error without
+  converting it into success; 401 bypasses negative caching and flows through
+  the existing one-time credential refresh/provider rebuild. No bundled model
+  file, prefix/alias match, model substitution, public `/v1/models`, disk cache,
+  or conditional ETag path was added.
+- The Codex provider HTTP client now disables redirects for fixed private
+  catalog/Responses endpoints, so bearer and custom account/installation
+  headers cannot be forwarded to a redirect target. Catalog body-read failures
+  retain the response status; a malformed or truncated 401 therefore still
+  bypasses failure backoff and enters the existing one-refresh/provider-rebuild
+  path.
+- Ordinary and compact requests exact-resolve the selected slug before body
+  construction. The adapter validates configured known reasoning effort
+  exactly against the selected entry, uses discovered
+  `supports_parallel_tool_calls`, and continues to send hardcoded
+  `service_tier: "priority"` unconditionally. The shared Rust/TypeScript wire
+  vocabulary ends at `max`; catalog-only `ultra` and future unknown effort
+  strings remain bounded metadata, cannot invalidate the catalog, and cannot
+  enter a request body. The local tool registry remains authoritative;
+  provider-native search/patch selector fields are ignored as
+  non-authoritative input and cannot invalidate the catalog or enable native
+  actions.
+- The web model picker remains a seeded, offline-safe convenience rather than a
+  catalog RPC. Sol, Terra, and Luna expose `max` in the picker because the live
+  account catalog advertised it for all three, but every selected slug and
+  effort is still exact-validated against the active account before ordinary or
+  compact request shaping. No catalog-only `ultra` option is exposed.
+- Deleted the daemon's duplicate static OpenAI context/threshold/effort table.
+  `ProviderModelMetadata` now contains only scheduler-consumed normalized
+  values: resolved current/default input window and optional provider
+  automatic-compaction recommendation. OpenAI recommends at most 90% of
+  `context_window.or(max_context_window)`; Anthropic retains its adapter-local
+  1M→500k and generic policy. The daemon applies provider-neutral precedence:
+  valid explicit session values, provider recommendation, generic 85% from an
+  authoritative returned window, then reactive-overflow-only. The 8k floor and
+  persisted in-flight/circuit-breaker behavior are unchanged.
+- Preserved the Anthropic adapter's Sonnet 4.5 fallback at a 200k input window
+  and generic 170k recommendation. Adaptive Claude effort shaping remains
+  adapter-owned: `none`/`minimal` map to `low`.
+- Sanitized probe evidence (no credentials, response payload, or account
+  identifiers retained here): the authenticated endpoint returned ten models
+  on 2026-07-04. GPT-5.6 appeared only with client versions at least `0.142.2`;
+  the installed Codex CLI was `0.142.3`. Sol/Terra/Luna reported
+  372,000 current/max context, null automatic limit (derived 334,800), and no
+  output-ceiling field. Sol/Terra advertised
+  `low,medium,high,xhigh,max,ultra`; Luna omitted `ultra`; none advertised
+  `none`. GPT-5.4 reported a 272,000 current/default window and 1,000,000
+  maximum, so its default recommendation is 244,800 rather than 900,000.
+  A weak ETag did not produce a 304 with `If-None-Match`.
+- Corrected the initial interpretation of catalog `ultra` after pinned-source
+  review and a completed live release test. Codex revision
+  `98d28aab54ed86714901b6619400598598876dd0` parses Ultra internally but maps
+  it to Max before every Responses request; only MultiAgent V2 uses it to
+  select proactive multi-agent behavior. Literal Sol/Ultra and Terra/Ultra
+  passed the discovered catalog check but every `/responses` POST returned
+  HTTP 400. Sol/High, Terra/High, Luna/Max, and GPT-5.4/Medium succeeded on the
+  same account and request path. pi-relay does not implement Codex proactive
+  orchestration, so it neither exposes Ultra nor aliases it to Max.
+- Unit/wire validation covers exact request identity, timeout configuration,
+  parse/bounds, current-vs-maximum precedence, effort rejection, priority and
+  parallel shaping, 20-way cold single-flight, fresh/expired/failure/401/account
+  transitions, cancellation safety, atomic replacement, catalog-only/future
+  effort tolerance, public-config Ultra rejection, non-emission of literal
+  Ultra, and provider-neutral scheduler precedence. Live validation observed
+  one catalog retrieval reused across all tested actions, correct metadata
+  resolution, successful ordinary exposed efforts, replay continuity, and the
+  literal-Ultra rejection described above.
+
 ## 2026-07-02
 
 ### Anthropic Model and Hosted-Tool Refresh

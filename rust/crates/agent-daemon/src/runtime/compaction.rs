@@ -121,14 +121,10 @@ async fn check_compaction_eligible(
     if compaction_auto_explicitly_disabled(&dispatch.config) {
         return None;
     }
-    let discovered = if dispatch.config.provider.kind == agent_vocab::ProviderKind::Claude {
-        model_metadata_for_config(state, &dispatch.config, session_id)
-            .await
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
+    let discovered = model_metadata_for_config(state, &dispatch.config, session_id)
+        .await
+        .ok()
+        .flatten();
     let config = compaction_config_with_model_metadata(&dispatch.config, discovered);
     if !config.auto_enabled {
         return None;

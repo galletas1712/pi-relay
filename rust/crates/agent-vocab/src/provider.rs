@@ -151,6 +151,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn provider_config_rejects_catalog_only_ultra_reasoning_effort() {
+        let error = serde_json::from_value::<ProviderConfig>(json!({
+            "kind": "openai",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "ultra",
+        }))
+        .expect_err("catalog-only Codex metadata is not a public wire effort");
+
+        assert!(error.to_string().contains("unknown ReasoningEffort: ultra"));
+    }
+
+    #[test]
     fn provider_kind_accepts_legacy_anthropic_alias() {
         let config: ProviderConfig = serde_json::from_value(json!({
             "kind": "anthropic",

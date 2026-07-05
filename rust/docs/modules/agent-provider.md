@@ -8,16 +8,24 @@ See [design decisions](../design-decisions.md) for *why* the provider scope is s
 
 ## Responsibilities
 
-- Define the `ModelProvider` trait: `complete`, plus optional `compact` and `count_tokens`.
+- Define the `ModelProvider` trait: `complete`, plus optional `model_metadata`,
+  `compact`, and `count_tokens`.
 - Render `ModelRequest` into provider-native request bodies and headers.
 - Stream and parse provider SSE into one `AssistantMessage` (`Text` / `ToolCall` items only).
 - Capture per-item `ProviderReplayItem` sidecars so encrypted reasoning / thinking blocks replay verbatim on the next request.
 - Map provider-native tool names to canonical pi-relay names only in semantic
   transcript/UI projections; opaque replay retains provider wire names.
-- Surface provider errors with diagnostics, including context-overflow classification for the daemon's recovery logic.
+- Discover/cache provider model capabilities and normalize only the input-window
+  and automatic-compaction values consumed by the daemon scheduler.
+- Surface provider errors with diagnostics, including typed catalog failures
+  and context-overflow classification for the daemon's recovery logic.
 - Estimate input tokens locally (`token_estimator`) for the runtime's pre-flight context gate.
 
-It does **not** own auth acquisition/refresh, retry loops, compaction policy, or tool execution — those live in the daemon and [agent-tools](./agent-tools.md). The provider only surfaces the typed errors and capabilities the daemon acts on.
+It does **not** own auth acquisition/refresh, retry loops, compaction lifecycle,
+or tool execution — those live in the daemon and
+[agent-tools](./agent-tools.md). Provider-specific threshold policy belongs in
+the adapters; the daemon owns neutral precedence/clamping and persisted
+compaction state.
 
 ## Key types
 
@@ -42,10 +50,18 @@ provider category and human-readable explanation.
 
 `ProviderCompactionRequest` / `ProviderCompactionResponse`, `ProviderTokenCountRequest` / `ProviderTokenCountResponse` mirror the same prompt/transcript/tool inputs for the non-`complete` methods.
 
+`ProviderModelMetadata` exposes only scheduler-consumed normalized values:
+`max_input_tokens` is the resolved current/default input window, and
+`recommended_auto_compact_tokens` is an optional adapter recommendation.
+Provider-only request ceilings stay private to the adapter; for example,
+Anthropic's output ceiling clamps Messages bodies without becoming daemon
+scheduler metadata.
+
 `ProviderUsage` carries token counts (`input`, `output`, `total`, `cache_read_input_tokens`, `cache_creation_input_tokens`), provider-native merged usage fields, and OpenAI debug metadata lifted off response headers (`upstream_request_id`, `cf_ray`, `server_model`, `codex_turn_state`, `reasoning_included`).
 
 `ProviderError` variants: `Http`, `Timeout`, `Transient`, `Provider`,
-`Status { status, message }`, `Incomplete { status, reason }`, and `Json`. The
+`ModelCatalog { status, message }`, `Status { status, message }`,
+`Incomplete { status, reason }`, and `Json`. The
 daemon's model-dispatch loop retries every ordinary-turn `ProviderError` up to
 five attempts; the provider crate does not classify status codes as retryable
 or non-retryable.
@@ -83,20 +99,72 @@ not append it afterward.
 
 Requests go to `https://chatgpt.com/backend-api/codex/responses`, streamed (`Accept: text/event-stream`), with the body zstd-compressed (`Content-Encoding: zstd`, level 3). The Codex request envelope is byte-for-byte aligned with the Codex CLI so the backend's routing and anti-abuse heuristics treat pi-relay like a real Codex client: `originator: codex_cli_rs`, a `codex_cli_rs/<version>` User-Agent, bearer ChatGPT token, optional `ChatGPT-Account-ID`, optional `x-codex-installation-id`, the `x-openai-internal-codex-residency: us` header, a `x-codex-window-id`, and the session id echoed across `session_id`/`session-id`/`thread_id`/`thread-id`/`x-client-request-id`.
 
+Before rendering an ordinary or compact body, the adapter exact-resolves the
+configured slug from authenticated
+`GET /models?client_version=0.142.3`. The GET uses the same bearer/account,
+originator, Codex-shaped User-Agent, installation-id, and residency identity as
+generation, but no session/window/turn routing headers and no request body.
+`CODEX_CLIENT_VERSION` is also the User-Agent version, preventing query/identity
+drift.
+
+The daemon owns one in-memory catalog cache shared by reconstructed OpenAI
+provider handles. It is scoped by base URL plus account id, or by a
+cryptographic token fingerprint when no account id exists; credentials are
+never included in debug output. A complete successful catalog remains fresh
+for five minutes, and concurrent callers share one detached refresh without
+holding the cache lock over HTTP. Responses are bounded to 4 MiB and 256 unique
+nonempty slugs; consumed positive limits and at most 16 nonempty efforts per
+model are validated before the whole catalog installs atomically. Empty success
+is authoritative. A generation/key guard prevents a late refresh from an old
+account replacing the active catalog.
+
+Cold or expired refresh failures surface `ProviderError::ModelCatalog`; an old
+snapshot is never used to shape a new request. A 30-second backoff may reuse the
+same explicit failure so the daemon's broad retry loop does not hammer
+`/models`. HTTP 401 is not negative-cached and enters the daemon's existing
+one-refresh/rebuild Codex auth path. There is no static/bundled OpenAI fallback,
+alias/prefix match, model substitution, public `/v1/models` fallback, ETag
+request, or disk cache.
+
 The Responses body hardcodes the low-variance personal-use policy:
 
 ```
-parallel_tool_calls = true
+parallel_tool_calls = <catalog supports_parallel_tool_calls>
 service_tier        = "priority"
 store               = false
 stream              = true
 include             = ["reasoning.encrypted_content"]
 tool_choice         = "auto"
-reasoning.effort    = <model-normalized ReasoningEffort>
+reasoning.effort    = <exact catalog-supported ReasoningEffort>
 prompt_cache_key    = <cohort key>
 ```
 
 `store = false` makes every request stateless, so reasoning must be replayed from sidecars (see below). There is **no daemon-enforced output-token cap**: `max_output_tokens` is omitted unless `ModelRequest.max_tokens` supplies an explicit value.
+
+The catalog's resolved input window is
+`context_window.or(max_context_window)`: current/default wins over maximum.
+OpenAI recommends the smaller of an explicit automatic limit and 90% of that
+resolved window, or derives 90% when the explicit value is null/missing. Thus
+the sanitized GPT-5.6 372k fixture yields 334,800, while GPT-5.4's 272k current
+window yields 244,800 even though it also advertises a 1M maximum. The catalog
+has no output-ceiling field, so the adapter does not invent one.
+
+Reasoning support is exact and model-specific. The public wire vocabulary ends
+at `max`. An explicitly configured wire effort absent from the selected model
+fails locally rather than being clamped or translated. Catalog entries are
+kept as bounded strings so `ultra` and future unknown levels do not invalidate
+discovery, but those entries are non-wire harness metadata and cannot enter a
+request body. The account catalog advertises `ultra` for Sol/Terra but not
+Luna, and advertises no `none` for those models. Pinned Codex maps Ultra to Max
+before every Responses request and uses it to select proactive behavior only
+under MultiAgent V2; live literal-Ultra requests to Sol/Terra returned HTTP
+400. Because pi-relay implements no corresponding proactive orchestration, it
+does not expose or alias `ultra`. Provider-native search and patch selector
+fields are ignored as non-authoritative input; unknown future values cannot
+invalidate the catalog, enable native shell/patch actions, or change the local
+tool registry. `service_tier: "priority"` remains unconditional for ordinary
+and compact calls even when the selected catalog entry does not advertise
+priority.
 
 `x-codex-turn-state` is sticky routing state scoped to a single `turn_id`: a value returned by an upstream request is replayed on later requests for the same turn (held in `OpenAiCodexSessionState`) and never leaks into the next turn. The `x-codex-window-id` carries a per-session window generation that bumps after compaction, mirroring Codex's "new window after compaction" signal — derived from the latest compacted turn id in the transcript when no session state is attached.
 
@@ -110,7 +178,7 @@ reactive overflow recovery.
 
 Requests go to `https://api.anthropic.com/v1/messages`, streamed, authenticated with `x-api-key`, `anthropic-version: 2023-06-01`, and a Claude-Code-style User-Agent/`x-app: cli`/`X-Claude-Code-Session-Id` envelope. The only unconditional `anthropic-beta` value is the existing `claude-code-20250219` identity header required by that transport. Effort, one-hour cache TTL, fine-grained tool streaming, text editor, and the current hosted web tools are GA and do not send their retired beta headers. Any future beta header must be added only with the beta body/tool that needs it.
 
-The provider retrieves model metadata from `GET /v1/models/{model_id}` through custom `reqwest` code (there is no official Rust SDK in this stack). Models GETs use the documented API version and credentials but do not copy the Messages-only Claude Code beta header. A process-wide cache shared by all reconstructed Anthropic provider handles holds at most 64 settled model ids and coalesces each model's refresh into one in-flight GET without holding the cache mutex during network I/O. In-flight entries are never evicted; if all eviction candidates are refreshing, they may temporarily exceed the bound until completion trims settled entries back to 64. Successful metadata is fresh for six hours. A refresh failure preserves stale last-known-good metadata and starts a separate one-minute retry backoff; the same backoff is a negative cache only when that model has never had a successful value. API-reported `max_input_tokens`, `max_tokens`, effort levels, and adaptive-thinking support shape requests and the daemon's proactive compaction threshold. `capabilities: null` still preserves authoritative token limits, and an authoritative `effort.xhigh: null` disables xhigh rather than inheriting static support. Static metadata keeps known options safe and available when discovery fails: Sonnet 5 and Fable 5 are 1M-input/128K-output models, as are the retained Opus 4.8/4.7 entries. Unknown models conservatively retain the old 64K output ceiling and no assumed input window/capabilities, so they cannot silently disable a known model's compaction fallback or receive unsupported request fields.
+The provider retrieves model metadata from `GET /v1/models/{model_id}` through custom `reqwest` code (there is no official Rust SDK in this stack). Models GETs use the documented API version and credentials but do not copy the Messages-only Claude Code beta header. A process-wide cache shared by all reconstructed Anthropic provider handles holds at most 64 settled model ids and coalesces each model's refresh into one in-flight GET without holding the cache mutex during network I/O. In-flight entries are never evicted; if all eviction candidates are refreshing, they may temporarily exceed the bound until completion trims settled entries back to 64. Successful metadata is fresh for six hours. A refresh failure preserves stale last-known-good metadata and starts a separate one-minute retry backoff; the same backoff is a negative cache only when that model has never had a successful value. API-reported `max_input_tokens`, `max_tokens`, effort levels, and adaptive-thinking support shape requests and the daemon's proactive compaction threshold. `capabilities: null` still preserves authoritative token limits, and an authoritative `effort.xhigh: null` disables xhigh rather than inheriting static support. Static metadata keeps known options safe and available when discovery fails: Sonnet 5 and Fable 5 are 1M-input/128K-output models, as are the retained Opus 4.8/4.7 entries. Sonnet 4.5 retains its compatibility fallback of a 200K input window, a generic 170K compaction recommendation, the existing 64K output ceiling, and no assumed adaptive/effort capability. Unknown models conservatively retain the old 64K output ceiling and no assumed input window/capabilities; without a resolved input window they receive no automatic compaction threshold, and unsupported request fields remain disabled.
 
 `max_tokens` is required by the Messages API. Explicit session limits are clamped to the discovered/static model ceiling. When a session has no explicit limit, pi-relay requests `min(64_000, model ceiling)`: this preserves the existing ordinary-turn budget instead of unexpectedly asking every 128K-capable model for its pathological maximum, while still respecting lower limits reported by the API.
 
@@ -273,9 +341,21 @@ Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire �
 
 ## Notes
 
-- `ReasoningEffort::default()` is `Medium`. OpenAI accepts `Max` only for `gpt-5.6-sol`; other gpt-5.x models clamp it to `xhigh`. Anthropic normalizes legacy `None`/`Minimal` configuration to `low`; Models API capability metadata determines whether the selected `low…max` effort is emitted. Sonnet 5, Fable 5, and Opus 4.8 support the full range.
+- `ReasoningEffort::default()` is `Medium`. OpenAI exact-validates the known
+  configured wire value against the selected catalog entry and never clamps
+  it. `Max` is the highest exposed value; catalog-only `ultra` is tolerated but
+  cannot be configured or emitted. Anthropic normalizes historical
+  `None`/`Minimal` requests to `Low` inside its adapter; Models API capability
+  metadata determines whether the selected `low…max` effort is emitted. Sonnet
+  5, Fable 5, and Opus 4.8 support that range.
 - Claude Fable 5 is intentionally an explicit opt-in UI choice: Anthropic requires 30-day data retention for Fable and does not offer Zero Data Retention for it. Do not silently select Fable for a ZDR workload.
-- The single Codex **401 token-refresh retry** is *not* in this crate. The daemon (`provider_runtime/auth_retry.rs`) wraps `complete`/`compact`/`count_tokens`: on a 401 from a Codex-auth provider it refreshes credentials once, rebuilds the provider, and retries exactly once inside that provider call. The provider only surfaces `ProviderError::Status { status: 401 }`.
+- The single Codex **401 token-refresh retry** is *not* in this crate. The
+  daemon (`provider_runtime/auth_retry.rs`) wraps
+  `model_metadata`/`complete`/`compact`/`count_tokens`: on a 401 from a
+  Codex-auth provider it uses the existing credential refresh, rebuilds the
+  provider, and retries exactly once inside that provider call. The provider
+  surfaces the status through either `ProviderError::ModelCatalog` or the
+  ordinary HTTP error path.
 - Registered builtin tools (from [agent-tools](./agent-tools.md)): `edit` (`apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `grep` (uniform JSON `Grep`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). There are no `read`/`write` tools.
 - Sending OpenAI-profile tools to Anthropic (or vice versa) is a hard `ProviderError::Provider`; the profile must match the provider.
 - Wire details (RPC methods, how the daemon calls these adapters) live in [websocket-rpc](../websocket-rpc.md); the React client that drives sessions is documented in the [web UI](../../../packages/web/docs/web-ui.md) doc.

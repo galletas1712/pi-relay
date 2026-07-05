@@ -7,22 +7,18 @@ export interface ModelOption {
 	provider: ProviderConfig;
 }
 
+const HOSTED_GPT56_MODELS = [
+	{ model: "gpt-5.6-sol", label: "OpenAI GPT-5.6 Sol" },
+	{ model: "gpt-5.6-terra", label: "OpenAI GPT-5.6 Terra" },
+	{ model: "gpt-5.6-luna", label: "OpenAI GPT-5.6 Luna" }
+] as const;
+
 export const MODEL_OPTIONS: ModelOption[] = [
-	{
-		id: "openai:gpt-5.6-sol",
-		label: "OpenAI GPT-5.6 Sol",
-		provider: { kind: "openai", model: "gpt-5.6-sol", reasoning_effort: "xhigh" }
-	},
-	{
-		id: "openai:gpt-5.6-terra",
-		label: "OpenAI GPT-5.6 Terra",
-		provider: { kind: "openai", model: "gpt-5.6-terra", reasoning_effort: "xhigh" }
-	},
-	{
-		id: "openai:gpt-5.6-luna",
-		label: "OpenAI GPT-5.6 Luna",
-		provider: { kind: "openai", model: "gpt-5.6-luna", reasoning_effort: "xhigh" }
-	},
+	...HOSTED_GPT56_MODELS.map(({ model, label }) => ({
+		id: `openai:${model}`,
+		label,
+		provider: { kind: "openai" as const, model, reasoning_effort: "xhigh" as const }
+	})),
 	{
 		id: "claude:claude-sonnet-5",
 		label: "Claude Sonnet 5",
@@ -42,7 +38,7 @@ export const MODEL_OPTIONS: ModelOption[] = [
 ];
 
 export const OPENAI_REASONING_EFFORTS: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
-export const OPENAI_SOL_REASONING_EFFORTS: ReasoningEffort[] = [...OPENAI_REASONING_EFFORTS, "max"];
+export const OPENAI_GPT56_REASONING_EFFORTS: ReasoningEffort[] = [...OPENAI_REASONING_EFFORTS, "max"];
 export const CLAUDE_REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
 
 export const DEFAULT_PROVIDER: ProviderConfig = {
@@ -75,5 +71,7 @@ export function providerFromModelKey(modelKey: string, current: ProviderConfig):
 
 export function reasoningEffortsForProvider(provider: ProviderConfig): ReasoningEffort[] {
 	if (provider.kind === "claude") return CLAUDE_REASONING_EFFORTS;
-	return provider.model === "gpt-5.6-sol" ? OPENAI_SOL_REASONING_EFFORTS : OPENAI_REASONING_EFFORTS;
+	return HOSTED_GPT56_MODELS.some(({ model }) => model === provider.model)
+		? OPENAI_GPT56_REASONING_EFFORTS
+		: OPENAI_REASONING_EFFORTS;
 }

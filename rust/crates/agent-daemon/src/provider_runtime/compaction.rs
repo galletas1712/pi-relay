@@ -11,7 +11,6 @@ use serde_json::Value;
 
 use crate::auth::Credentials;
 use crate::delegation_context::compaction_delegation_ledger;
-use crate::model_metadata;
 use crate::state::AppState;
 
 use super::auth_retry::{compact_with_auth_retry, complete_with_auth_retry};
@@ -169,18 +168,13 @@ pub(crate) fn resolve_compaction_config(
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
 
-    let default_window = discovered
-        .and_then(|metadata| metadata.max_input_tokens)
-        .or_else(|| model_metadata::context_window(config.provider.kind, &config.provider.model));
+    let default_window = discovered.and_then(|metadata| metadata.max_input_tokens);
     if !context_window_configured {
         resolved.context_window = default_window;
     }
     if !auto_limit_configured {
-        resolved.auto_limit_tokens = discovered
-            .and_then(|metadata| metadata.recommended_auto_compact_tokens)
-            .or_else(|| {
-                model_metadata::default_auto_limit(config.provider.kind, &config.provider.model)
-            });
+        resolved.auto_limit_tokens =
+            discovered.and_then(|metadata| metadata.recommended_auto_compact_tokens);
     }
 
     if !metadata_configured {
@@ -369,11 +363,7 @@ pub(crate) async fn remote_compaction_request(
             config.provider.kind,
             effective_prompt_profile(state, config, session_id).await?,
         ),
-        reasoning_effort: model_metadata::normalize_reasoning_effort(
-            config.provider.kind,
-            &config.provider.model,
-            config.provider.reasoning_effort,
-        ),
+        reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
         session_id: Some(session_id.to_string()),
     })
@@ -475,11 +465,7 @@ pub(crate) async fn local_summary_request(
         tool_profile: ProviderToolProfile::None,
         tools: Vec::new(),
         max_tokens: config.provider.max_tokens,
-        reasoning_effort: model_metadata::normalize_reasoning_effort(
-            config.provider.kind,
-            &config.provider.model,
-            config.provider.reasoning_effort,
-        ),
+        reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config
             .provider
             .prompt_cache_key()
@@ -612,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_compaction_config_uses_known_rust_defaults() {
+    fn openai_compaction_requires_discovered_or_explicit_limits() {
         let config = test_config(
             ProviderKind::OpenAi,
             "gpt-5.1-codex-max",
@@ -620,9 +606,9 @@ mod tests {
         );
         let resolved = resolve_compaction_config(&config, None);
 
-        assert!(resolved.auto_enabled);
-        assert_eq!(resolved.context_window, Some(272_000));
-        assert_eq!(resolved.auto_limit_tokens, Some(231_200));
+        assert!(!resolved.auto_enabled);
+        assert_eq!(resolved.context_window, None);
+        assert_eq!(resolved.auto_limit_tokens, None);
         assert_eq!(resolved.remote_mode, RemoteCompactionMode::Always);
     }
 
@@ -726,7 +712,13 @@ mod tests {
             "claude-sonnet-4-5",
             serde_json::json!({ "compaction": { "config": { "auto_enabled": false } } }),
         );
-        let resolved = resolve_compaction_config(&config, None);
+        let resolved = resolve_compaction_config(
+            &config,
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(200_000),
+                recommended_auto_compact_tokens: Some(170_000),
+            }),
+        );
 
         assert!(!resolved.auto_enabled);
         assert_eq!(resolved.context_window, Some(200_000));

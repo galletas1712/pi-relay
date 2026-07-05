@@ -158,13 +158,38 @@ OpenAI request path. `max_tokens` is optional; when present it is emitted as
 OpenAI `max_output_tokens`, and when omitted the daemon does not set an OpenAI
 output cap.
 
-`reasoning_effort` defaults to `medium`. OpenAI currently accepts `none`,
-`minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay; `gpt-5.6-sol` also
-accepts `max`. Claude Sonnet 5, Fable 5, and Opus 4.8 accept `low`, `medium`,
-`high`, `xhigh`, and `max`. Sonnet 5 and Fable 5 default to adaptive thinking,
-while Opus 4.8 requests it explicitly; all three carry effort in
-`output_config.effort`. Fable 5 requires 30-day retention and is not available
-under Zero Data Retention, so it is an explicit opt-in UI choice.
+`reasoning_effort` defaults to `medium`. The shared wire vocabulary is `none`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; decoding any other
+string fails. For OpenAI, that vocabulary is not a promise that every model
+accepts every value: before ordinary and compact requests, the private Codex
+catalog must contain the exact selected slug and advertise the exact configured
+effort. Unsupported values fail locally without normalization.
+
+The account-scoped GPT-5.6 catalog advertises `ultra` for Sol/Terra but not
+Luna. That is Codex harness metadata, not an additional pi-relay wire effort:
+pinned Codex converts Ultra to Max before Responses requests and uses Ultra to
+select proactive behavior only with MultiAgent V2. Live literal
+`reasoning.effort = "ultra"` requests to Sol and Terra returned HTTP 400, while
+ordinary exposed efforts succeeded. pi-relay does not implement that proactive
+orchestration mode, so it neither exposes `ultra` nor silently aliases it to
+`max`. Catalog-only and future unknown levels remain tolerated as metadata and
+cannot enter a request body. The same catalog advertises no `none` for the
+reviewed GPT-5.6 models.
+
+Claude Sonnet 5, Fable 5, and Opus 4.8 accept `low`, `medium`, `high`, `xhigh`,
+and `max`; their provider-specific shaping remains inside the Anthropic
+adapter. Fable 5 requires 30-day retention and is not available under Zero Data
+Retention, so it is an explicit opt-in UI choice.
+
+Compaction defaults are provider/model aware through provider metadata. OpenAI
+uses an authenticated account-scoped catalog and recommends at most 90% of the
+resolved current/default context window: the 372,000-token GPT-5.6 fixture
+produces 334,800, while GPT-5.4 uses 244,800 from its 272,000 current window
+rather than 900,000 from its 1,000,000 maximum. There is no static OpenAI
+fallback; if authoritative metadata is unavailable, proactive scheduling has no
+derived threshold and reactive overflow handling remains enabled. Verified
+1,000,000-token Claude models recommend 500,000. Explicit valid session
+metadata overrides provider recommendations and is clamped safely.
 
 ### `daemon_config`
 

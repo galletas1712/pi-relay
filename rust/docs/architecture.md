@@ -114,6 +114,16 @@ Implemented user-facing behavior:
 - Manual and automatic compaction; OpenAI uses provider-native compaction,
   Anthropic uses a local text summary. Compaction is a typed transcript root,
   not a session boundary.
+- Provider/model-aware compaction thresholds through the provider-neutral
+  `ModelProvider::model_metadata` contract. OpenAI exact-resolves the selected
+  slug from an authenticated, account-scoped private Codex catalog before
+  ordinary and compact requests; verified 372k GPT-5.6 windows recommend
+  334.8k, while GPT-5.4's 272k current/default window recommends 244.8k rather
+  than using its 1M maximum. There is no static OpenAI runtime fallback.
+  Anthropic preserves its verified 1M→500k policy. Explicit session values
+  remain highest precedence, and absent authoritative metadata leaves only
+  reactive overflow recovery. See the
+  [provider API audit](provider-api-support.md#account--and-client-version-sensitive-codex-catalog).
 - Turn-oriented selected-session loading: collapsed turn cards plus lazy
   per-turn detail, so normal loads do not scale with transcript size, and raw
   `provider_replay` never reaches any UI/RPC response.

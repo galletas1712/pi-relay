@@ -186,11 +186,7 @@ async fn run_provider_web_sidecar(
             tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![tool],
             max_tokens: Some(config.provider.max_tokens.unwrap_or(8_192).min(8_192)),
-            reasoning_effort: crate::model_metadata::normalize_reasoning_effort(
-                config.provider.kind,
-                &config.provider.model,
-                config.provider.reasoning_effort,
-            ),
+            reasoning_effort: config.provider.reasoning_effort,
             prompt_cache_key: None,
             session_id: None,
             turn_id: None,

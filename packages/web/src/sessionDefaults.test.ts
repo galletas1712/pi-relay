@@ -29,7 +29,7 @@ describe("session defaults", () => {
 		expect(`${fable?.label} ${fable?.description}`).toMatch(/not ZDR|zero data retention is unavailable/i);
 	});
 
-	it("exposes exactly the supported OpenAI/Codex model options", () => {
+	it("exposes the seeded OpenAI/Codex model picker options", () => {
 		expect(MODEL_OPTIONS.filter((option) => option.provider.kind === "openai").map((option) => option.provider.model)).toEqual([
 			"gpt-5.6-sol",
 			"gpt-5.6-terra",
@@ -45,9 +45,10 @@ describe("session defaults", () => {
 		});
 	});
 
-	it("offers Sol max reasoning while keeping Terra/Luna on the common OpenAI set", () => {
-		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.6-sol" })).toContain("max");
-		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.6-terra" })).not.toContain("max");
-		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.6-luna" })).not.toContain("max");
+	it("offers max reasoning for all hosted GPT-5.6 models but not older models", () => {
+		for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+			expect(reasoningEffortsForProvider({ kind: "openai", model })).toContain("max");
+		}
+		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.5" })).not.toContain("max");
 	});
 });
