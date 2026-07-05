@@ -21,9 +21,9 @@ use crate::{
     },
     http::send_provider_generation_request,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
-    ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
-    ProviderError, ProviderModelMetadata, ProviderResult, ProviderTokenCountRequest,
-    ProviderTokenCountResponse, ProviderToolProfile, ProviderUsage,
+    ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
+    ModelTranscriptEntry, ProviderError, ProviderModelMetadata, ProviderResult,
+    ProviderTokenCountRequest, ProviderTokenCountResponse, ProviderToolProfile, ProviderUsage,
 };
 
 const DEFAULT_MAX_OUTPUT_BUDGET: u32 = 64_000;
@@ -52,6 +52,164 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     model_cache: AnthropicModelCache,
+}
+
+fn validate_anthropic_hosted_tool_result(block_type: &str, content: &Value) -> ProviderResult<()> {
+    match (block_type, content) {
+        ("web_search_tool_result", Value::Array(results)) => {
+            for result in results {
+                if anthropic_block_type(result, "Anthropic web search result")?
+                    != "web_search_result"
+                {
+                    return Err(ProviderError::Provider(
+                        "Anthropic web_search_tool_result contained unsupported result type"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        ("web_search_tool_result", Value::Object(_)) => {
+            if anthropic_block_type(content, "Anthropic web search result error")?
+                != "web_search_tool_result_error"
+            {
+                return Err(ProviderError::Provider(
+                    "Anthropic web_search_tool_result contained malformed error".to_string(),
+                ));
+            }
+        }
+        ("web_fetch_tool_result", Value::Object(_)) => {
+            match anthropic_block_type(content, "Anthropic web fetch result")? {
+                "web_fetch_result" | "web_fetch_tool_result_error" => {}
+                _ => {
+                    return Err(ProviderError::Provider(
+                        "Anthropic web_fetch_tool_result contained malformed error".to_string(),
+                    ))
+                }
+            }
+        }
+        _ => {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic {block_type} content had invalid type"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn anthropic_stream_index(event: &Value, event_type: &str) -> ProviderResult<usize> {
+    event
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| {
+            ProviderError::Provider(format!(
+                "Anthropic {event_type} missing valid representable index"
+            ))
+        })
+}
+
+fn validate_anthropic_stream_content_start(block: &Value) -> ProviderResult<()> {
+    let block_type = anthropic_block_type(block, "Anthropic content_block_start content_block")?;
+    let required_string = |field: &str| -> ProviderResult<&str> {
+        block.get(field).and_then(Value::as_str).ok_or_else(|| {
+            ProviderError::Provider(format!(
+                "Anthropic {block_type} content block missing string {field}"
+            ))
+        })
+    };
+    let required_nonempty_string = |field: &str| -> ProviderResult<&str> {
+        required_string(field)?
+            .is_empty()
+            .then_some(())
+            .map_or_else(
+                || required_string(field),
+                |_| {
+                    Err(ProviderError::Provider(format!(
+                        "Anthropic {block_type} content block had empty {field}"
+                    )))
+                },
+            )
+    };
+
+    match block_type {
+        "text" => {
+            if !required_string("text")?.is_empty() {
+                return Err(ProviderError::Provider(
+                    "Anthropic streamed text content block had pre-populated text".to_string(),
+                ));
+            }
+            if !matches!(
+                block.get("citations"),
+                None | Some(Value::Null | Value::Array(_))
+            ) {
+                return Err(ProviderError::Provider(
+                    "Anthropic text content block citations was not an array or null".to_string(),
+                ));
+            }
+            if block
+                .get("citations")
+                .and_then(Value::as_array)
+                .is_some_and(|citations| !citations.is_empty())
+            {
+                return Err(ProviderError::Provider(
+                    "Anthropic streamed text content block had pre-populated citations".to_string(),
+                ));
+            }
+        }
+        "thinking" => {
+            if !required_string("thinking")?.is_empty() || !required_string("signature")?.is_empty()
+            {
+                return Err(ProviderError::Provider(
+                    "Anthropic streamed thinking content block had pre-populated content"
+                        .to_string(),
+                ));
+            }
+        }
+        "redacted_thinking" => {
+            required_nonempty_string("data")?;
+        }
+        "tool_use" | "server_tool_use" => {
+            required_nonempty_string("id")?;
+            required_nonempty_string("name")?;
+            match block.get("input").and_then(Value::as_object) {
+                Some(input) if input.is_empty() => {}
+                Some(_) => {
+                    return Err(ProviderError::Provider(format!(
+                        "Anthropic streamed {block_type} content block had pre-populated input"
+                    )))
+                }
+                None => {
+                    return Err(ProviderError::Provider(format!(
+                        "Anthropic {block_type} content block missing input object"
+                    )))
+                }
+            }
+        }
+        "web_search_tool_result" | "web_fetch_tool_result" => {
+            required_nonempty_string("tool_use_id")?;
+            validate_anthropic_hosted_tool_result(
+                block_type,
+                block.get("content").ok_or_else(|| {
+                    ProviderError::Provider(format!(
+                        "Anthropic {block_type} content block missing content"
+                    ))
+                })?,
+            )?;
+        }
+        _ => {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_start had unsupported content block type {block_type}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn reject_ordinary_anthropic_compaction() -> ProviderError {
+    ProviderError::Provider(
+        "Anthropic ordinary response unexpectedly contained inline compaction; refusing to persist partial or opaque response content"
+            .to_string(),
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1143,8 +1301,7 @@ fn transcript_to_messages(
                 }));
             }
             TranscriptItem::AssistantMessage(message) => {
-                let mut content =
-                    anthropic_replay_blocks(&entry.provider_replay_for(ProviderKind::Claude))?;
+                let mut content = anthropic_replay_blocks(entry)?;
                 if content.is_empty() {
                     for item in &message.items {
                         match item {
@@ -1204,12 +1361,25 @@ fn transcript_to_messages(
     Ok(messages)
 }
 
-fn anthropic_replay_blocks(replay: &[ProviderReplayItem]) -> ProviderResult<Vec<Value>> {
-    replay
-        .iter()
-        .filter(|record| record.provider == ProviderKind::Claude)
-        .map(|record| record.raw_value().map_err(ProviderError::Json))
-        .collect()
+fn anthropic_replay_blocks(entry: &ModelTranscriptEntry) -> ProviderResult<Vec<Value>> {
+    let blocks = entry
+        .provider_replay_values_for(ProviderKind::Claude)
+        .map_err(ProviderError::Json)?;
+    for block in &blocks {
+        anthropic_block_type(block, "persisted Anthropic replay block")?;
+    }
+    Ok(blocks)
+}
+
+fn anthropic_block_type<'a>(block: &'a Value, context: &str) -> ProviderResult<&'a str> {
+    let object = block
+        .as_object()
+        .ok_or_else(|| ProviderError::Provider(format!("{context} was not an object")))?;
+    object
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|block_type| !block_type.is_empty())
+        .ok_or_else(|| ProviderError::Provider(format!("{context} missing nonempty string type")))
 }
 
 fn anthropic_daemon_tool_use_id(tool_call_id: &str) -> String {
@@ -1257,6 +1427,16 @@ fn anthropic_user_content(message: &UserMessage) -> Value {
 #[cfg(test)]
 fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
     let stop_reason = anthropic_stop_reason(response);
+    let stop_details = anthropic_stop_details(response.get("stop_details"))?;
+    if stop_reason == ModelStopReason::Refusal {
+        return Ok(ModelResponse {
+            assistant: AssistantMessage { items: Vec::new() },
+            provider_replay: Vec::new(),
+            usage: response.get("usage").and_then(anthropic_usage),
+            stop_reason,
+            stop_details,
+        });
+    }
     let content = response
         .get("content")
         .and_then(Value::as_array)
@@ -1306,6 +1486,7 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
         provider_replay,
         usage: response.get("usage").and_then(anthropic_usage),
         stop_reason,
+        stop_details,
     })
 }
 
@@ -1329,80 +1510,220 @@ fn parse_anthropic_sse(text: &str) -> ProviderResult<ModelResponse> {
 }
 
 struct AnthropicStreamState {
-    message: Value,
-    content_blocks: Vec<Option<Value>>,
+    active_content_block: Option<(usize, Value)>,
+    next_content_block_index: usize,
     provider_replay: Vec<ProviderReplayItem>,
     items: Vec<AssistantItem>,
     usage: Option<ProviderUsage>,
     stop_reason: ModelStopReason,
+    stop_details: Option<ModelStopDetails>,
+    message_started: bool,
+    terminal_stop_reason: Option<String>,
+    message_stopped: bool,
 }
 
 impl Default for AnthropicStreamState {
     fn default() -> Self {
         Self {
-            message: Value::Null,
-            content_blocks: Vec::new(),
+            active_content_block: None,
+            next_content_block_index: 0,
             provider_replay: Vec::new(),
             items: Vec::new(),
             usage: None,
             stop_reason: ModelStopReason::Complete,
+            stop_details: None,
+            message_started: false,
+            terminal_stop_reason: None,
+            message_stopped: false,
         }
     }
 }
 
 impl AnthropicStreamState {
+    fn require_content_phase(&self, event_type: &str) -> ProviderResult<()> {
+        if !self.message_started {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic {event_type} arrived before message_start"
+            )));
+        }
+        if self.terminal_stop_reason.is_some() {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic {event_type} arrived after terminal stop_reason"
+            )));
+        }
+        Ok(())
+    }
+
     fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
         match event {
             SseEvent::Json(event) => self.process_event(&event),
-            SseEvent::Done => Ok(SseControl::Stop),
+            SseEvent::MalformedJson => Err(ProviderError::Provider(
+                "Anthropic response stream contained malformed JSON event data".to_string(),
+            )),
+            SseEvent::Done => Ok(SseControl::Continue),
         }
     }
 
     fn process_event(&mut self, event: &Value) -> ProviderResult<SseControl> {
+        reject_ordinary_compaction_event(event)?;
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
-                self.message = event.get("message").cloned().unwrap_or_else(|| json!({}));
-                self.usage = self.message.get("usage").and_then(anthropic_usage);
+                if self.message_started {
+                    return Err(ProviderError::Provider(
+                        "Anthropic response stream contained duplicate message_start".to_string(),
+                    ));
+                }
+                self.message_started = true;
+                self.usage = event
+                    .get("message")
+                    .and_then(|message| message.get("usage"))
+                    .and_then(anthropic_usage);
                 Ok(SseControl::Continue)
             }
             Some("content_block_start") => {
-                if let (Some(index), Some(content_block)) = (
-                    event.get("index").and_then(Value::as_u64),
-                    event.get("content_block"),
-                ) {
-                    self.set_content_block(
-                        index as usize,
-                        normalize_stream_content_start(content_block),
-                    );
-                }
+                self.require_content_phase("content_block_start")?;
+                let index = anthropic_stream_index(event, "content_block_start")?;
+                let content_block = event
+                    .get("content_block")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "Anthropic content_block_start missing content_block object"
+                                .to_string(),
+                        )
+                    })?;
+                self.start_content_block(index, &Value::Object(content_block.clone()))?;
                 Ok(SseControl::Continue)
             }
             Some("content_block_delta") => {
-                let Some(index) = event.get("index").and_then(Value::as_u64) else {
-                    return Ok(SseControl::Continue);
-                };
-                if let Some(delta) = event.get("delta") {
-                    self.apply_content_delta(index as usize, delta);
-                }
+                self.require_content_phase("content_block_delta")?;
+                let index = anthropic_stream_index(event, "content_block_delta")?;
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "Anthropic content_block_delta missing delta object".to_string(),
+                        )
+                    })?;
+                self.apply_content_delta(index, &Value::Object(delta.clone()))?;
                 Ok(SseControl::Continue)
             }
             Some("content_block_stop") => {
-                if let Some(index) = event.get("index").and_then(Value::as_u64) {
-                    self.finish_content_block(index as usize)?;
-                }
+                self.require_content_phase("content_block_stop")?;
+                let index = anthropic_stream_index(event, "content_block_stop")?;
+                self.finish_content_block(index)?;
                 Ok(SseControl::Continue)
             }
             Some("message_delta") => {
-                if let Some(usage) = event.get("usage").and_then(anthropic_usage) {
+                if !self.message_started {
+                    return Err(ProviderError::Provider(
+                        "Anthropic message_delta arrived before message_start".to_string(),
+                    ));
+                }
+                if let Some((index, _)) = self.active_content_block.as_ref() {
+                    return Err(ProviderError::Provider(format!(
+                        "Anthropic message_delta arrived before content_block_stop for index {index}"
+                    )));
+                }
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "Anthropic message_delta missing delta object".to_string(),
+                        )
+                    })?;
+                let has_usage = event.get("usage").is_some();
+                if let Some(usage) = anthropic_message_delta_usage(event.get("usage"))? {
                     merge_anthropic_usage(&mut self.usage, usage);
                 }
-                if event.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens")
-                {
-                    self.stop_reason = ModelStopReason::MaxOutputTokens;
+                let stop_details = anthropic_stop_details(delta.get("stop_details"))?;
+                let Some(stop_reason) = delta.get("stop_reason") else {
+                    if stop_details.is_some() {
+                        return Err(ProviderError::Provider(
+                            "Anthropic message_delta had stop_details without a terminal stop_reason"
+                                .to_string(),
+                        ));
+                    }
+                    if !has_usage {
+                        return Err(ProviderError::Provider(
+                            "Anthropic message_delta had neither stop_reason nor usage".to_string(),
+                        ));
+                    }
+                    return Ok(SseControl::Continue);
+                };
+                let Value::String(stop_reason) = stop_reason else {
+                    if stop_reason.is_null() {
+                        if stop_details.is_some() {
+                            return Err(ProviderError::Provider(
+                                "Anthropic message_delta had stop_details without a terminal stop_reason"
+                                    .to_string(),
+                            ));
+                        }
+                        return Ok(SseControl::Continue);
+                    }
+                    return Err(ProviderError::Provider(format!(
+                        "Anthropic message_delta stop_reason was not a string or null: {stop_reason}"
+                    )));
+                };
+                if stop_reason.is_empty() {
+                    return Err(ProviderError::Provider(
+                        "Anthropic message_delta stop_reason was empty".to_string(),
+                    ));
+                }
+                if let Some(existing) = self.terminal_stop_reason.as_deref() {
+                    if existing != stop_reason {
+                        return Err(ProviderError::Provider(format!(
+                            "Anthropic response stream contained conflicting terminal stop reasons: {existing:?} and {stop_reason:?}"
+                        )));
+                    }
+                }
+                if let Some(details) = stop_details {
+                    merge_anthropic_stop_details(&mut self.stop_details, details)?;
+                }
+                self.stop_reason = match stop_reason.as_str() {
+                    "end_turn" | "stop_sequence" | "tool_use" => ModelStopReason::Complete,
+                    "max_tokens" => ModelStopReason::MaxOutputTokens,
+                    "refusal" => ModelStopReason::Refusal,
+                    "pause_turn" | "model_context_window_exceeded" => {
+                        return Err(ProviderError::Incomplete {
+                            status: "incomplete".to_string(),
+                            reason: stop_reason.clone(),
+                        });
+                    }
+                    _ => {
+                        return Err(ProviderError::Incomplete {
+                            status: "unknown_stop_reason".to_string(),
+                            reason: stop_reason.clone(),
+                        });
+                    }
+                };
+                if self.terminal_stop_reason.is_none() {
+                    self.terminal_stop_reason = Some(stop_reason.clone());
                 }
                 Ok(SseControl::Continue)
             }
-            Some("message_stop") => Ok(SseControl::Stop),
+            Some("message_stop") => {
+                if !self.message_started {
+                    return Err(ProviderError::Provider(
+                        "Anthropic message_stop arrived before message_start".to_string(),
+                    ));
+                }
+                if let Some((index, _)) = self.active_content_block.as_ref() {
+                    return Err(ProviderError::Provider(format!(
+                        "Anthropic message_stop arrived before content_block_stop for index {index}"
+                    )));
+                }
+                if self.terminal_stop_reason.is_none() {
+                    return Err(ProviderError::Provider(
+                        "Anthropic message_stop arrived without a recognized terminal stop_reason"
+                            .to_string(),
+                    ));
+                }
+                self.message_stopped = true;
+                Ok(SseControl::Stop)
+            }
             Some("error") => {
                 let error_type = event.pointer("/error/type").and_then(Value::as_str);
                 let message = anthropic_error_message(
@@ -1420,63 +1741,208 @@ impl AnthropicStreamState {
         }
     }
 
-    fn set_content_block(&mut self, index: usize, block: Value) {
-        if self.content_blocks.len() <= index {
-            self.content_blocks.resize_with(index + 1, || None);
+    fn start_content_block(&mut self, index: usize, block: &Value) -> ProviderResult<()> {
+        if let Some((active_index, _)) = self.active_content_block.as_ref() {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_start for index {index} arrived before content_block_stop for index {active_index}"
+            )));
         }
-        self.content_blocks[index] = Some(block);
+        if index != self.next_content_block_index {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_start index was not contiguous: expected {}, found {index}",
+                self.next_content_block_index
+            )));
+        }
+        validate_anthropic_stream_content_start(block)?;
+        self.active_content_block = Some((index, normalize_stream_content_start(block)));
+        Ok(())
     }
 
-    fn apply_content_delta(&mut self, index: usize, delta: &Value) {
-        let Some(Some(block)) = self.content_blocks.get_mut(index) else {
-            return;
+    fn apply_content_delta(&mut self, index: usize, delta: &Value) -> ProviderResult<()> {
+        let Some((active_index, block)) = self.active_content_block.as_mut() else {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_delta referenced nonexistent block index {index}"
+            )));
         };
-        match delta.get("type").and_then(Value::as_str) {
-            Some("input_json_delta") => {
-                append_json_string_field(block, "input", delta.get("partial_json"));
+        if index != *active_index {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_delta index {index} did not match active block index {active_index}"
+            )));
+        }
+        let block_type = anthropic_block_type(block, "Anthropic streamed content block")?;
+        let delta_type = delta
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|delta_type| !delta_type.is_empty())
+            .ok_or_else(|| {
+                ProviderError::Provider(
+                    "Anthropic content_block_delta missing nonempty delta type".to_string(),
+                )
+            })?;
+        match delta_type {
+            "input_json_delta" if matches!(block_type, "tool_use" | "server_tool_use") => {
+                append_required_json_string_field(block, "input", delta, "partial_json")?;
             }
-            Some("text_delta") => {
-                append_json_string_field(block, "text", delta.get("text"));
+            "text_delta" if block_type == "text" => {
+                append_required_json_string_field(block, "text", delta, "text")?;
             }
-            Some("thinking_delta") => {
-                append_json_string_field(block, "thinking", delta.get("thinking"));
+            "thinking_delta" if block_type == "thinking" => {
+                if block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .is_some_and(|signature| !signature.is_empty())
+                {
+                    return Err(ProviderError::Provider(
+                        "Anthropic thinking_delta arrived after signature_delta".to_string(),
+                    ));
+                }
+                append_required_json_string_field(block, "thinking", delta, "thinking")?;
             }
-            Some("signature_delta") => {
-                if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
-                    block["signature"] = Value::String(signature.to_string());
+            "signature_delta" if block_type == "thinking" => {
+                let signature = required_anthropic_delta_string(delta, "signature")?;
+                if signature.is_empty() {
+                    return Err(ProviderError::Provider(
+                        "Anthropic signature_delta contained an empty signature".to_string(),
+                    ));
+                }
+                if block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .is_some_and(|signature| !signature.is_empty())
+                {
+                    return Err(ProviderError::Provider(
+                        "Anthropic thinking block received duplicate signature_delta".to_string(),
+                    ));
+                }
+                block["signature"] = Value::String(signature.to_string());
+            }
+            "citations_delta" if block_type == "text" => {
+                let citation = delta
+                    .get("citation")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "Anthropic citations_delta missing citation object".to_string(),
+                        )
+                    })?;
+                anthropic_block_type(
+                    &Value::Object(citation.clone()),
+                    "Anthropic citations_delta citation",
+                )?;
+                match block.get_mut("citations") {
+                    Some(Value::Array(citations)) => {
+                        citations.push(Value::Object(citation.clone()));
+                    }
+                    Some(Value::Null) | None => {
+                        block["citations"] = Value::Array(vec![Value::Object(citation.clone())]);
+                    }
+                    Some(_) => {
+                        return Err(ProviderError::Provider(
+                            "Anthropic text content block citations was not an array or null"
+                                .to_string(),
+                        ))
+                    }
                 }
             }
-            Some("citations_delta") | None => {}
-            Some(_) => {}
-        }
+            "input_json_delta" | "text_delta" | "thinking_delta" | "signature_delta"
+            | "citations_delta" => {
+                return Err(ProviderError::Provider(format!(
+                    "Anthropic {delta_type} was invalid for content block type {block_type}"
+                )))
+            }
+            _ => {
+                return Err(ProviderError::Provider(format!(
+                    "Anthropic content_block_delta had unsupported delta type {delta_type}"
+                )))
+            }
+        };
+        Ok(())
     }
 
     fn finish_content_block(&mut self, index: usize) -> ProviderResult<()> {
-        let Some(block) = self
-            .content_blocks
-            .get_mut(index)
-            .and_then(Option::take)
-            .map(finalize_stream_content_block)
-        else {
-            return Ok(());
+        let Some((active_index, block)) = self.active_content_block.take() else {
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_stop referenced nonexistent block index {index}"
+            )));
         };
+        if index != active_index {
+            self.active_content_block = Some((active_index, block));
+            return Err(ProviderError::Provider(format!(
+                "Anthropic content_block_stop index {index} did not match active block index {active_index}"
+            )));
+        }
+        let block = finalize_stream_content_block(block)?;
         push_anthropic_content_block(&block, &mut self.items, &mut self.provider_replay)
+            .map(|()| self.next_content_block_index += 1)
     }
 
     fn finish(mut self) -> ProviderResult<ModelResponse> {
-        for block in std::mem::take(&mut self.content_blocks)
-            .into_iter()
-            .flatten()
-            .map(finalize_stream_content_block)
+        if !self.message_started {
+            return Err(ProviderError::Provider(
+                "Anthropic response stream ended without message_start".to_string(),
+            ));
+        }
+        if !self.message_stopped {
+            return Err(ProviderError::Provider(
+                "Anthropic response stream ended before message_stop".to_string(),
+            ));
+        }
+        if self.terminal_stop_reason.is_none() {
+            return Err(ProviderError::Provider(
+                "Anthropic response stream ended without a recognized stop_reason".to_string(),
+            ));
+        }
+        if self.stop_reason == ModelStopReason::Refusal {
+            // Anthropic can classify a Fable response after streaming partial
+            // text, thinking, or tool blocks. The entire partial attempt is
+            // incomplete and must not be persisted or replayed.
+            self.active_content_block = None;
+            self.items.clear();
+            self.provider_replay.clear();
+        }
+        if self
+            .provider_replay
+            .iter()
+            .any(|item| item.raw_type().as_deref() == Some("compaction"))
         {
-            push_anthropic_content_block(&block, &mut self.items, &mut self.provider_replay)?;
+            return Err(reject_ordinary_anthropic_compaction());
         }
         Ok(ModelResponse {
             assistant: AssistantMessage { items: self.items },
             provider_replay: self.provider_replay,
             usage: self.usage,
             stop_reason: self.stop_reason,
+            stop_details: self.stop_details,
         })
+    }
+}
+
+fn reject_ordinary_compaction_event(event: &Value) -> ProviderResult<()> {
+    let is_compaction = match event.get("type").and_then(Value::as_str) {
+        Some("message_start") => event
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("compaction"))
+            }),
+        Some("content_block_start") => {
+            event.pointer("/content_block/type").and_then(Value::as_str) == Some("compaction")
+        }
+        Some("content_block_delta") => {
+            event.pointer("/delta/type").and_then(Value::as_str) == Some("compaction_delta")
+        }
+        Some("content_block_stop") => false,
+        Some("message_delta") => {
+            event.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("compaction")
+        }
+        _ => false,
+    };
+    if is_compaction {
+        Err(reject_ordinary_anthropic_compaction())
+    } else {
+        Ok(())
     }
 }
 
@@ -1498,30 +1964,69 @@ fn normalize_stream_content_start(block: &Value) -> Value {
     block
 }
 
-fn finalize_stream_content_block(mut block: Value) -> Value {
+fn finalize_stream_content_block(mut block: Value) -> ProviderResult<Value> {
     if let Some("tool_use" | "server_tool_use") = block.get("type").and_then(Value::as_str) {
-        if let Some(input) = block.get("input").and_then(Value::as_str) {
-            block["input"] = parse_streamed_json_object(input);
-        }
+        let input = block.get("input").and_then(Value::as_str).ok_or_else(|| {
+            ProviderError::Provider(
+                "Anthropic streamed tool content block input was not a string".to_string(),
+            )
+        })?;
+        block["input"] = parse_streamed_json_object(input)?;
     }
-    block
+    if block.get("type").and_then(Value::as_str) == Some("thinking")
+        && block
+            .get("signature")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(ProviderError::Provider(
+            "Anthropic thinking content block ended without signature_delta".to_string(),
+        ));
+    }
+    Ok(block)
 }
 
-fn parse_streamed_json_object(input: &str) -> Value {
+fn parse_streamed_json_object(input: &str) -> ProviderResult<Value> {
     if input.is_empty() {
-        return json!({});
+        return Ok(json!({}));
     }
-    serde_json::from_str(input).unwrap_or_else(|_| json!({}))
+    let value = serde_json::from_str::<Value>(input).map_err(|error| {
+        ProviderError::Provider(format!(
+            "Anthropic streamed tool input was malformed JSON: {error}"
+        ))
+    })?;
+    if !value.is_object() {
+        return Err(ProviderError::Provider(
+            "Anthropic streamed tool input was not a JSON object".to_string(),
+        ));
+    }
+    Ok(value)
 }
 
-fn append_json_string_field(block: &mut Value, field: &str, delta: Option<&Value>) {
-    let Some(delta) = delta.and_then(Value::as_str) else {
-        return;
-    };
-    match block.get_mut(field) {
-        Some(Value::String(value)) => value.push_str(delta),
-        _ => block[field] = Value::String(delta.to_string()),
+fn required_anthropic_delta_string<'a>(delta: &'a Value, field: &str) -> ProviderResult<&'a str> {
+    delta.get(field).and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::Provider(format!(
+            "Anthropic {} missing string {field}",
+            delta
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("content block delta")
+        ))
+    })
+}
+
+fn append_required_json_string_field(
+    block: &mut Value,
+    block_field: &str,
+    delta: &Value,
+    delta_field: &str,
+) -> ProviderResult<()> {
+    let value = required_anthropic_delta_string(delta, delta_field)?;
+    match block.get_mut(block_field) {
+        Some(Value::String(current)) => current.push_str(value),
+        _ => block[block_field] = Value::String(value.to_string()),
     }
+    Ok(())
 }
 
 fn push_anthropic_content_block(
@@ -1529,9 +2034,7 @@ fn push_anthropic_content_block(
     items: &mut Vec<AssistantItem>,
     provider_replay: &mut Vec<ProviderReplayItem>,
 ) -> ProviderResult<()> {
-    let Some(block_type) = block.get("type").and_then(Value::as_str) else {
-        return Ok(());
-    };
+    let block_type = anthropic_block_type(block, "Anthropic response content block")?;
     let display = anthropic_provider_replay_display(block);
     provider_replay.push(ProviderReplayItem::new_with_display(
         ProviderKind::Claude,
@@ -1573,8 +2076,36 @@ fn push_anthropic_content_block(
 fn anthropic_stop_reason(response: &Value) -> ModelStopReason {
     match response.get("stop_reason").and_then(Value::as_str) {
         Some("max_tokens") => ModelStopReason::MaxOutputTokens,
+        Some("refusal") => ModelStopReason::Refusal,
         _ => ModelStopReason::Complete,
     }
+}
+
+fn anthropic_stop_details(value: Option<&Value>) -> ProviderResult<Option<ModelStopDetails>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let value = value.as_object().ok_or_else(|| {
+        ProviderError::Provider(
+            "Anthropic message_delta stop_details was not an object or null".to_string(),
+        )
+    })?;
+    let optional_string = |field| -> ProviderResult<Option<String>> {
+        match value.get(field) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.clone())),
+            Some(value) => Err(ProviderError::Provider(format!(
+                "Anthropic message_delta stop_details.{field} was not a string or null: {value}"
+            ))),
+        }
+    };
+    Ok(Some(ModelStopDetails {
+        category: optional_string("category")?,
+        explanation: optional_string("explanation")?,
+    }))
 }
 
 fn canonical_anthropic_tool_name(name: &str) -> &str {
@@ -1601,41 +2132,201 @@ fn anthropic_provider_replay_display(block: &Value) -> Option<ReplayDisplay> {
 }
 
 fn anthropic_usage(value: &Value) -> Option<ProviderUsage> {
+    let provider_input_tokens = value
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let output_tokens = value
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let cache_read_input_tokens = value
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let cache_creation_input_tokens = value
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let input_tokens = provider_input_tokens.map(|input| {
+        input
+            .saturating_add(cache_read_input_tokens.unwrap_or_default())
+            .saturating_add(cache_creation_input_tokens.unwrap_or_default())
+    });
     Some(ProviderUsage {
-        input_tokens: value
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
-        output_tokens: value
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
-        total_tokens: None,
-        cache_read_input_tokens: value
-            .get("cache_read_input_tokens")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
-        cache_creation_input_tokens: value
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
+        input_tokens,
+        output_tokens,
+        // Anthropic's top-level input components exclude compaction
+        // iterations. Normalize message input as uncached + cache read +
+        // cache creation, while retaining each provider-native field below.
+        total_tokens: input_tokens
+            .zip(output_tokens)
+            .map(|(input, output)| input.saturating_add(output)),
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+        raw_provider_usage: Some(value.clone()),
         ..ProviderUsage::default()
     })
 }
 
+fn anthropic_message_delta_usage(value: Option<&Value>) -> ProviderResult<Option<ProviderUsage>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let usage = value.as_object().ok_or_else(|| {
+        ProviderError::Provider("Anthropic message_delta usage was not an object".to_string())
+    })?;
+    let mut has_token_count = false;
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ] {
+        if let Some(value) = usage.get(field) {
+            has_token_count = true;
+            let tokens = value.as_u64().ok_or_else(|| {
+                ProviderError::Provider(format!(
+                    "Anthropic message_delta usage.{field} was not an unsigned integer"
+                ))
+            })?;
+            usize::try_from(tokens).map_err(|_| {
+                ProviderError::Provider(format!(
+                    "Anthropic message_delta usage.{field} exceeded the platform limit"
+                ))
+            })?;
+        }
+    }
+    if !has_token_count {
+        return Err(ProviderError::Provider(
+            "Anthropic message_delta usage contained no cumulative token counts".to_string(),
+        ));
+    }
+    Ok(anthropic_usage(value))
+}
+
+fn merge_anthropic_stop_details(
+    current: &mut Option<ModelStopDetails>,
+    update: ModelStopDetails,
+) -> ProviderResult<()> {
+    let current = current.get_or_insert_with(ModelStopDetails::default);
+    for (field, current, update) in [
+        ("category", &mut current.category, update.category),
+        ("explanation", &mut current.explanation, update.explanation),
+    ] {
+        match (current.as_ref(), update) {
+            (Some(existing), Some(update)) if existing != &update => {
+                return Err(ProviderError::Provider(format!(
+                    "Anthropic response stream contained conflicting terminal stop_details.{field}"
+                )));
+            }
+            (None, Some(update)) => *current = Some(update),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn merge_anthropic_usage(current: &mut Option<ProviderUsage>, update: ProviderUsage) {
     let current = current.get_or_insert_with(ProviderUsage::default);
-    if update.input_tokens.unwrap_or_default() > 0 {
-        current.input_tokens = update.input_tokens;
+    let previous_raw = current.raw_provider_usage.as_ref();
+    let previous_input_tokens = previous_raw
+        .and_then(|raw| raw.get("input_tokens"))
+        .and_then(Value::as_u64);
+    let previous_cache_read = previous_raw
+        .and_then(|raw| raw.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64);
+    let previous_cache_creation = previous_raw
+        .and_then(|raw| raw.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64);
+    let update_raw = update.raw_provider_usage.as_ref();
+    let update_input_tokens = update_raw
+        .and_then(|raw| raw.get("input_tokens"))
+        .and_then(Value::as_u64);
+    let update_cache_read = update_raw
+        .and_then(|raw| raw.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64);
+    let update_cache_creation = update_raw
+        .and_then(|raw| raw.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64);
+    if let Some(update) = update.raw_provider_usage {
+        merge_json_object(&mut current.raw_provider_usage, update);
     }
-    if update.output_tokens.is_some() {
-        current.output_tokens = update.output_tokens;
+    if let Some(raw) = current
+        .raw_provider_usage
+        .as_mut()
+        .and_then(Value::as_object_mut)
+    {
+        for (key, previous, update) in [
+            ("input_tokens", previous_input_tokens, update_input_tokens),
+            (
+                "cache_read_input_tokens",
+                previous_cache_read,
+                update_cache_read,
+            ),
+            (
+                "cache_creation_input_tokens",
+                previous_cache_creation,
+                update_cache_creation,
+            ),
+        ] {
+            // Input accounting is cumulative across stream fragments. A zero
+            // in a later delta does not erase a nonzero component reported at
+            // message_start; a present nonzero value replaces the old value.
+            if update == Some(0) && previous.is_some_and(|value| value > 0) {
+                raw.insert(key.to_string(), json!(previous.expect("checked")));
+            }
+        }
+        let provider_input_tokens = raw
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        current.output_tokens = raw
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        current.cache_read_input_tokens = raw
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        current.cache_creation_input_tokens = raw
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        current.input_tokens = provider_input_tokens.map(|input| {
+            input
+                .saturating_add(current.cache_read_input_tokens.unwrap_or_default())
+                .saturating_add(current.cache_creation_input_tokens.unwrap_or_default())
+        });
     }
-    if update.cache_read_input_tokens.unwrap_or_default() > 0 {
-        current.cache_read_input_tokens = update.cache_read_input_tokens;
-    }
-    if update.cache_creation_input_tokens.unwrap_or_default() > 0 {
-        current.cache_creation_input_tokens = update.cache_creation_input_tokens;
+    current.total_tokens = current
+        .input_tokens
+        .zip(current.output_tokens)
+        .map(|(input, output)| input.saturating_add(output));
+}
+
+fn merge_json_object(current: &mut Option<Value>, update: Value) {
+    let current = current.get_or_insert_with(|| json!({}));
+    merge_json_value(current, update);
+}
+
+fn merge_json_value(current: &mut Value, update: Value) {
+    match update {
+        Value::Object(update) => {
+            let Some(current) = current.as_object_mut() else {
+                *current = Value::Object(update);
+                return;
+            };
+            for (key, update) in update {
+                match current.get_mut(&key) {
+                    Some(value) => merge_json_value(value, update),
+                    None => {
+                        current.insert(key, update);
+                    }
+                }
+            }
+        }
+        update => *current = update,
     }
 }
 
@@ -2910,9 +3601,9 @@ mod tests {
         let response = parse_anthropic_message(&response).expect("message parses");
         let usage = response.usage.expect("usage should be parsed");
 
-        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.input_tokens, Some(200));
         assert_eq!(usage.output_tokens, Some(20));
-        assert_eq!(usage.total_tokens, None);
+        assert_eq!(usage.total_tokens, Some(220));
         assert_eq!(usage.cache_read_input_tokens, Some(75));
         assert_eq!(usage.cache_creation_input_tokens, Some(25));
     }
@@ -2984,8 +3675,9 @@ data: {"type":"content_block_start","index":2,"content_block":{"type":"text","te
         );
         assert_eq!(response.provider_replay.len(), 2);
         let usage = response.usage.expect("usage should be parsed");
-        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.input_tokens, Some(200));
         assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.total_tokens, Some(220));
         assert_eq!(usage.cache_read_input_tokens, Some(75));
         assert_eq!(usage.cache_creation_input_tokens, Some(25));
         assert_eq!(response.stop_reason, ModelStopReason::Complete);
@@ -3004,6 +3696,8 @@ data: {"type":"content_block_stop","index":0}
 
 data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":64}}
 
+data: {"type":"message_stop"}
+
 data: [DONE]
 
 data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":"ignored"}}
@@ -3016,6 +3710,76 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
         assert_eq!(response.stop_reason, ModelStopReason::MaxOutputTokens);
         assert_eq!(usage.input_tokens, Some(8));
         assert_eq!(usage.output_tokens, Some(64));
+    }
+
+    #[test]
+    fn anthropic_sse_refusal_discards_partial_output_and_replay() {
+        let sse = r#"
+data: {"type":"message_start","message":{"id":"msg_refused","content":[],"usage":{"input_tokens":12,"output_tokens":0}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"category":"cyber","explanation":"declined"}},"usage":{"output_tokens":1}}
+
+data: {"type":"message_stop"}
+"#;
+
+        let response = parse_anthropic_sse(sse).expect("refusal is a terminal response");
+
+        assert_eq!(response.stop_reason, ModelStopReason::Refusal);
+        assert!(response.assistant.items.is_empty());
+        assert!(response.provider_replay.is_empty());
+        assert_eq!(
+            response.stop_details,
+            Some(ModelStopDetails {
+                category: Some("cyber".to_string()),
+                explanation: Some("declined".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_retains_incomplete_stop_reason() {
+        let sse = r#"
+data: {"type":"message_start","message":{"id":"msg_paused","content":[]}}
+
+data: {"type":"message_delta","delta":{"stop_reason":"pause_turn"}}
+"#;
+
+        match parse_anthropic_sse(sse).expect_err("pause_turn is not success") {
+            ProviderError::Incomplete { status, reason } => {
+                assert_eq!(status, "incomplete");
+                assert_eq!(reason, "pause_turn");
+            }
+            other => panic!("expected typed incomplete error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_sse_rejects_gapped_blocks_and_done_only_completion() {
+        let gapped = r#"
+data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
+
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+"#;
+        let done_only = r#"
+data: {"type":"message_start","message":{"id":"msg_1","content":[]}}
+
+data: [DONE]
+"#;
+
+        assert!(parse_anthropic_sse(gapped)
+            .expect_err("gapped index must fail")
+            .to_string()
+            .contains("not contiguous"));
+        assert!(parse_anthropic_sse(done_only)
+            .expect_err("done sentinel is not success")
+            .to_string()
+            .contains("before message_stop"));
     }
 
     #[test]
@@ -3052,6 +3816,22 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         .expect("messages render");
 
         assert_eq!(messages[0]["content"], json!([raw]));
+    }
+
+    #[test]
+    fn anthropic_serializer_rejects_corrupt_replay_without_fallback() {
+        let entry = ModelTranscriptEntry {
+            item: TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("must not substitute".to_string())],
+            }),
+            provider_replay: vec![ProviderReplayItem {
+                provider: ProviderKind::Claude,
+                raw_json: "{".to_string(),
+                display: None,
+            }],
+        };
+
+        assert!(transcript_to_messages(&crate::PromptSections::default(), &[entry]).is_err());
     }
 
     #[test]

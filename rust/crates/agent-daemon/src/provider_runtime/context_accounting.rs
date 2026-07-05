@@ -114,7 +114,7 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
             let suffix_tokens = agent_provider::estimate_transcript_tokens(
                 &agent_provider::PromptSections::default(),
                 &suffix_transcript,
-            )
+            )?
             .tokens;
             return Ok(usage
                 .with_estimated_suffix_tokens(suffix_tokens)
@@ -147,5 +147,5 @@ async fn estimate_model_input_tokens_from_local_heuristic(
     Ok(agent_provider::estimate_model_input_tokens(
         &prompt,
         &transcript,
-    ))
+    )?)
 }

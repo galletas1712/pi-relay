@@ -147,11 +147,14 @@ fn effective_provider_tools(
 }
 
 impl ModelTranscriptEntry {
-    pub fn provider_replay_for(&self, provider: ProviderKind) -> Vec<ProviderReplayItem> {
+    pub(crate) fn provider_replay_values_for(
+        &self,
+        provider: ProviderKind,
+    ) -> serde_json::Result<Vec<Value>> {
         self.provider_replay
             .iter()
             .filter(|record| record.provider == provider)
-            .filter_map(|record| canonical_provider_replay(record, provider))
+            .map(ProviderReplayItem::raw_value)
             .collect()
     }
 
@@ -187,28 +190,6 @@ pub fn canonical_tool_name_for_provider(provider: ProviderKind, name: &str) -> &
             other => other,
         },
     }
-}
-
-fn canonical_provider_replay(
-    record: &ProviderReplayItem,
-    provider: ProviderKind,
-) -> Option<ProviderReplayItem> {
-    let mut raw = record.raw_value().ok()?;
-    if let Some(name) = raw.get("name").and_then(Value::as_str) {
-        let canonical = canonical_tool_name_for_provider(provider, name);
-        // Local client-tool calls are stored internally under canonical
-        // pi-relay names. Provider-hosted/server replay blocks keep their
-        // provider-native names so a later stateless request can replay them
-        // byte-for-byte and the web UI can still pair provider result blocks.
-        let is_provider_hosted_replay = matches!(
-            raw.get("type").and_then(Value::as_str),
-            Some("server_tool_use" | "web_search_call")
-        );
-        if canonical != name && !is_provider_hosted_replay {
-            raw["name"] = Value::String(canonical.to_string());
-        }
-    }
-    ProviderReplayItem::new_with_display(provider, &raw, record.display.clone()).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +252,31 @@ pub struct ModelResponse {
     pub provider_replay: Vec<ProviderReplayItem>,
     pub usage: Option<ProviderUsage>,
     pub stop_reason: ModelStopReason,
+    pub stop_details: Option<ModelStopDetails>,
+}
+
+impl ModelResponse {
+    /// Return the terminal refusal message callers should surface instead of
+    /// persisting this response as an assistant completion.
+    pub fn refusal_error(&self) -> Option<String> {
+        (self.stop_reason == ModelStopReason::Refusal).then(|| {
+            let Some(details) = self.stop_details.as_ref() else {
+                return "provider refused the request".to_string();
+            };
+            match (&details.category, &details.explanation) {
+                (Some(category), Some(explanation)) => {
+                    format!("provider refused the request ({category}): {explanation}")
+                }
+                (Some(category), None) => {
+                    format!("provider refused the request ({category})")
+                }
+                (None, Some(explanation)) => {
+                    format!("provider refused the request: {explanation}")
+                }
+                (None, None) => "provider refused the request".to_string(),
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +284,15 @@ pub struct ModelResponse {
 pub enum ModelStopReason {
     Complete,
     MaxOutputTokens,
+    Refusal,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStopDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +302,11 @@ pub struct ProviderUsage {
     pub total_tokens: Option<usize>,
     pub cache_read_input_tokens: Option<usize>,
     pub cache_creation_input_tokens: Option<usize>,
+    /// Provider-native merged usage fields. This retains provider-specific
+    /// accounting details without replacing raw counters with normalized
+    /// aggregates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_provider_usage: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,6 +331,8 @@ pub enum ProviderError {
     Provider(String),
     #[error("provider returned HTTP {status}: {message}")]
     Status { status: u16, message: String },
+    #[error("provider response was incomplete (status: {status}, reason: {reason})")]
+    Incomplete { status: String, reason: String },
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -323,6 +345,7 @@ impl ProviderError {
             ProviderError::Timeout(_)
             | ProviderError::Transient(_)
             | ProviderError::Provider(_)
+            | ProviderError::Incomplete { .. }
             | ProviderError::Json(_) => None,
         }
     }
@@ -357,7 +380,9 @@ impl ProviderError {
             ProviderError::Timeout(message) => Some(format!("timeout={message}")),
             ProviderError::Transient(message) => Some(format!("transient={message}")),
             ProviderError::Status { status, .. } => Some(format!("status={status}")),
-            ProviderError::Provider(_) | ProviderError::Json(_) => None,
+            ProviderError::Provider(_)
+            | ProviderError::Incomplete { .. }
+            | ProviderError::Json(_) => None,
         }
     }
 
@@ -372,7 +397,7 @@ impl ProviderError {
             | ProviderError::Provider(message) => message.clone(),
             ProviderError::Http(error) => error.to_string(),
             ProviderError::Timeout(_) => return false,
-            ProviderError::Json(_) => return false,
+            ProviderError::Incomplete { .. } | ProviderError::Json(_) => return false,
         };
         let lower = message.to_ascii_lowercase();
         if status == Some(413) {
@@ -440,7 +465,6 @@ pub trait ModelProvider: Send + Sync {
 mod provider_error_tests {
     use super::*;
     use agent_vocab::{ReplayDisplay, ReplayDisplayKind};
-    use serde_json::json;
 
     #[test]
     fn context_overflow_classifier_matches_known_provider_messages() {
@@ -513,42 +537,35 @@ mod provider_error_tests {
     }
 
     #[test]
-    fn provider_replay_canonicalizes_local_tool_names_only() {
-        let local = ProviderReplayItem::new(
-            ProviderKind::OpenAi,
-            &json!({
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "web_search",
-                "arguments": "{\"query\":\"rust\"}",
-            }),
-        )
-        .unwrap();
-        let local = canonical_provider_replay(&local, ProviderKind::OpenAi)
-            .unwrap()
-            .raw_value()
-            .unwrap();
-        assert_eq!(local["name"], "WebSearch");
-
-        let hosted = ProviderReplayItem::new_with_display(
-            ProviderKind::Claude,
-            &json!({
-                "type": "server_tool_use",
-                "id": "srv_1",
-                "name": "web_fetch",
-                "input": { "url": "https://example.com" },
-            }),
-            Some(ReplayDisplay {
+    fn provider_replay_filter_parses_raw_values_without_rewriting() {
+        let openai = ProviderReplayItem {
+            provider: ProviderKind::OpenAi,
+            raw_json: r#"{"type":"function_call","name":"web_search"}"#.to_string(),
+            display: Some(ReplayDisplay {
                 kind: ReplayDisplayKind::HostedTool,
-                pretty_name: "WebFetch".to_string(),
-                input_summary: Some("https://example.com".to_string()),
+                pretty_name: "WebSearch".to_string(),
+                input_summary: None,
             }),
-        )
-        .unwrap();
-        let hosted = canonical_provider_replay(&hosted, ProviderKind::Claude)
-            .unwrap()
-            .raw_value()
-            .unwrap();
-        assert_eq!(hosted["name"], "web_fetch");
+        };
+        let corrupt_claude = ProviderReplayItem {
+            provider: ProviderKind::Claude,
+            raw_json: "{".to_string(),
+            display: None,
+        };
+        let entry = ModelTranscriptEntry {
+            item: TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            provider_replay: vec![openai.clone(), corrupt_claude.clone()],
+        };
+
+        assert_eq!(
+            entry
+                .provider_replay_values_for(ProviderKind::OpenAi)
+                .unwrap(),
+            vec![openai.raw_value().unwrap()]
+        );
+        assert!(entry
+            .provider_replay_values_for(ProviderKind::Claude)
+            .is_err());
+        assert_eq!(entry.provider_replay, vec![openai, corrupt_claude]);
     }
 }

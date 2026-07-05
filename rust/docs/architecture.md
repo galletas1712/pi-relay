@@ -11,7 +11,9 @@ This document is the overview and map. Each crate has its own reference under
 [`design-decisions.md`](design-decisions.md); the frontend wire contract is in
 [`websocket-rpc.md`](websocket-rpc.md); the React client is documented in
 [`../../packages/web/docs/web-ui.md`](../../packages/web/docs/web-ui.md); and
-in-flight future work lives under [`plans/`](plans/).
+the audited provider capability matrix is in
+[`provider-api-support.md`](provider-api-support.md). In-flight future work
+lives under [`plans/`](plans/).
 
 ## Goals
 
@@ -179,6 +181,8 @@ Anthropic real-provider websocket tests require a raw `ANTHROPIC_API_KEY`.
 ## Where To Read Next
 
 - Per-crate detail: [`modules/`](modules/).
+- Audited provider capabilities and limitations:
+  [provider-api-support.md](provider-api-support.md).
 - Why the visible/invisible choices were made: [design-decisions.md](design-decisions.md).
 - The frontend wire contract and manual exercise plan: [websocket-rpc.md](websocket-rpc.md).
 - The React client: [`../../packages/web/docs/web-ui.md`](../../packages/web/docs/web-ui.md).

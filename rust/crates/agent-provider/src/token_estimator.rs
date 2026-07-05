@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::{ModelTranscriptEntry, PromptSections};
+use crate::{ModelTranscriptEntry, PromptSections, ProviderResult};
 
 // The local token estimator only ever runs for OpenAI: Claude sessions count
 // tokens against the authoritative remote `count_tokens` endpoint (see
@@ -39,38 +39,42 @@ impl std::iter::Sum for TokenEstimate {
 pub fn estimate_model_input_tokens(
     prompt: &PromptSections,
     transcript: &[ModelTranscriptEntry],
-) -> usize {
-    estimate_model_input(prompt, transcript).tokens
+) -> ProviderResult<usize> {
+    Ok(estimate_model_input(prompt, transcript)?.tokens)
 }
 
 pub fn estimate_model_input(
     prompt: &PromptSections,
     transcript: &[ModelTranscriptEntry],
-) -> TokenEstimate {
-    prompt_estimate(prompt).saturating_add(estimate_transcript_tokens(prompt, transcript))
+) -> ProviderResult<TokenEstimate> {
+    Ok(prompt_estimate(prompt)?.saturating_add(estimate_transcript_tokens(prompt, transcript)?))
 }
 
 pub fn estimate_transcript_tokens(
     prompt: &PromptSections,
     transcript: &[ModelTranscriptEntry],
-) -> TokenEstimate {
-    crate::openai::transcript_to_response_items(prompt, transcript)
-        .map(|items| items.iter().map(serialized_estimate).sum())
-        .unwrap_or_else(|_| TokenEstimate::from_model_visible_bytes(0))
+) -> ProviderResult<TokenEstimate> {
+    crate::openai::transcript_to_response_items(prompt, transcript)?
+        .iter()
+        .map(serialized_estimate)
+        .try_fold(
+            TokenEstimate::from_model_visible_bytes(0),
+            |total, estimate| Ok(total.saturating_add(estimate?)),
+        )
 }
 
-fn prompt_estimate(prompt: &PromptSections) -> TokenEstimate {
+fn prompt_estimate(prompt: &PromptSections) -> ProviderResult<TokenEstimate> {
     prompt
         .render_joined()
         .map(|text| serialized_estimate(&text))
-        .unwrap_or_else(|| TokenEstimate::from_model_visible_bytes(0))
+        .unwrap_or_else(|| Ok(TokenEstimate::from_model_visible_bytes(0)))
 }
 
-fn serialized_estimate<T: Serialize>(value: &T) -> TokenEstimate {
-    let bytes = serde_json::to_string(value)
-        .map(|serialized| model_visible_bytes_for_serialized_json(&serialized))
-        .unwrap_or_default();
-    TokenEstimate::from_model_visible_bytes(bytes)
+fn serialized_estimate<T: Serialize>(value: &T) -> ProviderResult<TokenEstimate> {
+    let serialized = serde_json::to_string(value)?;
+    Ok(TokenEstimate::from_model_visible_bytes(
+        model_visible_bytes_for_serialized_json(&serialized),
+    ))
 }
 
 fn model_visible_bytes_for_serialized_json(serialized: &str) -> usize {
@@ -143,6 +147,7 @@ mod token_estimator_tests {
         AssistantItem, AssistantMessage, ContentBlock, ImageContent, ImageSource, ToolCall,
         ToolCallId, ToolResultMessage, ToolResultStatus, TranscriptItem, UserMessage,
     };
+    use serde_json::json;
 
     #[test]
     fn transcript_estimator_uses_serialized_model_visible_bytes() {
@@ -168,7 +173,7 @@ mod token_estimator_tests {
             .into(),
         ];
 
-        let estimate = estimate_transcript_tokens(&PromptSections::default(), &transcript);
+        let estimate = estimate_transcript_tokens(&PromptSections::default(), &transcript).unwrap();
 
         assert!(estimate.model_visible_bytes > "hello worldworkingok".len());
         assert_eq!(
@@ -197,18 +202,20 @@ mod token_estimator_tests {
         let small = estimate_transcript_tokens(
             &PromptSections::default(),
             std::slice::from_ref(&small_text),
-        );
+        )
+        .unwrap();
         let large = estimate_transcript_tokens(
             &PromptSections::default(),
             std::slice::from_ref(&large_text),
-        );
+        )
+        .unwrap();
 
         assert_eq!(small.model_visible_bytes, large.model_visible_bytes);
         assert!(large.model_visible_bytes < 10_000);
     }
 
     #[test]
-    fn compaction_summary_estimate_includes_pi_md_stable_prefix() {
+    fn compaction_summary_estimate_uses_native_replay() {
         let summary = agent_vocab::CompactionSummary::new(
             "session-1",
             "leaf-1",
@@ -216,16 +223,43 @@ mod token_estimator_tests {
             Some(1024),
             agent_vocab::TurnId(1),
         );
-        let transcript = vec![TranscriptItem::CompactionSummary(summary).into()];
+        let raw_replay = json!({
+            "type": "compaction",
+            "encrypted_content": "opaque compacted context",
+        });
+        let replay =
+            agent_vocab::ProviderReplayItem::new(agent_vocab::ProviderKind::OpenAi, &raw_replay)
+                .unwrap();
+        let transcript = vec![ModelTranscriptEntry {
+            item: TranscriptItem::CompactionSummary(summary),
+            provider_replay: vec![replay],
+        }];
 
-        let pi_prompt = "PI.md stable rules ".repeat(50);
-        let without_prefix = estimate_transcript_tokens(&PromptSections::default(), &transcript);
-        let with_prefix =
-            estimate_transcript_tokens(&PromptSections::stable(pi_prompt.clone()), &transcript);
-
-        assert!(
-            with_prefix.model_visible_bytes
-                >= without_prefix.model_visible_bytes + pi_prompt.trim().len()
+        let estimate = estimate_transcript_tokens(&PromptSections::default(), &transcript).unwrap();
+        let expected_bytes = serde_json::to_string(&raw_replay).unwrap().len();
+        assert_eq!(
+            estimate,
+            TokenEstimate::from_model_visible_bytes(expected_bytes)
         );
+    }
+
+    #[test]
+    fn transcript_estimator_propagates_invalid_replay() {
+        let transcript = vec![ModelTranscriptEntry {
+            item: TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+                "session-1",
+                "leaf-1",
+                "short recap",
+                Some(1024),
+                agent_vocab::TurnId(1),
+            )),
+            provider_replay: vec![agent_vocab::ProviderReplayItem {
+                provider: agent_vocab::ProviderKind::OpenAi,
+                raw_json: "{".to_string(),
+                display: None,
+            }],
+        }];
+
+        assert!(estimate_transcript_tokens(&PromptSections::default(), &transcript).is_err());
     }
 }
