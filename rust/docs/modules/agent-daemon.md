@@ -143,7 +143,14 @@ does not own session durability.
 
 ### Accept and routing
 
-`main` parses config, connects Postgres, migrates, and sweeps abandoned unfinished actions to stale. Each accepted TCP stream is upgraded to a websocket and handled in its own task. The connection loop multiplexes two sources: inbound request frames and the shared event broadcast.
+`main` parses config, connects Postgres, and migrates. Before stale-action
+cleanup it deterministically reconciles durable selected-subagent controls,
+then recovers durable post-compaction dispatch intents. This ordering lets an
+already-committed exact-child interrupt settle its captured generation before
+any resumed model runner is registered; the following stale sweep protects
+either class if recovery remains retryable. Each accepted TCP stream is
+upgraded to a websocket and handled in its own task. The connection loop
+multiplexes two sources: inbound request frames and the shared event broadcast.
 
 ```
 TcpListener.accept -> spawn handle_socket
@@ -172,7 +179,14 @@ Tool actions are dispatched immediately. `spawn_claimed_dispatch` runs `run_tool
 
 ### Model dispatch, retries, and auth recovery
 
-Model actions are claimed atomically (`claim_pending_model_action`) before `run_model_turn` runs, so a single action is never executed twice. `run_model` assembles the prompt, builds the request from `SessionConfig`, picks a provider, and completes through `complete_with_auth_retry`. Provider connections are cached per `(session_id, provider)` in `ProviderConnectionRegistry`; OpenAI always routes through the ChatGPT/Codex subscription transport, Claude through the Anthropic API-key adapter.
+Ordinary model actions are claimed atomically (`claim_pending_model_action`)
+before `run_model_turn` runs. The narrower post-compaction resume path uses a
+durable owner/generation lease described below. `run_model` assembles the
+prompt, builds the request from `SessionConfig`, picks a provider, and completes
+through `complete_with_auth_retry`. Provider connections are cached per
+`(session_id, provider)` in `ProviderConnectionRegistry`; OpenAI always routes
+through the ChatGPT/Codex subscription transport, Claude through the Anthropic
+API-key adapter.
 
 Two retry layers exist:
 
@@ -206,7 +220,46 @@ RequestModel ready to dispatch
             └─ tokens >= auto_limit -> block action, spawn compaction job
 ```
 
-Compaction runs as its own background task (`run_compaction_job`). On success it records the new compacted root, marks the provider connection compacted (bumping the OpenAI window generation), and resumes the blocked model action from the compacted root. A reactive path also fires: if the provider rejects a running request with a context-overflow error, `recover_model_context_overflow_with_compaction` blocks the running action and spawns a mid-turn compaction instead of failing the turn.
+Compaction runs as its own background task (`run_compaction_job`). On success
+it records the new compacted root, marks the provider connection compacted
+(bumping the OpenAI window generation), and resumes the blocked model action.
+Boundary compaction installs only the summary root. Mid-turn compaction retains
+the open turn's exact user instructions after that root while summarized
+assistant/tool/daemon output stays out of the new branch.
+
+The success transaction also persists an attempt-fenced dispatch intent on the
+resumed model action. Claim assigns a unique owner and incrementing generation
+with a 30-second lease; the registered runner renews it every 10 seconds.
+Startup preserves these marked pending/running rows, validates their exact
+row/attempt/compacted leaf, and reclaims pending or expired work. A
+process-lifetime watchdog sleeps until the next database-derived expiry and is
+woken by heartbeat or runner loss. Completion, failure, reactive compaction,
+and compensation all require the same owner/generation fence, so a stale
+runner cannot install durable output. Replacing a generation aborts any older
+registered task handle, while registration ids prevent an old task's cleanup
+from unregistering its replacement.
+
+This protocol is at least once: a process crash after a provider accepted a
+request but before the terminal database commit can repeat provider work after
+lease expiry. The fencing prevents duplicate durable completion, but neither
+adapter has a provider idempotency key that can eliminate the duplicate-call
+window.
+
+Remote selection remains on the existing policy path. OpenAI defaults to
+provider-native compaction. Claude with no `remote_mode` or explicit `never`
+uses the pre-existing local summary; `auto` attempts native compaction and
+retains the existing local fallback on failure; `always` requires native
+success. There is no additional rollout marker. Native Anthropic output is
+strict provider replay, while replay-free Claude checkpoints remain valid only
+for the local compatibility path at this branch boundary.
+
+A reactive path also fires: if the provider rejects a running request with a
+context-overflow error,
+`recover_model_context_overflow_with_compaction` blocks the running action and
+spawns a mid-turn compaction instead of failing the turn. A compaction tied to
+a concrete blocked model action remains mid-turn even when its source leaf is
+itself a compaction root, preserving task ownership across repeated overflow
+recovery.
 
 The circuit breaker lives in compaction auto-state on session metadata. Each auto-compaction failure increments a consecutive-failure counter and records the failing leaf id; the eligibility check skips a leaf that just failed, skips when `suppressed`, and a successful model response (any usage) resets the failure counter. This prevents an endless compact/retry/overflow loop on a context that cannot be shrunk.
 

@@ -1,5 +1,7 @@
 use crate::SessionActivity;
 
+use super::action_records::POST_COMPACTION_DISPATCH_KEY;
+
 const UNFINISHED_ACTION_STATUSES: &str = "'pending','blocked','running'";
 const ACTIVE_QUEUED_INPUT_STATUSES: &str = "'queued','consuming'";
 
@@ -33,11 +35,27 @@ pub(super) fn action_is_unfinished(alias: Option<&str>) -> String {
     status_is_one_of(alias, UNFINISHED_ACTION_STATUSES)
 }
 
+fn is_recoverable_post_compaction_dispatch(alias: Option<&str>) -> String {
+    let prefix = alias.map(|alias| format!("{alias}.")).unwrap_or_default();
+    format!(
+        "{prefix}status in ('pending','running') and {prefix}kind='model' and {prefix}payload ? '{POST_COMPACTION_DISPATCH_KEY}'"
+    )
+}
+
 /// The query that marks a single session's unfinished actions stale. Shared by
 /// per-session recovery (`recover_session`) and `mark_unfinished_actions_stale`.
 pub(super) fn stale_unfinished_actions_for_session() -> String {
     let unfinished_actions = action_is_unfinished(None);
-    format!("update actions set status='stale', updated_at=now() where session_id=$1 and {unfinished_actions}")
+    let post_compaction_dispatch = is_recoverable_post_compaction_dispatch(None);
+    format!(
+        "update actions set status='stale', payload=payload - '{POST_COMPACTION_DISPATCH_KEY}', updated_at=now() where session_id=$1 and {unfinished_actions} and not ({post_compaction_dispatch})"
+    )
+}
+
+pub(super) fn stale_unfinished_actions() -> String {
+    let unfinished_actions = action_is_unfinished(None);
+    let post_compaction_dispatch = is_recoverable_post_compaction_dispatch(None);
+    format!("{unfinished_actions} and not ({post_compaction_dispatch})")
 }
 
 pub(super) fn queued_input_is_active(alias: Option<&str>) -> String {

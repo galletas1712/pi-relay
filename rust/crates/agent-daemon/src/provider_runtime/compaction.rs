@@ -6,8 +6,10 @@ use agent_session::ModelContext;
 use agent_store::SessionConfig;
 use agent_vocab::{ProviderKind, ProviderReplayItem, TranscriptItem, UserMessage};
 use anyhow::{anyhow, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+#[cfg(test)]
+use std::future::Future;
 
 use crate::auth::Credentials;
 use crate::delegation_context::compaction_delegation_ledger;
@@ -33,6 +35,10 @@ fn generic_remote_compaction_summary(provider: ProviderKind) -> String {
     }
 }
 
+fn generic_auto_limit_for_window(window: usize) -> usize {
+    window / 100 * 85 + window % 100 * 85 / 100
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactionSummaryKind {
     ProviderText,
@@ -48,6 +54,7 @@ impl CompactionSummaryKind {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct CompactionOutput {
     pub summary: String,
     pub summary_kind: CompactionSummaryKind,
@@ -65,42 +72,82 @@ pub(crate) enum RemoteCompactionMode {
     Never,
 }
 
-fn default_remote_compaction_mode() -> RemoteCompactionMode {
-    RemoteCompactionMode::Auto
-}
-
-fn default_auto_compaction_enabled() -> bool {
-    false
-}
-
-fn default_auto_compaction_max_failures() -> usize {
-    3
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompactionConfig {
-    #[serde(default = "default_remote_compaction_mode")]
     pub remote_mode: RemoteCompactionMode,
-    #[serde(default = "default_auto_compaction_enabled")]
     pub auto_enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_limit_tokens: Option<usize>,
-    #[serde(default = "default_auto_compaction_max_failures")]
-    pub max_consecutive_failures: usize,
 }
 
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self {
-            remote_mode: default_remote_compaction_mode(),
-            auto_enabled: default_auto_compaction_enabled(),
-            context_window: None,
-            auto_limit_tokens: None,
-            max_consecutive_failures: default_auto_compaction_max_failures(),
+#[derive(Debug, Default, Deserialize)]
+struct StoredCompactionPolicy {
+    #[serde(default)]
+    remote_mode: PolicyField<RemoteCompactionMode>,
+    #[serde(default)]
+    auto_enabled: PolicyField<bool>,
+    #[serde(default)]
+    context_window: PolicyField<usize>,
+    #[serde(default)]
+    auto_limit_tokens: PolicyField<usize>,
+}
+
+#[derive(Debug)]
+enum ParsedCompactionPolicyState {
+    Missing,
+    Valid(StoredCompactionPolicy),
+    Invalid,
+}
+
+#[derive(Debug)]
+pub(crate) struct ParsedCompactionPolicy {
+    state: ParsedCompactionPolicyState,
+}
+
+impl ParsedCompactionPolicy {
+    pub(crate) fn explicitly_disables_auto(&self) -> bool {
+        match &self.state {
+            ParsedCompactionPolicyState::Missing => false,
+            ParsedCompactionPolicyState::Valid(policy) => policy.auto_enabled.get() == Some(false),
+            ParsedCompactionPolicyState::Invalid => true,
         }
     }
+}
+
+#[derive(Debug, Default)]
+enum PolicyField<T> {
+    #[default]
+    Missing,
+    Value(T),
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for PolicyField<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::Value)
+    }
+}
+
+impl<T: Copy> PolicyField<T> {
+    fn get(&self) -> Option<T> {
+        match self {
+            Self::Missing => None,
+            Self::Value(value) => Some(*value),
+        }
+    }
+}
+
+pub(crate) fn parse_compaction_policy(config: &SessionConfig) -> ParsedCompactionPolicy {
+    let selected = config
+        .metadata
+        .pointer("/compaction/config")
+        .or_else(|| config.metadata.get("compaction"));
+    let state = match selected {
+        None => ParsedCompactionPolicyState::Missing,
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(policy) => ParsedCompactionPolicyState::Valid(policy),
+            Err(_) => ParsedCompactionPolicyState::Invalid,
+        },
+    };
+    ParsedCompactionPolicy { state }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,89 +161,83 @@ pub(crate) struct CompactionAutoState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_leaf_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_success_root_id: Option<String>,
+    pub last_success_leaf_id: Option<String>,
+    #[serde(default)]
+    pub consecutive_recompactions: usize,
 }
 
 pub(crate) fn compaction_config(config: &SessionConfig) -> CompactionConfig {
-    resolve_compaction_config(config, None)
+    let policy = parse_compaction_policy(config);
+    resolve_compaction_config_with_policy(config, None, &policy)
 }
 
 pub(crate) fn compaction_config_with_model_metadata(
     config: &SessionConfig,
     discovered: Option<ProviderModelMetadata>,
+    policy: &ParsedCompactionPolicy,
 ) -> CompactionConfig {
-    resolve_compaction_config(config, discovered)
+    resolve_compaction_config_with_policy(config, discovered, policy)
 }
 
-pub(crate) fn resolve_compaction_config(
+#[cfg(test)]
+fn resolve_compaction_config(
     config: &SessionConfig,
     discovered: Option<ProviderModelMetadata>,
 ) -> CompactionConfig {
-    let metadata_configured = config.metadata.pointer("/compaction/config").is_some()
-        || config.metadata.get("compaction").is_some();
-    let auto_enabled_configured = config
-        .metadata
-        .pointer("/compaction/config/auto_enabled")
-        .is_some()
-        || config
-            .metadata
-            .get("compaction")
-            .and_then(|value| value.get("auto_enabled"))
-            .is_some();
-    let context_window_configured = config
-        .metadata
-        .pointer("/compaction/config/context_window")
-        .is_some_and(|value| !value.is_null())
-        || config
-            .metadata
-            .pointer("/compaction/context_window")
-            .is_some_and(|value| !value.is_null());
-    let auto_limit_configured = config
-        .metadata
-        .pointer("/compaction/config/auto_limit_tokens")
-        .is_some_and(|value| !value.is_null())
-        || config
-            .metadata
-            .pointer("/compaction/auto_limit_tokens")
-            .is_some_and(|value| !value.is_null());
+    let policy = parse_compaction_policy(config);
+    resolve_compaction_config_with_policy(config, discovered, &policy)
+}
 
-    let mut resolved: CompactionConfig = config
-        .metadata
-        .pointer("/compaction/config")
-        .cloned()
-        .or_else(|| config.metadata.get("compaction").cloned())
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
-
-    let default_window = discovered.and_then(|metadata| metadata.max_input_tokens);
-    if !context_window_configured {
-        resolved.context_window = default_window;
+fn resolve_compaction_config_with_policy(
+    config: &SessionConfig,
+    discovered: Option<ProviderModelMetadata>,
+    parsed: &ParsedCompactionPolicy,
+) -> CompactionConfig {
+    let default_policy = StoredCompactionPolicy::default();
+    let policy = match &parsed.state {
+        ParsedCompactionPolicyState::Missing => &default_policy,
+        ParsedCompactionPolicyState::Valid(policy) => policy,
+        ParsedCompactionPolicyState::Invalid => {
+            return invalid_compaction_config(config.provider.kind)
+        }
+    };
+    let context_window = policy
+        .context_window
+        .get()
+        .or_else(|| discovered.and_then(|metadata| metadata.max_input_tokens));
+    let requested_limit = policy
+        .auto_limit_tokens
+        .get()
+        .or_else(|| discovered.and_then(|metadata| metadata.recommended_auto_compact_tokens))
+        .or_else(|| context_window.map(generic_auto_limit_for_window));
+    let auto_limit_tokens = effective_auto_limit(context_window, requested_limit);
+    let auto_enabled = policy
+        .auto_enabled
+        .get()
+        .unwrap_or(auto_limit_tokens.is_some())
+        && (context_window.is_none() || auto_limit_tokens.is_some());
+    let remote_mode = match (config.provider.kind, policy.remote_mode.get()) {
+        (ProviderKind::Claude, Some(mode)) => mode,
+        (ProviderKind::Claude, None) => RemoteCompactionMode::Never,
+        (ProviderKind::OpenAi, Some(RemoteCompactionMode::Never)) => RemoteCompactionMode::Never,
+        (ProviderKind::OpenAi, _) => RemoteCompactionMode::Always,
+    };
+    CompactionConfig {
+        remote_mode,
+        auto_enabled,
+        auto_limit_tokens,
     }
-    if !auto_limit_configured {
-        resolved.auto_limit_tokens =
-            discovered.and_then(|metadata| metadata.recommended_auto_compact_tokens);
-    }
+}
 
-    if !metadata_configured {
-        resolved.remote_mode = match config.provider.kind {
-            ProviderKind::OpenAi => RemoteCompactionMode::Always,
+fn invalid_compaction_config(provider: ProviderKind) -> CompactionConfig {
+    CompactionConfig {
+        remote_mode: match provider {
             ProviderKind::Claude => RemoteCompactionMode::Never,
-        };
-    } else if matches!(config.provider.kind, ProviderKind::OpenAi)
-        && resolved.remote_mode == RemoteCompactionMode::Auto
-    {
-        // OpenAI/Codex provider-native compaction is the safe default: do not
-        // silently hide remote parser/provider failures behind local summary
-        // fallback unless the operator explicitly sets remote_mode="never".
-        resolved.remote_mode = RemoteCompactionMode::Always;
+            ProviderKind::OpenAi => RemoteCompactionMode::Always,
+        },
+        auto_enabled: false,
+        auto_limit_tokens: None,
     }
-
-    if !auto_enabled_configured {
-        resolved.auto_enabled =
-            resolved.auto_limit_tokens.is_some() || resolved.context_window.is_some();
-    }
-
-    resolved
 }
 
 pub(crate) fn compaction_auto_state(config: &SessionConfig) -> CompactionAutoState {
@@ -208,15 +249,6 @@ pub(crate) fn compaction_auto_state(config: &SessionConfig) -> CompactionAutoSta
         .unwrap_or_default()
 }
 
-pub(crate) fn compaction_auto_explicitly_disabled(config: &SessionConfig) -> bool {
-    config
-        .metadata
-        .pointer("/compaction/config/auto_enabled")
-        .or_else(|| config.metadata.pointer("/compaction/auto_enabled"))
-        .and_then(Value::as_bool)
-        == Some(false)
-}
-
 /// Lower bound on the effective auto-compaction limit. A limit below the
 /// irreducible post-compaction context (system prompt + summary + the current
 /// open turn ≈ a few thousand tokens) makes auto-compaction re-fire every turn
@@ -226,14 +258,13 @@ pub(crate) fn compaction_auto_explicitly_disabled(config: &SessionConfig) -> boo
 /// affects misconfigured tiny overrides.
 const MIN_AUTO_COMPACTION_LIMIT: usize = 8_000;
 
-pub(crate) fn auto_limit_tokens(config: &CompactionConfig) -> Option<usize> {
-    let limit = match (config.context_window, config.auto_limit_tokens) {
-        (Some(window), Some(limit)) => Some(limit.min(window)),
-        (Some(window), None) => Some(window.saturating_mul(85) / 100),
-        (None, Some(limit)) => Some(limit),
-        (None, None) => None,
-    };
-    limit.map(|limit| limit.max(MIN_AUTO_COMPACTION_LIMIT))
+fn effective_auto_limit(window: Option<usize>, limit: Option<usize>) -> Option<usize> {
+    match (window, limit) {
+        (Some(window), _) if window < MIN_AUTO_COMPACTION_LIMIT => None,
+        (Some(window), Some(limit)) => Some(limit.clamp(MIN_AUTO_COMPACTION_LIMIT, window)),
+        (None, Some(limit)) => Some(limit.max(MIN_AUTO_COMPACTION_LIMIT)),
+        (_, None) => None,
+    }
 }
 
 pub(crate) async fn run_compaction(
@@ -242,17 +273,9 @@ pub(crate) async fn run_compaction(
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<CompactionOutput> {
-    let compaction_config = compaction_config(config);
-    let remote_mode = compaction_config.remote_mode;
-    if remote_mode == RemoteCompactionMode::Always && config.provider.kind != ProviderKind::OpenAi {
-        return Err(anyhow!(
-            "remote compaction unsupported for provider {}",
-            config.provider.kind
-        ));
-    }
+    let remote_mode = compaction_config(config).remote_mode;
     let credentials = Credentials::load();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
-
     if remote_mode != RemoteCompactionMode::Never && provider.provider.supports_remote_compaction()
     {
         match run_remote_compaction_with_trimming(state, config, session_id, model_context.clone())
@@ -261,11 +284,10 @@ pub(crate) async fn run_compaction(
             Ok(output) => {
                 return append_delegation_ledger_to_output(state, session_id, output).await
             }
-            Err(error)
-                if remote_mode == RemoteCompactionMode::Auto
-                    && config.provider.kind != ProviderKind::OpenAi =>
-            {
-                eprintln!("remote compaction failed for {session_id}; falling back to local summary: {error}");
+            Err(error) if remote_mode == RemoteCompactionMode::Auto => {
+                eprintln!(
+                    "provider-native compaction failed for {session_id}; falling back to local summary: {error}"
+                );
             }
             Err(error) => return Err(error),
         }
@@ -286,8 +308,7 @@ async fn run_remote_compaction_with_trimming(
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<CompactionOutput> {
-    let base_transcript = provider_transcript(model_context);
-    let mut groups = transcript_groups(base_transcript);
+    let mut groups = transcript_groups(provider_transcript(model_context));
     let mut last_context_error = None;
     for attempt in 0..MAX_COMPACTION_CONTEXT_ATTEMPTS {
         let request =
@@ -303,10 +324,6 @@ async fn run_remote_compaction_with_trimming(
                     && trim_oldest_complete_group(&mut groups) =>
             {
                 last_context_error = Some(error.to_string());
-                eprintln!(
-                    "remote compaction for {session_id} exceeded context; retrying with older transcript group trimmed"
-                );
-                continue;
             }
             Err(error) => return Err(anyhow::Error::from(error)),
         }
@@ -315,6 +332,20 @@ async fn run_remote_compaction_with_trimming(
         "remote compaction still exceeded context limits after trimming: {}",
         last_context_error.unwrap_or_else(|| "unknown context-length error".to_string())
     ))
+}
+
+#[cfg(test)]
+async fn run_remote_compaction_algorithm<F, Fut>(
+    provider: ProviderKind,
+    model_context: ModelContext,
+    compact: F,
+) -> Result<CompactionOutput>
+where
+    F: FnOnce(Vec<ModelTranscriptEntry>) -> Fut,
+    Fut: Future<Output = Result<ProviderCompactionResponse>>,
+{
+    let result = compact(provider_transcript(model_context)).await?;
+    Ok(remote_compaction_output(provider, result))
 }
 
 fn remote_compaction_output(
@@ -349,6 +380,14 @@ pub(crate) async fn remote_compaction_request(
     session_id: &str,
     transcript: Vec<ModelTranscriptEntry>,
 ) -> Result<ProviderCompactionRequest> {
+    let compaction_instructions = if config.provider.kind == ProviderKind::Claude {
+        Some(format!(
+            "{}\n\nDo not call any tools while writing this summary. Respond with summary text only.",
+            render_pi_compaction_prompt(state, config)?
+        ))
+    } else {
+        None
+    };
     Ok(ProviderCompactionRequest {
         model: config.provider.model.clone(),
         // Compaction uses the stable prompt plus transcript/model history. Any
@@ -366,6 +405,7 @@ pub(crate) async fn remote_compaction_request(
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
         session_id: Some(session_id.to_string()),
+        compaction_instructions,
     })
 }
 
@@ -426,6 +466,9 @@ async fn run_local_summary_compaction(
             }
             Err(error) => return Err(anyhow::Error::from(error)),
         };
+        if let Some(error) = response.refusal_error() {
+            return Err(anyhow!(error));
+        }
         let summary = response.assistant.text().trim().to_string();
         if summary.is_empty() {
             return Err(anyhow!("compaction provider returned an empty summary"));
@@ -579,6 +622,11 @@ fn trim_oldest_complete_group(groups: &mut Vec<TranscriptGroup>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_provider::{ModelProvider, ModelResponse, ProviderError, ProviderResult};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     fn test_config(kind: ProviderKind, model: &str, metadata: Value) -> SessionConfig {
         SessionConfig {
@@ -597,8 +645,113 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingOverflowProvider {
+        compact_calls: AtomicUsize,
+        complete_calls: AtomicUsize,
+        compact_transcripts: Mutex<Vec<Vec<ModelTranscriptEntry>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for RecordingOverflowProvider {
+        async fn complete(&self, _request: ModelRequest) -> ProviderResult<ModelResponse> {
+            self.complete_calls.fetch_add(1, Ordering::Relaxed);
+            Err(ProviderError::Provider(
+                "local summary compaction must not run".to_string(),
+            ))
+        }
+
+        async fn compact(
+            &self,
+            request: ProviderCompactionRequest,
+        ) -> ProviderResult<ProviderCompactionResponse> {
+            self.compact_calls.fetch_add(1, Ordering::Relaxed);
+            self.compact_transcripts
+                .lock()
+                .expect("recorded transcripts lock")
+                .push(request.transcript);
+            Err(ProviderError::Status {
+                status: 413,
+                message: "context length exceeded".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_compaction_primitive_passes_the_full_transcript_once() {
+        let mut items = Vec::new();
+        for (turn, text) in [
+            (1, "oldest retained user instruction"),
+            (2, "middle retained user instruction"),
+            (3, "newest retained user instruction"),
+        ] {
+            let turn_id = agent_vocab::TurnId(turn);
+            items.extend([
+                TranscriptItem::TurnStarted { turn_id },
+                TranscriptItem::UserMessage(UserMessage::text(text)),
+                TranscriptItem::TurnFinished {
+                    turn_id,
+                    outcome: agent_vocab::TurnOutcome::Graceful,
+                },
+            ]);
+        }
+        let original_len = items.len();
+        let provider = RecordingOverflowProvider::default();
+        let error = run_remote_compaction_algorithm(
+            ProviderKind::Claude,
+            ModelContext::from_transcript_items(items),
+            |transcript| async {
+                let request = ProviderCompactionRequest {
+                    model: "claude-opus-4-8".to_string(),
+                    prompt: PromptSections::stable("test prompt"),
+                    transcript,
+                    tool_profile: ProviderToolProfile::AnthropicCoding,
+                    tools: Vec::new(),
+                    reasoning_effort: agent_vocab::ReasoningEffort::High,
+                    prompt_cache_key: None,
+                    session_id: Some("test-session".to_string()),
+                    compaction_instructions: Some("compact".to_string()),
+                };
+                provider.compact(request).await.map_err(anyhow::Error::from)
+            },
+        )
+        .await
+        .expect_err("native context overflow must surface");
+
+        assert!(error
+            .downcast_ref::<ProviderError>()
+            .is_some_and(ProviderError::is_context_overflow));
+        assert_eq!(
+            provider.compact_calls.load(Ordering::Relaxed),
+            1,
+            "the primitive itself performs exactly one provider call"
+        );
+        assert_eq!(provider.complete_calls.load(Ordering::Relaxed), 0);
+        let transcripts = provider
+            .compact_transcripts
+            .lock()
+            .expect("recorded transcripts lock");
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(transcripts[0].len(), original_len);
+        let sent_user_text = transcripts[0]
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                TranscriptItem::UserMessage(message) => message.as_text(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent_user_text,
+            vec![
+                "oldest retained user instruction",
+                "middle retained user instruction",
+                "newest retained user instruction"
+            ]
+        );
+    }
+
     #[test]
-    fn openai_compaction_requires_discovered_or_explicit_limits() {
+    fn missing_openai_metadata_has_no_static_proactive_threshold() {
         let config = test_config(
             ProviderKind::OpenAi,
             "gpt-5.1-codex-max",
@@ -607,56 +760,444 @@ mod tests {
         let resolved = resolve_compaction_config(&config, None);
 
         assert!(!resolved.auto_enabled);
-        assert_eq!(resolved.context_window, None);
         assert_eq!(resolved.auto_limit_tokens, None);
         assert_eq!(resolved.remote_mode, RemoteCompactionMode::Always);
     }
 
     #[test]
-    fn auto_limit_tokens_is_floored_to_prevent_compaction_churn() {
-        // A misconfigured tiny override clamps up to the churn floor, so
-        // auto-compaction can't re-fire every turn without creating headroom.
-        let tiny = CompactionConfig {
-            context_window: Some(272_000),
-            auto_limit_tokens: Some(3_700),
-            ..Default::default()
-        };
-        assert_eq!(auto_limit_tokens(&tiny), Some(MIN_AUTO_COMPACTION_LIMIT));
-        // A realistic explicit limit passes through unchanged.
-        let realistic = CompactionConfig {
-            context_window: Some(272_000),
-            auto_limit_tokens: Some(231_200),
-            ..Default::default()
-        };
-        assert_eq!(auto_limit_tokens(&realistic), Some(231_200));
-        // The window-derived default (85%) is far above the floor.
-        let windowed = CompactionConfig {
-            context_window: Some(272_000),
-            auto_limit_tokens: None,
-            ..Default::default()
-        };
-        assert_eq!(auto_limit_tokens(&windowed), Some(231_200));
-        // No window and no override means no automatic limit at all.
-        let unbounded = CompactionConfig {
-            context_window: None,
-            auto_limit_tokens: None,
-            ..Default::default()
-        };
-        assert_eq!(auto_limit_tokens(&unbounded), None);
+    fn gpt56_uses_discovered_codex_window_and_threshold() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let config = test_config(ProviderKind::OpenAi, model, serde_json::json!({}));
+            let resolved = resolve_compaction_config(
+                &config,
+                Some(ProviderModelMetadata {
+                    max_input_tokens: Some(372_000),
+                    recommended_auto_compact_tokens: Some(334_800),
+                }),
+            );
+
+            assert!(resolved.auto_enabled);
+            assert_eq!(resolved.auto_limit_tokens, Some(334_800));
+        }
     }
 
     #[test]
-    fn resolved_compaction_config_unknown_model_needs_explicit_limit() {
-        let config = test_config(ProviderKind::OpenAi, "unknown", serde_json::json!({}));
+    fn discovered_one_million_claude_window_defaults_to_half() {
+        for model in ["claude-sonnet-5", "claude-future"] {
+            let config = test_config(ProviderKind::Claude, model, serde_json::json!({}));
+            let resolved = resolve_compaction_config(
+                &config,
+                Some(ProviderModelMetadata {
+                    max_input_tokens: Some(1_000_000),
+                    recommended_auto_compact_tokens: Some(500_000),
+                }),
+            );
+
+            assert!(resolved.auto_enabled);
+            assert_eq!(resolved.auto_limit_tokens, Some(500_000));
+        }
+    }
+
+    #[test]
+    fn claude_remote_compaction_remains_opt_in() {
+        let default = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-5",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            resolve_compaction_config(&default, None).remote_mode,
+            RemoteCompactionMode::Never
+        );
+        let limits_only = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-5",
+            serde_json::json!({
+                "compaction": {
+                    "config": {
+                        "auto_enabled": true,
+                        "auto_limit_tokens": 100_000
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            resolve_compaction_config(&limits_only, None).remote_mode,
+            RemoteCompactionMode::Never,
+            "scheduler settings alone must not select native compaction"
+        );
+        for (configured, expected) in [
+            ("auto", RemoteCompactionMode::Auto),
+            ("always", RemoteCompactionMode::Always),
+        ] {
+            let explicit = test_config(
+                ProviderKind::Claude,
+                "claude-sonnet-5",
+                serde_json::json!({
+                    "compaction": {
+                        "config": {
+                            "remote_mode": configured
+                        }
+                    }
+                }),
+            );
+            assert_eq!(
+                resolve_compaction_config(&explicit, None).remote_mode,
+                expected
+            );
+        }
+        let explicit_never = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-5",
+            serde_json::json!({
+                "compaction": {
+                    "config": {
+                        "remote_mode": "never"
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            resolve_compaction_config(&explicit_never, None).remote_mode,
+            RemoteCompactionMode::Never
+        );
+    }
+
+    #[test]
+    fn remote_compaction_output_preserves_checkpoint_replay_and_raw_usage() {
+        let block = serde_json::json!({
+            "type": "compaction",
+            "content": "opaque Anthropic summary",
+            "provider_extension": { "preserve": true }
+        });
+        let replay = ProviderReplayItem::new(ProviderKind::Claude, &block).unwrap();
+        let raw_usage = serde_json::json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "iterations": [{
+                "type": "compaction",
+                "input_tokens": 180000,
+                "output_tokens": 3500
+            }]
+        });
+        let output = remote_compaction_output(
+            ProviderKind::Claude,
+            ProviderCompactionResponse {
+                summary: None,
+                provider_replay: vec![replay],
+                usage: Some(agent_provider::ProviderUsage {
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    total_tokens: Some(0),
+                    raw_provider_usage: Some(raw_usage.clone()),
+                    ..agent_provider::ProviderUsage::default()
+                }),
+            },
+        );
+
+        assert!(output.remote);
+        assert_eq!(output.summary_kind, CompactionSummaryKind::Generic);
+        assert_eq!(output.provider_replay[0].raw_value().unwrap(), block);
+        let serialized_replay =
+            serde_json::to_string(&output.provider_replay).expect("provider replay serializes");
+        let restored_replay: Vec<ProviderReplayItem> =
+            serde_json::from_str(&serialized_replay).expect("provider replay deserializes");
+        assert_eq!(restored_replay[0].raw_value().unwrap(), block);
+        assert_eq!(
+            output
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("raw_provider_usage")),
+            Some(&raw_usage)
+        );
+    }
+
+    #[test]
+    fn missing_policy_uses_discovered_metadata_or_reactive_only() {
+        let openai = resolve_compaction_config(
+            &test_config(ProviderKind::OpenAi, "gpt-5.6-sol", serde_json::json!({})),
+            Some(ProviderModelMetadata {
+                max_input_tokens: Some(372_000),
+                recommended_auto_compact_tokens: Some(334_800),
+            }),
+        );
+        assert_eq!(openai.remote_mode, RemoteCompactionMode::Always);
+        assert!(openai.auto_enabled);
+        assert_eq!(openai.auto_limit_tokens, Some(334_800));
+
+        let unknown = resolve_compaction_config(
+            &test_config(ProviderKind::OpenAi, "unknown", serde_json::json!({})),
+            None,
+        );
+        assert!(!unknown.auto_enabled);
+        assert_eq!(unknown.auto_limit_tokens, None);
+    }
+
+    #[test]
+    fn remote_mode_is_the_only_native_compaction_selector() {
+        let selected = test_config(
+            ProviderKind::Claude,
+            "claude-opus-4-8",
+            serde_json::json!({
+                "compaction": { "config": {
+                    "remote_mode": "auto"
+                }}
+            }),
+        );
+        assert_eq!(
+            resolve_compaction_config(&selected, None).remote_mode,
+            RemoteCompactionMode::Auto
+        );
+
+        let unselected = test_config(
+            ProviderKind::Claude,
+            "claude-opus-4-8",
+            serde_json::json!({
+                "compaction": { "config": {
+                    "auto_enabled": true,
+                    "max_consecutive_failures": 3,
+                    "unrelated_provider_metadata": "ignored"
+                }}
+            }),
+        );
+        assert_eq!(
+            resolve_compaction_config(&unselected, None).remote_mode,
+            RemoteCompactionMode::Never
+        );
+    }
+
+    #[test]
+    fn nested_policy_wins_as_one_whole_object() {
+        let config = test_config(
+            ProviderKind::OpenAi,
+            "unknown",
+            serde_json::json!({
+                "compaction": {
+                    "auto_enabled": true,
+                    "auto_limit_tokens": 123_456,
+                    "remote_mode": "never",
+                    "config": { "auto_enabled": false }
+                }
+            }),
+        );
         let resolved = resolve_compaction_config(&config, None);
 
         assert!(!resolved.auto_enabled);
-        assert_eq!(resolved.context_window, None);
+        assert_eq!(resolved.auto_limit_tokens, None);
+        assert_eq!(resolved.remote_mode, RemoteCompactionMode::Always);
+    }
+
+    #[test]
+    fn direct_policy_layout_remains_read_compatible() {
+        let disabled = resolve_compaction_config(
+            &test_config(
+                ProviderKind::OpenAi,
+                "gpt-5.6-sol",
+                serde_json::json!({ "compaction": { "auto_enabled": false } }),
+            ),
+            None,
+        );
+        assert!(!disabled.auto_enabled);
+
+        let limited = resolve_compaction_config(
+            &test_config(
+                ProviderKind::Claude,
+                "claude-future",
+                serde_json::json!({ "compaction": { "auto_limit_tokens": 123_456 } }),
+            ),
+            None,
+        );
+        assert_eq!(limited.auto_limit_tokens, Some(123_456));
+
+        let local_only = resolve_compaction_config(
+            &test_config(
+                ProviderKind::OpenAi,
+                "gpt-5.6-sol",
+                serde_json::json!({ "compaction": { "remote_mode": "never" } }),
+            ),
+            None,
+        );
+        assert_eq!(local_only.remote_mode, RemoteCompactionMode::Never);
+    }
+
+    #[test]
+    fn malformed_selected_direct_or_nested_policy_fails_closed() {
+        for metadata in [
+            serde_json::json!({ "compaction": { "auto_enabled": "invalid" } }),
+            serde_json::json!({
+                "compaction": {
+                    "auto_enabled": true,
+                    "auto_limit_tokens": 123_456,
+                    "config": null
+                }
+            }),
+        ] {
+            let config = test_config(ProviderKind::OpenAi, "gpt-5.6-sol", metadata);
+            let policy = parse_compaction_policy(&config);
+            let resolved = resolve_compaction_config_with_policy(&config, None, &policy);
+
+            assert!(policy.explicitly_disables_auto());
+            assert!(!resolved.auto_enabled);
+            assert_eq!(resolved.auto_limit_tokens, None);
+            assert_eq!(resolved.remote_mode, RemoteCompactionMode::Always);
+        }
+    }
+
+    #[test]
+    fn malformed_known_policy_fails_closed_without_changing_openai_native_baseline() {
+        for malformed_policy in [
+            serde_json::json!({
+                "remote_mode": "auto",
+                "auto_limit_tokens": "invalid"
+            }),
+            serde_json::json!({ "remote_mode": null }),
+            serde_json::json!({ "auto_enabled": null }),
+        ] {
+            for provider in [ProviderKind::Claude, ProviderKind::OpenAi] {
+                let config = test_config(
+                    provider,
+                    if provider == ProviderKind::Claude {
+                        "claude-opus-4-8"
+                    } else {
+                        "gpt-5.6-sol"
+                    },
+                    serde_json::json!({
+                        "compaction": { "config": malformed_policy }
+                    }),
+                );
+                let resolved = resolve_compaction_config(&config, None);
+                assert!(!resolved.auto_enabled);
+                assert_eq!(resolved.auto_limit_tokens, None);
+                assert_eq!(
+                    resolved.remote_mode,
+                    if provider == ProviderKind::Claude {
+                        RemoteCompactionMode::Never
+                    } else {
+                        RemoteCompactionMode::Always
+                    }
+                );
+                assert!(parse_compaction_policy(&config).explicitly_disables_auto());
+            }
+        }
+
+        let openai_with_unknown_metadata = test_config(
+            ProviderKind::OpenAi,
+            "gpt-5.6-sol",
+            serde_json::json!({
+                "compaction": { "config": {
+                    "unrelated_provider_metadata": { "ignored": true }
+                }}
+            }),
+        );
+        assert!(
+            !resolve_compaction_config(&openai_with_unknown_metadata, None).auto_enabled,
+            "unknown metadata must not invent a proactive threshold"
+        );
+    }
+
+    #[test]
+    fn store_owned_failure_limit_does_not_change_daemon_policy() {
+        let config = test_config(
+            ProviderKind::OpenAi,
+            "gpt-5.6-sol",
+            serde_json::json!({
+                "compaction": { "config": {
+                    "auto_enabled": true,
+                    "auto_limit_tokens": 123_456,
+                    "remote_mode": "never",
+                    "max_consecutive_failures": "invalid"
+                }}
+            }),
+        );
+        let resolved = resolve_compaction_config(&config, None);
+
+        assert!(resolved.auto_enabled);
+        assert_eq!(resolved.auto_limit_tokens, Some(123_456));
+        assert_eq!(resolved.remote_mode, RemoteCompactionMode::Never);
+    }
+
+    #[test]
+    fn parsed_explicit_disable_is_shared_by_early_and_resolved_checks() {
+        let config = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-4-5",
+            serde_json::json!({
+                "compaction": { "config": { "auto_enabled": false } }
+            }),
+        );
+        let policy = parse_compaction_policy(&config);
+        assert!(policy.explicitly_disables_auto());
+        assert!(!resolve_compaction_config_with_policy(&config, None, &policy).auto_enabled);
+    }
+
+    #[test]
+    fn explicit_auto_without_known_threshold_remains_reactive_only() {
+        let config = test_config(
+            ProviderKind::OpenAi,
+            "unknown",
+            serde_json::json!({
+                "compaction": { "config": { "auto_enabled": true } }
+            }),
+        );
+        let resolved = resolve_compaction_config(&config, None);
+
+        assert!(resolved.auto_enabled);
         assert_eq!(resolved.auto_limit_tokens, None);
     }
 
     #[test]
-    fn discovered_context_window_enables_unknown_claude_model_compaction() {
+    fn valid_limits_are_effective_once_and_never_exceed_the_window() {
+        for (policy, expected) in [
+            (
+                serde_json::json!({ "context_window": 600_000 }),
+                Some(510_000),
+            ),
+            (
+                serde_json::json!({
+                    "context_window": 600_000,
+                    "auto_limit_tokens": 700_000
+                }),
+                Some(600_000),
+            ),
+            (
+                serde_json::json!({
+                    "context_window": 600_000,
+                    "auto_limit_tokens": 3_700
+                }),
+                Some(MIN_AUTO_COMPACTION_LIMIT),
+            ),
+        ] {
+            let config = test_config(
+                ProviderKind::Claude,
+                "claude-future",
+                serde_json::json!({ "compaction": { "config": policy } }),
+            );
+            assert_eq!(
+                resolve_compaction_config(&config, None).auto_limit_tokens,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_window_disables_automatic_compaction() {
+        let config = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-4-5",
+            serde_json::json!({
+                "compaction": { "config": {
+                    "auto_enabled": true,
+                    "context_window": 123
+                }}
+            }),
+        );
+        let resolved = resolve_compaction_config(&config, None);
+        assert!(!resolved.auto_enabled);
+        assert_eq!(resolved.auto_limit_tokens, None);
+    }
+
+    #[test]
+    fn discovered_metadata_supplies_provider_aware_default() {
         let config = test_config(ProviderKind::Claude, "claude-future", serde_json::json!({}));
         let resolved = resolve_compaction_config(
             &config,
@@ -665,90 +1206,22 @@ mod tests {
                 recommended_auto_compact_tokens: Some(425_000),
             }),
         );
-
         assert!(resolved.auto_enabled);
-        assert_eq!(resolved.context_window, Some(500_000));
         assert_eq!(resolved.auto_limit_tokens, Some(425_000));
     }
 
     #[test]
-    fn resolved_compaction_config_respects_explicit_overrides() {
-        let config = test_config(
-            ProviderKind::Claude,
-            "claude-sonnet-4-5",
-            serde_json::json!({
-                "compaction": {
-                    "config": {
-                        "auto_enabled": true,
-                        "context_window": 123,
-                        "auto_limit_tokens": 77,
-                        "remote_mode": "auto"
-                    }
-                }
-            }),
-        );
-        let resolved = resolve_compaction_config(&config, None);
-
-        assert!(resolved.auto_enabled);
-        assert_eq!(resolved.context_window, Some(123));
-        assert_eq!(resolved.auto_limit_tokens, Some(77));
-        assert_eq!(resolved.remote_mode, RemoteCompactionMode::Auto);
-
-        let discovered = resolve_compaction_config(
-            &config,
-            Some(ProviderModelMetadata {
-                max_input_tokens: Some(500_000),
-                recommended_auto_compact_tokens: Some(425_000),
-            }),
-        );
-        assert_eq!(discovered.context_window, Some(123));
-        assert_eq!(discovered.auto_limit_tokens, Some(77));
-    }
-
-    #[test]
-    fn resolved_compaction_config_respects_explicit_auto_disabled() {
-        let config = test_config(
-            ProviderKind::Claude,
-            "claude-sonnet-4-5",
-            serde_json::json!({ "compaction": { "config": { "auto_enabled": false } } }),
-        );
-        let resolved = resolve_compaction_config(
-            &config,
-            Some(ProviderModelMetadata {
-                max_input_tokens: Some(200_000),
-                recommended_auto_compact_tokens: Some(170_000),
-            }),
-        );
-
-        assert!(!resolved.auto_enabled);
-        assert_eq!(resolved.context_window, Some(200_000));
-        assert_eq!(resolved.auto_limit_tokens, Some(170_000));
-    }
-
-    #[test]
-    fn explicit_null_limits_preserve_safe_discovered_defaults() {
+    fn explicit_limit_without_known_window_is_safely_floored() {
         let config = test_config(
             ProviderKind::Claude,
             "claude-future",
             serde_json::json!({
-                "compaction": {
-                    "config": {
-                        "context_window": null,
-                        "auto_limit_tokens": null
-                    }
-                }
+                "compaction": { "config": { "auto_limit_tokens": 100 } }
             }),
         );
-        let resolved = resolve_compaction_config(
-            &config,
-            Some(ProviderModelMetadata {
-                max_input_tokens: Some(500_000),
-                recommended_auto_compact_tokens: Some(425_000),
-            }),
+        assert_eq!(
+            resolve_compaction_config(&config, None).auto_limit_tokens,
+            Some(MIN_AUTO_COMPACTION_LIMIT)
         );
-
-        assert!(resolved.auto_enabled);
-        assert_eq!(resolved.context_window, Some(500_000));
-        assert_eq!(resolved.auto_limit_tokens, Some(425_000));
     }
 }

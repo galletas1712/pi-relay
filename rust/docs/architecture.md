@@ -111,9 +111,11 @@ Implemented user-facing behavior:
   model request; follow-ups remain next-turn work.
 - Turn-level interrupt; idle-only retry/continue (`turn.resume`) for terminal
   model turns; idle-only active-branch switch; idle-only `session.delete`.
-- Manual and automatic compaction; OpenAI uses provider-native compaction,
-  Anthropic uses a local text summary. Compaction is a typed transcript root,
-  not a session boundary.
+- Manual and automatic compaction. OpenAI uses provider-native compaction by
+  default; Anthropic can use its strict native compaction endpoint through the
+  existing `remote_mode` policy while retaining the pre-existing local-summary
+  compatibility path. Compaction is a typed transcript root, not a session
+  boundary.
 - Provider/model-aware compaction thresholds through the provider-neutral
   `ModelProvider::model_metadata` contract. OpenAI exact-resolves the selected
   slug from an authenticated, account-scoped private Codex catalog before

@@ -17,6 +17,7 @@ agent-store = { workspace = true }
 agent-tools = { workspace = true }
 agent-vocab = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
 reflink-copy = { workspace = true }

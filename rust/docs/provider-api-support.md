@@ -165,9 +165,9 @@ deserialized.
 | Successful terminal | **Supported.** Requires a valid `response.completed` and no pending added output items; terminal omission never completes a pending item. Optional terminal output is merged by index: completed items keep their exact payload, overlaps require stable type/identity compatibility, and terminal-only items cross the ordinary fail-closed item boundary. EOF or `[DONE]` is not success. The private minimal terminal without `output` remains accepted only with no pending items. | **Supported.** Requires `message_start`, closed content blocks, a recognized terminal stop reason, and `message_stop`; EOF alone is not success. | Unknown future event types may be ignored but never imply success. `[source, unit]` |
 | Refusal | **Supported.** Refusal content becomes a refusal terminal and partial semantic output/replay is discarded. | **Supported.** `stop_reason: refusal` retains valid details and discards partial semantic output/replay. | `[unit]` |
 | Incomplete / max output | **Supported.** `response.incomplete` is a typed non-success with status/reason. | **Supported.** `max_tokens` is a normalized terminal; `pause_turn`, context-window exhaustion, and unknown reasons are typed non-successes. | `[unit]` |
-| Native compaction | **Supported.** Private unary `/responses/compact`; canonical returned output is installed and replayed exactly. Public inline `context_management` compaction is not sent. | **Unsupported.** The daemon uses its pre-existing local text-summary path; the adapter does not activate Anthropic native compaction. | OpenAI standalone compaction has historical real-backend coverage. Anthropic's public feature is not adapter support. `[source, unit, live, official]` |
-| Compaction replay | **Supported.** Exactly one native checkpoint is evidenced; the complete opaque returned array is replayed unchanged and in order. | **Not applicable to local summaries.** A local `CompactionSummary` is rendered as user text. Ordinary Messages defensively rejects inline compaction. | `[source, unit, live]` |
-| Input token counting | **Partial.** No usable private endpoint: `/responses/input_tokens` returned a Cloudflare 403 challenge. The daemon anchors on completed usage, estimates only the local suffix, and retains reactive overflow recovery. | **Supported.** Calls `/messages/count_tokens` with the same local prompt/tool shape. | Public OpenAI `POST /v1/responses/input_tokens` exists but is not usable through this private adapter. Anthropic counting is mock-tested. `[source, unit, official]` |
+| Native compaction | **Supported.** Private unary `/responses/compact`; canonical returned output is installed and replayed exactly. Public inline `context_management` compaction is not sent. | **Supported additively.** The strict Messages context-management operation is reachable through the existing `remote_mode` policy. Missing/`never` retains local summary compatibility, `auto` retains the existing native-to-local failure fallback, and `always` fails closed. | Both adapters are source/mock-tested. OpenAI standalone compaction has historical real-backend coverage. `[source, unit, live, official]` |
+| Compaction replay | **Supported.** Exactly one native checkpoint is evidenced; the complete opaque returned array is replayed unchanged and in order. | **Supported.** A native checkpoint is exactly one strict opaque `compaction` block, replayed unchanged. A replay-free local `CompactionSummary` remains valid only for the retained compatibility path; malformed or mixed native replay fails locally. | Ordinary Messages rejects unexpected inline compaction. `[source, unit]` |
+| Input token counting | **Partial.** No usable private endpoint: `/responses/input_tokens` returned a Cloudflare 403 challenge. The daemon anchors on completed usage, estimates only the local suffix, and retains reactive overflow recovery. | **Supported.** Calls `/messages/count_tokens` with the same local prompt/tool shape. Existing native compaction blocks use the apply-existing edit; effective occupancy is returned and original occupancy is retained as diagnostics. | Public OpenAI `POST /v1/responses/input_tokens` exists but is not usable through this private adapter. Anthropic counting is mock-tested. `[source, unit, official]` |
 
 ## Tools, actions, and citations
 
@@ -223,9 +223,10 @@ database, tool output, logs, backups, or exported transcripts.
 
 The deliberate state model is therefore: `store: false` where the private
 Codex transport supports it, no provider Conversations/background state,
-complete local replay, exact OpenAI compaction checkpoints, and local Anthropic
-summaries. This supports crash recovery and auditability without claiming
-provider-side ZDR that has not been contractually or live verified.
+complete local replay, exact OpenAI and Anthropic native compaction
+checkpoints, and retained local Anthropic summaries only through the existing
+compatibility selector. This supports crash recovery and auditability without
+claiming provider-side ZDR that has not been contractually or live verified.
 
 ## Sources
 

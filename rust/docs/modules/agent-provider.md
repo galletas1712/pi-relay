@@ -8,8 +8,8 @@ See [design decisions](../design-decisions.md) for *why* the provider scope is s
 
 ## Responsibilities
 
-- Define the `ModelProvider` trait: `complete`, plus optional `model_metadata`,
-  `compact`, and `count_tokens`.
+- Define the `ModelProvider` trait: `complete`, provider-neutral
+  `model_metadata`, plus optional `compact` and `count_tokens`.
 - Render `ModelRequest` into provider-native request bodies and headers.
 - Stream and parse provider SSE into one `AssistantMessage` (`Text` / `ToolCall` items only).
 - Capture per-item `ProviderReplayItem` sidecars so encrypted reasoning / thinking blocks replay verbatim on the next request.
@@ -45,10 +45,15 @@ compaction state.
 
 `ModelResponse` = `{ assistant: AssistantMessage, provider_replay, usage:
 Option<ProviderUsage>, stop_reason, stop_details }`. `ModelStopReason` is
-`Complete`, `MaxOutputTokens`, or `Refusal`. Refusal details retain the optional
-provider category and human-readable explanation.
+`Complete`, `MaxOutputTokens`, `Refusal`, or `Compaction`. Refusal details
+retain the optional provider category and human-readable explanation.
 
-`ProviderCompactionRequest` / `ProviderCompactionResponse`, `ProviderTokenCountRequest` / `ProviderTokenCountResponse` mirror the same prompt/transcript/tool inputs for the non-`complete` methods.
+`ProviderCompactionRequest` / `ProviderCompactionResponse`,
+`ProviderTokenCountRequest` / `ProviderTokenCountResponse` mirror the same
+prompt/transcript/tool inputs for the non-`complete` methods. Compaction
+requests can carry provider-native custom instructions. Token-count responses
+return effective input occupancy and can retain the provider's original
+pre-compaction occupancy as diagnostics.
 
 `ProviderModelMetadata` exposes only scheduler-consumed normalized values:
 `max_input_tokens` is the resolved current/default input window, and
@@ -191,7 +196,11 @@ nullable `stop_details.category`/`explanation`. The daemon records the action as
 an error and surfaces that explanation instead of persisting an assistant
 completion. It does not automatically retry or switch models.
 
-`count_tokens` is supported via `/messages/count_tokens` using the same input-shaping body minus `max_tokens` and transcript cache breakpoints.
+`count_tokens` is supported via `/messages/count_tokens` using the same
+input-shaping body minus `max_tokens` and transcript cache breakpoints. When a
+native compaction block is replayed, counting sends Anthropic's apply-existing
+context-management edit, returns effective occupancy, and retains
+`context_management.original_input_tokens` as diagnostics.
 
 ### Prompt-cache cohort key and Anthropic cache markers
 
@@ -253,9 +262,14 @@ pairs are not split. The model sees an `inspect_delegation` result in the same
 shape as a real tool result, while the transcript/UI semantics remain explicit:
 the daemon authored the observation.
 
-### Compaction: provider-native vs local summary
+### Compaction: additive provider-native support
 
-`supports_remote_compaction()` is `true` for OpenAI, `false` for Anthropic.
+Both adapters advertise provider-native compaction, while the trait keeps a
+conservative unsupported default for adapters that do not implement it. The
+daemon still owns selection and retains its pre-existing local-summary path at
+this boundary: OpenAI defaults to native; Claude with no `remote_mode` or with
+`never` stays local; Claude `auto` tries native and may use the existing local
+fallback; Claude `always` requires native success.
 
 - **OpenAI** posts a unary `ProviderCompactionRequest` to `/responses/compact`
   (JSON, 20-minute timeout). The body is a valid subset of Codex's current
@@ -275,10 +289,30 @@ the daemon authored the observation.
   display summary, but is never substituted into replay. Missing, corrupt,
   duplicate, or non-native replay on a persisted OpenAI `CompactionSummary`
   fails request construction rather than synthesizing a user summary.
-- **Anthropic** has no compaction endpoint at this boundary; the daemon generates
-  a local text summary through the normal `complete` path and stores it as a
-  `CompactionSummary` transcript item. The Anthropic adapter never constructs
-  or consumes `ProviderCompactionRequest`.
+- **Anthropic** uses the Messages API with the provider-required
+  `compact-2026-01-12` beta and
+  `context_management.edits[0].type = "compact_20260112"`. The request uses the
+  documented minimum 50K input trigger, pauses after compaction, supplies the
+  PI compaction prompt as custom instructions, and forbids tools. Model support
+  is resolved from authoritative Models API capability metadata over the
+  adapter's conservative known-model fallback; unsupported models fail before
+  network dispatch. Success requires the explicit `compaction` stop and exactly
+  one index-zero compaction block with nonempty content. Ordinary completion,
+  tools, refusal, max output, malformed/truncated streams, and missing or
+  malformed block content are typed native-compaction failures.
+
+The Anthropic compaction block is persisted as exact opaque replay. Its stable
+contract requires `type = "compaction"`, nonempty string `content`, and absent,
+null, or string `encrypted_content`; start/delta extension fields and ordering
+are retained unchanged. A native `CompactionSummary` must carry exactly one
+such block. The one compatibility exception at this additive boundary is a
+replay-free local-summary checkpoint produced by the retained daemon path,
+which still renders as synthetic user text. Nonempty malformed, duplicate, or
+mixed native replay fails locally rather than being canonicalized or dropped.
+Subsequent ordinary Messages and token-count requests replay a valid block
+unchanged and scope the required beta header to bodies that use it. Compaction
+blocks or compaction stops appearing unexpectedly in ordinary generation are
+rejected and cannot become persistable output.
 
 A local `CompactionSummary` renders as a synthetic user message ("The
 conversation history before this point was compacted into this summary…"), with

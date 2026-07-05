@@ -54,3 +54,21 @@ shaping:
 strings remain bounded metadata and are never public configuration. There is
 no duplicate auth coordinator, public Ultra phase, stale/static/public/disk
 fallback, proactive agent mode, or native-compaction activation.
+
+## 4. `restack/native-compaction-foundation`
+
+Adds strict Anthropic provider-native compaction and token counting together
+with provider-neutral durable continuation:
+
+- exact opaque compaction replay and strict canonical parsing;
+- retained open user instructions;
+- transactional checkpoint installation;
+- dispatch claim, lease, owner/generation fencing, heartbeat, and restart
+  recovery; and
+- task-registration ownership that prevents stale runners from removing their
+  replacements.
+
+Reachability uses the pre-existing `remote_mode` configuration path. The
+pre-existing local summary, trimming, and compatible fallback modes remain at
+this additive boundary, so native Anthropic compaction can be exercised without
+performing the breaking cutover. No new rollout marker is introduced.

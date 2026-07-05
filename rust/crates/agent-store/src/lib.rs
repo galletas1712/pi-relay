@@ -2,9 +2,11 @@
 
 mod postgres;
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
-use agent_session::{ModelContext, SessionAction, SessionEvent, TranscriptStorageNode};
+use agent_session::{
+    ModelContext, ModelContextEntry, SessionAction, SessionEvent, TranscriptStorageNode,
+};
 use agent_vocab::{
     text_enum, ActionId, DaemonToolObservation, ProviderConfig, ProviderKind, ProviderReplayItem,
     TranscriptItem, TurnId, TurnOutcome, UserMessage,
@@ -22,7 +24,6 @@ text_enum! {
         FollowUp => "follow_up",
         Steer => "steer",
     }
-
     pub enum QueuedInputStatus {
         Queued => "queued",
         Consuming => "consuming",
@@ -241,6 +242,7 @@ pub struct EventFrame {
 pub struct ActionUpdate {
     pub row_id: String,
     pub attempt_id: String,
+    pub post_compaction_dispatch_lease: Option<PostCompactionDispatchLease>,
     pub status: ActionStatus,
     pub result: Value,
 }
@@ -258,6 +260,93 @@ pub struct PendingDispatchAction {
     pub attempt_id: String,
     pub action: SessionAction,
 }
+
+#[derive(Debug, Clone)]
+pub struct PostCompactionDispatchIntent {
+    pub session_id: String,
+    pub row_id: String,
+    pub attempt_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostCompactionDispatchLease {
+    pub owner_id: String,
+    pub generation: u64,
+    pub context_leaf_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaimedPostCompactionDispatch {
+    pub pending: PendingDispatchAction,
+    pub lease: PostCompactionDispatchLease,
+}
+
+#[derive(Debug, Clone)]
+pub struct PostCompactionDispatchFence {
+    status: ActionStatus,
+    marker: Value,
+    lease: Option<PostCompactionDispatchLease>,
+}
+
+impl PostCompactionDispatchFence {
+    fn new(
+        status: ActionStatus,
+        marker: Value,
+        lease: Option<PostCompactionDispatchLease>,
+    ) -> Self {
+        Self {
+            status,
+            marker,
+            lease,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct CorruptPostCompactionDispatch {
+    message: String,
+    fence: PostCompactionDispatchFence,
+}
+
+impl CorruptPostCompactionDispatch {
+    fn new(message: String, fence: PostCompactionDispatchFence) -> Self {
+        Self { message, fence }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn fence(&self) -> &PostCompactionDispatchFence {
+        &self.fence
+    }
+}
+
+#[derive(Debug)]
+pub enum PostCompactionDispatchClaimError {
+    Corrupt(CorruptPostCompactionDispatch),
+    Transient(anyhow::Error),
+}
+
+impl fmt::Display for PostCompactionDispatchClaimError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Corrupt(error) => formatter.write_str(error.message()),
+            Self::Transient(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for PostCompactionDispatchClaimError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Corrupt(_) => None,
+            Self::Transient(error) => error.source(),
+        }
+    }
+}
+
+pub const POST_COMPACTION_DISPATCH_LEASE_DURATION: Duration = Duration::from_secs(30);
 
 pub struct EnqueueUserInputResult {
     pub input_id: String,
@@ -505,7 +594,7 @@ pub struct CompactionCompletion {
     pub remote: bool,
     pub provider: ProviderKind,
     pub usage: Option<Value>,
-    pub continuation_suffix: Vec<TranscriptStorageNode>,
+    pub continuation_suffix: Vec<ModelContextEntry>,
 }
 
 pub struct CreateCompactionResult {
@@ -799,6 +888,8 @@ pub struct StoredAction {
     pub action_id: i64,
     pub turn_id: Option<i64>,
     pub attempt_id: String,
+    pub post_compaction_dispatch_context_leaf_id: Option<String>,
+    pub post_compaction_dispatch_lease: Option<PostCompactionDispatchLease>,
 }
 
 #[derive(Debug, Clone)]

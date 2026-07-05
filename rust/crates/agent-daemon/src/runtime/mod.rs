@@ -7,13 +7,16 @@ mod outputs;
 mod tasks;
 mod tool;
 
-use std::sync::Arc;
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 use agent_core::AgentInput;
 use agent_session::{AgentSession, SessionAction, SessionInput};
 use agent_store::{
     AcceptedInput, ActionUpdate, EventFrame, EventType, OutputBatch, QueuedInput, SessionActivity,
-    SessionConfig, SubagentType,
+    SessionConfig, SubagentType, POST_COMPACTION_DISPATCH_LEASE_DURATION,
 };
 use agent_vocab::ProviderReplayItem;
 use anyhow::Context;
@@ -26,15 +29,110 @@ use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
 pub(crate) use compaction::spawn_compaction;
 use dispatch::dispatch_all;
+#[cfg(test)]
+pub(crate) use dispatch::runner_start_count;
 pub(crate) use errors::{
     history_error_to_rpc, map_queued_mutation_error, map_source_mutation_error,
 };
 pub(crate) use events::{clear_event_buffer_if_idle, publish_events};
+#[cfg(test)]
+pub(crate) use model::apply_model_response;
 use outputs::attach_provider_replay;
 pub(crate) use outputs::{
     agent_input_from_queued_priority, attach_dispatch_config, collect_runtime_outputs,
 };
-pub(crate) use tasks::{abort_session_tasks, session_has_live_tasks, take_tasks};
+pub(crate) use tasks::{
+    abort_session_tasks, register_auxiliary_task, session_has_live_tasks, take_tasks,
+};
+
+pub(crate) async fn recover_post_compaction_dispatches_on_boot(
+    state: &AppState,
+) -> anyhow::Result<usize> {
+    ensure_post_compaction_dispatch_recovery(state);
+    recover_post_compaction_dispatches_once(state).await
+}
+
+async fn recover_post_compaction_dispatches_once(state: &AppState) -> anyhow::Result<usize> {
+    if tasks::is_shutting_down(state) {
+        return Ok(0);
+    }
+    let mut recovered_total = 0;
+    let session_ids = state.repo.post_compaction_dispatch_session_ids().await?;
+    for session_id in session_ids {
+        let driver = SessionDriver::acquire(state, &session_id).await;
+        recovered_total += driver
+            .recover_post_compaction_dispatches()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to recover post-compaction dispatch for {session_id}: {}: {}",
+                    error.code,
+                    error.message
+                )
+            })?;
+    }
+    Ok(recovered_total)
+}
+
+pub(super) fn ensure_post_compaction_dispatch_recovery(state: &AppState) {
+    if state.shutting_down.load(Ordering::Acquire)
+        || state
+            .post_compaction_recovery_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    let task_state = state.clone();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
+        let mut error_backoff = Duration::from_millis(100);
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            () = task_state.post_compaction_recovery_notify.notified() => {}
+        }
+        loop {
+            if task_state.shutting_down.load(Ordering::Acquire) {
+                break;
+            }
+            let delay = match task_state
+                .repo
+                .next_post_compaction_dispatch_lease_delay()
+                .await
+            {
+                Ok(Some(delay)) => delay.saturating_add(Duration::from_millis(10)),
+                Ok(None) => Duration::from_secs(30),
+                Err(error) => {
+                    eprintln!("failed to load post-compaction recovery lease delay: {error:#}");
+                    let delay = error_backoff;
+                    error_backoff = (error_backoff * 2).min(Duration::from_secs(5));
+                    delay
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(delay.max(Duration::from_millis(10))) => {}
+                () = task_state.post_compaction_recovery_notify.notified() => {}
+            }
+            if task_state.shutting_down.load(Ordering::Acquire) {
+                break;
+            }
+            if let Err(error) = recover_post_compaction_dispatches_once(&task_state).await {
+                eprintln!("delayed post-compaction dispatch recovery failed: {error:#}");
+                tokio::select! {
+                    () = tokio::time::sleep(error_backoff) => {}
+                    () = task_state.post_compaction_recovery_notify.notified() => {}
+                }
+                error_backoff = (error_backoff * 2).min(Duration::from_secs(5));
+            } else {
+                error_backoff = Duration::from_millis(100);
+            }
+        }
+    });
+    let _ = tasks::register_recovery_task(state, handle, start_tx);
+}
 
 pub(crate) fn ensure_expected_active_leaf_matches(
     current: &Option<String>,
@@ -207,6 +305,197 @@ impl SessionDriver {
         Ok(())
     }
 
+    async fn recover_post_compaction_dispatches(&self) -> std::result::Result<usize, RpcError> {
+        let intents = self
+            .state
+            .repo
+            .post_compaction_dispatch_intents(&self.session_id)
+            .await?;
+        let mut recovered = 0;
+        for intent in intents {
+            let claimed = match self
+                .state
+                .repo
+                .claim_post_compaction_model_action(
+                    &intent,
+                    POST_COMPACTION_DISPATCH_LEASE_DURATION,
+                )
+                .await
+            {
+                Ok(Some(claimed)) => claimed,
+                Ok(None) => continue,
+                Err(agent_store::PostCompactionDispatchClaimError::Corrupt(error)) => {
+                    let message = format!(
+                        "failed to reconstruct post-compaction dispatch: {}",
+                        error.message()
+                    );
+                    let events = self
+                        .state
+                        .repo
+                        .fail_corrupt_post_compaction_model_action(&intent, error.fence(), &message)
+                        .await?;
+                    publish_events(&self.state, events);
+                    continue;
+                }
+                Err(agent_store::PostCompactionDispatchClaimError::Transient(error)) => {
+                    return Err(error.into());
+                }
+            };
+            let SessionAction::RequestModel {
+                action_id,
+                turn_id,
+                context_leaf_id: Some(context_leaf_id),
+                ..
+            } = &claimed.pending.action
+            else {
+                let message =
+                    "failed to reconstruct post-compaction dispatch: invalid model action"
+                        .to_string();
+                let events = self
+                    .state
+                    .repo
+                    .fail_unfinished_model_action(
+                        &intent.session_id,
+                        &intent.row_id,
+                        &intent.attempt_id,
+                        Some(&claimed.lease),
+                        &message,
+                    )
+                    .await?;
+                publish_events(&self.state, events);
+                continue;
+            };
+
+            if self
+                .state
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.state.active.lock().await.remove(&self.session_id);
+                return Ok(recovered);
+            }
+            let config = match self
+                .install_post_compaction_runtime(context_leaf_id, *turn_id, *action_id)
+                .await
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    self.state.active.lock().await.remove(&self.session_id);
+                    return Err(RpcError::new(
+                        "post_compaction_recovery_failed",
+                        format!(
+                            "failed to install post-compaction dispatch runtime; retaining lease for retry: {}",
+                            error.message
+                        ),
+                    ));
+                }
+            };
+            let dispatch = DispatchAction {
+                row_id: claimed.pending.row_id,
+                attempt_id: claimed.pending.attempt_id,
+                post_compaction_dispatch_lease: Some(claimed.lease),
+                action: claimed.pending.action,
+                config,
+            };
+            if session_uses_harness(&dispatch.config) {
+                // Harness/manual completion accepts running actions, so consume
+                // the restart marker through the normal claim CAS but do not
+                // start an internal provider runner.
+                recovered += 1;
+                continue;
+            }
+            #[cfg(test)]
+            if let Some(milliseconds) = dispatch
+                .config
+                .metadata
+                .pointer("/fault_injection/pause_recovery_before_register_ms")
+                .and_then(serde_json::Value::as_u64)
+            {
+                tokio::time::sleep(Duration::from_millis(milliseconds)).await;
+            }
+            let lease = dispatch.post_compaction_dispatch_lease.clone();
+            let registration_id = dispatch::spawn_model_dispatch(
+                self.state.clone(),
+                self.session_id.clone(),
+                dispatch,
+                true,
+            )
+            .await;
+            if matches!(registration_id, Err(tasks::TaskRegistrationRejected)) {
+                self.state.active.lock().await.remove(&self.session_id);
+                return Ok(recovered);
+            }
+            if !registration_id
+                .ok()
+                .flatten()
+                .as_ref()
+                .is_some_and(|registration_id| {
+                    tasks::task_registration_is_live(&self.state, &intent.row_id, registration_id)
+                })
+            {
+                let message =
+                    "failed to register recovered post-compaction model runner".to_string();
+                let events = self
+                    .state
+                    .repo
+                    .fail_unfinished_model_action(
+                        &intent.session_id,
+                        &intent.row_id,
+                        &intent.attempt_id,
+                        lease.as_ref(),
+                        &message,
+                    )
+                    .await?;
+                publish_events(&self.state, events);
+                self.state.active.lock().await.remove(&self.session_id);
+                continue;
+            }
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    async fn install_post_compaction_runtime(
+        &self,
+        context_leaf_id: &str,
+        turn_id: agent_vocab::TurnId,
+        action_id: agent_vocab::ActionId,
+    ) -> std::result::Result<SessionConfig, RpcError> {
+        let stored = self
+            .state
+            .repo
+            .load_stored_session(&self.session_id)
+            .await?;
+        let config = self
+            .state
+            .repo
+            .load_session_config(&self.session_id)
+            .await?;
+        self.state
+            .workspaces
+            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
+            .await?;
+        let mut session = AgentSession::from_stored_session_preserving_open_turn(stored)
+            .map_err(history_error_to_rpc)?;
+        if session.transcript_store().active_leaf_id() != Some(context_leaf_id) {
+            return Err(RpcError::new(
+                "invalid_compaction",
+                "post-compaction dispatch leaf is not active",
+            ));
+        }
+        session
+            .restore_compacted_runtime(context_leaf_id, turn_id, action_id)
+            .map_err(history_error_to_rpc)?;
+        self.state.active.lock().await.insert(
+            self.session_id.clone(),
+            Arc::new(Mutex::new(RuntimeSession {
+                session,
+                config: config.clone(),
+            })),
+        );
+        Ok(config)
+    }
+
     /// Resolve all durable combined controls before ordinary recovery or queue
     /// driving can claim their messages.
     ///
@@ -301,6 +590,15 @@ impl SessionDriver {
             .repo
             .reset_abandoned_consuming_inputs(&self.session_id)
             .await?;
+        let had_post_compaction_intent = !self
+            .state
+            .repo
+            .post_compaction_dispatch_intents(&self.session_id)
+            .await?
+            .is_empty();
+        if self.recover_post_compaction_dispatches().await? > 0 || had_post_compaction_intent {
+            return Ok(());
+        }
         if self
             .state
             .repo
@@ -773,7 +1071,12 @@ impl SessionDriver {
             if !self
                 .state
                 .repo
-                .action_can_complete(&self.session_id, &update.row_id, &update.attempt_id)
+                .action_can_complete(
+                    &self.session_id,
+                    &update.row_id,
+                    &update.attempt_id,
+                    update.post_compaction_dispatch_lease.as_ref(),
+                )
                 .await
                 .context("check action can complete")?
             {
@@ -933,6 +1236,7 @@ impl SessionDriver {
             .map(|action| DispatchAction {
                 row_id: action.row_id,
                 attempt_id: action.attempt_id,
+                post_compaction_dispatch_lease: None,
                 action: action.action,
                 config: config.clone(),
             })
@@ -957,7 +1261,7 @@ impl SessionDriver {
                 SessionAction::CancelSessionWork => {}
             }
         }
-        dispatch_all(&self.state, &self.session_id, ready);
+        dispatch_all(&self.state, &self.session_id, ready).await;
         Ok(())
     }
 }
