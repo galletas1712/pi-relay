@@ -15,7 +15,6 @@ use crate::state::AppState;
 
 use super::{build_model_request, run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 
-const TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 160;
 const TITLE_MAX_CHARS: usize = 64;
 const TITLE_SIDECAR_TIMEOUT_SECS: u64 = 45;
 
@@ -191,7 +190,10 @@ async fn generate_session_title(
     .await?;
     let cache_prefix_len = model_request.transcript.len();
     model_request.transcript_cache_prefix_len = Some(cache_prefix_len);
-    model_request.max_tokens = Some(TITLE_GENERATION_MAX_OUTPUT_TOKENS);
+    // No max_output_tokens: the OpenAI/Codex `/responses` backend rejects that
+    // parameter for some models (e.g. gpt-5.6-sol returns HTTP 400
+    // "Unsupported parameter: max_output_tokens"). The short-title prompt plus
+    // TITLE_MAX_CHARS truncation already bound the output.
     model_request.reasoning_effort = ReasoningEffort::Low;
     model_request
         .transcript

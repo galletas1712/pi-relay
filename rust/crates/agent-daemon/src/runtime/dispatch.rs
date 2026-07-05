@@ -1,9 +1,12 @@
+use std::panic::AssertUnwindSafe;
+
 use agent_session::SessionAction;
 use agent_store::{ActionKind, EventType, POST_COMPACTION_DISPATCH_LEASE_DURATION};
+use futures_util::future::FutureExt;
 use serde_json::json;
 
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
-use crate::types::DispatchAction;
+use crate::types::{DispatchAction, RpcError};
 
 use super::events::{clear_event_buffer_if_idle, publish_events};
 use super::model::run_model_turn;
@@ -130,7 +133,12 @@ fn spawn_claimed_dispatch(
         let attempt_id = dispatch.attempt_id.clone();
         let lease = dispatch.post_compaction_dispatch_lease.clone();
         let heartbeat_interval = post_compaction_heartbeat_interval(&dispatch.config);
-        let run = async {
+        // Guard against a panic in the model/tool turn: a bare panic unwinds
+        // past the terminal-state handling below, stranding the action in
+        // `running` forever with no stale-mark and no timeout. catch_unwind
+        // turns it into an error we route through the same stale + ToolError
+        // path as a returned error (and logs it so the panic is still visible).
+        let run = AssertUnwindSafe(async {
             #[cfg(test)]
             if dispatch
                 .config
@@ -161,7 +169,8 @@ fn spawn_claimed_dispatch(
                 }
                 SessionAction::CancelSessionWork => Ok(()),
             }
-        };
+        })
+        .catch_unwind();
         let result = if let Some(lease) = lease.as_ref() {
             let state = task_state.clone();
             let lease = lease.clone();
@@ -215,6 +224,21 @@ fn spawn_claimed_dispatch(
             }
         } else {
             run.await
+        };
+        let result = match result {
+            Ok(inner) => inner,
+            Err(panic) => {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                eprintln!("dispatch task panicked {session_id}/{row_id}: {detail}");
+                Err(RpcError::new(
+                    "dispatch_panicked",
+                    format!("dispatch task panicked: {detail}"),
+                ))
+            }
         };
         if !unregister_task(&task_state, &row_id, &task_registration_id) {
             return;
