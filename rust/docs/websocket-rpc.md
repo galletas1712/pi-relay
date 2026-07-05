@@ -52,11 +52,23 @@ sending the same websocket frames a frontend would send.
    truth for stale completions.
 
 7. Daemon death is recoverable state.
-   On startup, a daemon marks leftover unfinished action rows stale because the
-   provider/tool futures from the previous process cannot resume. If the daemon
-   died with an open turn, first touch then repairs the session by appending a
-   crashed turn tail. External side effects, such as files written by tools,
-   are not transactional.
+   Startup first reconciles durable selected-subagent controls so an
+   already-committed exact-child interrupt settles its captured action
+   generation. It then validates and recovers pending/running model actions
+   carrying transactionally installed post-compaction dispatch intents before
+   stale-marking other leftover unfinished actions whose provider/tool futures
+   cannot resume. Recovery validates the action/attempt/leaf fences and
+   reclaims pending or expired ownership leases; an unexpired lease is left
+   alone. The stale sweep protects either durable class if reconciliation
+   remains retryable. A process-lifetime watchdog retries post-compaction work
+   at the database-derived expiry, wakes when a heartbeat/runner loses
+   ownership, and backs off across transient database/recovery errors. Terminal
+   completion clears the intent atomically. Dispatch is at least once because a
+   crash after provider acceptance but before the terminal commit can lead to a
+   duplicate call, and current provider requests have no idempotency key. If
+   the daemon died with another open turn, first touch
+   repairs the session by appending a crashed turn tail. External side effects,
+   such as files written by tools, are not transactional.
 
 ## Postgres Model
 

@@ -591,7 +591,6 @@ pub struct CompactionCompletion {
     pub summary: String,
     pub summary_kind: String,
     pub provider_replay: Vec<ProviderReplayItem>,
-    pub remote: bool,
     pub provider: ProviderKind,
     pub usage: Option<Value>,
     pub continuation_suffix: Vec<ModelContextEntry>,

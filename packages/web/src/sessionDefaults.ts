@@ -75,3 +75,10 @@ export function reasoningEffortsForProvider(provider: ProviderConfig): Reasoning
 		? OPENAI_GPT56_REASONING_EFFORTS
 		: OPENAI_REASONING_EFFORTS;
 }
+
+export function newSessionCompactionConfig() {
+	return {
+		auto_enabled: true,
+		max_consecutive_failures: 3,
+	};
+}

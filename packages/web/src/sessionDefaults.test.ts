@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	DEFAULT_PROVIDER,
 	MODEL_OPTIONS,
+	newSessionCompactionConfig,
 	providerFromModelKey,
 	reasoningEffortsForProvider,
 } from "./sessionDefaults.ts";
@@ -50,5 +51,12 @@ describe("session defaults", () => {
 			expect(reasoningEffortsForProvider({ kind: "openai", model })).toContain("max");
 		}
 		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.5" })).not.toContain("max");
+	});
+
+	it("uses provider-independent native compaction scheduler defaults", () => {
+		expect(newSessionCompactionConfig()).toEqual({
+			auto_enabled: true,
+			max_consecutive_failures: 3,
+		});
 	});
 });

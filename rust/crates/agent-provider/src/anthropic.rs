@@ -1068,10 +1068,6 @@ impl ModelProvider for AnthropicProvider {
         }))
     }
 
-    fn supports_remote_compaction(&self) -> bool {
-        true
-    }
-
     async fn compact(
         &self,
         request: ProviderCompactionRequest,
@@ -1753,11 +1749,6 @@ fn emitted_anthropic_replay(
         .provider_replay_values_for(ProviderKind::Claude)
         .map_err(ProviderError::Json)?;
     if compaction_summary {
-        // Branch-4 compatibility: origin/main local summaries have no provider
-        // checkpoint. Any native Claude checkpoint remains strict and opaque.
-        if blocks.is_empty() {
-            return Ok((blocks, false));
-        }
         if blocks.len() != 1 {
             return Err(ProviderError::Provider(
                 "refusing malformed persisted Anthropic compaction replay: expected exactly one Claude block"
@@ -5150,7 +5141,7 @@ mod tests {
     }
 
     #[test]
-    fn native_compaction_replay_is_strict_while_local_summary_stays_compatible() {
+    fn compaction_summary_requires_exactly_one_valid_compaction_replay_block() {
         let summary = || {
             TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
                 "session-1",
@@ -5193,17 +5184,8 @@ mod tests {
         assert!(valid.beta_header.contains(COMPACTION_BETA));
         assert_eq!(valid.body["messages"][0]["content"][0], block);
 
-        let local = prepare_messages_request(
-            request(ModelTranscriptEntry {
-                item: summary(),
-                provider_replay: Vec::new(),
-            }),
-            &static_anthropic_model_metadata("claude-opus-4-8"),
-        )
-        .expect("pre-existing local summary without replay remains renderable");
-        assert_eq!(local.beta_header, CLAUDE_CODE_BETA);
-
         let invalid_replays = [
+            Vec::new(),
             vec![ProviderReplayItem {
                 provider: ProviderKind::Claude,
                 raw_json: "{".to_string(),

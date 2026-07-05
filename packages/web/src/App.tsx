@@ -52,6 +52,7 @@ import { useSelectedSessionStore } from "./selectedSessionStore.ts";
 import {
 	DEFAULT_PROVIDER,
 	MODEL_OPTIONS,
+	newSessionCompactionConfig,
 	providerFromModelKey,
 	providerModelKey,
 	providerReasoningEffort,
@@ -1664,11 +1665,7 @@ export function App() {
 					title,
 					created_by: "web",
 					compaction: {
-						config: {
-							auto_enabled: true,
-							remote_mode: "auto",
-							max_consecutive_failures: 3,
-						},
+						config: newSessionCompactionConfig(),
 					},
 				},
 				clientInputId,
@@ -2529,10 +2526,9 @@ function compactionRequestedNotice(data: Record<string, unknown>): string {
 function compactionCompletedNotice(data: Record<string, unknown>): string {
 	const trigger = typeof data.trigger === "string" ? data.trigger : null;
 	const provider = typeof data.provider === "string" ? data.provider : null;
-	const remote = data.remote === true;
 	const prefix = trigger === "auto" ? "auto-compaction" : "compaction";
-	if (provider === "openai" && remote) return `${prefix} completed with OpenAI provider-native compaction`;
-	if (provider === "claude") return `${prefix} completed with Claude summary`;
+	if (provider === "openai") return `${prefix} completed with OpenAI provider-native compaction`;
+	if (provider === "claude") return `${prefix} completed with Anthropic provider-native compaction`;
 	return `${prefix} completed`;
 }
 

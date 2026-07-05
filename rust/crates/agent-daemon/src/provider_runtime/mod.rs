@@ -14,8 +14,8 @@ mod web_tools;
 pub(crate) use agent_prompt::PromptProfile;
 #[cfg(test)]
 pub(crate) use compaction::{
-    append_delegation_ledger_to_output, remote_compaction_request as native_compaction_request,
-    CompactionOutput, CompactionSummaryKind,
+    append_delegation_ledger_to_output, native_compaction_request, CompactionOutput,
+    CompactionSummaryKind,
 };
 pub(crate) use compaction::{
     compaction_auto_state, compaction_config_with_model_metadata, parse_compaction_policy,

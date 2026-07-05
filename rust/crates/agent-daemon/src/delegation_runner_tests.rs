@@ -339,7 +339,6 @@ fn successful_compaction(summary: &str) -> CompactionCompletion {
         summary: summary.to_string(),
         summary_kind: "provider_text".to_string(),
         provider_replay: Vec::new(),
-        remote: true,
         provider: ProviderKind::OpenAi,
         usage: None,
         continuation_suffix: vec![ModelContextEntry {
@@ -4123,7 +4122,6 @@ fn test_compaction_output(summary: &str) -> CompactionOutput {
         summary: summary.to_string(),
         summary_kind: CompactionSummaryKind::ProviderText,
         provider_replay: Vec::new(),
-        remote: true,
         provider: ProviderKind::OpenAi,
         usage: None,
     }
