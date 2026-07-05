@@ -33,7 +33,7 @@ use crate::workspaces::{validate_remote_branch, validate_workspace_dir, Workspac
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{atomic::AtomicBool, Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use agent_core::AgentInput;
@@ -69,6 +69,12 @@ async fn main() -> Result<()> {
         active: Arc::new(Mutex::new(HashMap::new())),
         session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
         tasks: Arc::new(StdMutex::new(HashMap::new())),
+        auxiliary_tasks: Arc::new(StdMutex::new(Vec::new())),
+        task_registration_lock: Arc::new(StdMutex::new(())),
+        post_compaction_recovery_scheduled: Arc::new(AtomicBool::new(false)),
+        post_compaction_recovery_notify: Arc::new(tokio::sync::Notify::new()),
+        post_compaction_recovery_task: Arc::new(StdMutex::new(None)),
+        shutting_down: Arc::new(AtomicBool::new(false)),
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         provider_connections: ProviderConnectionRegistry::new(),
@@ -86,9 +92,10 @@ async fn main() -> Result<()> {
     };
 
     // Combined controls capture an exact unfinished child action generation.
-    // Reconcile them before the general abandoned-action stale mark erases that
-    // generation fence. Each worker runs under the exact child's SessionDriver;
-    // failures remain discoverable by the periodic reconciler below.
+    // Reconcile them before post-compaction recovery so a committed interrupt
+    // cannot race a newly registered resumed model runner. Each worker runs
+    // under the exact child's SessionDriver; failures remain durable for the
+    // periodic reconciler below.
     match state
         .repo
         .sessions_with_recoverable_subagent_controls()
@@ -113,6 +120,25 @@ async fn main() -> Result<()> {
         }
         Err(error) => eprintln!("failed to sweep recoverable subagent controls on boot: {error:#}"),
     }
+
+    // Recover post-compaction intents only after exact-child controls have had
+    // the opportunity to cancel their captured action generation. The stale
+    // sweep follows both recovery passes and protects any durable work that
+    // remains retryable after a transient recovery failure.
+    match recover_post_compaction_dispatches_on_boot(&state).await {
+        Ok(resumed_compactions) if resumed_compactions > 0 => {
+            eprintln!(
+                "recovered {resumed_compactions} committed post-compaction dispatch intent(s)"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!(
+                "initial post-compaction dispatch recovery failed; watchdog will retry: {error:#}"
+            );
+        }
+    }
+
     let stale_actions = state.repo.mark_all_unfinished_actions_stale().await?;
     if stale_actions > 0 {
         eprintln!("marked {stale_actions} abandoned action(s) stale");
@@ -291,12 +317,12 @@ fn find_prompt_root(start: PathBuf) -> Result<PathBuf> {
 }
 
 async fn drain_dispatch_tasks(state: &AppState) {
-    let handles = take_tasks(state);
+    let mut handles = take_tasks(state);
     if handles.is_empty() {
         return;
     }
     let drain = async {
-        for handle in handles {
+        for handle in &mut handles {
             if let Err(error) = handle.await {
                 eprintln!("dispatch task join error: {error}");
             }
@@ -304,6 +330,9 @@ async fn drain_dispatch_tasks(state: &AppState) {
     };
     if timeout(Duration::from_secs(15), drain).await.is_err() {
         eprintln!("timed out waiting for dispatch tasks during shutdown");
+        for handle in handles {
+            handle.abort();
+        }
     }
 }
 
@@ -1089,7 +1118,12 @@ pub(crate) fn spawn_drive_until_blocked(
     reason: &'static str,
 ) {
     let state = state.clone();
-    tokio::spawn(async move {
+    let task_state = state.clone();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
         let driver = SessionDriver::acquire(&state, &session_id).await;
         let drive_result = async {
             driver.reconcile_pending_subagent_controls().await?;
@@ -1126,6 +1160,7 @@ pub(crate) fn spawn_drive_until_blocked(
             }
         }
     });
+    let _ = crate::runtime::register_auxiliary_task(&task_state, handle, start_tx);
 }
 
 /// Best-effort control recovery nudge that never queues behind another owner.
@@ -1822,7 +1857,8 @@ async fn compaction_request(
         .await?;
     publish_events(state, created.events);
     let action_row_id = created.job.action_row_id.clone();
-    spawn_compaction(state, session_id, created.job, config);
+    spawn_compaction(state, session_id, created.job, config)
+        .map_err(|_| RpcError::new("shutting_down", "daemon is shutting down"))?;
     Ok(json!({ "action_row_id": action_row_id }))
 }
 
@@ -1838,7 +1874,7 @@ async fn harness_model_complete(
             .cloned()
             .ok_or_else(|| RpcError::new("invalid_params", "assistant is required"))?,
     )?;
-    let action = state
+    let mut action = state
         .repo
         .load_harness_model_action(&session_id, &action_row_id)
         .await
@@ -1849,10 +1885,34 @@ async fn harness_model_complete(
             "action is not a model action",
         ));
     }
-    state
-        .repo
-        .claim_pending_model_action(&session_id, &action_row_id, &action.attempt_id)
-        .await?;
+    if action.post_compaction_dispatch_context_leaf_id.is_some() {
+        if action.post_compaction_dispatch_lease.is_none() {
+            let claimed = state
+                .repo
+                .claim_post_compaction_model_action(
+                    &agent_store::PostCompactionDispatchIntent {
+                        session_id: session_id.clone(),
+                        row_id: action_row_id.clone(),
+                        attempt_id: action.attempt_id.clone(),
+                    },
+                    agent_store::POST_COMPACTION_DISPATCH_LEASE_DURATION,
+                )
+                .await
+                .map_err(|error| RpcError::new("stale_action", error.to_string()))?
+                .ok_or_else(|| {
+                    RpcError::new(
+                        "stale_action",
+                        "post-compaction model action has a live owner",
+                    )
+                })?;
+            action.post_compaction_dispatch_lease = Some(claimed.lease);
+        }
+    } else {
+        state
+            .repo
+            .claim_pending_model_action(&session_id, &action_row_id, &action.attempt_id)
+            .await?;
+    }
     let driver = SessionDriver::acquire(state, &session_id).await;
     let active = driver
         .require_active_session("stale_action", "session is not active")
@@ -1868,6 +1928,7 @@ async fn harness_model_complete(
             Some(ActionUpdate {
                 row_id: action_row_id,
                 attempt_id: action.attempt_id,
+                post_compaction_dispatch_lease: action.post_compaction_dispatch_lease,
                 status: ActionStatus::Completed,
                 result: json!({ "source": "harness" }),
             }),
@@ -1890,15 +1951,39 @@ async fn harness_model_fail(
         .and_then(Value::as_str)
         .unwrap_or("model failed")
         .to_string();
-    let action = state
+    let mut action = state
         .repo
         .load_harness_model_action(&session_id, &action_row_id)
         .await
         .map_err(|error| RpcError::new("stale_action", error.to_string()))?;
-    state
-        .repo
-        .claim_pending_model_action(&session_id, &action_row_id, &action.attempt_id)
-        .await?;
+    if action.post_compaction_dispatch_context_leaf_id.is_some() {
+        if action.post_compaction_dispatch_lease.is_none() {
+            let claimed = state
+                .repo
+                .claim_post_compaction_model_action(
+                    &agent_store::PostCompactionDispatchIntent {
+                        session_id: session_id.clone(),
+                        row_id: action_row_id.clone(),
+                        attempt_id: action.attempt_id.clone(),
+                    },
+                    agent_store::POST_COMPACTION_DISPATCH_LEASE_DURATION,
+                )
+                .await
+                .map_err(|error| RpcError::new("stale_action", error.to_string()))?
+                .ok_or_else(|| {
+                    RpcError::new(
+                        "stale_action",
+                        "post-compaction model action has a live owner",
+                    )
+                })?;
+            action.post_compaction_dispatch_lease = Some(claimed.lease);
+        }
+    } else {
+        state
+            .repo
+            .claim_pending_model_action(&session_id, &action_row_id, &action.attempt_id)
+            .await?;
+    }
     let driver = SessionDriver::acquire(state, &session_id).await;
     let active = driver
         .require_active_session("stale_action", "session is not active")
@@ -1914,6 +1999,7 @@ async fn harness_model_fail(
             Some(ActionUpdate {
                 row_id: action_row_id,
                 attempt_id: action.attempt_id,
+                post_compaction_dispatch_lease: action.post_compaction_dispatch_lease,
                 status: ActionStatus::Error,
                 result: json!({ "error": error }),
             }),

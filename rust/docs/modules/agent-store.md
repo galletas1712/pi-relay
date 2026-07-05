@@ -182,11 +182,15 @@ full model context — recovery rebuilds context by walking
 
 `action_is_unfinished` = `status in ('pending','blocked','running')`. These
 rows are execution leases owned by the live daemon process. At startup,
-`mark_all_unfinished_actions_stale` flips every unfinished row to `stale` (and
-bumps the owning sessions' `session_revision`) before clients are accepted.
-Completion is fenced by `(id, attempt_id, status in ('pending','running'))`, so
-a late completion from a stale attempt matches zero rows and cannot mutate
-history.
+`mark_all_unfinished_actions_stale` flips abandoned rows to `stale` (and bumps
+the owning sessions' `session_revision`) before clients are accepted. It
+protects both an action generation captured by a running delegation's pending
+selected-subagent control and a pending/running model row carrying the
+attempt-fenced post-compaction dispatch intent described below. Rows actually
+made stale have any post-compaction marker removed. Ordinary completion is
+fenced by row id, attempt id, and status; marked completion additionally
+requires its exact unexpired owner/generation/context lease. A late completion
+from a stale attempt or lease cannot mutate history.
 
 Recovery invariants the daemon relies on:
 
@@ -210,17 +214,29 @@ Compaction is a typed transcript root, not a transcript replacement (see
   to be a turn boundary and not already a compaction summary.
 - `block_model_action_for_compaction` (auto): transitions a `pending`/`running`
   model action to `blocked` and inserts a sibling `running` compaction action in
-  the same transaction. Scope is `Boundary` if the source context is at a turn
-  boundary, else `MidTurn` (carrying the blocked model action's row/attempt ids
-  and the turn's persisted `turn_started_at_ms`).
+  the same transaction. Because this path owns a blocked model action, its
+  scope remains `MidTurn` (carrying that row/attempt and the persisted
+  `turn_started_at_ms`) even when the source leaf is a compaction boundary.
+  Manual compaction remains `Boundary`.
 - `complete_compaction_action`: re-checks the action is still unfinished and
   validates the source leaf. If the source leaf changed *and* a `MidTurn`
   blocked model action is no longer blocked, it marks the compaction `stale`.
   Otherwise it installs a new `CompactionSummary` root (plus any continuation
   suffix), repoints `active_leaf_id`, and for `MidTurn` scope flips the blocked
-  model action back to `pending` re-anchored on the compacted leaf, returning it
-  as a `resumed_model_action` for the daemon to dispatch.
-- `fail_compaction_action` records a `CompactionError`.
+  model action back to `pending` re-anchored on the compacted leaf. The same
+  transaction writes its typed post-compaction dispatch intent and commits the
+  updated auto/recompaction state before returning it to the daemon.
+- `fail_compaction_action` updates failure/suppression state and, for mid-turn
+  work, terminally errors both the blocked model and compaction actions in one
+  transaction.
+
+The post-compaction intent is a narrow durable outbox/lease for the
+commit-to-runner-registration window. Claim validates the exact
+row/attempt/context and active leaf, then writes a random owner, an incremented
+generation, and a database-clock expiry. Pending and expired work can be
+reclaimed after restart. Heartbeat renewal and every terminal transition use
+the same owner/generation fence; removing the intent is part of the terminal
+transaction.
 
 Auto-compaction failure/success bookkeeping lives in session metadata under
 `compaction.auto_state` (`record_auto_compaction_failure`,

@@ -86,9 +86,15 @@ pub(crate) fn schedule_session_title_refresh_for_model_turn(
     };
 
     if should_spawn {
-        tokio::spawn(async move {
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let task_state = state.clone();
+        let handle = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
             run_title_refresh_worker(state, session_id).await;
         });
+        let _ = crate::runtime::register_auxiliary_task(&task_state, handle, start_tx);
     }
 }
 

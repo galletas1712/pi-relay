@@ -44,7 +44,11 @@ pub(crate) async fn run_model_sidecar(
         .provider_connections
         .remove_session(&sidecar_session_id)
         .await;
-    result
+    let response = result?;
+    if let Some(error) = response.refusal_error() {
+        anyhow::bail!("{error}");
+    }
+    Ok(response)
 }
 
 pub(crate) fn sidecar_session_id(prefix: &str, owner_session_id: &str, parts: &[&str]) -> String {

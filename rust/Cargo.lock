@@ -21,6 +21,7 @@ dependencies = [
  "agent-tools",
  "agent-vocab",
  "anyhow",
+ "async-trait",
  "futures-util",
  "reflink-copy",
  "reqwest",

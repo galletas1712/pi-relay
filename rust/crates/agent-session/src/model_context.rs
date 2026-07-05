@@ -101,22 +101,43 @@ impl ModelContext {
             .unwrap_or_default()
     }
 
+    pub fn open_turn_entries(
+        &self,
+    ) -> Option<impl Iterator<Item = (&TranscriptItem, &[ProviderReplayItem])>> {
+        let (items, provider_replay) = self.open_turn_slices()?;
+        Some(
+            items
+                .iter()
+                .zip(provider_replay)
+                .map(|(item, replay)| (item, replay.as_slice())),
+        )
+    }
+
     pub fn split_before_open_turn(&self) -> Option<(Self, Vec<ModelContextEntry>)> {
-        let (_, turn_start) = Self::open_turn_start(&self.items)?;
+        let (open_turn_items, open_turn_replay) = self.open_turn_slices()?;
+        let turn_start = self.items.len() - open_turn_items.len();
         let prefix = Self {
             items: self.items[..turn_start].to_vec(),
             provider_replay: self.provider_replay[..turn_start].to_vec(),
         };
-        let suffix = self.items[turn_start..]
+        let suffix = open_turn_items
             .iter()
             .cloned()
-            .zip(self.provider_replay[turn_start..].iter().cloned())
+            .zip(open_turn_replay.iter().cloned())
             .map(|(item, provider_replay)| ModelContextEntry {
                 item,
                 provider_replay,
             })
             .collect();
         Some((prefix, suffix))
+    }
+
+    fn open_turn_slices(&self) -> Option<(&[TranscriptItem], &[Vec<ProviderReplayItem>])> {
+        let (_, turn_start) = Self::open_turn_start(&self.items)?;
+        Some((
+            &self.items[turn_start..],
+            &self.provider_replay[turn_start..],
+        ))
     }
 
     pub fn open_turn_ready_to_continue(&self) -> Option<TurnId> {

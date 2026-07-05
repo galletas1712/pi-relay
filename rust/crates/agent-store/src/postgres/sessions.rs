@@ -25,7 +25,64 @@ fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("value was forced to object")
 }
 
-fn ensure_compaction_auto_state_object(metadata: &mut Value) -> &mut Map<String, Value> {
+pub(super) fn next_auto_compaction_failure_metadata(
+    mut metadata: Value,
+    fallback_max_failures: usize,
+    source_leaf_id: &str,
+    error: &str,
+) -> Value {
+    let max_failures = metadata
+        .pointer("/compaction/config/max_consecutive_failures")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(fallback_max_failures)
+        .max(1);
+    let state = ensure_compaction_auto_state_object(&mut metadata);
+    let failures = state
+        .get("consecutive_failures")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    state.insert("consecutive_failures".to_string(), json!(failures));
+    state.insert("last_failure".to_string(), json!(error));
+    state.insert("last_failure_leaf_id".to_string(), json!(source_leaf_id));
+    state.insert(
+        "suppressed".to_string(),
+        json!(failures as usize >= max_failures),
+    );
+    metadata
+}
+
+pub(super) fn next_compaction_success_metadata(
+    mut metadata: Value,
+    source_leaf_id: &str,
+    new_leaf_id: &str,
+    manual: bool,
+) -> Value {
+    let state = ensure_compaction_auto_state_object(&mut metadata);
+    let previous_leaf = state.get("last_success_leaf_id").and_then(Value::as_str);
+    let previous_recompactions = state
+        .get("consecutive_recompactions")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let consecutive_recompactions = if !manual && previous_leaf == Some(source_leaf_id) {
+        previous_recompactions.saturating_add(1)
+    } else {
+        0
+    };
+    state.insert("consecutive_failures".to_string(), json!(0));
+    state.insert("suppressed".to_string(), json!(false));
+    state.insert("last_failure".to_string(), Value::Null);
+    state.insert("last_failure_leaf_id".to_string(), Value::Null);
+    state.insert(
+        "consecutive_recompactions".to_string(),
+        json!(consecutive_recompactions),
+    );
+    state.insert("last_success_leaf_id".to_string(), json!(new_leaf_id));
+    metadata
+}
+
+pub(super) fn ensure_compaction_auto_state_object(metadata: &mut Value) -> &mut Map<String, Value> {
     let root = ensure_object(metadata);
     let compaction = root
         .entry("compaction".to_string())
@@ -106,51 +163,6 @@ impl PostgresAgentStore {
         Ok(vec![event])
     }
 
-    pub async fn record_auto_compaction_failure(
-        &self,
-        session_id: &str,
-        config: &SessionConfig,
-        source_leaf_id: &str,
-        error: &str,
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
-        let mut metadata = session_metadata_tx(&mut tx, session_id).await?;
-        let max_failures = metadata
-            .pointer("/compaction/config/max_consecutive_failures")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                config
-                    .metadata
-                    .pointer("/compaction/config/max_consecutive_failures")
-                    .and_then(Value::as_u64)
-            })
-            .map(|value| value as usize)
-            .unwrap_or(3)
-            .max(1);
-        let state = ensure_compaction_auto_state_object(&mut metadata);
-        let failures = state
-            .get("consecutive_failures")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            .saturating_add(1);
-        state.insert("consecutive_failures".to_string(), json!(failures));
-        state.insert("last_failure".to_string(), json!(error));
-        state.insert("last_failure_leaf_id".to_string(), json!(source_leaf_id));
-        state.insert(
-            "suppressed".to_string(),
-            json!(failures as usize >= max_failures),
-        );
-        sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
-            .bind(session_id)
-            .bind(metadata)
-            .execute(&mut *tx)
-            .await?;
-        bump_revisions_tx(&mut tx, session_id, false, false).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     pub async fn reset_auto_compaction_failures(&self, session_id: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
@@ -160,31 +172,7 @@ impl PostgresAgentStore {
         state.insert("suppressed".to_string(), json!(false));
         state.insert("last_failure".to_string(), Value::Null);
         state.insert("last_failure_leaf_id".to_string(), Value::Null);
-        sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
-            .bind(session_id)
-            .bind(metadata)
-            .execute(&mut *tx)
-            .await?;
-        bump_revisions_tx(&mut tx, session_id, false, false).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn record_compaction_success(
-        &self,
-        session_id: &str,
-        new_root_id: Option<&str>,
-        _manual: bool,
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
-        let mut metadata = session_metadata_tx(&mut tx, session_id).await?;
-        let state = ensure_compaction_auto_state_object(&mut metadata);
-        state.insert("consecutive_failures".to_string(), json!(0));
-        state.insert("suppressed".to_string(), json!(false));
-        state.insert("last_failure".to_string(), Value::Null);
-        state.insert("last_failure_leaf_id".to_string(), Value::Null);
-        state.insert("last_success_root_id".to_string(), json!(new_root_id));
+        state.insert("consecutive_recompactions".to_string(), json!(0));
         sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
             .bind(session_id)
             .bind(metadata)
@@ -595,7 +583,7 @@ impl PostgresAgentStore {
 #[path = "sessions_tests.rs"]
 mod tests;
 
-async fn session_metadata_tx(
+pub(super) async fn session_metadata_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: &str,
 ) -> Result<Value> {

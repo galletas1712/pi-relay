@@ -61,6 +61,30 @@ pub struct ModelRequest {
     pub turn_id: Option<TurnId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeCompactionErrorKind {
+    Unsupported,
+    MalformedStream,
+    UnexpectedStopReason,
+    NullBlock,
+    EmptyBlock,
+    UnexpectedContent,
+}
+
+impl std::fmt::Display for NativeCompactionErrorKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Unsupported => "unsupported",
+            Self::MalformedStream => "malformed_stream",
+            Self::UnexpectedStopReason => "unexpected_stop_reason",
+            Self::NullBlock => "null_block",
+            Self::EmptyBlock => "empty_block",
+            Self::UnexpectedContent => "unexpected_content",
+        };
+        formatter.write_str(value)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderCompactionRequest {
     pub model: String,
@@ -71,6 +95,10 @@ pub struct ProviderCompactionRequest {
     pub reasoning_effort: ReasoningEffort,
     pub prompt_cache_key: Option<String>,
     pub session_id: Option<String>,
+    /// Provider-native summary instructions. Providers with a dedicated
+    /// compaction endpoint may ignore this when their wire contract derives
+    /// instructions from `prompt`.
+    pub compaction_instructions: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +125,12 @@ pub struct ProviderTokenCountRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderTokenCountResponse {
+    /// Effective input occupancy after any provider-native context edits
+    /// already represented in the request.
     pub input_tokens: usize,
+    /// Input occupancy before applying an existing provider-native compaction
+    /// block, when the provider returns that diagnostic.
+    pub original_input_tokens: Option<usize>,
 }
 
 /// Provider-normalized model limits consumed by the daemon scheduler.
@@ -285,6 +318,7 @@ pub enum ModelStopReason {
     Complete,
     MaxOutputTokens,
     Refusal,
+    Compaction,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,8 +337,9 @@ pub struct ProviderUsage {
     pub cache_read_input_tokens: Option<usize>,
     pub cache_creation_input_tokens: Option<usize>,
     /// Provider-native merged usage fields. This retains provider-specific
-    /// accounting details without replacing raw counters with normalized
-    /// aggregates.
+    /// accounting such as Anthropic compaction iterations, cache TTL detail,
+    /// and thinking-token detail without replacing raw counters with
+    /// normalized aggregates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_provider_usage: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -340,9 +375,21 @@ pub enum ProviderError {
     Incomplete { status: String, reason: String },
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("native compaction failed ({kind}): {message}")]
+    NativeCompaction {
+        kind: NativeCompactionErrorKind,
+        message: String,
+    },
 }
 
 impl ProviderError {
+    pub fn native_compaction(kind: NativeCompactionErrorKind, message: impl Into<String>) -> Self {
+        Self::NativeCompaction {
+            kind,
+            message: message.into(),
+        }
+    }
+
     pub fn status_code(&self) -> Option<u16> {
         match self {
             ProviderError::Status { status, .. } => Some(*status),
@@ -352,7 +399,8 @@ impl ProviderError {
             | ProviderError::Transient(_)
             | ProviderError::Provider(_)
             | ProviderError::Incomplete { .. }
-            | ProviderError::Json(_) => None,
+            | ProviderError::Json(_)
+            | ProviderError::NativeCompaction { .. } => None,
         }
     }
 
@@ -391,7 +439,8 @@ impl ProviderError {
             ProviderError::Status { status, .. } => Some(format!("status={status}")),
             ProviderError::Provider(_)
             | ProviderError::Incomplete { .. }
-            | ProviderError::Json(_) => None,
+            | ProviderError::Json(_)
+            | ProviderError::NativeCompaction { .. } => None,
         }
     }
 
@@ -408,7 +457,9 @@ impl ProviderError {
             // Catalog failures happen before request shaping and are never
             // evidence that a generation exceeded its context window.
             ProviderError::ModelCatalog { .. } | ProviderError::Timeout(_) => return false,
-            ProviderError::Incomplete { .. } | ProviderError::Json(_) => return false,
+            ProviderError::Incomplete { .. }
+            | ProviderError::Json(_)
+            | ProviderError::NativeCompaction { .. } => return false,
         };
         let lower = message.to_ascii_lowercase();
         if status == Some(413) {
