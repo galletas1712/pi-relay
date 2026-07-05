@@ -701,7 +701,7 @@ export function LogHeader({
 	status: SessionStatus | null;
 	title: string | null;
 	parentSessionId?: string | null;
-	modelOptions: { id: string; label: string }[];
+	modelOptions: { id: string; label: string; description?: string }[];
 	modelValue: string;
 	modelDisabled: boolean;
 	modelDisabledTitle: string;
@@ -755,7 +755,7 @@ export function LogHeader({
 						onChange={(event) => onModelChange(event.target.value)}
 					>
 						{modelOptions.map((option) => (
-							<option key={option.id} value={option.id}>{option.label}</option>
+							<option key={option.id} value={option.id} title={option.description}>{option.label}</option>
 						))}
 					</select>
 				</label>

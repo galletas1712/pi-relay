@@ -1,4 +1,4 @@
-use agent_provider::ModelProvider;
+use agent_provider::{ModelProvider, ProviderModelMetadata};
 use agent_store::SessionConfig;
 use anyhow::Result;
 
@@ -20,4 +20,18 @@ pub(super) async fn provider_for_config(
         .provider_connections
         .provider_for_config(config.provider.kind, credentials, session_id)
         .await
+}
+
+pub(crate) async fn model_metadata_for_config(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+) -> Result<Option<ProviderModelMetadata>> {
+    let credentials = Credentials::load();
+    let provider = provider_for_config(state, config, &credentials, session_id).await?;
+    provider
+        .provider
+        .model_metadata(&config.provider.model)
+        .await
+        .map_err(Into::into)
 }

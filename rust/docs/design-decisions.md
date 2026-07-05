@@ -408,9 +408,16 @@ value.
 
 The daemon also no longer imposes a default OpenAI/Codex output-token cap.
 `provider.max_tokens` remains an optional explicit cap if a particular session
-needs one. Claude Opus 4.8 uses adaptive thinking with `output_config.effort`;
-the provider sends a 64k `max_tokens` fallback because the Messages API requires
-that field and Anthropic recommends a large cap for `xhigh`/`max`.
+needs one. Anthropic's Messages API does require `max_tokens`, so its provider
+uses API-discovered/static per-model ceilings and clamps explicit limits to that
+ceiling. With no explicit limit it requests at most 64k: enough headroom for
+high-effort work without making an ordinary turn reserve the full 128k supported
+by Sonnet 5, Fable 5, and Opus 4.8. Model discovery is cached and has a
+conservative static fallback, so an API outage never removes known UI options or
+turns off proactive compaction for known models. Discovery refreshes are
+single-flight per model. A transient refresh failure backs off for one minute
+while preserving stale last-known-good metadata instead of replacing it with a
+less authoritative fallback.
 
 ### Tools Are A Separate Runtime Surface
 

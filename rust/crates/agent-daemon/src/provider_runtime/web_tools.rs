@@ -268,9 +268,11 @@ fn embedded_tool_call_to_summary(call: &ToolCall) -> Option<String> {
 
 fn anthropic_web_search_tool(args: &WebSearchArgs) -> ProviderTool {
     let mut declaration = json!({
-        "type": "web_search_20250305",
+        "type": "web_search_20260318",
         "name": "web_search",
         "max_uses": 8,
+        "response_inclusion": "excluded",
+        "allowed_callers": ["direct"],
     });
     if let Some(domains) = nonempty_domains(args.allowed_domains.as_deref()) {
         declaration["allowed_domains"] = json!(domains);
@@ -296,10 +298,12 @@ fn anthropic_web_fetch_tool() -> ProviderTool {
         "Anthropic web fetch sidecar tool.",
         json!({ "type": "object" }),
         json!({
-            "type": "web_fetch_20250910",
+            "type": "web_fetch_20260318",
             "name": "web_fetch",
             "citations": { "enabled": true },
             "max_content_tokens": 20_000,
+            "response_inclusion": "excluded",
+            "allowed_callers": ["direct"],
         }),
         // Sidecar-only provider declaration; main-loop execution is still the
         // local JSON wrapper.
@@ -451,5 +455,30 @@ mod tests {
         let second = web_sidecar_session_id("session", "call_b");
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn anthropic_sidecars_use_current_web_tool_shapes() {
+        let search = anthropic_web_search_tool(&WebSearchArgs {
+            query: "rust".to_string(),
+            allowed_domains: Some(vec!["rust-lang.org".to_string()]),
+            blocked_domains: None,
+            recency: None,
+            max_output_tokens: None,
+        });
+        assert_eq!(search.declaration["type"], "web_search_20260318");
+        assert_eq!(search.declaration["response_inclusion"], "excluded");
+        assert_eq!(search.declaration["allowed_callers"], json!(["direct"]));
+        assert_eq!(
+            search.declaration["allowed_domains"],
+            json!(["rust-lang.org"])
+        );
+
+        let fetch = anthropic_web_fetch_tool();
+        assert_eq!(fetch.declaration["type"], "web_fetch_20260318");
+        assert_eq!(fetch.declaration["response_inclusion"], "excluded");
+        assert_eq!(fetch.declaration["allowed_callers"], json!(["direct"]));
+        assert_eq!(fetch.declaration["citations"]["enabled"], true);
+        assert_eq!(fetch.declaration["max_content_tokens"], 20_000);
     }
 }
