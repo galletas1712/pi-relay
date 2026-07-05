@@ -1,10 +1,10 @@
 # Provider modernization stack boundaries
 
-This document records the cumulative local restack from base `c84d36a` to the
-tested production behavior at `84c7db0`. Each branch is independently
-buildable and contains final-state hunks for its boundary rather than temporary
-development phases. Later branches build on earlier branches in the order
-listed here.
+This document records the five-commit cumulative local restack on base
+`2fda1ae` (durable selected-subagent controls, PR #217). Each branch is
+independently buildable and contains final-state hunks for its boundary rather
+than temporary development phases. Later branches build on earlier branches in
+the order listed here.
 
 ## 1. `restack/anthropic-provider-surface`
 
@@ -68,7 +68,59 @@ with provider-neutral durable continuation:
 - task-registration ownership that prevents stale runners from removing their
   replacements.
 
+Composed with the base controls, startup first reconciles a committed
+exact-child control, then recovers post-compaction dispatch intents, then
+stale-marks only work protected by neither durable mechanism. Exact-session
+task abort and post-compaction registration/lease fencing remain independent.
+
 Reachability uses the pre-existing `remote_mode` configuration path. The
 pre-existing local summary, trimming, and compatible fallback modes remain at
 this additive boundary, so native Anthropic compaction can be exercised without
 performing the breaking cutover. No new rollout marker is introduced.
+
+## 5. `restack/native-only-compaction-cutover`
+
+Makes `ModelProvider::compact` the required path for every manual and automatic
+compaction, then deletes the superseded compatibility surface:
+
+- local summarization and trim-and-retry;
+- native-to-local failure fallback;
+- enrollment and `remote_mode` selectors;
+- obsolete remote-result fields;
+- old direct metadata-layout compatibility;
+- replay-free Claude checkpoints; and
+- dead capability seams.
+
+The native-only production behavior remains derived from the tested pre-#217
+cutover reference, composed with PR #217's durable control behavior and the
+foundation's recovery integration.
+
+Existing databases are cut over by the one-time self-validating
+[`native-compaction-v1.sql`](../../migrations/native-compaction-v1.sql) patch.
+It is executed directly with `psql` after `pg_dump` and after stopping/draining
+all writers. Dry-run and apply execute the same serializable transaction;
+dry-run rolls it back, apply commits after final full-forest verification, and
+a second apply is a verified no-op. Post-commit rollback is `pg_restore`.
+Nothing in this migration is linked into `pi-agentd`; there is no automatic
+migration, compatibility fallback, daemon lock, or migration ledger.
+The patch validates and checksum-protects the post-#217 schema and blocks
+pending/applied selected-subagent interrupts rather than rewriting live control
+state.
+
+```mermaid
+flowchart LR
+    A[pg_dump] --> B[Stop and drain writers]
+    B --> C[psql dry-run]
+    C --> D[Review JSON manifest]
+    D --> E[psql apply]
+    E --> F[Second apply: no-op]
+    F --> G[Start final daemon]
+```
+
+## Validation expectations
+
+Every branch head must pass Rust formatting and workspace compilation plus the
+provider/daemon tests appropriate to its boundary. Web tests and a production
+web build cover branches that alter picker or UI behavior. The final branch is
+also checked for the native-only cutover behavior while retaining the PR #217
+control regressions and PR4 dispatch-recovery fencing.

@@ -87,9 +87,12 @@ agent-store (append, bump revisions, emit events) --> websocket subscribers
 ```
 
 Postgres is committed before follow-on provider/tool work is dispatched, so a
-crash leaves either a recoverable open tail or replayable events. Long provider,
-tool, and compaction I/O runs outside the per-session row lock and reconverges
-through the action `attempt_id` fence. The mechanics live in
+crash leaves either a recoverable open tail, replayable events, or the narrow
+leased post-compaction dispatch intent. That intent is reclaimed at least once;
+a crash after provider acceptance can duplicate the external call because the
+provider requests have no idempotency key. Long provider, tool, and compaction
+I/O runs outside the per-session row lock and reconverges through action
+attempt/dispatch-owner fences. The mechanics live in
 [agent-store](modules/agent-store.md) and [agent-daemon](modules/agent-daemon.md).
 
 ## Feature Audit
@@ -111,11 +114,18 @@ Implemented user-facing behavior:
   model request; follow-ups remain next-turn work.
 - Turn-level interrupt; idle-only retry/continue (`turn.resume`) for terminal
   model turns; idle-only active-branch switch; idle-only `session.delete`.
-- Manual and automatic compaction. OpenAI uses provider-native compaction by
-  default; Anthropic can use its strict native compaction endpoint through the
-  existing `remote_mode` policy while retaining the pre-existing local-summary
-  compatibility path. Compaction is a typed transcript root, not a session
-  boundary.
+- Manual and automatic compaction always use the selected provider's native
+  compaction API. Compaction is a typed transcript root, not a session boundary.
+  Replayed Anthropic compaction blocks remain opaque and require the provider's
+  compaction beta header plus matching strategy edit. Because Anthropic has no
+  apply-only mode, ordinary Messages uses a paused trigger at the resolved model
+  input ceiling, while token counting uses the documented non-triggering bare
+  edit. The ceiling value is schema-valid under Anthropic's documented
+  minimum-only rule.
+  A paid production Sonnet 5 automatic E2E accepted that replay shape, resumed
+  the same blocked action after one native checkpoint, and reduced the
+  effective count from the 541,564-token gate to 15,628. Ordinary inline
+  compaction blocks still fail closed at the provider boundary.
 - Provider/model-aware compaction thresholds through the provider-neutral
   `ModelProvider::model_metadata` contract. OpenAI exact-resolves the selected
   slug from an authenticated, account-scoped private Codex catalog before

@@ -500,18 +500,10 @@ pub trait ModelProvider: Send + Sync {
         Ok(None)
     }
 
-    fn supports_remote_compaction(&self) -> bool {
-        false
-    }
-
     async fn compact(
         &self,
-        _request: ProviderCompactionRequest,
-    ) -> ProviderResult<ProviderCompactionResponse> {
-        Err(ProviderError::Provider(
-            "provider does not support remote compaction".to_string(),
-        ))
-    }
+        request: ProviderCompactionRequest,
+    ) -> ProviderResult<ProviderCompactionResponse>;
 
     async fn count_tokens(
         &self,

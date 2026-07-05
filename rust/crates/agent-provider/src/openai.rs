@@ -2482,10 +2482,6 @@ impl ModelProvider for OpenAiProvider {
         self.complete_responses(request).await
     }
 
-    fn supports_remote_compaction(&self) -> bool {
-        true
-    }
-
     async fn model_metadata(&self, model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
         let metadata = self.resolved_model_metadata(model).await?;
         Ok(Some(ProviderModelMetadata {
@@ -3584,12 +3580,6 @@ mod tests {
 
     fn first_party_tools(provider: ProviderKind) -> Vec<ProviderTool> {
         agent_tools::ToolRegistry::with_builtin_tools().provider_tools_for_provider(provider)
-    }
-
-    #[test]
-    fn openai_advertises_the_existing_remote_compaction_endpoint() {
-        let provider = OpenAiProvider::codex("access-token", None, None);
-        assert!(provider.supports_remote_compaction());
     }
 
     #[test]

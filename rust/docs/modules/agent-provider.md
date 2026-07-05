@@ -8,8 +8,9 @@ See [design decisions](../design-decisions.md) for *why* the provider scope is s
 
 ## Responsibilities
 
-- Define the `ModelProvider` trait: `complete`, provider-neutral
-  `model_metadata`, plus optional `compact` and `count_tokens`.
+- Define the `ModelProvider` trait: required `complete` and provider-native
+  `compact`, plus optional provider-neutral `model_metadata` and
+  `count_tokens`.
 - Render `ModelRequest` into provider-native request bodies and headers.
 - Stream and parse provider SSE into one `AssistantMessage` (`Text` / `ToolCall` items only).
 - Capture per-item `ProviderReplayItem` sidecars so encrypted reasoning / thinking blocks replay verbatim on the next request.
@@ -21,7 +22,7 @@ See [design decisions](../design-decisions.md) for *why* the provider scope is s
   and context-overflow classification for the daemon's recovery logic.
 - Estimate input tokens locally (`token_estimator`) for the runtime's pre-flight context gate.
 
-It does **not** own auth acquisition/refresh, retry loops, compaction lifecycle,
+It does **not** own auth acquisition/refresh, retry loops, scheduler lifecycle,
 or tool execution — those live in the daemon and
 [agent-tools](./agent-tools.md). Provider-specific threshold policy belongs in
 the adapters; the daemon owns neutral precedence/clamping and persisted
@@ -45,15 +46,12 @@ compaction state.
 
 `ModelResponse` = `{ assistant: AssistantMessage, provider_replay, usage:
 Option<ProviderUsage>, stop_reason, stop_details }`. `ModelStopReason` is
-`Complete`, `MaxOutputTokens`, `Refusal`, or `Compaction`. Refusal details
-retain the optional provider category and human-readable explanation.
+`Complete`, `MaxOutputTokens`, `Refusal`, or `Compaction`. `Compaction` is valid
+only for the special paused Anthropic compact call; an ordinary model turn
+rejects it. Refusal details retain the optional provider category and
+human-readable explanation.
 
-`ProviderCompactionRequest` / `ProviderCompactionResponse`,
-`ProviderTokenCountRequest` / `ProviderTokenCountResponse` mirror the same
-prompt/transcript/tool inputs for the non-`complete` methods. Compaction
-requests can carry provider-native custom instructions. Token-count responses
-return effective input occupancy and can retain the provider's original
-pre-compaction occupancy as diagnostics.
+`ProviderCompactionRequest` / `ProviderCompactionResponse`, `ProviderTokenCountRequest` / `ProviderTokenCountResponse` mirror the same prompt/transcript/tool inputs for the non-`complete` methods. Compaction requests also carry optional provider-native custom instructions; token-count responses can retain provider-reported original input occupancy.
 
 `ProviderModelMetadata` exposes only scheduler-consumed normalized values:
 `max_input_tokens` is the resolved current/default input window, and
@@ -66,7 +64,7 @@ scheduler metadata.
 
 `ProviderError` variants: `Http`, `Timeout`, `Transient`, `Provider`,
 `ModelCatalog { status, message }`, `Status { status, message }`,
-`Incomplete { status, reason }`, and `Json`. The
+`Incomplete { status, reason }`, `Json`, and typed `NativeCompaction`. The
 daemon's model-dispatch loop retries every ordinary-turn `ProviderError` up to
 five attempts; the provider crate does not classify status codes as retryable
 or non-retryable.
@@ -217,7 +215,7 @@ Anthropic spends its limited `cache_control` breakpoints deliberately:
 - **5-minute TTL** deep breakpoint placed `~18` cacheable blocks behind the tail, added only once total cacheable blocks exceed Anthropic's ~20-block lookback so long agentic sessions keep hitting older cached prefix.
 - **No** tool-level breakpoint: tools are hashed in the cumulative `tools → system → messages` prefix, so the stable-system marker already covers them.
 
-The attribution `system[0]` fingerprint is derived from the **stable prefix** (not the first user message) so sessions sharing the same system prompt share the cached prefix; it falls back to a first-user-text digest only when no stable prefix exists (e.g. compaction calls). `ProviderUsage` reports `cache_read_input_tokens` / `cache_creation_input_tokens` for both providers (OpenAI exposes only `input_tokens_details.cached_tokens`).
+The attribution `system[0]` fingerprint is derived from the **stable prefix** (not the first user message) so sessions sharing the same system prompt share the cached prefix; it falls back to a first-user-text digest only for callers that supply no stable prefix. Both daemon compaction paths supply the stable system-prompt section. `ProviderUsage` reports `cache_read_input_tokens` / `cache_creation_input_tokens` for both providers (OpenAI exposes only `input_tokens_details.cached_tokens`).
 
 ### Reasoning continuity (provider replay)
 
@@ -262,14 +260,13 @@ pairs are not split. The model sees an `inspect_delegation` result in the same
 shape as a real tool result, while the transcript/UI semantics remain explicit:
 the daemon authored the observation.
 
-### Compaction: additive provider-native support
+### Provider-native compaction
 
-Both adapters advertise provider-native compaction, while the trait keeps a
-conservative unsupported default for adapters that do not implement it. The
-daemon still owns selection and retains its pre-existing local-summary path at
-this boundary: OpenAI defaults to native; Claude with no `remote_mode` or with
-`never` stays local; Claude `auto` tries native and may use the existing local
-fallback; Claude `always` requires native success.
+Both provider adapters implement the required `compact` trait method, and the
+daemon uses it for every manual and automatic compaction. Anthropic also
+validates the selected model before constructing the compact request; adapter
+support alone does not imply that every Claude model supports native
+compaction.
 
 - **OpenAI** posts a unary `ProviderCompactionRequest` to `/responses/compact`
   (JSON, 20-minute timeout). The body is a valid subset of Codex's current
@@ -289,40 +286,20 @@ fallback; Claude `always` requires native success.
   display summary, but is never substituted into replay. Missing, corrupt,
   duplicate, or non-native replay on a persisted OpenAI `CompactionSummary`
   fails request construction rather than synthesizing a user summary.
-- **Anthropic** uses the Messages API with the provider-required
-  `compact-2026-01-12` beta and
-  `context_management.edits[0].type = "compact_20260112"`. The request uses the
-  documented minimum 50K input trigger, pauses after compaction, supplies the
-  PI compaction prompt as custom instructions, and forbids tools. Model support
-  is resolved from authoritative Models API capability metadata over the
-  adapter's conservative known-model fallback; unsupported models fail before
-  network dispatch. Success requires the explicit `compaction` stop and exactly
-  one index-zero compaction block with nonempty content. Ordinary completion,
-  tools, refusal, max output, malformed/truncated streams, and missing or
-  malformed block content are typed native-compaction failures.
+- **Anthropic** uses the Messages API with the provider-required beta `compact-2026-01-12`, `context_management.edits[0].type = "compact_20260112"`, the minimum valid 50K input-token trigger, and `pause_after_compaction = true`. It supplies the PI compaction prompt as replacement custom instructions, explicitly forbids tool calls, and supplies no tools. Because Anthropic rejects an assistant prefill for this operation, the adapter appends one minimal synthetic user instruction when the rendered transcript is assistant-ended or empty. For an assistant tool-use tail, it normalizes the complete following user run once: real results are retained in tool-use order, only missing results are synthesized, then all non-result user content follows in original order; duplicates and redundant empty user messages are dropped. The authoritative custom instructions remain in the context-management edit. Static support is limited to the documented model ids `claude-fable-5`, `claude-mythos-5`, `claude-mythos-preview`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, and `claude-sonnet-4-6`; when Models API metadata includes `capabilities.context_management.compact_20260112`, that authoritative value overrides the static fallback. This static metadata remains necessary when authoritative model metadata is unavailable. Unknown and known-unsupported ids return a typed terminal native-compaction `unsupported` error before network dispatch. The compact call accepts only an eventual terminal `stop_reason = "compaction"` with one index-zero compaction block whose `content` is a non-null/non-empty string; ordinary completion, tools, refusal, max tokens, malformed/truncated streams, and missing/null/empty content are typed native-compaction errors.
 
-The Anthropic compaction block is persisted as exact opaque replay. Its stable
-contract requires `type = "compaction"`, nonempty string `content`, and absent,
-null, or string `encrypted_content`; start/delta extension fields and ordering
-are retained unchanged. A native `CompactionSummary` must carry exactly one
-such block. The one compatibility exception at this additive boundary is a
-replay-free local-summary checkpoint produced by the retained daemon path,
-which still renders as synthetic user text. Nonempty malformed, duplicate, or
-mixed native replay fails locally rather than being canonicalized or dropped.
-Subsequent ordinary Messages and token-count requests replay a valid block
-unchanged and scope the required beta header to bodies that use it. Compaction
-blocks or compaction stops appearing unexpectedly in ordinary generation are
-rejected and cannot become persistable output.
+The Anthropic compaction block is stored as opaque provider replay on the new `CompactionSummary` root. One strict rule defines valid replay: `type` is `compaction`, `content` is a nonempty string, and `encrypted_content` is absent, null, or a string. `content` is copied from the compaction delta; opaque encryption and all start/delta extension fields (including a top-level `name`) are retained unchanged. No cache fields or daemon metadata are injected into the provider block. Request rendering parses every Claude sidecar on the only transcript kinds that can emit it, `CompactionSummary` and `AssistantMessage`. Every `CompactionSummary` must have exactly one valid Claude compaction replay block; zero or multiple Claude blocks fail locally. Assistant replay may contain ordinary Claude block types, but corrupt JSON and malformed exact compaction blocks fail locally. Wrong-provider and non-emitted sidecars have no effect.
 
-A local `CompactionSummary` renders as a synthetic user message ("The
-conversation history before this point was compacted into this summary…"), with
-the active PI.md system prompt re-prepended when a stable prefix is present.
+Subsequent Messages and token-count requests replay the complete block unchanged as an assistant message; the synthetic user summary follows it and carries pi-relay's generic checkpoint label plus the daemon's fresh delegation ledger. Rendering prepares the body and required beta header together, so replay is not rescanned for headers. The two request types intentionally use different strategy shapes. Ordinary Messages sets `trigger = { type: "input_tokens", value: <resolved model max_input_tokens> }` (clamped to the documented 50K minimum) plus `pause_after_compaction = true`. Anthropic documents only the 50K minimum, so the exact model ceiling is schema-valid. A paid production Sonnet 5 automatic E2E accepted this replay shape, resumed the same blocked model action after one native checkpoint, returned the exact requested sentinel JSON, and reduced the effective count from the 541,564-token gate to 15,628 tokens. This proves the tested continuation path, not provider-generated inline compaction during an ordinary response. Anthropic has no documented apply-only mode, so the paused ceiling trigger plus fail-closed parsing is required to protect durable state while pi-relay schedules normal replacement checkpoints at its lower threshold. A model with no safely resolved input ceiling fails replay request construction locally. Token counting retains the live-proven bare `[{ "type": "compact_20260112" }]` edit because Anthropic documents that counting applies existing blocks but does not trigger new compactions. Any compaction block, delta, or compaction stop returned by an ordinary Messages call—including non-paused compaction followed by text/tool use and paused/null/malformed forms—is rejected at the provider parser boundary and cannot become successful persistable replay. Ordinary pre-compaction calls include neither the compaction beta nor the edit. Token counting uses returned `input_tokens` as effective occupancy and retains `context_management.original_input_tokens` as diagnostics.
 
 `ProviderUsage` keeps normalized counts and provider-native merged usage fields
 in `raw_provider_usage`. For Anthropic, normalized input is raw
 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`, and
-normalized total adds output tokens. Raw fields retain provider extensions for
-billing and audit without double counting.
+normalized total adds output tokens. Compaction iterations remain excluded from
+those normalized message totals. The raw fields retain the unaggregated input
+components, `usage.iterations`, nested cache-creation TTL fields, and
+`output_tokens_details.thinking_tokens` for billing/audit without double
+counting.
 
 ### Streaming, timeouts, and tool naming
 
@@ -357,8 +334,17 @@ output/replay is not returned. For both providers, EOF or `[DONE]` alone and
 malformed JSON are failures. Unknown future event types remain ignorable but
 never imply success.
 
-`http.rs` enforces a 45-second response-headers timeout; the SSE reader enforces
-a 5-minute idle timeout. The ordinary Anthropic parser requires
+The special Anthropic compact call uses separate strict state and requires
+`message_start`, one index-zero compaction `content_block_start`, one matching
+`compaction_delta`, matching `content_block_stop`, one or more `message_delta`
+frames with exactly one eventual `stop_reason = "compaction"`, and final
+`message_stop`. Pings and unknown future event types are ignored without
+advancing structural state. The parser consumes through EOF so
+duplicate/conflicting terminal reasons and trailing known frames are
+observable, and rejects missing fields, wrong indices/types/order, multiple or
+mixed blocks, pre-populated start content, malformed JSON, `[DONE]`, and
+truncation. `http.rs` enforces a 45-second response-headers timeout; the SSE
+reader enforces a 5-minute idle timeout. The ordinary Anthropic parser requires
 contiguous, checked content-block indices and an explicit `content_block_stop`
 for every start. It validates the known start/delta schemas, rejects duplicate,
 gapped, nonexistent, or mismatched block transitions, and fails malformed

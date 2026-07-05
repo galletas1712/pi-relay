@@ -152,7 +152,7 @@ async fn check_compaction_eligible(
         .await
         .ok()
         .flatten();
-    let config = compaction_config_with_model_metadata(&dispatch.config, discovered, &policy);
+    let config = compaction_config_with_model_metadata(discovered, &policy);
     if !config.auto_enabled {
         return None;
     }
@@ -353,7 +353,6 @@ async fn run_compaction_job(
                 summary: output.summary,
                 summary_kind: output.summary_kind.as_str().to_string(),
                 provider_replay: output.provider_replay,
-                remote: output.remote,
                 provider: output.provider,
                 usage: output.usage,
                 continuation_suffix,

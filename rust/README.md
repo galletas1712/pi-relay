@@ -11,6 +11,9 @@ hierarchical subagent machinery from the TypeScript fork.
   invisible engineering choices and why they were made.
 - [`docs/websocket-rpc.md`](docs/websocket-rpc.md) - the frontend websocket RPC
   contract and manual exercise plan.
+- [`docs/native-compaction-v1-migration.md`](docs/native-compaction-v1-migration.md)
+  - one-time `psql` runbook for databases created before the native-only
+    compaction cutover.
 - [`docs/modules/`](docs/modules) - one reference per crate (linked below).
 - [`docs/plans/`](docs/plans) - in-flight future work only.
 - [`../packages/web/docs/web-ui.md`](../packages/web/docs/web-ui.md) - the React
@@ -59,7 +62,10 @@ cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
 
 `--database-url`/`DATABASE_URL` is required; `--bind`/`PI_AGENTD_BIND` defaults
 to `127.0.0.1:8787`. The daemon creates its schema on startup but does not run
-old-session migrations automatically.
+old-session migrations automatically. Before upgrading an existing database to
+the native-only cutover, run
+[`migrations/native-compaction-v1.sql`](migrations/native-compaction-v1.sql)
+exactly as documented in the migration runbook.
 
 ## Run The Web UI
 

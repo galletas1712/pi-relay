@@ -89,6 +89,71 @@
 
 ## 2026-07-02
 
+### Native Compaction Live-E2E Corrections And Model Defaults
+
+- Corrected two request-shape failures found by an earlier billed, sanitized
+  Anthropic E2E:
+  - Native compact requests now append one minimal text-only user instruction
+    when the provider-visible transcript is assistant-ended or empty. Before
+    compaction, the consecutive user run after an assistant tool-use tail is
+    normalized once: required real/synthetic results are emitted in tool-use
+    order, followed by non-result user content in original order, with
+    duplicate results and redundant empty user messages removed. Tools remain
+    omitted, and the authoritative PI compaction instructions remain solely in
+    `context_management.edits`.
+  - Ordinary Messages and token-count requests that replay a valid Claude
+    `compaction` block send the compaction beta and the strategy that applies
+    that block. Messages sets an explicit trigger at the resolved model's
+    authoritative input ceiling (defensively clamped to Anthropic's documented
+    50K minimum) and `pause_after_compaction = true`; this suppresses the
+    provider's 150K default trigger but is not an apply-only mode. The daemon's
+    durable scheduler still owns normal compaction at its lower policy limit.
+    Anthropic documents only the 50K minimum, so the ceiling value is
+    schema-valid. The final paid automatic E2E accepted this replay shape and
+    completed the continuation. Token counting keeps the live-proven bare
+    strategy because Anthropic documents that it applies existing blocks
+    without triggering new compactions.
+  - Emitted replay rendering parses every Claude sidecar once. Every
+    `CompactionSummary` requires exactly one valid Claude compaction block
+    (`type = "compaction"`, nonempty string `content`, absent/null/string
+    `encrypted_content`); zero or multiple Claude blocks fail locally.
+    Assistant replay permits ordinary Claude blocks but rejects corrupt JSON
+    and malformed exact compaction. Valid compaction remains opaque, including
+    arbitrary extension fields. Wrong-provider and non-emitted sidecars have no
+    effect. Any compaction block,
+    compaction delta, or compaction stop returned
+    by an ordinary Messages call is rejected at the provider parser boundary,
+    before it can become persistable replay. Pre-compaction requests opt into
+    neither the edit nor beta.
+- Added exact provider request-shape regressions for assistant-ended,
+  user-ended, partial/missing/matched tool-ended, dynamic-context, empty, and
+  marker-only compact histories; distinct Messages/count-token replay
+  strategies (including a non-1M model); ordinary pre-compaction omission;
+  malformed/wrong-provider/non-emitted replay handling; inline compaction
+  rejection; opaque extension preservation; and a local wire mock that pairs
+  the replay strategy with its beta header.
+- Final paid automatic evidence used Sonnet 5 through the production
+  daemon/store path. The gate counted 541,564 tokens against the 500,000
+  threshold, ran exactly one native compaction, retained the exact user
+  instruction, resumed the same blocked model action, returned the exact
+  three-key sentinel JSON, and counted 15,628 tokens afterward. There was no
+  alternate result, duplicate action/attempt, or retry. Estimated
+  observable generation cost was $1.350969. No sentinel plaintext, transcript,
+  provider payload, or credential content is recorded here.
+- Updated auto-compaction defaults from current provider metadata. Any
+  authoritative 1,000,000-token Claude window defaults to 500,000 tokens,
+  including newly discovered Claude ids; non-1M Claude discoveries retain the
+  generic 85% policy. The daemon reads scheduler controls only from nested
+  `/compaction/config` and resolves them to one effective limit. Valid explicit
+  limits win and clamp to the selected window; windows below the anti-churn
+  floor disable auto-compaction. A malformed active field disables automatic
+  scheduling without changing provider-native execution.
+- Both supported providers now use native compaction unconditionally for
+  manual and automatic jobs. Persisted unknown metadata has no execution
+  effect. Native failures remain typed and terminal rather than omitting
+  transcript history, retrying with a trimmed transcript, or substituting a
+  different algorithm.
+
 ### Anthropic Model and Hosted-Tool Refresh
 
 - Added Claude Sonnet 5 as the normal Claude UI option (`high` effort), retained
@@ -294,8 +359,8 @@ Implemented the cleaner split:
 - `ModelContext` materializes `ModelContextEntry` values and preserves replay
   sidecars along fork/switch/compact branches.
 - `ModelRequest` now passes `Vec<ModelTranscriptEntry>` to providers.
-  Providers serialize replay sidecars when present and fall back to semantic
-  transcript items for older or replay-free history.
+  Providers serialize replay sidecars when present and otherwise render
+  ordinary semantic transcript items directly.
 - Postgres has a sibling `transcript_entries.provider_replay` JSONB column.
   The schema migration lifts legacy `provider_replay_record` assistant items
   into that column and removes them from assistant message JSON.
@@ -1523,3 +1588,193 @@ paths. Changes made from that review:
   (5 tests, including 3 env-gated cancellation tests),
   `cargo test --manifest-path rust/Cargo.toml -p agent-daemon` (4 tests), and
   `cargo check --manifest-path rust/Cargo.toml`.
+
+### Anthropic Provider-Native Compaction
+
+- Added Anthropic server-side compaction through the required
+  `ModelProvider::compact` seam. The adapter sends a special streaming
+  `/messages` request with beta `compact-2026-01-12`,
+  `compact_20260112`, a 50K trigger, `pause_after_compaction`, replacement PI
+  compaction instructions, and no tools.
+- Strictly parse streamed `compaction_delta` with one index-zero
+  start/delta/stop sequence, an eventual `stop_reason: "compaction"`, and final
+  `message_stop`, while transparently ignoring pings and unknown future event
+  types and accepting multiple usage/message deltas. Missing,
+  duplicate/conflicting terminal reasons, wrong-index, wrong-type,
+  mixed/multiple-block, trailing, malformed, and truncated known frames fail
+  closed without changing the intentionally permissive ordinary parser. A
+  successful block requires non-null/non-empty string `content`; opaque
+  `encrypted_content` remains exactly string, explicit null, or absent. Those
+  fields and extension fields are stored as provider replay on the checkpoint
+  root and replayed unchanged on later Messages/count-token calls. The daemon's
+  fresh delegation ledger stays outside that opaque block as the following
+  synthetic user summary.
+- Manual and automatic compaction call the selected provider's native
+  implementation unconditionally. New web sessions store only scheduler and
+  store-owned circuit-breaker controls; unknown persisted metadata cannot
+  select another execution path.
+- Validate Anthropic native compaction against a static supported-model list
+  and Models API `context_management` capability when advertised.
+  Unknown/unsupported models return typed terminal `unsupported` failures.
+- Preserve active-action lifecycle independently from transcript-root shape:
+  reactive overflow compactions are always mid-turn, including immediately
+  after a prior compaction. One successful immediate recompaction is allowed;
+  another overflow then terminally follows the ordinary error path instead of
+  looping or leaving a blocked action stranded.
+- Commit success metadata with checkpoint installation, compaction completion,
+  and blocked-model resumption in one Postgres transaction. Failure likewise
+  commits breaker metadata and terminally fails both model and compaction
+  actions atomically. Mid-turn success also writes an attempt-fenced
+  `post_compaction_dispatch` intent into the resumed model action's payload in
+  that transaction. Claim retains the intent while atomically assigning a
+  random owner, incremented generation, and database-clock 30-second lease;
+  registered runners renew every 10 seconds. Startup stale marking preserves
+  only marked pending/running model rows, reconstructs the exact compacted
+  leaf/runtime, claims pending or expired ownership, and schedules retry at the
+  expiry of an unexpired lease. Terminal completion/error removes the marker in
+  the same owner/generation-fenced transaction; reactive re-block, interruption,
+  and task-failure staling are fenced as well. Corrupt or unreconstructable
+  markers terminally fail with a visible model error. The same-process path
+  reloads the committed checkpoint/config before claiming resumed work and
+  verifies synchronous task registration. This is at-least-once dispatch:
+  process death after provider acceptance but before terminal commit can cause
+  another provider call after expiry. Current OpenAI/Codex and Anthropic model
+  requests expose no provider idempotency key, so exactly-once calls are not
+  claimed. The narrow payload protocol remains required for at-least-once
+  post-compaction continuation.
+- Retain Anthropic's complete raw usage object alongside normalized top-level
+  counts. This preserves compaction/message iterations, cache-creation TTL
+  detail, and thinking-token detail without adding compaction iterations to
+  top-level totals that explicitly exclude them.
+- Token counting applies existing compaction state, reports effective
+  `input_tokens`, and retains `context_management.original_input_tokens`.
+
+#### Current native-compaction protocol and durability requirements
+
+- Both providers always run native compaction. Unsupported model/capability,
+  Anthropic's below-minimum input, unexpected stop, transport/HTTP,
+  protocol/content, and context overflow are typed terminal failures. Native
+  compaction sends the selected full model context once and does not retry with
+  transcript history omitted or substitute another algorithm.
+- Anthropic compact and replay requests send the provider-required compaction
+  beta header. Replay Messages use a paused trigger at the resolved model
+  ceiling because Anthropic does not provide an apply-only/no-trigger mode.
+- The `post_compaction_dispatch` payload outbox/lease supplies atomic intent,
+  heartbeat, startup reclaim, and terminal clear for crash-durable
+  continuation. Dispatch remains at least once: a crash after provider
+  acceptance but before terminal commit can still cause a repeated call.
+- Ordinary Messages still reject every inline compaction block, delta, or stop
+  at the provider boundary; the successful automatic E2E does not turn those
+  blocks into an inline durable-checkpoint path.
+
+Validation for this simplification: `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -A clippy::too-many-arguments -D
+warnings`, all 106 `agent-provider` tests, the non-daemon workspace tests, the
+15 focused compaction-policy tests, the 10 model-metadata tests,
+`npm run test --workspace @pi-relay/web` (192 tests),
+`npm run build --workspace @pi-relay/web`, and `git diff --check` pass. The
+isolated-Postgres full workspace command ran 177 daemon tests successfully and
+reproduced the same five pre-existing delegation/steering fixture failures
+(`Store(NotTurnBoundary)`) previously reproduced from detached baseline
+`d296e3f`. That validation phase used in-process wire mocks; the later paid
+production E2E is summarized above.
+
+### Final native-compaction policy correction
+
+- Scheduler controls are read only from `/compaction/config`; sibling
+  compaction metadata is not an execution or scheduling policy.
+- The daemon now ignores store-owned `max_consecutive_failures`, carries one
+  parsed policy through the cheap explicit-disable gate and optional model
+  metadata discovery, and keeps explicit automatic scheduling without a known
+  threshold available for reactive overflow recovery only. Known windows below
+  the 8K floor still disable auto-compaction.
+- Anthropic native SSE finish validates its single state-machine-owned block
+  directly and returns `ProviderCompactionResponse`; the synthetic generic
+  response revalidation and dead ordinary-stream bookkeeping are gone.
+
+Validation: formatting and strict workspace clippy pass; all 20 focused daemon
+policy tests, all 58 focused Anthropic tests, the isolated-Postgres
+unknown-model reactive-overflow regression, all non-daemon workspace tests
+(including 53 store tests), 192 web tests, and the web production build pass.
+The full serial isolated-Postgres daemon run passed 182 tests and reproduced
+only the same five documented delegation/steering `Store(NotTurnBoundary)`
+fixture failures. That correction's validation was offline; the final paid
+production proof is summarized above.
+
+### Lease/watchdog blocker interleavings
+
+- Heartbeat loss or renewal error now wakes the watchdog and stops renewal
+  without selecting away/dropping the leased model future. This preserves the
+  same runner's post-commit terminal-successor or reactive-compaction handoff.
+  If ownership was truly lost or the provider hangs, expiry recovery claims a
+  newer generation and compare-replacement registration aborts the old handle;
+  all durable commits remain exact owner/generation fenced.
+- Task registration and shutdown now share one registration lock. Registration
+  explicitly rejects and aborts a spawned handle before its oneshot provider
+  start barrier when shutdown has won; shutdown sets `shutting_down` and drains
+  dispatch/compaction handles, provider sidecars/background drivers, and the
+  process watchdog while holding the same gate. Recovery checks shutdown before
+  inspection and again at registration. A lease claimed concurrently with
+  shutdown is retained for expiry/next boot instead of being terminally
+  compensated.
+- `claim_post_compaction_model_action` now returns typed structural corruption
+  separately from transient infrastructure/context-load errors. Only typed
+  corruption is terminally compensated. The compensation CAS matches exact
+  session/row/attempt/status and the full marker snapshot (plus owner/generation
+  when present), so a stale recovery cannot fail a newer claimed generation.
+  SQL/pool/query/commit/context/runtime-install/load failures retain their
+  marker/lease for watchdog retry. Immediate post-compaction claim failure uses
+  the same classification.
+- Added deterministic real-Postgres regressions for terminal successor and
+  reactive-compaction commit-to-local-follow-up heartbeat races; shutdown during
+  recovery claim/register and existing-runner successor spawn; transient
+  per-intent context-load failure followed by autonomous watchdog retry; and a
+  stale corruption compensation racing a real generation-two reclaim.
+
+Validation for this pass: `cargo fmt --all -- --check`, `cargo check --workspace
+--all-targets`, ordinary `cargo clippy --workspace --all-targets`,
+`git diff --check`, all six new focused real-Postgres races plus the existing
+lease/watchdog/concurrent-state/corruption regressions, serial
+`cargo test -p agent-store -- --test-threads=1` with
+`PI_RELAY_TEST_DATABASE_URL` (53 passed), and `cargo test --workspace` without
+the optional database URL all pass. The full serial daemon Postgres run is 175
+passed / the same five pre-existing delegation/steering fixture failures
+already documented above. Strict `cargo clippy --workspace --all-targets -- -D
+warnings` remains blocked only by the three pre-existing
+`clippy::too_many_arguments` warnings in store transcript/delegation test code;
+ordinary clippy completes with those warnings and no new warning from this
+pass.
+
+### Native-only cutover: one-time SQL migration
+
+- Kept the already live-tested production source equivalent to approved
+  `9264f3e9`/`84c7db0`; the migration adds no daemon command, runtime branch,
+  process lock, API/web concept, provider abstraction, or legacy fallback.
+- Replaced the rejected Rust migrator with the single PostgreSQL 16/`psql`
+  patch at `migrations/native-compaction-v1.sql`. It uses one serializable
+  transaction, a transaction-scoped advisory lock, explicit application-table
+  locks, fail-fast assertions, deterministic JSON reporting, and dry-run
+  rollback.
+- The deployment contract is backup, stop/drain writers, acknowledged dry-run,
+  review, apply, second verified no-op, and daemon start. `pg_restore` is the
+  only post-commit rollback mechanism; there is no durable migration ledger.
+- The patch inventories and removes retired policy semantics, canonicalizes
+  historical tags, lifts ordered replay without deduplication, preserves valid
+  native replay, bootstraps safe replay-free summaries as ordinary semantic
+  turns, rewrites completed topology facts, and preserves sequence high-water
+  marks. Ambiguous/live/corrupt forms abort with a machine-readable category
+  and must be remediated using the old release.
+- Manual PostgreSQL 16 validation used uncommitted scratch data and exercised
+  acknowledged dry-run (`ready`), apply (`applied`), second apply (`no_op`),
+  missing-sidecar apply, invalid-checkpoint semantic bootstrap, duplicate
+  replay preservation, action/event rewrites, and sequence next values held at
+  1001. Missing variables/acknowledgement, wrong schema, live bare-summary
+  dispatch, and self/two-node logical cycles all rolled back with the expected
+  JSON category; cycle checks returned in under 70 ms.
+- Formatting, locked all-target check, strict clippy (with the established
+  too-many-arguments allowance), all 192 web tests/build, all non-daemon Rust
+  tests (including 173 provider and 54 real-PostgreSQL store tests), and diff
+  checks pass. The serial daemon run is 177 passed / the same five
+  delegation/steering `Store(NotTurnBoundary)` failures reproduced from
+  detached approved commit `9264f3e9`; the production source is byte-identical
+  to that commit.

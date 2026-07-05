@@ -9,7 +9,8 @@ APIs.
 
 **Revisions audited:**
 
-- pi-relay provider-modernization behavior through this branch;
+- pi-relay provider-modernization behavior through tested reference
+  `84c7db0`;
 - pinned Codex source clone `../openai-codex` at
   `98d28aab54ed86714901b6619400598598876dd0`;
 - current OpenAI and Anthropic contracts linked under
@@ -35,7 +36,7 @@ status alone, distinguish unit/fixture coverage from historical live use.
 | Adapter | Actual transport | Important boundary |
 | --- | --- | --- |
 | OpenAI | Private ChatGPT/Codex subscription backend at `https://chatgpt.com/backend-api/codex`, authenticated with a ChatGPT bearer token and Codex CLI identity/routing headers. Ordinary turns use zstd-compressed Responses-compatible HTTP + SSE; compaction uses private unary `/responses/compact`. | This is **not** the public `api.openai.com` API-key transport. A public Responses feature is unavailable unless it is separately implemented and evidenced on this private backend. `[source, live, pinned]` |
-| Anthropic | Public Claude Messages API at `https://api.anthropic.com/v1`, authenticated with `x-api-key`, plus a Claude-Code-style identity/attribution envelope pinned to `2.1.75`. Ordinary turns use Messages SSE; counting uses `/messages/count_tokens`; capability lookup uses `/models/{id}`. | The pinned envelope is historically live-proven; it is not claimed to be the current Claude Code identity. Identity headers do not change the API contract or by themselves grant Zero Data Retention. `[source, live, official]` |
+| Anthropic | Public Claude Messages API at `https://api.anthropic.com/v1`, authenticated with `x-api-key`, plus a Claude-Code-style identity/attribution envelope pinned to `2.1.75`. Ordinary turns and native compaction use Messages SSE; counting uses `/messages/count_tokens`; capability lookup uses `/models/{id}`. | The pinned envelope is historically live-proven; it is not claimed to be the current Claude Code identity. Identity headers do not change the API contract or by themselves grant Zero Data Retention. Native compaction requires the `compact-2026-01-12` beta and a supported model. `[source, live, official]` |
 
 ## Architecture boundary
 
@@ -44,7 +45,7 @@ cross-provider wire schema:
 
 - [`agent-provider/src/lib.rs`](../crates/agent-provider/src/lib.rs) owns the
   provider-neutral `ModelRequest`, `ModelResponse`, `ProviderError`,
-  `ProviderUsage`, model metadata, optional compact/count contracts, terminal
+  `ProviderUsage`, model metadata, native compact/count contracts, terminal
   stop semantics, and the replay contract using `ProviderReplayItem` from
   `agent-vocab`.
 - [`agent-provider/src/sse.rs`](../crates/agent-provider/src/sse.rs) owns generic
@@ -165,9 +166,9 @@ deserialized.
 | Successful terminal | **Supported.** Requires a valid `response.completed` and no pending added output items; terminal omission never completes a pending item. Optional terminal output is merged by index: completed items keep their exact payload, overlaps require stable type/identity compatibility, and terminal-only items cross the ordinary fail-closed item boundary. EOF or `[DONE]` is not success. The private minimal terminal without `output` remains accepted only with no pending items. | **Supported.** Requires `message_start`, closed content blocks, a recognized terminal stop reason, and `message_stop`; EOF alone is not success. | Unknown future event types may be ignored but never imply success. `[source, unit]` |
 | Refusal | **Supported.** Refusal content becomes a refusal terminal and partial semantic output/replay is discarded. | **Supported.** `stop_reason: refusal` retains valid details and discards partial semantic output/replay. | `[unit]` |
 | Incomplete / max output | **Supported.** `response.incomplete` is a typed non-success with status/reason. | **Supported.** `max_tokens` is a normalized terminal; `pause_turn`, context-window exhaustion, and unknown reasons are typed non-successes. | `[unit]` |
-| Native compaction | **Supported.** Private unary `/responses/compact`; canonical returned output is installed and replayed exactly. Public inline `context_management` compaction is not sent. | **Supported additively.** The strict Messages context-management operation is reachable through the existing `remote_mode` policy. Missing/`never` retains local summary compatibility, `auto` retains the existing native-to-local failure fallback, and `always` fails closed. | Both adapters are source/mock-tested. OpenAI standalone compaction has historical real-backend coverage. `[source, unit, live, official]` |
-| Compaction replay | **Supported.** Exactly one native checkpoint is evidenced; the complete opaque returned array is replayed unchanged and in order. | **Supported.** A native checkpoint is exactly one strict opaque `compaction` block, replayed unchanged. A replay-free local `CompactionSummary` remains valid only for the retained compatibility path; malformed or mixed native replay fails locally. | Ordinary Messages rejects unexpected inline compaction. `[source, unit]` |
-| Input token counting | **Partial.** No usable private endpoint: `/responses/input_tokens` returned a Cloudflare 403 challenge. The daemon anchors on completed usage, estimates only the local suffix, and retains reactive overflow recovery. | **Supported.** Calls `/messages/count_tokens` with the same local prompt/tool shape. Existing native compaction blocks use the apply-existing edit; effective occupancy is returned and original occupancy is retained as diagnostics. | Public OpenAI `POST /v1/responses/input_tokens` exists but is not usable through this private adapter. Anthropic counting is mock-tested. `[source, unit, official]` |
+| Native compaction | **Supported.** Private unary `/responses/compact`; canonical returned output is installed and replayed exactly. Public inline `context_management` compaction is not sent. | **Supported.** Special paused Messages call with beta `compact-2026-01-12`, replacement instructions, no tools, and strict compaction-only stream parsing. | OpenAI standalone compaction has historical real-backend coverage. Anthropic has a paid production Sonnet 5 E2E; model support is capability/static gated. `[source, unit, live, official]` |
+| Compaction replay | **Supported.** Exactly one native checkpoint is evidenced; the complete opaque returned array is replayed unchanged and in order. | **Supported.** Exactly one valid opaque compaction block is retained and replayed with the required beta/strategy; no local alternate summary is substituted. | Ordinary Anthropic turns reject inline compaction, preserving the daemon's durable checkpoint boundary. `[source, unit, live]` |
+| Input token counting | **Partial.** No usable private endpoint: `/responses/input_tokens` returned a Cloudflare 403 challenge. The daemon anchors on completed usage, estimates only the local suffix, and retains reactive overflow recovery. | **Supported.** Calls `/messages/count_tokens` with the same local prompt/tool shape. Existing compaction is applied without triggering a new one, and original/effective occupancy is retained. | Public OpenAI `POST /v1/responses/input_tokens` exists but is not usable through this private adapter. Anthropic counting is mock-tested and exercised in the paid compaction path. `[source, unit, live, official]` |
 
 ## Tools, actions, and citations
 
@@ -191,7 +192,7 @@ not local execution support.
 
 | Mode | OpenAI private Codex adapter | Anthropic Messages adapter | Evidence and limitations |
 | --- | --- | --- | --- |
-| HTTP + SSE | **Supported.** Ordinary generation uses private Responses-compatible SSE. | **Supported.** Ordinary generation uses Messages SSE. | `[source, unit, live]` |
+| HTTP + SSE | **Supported.** Ordinary generation uses private Responses-compatible SSE. | **Supported.** Ordinary and compact generation use Messages SSE. | `[source, unit, live]` |
 | Public Responses WebSocket | **Unsupported.** The adapter never connects to `wss://api.openai.com/v1/responses`. | **Unsupported.** Messages has no corresponding mode in this adapter. | Public OpenAI WebSocket mode supports in-memory `previous_response_id` with `store=false`; that is public-contract-only here. `[official]` |
 | Private Codex WebSocket | **Unsupported.** pi-relay uses private HTTP SSE only. | **Unsupported.** It is not an Anthropic transport. | Pinned Codex implements a private Responses WebSocket client and chaining, but pi-relay does not reuse it. `[source, pinned]` |
 | Background responses | **Intentionally not used.** No background create/poll/cancel path. | **Unsupported.** No analogous background Messages path is implemented. | Public OpenAI background mode requires stored response state and is not ZDR compatible, conflicting with local durable replay. `[official]` |
@@ -203,7 +204,7 @@ not local execution support.
 | --- | --- | --- | --- |
 | Basic usage | **Supported.** Normalizes input, output, and total tokens. | **Supported.** Normalized input is provider raw `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`; normalized total is that cache-inclusive input plus output, including across cumulative stream updates. | `[unit, official]` |
 | Cached tokens | **Partial.** Normalizes `input_tokens_details.cached_tokens`; no cache-write metric is exposed. | **Supported.** Normalizes cache read/write counts, includes both in normalized input/total, and retains provider-native counters and TTL detail in raw usage. | Historical cache hits exist for both providers. `[unit, live, official]` |
-| Reasoning and hosted-tool detail | **Partial.** Does not retain the full OpenAI usage object or normalized reasoning-token count. | **Supported.** `raw_provider_usage` retains provider-native merged usage fields, including unaggregated `input_tokens`, thinking detail, server-tool counts, and inference/service-tier fields. | Provider-specific detail intentionally stays raw. `[source, unit]` |
+| Reasoning / compaction / hosted-tool detail | **Partial.** Does not retain the full OpenAI usage object or normalized reasoning-token count. | **Supported.** `raw_provider_usage` retains provider-native merged usage fields, including unaggregated `input_tokens`, thinking detail, server-tool counts, inference/service tier fields, and compaction iterations without adding iterations to normalized message totals. | Provider-specific detail intentionally stays raw. `[source, unit]` |
 | Response and request IDs | **Partial.** Validates the terminal response id but does not retain it; retains upstream `x-request-id`, Cloudflare ray, server model, Codex turn state, and reasoning-included headers when usage exists. | **Partial.** Generates a client request id; provider request ids are included in parsed error text but successful message/request ids are not normalized. | `[source, unit]` |
 | Assigned service tier | **Unsupported.** The request is fixed to priority, but returned tier is not retained as response accounting. | **Partial.** If returned inside usage it survives raw JSON, but there is no normalized field. | `[source, official]` |
 
@@ -215,7 +216,7 @@ database, tool output, logs, backups, or exported transcripts.
 
 | Concern | OpenAI private Codex adapter | Anthropic Messages adapter |
 | --- | --- | --- |
-| Provider-side guarantee | **Unsupported.** Public OpenAI API ZDR terms cannot be applied to the private ChatGPT subscription backend. `store: false` and local stateless replay are ZDR-aligned design choices, but private abuse logging and prompt-cache retention were not established by this audit. | **Partial.** Messages, token counting, and prompt caching are documented as ZDR eligible when the organization has a ZDR arrangement. The API defaults to up-to-30-day retention otherwise. Claude Code identity headers do not establish the workspace contract. |
+| Provider-side guarantee | **Unsupported.** Public OpenAI API ZDR terms cannot be applied to the private ChatGPT subscription backend. `store: false` and local stateless replay are ZDR-aligned design choices, but private abuse logging and prompt-cache retention were not established by this audit. | **Partial.** Messages, token counting, prompt caching, and compaction are documented as ZDR eligible when the organization has a ZDR arrangement. The API defaults to up-to-30-day retention otherwise. Claude Code identity headers do not establish the workspace contract. |
 | Server-side conversation state | **Intentionally not used.** `store`, Conversations, and background mode are avoided. Public Conversations persist until deletion and background responses persist for polling. | **Intentionally not used.** Every request is rebuilt from the local transcript. |
 | Prompt cache | **Partial.** Private retention is unknown: pi-relay sends a cache routing key but no retention selector. Public OpenAI extended cache may retain derived KV tensors on GPU-local storage for up to 24 hours, and newer public models may require it; private behavior is not inferred. | **Supported.** Under the documented ZDR feature contract, cache representations/hashes are memory-only, with 5-minute or 1-hour TTLs. |
 | Covered-model exception | **Unsupported.** No applicability claim can be made: an analogous exception was not established for this private product. | **Unsupported.** ZDR does not apply to covered Mythos-class models: as of 2026-06-09, Anthropic requires 30-day prompt/output retention for Mythos 5 and Fable 5 (and designated future covered models), including otherwise-ZDR workspaces. Fable must remain an explicit opt-in. |
@@ -223,10 +224,9 @@ database, tool output, logs, backups, or exported transcripts.
 
 The deliberate state model is therefore: `store: false` where the private
 Codex transport supports it, no provider Conversations/background state,
-complete local replay, exact OpenAI and Anthropic native compaction
-checkpoints, and retained local Anthropic summaries only through the existing
-compatibility selector. This supports crash recovery and auditability without
-claiming provider-side ZDR that has not been contractually or live verified.
+complete local replay, and exact provider-native compaction checkpoints. This
+supports crash recovery and auditability without claiming provider-side ZDR
+that has not been contractually or live verified.
 
 ## Sources
 
@@ -240,8 +240,8 @@ claiming provider-side ZDR that has not been contractually or live verified.
   [`agent-provider/src/anthropic.rs`](../crates/agent-provider/src/anthropic.rs)
 - Shared SSE framing:
   [`agent-provider/src/sse.rs`](../crates/agent-provider/src/sse.rs)
-- Runtime model scheduling and counting:
-  [`agent-provider/src/openai.rs`](../crates/agent-provider/src/openai.rs),
+- Runtime metadata scheduling and counting:
+  [`compaction.rs`](../crates/agent-daemon/src/provider_runtime/compaction.rs),
   [`context_accounting.rs`](../crates/agent-daemon/src/provider_runtime/context_accounting.rs)
 - Hosted web sidecars:
   [`web_tools.rs`](../crates/agent-daemon/src/provider_runtime/web_tools.rs)
@@ -269,6 +269,7 @@ claiming provider-side ZDR that has not been contractually or live verified.
 - OpenAI [data controls](https://developers.openai.com/api/docs/guides/your-data)
 - Anthropic [Messages streaming](https://platform.claude.com/docs/en/build-with-claude/streaming)
 - Anthropic [context windows](https://platform.claude.com/docs/en/build-with-claude/context-windows)
+- Anthropic [compaction](https://platform.claude.com/docs/en/build-with-claude/compaction)
 - Anthropic [token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting)
 - Anthropic [prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 - Anthropic [Message Batches](https://platform.claude.com/docs/en/build-with-claude/batch-processing)
