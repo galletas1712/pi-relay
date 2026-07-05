@@ -11,16 +11,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_provider::ModelTranscriptEntry;
-use agent_session::{ModelContext, SessionAction, TranscriptStorageNode};
+use agent_session::{AgentSession, ModelContext, SessionAction, TranscriptStorageNode};
 use agent_store::{
-    Delegation, DelegationKind, DelegationStatus, EventType, InputPriority, OutputBatch,
-    PostgresAgentStore, QueuedInputStatus, SessionConfig, SubagentType,
+    ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, Delegation, DelegationKind,
+    DelegationStatus, EventType, InputPriority, OutputBatch, PostgresAgentStore,
+    QueuedInputContent, QueuedInputStatus, SessionConfig, SubagentControlPhase, SubagentType,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{
     ActionId, AssistantItem, AssistantMessage, CompactionSummary, DaemonToolObservation,
-    ProviderConfig, ProviderKind, ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, TurnId,
-    TurnOutcome, UserMessage,
+    ProviderConfig, ProviderKind, ReasoningEffort, ToolCall, ToolCallId, ToolResultMessage,
+    TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
@@ -60,7 +61,7 @@ use crate::provider_runtime::{
     SessionTitleScheduler,
 };
 use crate::runtime::SessionDriver;
-use crate::state::AppState;
+use crate::state::{AppState, RunningTask};
 use crate::workspaces::WorkspaceManager;
 
 use super::{
@@ -68,8 +69,8 @@ use super::{
     sweep_running_delegations_on_boot, try_claim_and_publish_completed_delegation,
 };
 use crate::delegation_tools::{
-    cancel_core, read_handoff_file_core, rpc_list, run_delegation_tool, status_core,
-    steer_subagent_core,
+    cancel_core, interrupt_subagent_core, read_handoff_file_core, rpc_list, run_delegation_tool,
+    status_core, steer_subagent_core,
 };
 use crate::{enqueue_session_input, SessionInputRequest};
 
@@ -137,6 +138,11 @@ async fn test_env() -> Option<TestEnv> {
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
         prompt_root: cwd.path().to_path_buf(),
+        pause_subagent_control_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        subagent_control_committed: Arc::new(tokio::sync::Notify::new()),
+        fail_subagent_control_reload_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )),
     };
     Some(TestEnv {
         state,
@@ -286,6 +292,1071 @@ async fn follow_up_to_idle_session_is_durably_queued_before_drive() {
     env.cleanup().await;
 }
 
+#[tokio::test]
+async fn exact_child_interrupt_and_combined_control_preserve_parent_and_sibling_scope() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "exact child control test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    create_parent(&env, project_id, "other_parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 3)
+        .await
+        .expect("create delegation");
+    for child in ["child_stop", "child_tool", "child_combined"] {
+        create_busy_subagent(
+            &env,
+            project_id,
+            "parent",
+            &delegation.id,
+            child,
+            "reviewer",
+            SubagentType::ReadOnly,
+        )
+        .await;
+    }
+
+    let stopped = crate::interrupt_session(&env.state, "child_stop")
+        .await
+        .expect("user Stop exact child succeeds");
+    assert_eq!(stopped["interrupted"], true);
+    assert!(!env
+        .state
+        .repo
+        .has_unfinished_actions("child_stop")
+        .await
+        .expect("stopped child action state"));
+    assert!(env
+        .state
+        .repo
+        .has_unfinished_actions("child_tool")
+        .await
+        .expect("model-controlled sibling remains"));
+    assert!(env
+        .state
+        .repo
+        .has_unfinished_actions("child_combined")
+        .await
+        .expect("combined-control sibling remains"));
+
+    let parent_stop = crate::interrupt_session(&env.state, "parent")
+        .await
+        .expect("user Stop parent is exact");
+    assert_eq!(parent_stop["ignored"], true);
+    assert!(env
+        .state
+        .repo
+        .has_unfinished_actions("child_tool")
+        .await
+        .expect("parent Stop must not cascade to child"));
+    assert!(env
+        .state
+        .repo
+        .has_unfinished_actions("child_combined")
+        .await
+        .expect("parent Stop must not cascade to sibling"));
+
+    let out_of_scope = interrupt_subagent_core(
+        &env.state,
+        "other_parent",
+        json!({ "subagent_id": "child_tool" }),
+    )
+    .await
+    .expect_err("another parent cannot interrupt this child");
+    assert_eq!(out_of_scope.code, "subagent_not_found");
+
+    let interrupted =
+        interrupt_subagent_core(&env.state, "parent", json!({ "subagent_id": "child_tool" }))
+            .await
+            .expect("exact child interrupt succeeds");
+    assert_eq!(interrupted["subagent_id"], "child_tool");
+    assert_eq!(interrupted["interrupted"], true);
+    assert!(!env
+        .state
+        .repo
+        .has_unfinished_actions("child_tool")
+        .await
+        .expect("tool-controlled child action state"));
+    assert!(env
+        .state
+        .repo
+        .has_unfinished_actions("child_combined")
+        .await
+        .expect("combined-control sibling remains"));
+    assert_eq!(
+        env.state
+            .repo
+            .get_delegation(&delegation.id)
+            .await
+            .expect("delegation")
+            .expect("delegation exists")
+            .status,
+        DelegationStatus::Running
+    );
+    assert!(env
+        .state
+        .repo
+        .session_exists("parent")
+        .await
+        .expect("parent still exists"));
+
+    let first = steer_subagent_core(
+        &env.state,
+        "parent",
+        json!({
+            "subagent_id": "child_combined",
+            "message": "stop the old work and check the retry",
+            "interrupt": true,
+            "client_control_id": "combined-once",
+        }),
+    )
+    .await
+    .expect("combined control succeeds");
+    assert_eq!(first["accepted"], true);
+    assert_eq!(first["interrupted"], true);
+    let first_input_id = first["input_id"].as_str().expect("input id").to_string();
+
+    let replay = steer_subagent_core(
+        &env.state,
+        "parent",
+        json!({
+            "subagent_id": "child_combined",
+            "message": "stop the old work and check the retry",
+            "interrupt": true,
+            "client_control_id": "combined-once",
+        }),
+    )
+    .await
+    .expect("combined retry is accepted");
+    assert_eq!(replay["input_id"], first_input_id);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(
+        replay["interrupted"], true,
+        "replay reports the durable historical interrupt outcome"
+    );
+
+    let conflict = steer_subagent_core(
+        &env.state,
+        "parent",
+        json!({
+            "subagent_id": "child_combined",
+            "message": "different text",
+            "interrupt": true,
+            "client_control_id": "combined-once",
+        }),
+    )
+    .await
+    .expect_err("conflicting client_control_id reuse is rejected");
+    assert_eq!(conflict.code, "client_control_id_conflict");
+
+    let history = env
+        .state
+        .repo
+        .active_branch("child_combined")
+        .await
+        .expect("child history");
+    let matching_messages = history
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.item,
+                TranscriptItem::UserMessage(message)
+                    if message.as_text() == Some("stop the old work and check the retry")
+            )
+        })
+        .count();
+    assert_eq!(
+        matching_messages, 1,
+        "combined retry must not duplicate text"
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn interrupt_only_replay_never_interrupts_newer_generation_or_queues_text() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "durable interrupt-only", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "interrupt_parent").await;
+    create_parent(&env, project_id, "interrupt_other_parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation(
+            "interrupt_parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            None,
+            2,
+        )
+        .await
+        .expect("create delegation");
+    create_busy_subagent(
+        &env,
+        project_id,
+        "interrupt_parent",
+        &delegation.id,
+        "interrupt_child",
+        "reviewer",
+        SubagentType::ReadOnly,
+    )
+    .await;
+    create_busy_subagent(
+        &env,
+        project_id,
+        "interrupt_parent",
+        &delegation.id,
+        "interrupt_sibling",
+        "reviewer",
+        SubagentType::ReadOnly,
+    )
+    .await;
+
+    let wrong_parent = interrupt_subagent_core(
+        &env.state,
+        "interrupt_other_parent",
+        json!({
+            "subagent_id": "interrupt_child",
+            "client_control_id": "lost-tool-call",
+        }),
+    )
+    .await
+    .expect_err("wrong parent cannot target child");
+    assert_eq!(wrong_parent.code, "subagent_not_found");
+
+    let first_tool_result = run_delegation_tool(
+        &env.state,
+        "interrupt_parent",
+        &ToolCall {
+            id: ToolCallId::new("call_interrupt"),
+            tool_name: "interrupt_subagent".to_string(),
+            args_json: json!({
+                "subagent_id": "interrupt_child",
+                "client_control_id": "provider-must-not-control-this",
+            })
+            .to_string(),
+        },
+    )
+    .await;
+    assert_eq!(
+        first_tool_result.status,
+        agent_vocab::ToolResultStatus::Success
+    );
+    let first: serde_json::Value =
+        serde_json::from_str(&first_tool_result.output).expect("interrupt result JSON");
+    assert_eq!(first["accepted"], true);
+    assert_eq!(first["phase"], "ready");
+    assert_eq!(first["interrupted"], true);
+    assert_eq!(first["queued"], false);
+    let input_id = first["input_id"].as_str().expect("control id").to_string();
+    assert!(env
+        .state
+        .repo
+        .has_unfinished_actions("interrupt_sibling")
+        .await
+        .expect("sibling remains live"));
+
+    let sibling_conflict = interrupt_subagent_core(
+        &env.state,
+        "interrupt_parent",
+        json!({
+            "subagent_id": "interrupt_sibling",
+            "client_control_id": "tool-call:call_interrupt",
+        }),
+    )
+    .await
+    .expect_err("delegation-scoped id cannot be reused for a sibling");
+    assert_eq!(sibling_conflict.code, "client_control_id_conflict");
+    assert!(env
+        .state
+        .repo
+        .has_unfinished_actions("interrupt_sibling")
+        .await
+        .expect("conflict does not interrupt sibling"));
+
+    env.state
+        .repo
+        .enqueue_user_input(
+            "interrupt_child",
+            InputPriority::FollowUp,
+            &UserMessage::text("generation B"),
+            Some("generation-b"),
+            None,
+        )
+        .await
+        .expect("enqueue newer generation");
+    let driver = SessionDriver::acquire(&env.state, "interrupt_child").await;
+    driver
+        .recover_if_needed()
+        .await
+        .expect("recover interrupted boundary");
+    driver
+        .drive_until_blocked()
+        .await
+        .expect("start generation B");
+    drop(driver);
+    let generation_b = env
+        .state
+        .repo
+        .pending_actions_for_dispatch("interrupt_child")
+        .await
+        .expect("load generation B");
+    assert_eq!(generation_b.len(), 1);
+    env.state
+        .repo
+        .mark_action_running_and_event(
+            "interrupt_child",
+            &generation_b[0].row_id,
+            &generation_b[0].attempt_id,
+            EventType::ModelRequested,
+        )
+        .await
+        .expect("mark generation B running");
+
+    let replay_tool_result = run_delegation_tool(
+        &env.state,
+        "interrupt_parent",
+        &ToolCall {
+            id: ToolCallId::new("call_interrupt"),
+            tool_name: "interrupt_subagent".to_string(),
+            args_json: json!({
+                "subagent_id": "interrupt_child",
+                "client_control_id": "another-provider-value",
+            })
+            .to_string(),
+        },
+    )
+    .await;
+    assert_eq!(
+        replay_tool_result.status,
+        agent_vocab::ToolResultStatus::Success
+    );
+    let replay: serde_json::Value =
+        serde_json::from_str(&replay_tool_result.output).expect("replay result JSON");
+    assert_eq!(replay["input_id"], input_id);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["phase"], "ready");
+    assert!(env
+        .state
+        .repo
+        .action_can_complete(
+            "interrupt_child",
+            &generation_b[0].row_id,
+            &generation_b[0].attempt_id,
+        )
+        .await
+        .expect("generation B remains current"));
+
+    env.state
+        .repo
+        .set_delegation_status(&delegation.id, DelegationStatus::Cancelled)
+        .await
+        .expect("make delegation terminal");
+    let terminal_replay_tool_result = run_delegation_tool(
+        &env.state,
+        "interrupt_parent",
+        &ToolCall {
+            id: ToolCallId::new("call_interrupt"),
+            tool_name: "interrupt_subagent".to_string(),
+            args_json: json!({
+                "subagent_id": "interrupt_child",
+            })
+            .to_string(),
+        },
+    )
+    .await;
+    assert_eq!(
+        terminal_replay_tool_result.status,
+        agent_vocab::ToolResultStatus::Success
+    );
+    let terminal_replay: serde_json::Value =
+        serde_json::from_str(&terminal_replay_tool_result.output)
+            .expect("terminal replay result JSON");
+    assert_eq!(terminal_replay["input_id"], input_id);
+    assert_eq!(terminal_replay["replayed"], true);
+    assert!(env
+        .state
+        .repo
+        .action_can_complete(
+            "interrupt_child",
+            &generation_b[0].row_id,
+            &generation_b[0].attempt_id,
+        )
+        .await
+        .expect("terminal replay still does not interrupt generation B"));
+
+    let history = env
+        .state
+        .repo
+        .active_branch("interrupt_child")
+        .await
+        .expect("load interrupt history");
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .filter(|entry| matches!(
+                entry.item,
+                TranscriptItem::TurnFinished {
+                    outcome: TurnOutcome::Interrupted,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "replay must not append a second interrupted boundary"
+    );
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .filter(|entry| matches!(
+                &entry.item,
+                TranscriptItem::UserMessage(message)
+                    if message.as_text() == Some("generation B")
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        history.entries.iter().all(|entry| {
+            !matches!(
+                &entry.item,
+                TranscriptItem::UserMessage(message)
+                    if message.as_text().is_some_and(|text| text.contains("call_interrupt"))
+            )
+        }),
+        "interrupt-only ledger identity must never be injected as text"
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn parent_control_task_aborted_after_commit_is_reconciled_by_detached_child_driver() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "detached combined control", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "detached_child").await;
+
+    let client_input_id = format!("subagent-control:{}:aborted-owner", delegation.id);
+    let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+    let owner_state = env.state.clone();
+    let owner_delegation_id = delegation.id.clone();
+    let owner_client_input_id = client_input_id.clone();
+    let owner = tokio::spawn(async move {
+        let queued = owner_state
+            .repo
+            .enqueue_scoped_subagent_steer(
+                "parent",
+                &owner_delegation_id,
+                "detached_child",
+                &UserMessage::text("continue after the durable interrupt"),
+                &owner_client_input_id,
+                true,
+            )
+            .await
+            .expect("enqueue combined control")
+            .expect("running delegation accepts control");
+        committed_tx
+            .send(queued.input_id)
+            .expect("signal committed input");
+        std::future::pending::<()>().await;
+    });
+    let input_id = committed_rx.await.expect("control commit observed");
+    owner.abort();
+    let _ = owner.await;
+
+    let pending = env
+        .state
+        .repo
+        .get_subagent_control_by_input_id("detached_child", &input_id)
+        .await
+        .expect("load pending control")
+        .expect("pending control exists");
+    assert_eq!(pending.phase, SubagentControlPhase::PendingInterrupt);
+    assert!(
+        env.state
+            .repo
+            .take_next_queued_input("detached_child")
+            .await
+            .expect("generic queue read")
+            .is_none(),
+        "generic driving cannot consume the parked combined message"
+    );
+
+    crate::spawn_drive_until_blocked(
+        &env.state,
+        "detached_child".to_string(),
+        "test.detached_combined_control",
+    );
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let control = env
+                .state
+                .repo
+                .get_subagent_control_by_input_id("detached_child", &input_id)
+                .await
+                .expect("load recovering control")
+                .expect("control remains durable");
+            if control.phase == SubagentControlPhase::Ready
+                && control.interrupted
+                && control.status == QueuedInputStatus::Consumed
+            {
+                break control;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached exact-child driver reconciles and consumes control");
+    assert_eq!(recovered.interrupt_outcome.as_deref(), Some("interrupted"));
+
+    let history = env
+        .state
+        .repo
+        .active_branch("detached_child")
+        .await
+        .expect("child history after reconciliation");
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.item,
+                    TranscriptItem::TurnFinished {
+                        outcome: TurnOutcome::Interrupted,
+                        ..
+                    }
+                )
+            })
+            .count(),
+        1,
+        "the captured old turn is interrupted exactly once"
+    );
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.item,
+                    TranscriptItem::UserMessage(message)
+                        if message.as_text() == Some("continue after the durable interrupt")
+                )
+            })
+            .count(),
+        1,
+        "the steer is driven exactly once after the interrupt phase"
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn restart_from_interrupt_applied_phase_does_not_repeat_interrupt() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "combined control crash recovery",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "crash_phase_child",
+    )
+    .await;
+
+    let queued = env
+        .state
+        .repo
+        .enqueue_scoped_subagent_steer(
+            "parent",
+            &delegation.id,
+            "crash_phase_child",
+            &UserMessage::text("drive after crash recovery"),
+            &format!("subagent-control:{}:crash-phase", delegation.id),
+            true,
+        )
+        .await
+        .expect("enqueue combined control")
+        .expect("running delegation accepts control");
+    let interrupted_leaf = "crash_phase_child_interrupted";
+    let interrupted_entry = TranscriptStorageNode {
+        id: interrupted_leaf.to_string(),
+        parent_id: Some("crash_phase_child_a".to_string()),
+        timestamp_ms: 4,
+        item: TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Interrupted,
+        },
+        provider_replay: Vec::new(),
+    };
+    env.state
+        .repo
+        .persist_outputs(
+            "crash_phase_child",
+            OutputBatch::new(&[interrupted_entry], Some(interrupted_leaf), &[], &[])
+                .with_control_interrupt(&queued.input_id),
+        )
+        .await
+        .expect("simulate crash after atomic interrupt commit");
+    let applied = env
+        .state
+        .repo
+        .get_subagent_control_by_input_id("crash_phase_child", &queued.input_id)
+        .await
+        .expect("load applied control")
+        .expect("control exists");
+    assert_eq!(applied.phase, SubagentControlPhase::InterruptApplied);
+    assert!(applied.interrupted);
+    assert!(
+        env.state
+            .repo
+            .take_next_queued_input("crash_phase_child")
+            .await
+            .expect("generic queue read")
+            .is_none(),
+        "the crash phase remains mailbox-blocking"
+    );
+
+    // Simulate process loss: no volatile session or task ownership survives.
+    env.state.active.lock().await.remove("crash_phase_child");
+    crate::spawn_drive_until_blocked(
+        &env.state,
+        "crash_phase_child".to_string(),
+        "test.interrupt_applied_recovery",
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let control = env
+                .state
+                .repo
+                .get_subagent_control_by_input_id("crash_phase_child", &queued.input_id)
+                .await
+                .expect("load recovered control")
+                .expect("control remains durable");
+            if control.phase == SubagentControlPhase::Ready
+                && control.status == QueuedInputStatus::Consumed
+            {
+                assert!(control.interrupted);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fresh child driver settles applied phase");
+
+    let history = env
+        .state
+        .repo
+        .active_branch("crash_phase_child")
+        .await
+        .expect("recovered history");
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.item,
+                    TranscriptItem::TurnFinished {
+                        outcome: TurnOutcome::Interrupted,
+                        ..
+                    }
+                )
+            })
+            .count(),
+        1,
+        "an interrupt_applied retry must not append another boundary"
+    );
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.item,
+                    TranscriptItem::UserMessage(message)
+                        if message.as_text() == Some("drive after crash recovery")
+                )
+            })
+            .count(),
+        1
+    );
+    tokio::task::yield_now().await;
+    drop(SessionDriver::acquire(&env.state, "ready_child").await);
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn combined_control_interrupts_complete_parallel_tool_generation_once() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "parallel control generation", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parallel_parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parallel_parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+
+    let first_call = ToolCall {
+        id: ToolCallId::from_u64(101),
+        tool_name: "Bash".to_string(),
+        args_json: r#"{"command":"sleep 10"}"#.to_string(),
+    };
+    let second_call = ToolCall {
+        id: ToolCallId::from_u64(102),
+        tool_name: "Grep".to_string(),
+        args_json: r#"{"pattern":"needle"}"#.to_string(),
+    };
+    let entries = vec![
+        TranscriptStorageNode {
+            id: "parallel_start".to_string(),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "parallel_user".to_string(),
+            parent_id: Some("parallel_start".to_string()),
+            timestamp_ms: 2,
+            item: TranscriptItem::UserMessage(UserMessage::text("run both")),
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "parallel_assistant".to_string(),
+            parent_id: Some("parallel_user".to_string()),
+            timestamp_ms: 3,
+            item: TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![
+                    AssistantItem::ToolCall(first_call.clone()),
+                    AssistantItem::ToolCall(second_call.clone()),
+                ],
+            }),
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "parallel_first_started".to_string(),
+            parent_id: Some("parallel_assistant".to_string()),
+            timestamp_ms: 4,
+            item: TranscriptItem::ToolCallStarted {
+                turn_id: TurnId(1),
+                tool_call: first_call.clone(),
+            },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "parallel_second_started".to_string(),
+            parent_id: Some("parallel_first_started".to_string()),
+            timestamp_ms: 5,
+            item: TranscriptItem::ToolCallStarted {
+                turn_id: TurnId(1),
+                tool_call: second_call.clone(),
+            },
+            provider_replay: Vec::new(),
+        },
+    ];
+    let actions = vec![
+        SessionAction::RequestTool {
+            action_id: ActionId(2),
+            turn_id: TurnId(1),
+            tool_call: first_call.clone(),
+        },
+        SessionAction::RequestTool {
+            action_id: ActionId(3),
+            turn_id: TurnId(1),
+            tool_call: second_call.clone(),
+        },
+    ];
+    env.state
+        .repo
+        .start_session_outputs_with_parent(
+            "parallel_child",
+            &session_config(&env, project_id, {
+                let mut metadata = subagent_test_metadata("implementer", SubagentType::Full);
+                metadata["harness"] = json!(true);
+                metadata
+            }),
+            &entries,
+            Some("parallel_second_started"),
+            &[],
+            &actions,
+            InputPriority::FollowUp,
+            &UserMessage::text("run both"),
+            None,
+            Some("parallel_parent"),
+            Some(SubagentType::Full),
+            Some(&delegation.id),
+        )
+        .await
+        .expect("create parallel child");
+    let attempts = env
+        .state
+        .repo
+        .pending_actions_for_dispatch("parallel_child")
+        .await
+        .expect("load parallel attempts");
+    assert_eq!(attempts.len(), 2);
+    for attempt in &attempts {
+        env.state
+            .repo
+            .mark_action_running_and_event(
+                "parallel_child",
+                &attempt.row_id,
+                &attempt.attempt_id,
+                EventType::ToolStarted,
+            )
+            .await
+            .expect("mark captured attempt running");
+        assert!(env
+            .state
+            .repo
+            .action_can_complete("parallel_child", &attempt.row_id, &attempt.attempt_id)
+            .await
+            .expect("captured attempt initially live"));
+    }
+
+    let client_input_id = format!("subagent-control:{}:parallel-tools", delegation.id);
+    let queued = env
+        .state
+        .repo
+        .enqueue_scoped_subagent_steer(
+            "parallel_parent",
+            &delegation.id,
+            "parallel_child",
+            &UserMessage::text("continue exactly once"),
+            &client_input_id,
+            true,
+        )
+        .await
+        .expect("enqueue combined control")
+        .expect("running delegation accepts control");
+    let captured = env
+        .state
+        .repo
+        .get_subagent_control_by_input_id("parallel_child", &queued.input_id)
+        .await
+        .expect("load captured generation")
+        .expect("control exists");
+    let mut expected_attempt_ids = attempts
+        .iter()
+        .map(|attempt| attempt.attempt_id.clone())
+        .collect::<Vec<_>>();
+    expected_attempt_ids.sort();
+    let mut captured_attempt_ids = captured.target_action_attempt_ids.clone();
+    captured_attempt_ids.sort();
+    assert_eq!(captured_attempt_ids, expected_attempt_ids);
+
+    // One captured sibling wins its completion race before reconciliation.
+    // The remaining captured sibling must still be interrupted rather than
+    // misclassified as a newer generation.
+    let first_result_leaf = "parallel_first_result";
+    let first_result = TranscriptStorageNode {
+        id: first_result_leaf.to_string(),
+        parent_id: Some("parallel_second_started".to_string()),
+        timestamp_ms: 6,
+        item: TranscriptItem::ToolResult(ToolResultMessage::success(
+            first_call.id.clone(),
+            first_call.tool_name.clone(),
+            "completed before reconciliation",
+        )),
+        provider_replay: Vec::new(),
+    };
+    env.state
+        .repo
+        .persist_outputs(
+            "parallel_child",
+            OutputBatch::new(&[first_result], Some(first_result_leaf), &[], &[])
+                .with_action_update(Some(ActionUpdate {
+                    row_id: attempts[0].row_id.clone(),
+                    attempt_id: attempts[0].attempt_id.clone(),
+                    status: ActionStatus::Completed,
+                    result: json!({ "completed": true }),
+                })),
+        )
+        .await
+        .expect("one parallel sibling completes before reconciliation");
+
+    let driver = SessionDriver::acquire(&env.state, "parallel_child").await;
+    driver
+        .reconcile_pending_subagent_controls()
+        .await
+        .expect("interrupt complete captured generation");
+    driver
+        .drive_until_blocked()
+        .await
+        .expect("consume ready steer once");
+    drop(driver);
+
+    for attempt in &attempts {
+        assert!(
+            !env.state
+                .repo
+                .action_can_complete("parallel_child", &attempt.row_id, &attempt.attempt_id)
+                .await
+                .expect("late completion fence"),
+            "every interrupted parallel attempt rejects late completion"
+        );
+    }
+    assert!(
+        env.state
+            .repo
+            .has_unfinished_actions("parallel_child")
+            .await
+            .expect("new generation remains"),
+        "the steer-created model generation must remain live and un-interrupted"
+    );
+    let settled = env
+        .state
+        .repo
+        .get_subagent_control_by_input_id("parallel_child", &queued.input_id)
+        .await
+        .expect("load settled control")
+        .expect("control remains durable");
+    assert_eq!(settled.phase, SubagentControlPhase::Ready);
+    assert_eq!(settled.status, QueuedInputStatus::Consumed);
+
+    let history = env
+        .state
+        .repo
+        .active_branch("parallel_child")
+        .await
+        .expect("load valid interrupted history");
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.item, TranscriptItem::ToolResult(_)))
+            .count(),
+        2,
+        "both open parallel tool calls receive synthesized results"
+    );
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .filter(|entry| matches!(
+                entry.item,
+                TranscriptItem::TurnFinished {
+                    outcome: TurnOutcome::Interrupted,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .filter(|entry| matches!(
+                &entry.item,
+                TranscriptItem::UserMessage(message)
+                    if message.as_text() == Some("continue exactly once")
+            ))
+            .count(),
+        1
+    );
+
+    let newer = env
+        .state
+        .repo
+        .pending_actions_for_dispatch("parallel_child")
+        .await
+        .expect("load post-steer generation");
+    assert_eq!(newer.len(), 1);
+    crate::harness_model_complete(
+        &env.state,
+        json!({
+            "session_id": "parallel_child",
+            "action_row_id": newer[0].row_id,
+            "assistant": { "items": [{ "type": "text", "text": "done" }] },
+        }),
+    )
+    .await
+    .expect("genuinely newer generation completes normally");
+    complete_delegation_if_ready(&env.state, &delegation.id)
+        .await
+        .expect("barrier runs after settled steer");
+    assert_eq!(
+        env.state
+            .repo
+            .get_delegation(&delegation.id)
+            .await
+            .expect("load completed delegation")
+            .expect("delegation exists")
+            .status,
+        DelegationStatus::Done
+    );
+
+    env.cleanup().await;
+}
+
 /// Create a delegation subagent whose durable transcript carries one assistant turn
 /// finished with `outcome`, then settle it terminal (no queued input, no
 /// unfinished action) so the all-terminal predicate sees it as done.
@@ -377,16 +1448,23 @@ async fn create_running_subagent(
     let boundary = format!("{session_id}_finish");
     let entries = vec![
         TranscriptStorageNode {
-            id: format!("{session_id}_u"),
+            id: format!("{session_id}_start"),
             parent_id: None,
             timestamp_ms: 1,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: format!("{session_id}_u"),
+            parent_id: Some(format!("{session_id}_start")),
+            timestamp_ms: 2,
             item: TranscriptItem::UserMessage(UserMessage::text("keep working")),
             provider_replay: Vec::new(),
         },
         TranscriptStorageNode {
             id: mid_turn.clone(),
             parent_id: Some(format!("{session_id}_u")),
-            timestamp_ms: 2,
+            timestamp_ms: 3,
             item: TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text("working...".to_string())],
             }),
@@ -395,7 +1473,7 @@ async fn create_running_subagent(
         TranscriptStorageNode {
             id: boundary.clone(),
             parent_id: Some(mid_turn.clone()),
-            timestamp_ms: 3,
+            timestamp_ms: 4,
             item: TranscriptItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome,
@@ -415,7 +1493,12 @@ async fn create_running_subagent(
             &entries,
             Some(&mid_turn),
             &[],
-            &[],
+            &[SessionAction::RequestModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                model_context: ModelContext::new(),
+                context_leaf_id: Some(mid_turn.clone()),
+            }],
             InputPriority::FollowUp,
             &UserMessage::text("keep working"),
             None,
@@ -425,8 +1508,13 @@ async fn create_running_subagent(
         )
         .await
         .expect("create running subagent");
-    // The active leaf is the assistant message — a non-boundary, so the subagent
-    // is NON-terminal even though it has no queued input or unfinished action.
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    driver
+        .ensure_active_loaded_preserving_open_turn()
+        .await
+        .expect("load live running subagent");
+    // The active leaf is the assistant message and the model action is still
+    // unfinished, so this is a valid busy, non-terminal subagent fixture.
     assert!(!env
         .state
         .repo
@@ -500,6 +1588,7 @@ fn assert_delegation_tools_visible(names: &[String]) {
     assert!(names.contains(&"inspect_delegation".to_string()));
     assert!(names.contains(&"cancel_delegation".to_string()));
     assert!(names.contains(&"steer_subagent".to_string()));
+    assert!(names.contains(&"interrupt_subagent".to_string()));
 }
 
 fn assert_delegation_tools_hidden(names: &[String]) {
@@ -509,6 +1598,7 @@ fn assert_delegation_tools_hidden(names: &[String]) {
     assert!(!names.contains(&"inspect_delegation".to_string()));
     assert!(!names.contains(&"cancel_delegation".to_string()));
     assert!(!names.contains(&"steer_subagent".to_string()));
+    assert!(!names.contains(&"interrupt_subagent".to_string()));
 }
 
 #[tokio::test]
@@ -708,16 +1798,23 @@ async fn create_busy_subagent(
     let active_leaf = format!("{session_id}_a");
     let entries = vec![
         TranscriptStorageNode {
-            id: format!("{session_id}_u"),
+            id: format!("{session_id}_start"),
             parent_id: None,
             timestamp_ms: 1,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: format!("{session_id}_u"),
+            parent_id: Some(format!("{session_id}_start")),
+            timestamp_ms: 2,
             item: TranscriptItem::UserMessage(UserMessage::text("keep working")),
             provider_replay: Vec::new(),
         },
         TranscriptStorageNode {
             id: active_leaf.clone(),
             parent_id: Some(format!("{session_id}_u")),
-            timestamp_ms: 2,
+            timestamp_ms: 3,
             item: TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text("working...".to_string())],
             }),
@@ -752,6 +1849,11 @@ async fn create_busy_subagent(
         )
         .await
         .expect("create busy subagent");
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    driver
+        .ensure_active_loaded_preserving_open_turn()
+        .await
+        .expect("load live busy subagent runtime");
     assert_eq!(
         env.state.repo.activity(session_id).await.expect("activity"),
         agent_store::SessionActivity::Running
@@ -761,6 +1863,12 @@ async fn create_busy_subagent(
 /// Settle a subagent created by `create_running_subagent` terminal by switching
 /// its active leaf to the pre-attached `TurnFinished` boundary node.
 async fn settle_subagent_terminal(env: &TestEnv, session_id: &str, boundary_leaf: &str) {
+    env.state
+        .repo
+        .cancel_unfinished_session_work(session_id, "test settled")
+        .await
+        .expect("settle action");
+    env.state.active.lock().await.remove(session_id);
     env.state
         .repo
         .set_active_leaf(session_id, Some(boundary_leaf))
@@ -1753,7 +2861,8 @@ async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
             tool_name: "steer_subagent".to_string(),
             args_json: json!({
                 "subagent_id": "impl_busy",
-                "message": "Please also update the docs."
+                "message": "Please also update the docs.",
+                "client_control_id": "provider-must-not-control-this",
             })
             .to_string(),
         },
@@ -1776,6 +2885,13 @@ async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
     let queued = &queue.queued_inputs[0];
     assert_eq!(queued.priority, InputPriority::Steer);
     assert_eq!(queued.status, QueuedInputStatus::Queued);
+    let expected_client_input_id =
+        format!("subagent-control:{}:tool-call:call_steer", delegation.id);
+    assert_eq!(
+        queued.client_input_id.as_deref(),
+        Some(expected_client_input_id.as_str()),
+        "model dispatch unconditionally derives the ledger key from the tool-call id"
+    );
     assert_eq!(
         queued.content.as_text(),
         Some("Please also update the docs.")
@@ -1881,6 +2997,85 @@ async fn websocket_delegation_steer_subagent_uses_parent_scope() {
     .expect("parent-scoped websocket steer succeeds");
     assert_eq!(result["subagent_id"], "readonly_busy");
     assert_eq!(result["queued"], true);
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn model_and_websocket_steers_share_one_durable_subagent_mailbox() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "shared steer mailbox test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
+
+    let model_call = ToolCall {
+        id: ToolCallId::new("call_model_steer"),
+        tool_name: "steer_subagent".to_string(),
+        args_json: json!({
+            "subagent_id": "impl_busy",
+            "message": "instruction from the parent model"
+        })
+        .to_string(),
+    };
+    let (model_result, web_result) = tokio::join!(
+        run_delegation_tool(&env.state, "parent", &model_call),
+        crate::delegation_tools::rpc_steer_subagent(
+            &env.state,
+            json!({
+                "parent_session_id": "parent",
+                "subagent_id": "impl_busy",
+                "message": "instruction from the user transcript"
+            }),
+        ),
+    );
+
+    assert_eq!(model_result.status, agent_vocab::ToolResultStatus::Success);
+    let model_output: serde_json::Value =
+        serde_json::from_str(&model_result.output).expect("model steer output JSON");
+    let web_output = web_result.expect("websocket steer succeeds");
+    assert_eq!(model_output["queued"], true);
+    assert!(model_output["input_id"].as_str().is_some());
+    assert_eq!(web_output["queued"], true);
+    assert!(web_output["input_id"].as_str().is_some());
+    assert_ne!(model_output["input_id"], web_output["input_id"]);
+
+    let queue = env
+        .state
+        .repo
+        .queue_state("impl_busy")
+        .await
+        .expect("shared mailbox state");
+    assert_eq!(queue.queued_inputs.len(), 2);
+    assert!(queue
+        .queued_inputs
+        .iter()
+        .all(|input| input.priority == InputPriority::Steer));
+    let messages = queue
+        .queued_inputs
+        .iter()
+        .filter_map(|input| input.content.as_text())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        messages,
+        std::collections::BTreeSet::from([
+            "instruction from the parent model",
+            "instruction from the user transcript",
+        ])
+    );
 
     env.cleanup().await;
 }
@@ -2166,7 +3361,443 @@ async fn queued_work_on_boundary_subagent_reports_running_and_steerable() {
 }
 
 #[tokio::test]
-async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_it() {
+async fn boundary_controls_settle_without_double_boundary_and_keep_mailbox_live() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "boundary control matrix", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 4)
+        .await
+        .expect("create delegation");
+
+    for (child, combined, boundary_action) in [
+        ("combined_no_action", true, false),
+        ("combined_boundary_action", true, true),
+        ("interrupt_no_action", false, false),
+        ("interrupt_boundary_action", false, true),
+    ] {
+        create_terminal_subagent(
+            &env,
+            project_id,
+            "parent",
+            &delegation.id,
+            child,
+            "reviewer",
+            SubagentType::ReadOnly,
+            TurnOutcome::Graceful,
+            "Ready for more work.",
+        )
+        .await;
+        let mut config = env
+            .state
+            .repo
+            .load_session_config(child)
+            .await
+            .expect("load child config");
+        config.metadata["harness"] = json!(true);
+        env.state
+            .repo
+            .configure_session(child, &config)
+            .await
+            .expect("make post-control model dispatch deterministic");
+        let ordinary_key = format!("{child}-ordinary");
+        env.state
+            .repo
+            .enqueue_user_input(
+                child,
+                InputPriority::FollowUp,
+                &UserMessage::text(format!("ordinary work for {child}")),
+                Some(&ordinary_key),
+                None,
+            )
+            .await
+            .expect("queue work on boundary child");
+
+        let boundary_job = if boundary_action {
+            let created = env
+                .state
+                .repo
+                .create_compaction_action(child, CompactionTrigger::Manual)
+                .await
+                .expect("create boundary-hosted compaction action");
+            let action_row_id = created.job.action_row_id.clone();
+            env.state.tasks.lock().expect("task registry").insert(
+                action_row_id.clone(),
+                RunningTask {
+                    session_id: child.to_string(),
+                    action_row_id,
+                    kind: ActionKind::Compaction,
+                    handle: tokio::spawn(std::future::pending()),
+                },
+            );
+            Some(created.job)
+        } else {
+            None
+        };
+
+        let result = if combined {
+            steer_subagent_core(
+                &env.state,
+                "parent",
+                json!({
+                    "subagent_id": child,
+                    "message": format!("priority control for {child}"),
+                    "interrupt": true,
+                    "client_control_id": format!("{child}-control"),
+                }),
+            )
+            .await
+            .expect("combined boundary control")
+        } else {
+            interrupt_subagent_core(
+                &env.state,
+                "parent",
+                json!({
+                    "subagent_id": child,
+                    "client_control_id": format!("{child}-control"),
+                }),
+            )
+            .await
+            .expect("interrupt-only boundary control")
+        };
+        assert_eq!(result["accepted"], true);
+        assert_eq!(result["phase"], "ready");
+        assert_eq!(result["interrupted"], boundary_action);
+        assert_eq!(
+            result["interrupt_outcome"],
+            if boundary_action {
+                json!("interrupted")
+            } else {
+                json!("already_between_turns")
+            }
+        );
+        assert_eq!(
+            result["queued"], false,
+            "the control ledger/message must make progress"
+        );
+
+        let input_id = result["input_id"].as_str().expect("control input id");
+        let control = env
+            .state
+            .repo
+            .get_subagent_control_by_input_id(child, input_id)
+            .await
+            .expect("load settled control")
+            .expect("control remains durable");
+        assert_eq!(control.phase, SubagentControlPhase::Ready);
+        assert_eq!(control.status, QueuedInputStatus::Consumed);
+        assert_eq!(control.interrupted, boundary_action);
+        if let Some(job) = boundary_job {
+            assert!(
+                !env.state
+                    .repo
+                    .action_can_complete(child, &job.action_row_id, &job.attempt_id)
+                    .await
+                    .expect("boundary action completion fence"),
+                "the captured boundary action generation is no longer completable"
+            );
+        }
+
+        let ordinary = env
+            .state
+            .repo
+            .find_client_input(child, &ordinary_key)
+            .await
+            .expect("load ordinary queued work")
+            .expect("ordinary work remains recorded");
+        assert_eq!(
+            ordinary.status,
+            if combined {
+                QueuedInputStatus::Queued
+            } else {
+                QueuedInputStatus::Consumed
+            },
+            "combined text runs ahead of normal follow-ups; interrupt-only unblocks them"
+        );
+        assert!(
+            env.state
+                .repo
+                .has_unfinished_actions(child)
+                .await
+                .expect("new generation state"),
+            "the next accepted mailbox item starts normally instead of wedging"
+        );
+
+        let history = env
+            .state
+            .repo
+            .active_branch(child)
+            .await
+            .expect("load valid child transcript");
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry.item,
+                    TranscriptItem::TurnFinished {
+                        outcome: TurnOutcome::Graceful,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry.item,
+                    TranscriptItem::TurnFinished {
+                        outcome: TurnOutcome::Interrupted,
+                        ..
+                    }
+                ))
+                .count(),
+            0,
+            "interrupting boundary-hosted work must not append a second turn boundary"
+        );
+        AgentSession::from_stored_session_preserving_open_turn(
+            env.state
+                .repo
+                .load_stored_session(child)
+                .await
+                .expect("load stored child transcript"),
+        )
+        .expect("the resulting transcript remains structurally valid");
+        tokio::task::yield_now().await;
+        drop(SessionDriver::acquire(&env.state, child).await);
+    }
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn aborted_ready_steer_tool_future_is_recovered_by_live_control_sweep() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "ready steer live recovery", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "ready_child",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "Waiting.",
+    )
+    .await;
+    let mut config = env
+        .state
+        .repo
+        .load_session_config("ready_child")
+        .await
+        .expect("load child config");
+    config.metadata["harness"] = json!(true);
+    env.state
+        .repo
+        .configure_session("ready_child", &config)
+        .await
+        .expect("configure harness child");
+    env.state
+        .repo
+        .enqueue_user_input(
+            "ready_child",
+            InputPriority::FollowUp,
+            &UserMessage::text("normal follow-up"),
+            Some("normal-follow-up"),
+            None,
+        )
+        .await
+        .expect("keep boundary child active");
+
+    env.state
+        .pause_subagent_control_after_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let committed_signal = env.state.subagent_control_committed.notified();
+    let state = env.state.clone();
+    let owner = tokio::spawn(async move {
+        steer_subagent_core(
+            &state,
+            "parent",
+            json!({
+                "subagent_id": "ready_child",
+                "message": "accepted before parent abort",
+                "client_control_id": "ready-abort",
+            }),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), committed_signal)
+        .await
+        .expect("actual steer future reached durable commit");
+    let client_input_id = format!("subagent-control:{}:ready-abort", delegation.id);
+    let committed = env
+        .state
+        .repo
+        .get_scoped_subagent_control(
+            "ready_child",
+            &client_input_id,
+            "parent",
+            &delegation.id,
+            &UserMessage::text("accepted before parent abort"),
+            false,
+        )
+        .await
+        .expect("load committed control")
+        .expect("commit notification follows durable enqueue");
+    assert_eq!(committed.phase, SubagentControlPhase::Ready);
+    assert_eq!(committed.status, QueuedInputStatus::Queued);
+    owner.abort();
+    let _ = owner.await;
+    env.state
+        .pause_subagent_control_after_commit
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    crate::sweep_pending_subagent_controls_once(&env.state)
+        .await
+        .expect("bounded live sweep recovers ready steer");
+    let recovered = env
+        .state
+        .repo
+        .get_subagent_control_by_input_id("ready_child", &committed.input_id)
+        .await
+        .expect("load recovered ready control")
+        .expect("control remains durable");
+    assert_eq!(recovered.phase, SubagentControlPhase::Ready);
+    assert_eq!(recovered.status, QueuedInputStatus::Consumed);
+    assert!(env
+        .state
+        .repo
+        .has_unfinished_actions("ready_child")
+        .await
+        .expect("steer-created generation"));
+    let normal = env
+        .state
+        .repo
+        .find_client_input("ready_child", "normal-follow-up")
+        .await
+        .expect("load normal follow-up")
+        .expect("normal follow-up remains recorded");
+    assert_eq!(
+        normal.status,
+        QueuedInputStatus::Queued,
+        "recovered scoped steer keeps steer priority"
+    );
+    let history = env
+        .state
+        .repo
+        .active_branch("ready_child")
+        .await
+        .expect("load recovered transcript");
+    assert_eq!(
+        history
+            .entries
+            .iter()
+            .filter(|entry| matches!(
+                &entry.item,
+                TranscriptItem::UserMessage(message)
+                    if message.as_text() == Some("accepted before parent abort")
+            ))
+            .count(),
+        1
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn interrupt_only_status_reload_failure_returns_accepted_fallback() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "interrupt accepted fallback", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "fallback_child").await;
+    env.state
+        .fail_subagent_control_reload_after_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let result = interrupt_subagent_core(
+        &env.state,
+        "parent",
+        json!({
+            "subagent_id": "fallback_child",
+            "client_control_id": "reload-failure",
+        }),
+    )
+    .await
+    .expect("a postcommit reload failure cannot reject a durable interrupt");
+    assert_eq!(result["accepted"], true);
+    assert_eq!(result["drive_status"], "pending");
+    assert_eq!(result["phase"], "pending_interrupt");
+    assert_eq!(result["interrupted"], serde_json::Value::Null);
+    assert!(result["drive_error"]
+        .as_str()
+        .expect("fallback diagnostic")
+        .contains("injected accepted-control status reload failure"));
+    let control = env
+        .state
+        .repo
+        .get_scoped_subagent_interrupt(
+            "fallback_child",
+            &format!("subagent-control:{}:reload-failure", delegation.id),
+            "parent",
+            &delegation.id,
+        )
+        .await
+        .expect("reload durable interrupt after injected failure")
+        .expect("interrupt remains accepted");
+    assert_eq!(control.phase, SubagentControlPhase::Ready);
+    assert_eq!(control.status, QueuedInputStatus::Consumed);
+    assert!(control.interrupted);
+    tokio::task::yield_now().await;
+    drop(SessionDriver::acquire(&env.state, "fallback_child").await);
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn steer_subagent_rejects_idle_terminal_subagent_without_reactivating_it() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -2184,22 +3815,30 @@ async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_i
         .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
         .await
         .expect("create delegation");
-    let active_leaf = "ro_idle_a";
+    let active_leaf = "ro_idle_finish";
     let entries = vec![
         TranscriptStorageNode {
-            id: "ro_idle_u".to_string(),
+            id: "ro_idle_start".to_string(),
             parent_id: None,
             timestamp_ms: 1,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "ro_idle_u".to_string(),
+            parent_id: Some("ro_idle_start".to_string()),
+            timestamp_ms: 2,
             item: TranscriptItem::UserMessage(UserMessage::text("keep working")),
             provider_replay: Vec::new(),
         },
         TranscriptStorageNode {
             id: active_leaf.to_string(),
             parent_id: Some("ro_idle_u".to_string()),
-            timestamp_ms: 2,
-            item: TranscriptItem::AssistantMessage(AssistantMessage {
-                items: vec![AssistantItem::Text("mid turn".to_string())],
-            }),
+            timestamp_ms: 3,
+            item: TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
             provider_replay: Vec::new(),
         },
     ];
@@ -2225,12 +3864,12 @@ async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_i
         )
         .await
         .expect("create idle nonterminal subagent");
-    assert!(!env
+    assert!(env
         .state
         .repo
         .active_leaf_is_turn_boundary("ro_idle")
         .await
-        .expect("nonterminal"));
+        .expect("terminal boundary"));
     assert_eq!(
         env.state.repo.activity("ro_idle").await.expect("activity"),
         agent_store::SessionActivity::Idle
@@ -2242,8 +3881,8 @@ async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_i
         json!({ "subagent_id": "ro_idle", "message": "one more thing" }),
     )
     .await
-    .expect_err("idle nonterminal subagent rejected");
-    assert_eq!(error.code, "subagent_not_running");
+    .expect_err("idle terminal subagent rejected");
+    assert_eq!(error.code, "delegation_not_running");
     assert!(env
         .state
         .repo
@@ -2337,6 +3976,88 @@ async fn steer_subagent_rejects_terminal_or_cancelled_delegations() {
 }
 
 #[tokio::test]
+async fn terminal_historical_control_replays_without_recovering_child() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "terminal control replay", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "terminal_replay_child",
+    )
+    .await;
+    let first = steer_subagent_core(
+        &env.state,
+        "parent",
+        json!({
+            "subagent_id": "terminal_replay_child",
+            "message": "remember this accepted control",
+            "client_control_id": "terminal-replay",
+        }),
+    )
+    .await
+    .expect("accept control while delegation runs");
+    assert_eq!(first["accepted"], true);
+    assert_eq!(first["replayed"], false);
+
+    // Wait behind any detached driver spawned by the accepted call, then make
+    // the durable scope terminal and discard all volatile child state.
+    tokio::task::yield_now().await;
+    drop(SessionDriver::acquire(&env.state, "terminal_replay_child").await);
+    env.state
+        .repo
+        .set_delegation_status(&delegation.id, DelegationStatus::Done)
+        .await
+        .expect("mark delegation terminal");
+    env.state
+        .active
+        .lock()
+        .await
+        .remove("terminal_replay_child");
+
+    let replay = steer_subagent_core(
+        &env.state,
+        "parent",
+        json!({
+            "subagent_id": "terminal_replay_child",
+            "message": "remember this accepted control",
+            "client_control_id": "terminal-replay",
+        }),
+    )
+    .await
+    .expect("historical terminal replay remains readable");
+    assert_eq!(replay["accepted"], true);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["input_id"], first["input_id"]);
+    assert!(
+        !env.state
+            .active
+            .lock()
+            .await
+            .contains_key("terminal_replay_child"),
+        "terminal replay returns before child recovery/reactivation"
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
 async fn cancel_delegation_returns_transcript_only_paths() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -2367,6 +4088,20 @@ async fn cancel_delegation_returns_transcript_only_paths() {
         )
         .await
         .expect("queue follow-up before cancellation");
+    let pending_control = env
+        .state
+        .repo
+        .enqueue_scoped_subagent_steer(
+            "parent",
+            &delegation.id,
+            "impl_to_cancel",
+            &UserMessage::text("pending combined control to settle"),
+            &format!("subagent-control:{}:cancel-pending", delegation.id),
+            true,
+        )
+        .await
+        .expect("enqueue pending combined control")
+        .expect("running delegation accepts pending control");
 
     let result = cancel_core(
         &env.state,
@@ -2497,12 +4232,26 @@ async fn cancel_delegation_returns_transcript_only_paths() {
         .queue_state("impl_to_cancel")
         .await
         .expect("queue state after cancellation");
-    assert_eq!(queue.queued_inputs.len(), 1);
-    assert_eq!(queue.queued_inputs[0].status, QueuedInputStatus::Queued);
-    assert_eq!(
-        queue.queued_inputs[0].content.as_text(),
-        Some("queued work that must not run after cancellation")
+    assert!(
+        queue.queued_inputs.is_empty(),
+        "whole-delegation cancellation settles every active child input"
     );
+    let cancelled_control = env
+        .state
+        .repo
+        .get_subagent_control_by_input_id("impl_to_cancel", &pending_control.input_id)
+        .await
+        .expect("load cancelled control")
+        .expect("control ledger retained");
+    assert_eq!(cancelled_control.status, QueuedInputStatus::Cancelled);
+    assert_eq!(cancelled_control.phase, SubagentControlPhase::Cancelled);
+    assert!(!env
+        .state
+        .repo
+        .sessions_with_recoverable_subagent_controls()
+        .await
+        .expect("pending control sessions after cancellation")
+        .contains(&"impl_to_cancel".to_string()));
 
     env.cleanup().await;
 }
@@ -3610,8 +5359,10 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
     // that died mid-task and was recovered to a boundary would appear.
     settle_subagent_terminal(&env, "still_running", &boundary_leaf).await;
 
-    // Now all terminal -> exactly one wakeup observation, done_with_failures,
-    // handoff for all.
+    // Now all terminal -> exactly one durable wakeup publication,
+    // done_with_failures, and handoff for all. The parent may still be busy
+    // with the earlier partial-progress observation, so the final observation
+    // can legitimately remain queued rather than already be in its transcript.
     complete_delegation_if_ready(&env.state, &delegation.id)
         .await
         .expect("barrier (complete)");
@@ -3626,7 +5377,9 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
         DelegationStatus::DoneWithFailures
     );
     assert_eq!(
-        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        durable_parent_wakeup_observation_events(&env, "parent", &delegation)
+            .await
+            .len(),
         1
     );
 
@@ -3637,7 +5390,9 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
         .expect("barrier (replay)");
     sweep_running_delegations_on_boot(&env.state).await;
     assert_eq!(
-        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        durable_parent_wakeup_observation_events(&env, "parent", &delegation)
+            .await
+            .len(),
         1
     );
 
@@ -3647,9 +5402,8 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
     let root = handoff_root(&env, &delegation.id);
     assert!(!root.join("index.json").exists());
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
-    let wakeup_observations = parent_completion_observations(&env, "parent", &delegation.id).await;
-    assert_eq!(wakeup_observations.len(), 1);
-    let wakeup_observation = &wakeup_observations[0];
+    let wakeup_observation =
+        published_parent_completion_observation(&env, "parent", &delegation).await;
     assert_eq!(wakeup_observation.tool_name, "inspect_delegation");
     assert_eq!(
         wakeup_observation.args_json,
@@ -3813,7 +5567,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .iter()
         .find(|subagent| subagent["id"] == "running_child")
         .unwrap();
-    assert_eq!(running["activity"], "idle");
+    assert_eq!(running["activity"], "running");
     assert_eq!(running["status"], "running");
     assert_eq!(running["outcome"], serde_json::Value::Null);
     assert_eq!(running["final_message_file"], serde_json::Value::Null);
@@ -3857,7 +5611,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .find(|subagent| subagent["id"] == "running_child")
         .unwrap();
     assert_eq!(listed_running["status"], "running");
-    assert_eq!(listed_running["activity"], "idle");
+    assert_eq!(listed_running["activity"], "running");
     assert_eq!(listed_running["outcome"], serde_json::Value::Null);
     assert_eq!(listed_running["transcript_file"], serde_json::Value::Null);
     assert_list_subagent_has_only_compact_fields(listed_running);
@@ -4287,6 +6041,18 @@ async fn stale_attempt_id_cannot_finish_delegation() {
         .create_delegation("parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "impl",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "Done.",
+    )
+    .await;
 
     // The real attempt_id wins exactly once.
     assert!(env
@@ -4586,6 +6352,49 @@ async fn durable_parent_wakeup_observation_events(
         })
         .map(|event| event.data)
         .collect()
+}
+
+async fn published_parent_completion_observation(
+    env: &TestEnv,
+    parent_id: &str,
+    delegation: &Delegation,
+) -> DaemonToolObservation {
+    let transcript_observations =
+        parent_completion_observations(env, parent_id, &delegation.id).await;
+    if !transcript_observations.is_empty() {
+        assert_eq!(
+            transcript_observations.len(),
+            1,
+            "completion observation must be consumed at most once"
+        );
+        return transcript_observations[0].clone();
+    }
+
+    let client_input_id = delegation_wakeup_client_input_id(delegation);
+    let queue = env
+        .state
+        .repo
+        .queue_state(parent_id)
+        .await
+        .expect("parent queue");
+    queue
+        .queued_inputs
+        .into_iter()
+        .find_map(|input| {
+            if input.client_input_id.as_deref() != Some(client_input_id.as_str()) {
+                return None;
+            }
+            match input.content {
+                QueuedInputContent::DaemonToolObservation(observation) => Some(observation),
+                QueuedInputContent::UserMessage(_) => {
+                    panic!("delegation wakeup must remain a typed daemon observation")
+                }
+                QueuedInputContent::SubagentControl => {
+                    panic!("delegation wakeup must not be a child control marker")
+                }
+            }
+        })
+        .expect("completion observation is either consumed or durably queued")
 }
 
 fn assert_minimal_wakeup_event_payload(payload: &serde_json::Value, client_input_id: &str) {
@@ -5002,8 +6811,9 @@ async fn terminal_delegation_member_yields_zero_parent_idle_rows() {
 }
 
 /// Server-side guard: raw `session.input` with `priority=steer` is not a
-/// subagent-control surface. Parents must use the scoped `steer_subagent` tool
-/// so the daemon can verify parent/delegation membership and running state.
+/// subagent-control surface.
+/// Parents must use the scoped `steer_subagent` tool so the daemon can verify
+/// parent/delegation membership and running state.
 #[tokio::test]
 async fn raw_session_input_steer_to_any_subagent_is_rejected_server_side() {
     let Some(env) = test_env().await else {

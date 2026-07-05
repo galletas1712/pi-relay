@@ -7,6 +7,7 @@ import remarkGfm from "remark-gfm";
 import { createAgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
 import { Composer, type ComposerHandle } from "./composer.tsx";
+import { routeComposerSubmission, type ComposerSubmission } from "./composerRouting.ts";
 import { CompactHistoryPickerDialog } from "./historyPickerCompact.tsx";
 import { type HistoryTargetOption } from "./historyTargets.ts";
 import { ExportDialog } from "./exportDialog.tsx";
@@ -16,8 +17,9 @@ import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
 import { isDelegationRunning, reRunParamsForDelegation, subagentHasNonEmptyPromptFile } from "./delegationBoard.ts";
 import type { ConnectionStatus } from "./rpc.ts";
-import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
+import { COMMANDS, findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
+import { stopSession } from "./stopSession.ts";
 import { markdownComponents } from "./transcript.tsx";
 import {
 	mergeSnapshotIntoSessionList,
@@ -1567,21 +1569,22 @@ export function App() {
 	}, []);
 
 	const queueUserInput = useCallback(
-		async (text: string) => {
-			const sessionId = requireSelected();
-			if (!loadedSnapshot && selectedRef.current === sessionId) {
-				throw new Error("session is still loading");
-			}
-			if (selectedSession && isArchivedSession(selectedSession)) {
-				const current = loadedSnapshot?.session_id === sessionId ? loadedSnapshot : (await refreshSelected(sessionId))?.snapshot;
-				if ((current?.activity ?? selectedSession.activity) !== "idle") {
+		async (
+			sessionId: string,
+			text: string,
+			snapshot: SessionSnapshot,
+			clientInputId: string,
+		) => {
+			if (isArchivedSession(snapshot)) {
+				const current = snapshot;
+				if (current.activity !== "idle") {
 					throw new Error("only idle archived sessions can be resumed");
 				}
-				const metadata = { ...(current?.metadata ?? selectedSession.metadata) };
+				const metadata = { ...current.metadata };
 				delete metadata.archived;
 				const result = await api.configureSession({
 					sessionId,
-					provider: current?.provider ?? selectedSession.provider,
+					provider: current.provider,
 					metadata,
 				});
 				patchSessionListMetadata(queryClient, selectedProjectRef.current, sessionId, {}, ["archived"]);
@@ -1592,72 +1595,65 @@ export function App() {
 				}));
 				invalidateSessionList();
 			}
-			const clientInputId = randomId("web_input");
 			const content = textContent(text);
-			try {
-				const result = await api.queueFollowUp({
-					sessionId,
-					clientInputId,
-					expectedActiveLeafId: loadedSnapshot?.activity === "idle" ? (loadedSnapshot.active_leaf_id ?? null) : undefined,
-					baseLeafId: selectedBaseLeafId(selectedCacheRef.current, sessionId, loadedSnapshot?.active_leaf_id ?? null),
-					content,
-				});
-				if (result.queue) {
-					updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue!));
-				}
-				if (result.queued) {
-					invalidateSessionList();
+			const result = await api.queueFollowUp({
+				sessionId,
+				clientInputId,
+				expectedActiveLeafId: snapshot.activity === "idle" ? (snapshot.active_leaf_id ?? null) : undefined,
+				baseLeafId: selectedBaseLeafId(selectedCacheRef.current, sessionId, snapshot.active_leaf_id ?? null),
+				content,
+			});
+			if (selectedRef.current !== sessionId) {
+				invalidateSessionList();
+				return;
+			}
+			if (result.queue) {
+				updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue!));
+			}
+			if (result.queued) {
+				invalidateSessionList();
+			} else {
+				if (result.active_branch_sync) {
+					const overview = {
+						...result.active_branch_sync.overview,
+						active_leaf_id: result.active_branch_sync.active_leaf_id,
+					};
+					commitSelectedSnapshot(overview);
+					lastEventIds.current.set(sessionId, Math.max(lastEventIds.current.get(sessionId) ?? 0, overview.last_event_id));
+				} else if (result.active_branch) {
+					updateSelectedCache((current) =>
+						applySwitchResultToCache(
+							current.sessionId === sessionId ? current : selectedCacheRef.current,
+							result.active_branch!,
+						),
+					);
+					if (result.active_branch.last_event_id !== undefined) {
+						lastEventIds.current.set(sessionId, result.active_branch.last_event_id);
+					}
 				} else {
-					if (result.active_branch_sync) {
-						const overview = {
-							...result.active_branch_sync.overview,
-							active_leaf_id: result.active_branch_sync.active_leaf_id,
-						};
-						commitSelectedSnapshot(overview);
-						lastEventIds.current.set(sessionId, Math.max(lastEventIds.current.get(sessionId) ?? 0, overview.last_event_id));
-					} else if (result.active_branch) {
-						updateSelectedCache((current) =>
-							applySwitchResultToCache(
-								current.sessionId === sessionId ? current : selectedCacheRef.current,
-								result.active_branch!,
-							),
-						);
-						if (result.active_branch.last_event_id !== undefined) {
-							lastEventIds.current.set(sessionId, result.active_branch.last_event_id);
-						}
-					} else {
-						try {
-							await syncActiveBranchNow(sessionId);
-						} catch (error) {
-							pushNotice("error", errorMessage(error));
-						}
+					try {
+						await syncActiveBranchNow(sessionId);
+					} catch (error) {
+						pushNotice("error", errorMessage(error));
 					}
 				}
-				void refreshTranscriptTurns(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
-			} catch (error) {
-				composerHandleRef.current?.restoreSubmittedDraft(sessionId, text);
-				throw error;
 			}
+			void refreshTranscriptTurns(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
 		},
 		[
 			api,
 			commitSelectedSnapshot,
 			invalidateSessionList,
-			loadedSnapshot,
 			patchSelectedSnapshot,
 			pushNotice,
 			refreshTranscriptTurns,
-			refreshSelected,
-			requireSelected,
-			selectedSession,
 			updateSelectedCache,
 		],
 	);
 
 	const startNewSession = useCallback(
-		async (text: string) => {
+		async (text: string, clientInputId: string, sessionId: string) => {
 			const projectId = selectedProjectRef.current;
-			const sessionId = randomId("session");
 			const title = nextSessionTitleRef.current || titleFromText(text);
 			nextSessionTitleRef.current = null;
 			const result = await api.startSession({
@@ -1675,7 +1671,7 @@ export function App() {
 						},
 					},
 				},
-				clientInputId: randomId("web_start"),
+				clientInputId,
 				priority: "follow_up",
 				content: textContent(text),
 				workspaces: projectId ? startWorkspacesFromScope(workspaceScopeRef.current) : undefined,
@@ -1820,11 +1816,14 @@ export function App() {
 		const sessionId = requireSelected();
 		setStopping(true);
 		try {
-			await api.interrupt(sessionId);
-			await Promise.all([
-				syncActiveBranchNow(sessionId),
-				queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) }),
-			]);
+			await stopSession(sessionId, {
+				interrupt: (targetSessionId) => api.interrupt(targetSessionId),
+				refresh: (targetSessionId) => syncActiveBranchNow(targetSessionId),
+				invalidateSessions: () =>
+					queryClient.invalidateQueries({
+						queryKey: queryKeys.sessions(selectedProjectRef.current),
+					}),
+			});
 		} catch (error) {
 			pushNotice("error", errorMessage(error));
 		} finally {
@@ -1915,23 +1914,22 @@ export function App() {
 	);
 
 	const openHistoryDialog = useCallback(
-		() => {
-			if (!loadedSnapshot) throw new Error("session is still loading");
-			if (loadedSnapshot.activity !== "idle") {
+		(snapshot: SessionSnapshot) => {
+			if (snapshot.activity !== "idle") {
 				throw new Error("stop the active turn before switching history");
 			}
-			const sessionId = loadedSnapshot.session_id;
+			const sessionId = snapshot.session_id;
 			const cache = selectedCacheRef.current;
 			const treeRevisionMatches =
-				loadedSnapshot.transcript_revision === undefined ||
+				snapshot.transcript_revision === undefined ||
 				cache.treeTranscriptRevision === null ||
-				cache.treeTranscriptRevision === loadedSnapshot.transcript_revision;
+				cache.treeTranscriptRevision === snapshot.transcript_revision;
 			const cachedNodes = cache.sessionId === sessionId && treeRevisionMatches ? treeNodesInOrder(cache) : [];
 			const treeComplete = cache.sessionId === sessionId && treeRevisionMatches && cache.treeComplete;
 			setHistoryDialog({
 				sessionId,
 				nodes: treeComplete ? cachedNodes : [],
-				activeLeafId: loadedSnapshot.active_leaf_id,
+				activeLeafId: snapshot.active_leaf_id,
 				loading: !treeComplete,
 				error: null,
 			});
@@ -1942,7 +1940,7 @@ export function App() {
 						return {
 							...current,
 							nodes: complete ? nodes : [],
-							activeLeafId: selectedCacheRef.current.treeActiveLeafId ?? loadedSnapshot.active_leaf_id,
+							activeLeafId: selectedCacheRef.current.treeActiveLeafId ?? snapshot.active_leaf_id,
 							loading: !complete,
 							error: null,
 						};
@@ -1972,11 +1970,15 @@ export function App() {
 					});
 				});
 		},
-		[ensureTreeIndex, loadedSnapshot],
+		[ensureTreeIndex],
 	);
 
 	const executeSlash = useCallback(
-		async (parsed: ParsedSlash) => {
+		async (
+			parsed: ParsedSlash,
+			submittedSessionId: string | null,
+			submittedSnapshot: SessionSnapshot | null,
+		) => {
 			const name = parsed.name;
 			const args = parsed.args;
 			const pushActionNotice = (tone: Notice["tone"], text: string) => {
@@ -1994,14 +1996,14 @@ export function App() {
 					pushActionNotice("info", "/system is read-only; edit PI.md in the repo to change the prompt");
 					return;
 				}
-				if (!loadedSnapshot) {
+				if (!submittedSessionId || submittedSnapshot?.session_id !== submittedSessionId) {
 					throw new Error("/system requires a selected session");
 				}
 				setPromptDialog({ loading: true, template: "", rendered: null, view: "rendered", error: null });
 				try {
 					const next = await queryClient.fetchQuery({
-						queryKey: queryKeys.systemPrompt(loadedSnapshot.session_id),
-						queryFn: () => api.getSystemPrompt(loadedSnapshot.session_id),
+						queryKey: queryKeys.systemPrompt(submittedSessionId),
+						queryFn: () => api.getSystemPrompt(submittedSessionId),
 						staleTime: 0,
 					});
 					setPromptDialog({ loading: false, template: next.template, rendered: next.rendered, view: next.rendered ? "rendered" : "template", error: null });
@@ -2011,10 +2013,12 @@ export function App() {
 				return;
 			}
 
-			const sessionId = requireSelected();
-			if (!loadedSnapshot) throw new Error("session is still loading");
+			if (!submittedSessionId || submittedSnapshot?.session_id !== submittedSessionId) {
+				throw new Error("session is still loading");
+			}
+			const sessionId = submittedSessionId;
 			if (name === "switch") {
-				openHistoryDialog();
+				openHistoryDialog(submittedSnapshot);
 				return;
 			}
 			if (name === "export") {
@@ -2032,34 +2036,29 @@ export function App() {
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[api, commitSelectedSnapshot, loadedSnapshot, openHistoryDialog, pushNotice, queryClient, requireSelected],
+		[api, commitSelectedSnapshot, openHistoryDialog, pushNotice, queryClient],
 	);
 
 	const submitComposer = useCallback(
-		async (text: string) => {
-			if (!text.trim() || sending) return false;
-			text = text.trim();
-			const slash = parseSlash(text);
+		async (submission: ComposerSubmission) => {
+			if (!submission.text.trim() || sending) return false;
 			setSending(true);
 			try {
-				if (slash) {
-					await executeSlash(slash);
-				} else {
-					if (selectedRef.current) {
-						await queueUserInput(text);
-					} else {
-						await startNewSession(text);
-					}
-				}
-				return true;
-			} catch (error) {
-				pushNotice("error", errorMessage(error));
-				return false;
+				return await routeComposerSubmission(submission, {
+					getLoadedSnapshot: (sessionId) => {
+						return getSelectedCache(sessionId)?.snapshot ?? null;
+					},
+					executeSlash,
+					queueFollowUp: queueUserInput,
+					steerSubagent: (params) => api.steerSubagent(params),
+					startNewSession,
+					reportError: (error) => pushNotice("error", errorMessage(error)),
+				});
 			} finally {
 				setSending(false);
 			}
 		},
-		[executeSlash, pushNotice, queueUserInput, sending, startNewSession],
+		[api, executeSlash, getSelectedCache, pushNotice, queueUserInput, sending, startNewSession],
 	);
 
 	const canStop = !!selectedId && loadedSnapshot?.activity === "running";
@@ -2401,6 +2400,9 @@ export function App() {
 				) : null}
 				<Composer
 					selectedId={selectedId}
+					selectedIsSubagent={
+						loadedSnapshot?.session_id === selectedId && !!loadedSnapshot.parent_session_id
+					}
 					composerHandleRef={composerHandleRef}
 					sending={sending}
 					canStop={canStop}

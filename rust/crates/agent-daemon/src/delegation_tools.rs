@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use agent_core::AgentInput;
 use agent_store::{
     Delegation, DelegationKind, DelegationProgress, DelegationStatus, DelegationSubagent,
-    DelegationSubagentOverview, SubagentType,
+    DelegationSubagentOverview, QueuedInputStatus, SubagentControlPhase, SubagentControlRecord,
+    SubagentType,
 };
 use agent_vocab::{ToolCall, ToolResultMessage, UserMessage};
 use serde::Deserialize;
@@ -34,11 +35,6 @@ struct StartFullParams {
     prompt: String,
     workflow: Option<String>,
     label: Option<String>,
-}
-
-pub(crate) struct SubagentSteerEligibility {
-    pub(crate) delegation: Delegation,
-    pub(crate) has_unfinished_actions: bool,
 }
 
 pub(crate) struct SubagentWorkState {
@@ -74,7 +70,40 @@ pub(crate) async fn ensure_subagent_steer_allowed(
     state: &AppState,
     subagent_id: &str,
     parent_session_id: &str,
-) -> std::result::Result<SubagentSteerEligibility, RpcError> {
+) -> std::result::Result<(), RpcError> {
+    let delegation = load_subagent_scope(state, subagent_id, parent_session_id).await?;
+    if delegation.status != DelegationStatus::Running {
+        return Err(RpcError::new(
+            "delegation_not_running",
+            "cannot steer a subagent whose delegation is terminal",
+        ));
+    }
+    let work_state = load_subagent_work_state(state, subagent_id).await?;
+    // A running delegation row can briefly race a subagent reaching its terminal
+    // transcript boundary before the barrier wins the delegation CAS. Callers
+    // hold the child SessionDriver lock while invoking this helper and while
+    // enqueueing the steer. A boundary leaf with queued/unfinished/runtime work
+    // is still active; only an idle boundary child is completion-terminal.
+    if work_state.is_completion_terminal() {
+        return Err(RpcError::new(
+            "subagent_terminal",
+            "cannot steer a subagent that is already terminal",
+        ));
+    }
+    if !work_state.has_active_work() {
+        return Err(RpcError::new(
+            "subagent_not_running",
+            "cannot steer a subagent without active work or queued input",
+        ));
+    }
+    Ok(())
+}
+
+async fn load_subagent_scope(
+    state: &AppState,
+    subagent_id: &str,
+    parent_session_id: &str,
+) -> std::result::Result<Delegation, RpcError> {
     let parent = state
         .repo
         .session_parent_id(subagent_id)
@@ -118,34 +147,7 @@ pub(crate) async fn ensure_subagent_steer_allowed(
             "subagent is not in scope",
         ));
     }
-    if delegation.status != DelegationStatus::Running {
-        return Err(RpcError::new(
-            "delegation_not_running",
-            "cannot steer a subagent whose delegation is terminal",
-        ));
-    }
-    let work_state = load_subagent_work_state(state, subagent_id).await?;
-    // A running delegation row can briefly race a subagent reaching its terminal
-    // transcript boundary before the barrier wins the delegation CAS. Callers
-    // hold the child SessionDriver lock while invoking this helper and while
-    // enqueueing the steer. A boundary leaf with queued/unfinished/runtime work
-    // is still active; only an idle boundary child is completion-terminal.
-    if work_state.is_completion_terminal() {
-        return Err(RpcError::new(
-            "subagent_terminal",
-            "cannot steer a subagent that is already terminal",
-        ));
-    }
-    if !work_state.has_active_work() {
-        return Err(RpcError::new(
-            "subagent_not_running",
-            "cannot steer a subagent without active work or queued input",
-        ));
-    }
-    Ok(SubagentSteerEligibility {
-        delegation,
-        has_unfinished_actions: work_state.has_unfinished_actions,
-    })
+    Ok(delegation)
 }
 
 pub(crate) async fn steer_subagent_core(
@@ -156,46 +158,420 @@ pub(crate) async fn steer_subagent_core(
     let params: SteerSubagentParams = from_params(params)?;
     let subagent_id = trim_required(&params.subagent_id, "subagent_id")?;
     let message = trim_required(&params.message, "message")?;
-    // Validate parent/delegation scope before touching the child runtime. The
-    // post-recovery check below repeats the work-state predicates while holding
-    // the child driver lock, so terminality cannot be resurrected by a race.
-    ensure_subagent_steer_allowed(state, &subagent_id, parent_session_id).await?;
-    let driver = SessionDriver::acquire(state, &subagent_id).await;
-    driver.recover_if_needed().await?;
-    let eligibility = ensure_subagent_steer_allowed(state, &subagent_id, parent_session_id).await?;
+    let interrupt = params.interrupt.unwrap_or(false);
+    let client_control_id = params
+        .client_control_id
+        .as_deref()
+        .map(|id| trim_required(id, "client_control_id"))
+        .transpose()?
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Derive the immutable ledger key and check replay before child recovery.
+    // Historical controls remain readable after terminal completion, while a
+    // new terminal-delegation request cannot mutate/reactivate the child.
+    let scope = load_subagent_scope(state, &subagent_id, parent_session_id).await?;
+    let client_input_id = format!("subagent-control:{}:{}", scope.id, client_control_id);
+    if let Some(control) = state
+        .repo
+        .get_scoped_subagent_control(
+            &subagent_id,
+            &client_input_id,
+            parent_session_id,
+            &scope.id,
+            &UserMessage::text(&message),
+            interrupt,
+        )
+        .await
+        .map_err(map_subagent_control_store_error)?
+    {
+        if control.delegation_running
+            && matches!(
+                control.phase,
+                SubagentControlPhase::PendingInterrupt
+                    | SubagentControlPhase::InterruptApplied
+                    | SubagentControlPhase::Ready
+            )
+            && matches!(
+                control.status,
+                QueuedInputStatus::Queued | QueuedInputStatus::Consuming
+            )
+        {
+            crate::spawn_try_drive_until_blocked(
+                state,
+                subagent_id.clone(),
+                "steer_subagent.replay",
+            );
+        }
+        return Ok(subagent_control_result(&subagent_id, &control, true, None));
+    }
+    if scope.status != DelegationStatus::Running {
+        return Err(RpcError::new(
+            "delegation_not_running",
+            "cannot steer a subagent whose delegation is terminal",
+        ));
+    }
 
-    let client_input_id = format!(
-        "subagent-steer:{}:{}",
-        eligibility.delegation.id,
-        uuid::Uuid::new_v4()
-    );
+    let driver = SessionDriver::acquire(state, &subagent_id).await;
+    driver.reconcile_pending_subagent_controls().await?;
+    driver.recover_if_needed().await?;
+    ensure_subagent_steer_allowed(state, &subagent_id, parent_session_id).await?;
+    let had_unfinished_actions = state.repo.has_unfinished_actions(&subagent_id).await?;
     let queued = state
         .repo
         .enqueue_scoped_subagent_steer(
             parent_session_id,
-            &eligibility.delegation.id,
+            &scope.id,
             &subagent_id,
             &UserMessage::text(message),
             &client_input_id,
+            interrupt,
         )
-        .await?
+        .await
+        .map_err(map_subagent_control_store_error)?
         .ok_or_else(|| {
             RpcError::new(
                 "delegation_not_running",
                 "cannot steer a subagent whose delegation is terminal",
             )
         })?;
+    let replayed = queued.replayed;
     if let Some(event) = queued.event {
         publish_events(state, vec![event]);
     }
-    if !eligibility.has_unfinished_actions {
-        driver.drive_until_blocked().await?;
+    #[cfg(test)]
+    if state
+        .pause_subagent_control_after_commit
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        state.subagent_control_committed.notify_waiters();
+        std::future::pending::<()>().await;
     }
-    Ok(json!({
+    // Establish detached ownership immediately after the durable commit. This
+    // single fresh-request waiter closes the commit-to-worker cancellation gap;
+    // replay nudges use the nonwaiting helper above to avoid accumulation.
+    crate::spawn_drive_until_blocked(state, subagent_id.clone(), "steer_subagent.accepted");
+    let mut postcommit_error = None;
+    let should_drive_inline = interrupt || !had_unfinished_actions;
+    if should_drive_inline {
+        let result = async {
+            driver.reconcile_pending_subagent_controls().await?;
+            driver.drive_until_blocked().await?;
+            Ok::<(), RpcError>(())
+        }
+        .await;
+        if let Err(error) = result {
+            postcommit_error = Some(format!("{}: {}", error.code, error.message));
+            record_accepted_control_drive_failure(
+                state,
+                &subagent_id,
+                "steer_subagent.reconcile",
+                &error,
+            )
+            .await;
+        }
+    }
+    drop(driver);
+    let current =
+        match reload_accepted_subagent_control(state, &subagent_id, &queued.input_id).await {
+            Ok(Some(control)) => control,
+            Ok(None) => {
+                let error = RpcError::new(
+                    "accepted_control_missing",
+                    "durably accepted subagent control could not be reloaded",
+                );
+                record_accepted_control_drive_failure(
+                    state,
+                    &subagent_id,
+                    "steer_subagent.reload",
+                    &error,
+                )
+                .await;
+                return Ok(json!({
+                    "subagent_id": subagent_id,
+                    "accepted": true,
+                    "queued": true,
+                    "input_id": queued.input_id,
+                    "replayed": replayed,
+                    "phase": queued.control_phase,
+                    "interrupted": Value::Null,
+                    "drive_status": "pending",
+                    "drive_error": error.message,
+                }));
+            }
+            Err(error) => {
+                eprintln!(
+                "accepted subagent control status refresh failed session={subagent_id}: {error:#}"
+            );
+                return Ok(json!({
+                    "subagent_id": subagent_id,
+                    "accepted": true,
+                    "queued": true,
+                    "input_id": queued.input_id,
+                    "replayed": replayed,
+                    "phase": queued.control_phase,
+                    "interrupted": Value::Null,
+                    "drive_status": "pending",
+                    "drive_error": error.to_string(),
+                }));
+            }
+        };
+    Ok(subagent_control_result(
+        &subagent_id,
+        &current,
+        replayed,
+        postcommit_error,
+    ))
+}
+
+async fn reload_accepted_subagent_control(
+    state: &AppState,
+    subagent_id: &str,
+    input_id: &str,
+) -> anyhow::Result<Option<SubagentControlRecord>> {
+    #[cfg(test)]
+    if state
+        .fail_subagent_control_reload_after_commit
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        anyhow::bail!("injected accepted-control status reload failure");
+    }
+    state
+        .repo
+        .get_subagent_control_by_input_id(subagent_id, input_id)
+        .await
+}
+
+fn accepted_control_pending_result(
+    subagent_id: &str,
+    queued: &agent_store::EnqueueUserInputResult,
+    replayed: bool,
+    drive_error: String,
+) -> Value {
+    json!({
         "subagent_id": subagent_id,
+        "accepted": true,
         "queued": true,
         "input_id": queued.input_id,
-    }))
+        "replayed": replayed,
+        "phase": queued.control_phase,
+        "interrupted": Value::Null,
+        "interrupt_outcome": queued.control_interrupt_outcome,
+        "drive_status": "pending",
+        "drive_error": drive_error,
+    })
+}
+
+fn subagent_control_result(
+    subagent_id: &str,
+    control: &SubagentControlRecord,
+    replayed: bool,
+    drive_error: Option<String>,
+) -> Value {
+    let drive_status = if drive_error.is_some() {
+        "failed"
+    } else {
+        match control.phase {
+            SubagentControlPhase::PendingInterrupt | SubagentControlPhase::InterruptApplied => {
+                "pending"
+            }
+            SubagentControlPhase::Ready
+                if matches!(
+                    control.status,
+                    QueuedInputStatus::Queued | QueuedInputStatus::Consuming
+                ) =>
+            {
+                "started"
+            }
+            SubagentControlPhase::Ready => "settled",
+            SubagentControlPhase::Cancelled => "cancelled",
+        }
+    };
+    let interrupted = match control.phase {
+        SubagentControlPhase::PendingInterrupt => Value::Null,
+        _ => json!(control.interrupted),
+    };
+    json!({
+        "subagent_id": subagent_id,
+        "accepted": true,
+        "queued": matches!(
+            control.status,
+            QueuedInputStatus::Queued | QueuedInputStatus::Consuming
+        ),
+        "input_id": control.input_id,
+        "replayed": replayed,
+        "phase": control.phase,
+        "interrupted": interrupted,
+        "interrupt_outcome": control.interrupt_outcome,
+        "drive_status": drive_status,
+        "drive_error": drive_error,
+    })
+}
+
+fn map_subagent_control_store_error(error: anyhow::Error) -> RpcError {
+    if error.to_string().contains("client_control_id_conflict") {
+        RpcError::new(
+            "client_control_id_conflict",
+            "client_control_id was already used for a different subagent control",
+        )
+    } else {
+        error.into()
+    }
+}
+
+async fn record_accepted_control_drive_failure(
+    state: &AppState,
+    subagent_id: &str,
+    reason: &str,
+    error: &RpcError,
+) {
+    eprintln!(
+        "accepted subagent control drive failed session={subagent_id} reason={reason}: {}: {}",
+        error.code, error.message
+    );
+    match state
+        .repo
+        .insert_event(
+            subagent_id,
+            agent_store::EventType::ModelError,
+            json!({ "error": error.message, "reason": reason, "accepted": true }),
+        )
+        .await
+    {
+        Ok(event) => publish_events(state, vec![event]),
+        Err(event_error) => eprintln!(
+            "failed to record accepted subagent control drive failure {subagent_id}: {event_error:#}"
+        ),
+    }
+}
+
+pub(crate) async fn interrupt_subagent_core(
+    state: &AppState,
+    parent_session_id: &str,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let params: InterruptSubagentParams = from_params(params)?;
+    let subagent_id = trim_required(&params.subagent_id, "subagent_id")?;
+    let client_control_id = params
+        .client_control_id
+        .as_deref()
+        .map(|id| trim_required(id, "client_control_id"))
+        .transpose()?
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let scope = load_subagent_scope(state, &subagent_id, parent_session_id).await?;
+    let client_input_id = format!("subagent-control:{}:{}", scope.id, client_control_id);
+    if let Some(control) = state
+        .repo
+        .get_scoped_subagent_interrupt(&subagent_id, &client_input_id, parent_session_id, &scope.id)
+        .await
+        .map_err(map_subagent_control_store_error)?
+    {
+        if control.delegation_running
+            && matches!(
+                control.phase,
+                SubagentControlPhase::PendingInterrupt | SubagentControlPhase::InterruptApplied
+            )
+            && matches!(
+                control.status,
+                QueuedInputStatus::Queued | QueuedInputStatus::Consuming
+            )
+        {
+            crate::spawn_try_drive_until_blocked(
+                state,
+                subagent_id.clone(),
+                "interrupt_subagent.replay",
+            );
+        }
+        return Ok(subagent_control_result(&subagent_id, &control, true, None));
+    }
+    if scope.status != DelegationStatus::Running {
+        return Err(RpcError::new(
+            "delegation_not_running",
+            "cannot interrupt a subagent whose delegation is terminal",
+        ));
+    }
+
+    let driver = SessionDriver::acquire(state, &subagent_id).await;
+    driver.reconcile_pending_subagent_controls().await?;
+    driver.recover_if_needed().await?;
+    ensure_subagent_steer_allowed(state, &subagent_id, parent_session_id).await?;
+    let queued = state
+        .repo
+        .enqueue_scoped_subagent_interrupt(
+            parent_session_id,
+            &scope.id,
+            &subagent_id,
+            &client_input_id,
+        )
+        .await
+        .map_err(map_subagent_control_store_error)?
+        .ok_or_else(|| {
+            RpcError::new(
+                "delegation_not_running",
+                "cannot interrupt a subagent whose delegation is terminal",
+            )
+        })?;
+    let replayed = queued.replayed;
+    // See the combined-steer path: one detached owner is installed before any
+    // postcommit await, so aborting the parent tool future cannot strand this
+    // accepted interrupt.
+    crate::spawn_drive_until_blocked(state, subagent_id.clone(), "interrupt_subagent.accepted");
+    let mut postcommit_error = None;
+    let result = async {
+        driver.reconcile_pending_subagent_controls().await?;
+        driver.drive_until_blocked().await?;
+        Ok::<(), RpcError>(())
+    }
+    .await;
+    if let Err(error) = result {
+        postcommit_error = Some(format!("{}: {}", error.code, error.message));
+        record_accepted_control_drive_failure(
+            state,
+            &subagent_id,
+            "interrupt_subagent.reconcile",
+            &error,
+        )
+        .await;
+    }
+    drop(driver);
+    let current =
+        match reload_accepted_subagent_control(state, &subagent_id, &queued.input_id).await {
+            Ok(Some(control)) => control,
+            Ok(None) => {
+                let error = RpcError::new(
+                    "accepted_control_missing",
+                    "durably accepted subagent interrupt could not be reloaded",
+                );
+                record_accepted_control_drive_failure(
+                    state,
+                    &subagent_id,
+                    "interrupt_subagent.reload",
+                    &error,
+                )
+                .await;
+                return Ok(accepted_control_pending_result(
+                    &subagent_id,
+                    &queued,
+                    replayed,
+                    error.message,
+                ));
+            }
+            Err(error) => {
+                eprintln!(
+                "accepted subagent interrupt status refresh failed session={subagent_id}: {error:#}"
+            );
+                return Ok(accepted_control_pending_result(
+                    &subagent_id,
+                    &queued,
+                    replayed,
+                    error.to_string(),
+                ));
+            }
+        };
+    Ok(subagent_control_result(
+        &subagent_id,
+        &current,
+        replayed,
+        postcommit_error,
+    ))
 }
 
 async fn subagent_has_active_runtime(state: &AppState, subagent_id: &str) -> bool {
@@ -245,6 +621,15 @@ struct SteerSubagentParams {
     _parent_session_id: Option<String>,
     subagent_id: String,
     message: String,
+    interrupt: Option<bool>,
+    client_control_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterruptSubagentParams {
+    subagent_id: String,
+    client_control_id: Option<String>,
 }
 
 fn trim_required(value: &str, field: &str) -> std::result::Result<String, RpcError> {
@@ -1216,6 +1601,7 @@ pub(crate) fn is_delegation_tool_name(name: &str) -> bool {
             | "inspect_delegation"
             | "cancel_delegation"
             | "steer_subagent"
+            | "interrupt_subagent"
     )
 }
 
@@ -1233,7 +1619,7 @@ pub(crate) async fn run_delegation_tool(
             format!("{}: {}", error.code, error.message),
         );
     }
-    let params: Value = match serde_json::from_str(&call.args_json) {
+    let mut params: Value = match serde_json::from_str(&call.args_json) {
         Ok(params) => params,
         Err(error) => {
             return ToolResultMessage::error(
@@ -1243,6 +1629,24 @@ pub(crate) async fn run_delegation_tool(
             )
         }
     };
+    if matches!(
+        call.tool_name.as_str(),
+        "steer_subagent" | "interrupt_subagent"
+    ) {
+        let Some(object) = params.as_object_mut() else {
+            return ToolResultMessage::error(
+                call.id.clone(),
+                &call.tool_name,
+                format!("{} arguments must be a JSON object", call.tool_name),
+            );
+        };
+        // Provider/runtime retries preserve the tool-call id. Always replace
+        // hidden/provider-supplied values at this runtime trust boundary.
+        object.insert(
+            "client_control_id".to_string(),
+            json!(format!("tool-call:{}", call.id.0)),
+        );
+    }
     let result = match call.tool_name.as_str() {
         "delegate_writing_task" => start_full_core(state, parent_session_id, params).await,
         "delegate_readonly_tasks" => {
@@ -1251,6 +1655,7 @@ pub(crate) async fn run_delegation_tool(
         "inspect_delegation" => status_core(state, parent_session_id, params).await,
         "cancel_delegation" => cancel_core(state, parent_session_id, params).await,
         "steer_subagent" => steer_subagent_core(state, parent_session_id, params).await,
+        "interrupt_subagent" => interrupt_subagent_core(state, parent_session_id, params).await,
         other => Err(RpcError::new(
             "unknown_tool",
             format!("unknown delegation tool: {other}"),
@@ -1286,6 +1691,7 @@ mod tests {
             "inspect_delegation",
             "cancel_delegation",
             "steer_subagent",
+            "interrupt_subagent",
         ] {
             assert!(
                 is_delegation_tool_name(name),
@@ -1305,6 +1711,46 @@ mod tests {
         }
         assert!(!is_delegation_tool_name("delegation.list"));
         assert!(!is_delegation_tool_name("delegation.start_full"));
+    }
+
+    #[test]
+    fn combined_control_result_reports_durable_interrupt_phase_truthfully() {
+        let pending = SubagentControlRecord {
+            input_id: "input-1".to_string(),
+            status: QueuedInputStatus::Queued,
+            kind: agent_store::SubagentControlKind::Steer,
+            phase: SubagentControlPhase::PendingInterrupt,
+            interrupt: true,
+            interrupted: false,
+            interrupt_outcome: None,
+            target_active_leaf_id: Some("old-leaf".to_string()),
+            target_turn_id: Some(7),
+            target_action_attempt_ids: vec!["attempt-1".to_string()],
+            delegation_running: true,
+        };
+        let result = subagent_control_result("child", &pending, false, None);
+        assert_eq!(result["accepted"], true);
+        assert_eq!(result["phase"], "pending_interrupt");
+        assert_eq!(result["interrupted"], Value::Null);
+        assert_eq!(result["drive_status"], "pending");
+
+        let applied = SubagentControlRecord {
+            phase: SubagentControlPhase::InterruptApplied,
+            interrupted: true,
+            interrupt_outcome: Some("interrupted".to_string()),
+            ..pending
+        };
+        let result = subagent_control_result(
+            "child",
+            &applied,
+            false,
+            Some("postcommit drive failed".to_string()),
+        );
+        assert_eq!(result["accepted"], true);
+        assert_eq!(result["phase"], "interrupt_applied");
+        assert_eq!(result["interrupted"], true);
+        assert_eq!(result["interrupt_outcome"], "interrupted");
+        assert_eq!(result["drive_status"], "failed");
     }
 
     #[test]

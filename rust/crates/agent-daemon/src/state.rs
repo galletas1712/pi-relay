@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -32,4 +34,10 @@ pub(crate) struct AppState {
     pub(crate) session_titles: SessionTitleScheduler,
     pub(crate) workspaces: WorkspaceManager,
     pub(crate) prompt_root: PathBuf,
+    #[cfg(test)]
+    pub(crate) pause_subagent_control_after_commit: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) subagent_control_committed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pub(crate) fail_subagent_control_reload_after_commit: Arc<AtomicBool>,
 }

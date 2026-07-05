@@ -23,6 +23,21 @@ impl PostgresAgentStore {
                 update actions
                 set status='stale', updated_at=now()
                 where {unfinished_actions}
+                  and not exists (
+                      select 1
+                      from queued_inputs q
+                      join sessions s on s.id=q.session_id
+                      join delegations d on d.id=s.delegation_id
+                      where q.session_id=actions.session_id
+                        and q.status in ('queued', 'consuming')
+                        and q.priority='steer'
+                        and q.origin->>'control_kind' in (
+                            'scoped_subagent_steer',
+                            'scoped_subagent_interrupt'
+                        )
+                        and q.origin->>'control_phase'='pending_interrupt'
+                        and d.status='running'
+                  )
                 returning session_id
             ),
             updated_sessions as (

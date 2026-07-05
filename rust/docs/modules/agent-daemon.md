@@ -40,7 +40,8 @@ subagents.rs       delegation subagent spawn core: role resolution, full vs
                    read-only workspace handling, child prompt + lifecycle events
 delegation_tools.rs     delegation tool surface (delegate_writing_task /
                    delegate_readonly_tasks / inspect_delegation /
-                   cancel_delegation / steer_subagent) plus delegation.* web RPCs
+                   cancel_delegation / steer_subagent / interrupt_subagent)
+                   plus delegation.* web RPCs
                    (start_full / start_readonly_fanout / status / cancel /
                    steer_subagent / list) + homogeneity/one-delegation-per-parent guards
 delegation_runner.rs    delegation barrier: all-terminal detect, attempt-fenced finish CAS,
@@ -52,7 +53,7 @@ handoff.rs         renders per-subagent task_prompt.md / final_message.md /
 
 Subagent work runs as **delegations** (`delegate_writing_task` /
 `delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation` /
-`steer_subagent`). Full subagents
+`steer_subagent` / `interrupt_subagent`). Full subagents
 reuse the parent's workspace dirs in place; read-only subagents get a forked
 snapshot destroyed on return. Delegation subagents may emit
 `subagent.spawned`/`subagent.running` progress events; their terminal hook fires
@@ -66,6 +67,19 @@ Completion is that typed wakeup observation/handoff, not a parent-visible per-ch
 runner never decides the next delegation — the parent does, guided by workflow
 skills. Cancellation is terminal and exports transcript-only files for the
 cancelled subagents instead of running the normal completion handoff.
+
+Interrupting child controls are durable and generation-fenced. The captured
+generation is the active turn plus its complete deterministic unfinished
+attempt set, including parallel tools; reconciliation atomically synthesizes a
+valid interrupted transcript boundary and settles all remaining captured rows.
+If the active leaf is already a boundary, reconciliation keeps that leaf
+unchanged and atomically interrupts only captured boundary-hosted actions, or
+records an `already_between_turns` no-op when there are none.
+`interrupt_subagent` uses a non-message ledger marker, so replay returns the
+prior phase without injecting text or interrupting newer work. A periodic
+reconciler also recovers ownerless ready steers, using nonblocking per-session
+driver acquisition and bounded diagnostic backoff rather than accumulating
+duplicate waiters.
 
 Delegation completion wakeups are rendered as provider-neutral daemon
 observations. The durable transcript entry is a typed

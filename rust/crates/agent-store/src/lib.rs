@@ -263,6 +263,56 @@ pub struct EnqueueUserInputResult {
     pub input_id: String,
     pub event: Option<EventFrame>,
     pub queue: Option<QueueState>,
+    pub replayed: bool,
+    pub status: QueuedInputStatus,
+    pub control_interrupt_applied: bool,
+    pub delegation_running: bool,
+    pub control_phase: Option<SubagentControlPhase>,
+    pub control_interrupt_outcome: Option<String>,
+}
+
+text_enum! {
+    /// Durable phase of a parent-scoped child control.
+    ///
+    /// Interrupting controls stay non-dispatchable until the old generation has
+    /// been settled and exact-session runtime tasks have been aborted.
+    pub enum SubagentControlPhase {
+        PendingInterrupt => "pending_interrupt",
+        InterruptApplied => "interrupt_applied",
+        Ready => "ready",
+        Cancelled => "cancelled",
+    }
+
+    /// Provenance and delivery semantics of a durable parent-scoped child
+    /// control. Interrupt-only controls are ledger records, never mailbox text.
+    pub enum SubagentControlKind {
+        Steer => "scoped_subagent_steer",
+        Interrupt => "scoped_subagent_interrupt",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentControlRecord {
+    pub input_id: String,
+    pub status: QueuedInputStatus,
+    pub kind: SubagentControlKind,
+    pub phase: SubagentControlPhase,
+    pub interrupt: bool,
+    pub interrupted: bool,
+    pub interrupt_outcome: Option<String>,
+    pub target_active_leaf_id: Option<String>,
+    pub target_turn_id: Option<i64>,
+    /// Deterministically ordered complete set of unfinished attempts captured
+    /// for the active turn when the control was accepted.
+    pub target_action_attempt_ids: Vec<String>,
+    pub delegation_running: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentBoundaryInterruptResult {
+    NotAtBoundary,
+    Applied { interrupted: bool },
+    GenerationAdvanced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -709,6 +759,9 @@ pub struct QueuedInput {
 pub enum QueuedInputContent {
     UserMessage(UserMessage),
     DaemonToolObservation(DaemonToolObservation),
+    /// A durable control-ledger marker. Queue claim SQL excludes this variant,
+    /// so it can never be injected into a model-visible transcript.
+    SubagentControl,
 }
 
 impl QueuedInputContent {
@@ -723,7 +776,7 @@ impl QueuedInputContent {
     pub fn editable_user_message(&self) -> Option<&UserMessage> {
         match self {
             Self::UserMessage(message) => Some(message),
-            Self::DaemonToolObservation(_) => None,
+            Self::DaemonToolObservation(_) | Self::SubagentControl => None,
         }
     }
 
@@ -735,6 +788,7 @@ impl QueuedInputContent {
         match self {
             Self::UserMessage(_) => "user_message",
             Self::DaemonToolObservation(_) => "daemon_tool_observation",
+            Self::SubagentControl => "subagent_control",
         }
     }
 }
@@ -785,6 +839,7 @@ pub struct OutputBatch<'a> {
     pub(crate) action_update: Option<ActionUpdate>,
     pub(crate) consumed_input: Option<QueuedInput>,
     pub(crate) accepted_input: Option<AcceptedInput>,
+    pub(crate) control_interrupt_input_id: Option<&'a str>,
 }
 
 impl<'a> OutputBatch<'a> {
@@ -802,6 +857,7 @@ impl<'a> OutputBatch<'a> {
             action_update: None,
             consumed_input: None,
             accepted_input: None,
+            control_interrupt_input_id: None,
         }
     }
 
@@ -817,6 +873,11 @@ impl<'a> OutputBatch<'a> {
 
     pub fn with_accepted_input(mut self, accepted_input: Option<AcceptedInput>) -> Self {
         self.accepted_input = accepted_input;
+        self
+    }
+
+    pub fn with_control_interrupt(mut self, input_id: &'a str) -> Self {
+        self.control_interrupt_input_id = Some(input_id);
         self
     }
 }

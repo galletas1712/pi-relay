@@ -53,7 +53,13 @@ impl ModelContext {
     }
 
     pub(crate) fn close_open_turn_to_boundary(mut self) -> Self {
-        Self::close_open_turn_items_to_boundary(&mut self.items);
+        Self::close_open_turn_items_to_boundary(&mut self.items, TurnOutcome::Crashed);
+        self.provider_replay.resize_with(self.items.len(), Vec::new);
+        self
+    }
+
+    pub(crate) fn close_open_turn_to_interrupted_boundary(mut self) -> Self {
+        Self::close_open_turn_items_to_boundary(&mut self.items, TurnOutcome::Interrupted);
         self.provider_replay.resize_with(self.items.len(), Vec::new);
         self
     }
@@ -132,17 +138,14 @@ impl ModelContext {
         });
     }
 
-    fn close_open_turn_items_to_boundary(items: &mut Vec<TranscriptItem>) {
+    fn close_open_turn_items_to_boundary(items: &mut Vec<TranscriptItem>, outcome: TurnOutcome) {
         let Some((turn_id, turn_start)) = Self::open_turn_start(items) else {
             return;
         };
 
         Self::complete_open_tool_calls(items, turn_start, turn_id);
         if !Self::is_turn_boundary_items(items) {
-            items.push(TranscriptItem::TurnFinished {
-                turn_id,
-                outcome: TurnOutcome::Crashed,
-            });
+            items.push(TranscriptItem::TurnFinished { turn_id, outcome });
         }
     }
 

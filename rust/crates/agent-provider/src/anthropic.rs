@@ -1414,6 +1414,7 @@ mod tests {
                 "delegate_writing_task",
                 "Grep",
                 "inspect_delegation",
+                "interrupt_subagent",
                 "LoadSkill",
                 "steer_subagent",
                 "str_replace_based_edit_tool",
@@ -1459,19 +1460,21 @@ mod tests {
         assert!(body["tools"][4].get("type").is_none());
         assert_eq!(body["tools"][5]["name"], "inspect_delegation");
         assert!(body["tools"][5].get("type").is_none());
-        assert_eq!(body["tools"][6]["name"], "LoadSkill");
+        assert_eq!(body["tools"][6]["name"], "interrupt_subagent");
         assert!(body["tools"][6].get("type").is_none());
-        assert_eq!(body["tools"][7]["name"], "steer_subagent");
+        assert_eq!(body["tools"][7]["name"], "LoadSkill");
         assert!(body["tools"][7].get("type").is_none());
-        assert_eq!(body["tools"][8]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][8]["name"], "str_replace_based_edit_tool");
-        assert_eq!(body["tools"][9]["name"], "web_fetch");
-        assert!(body["tools"][9].get("type").is_none());
-        assert_eq!(body["tools"][10]["name"], "web_search");
+        assert_eq!(body["tools"][8]["name"], "steer_subagent");
+        assert!(body["tools"][8].get("type").is_none());
+        assert_eq!(body["tools"][9]["type"], "text_editor_20250728");
+        assert_eq!(body["tools"][9]["name"], "str_replace_based_edit_tool");
+        assert_eq!(body["tools"][10]["name"], "web_fetch");
         assert!(body["tools"][10].get("type").is_none());
+        assert_eq!(body["tools"][11]["name"], "web_search");
+        assert!(body["tools"][11].get("type").is_none());
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
-        for index in 0..11 {
+        for index in 0..12 {
             assert!(
                 body["tools"][index].get("cache_control").is_none(),
                 "tool {index} should not carry cache_control"

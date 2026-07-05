@@ -299,6 +299,24 @@ fn load_skill_definition() -> ToolDefinition {
     )
 }
 
+fn interrupt_subagent_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "interrupt_subagent",
+        "Durably interrupt exactly one running subagent generation in your active delegation without cancelling its parent, siblings, or the whole delegation. This queues no instruction; replay of the same tool call returns its prior control state without interrupting newer work.",
+        json!({
+            "type": "object",
+            "properties": {
+                "subagent_id": {
+                    "type": "string",
+                    "description": "The exact target subagent session id shown in delegation inspection."
+                }
+            },
+            "required": ["subagent_id"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 fn delegate_writing_task_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_writing_task",
@@ -409,7 +427,7 @@ fn cancel_delegation_definition() -> ToolDefinition {
 fn steer_subagent_definition() -> ToolDefinition {
     ToolDefinition::new(
         "steer_subagent",
-        "Send an additional instruction or correction to a running subagent without cancelling and restarting it. Read-only subagent workspaces are disposable, but their running conversations can still be steered. The subagent id is the subagent session id shown by inspect_delegation.",
+        "Send an additional instruction or correction to a running subagent. By default it is non-interrupting and waits in the durable child mailbox. Set interrupt=true to durably queue the instruction first, then interrupt exactly that child's current work and drive the queued instruction. Read-only subagent workspaces are disposable, but their running conversations can still be controlled.",
         json!({
             "type": "object",
             "properties": {
@@ -420,6 +438,10 @@ fn steer_subagent_definition() -> ToolDefinition {
                 "message": {
                     "type": "string",
                     "description": "The additional instruction, correction, or context to send to the running subagent."
+                },
+                "interrupt": {
+                    "type": "boolean",
+                    "description": "Optional. When true, queue the instruction durably before interrupting exactly this child's current work. Defaults to false."
                 }
             },
             "required": ["subagent_id", "message"],
@@ -471,6 +493,12 @@ impl ToolExtension for FirstPartyToolExtension {
             "steer_subagent",
             "delegation",
             steer_subagent_definition(),
+        );
+        register_runtime_tool(
+            registry,
+            "interrupt_subagent",
+            "delegation",
+            interrupt_subagent_definition(),
         );
         register_edit(registry);
         register_uniform(registry, "Bash", "shell", BashTool);
@@ -623,6 +651,7 @@ mod tests {
                 "delegate_writing_task",
                 "Grep",
                 "inspect_delegation",
+                "interrupt_subagent",
                 "LoadSkill",
                 "steer_subagent",
                 "WebFetch",
@@ -638,6 +667,7 @@ mod tests {
                 "delegate_writing_task",
                 "Grep",
                 "inspect_delegation",
+                "interrupt_subagent",
                 "LoadSkill",
                 "steer_subagent",
                 "Edit",
@@ -671,6 +701,7 @@ mod tests {
                 "delegate_writing_task",
                 "Grep",
                 "inspect_delegation",
+                "interrupt_subagent",
                 "LoadSkill",
                 "steer_subagent",
                 "web_fetch",
@@ -686,6 +717,7 @@ mod tests {
                 "delegate_writing_task",
                 "Grep",
                 "inspect_delegation",
+                "interrupt_subagent",
                 "LoadSkill",
                 "steer_subagent",
                 "str_replace_based_edit_tool",
@@ -727,12 +759,32 @@ mod tests {
             json!(["subagent_id", "message"])
         );
         assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert_eq!(
+            tool.input_schema["properties"]["interrupt"]["type"],
+            "boolean"
+        );
         assert!(
             tool.input_schema["properties"]["subagent_id"]["description"]
                 .as_str()
                 .expect("subagent_id description")
                 .contains("subagent session id")
         );
+    }
+
+    #[test]
+    fn interrupt_subagent_tool_schema_is_exact_child_only() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let tool = registry
+            .provider_tools_for_provider(ProviderKind::OpenAi)
+            .into_iter()
+            .find(|tool| tool.name == "interrupt_subagent")
+            .expect("interrupt_subagent tool");
+
+        assert_eq!(tool.canonical_name, "interrupt_subagent");
+        assert_eq!(tool.execution, ToolExecution::LocalJson);
+        assert_eq!(tool.input_schema["required"], json!(["subagent_id"]));
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert!(tool.input_schema["properties"].get("message").is_none());
     }
 
     #[test]
@@ -833,6 +885,7 @@ mod tests {
             "inspect_delegation",
             "cancel_delegation",
             "steer_subagent",
+            "interrupt_subagent",
         ] {
             assert!(
                 names.contains(&expected.to_string()),

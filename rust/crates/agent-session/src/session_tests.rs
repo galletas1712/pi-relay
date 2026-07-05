@@ -340,6 +340,55 @@ fn from_transcript_store_repairs_open_tool_turn_to_boundary() {
 }
 
 #[test]
+fn stored_session_interrupt_recovery_repairs_open_tool_turn_and_emits_events() {
+    let tool_call = ToolCall {
+        id: ToolCallId::from_u64(1),
+        tool_name: "read".to_string(),
+        args_json: "{}".to_string(),
+    };
+    let store = TranscriptStore::from_model_context(&ModelContext::from_transcript_items(vec![
+        TranscriptItem::TurnStarted { turn_id: TurnId(7) },
+        TranscriptItem::UserMessage(UserMessage::text("hello")),
+        TranscriptItem::AssistantMessage(AssistantMessage {
+            items: vec![AssistantItem::ToolCall(tool_call.clone())],
+        }),
+        TranscriptItem::ToolCallStarted {
+            turn_id: TurnId(7),
+            tool_call: tool_call.clone(),
+        },
+    ]));
+    let mut stored = StoredSession::new("s1");
+    stored.active_leaf_id = store.active_leaf_id().map(str::to_string);
+    stored.entries = store.entries().into_iter().map(Into::into).collect();
+    let mut session = AgentSession::from_stored_session_interrupted(stored)
+        .expect("interrupt recovery should close the open tool turn");
+
+    assert_eq!(
+        &session.model_context().transcript_items()[4..],
+        &[
+            TranscriptItem::ToolResult(ToolResultMessage::crashed(
+                tool_call.id,
+                tool_call.tool_name,
+            )),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(7),
+                outcome: TurnOutcome::Interrupted,
+            },
+        ]
+    );
+    assert!(session.transcript_store().is_turn_boundary());
+    assert_eq!(
+        session
+            .drain_events()
+            .into_iter()
+            .filter(|event| matches!(event, SessionEvent::TranscriptItemAppended { .. }))
+            .count(),
+        2,
+        "both synthesized durable entries must be persisted by the caller"
+    );
+}
+
+#[test]
 fn stored_session_repairs_compacted_open_tool_turn_to_boundary() {
     let first = ToolCall {
         id: ToolCallId::from_u64(1),

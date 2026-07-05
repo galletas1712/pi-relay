@@ -122,6 +122,42 @@ impl AgentSession {
         Ok(session)
     }
 
+    /// Rehydrate durable history and close any open turn as interrupted.
+    ///
+    /// Combined interrupt-and-steer recovery uses this after a process/task
+    /// boundary. It cannot reconstruct volatile model/tool execution, but it
+    /// can durably synthesize missing crashed tool results and an interrupted
+    /// turn boundary before the queued steer is allowed to run.
+    pub fn from_stored_session_interrupted(
+        stored: StoredSession,
+    ) -> Result<Self, HistoryOperationError> {
+        let existing_entry_count = stored.entries.len();
+        let entries = stored.entries.into_iter().map(Into::into).collect();
+        let mut transcript_store =
+            TranscriptStore::from_storage_entries(entries, stored.active_leaf_id)
+                .map_err(HistoryOperationError::Store)?;
+        Self::close_transcript_store_open_turn_as_interrupted(&mut transcript_store)?;
+
+        let model_context = transcript_store.model_context();
+        let last_turn_id = model_context.last_turn_id();
+        let mut session = Self::new();
+        session.core = AgentCoreLoop::resume_at(last_turn_id, ActionId::first());
+        for entry in transcript_store
+            .entries()
+            .into_iter()
+            .skip(existing_entry_count)
+        {
+            session
+                .event_outbox
+                .push_back(SessionEvent::TranscriptItemAppended {
+                    entry_id: entry.id,
+                    item: entry.item,
+                });
+        }
+        session.transcript_store = transcript_store;
+        Ok(session)
+    }
+
     pub fn from_stored_session_preserving_open_turn(
         stored: StoredSession,
     ) -> Result<Self, HistoryOperationError> {
@@ -557,6 +593,34 @@ impl AgentSession {
         // that require boundary leaves never see a recovered tool_result leaf.
         let recovered_context =
             ModelContext::from_transcript_items(items).close_open_turn_to_boundary();
+        let recovered = recovered_context.into_transcript_items();
+        if recovered.len() == original_len {
+            return Err(HistoryOperationError::Store(
+                TranscriptStoreError::NotTurnBoundary,
+            ));
+        }
+
+        transcript_store.append_transcript_items(recovered.into_iter().skip(original_len));
+        if transcript_store.is_turn_boundary() {
+            Ok(())
+        } else {
+            Err(HistoryOperationError::Store(
+                TranscriptStoreError::NotTurnBoundary,
+            ))
+        }
+    }
+
+    fn close_transcript_store_open_turn_as_interrupted(
+        transcript_store: &mut TranscriptStore,
+    ) -> Result<(), HistoryOperationError> {
+        if transcript_store.is_turn_boundary() {
+            return Ok(());
+        }
+
+        let items = transcript_store.model_context().into_transcript_items();
+        let original_len = items.len();
+        let recovered_context =
+            ModelContext::from_transcript_items(items).close_open_turn_to_interrupted_boundary();
         let recovered = recovered_context.into_transcript_items();
         if recovered.len() == original_len {
             return Err(HistoryOperationError::Store(

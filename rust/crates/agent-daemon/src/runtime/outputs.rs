@@ -17,6 +17,9 @@ pub(crate) fn agent_input_from_queued_priority(
         QueuedInputContent::DaemonToolObservation(observation) => {
             AgentInput::daemon_observation(observation)
         }
+        QueuedInputContent::SubagentControl => {
+            unreachable!("subagent control ledger rows are not dispatchable queue inputs")
+        }
     }
 }
 

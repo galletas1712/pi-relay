@@ -154,13 +154,50 @@ create index if not exists delegations_completed_repair_idx
     on delegations(updated_at, id)
     where status in ('done','done_with_failures');
 
+-- This link must exist before the expected-count repair below queries it.
+alter table sessions add column if not exists delegation_id text null references delegations(id);
+
 -- The number of subagents the delegation will eventually spawn. The barrier
 -- requires the full set to exist (and be terminal) before completing, so a
 -- partial spawn (subagent #1 terminal while #2 is not yet inserted) cannot
 -- complete the delegation.
 alter table delegations add column if not exists expected_subagents integer not null default 1;
 
-alter table sessions add column if not exists delegation_id text null references delegations(id);
+-- Legacy databases gained the column with its default after fan-out children
+-- already existed. Narrowly repair default-one rows from the durable links,
+-- preserving every intentional value greater than one. Also normalize any
+-- invalid value from an intermediate/manual schema before adding the check.
+update delegations
+set expected_subagents=1
+where expected_subagents is null or expected_subagents <= 0;
+
+update delegations d
+set expected_subagents=children.actual
+from (
+    select delegation_id, count(*)::integer as actual
+    from sessions
+    where delegation_id is not null
+    group by delegation_id
+) children
+where d.id=children.delegation_id
+  and d.expected_subagents=1
+  and children.actual > 1;
+
+alter table delegations alter column expected_subagents set default 1;
+alter table delegations alter column expected_subagents set not null;
+
+do $$
+begin
+    if not exists (
+        select 1
+        from pg_constraint
+        where conname='delegations_expected_subagents_positive'
+    ) then
+        alter table delegations
+            add constraint delegations_expected_subagents_positive
+            check (expected_subagents > 0);
+    end if;
+end $$;
 
 create index if not exists sessions_delegation_created_idx
     on sessions(delegation_id, created_at, id)
