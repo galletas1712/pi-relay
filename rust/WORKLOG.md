@@ -26,6 +26,11 @@
   proactive compaction. Static 1M-input/128K-output metadata for Sonnet 5 and
   Fable 5 keeps known models safe during discovery failure; unknown models
   retain a conservative 64K output ceiling and no assumed context window.
+- Treats Fable's HTTP-200 `stop_reason: "refusal"` as a terminal model failure,
+  not a completed assistant turn. Any partial streamed assistant content and
+  provider replay are discarded, while `stop_details` category/explanation are
+  retained in the surfaced error and action result. Refusals do not trigger an
+  automatic retry or fallback model.
 - Kept the ordinary Anthropic default output request at
   `min(64K, model ceiling)` rather than automatically reserving each model's
   full 128K. Explicit session limits are clamped to the discovered/static

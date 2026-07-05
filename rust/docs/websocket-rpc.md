@@ -154,8 +154,9 @@ Supported provider kinds are exactly two (`ProviderKind = OpenAi | Claude`):
 `openai` kind. A request with `"kind": "codex"` is rejected at decode time.
 
 `prompt_cache.key` maps to `ModelRequest::prompt_cache_key` and is sent on the
-OpenAI request path. `max_tokens` is optional; when omitted the daemon does not
-set an OpenAI output cap.
+OpenAI request path. `max_tokens` is optional; when present it is emitted as
+OpenAI `max_output_tokens`, and when omitted the daemon does not set an OpenAI
+output cap.
 
 `reasoning_effort` defaults to `medium`. OpenAI currently accepts `none`,
 `minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay; `gpt-5.6-sol` also
@@ -2010,27 +2011,7 @@ With `~/.codex/auth.json` or `CODEX_ACCESS_TOKEN` available:
       "model": "gpt-5.6-sol",
       "prompt_cache": { "key": "pi-relay-real-smoke" }
     },
-    "metadata": { "manual": "real-codex" }
-  }
-}
-```
-
-Inspect the prompt template if needed:
-
-```json
-{
-  "method": "system.prompt",
-  "params": { "session_id": "s1" }
-}
-```
-
-Then send:
-
-```json
-{
-  "method": "input.follow_up",
-  "params": {
-    "session_id": "manual_real_codex",
+    "metadata": { "manual": "real-codex" },
     "client_input_id": "ci-real-codex",
     "content": [
       { "type": "text", "text": "Reply with exactly: websocket real codex ok" }
@@ -2039,7 +2020,8 @@ Then send:
 }
 ```
 
-Verify a real `model.completed`, assistant transcript entry, prompt-cache key
+`session.start` creates the session and immediately starts this first turn.
+Verify a real `model.completed`, assistant transcript entry, prompt-cache-key
 request path, and `session.idle`.
 
 For image support, send a public image URL, for example:
