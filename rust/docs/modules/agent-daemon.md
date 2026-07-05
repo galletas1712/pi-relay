@@ -34,8 +34,8 @@ runtime/           SessionDriver facade plus concrete lifecycle phases:
 workspaces/        workspace base refresh, local/git source handling, sanitization,
                    and session instantiation (btrfs/reflink/copy fallback)
 rpc_views.rs       response shaping (snapshots, queue state, transcript views, server_time_ms)
-model_metadata.rs  per-model context windows + 85% auto-compaction default limit
-provider_runtime/  provider selection, model/web-tool execution, compaction, token accounting
+provider_runtime/  provider selection, model metadata scheduling, model/web-tool
+                   execution, compaction, token accounting
 subagents.rs       delegation subagent spawn core: role resolution, full vs
                    read-only workspace handling, child prompt + lifecycle events
 delegation_tools.rs     delegation tool surface (delegate_writing_task /
@@ -183,7 +183,19 @@ Two retry layers exist:
 
 ### Auto-compaction with circuit breaker
 
-Before a model action dispatches, `gate_model_dispatch` measures input tokens and blocks the action if it would exceed the model's auto limit. `model_metadata.rs` supplies per-model context windows; the default auto limit is 85% of the window (`window * 85 / 100`). Token accounting differs by provider: Claude uses the authoritative remote token-count preflight; OpenAI/Codex has no usable remote count endpoint, so it anchors on the latest provider-reported usage and estimates only the local transcript suffix appended after that point.
+Before a model action dispatches, `gate_model_dispatch` asks every provider for
+`ModelProvider::model_metadata`, measures input tokens, and blocks the action if
+it would exceed the resolved automatic limit. Adapters own discovery and
+provider-specific threshold recommendations: OpenAI's authenticated catalog
+uses 90% of its resolved current/default context window (or a smaller explicit
+provider limit), while Anthropic preserves the verified 1M→500k policy and
+uses the generic 85% recommendation otherwise. The daemon no longer contains
+OpenAI model-id, effort, context-window, or threshold rows. Metadata lookup
+uses the same one-time Codex 401 refresh/rebuild path as generation. Token
+accounting differs by provider: Claude uses the authoritative remote
+token-count preflight; OpenAI/Codex has no usable remote count endpoint, so it
+anchors on the latest provider-reported usage and estimates only the local
+transcript suffix appended after that point.
 
 ```
 RequestModel ready to dispatch

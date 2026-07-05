@@ -5,7 +5,6 @@ use agent_vocab::{ProviderKind, TranscriptItem};
 use anyhow::Result;
 
 use crate::auth::Credentials;
-use crate::model_metadata;
 use crate::state::AppState;
 
 use super::auth_retry::count_tokens_with_auth_retry;
@@ -58,11 +57,7 @@ async fn count_claude_model_input_tokens_remotely(
             effective_prompt_profile(state, config, session_id).await?,
         ),
         max_tokens: config.provider.max_tokens,
-        reasoning_effort: model_metadata::normalize_reasoning_effort(
-            config.provider.kind,
-            &config.provider.model,
-            config.provider.reasoning_effort,
-        ),
+        reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
         session_id: Some(session_id.to_string()),
     };

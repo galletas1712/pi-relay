@@ -642,16 +642,20 @@ auth.rs:21-35). A fresh empty DB needs NOTHING seeded for auth.
 | rust/crates/agent-daemon/src/provider_runtime/requests.rs | complete_model_request | 65-74 | Real dispatch: Credentials::load() then provider_for_config then complete_with_auth_retry (creds re-read every time). |
 | rust/crates/agent-daemon/src/config.rs | Config::from_env_and_args | 11-46 | --database-url (or DATABASE_URL, required), --bind (or PI_AGENTD_BIND, default 127.0.0.1:8787). NO API-key flag. |
 | rust/crates/agent-daemon/src/main.rs | main | 55-82 | Boot: Config → connect → migrate → ProviderConnectionRegistry::new → TcpListener::bind. WebSocket RPC server. |
-| rust/crates/agent-daemon/src/model_metadata.rs | context_window / supported_reasoning_efforts | 6-72 | Model IDs (below). |
+| rust/crates/agent-provider/src/openai.rs | OpenAiModelCatalogCache / ModelProvider::model_metadata | provider adapter | Authenticated account-scoped private Codex catalog; exact model/effort validation and OpenAI threshold policy. |
 | rust/crates/agent-store/src/postgres/sessions_tests.rs | test_store / TestDb | 14-63 | Integration-test convention: gate PI_RELAY_TEST_DATABASE_URL, create unique DB, migrate, drop. |
 | rust/crates/agent-store/src/postgres/schema.rs | migrate | 21-125 | Idempotent create-table-if-not-exists. Fresh DB fully provisioned by store.migrate(); no auth tables. |
 | rust/crates/agent-vocab/src/provider.rs | ProviderConfig | 79-85 | session.start: {kind:ProviderKind(OpenAi|Claude), model, reasoning_effort, max_tokens}. No default model. |
 
-**Model IDs:** OpenAI daemon fallbacks in `model_metadata.rs` cover `gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.1,
-gpt-5.1-codex-max, gpt-5.1-codex-mini, gpt-5.2, gpt-5.2-codex, gpt-5.3-codex`. Claude `claude-sonnet-5`,
-`claude-fable-5`, `claude-opus-4-8`, and `claude-opus-4-7` have 1M static fallbacks owned by the Anthropic adapter; its
-Models API cache can authoritatively refine runtime input/output limits and capabilities. Fable 5 requires 30-day
-retention and is not available under Zero Data Retention.
+**Model capabilities:** OpenAI runtime model ids are not maintained in this
+map. The authenticated private Codex `/models` catalog is authoritative and
+uses exact slug/effort matching with no static fallback. The web picker remains
+seeded separately. Claude `claude-sonnet-5`, `claude-fable-5`,
+`claude-opus-4-8`, and `claude-opus-4-7` retain adapter-private static
+fallbacks that the Anthropic Models API can refine. Fable 5 requires 30-day
+retention and is not available under Zero Data Retention. Verified/discovered
+1M Claude windows recommend a 500k threshold; other authoritative windows use
+the generic 85% policy.
 
 ### build_seams
 **Deterministic harness tests:** session.start with `metadata:{"harness":true}` → runtime stops at spawn_model_dispatch:34
@@ -835,7 +839,8 @@ is NO connections table, NO auth/login RPC, NO `--api-key` CLI flag (config.rs:1
    `primaryApiKey` **starting with `sk-ant-`** (keys without that prefix are silently dropped → surfaces as
    "ANTHROPIC_API_KEY not found").
 4. **Start the e2e session WITHOUT the harness flag** (omit `metadata.harness` or set false) so real dispatch runs. Pick
-   a seeded model ID — e.g. OpenAI `gpt-5.6-sol`, Claude `claude-sonnet-5`/`claude-opus-4-8`.
+   an exact OpenAI slug advertised by the authenticated private Codex catalog, or a Claude id such as
+   `claude-sonnet-5`/`claude-opus-4-8`.
    session.start provider = `{ "kind": "open_ai"|"claude", "model": "<id>" }` (verify exact ProviderKind wire casing at
    `agent-vocab/src/provider.rs:9` before hardcoding).
 
