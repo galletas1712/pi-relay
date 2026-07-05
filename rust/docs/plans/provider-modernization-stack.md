@@ -95,9 +95,9 @@ The native-only production behavior remains derived from the tested pre-#217
 cutover reference, composed with PR #217's durable control behavior and the
 foundation's recovery integration.
 
-Existing databases are cut over by the one-time self-validating
-[`native-compaction-v1.sql`](../../migrations/native-compaction-v1.sql) patch.
-It is executed directly with `psql` after `pg_dump` and after stopping/draining
+Existing databases were cut over by the one-time self-validating
+`native-compaction-v1.sql` patch (applied, then removed from the tree). It was
+executed directly with `psql` after `pg_dump` and after stopping/draining
 all writers. Dry-run and apply execute the same serializable transaction;
 dry-run rolls it back, apply commits after final full-forest verification, and
 a second apply is a verified no-op. Post-commit rollback is `pg_restore`.
