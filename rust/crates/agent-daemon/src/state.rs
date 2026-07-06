@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
+use crate::runtime::SessionLockRegistry;
 use crate::types::RuntimeSession;
 use crate::workspaces::WorkspaceManager;
 
@@ -36,7 +37,7 @@ pub(crate) struct RunningTask {
 pub(crate) struct AppState {
     pub(crate) repo: Arc<PostgresAgentStore>,
     pub(crate) active: Arc<Mutex<HashMap<String, Arc<Mutex<RuntimeSession>>>>>,
-    pub(crate) session_driver_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub(crate) session_driver_locks: SessionLockRegistry,
     pub(crate) tasks: Arc<StdMutex<HashMap<String, RunningTask>>>,
     pub(crate) auxiliary_tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
     pub(crate) task_registration_lock: Arc<StdMutex<()>>,

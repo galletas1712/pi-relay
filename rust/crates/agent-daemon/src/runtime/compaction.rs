@@ -550,6 +550,7 @@ async fn install_runtime_compaction_checkpoint(
     job: &CompactionJob,
 ) -> std::result::Result<SessionConfig, RpcError> {
     let stored = state.repo.load_stored_session(session_id).await?;
+    let persisted_active_leaf_id = stored.active_leaf_id.clone();
     let config = state.repo.load_session_config(session_id).await?;
     state
         .workspaces
@@ -579,12 +580,14 @@ async fn install_runtime_compaction_checkpoint(
         let mut runtime = active.lock().await;
         runtime.session = session;
         runtime.config = config.clone();
+        runtime.persisted_active_leaf_id = persisted_active_leaf_id;
     } else {
         state.active.lock().await.insert(
             session_id.to_string(),
             std::sync::Arc::new(tokio::sync::Mutex::new(RuntimeSession {
                 session,
                 config: config.clone(),
+                persisted_active_leaf_id,
             })),
         );
     }

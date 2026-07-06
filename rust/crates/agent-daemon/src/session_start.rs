@@ -192,7 +192,11 @@ async fn start_prepared_session_with_driver(
             QueuedInputContent::user_message(content.clone()),
         ))
         .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
-    let mut runtime = RuntimeSession { session, config };
+    let mut runtime = RuntimeSession {
+        session,
+        config,
+        persisted_active_leaf_id: None,
+    };
     let (entries, events, actions, active_leaf_id) = collect_runtime_outputs(&mut runtime);
     let config = runtime.config.clone();
     let (frames, persisted_actions) = state
@@ -212,6 +216,7 @@ async fn start_prepared_session_with_driver(
             delegation_id.as_deref(),
         )
         .await?;
+    runtime.persisted_active_leaf_id.clone_from(&active_leaf_id);
 
     if frames.is_empty() {
         return Ok(StartedSession {
