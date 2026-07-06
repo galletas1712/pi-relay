@@ -67,13 +67,15 @@ use crate::provider_runtime::{
     CompactionOutput, CompactionSummaryKind, ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::{
-    apply_model_response, recover_post_compaction_dispatches_on_boot, take_tasks, SessionDriver,
+    apply_model_response, recover_post_compaction_dispatches_on_boot, runner_start_count,
+    take_tasks, SessionDriver,
 };
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart,
 };
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
 use crate::types::DispatchAction;
+use crate::types::RuntimeSession;
 use crate::workspaces::WorkspaceManager;
 
 use super::{
@@ -145,7 +147,7 @@ async fn test_env() -> Option<TestEnv> {
     let state = AppState {
         repo: Arc::new(store),
         active: Arc::new(Mutex::new(HashMap::new())),
-        session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
+        session_driver_locks: crate::runtime::SessionLockRegistry::default(),
         tasks: Arc::new(StdMutex::new(HashMap::new())),
         auxiliary_tasks: Arc::new(StdMutex::new(Vec::new())),
         task_registration_lock: Arc::new(StdMutex::new(())),
@@ -194,7 +196,7 @@ fn test_app_state(
     AppState {
         repo: Arc::new(store),
         active: Arc::new(Mutex::new(HashMap::new())),
-        session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
+        session_driver_locks: crate::runtime::SessionLockRegistry::default(),
         tasks: Arc::new(StdMutex::new(HashMap::new())),
         auxiliary_tasks: Arc::new(StdMutex::new(Vec::new())),
         task_registration_lock: Arc::new(StdMutex::new(())),
@@ -332,6 +334,115 @@ async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
         )
         .await
         .expect("create parent");
+}
+
+#[tokio::test]
+async fn empty_dispatch_stops_after_the_pending_query() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let session_id = "missing-empty-dispatch";
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+
+    let dispatched = driver
+        .dispatch_ready_actions()
+        .await
+        .expect("missing session has no pending actions");
+
+    assert!(dispatched.is_empty());
+    assert_eq!(runner_start_count(session_id, "model"), 0);
+    assert_eq!(runner_start_count(session_id, "tool"), 0);
+    assert!(env.state.tasks.lock().expect("tasks lock").is_empty());
+    drop(driver);
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn nonempty_dispatch_still_resolves_and_dispatches_the_action() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    let session_id = "nonempty-dispatch";
+    env.state
+        .repo
+        .create_project(project_id, "nonempty dispatch", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, session_id).await;
+    let action = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::from_transcript_items(vec![TranscriptItem::UserMessage(
+            UserMessage::text("dispatch"),
+        )]),
+        context_leaf_id: Some("dispatch-entry".to_string()),
+    };
+    let entry = TranscriptStorageNode {
+        id: "dispatch-entry".to_string(),
+        parent_id: None,
+        timestamp_ms: 1,
+        item: TranscriptItem::UserMessage(UserMessage::text("dispatch")),
+        provider_replay: Vec::new(),
+    };
+    env.state
+        .repo
+        .persist_outputs(
+            session_id,
+            OutputBatch::new(
+                std::slice::from_ref(&entry),
+                Some(&entry.id),
+                &[],
+                std::slice::from_ref(&action),
+            ),
+        )
+        .await
+        .expect("persist pending action");
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+
+    let dispatched = driver
+        .dispatch_ready_actions()
+        .await
+        .expect("pending action dispatches");
+
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(dispatched[0].action, action);
+    assert_eq!(dispatched[0].config.project_id, Some(project_id));
+    drop(driver);
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn true_empty_active_output_pass_opens_no_transaction_or_events() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let session_id = "empty-active-output";
+    let project_id = Uuid::new_v4();
+    let active = Arc::new(Mutex::new(RuntimeSession {
+        session: AgentSession::new(),
+        config: session_config(&env, project_id, json!({})),
+        persisted_active_leaf_id: None,
+    }));
+    let mut events = env.state.events.subscribe();
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    env.state.repo.close().await;
+
+    let dispatched = driver
+        .persist_active_outputs(active, None, None, None, Vec::new())
+        .await
+        .expect("empty output does not touch the closed pool");
+
+    assert!(dispatched.is_empty());
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    drop(driver);
+    env.cleanup().await;
 }
 
 fn successful_compaction(summary: &str) -> CompactionCompletion {
@@ -550,7 +661,7 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
     let restarted_state = AppState {
         repo: Arc::new(restarted_store),
         active: Arc::new(Mutex::new(HashMap::new())),
-        session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
+        session_driver_locks: crate::runtime::SessionLockRegistry::default(),
         tasks: Arc::new(StdMutex::new(HashMap::new())),
         auxiliary_tasks: Arc::new(StdMutex::new(Vec::new())),
         task_registration_lock: Arc::new(StdMutex::new(())),

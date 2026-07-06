@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         repo,
         active: Arc::new(Mutex::new(HashMap::new())),
-        session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
+        session_driver_locks: SessionLockRegistry::default(),
         tasks: Arc::new(StdMutex::new(HashMap::new())),
         auxiliary_tasks: Arc::new(StdMutex::new(Vec::new())),
         task_registration_lock: Arc::new(StdMutex::new(())),
