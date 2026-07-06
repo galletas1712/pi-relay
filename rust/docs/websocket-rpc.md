@@ -160,10 +160,11 @@ Supported provider kinds are exactly two (`ProviderKind = OpenAi | Claude`):
   routing header required by workspace-backed ChatGPT accounts. pi-relay
   intentionally does not support plain OpenAI API-key auth for OpenAI models.
   This is the path tested with real credentials.
-- `anthropic` or `claude`: Anthropic Messages API through `ANTHROPIC_API_KEY`.
+- `claude`: Anthropic Messages API through `ANTHROPIC_API_KEY`.
 
-`codex` is **not** a provider kind; it is the auth transport used by the
-`openai` kind. A request with `"kind": "codex"` is rejected at decode time.
+`anthropic` and `codex` are **not** provider kinds. `codex` is the auth
+transport used by the `openai` kind. Requests using either retired name are
+rejected at decode time.
 
 `prompt_cache.key` maps to `ModelRequest::prompt_cache_key` and is sent on the
 OpenAI request path. `max_tokens` is optional; when present it is emitted as
@@ -1659,7 +1660,7 @@ child session lifetime.
 
 ### `tools.list`
 
-Requires a `provider` parameter (`"openai"` or `"anthropic"`/`"claude"`) and returns the
+Requires a `provider` parameter (`"openai"` or `"claude"`) and returns the
 model-visible tool definitions for that provider, because the tool surface is
 provider-shaped (e.g. OpenAI `apply_patch` vs Anthropic `text_editor_20250728`
 for editing). Callers may pass `session_id` so the daemon can derive the actual
@@ -2082,7 +2083,7 @@ contains the original image block.
 ### 13. Real Anthropic Provider
 
 Run only when `ANTHROPIC_API_KEY` is present. Create a session with
-`provider.kind = "anthropic"` or `"claude"` and ask the model to use the `edit`
+`provider.kind = "claude"` and ask the model to use the `edit`
 tool (`text_editor_20250728`) or `bash`. Verify provider-requested tool calls,
 real tool results, a second model request containing those results, and a final
 assistant message.

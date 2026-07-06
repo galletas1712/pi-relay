@@ -32,7 +32,7 @@ impl FromStr for ProviderKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "openai" => Ok(Self::OpenAi),
-            "claude" | "anthropic" => Ok(Self::Claude),
+            "claude" => Ok(Self::Claude),
             other => Err(format!("unsupported provider kind: {other}")),
         }
     }
@@ -163,16 +163,14 @@ mod tests {
     }
 
     #[test]
-    fn provider_kind_accepts_legacy_anthropic_alias() {
-        let config: ProviderConfig = serde_json::from_value(json!({
+    fn provider_kind_rejects_retired_anthropic_alias() {
+        let error = serde_json::from_value::<ProviderConfig>(json!({
             "kind": "anthropic",
             "model": "claude-sonnet-4-5",
         }))
-        .expect("legacy provider kind should deserialize");
+        .expect_err("migrated provider aliases must not deserialize");
 
-        assert_eq!(config.kind, ProviderKind::Claude);
-        assert_eq!(config.reasoning_effort, ReasoningEffort::Medium);
-        assert_eq!(serde_json::to_value(config.kind).unwrap(), json!("claude"));
+        assert!(error.to_string().contains("unsupported provider kind"));
     }
 
     #[test]

@@ -326,185 +326,6 @@ async fn migration_creates_delegation_ledger_query_indexes() {
 }
 
 #[tokio::test]
-async fn migration_backfills_legacy_default_one_fanout_and_is_idempotent() {
-    let Some(admin_url) = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok() else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let name = format!(
-        "pi_relay_legacy_migration_test_{}_{}",
-        std::process::id(),
-        TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
-    let admin = sqlx::PgPool::connect(&admin_url)
-        .await
-        .expect("connect test admin");
-    sqlx::query(&format!(r#"create database "{name}""#))
-        .execute(&admin)
-        .await
-        .expect("create legacy database");
-    admin.close().await;
-    let database_url = database_url_with_name(&admin_url, &name);
-    let pool = sqlx::PgPool::connect(&database_url)
-        .await
-        .expect("connect legacy database");
-    sqlx::raw_sql(
-        r#"
-        create table projects (
-            id uuid primary key,
-            created_at timestamptz not null default now(),
-            updated_at timestamptz not null default now(),
-            name text not null,
-            workspaces jsonb not null default '[]'::jsonb,
-            metadata jsonb not null default '{}'::jsonb
-        );
-        create table sessions (
-            id text primary key,
-            project_id uuid null references projects(id),
-            outer_cwd text not null,
-            workspaces jsonb not null default '[]'::jsonb,
-            created_at timestamptz not null default now(),
-            updated_at timestamptz not null default now(),
-            active_leaf_id text null,
-            system_prompt text not null,
-            provider_config jsonb not null,
-            metadata jsonb not null default '{}'::jsonb,
-            parent_session_id text null references sessions(id) on delete set null,
-            last_user_message_timestamp_ms bigint null,
-            session_revision bigint not null default 0,
-            queue_revision bigint not null default 0,
-            transcript_revision bigint not null default 0,
-            subagent_type text null
-        );
-        create table delegations (
-            id text primary key,
-            parent_session_id text not null references sessions(id) on delete cascade,
-            workflow text null,
-            label text null,
-            kind text not null,
-            status text not null,
-            attempt_id text not null,
-            created_at timestamptz not null default now(),
-            updated_at timestamptz not null default now()
-        );
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .expect("create pre-column schema");
-    let provider = serde_json::to_value(session_config(Uuid::nil(), None).provider)
-        .expect("serialize provider");
-    for (session_id, parent_id, subagent_type) in [
-        ("legacy_parent", None, None),
-        ("intentional_parent", None, None),
-        ("legacy_a", Some("legacy_parent"), Some("read_only")),
-        ("legacy_b", Some("legacy_parent"), Some("read_only")),
-        ("legacy_c", Some("legacy_parent"), Some("read_only")),
-    ] {
-        sqlx::query(
-            r#"
-            insert into sessions (
-                id, outer_cwd, system_prompt, provider_config,
-                parent_session_id, subagent_type
-            )
-            values ($1, '/tmp/legacy', '', $2, $3, $4)
-            "#,
-        )
-        .bind(session_id)
-        .bind(&provider)
-        .bind(parent_id)
-        .bind(subagent_type)
-        .execute(&pool)
-        .await
-        .expect("insert legacy session");
-    }
-    sqlx::query(
-        r#"
-        insert into delegations (
-            id, parent_session_id, kind, status, attempt_id
-        )
-        values
-            ('legacy_fanout', 'legacy_parent', 'readonly_fanout', 'running', 'legacy-attempt'),
-            ('intentional_count', 'intentional_parent', 'readonly_fanout', 'done', 'intentional-attempt')
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .expect("insert legacy delegation");
-    sqlx::query(
-        "alter table sessions add column delegation_id text null references delegations(id)",
-    )
-    .execute(&pool)
-    .await
-    .expect("legacy link migration");
-    sqlx::query(
-        "update sessions set delegation_id='legacy_fanout' where id like 'legacy_%' and id<>'legacy_parent'",
-    )
-    .execute(&pool)
-    .await
-    .expect("link legacy children");
-    sqlx::query("alter table delegations add column expected_subagents integer not null default 1")
-        .execute(&pool)
-        .await
-        .expect("simulate legacy default-one column addition");
-    sqlx::query("update delegations set expected_subagents=7 where id='intentional_count'")
-        .execute(&pool)
-        .await
-        .expect("seed intentional fan-out count");
-
-    let store = PostgresAgentStore::connect(&database_url)
-        .await
-        .expect("connect store");
-    store.migrate().await.expect("first migration");
-    store.migrate().await.expect("idempotent migration");
-    let expected: i32 =
-        sqlx::query_scalar("select expected_subagents from delegations where id='legacy_fanout'")
-            .fetch_one(&pool)
-            .await
-            .expect("load repaired count");
-    assert_eq!(expected, 3);
-    let intentional_expected: i32 = sqlx::query_scalar(
-        "select expected_subagents from delegations where id='intentional_count'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("load preserved intentional count");
-    assert_eq!(
-        intentional_expected, 7,
-        "migration repair must not overwrite an intentional count greater than one"
-    );
-    let delegation = store
-        .get_delegation("legacy_fanout")
-        .await
-        .expect("load repaired delegation")
-        .expect("delegation exists");
-    assert_eq!(delegation.expected_subagents, 3);
-    assert!(
-        store
-            .delegation_subagents_all_terminal("legacy_fanout")
-            .await
-            .expect("completion fence remains live"),
-        "the repaired exact-count fence must recognize all three terminal legacy children"
-    );
-    assert!(
-        store
-            .finish_delegation("legacy_fanout", "legacy-attempt", DelegationStatus::Done,)
-            .await
-            .expect("finish repaired legacy fanout"),
-        "the legacy running fan-out must not remain stranded behind expected=1"
-    );
-
-    store.close().await;
-    pool.close().await;
-    if let Ok(admin) = sqlx::PgPool::connect(&admin_url).await {
-        let _ = sqlx::query(&format!(r#"drop database if exists "{}""#, name))
-            .execute(&admin)
-            .await;
-        admin.close().await;
-    }
-}
-
-#[tokio::test]
 async fn list_delegation_subagents_for_context_is_bounded_and_ordered() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -1030,20 +851,26 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
 
     // The status CAS no longer enqueues the wakeup. Publication happens after
     // the handoff files exist, but the deterministic client_input_id still
-    // makes the enqueue idempotent.
+    // makes the typed observation enqueue idempotent.
     let key = format!(
         "delegation-steer:{}:{}",
         delegation.id, delegation.attempt_id
     );
+    let observation = DaemonToolObservation::inspect_delegation(
+        ToolCallId::new("call_finish_delegation"),
+        &delegation.id,
+        Some("done".to_string()),
+        json!({ "delegation_id": delegation.id, "status": "done" }),
+    );
     assert_eq!(steer_count(&db, "parent", &key).await, 0);
     db.store
-        .enqueue_delegation_steer("parent", "done", &key)
+        .enqueue_delegation_observation("parent", &observation, &key)
         .await
-        .expect("enqueue steer");
+        .expect("enqueue observation");
     db.store
-        .enqueue_delegation_steer("parent", "done", &key)
+        .enqueue_delegation_observation("parent", &observation, &key)
         .await
-        .expect("enqueue steer idempotent");
+        .expect("enqueue observation idempotent");
     assert_eq!(steer_count(&db, "parent", &key).await, 1);
 
     // A stale attempt id cannot re-fire a re-opened delegation.
@@ -1441,7 +1268,7 @@ async fn combined_control_phases_block_mailbox_and_fence_newer_action_generation
 }
 
 #[tokio::test]
-async fn cancel_running_delegation_is_attempt_fenced_and_terminal_safe() {
+async fn atomic_cancel_is_attempt_fenced_and_terminal_safe() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -1458,11 +1285,18 @@ async fn cancel_running_delegation_is_attempt_fenced_and_terminal_safe() {
         .create_delegation("parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
-    assert!(!db
+    let (won, events) = db
         .store
-        .cancel_running_delegation(&delegation.id, "stale-attempt-id")
+        .cancel_running_delegation_and_queued_partials(
+            "parent",
+            &delegation.id,
+            "stale-attempt-id",
+            "test",
+        )
         .await
-        .expect("stale cancel loses"));
+        .expect("stale cancel loses");
+    assert!(!won);
+    assert!(events.is_empty());
     assert_eq!(
         db.store
             .get_delegation(&delegation.id)
@@ -1472,16 +1306,30 @@ async fn cancel_running_delegation_is_attempt_fenced_and_terminal_safe() {
             .status,
         DelegationStatus::Running
     );
-    assert!(db
+    let (won, events) = db
         .store
-        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
+        .cancel_running_delegation_and_queued_partials(
+            "parent",
+            &delegation.id,
+            &delegation.attempt_id,
+            "test",
+        )
         .await
-        .expect("real cancel wins"));
-    assert!(!db
+        .expect("real cancel wins");
+    assert!(won);
+    assert!(events.is_empty());
+    let (won, events) = db
         .store
-        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
+        .cancel_running_delegation_and_queued_partials(
+            "parent",
+            &delegation.id,
+            &delegation.attempt_id,
+            "test",
+        )
         .await
-        .expect("cancel replay loses"));
+        .expect("cancel replay loses");
+    assert!(!won);
+    assert!(events.is_empty());
     assert_eq!(
         db.store
             .get_delegation(&delegation.id)
@@ -1512,11 +1360,13 @@ async fn cancel_running_delegation_is_attempt_fenced_and_terminal_safe() {
         .finish_delegation(&done.id, &done.attempt_id, DelegationStatus::Done)
         .await
         .expect("finish done"));
-    assert!(!db
+    let (won, events) = db
         .store
-        .cancel_running_delegation(&done.id, &done.attempt_id)
+        .cancel_running_delegation_and_queued_partials("parent", &done.id, &done.attempt_id, "test")
         .await
-        .expect("cancel after done loses"));
+        .expect("cancel after done loses");
+    assert!(!won);
+    assert!(events.is_empty());
     assert_eq!(
         db.store
             .get_delegation(&done.id)
@@ -1551,11 +1401,18 @@ async fn cancel_running_delegation_is_attempt_fenced_and_terminal_safe() {
         )
         .await
         .expect("finish done_with_failures"));
-    assert!(!db
+    let (won, events) = db
         .store
-        .cancel_running_delegation(&failed.id, &failed.attempt_id)
+        .cancel_running_delegation_and_queued_partials(
+            "parent",
+            &failed.id,
+            &failed.attempt_id,
+            "test",
+        )
         .await
-        .expect("cancel after done_with_failures loses"));
+        .expect("cancel after done_with_failures loses");
+    assert!(!won);
+    assert!(events.is_empty());
     assert_eq!(
         db.store
             .get_delegation(&failed.id)
@@ -1860,303 +1717,6 @@ async fn cancellation_and_boundary_control_reconciliation_do_not_deadlock() {
             "neither legal winner may leave a mailbox-blocking control"
         );
     }
-
-    db.cleanup().await;
-}
-
-#[tokio::test]
-async fn boot_repair_cancels_partial_wakeup_left_after_cancel_crash_gap() {
-    let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
-        .await
-        .expect("create project");
-    create_session(&db, "parent", project_id).await;
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
-    let partial_observation = DaemonToolObservation::inspect_delegation(
-        ToolCallId::new("call_partial_boot_repair"),
-        &delegation.id,
-        Some("Subagent finished before cancellation".to_string()),
-        json!({
-            "delegation_id": delegation.id,
-            "status": "running",
-        }),
-    );
-    let partial_key = format!(
-        "delegation-steer:{}:{}:done_child",
-        delegation.id, delegation.attempt_id
-    );
-    assert!(db
-        .store
-        .enqueue_partial_delegation_observation_if_running(
-            "parent",
-            &delegation.id,
-            &delegation.attempt_id,
-            &partial_observation,
-            &partial_key,
-        )
-        .await
-        .expect("enqueue partial"));
-
-    // Simulate the historical crash window: the cancellation status CAS
-    // committed, but the follow-up queued-partial cleanup never ran.
-    assert!(db
-        .store
-        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
-        .await
-        .expect("simulate old cancel CAS"));
-    assert_eq!(
-        db.store
-            .find_client_input("parent", &partial_key)
-            .await
-            .expect("find partial before repair")
-            .expect("partial row")
-            .status,
-        QueuedInputStatus::Queued
-    );
-    assert_eq!(
-        db.store
-            .sessions_with_active_queued_inputs()
-            .await
-            .expect("active queued sessions before repair"),
-        vec!["parent".to_string()],
-        "top-level parent would be resumed and consume the stale partial before repair"
-    );
-
-    let events = db
-        .store
-        .repair_cancelled_delegation_partial_wakeups()
-        .await
-        .expect("boot repair");
-    assert_eq!(events.len(), 1);
-    assert_eq!(
-        db.store
-            .find_client_input("parent", &partial_key)
-            .await
-            .expect("find partial after repair")
-            .expect("partial row")
-            .status,
-        QueuedInputStatus::Cancelled
-    );
-    assert_eq!(
-        active_partial_wakeup_count(&db, "parent", &delegation).await,
-        0,
-        "boot repair must leave no queued/consuming partial for this attempt"
-    );
-    assert!(
-        db.store
-            .take_next_queued_steer_input("parent")
-            .await
-            .expect("take next steer after repair")
-            .is_none(),
-        "stale cancelled partial must not remain consumable"
-    );
-    assert!(
-        db.store
-            .sessions_with_active_queued_inputs()
-            .await
-            .expect("active queued sessions after repair")
-            .is_empty(),
-        "boot parent queued-input resume should not see the repaired stale partial"
-    );
-    assert!(db
-        .store
-        .repair_cancelled_delegation_partial_wakeups()
-        .await
-        .expect("boot repair is idempotent")
-        .is_empty());
-
-    db.cleanup().await;
-}
-
-#[tokio::test]
-async fn boot_repair_only_cancels_active_partial_wakeups_for_cancelled_attempts() {
-    let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
-        .await
-        .expect("create project");
-    create_session(&db, "parent", project_id).await;
-    create_session(&db, "other_parent", project_id).await;
-
-    let cancelled = db
-        .store
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create cancelled delegation");
-    let running = db
-        .store
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create running delegation");
-    let other_cancelled = db
-        .store
-        .create_delegation(
-            "other_parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            None,
-            2,
-        )
-        .await
-        .expect("create other cancelled delegation");
-    let observation = DaemonToolObservation::inspect_delegation(
-        ToolCallId::new("call_partial_boot_repair_scoped"),
-        &cancelled.id,
-        Some("Subagent finished before cancellation".to_string()),
-        json!({
-            "delegation_id": cancelled.id,
-            "status": "running",
-        }),
-    );
-    let stale_key = format!(
-        "delegation-steer:{}:{}:done_child",
-        cancelled.id, cancelled.attempt_id
-    );
-    assert!(db
-        .store
-        .enqueue_partial_delegation_observation_if_running(
-            "parent",
-            &cancelled.id,
-            &cancelled.attempt_id,
-            &observation,
-            &stale_key,
-        )
-        .await
-        .expect("enqueue stale partial"));
-    let running_key = format!(
-        "delegation-steer:{}:{}:done_child",
-        running.id, running.attempt_id
-    );
-    assert!(db
-        .store
-        .enqueue_partial_delegation_observation_if_running(
-            "parent",
-            &running.id,
-            &running.attempt_id,
-            &observation,
-            &running_key,
-        )
-        .await
-        .expect("enqueue running partial"));
-    let wrong_parent_key = format!(
-        "delegation-steer:{}:{}:done_child",
-        other_cancelled.id, other_cancelled.attempt_id
-    );
-    assert!(db
-        .store
-        .enqueue_partial_delegation_observation_if_running(
-            "other_parent",
-            &other_cancelled.id,
-            &other_cancelled.attempt_id,
-            &observation,
-            &wrong_parent_key,
-        )
-        .await
-        .expect("enqueue other parent partial"));
-    db.store
-        .enqueue_delegation_observation(
-            "parent",
-            &observation,
-            &format!("delegation-steer:{}:{}", cancelled.id, cancelled.attempt_id),
-        )
-        .await
-        .expect("enqueue terminal-shaped cancelled observation");
-    db.store
-        .enqueue_user_input(
-            "parent",
-            InputPriority::FollowUp,
-            &UserMessage::text("unrelated follow-up"),
-            Some("unrelated-follow-up"),
-            None,
-        )
-        .await
-        .expect("enqueue unrelated follow-up");
-
-    assert!(db
-        .store
-        .cancel_running_delegation(&cancelled.id, &cancelled.attempt_id)
-        .await
-        .expect("cancel stale delegation"));
-    assert!(db
-        .store
-        .cancel_running_delegation(&other_cancelled.id, &other_cancelled.attempt_id)
-        .await
-        .expect("cancel other delegation"));
-
-    let events = db
-        .store
-        .repair_cancelled_delegation_partial_wakeups()
-        .await
-        .expect("boot repair");
-    assert_eq!(
-        events.len(),
-        2,
-        "one cancellation event per affected parent session"
-    );
-    assert_eq!(
-        db.store
-            .find_client_input("parent", &stale_key)
-            .await
-            .expect("find stale partial")
-            .expect("stale partial row")
-            .status,
-        QueuedInputStatus::Cancelled
-    );
-    assert_eq!(
-        db.store
-            .find_client_input("parent", &running_key)
-            .await
-            .expect("find running partial")
-            .expect("running partial row")
-            .status,
-        QueuedInputStatus::Queued,
-        "running delegation partials must not be cancelled"
-    );
-    assert_eq!(
-        db.store
-            .find_client_input("other_parent", &wrong_parent_key)
-            .await
-            .expect("find other parent partial")
-            .expect("other parent partial row")
-            .status,
-        QueuedInputStatus::Cancelled,
-        "matching stale partials on other parents are repaired independently"
-    );
-    assert_eq!(
-        db.store
-            .find_client_input(
-                "parent",
-                &format!("delegation-steer:{}:{}", cancelled.id, cancelled.attempt_id),
-            )
-            .await
-            .expect("find terminal-shaped wakeup")
-            .expect("terminal row")
-            .status,
-        QueuedInputStatus::Queued,
-        "terminal wakeup key must not match the partial key shape"
-    );
-    assert_eq!(
-        db.store
-            .find_client_input("parent", "unrelated-follow-up")
-            .await
-            .expect("find follow-up")
-            .expect("follow-up row")
-            .status,
-        QueuedInputStatus::Queued
-    );
 
     db.cleanup().await;
 }
