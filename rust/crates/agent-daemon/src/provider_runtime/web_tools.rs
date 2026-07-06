@@ -170,8 +170,27 @@ async fn run_provider_web_sidecar(
     user_prompt: String,
     max_output_tokens: Option<usize>,
 ) -> ToolResultMessage {
+    let request = build_web_sidecar_request(config, session_id, call, tool, user_prompt);
+
+    match run_model_sidecar(state, config, request).await {
+        Ok(response) => sidecar_response_to_tool_result(call, response, max_output_tokens),
+        Err(error) => ToolResultMessage::error(
+            call.id.clone(),
+            &call.tool_name,
+            format!("web tool provider backend failed: {error}"),
+        ),
+    }
+}
+
+fn build_web_sidecar_request(
+    config: &SessionConfig,
+    session_id: &str,
+    call: &ToolCall,
+    tool: ProviderTool,
+    user_prompt: String,
+) -> ModelSidecarRequest {
     let sidecar_session_id = web_sidecar_session_id(session_id, call.id.as_str());
-    let request = ModelSidecarRequest {
+    ModelSidecarRequest {
         prompt_cache_key: sidecar_session_id.clone(),
         sidecar_session_id,
         request: ModelRequest {
@@ -185,21 +204,15 @@ async fn run_provider_web_sidecar(
             ))],
             tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![tool],
-            max_tokens: Some(config.provider.max_tokens.unwrap_or(8_192).min(8_192)),
+            max_tokens: match config.provider.kind {
+                ProviderKind::OpenAi => None,
+                ProviderKind::Claude => config.provider.max_tokens,
+            },
             reasoning_effort: config.provider.reasoning_effort,
             prompt_cache_key: None,
             session_id: None,
             turn_id: None,
         },
-    };
-
-    match run_model_sidecar(state, config, request).await {
-        Ok(response) => sidecar_response_to_tool_result(call, response, max_output_tokens),
-        Err(error) => ToolResultMessage::error(
-            call.id.clone(),
-            &call.tool_name,
-            format!("web tool provider backend failed: {error}"),
-        ),
     }
 }
 
@@ -433,6 +446,33 @@ fn summarize_json_block(label: &str, raw: &Value, lines: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_provider::ModelStopReason;
+    use agent_vocab::{AssistantMessage, ProviderConfig, ReasoningEffort, ToolCallId};
+
+    fn test_session_config(provider_kind: ProviderKind, max_tokens: Option<u32>) -> SessionConfig {
+        SessionConfig {
+            project_id: None,
+            outer_cwd: "/tmp".to_string(),
+            workspaces: Vec::new(),
+            system_prompt: String::new(),
+            provider: ProviderConfig {
+                kind: provider_kind,
+                model: "test-model".to_string(),
+                reasoning_effort: ReasoningEffort::Medium,
+                max_tokens,
+                prompt_cache: None,
+            },
+            metadata: Value::Null,
+        }
+    }
+
+    fn test_web_search_call() -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new("call_web"),
+            tool_name: "WebSearch".to_string(),
+            args_json: json!({ "query": "rust" }).to_string(),
+        }
+    }
 
     #[test]
     fn sidecar_session_id_is_short_enough_for_openai_prompt_cache_key() {
@@ -451,6 +491,78 @@ mod tests {
         let second = web_sidecar_session_id("session", "call_b");
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn openai_web_sidecars_use_provider_default_generation_limit() {
+        let call = test_web_search_call();
+
+        for max_tokens in [None, Some(4_096)] {
+            let request = build_web_sidecar_request(
+                &test_session_config(ProviderKind::OpenAi, max_tokens),
+                "session",
+                &call,
+                openai_web_search_tool(),
+                "rust".to_string(),
+            );
+
+            assert_eq!(request.request.max_tokens, None);
+        }
+    }
+
+    #[test]
+    fn claude_web_sidecars_preserve_configured_generation_limit() {
+        let call = test_web_search_call();
+
+        for max_tokens in [None, Some(4_096), Some(256_000)] {
+            let request = build_web_sidecar_request(
+                &test_session_config(ProviderKind::Claude, max_tokens),
+                "session",
+                &call,
+                anthropic_web_search_tool(&WebSearchArgs {
+                    query: "rust".to_string(),
+                    allowed_domains: None,
+                    blocked_domains: None,
+                    recency: None,
+                    max_output_tokens: None,
+                }),
+                "rust".to_string(),
+            );
+
+            assert_eq!(request.request.max_tokens, max_tokens);
+        }
+    }
+
+    #[test]
+    fn web_max_output_tokens_truncates_the_local_tool_result() {
+        let call = ToolCall {
+            args_json: json!({
+                "query": "rust",
+                "max_output_tokens": 1,
+            })
+            .to_string(),
+            ..test_web_search_call()
+        };
+        let args: WebSearchArgs =
+            serde_json::from_str(&call.args_json).expect("web arguments deserialize");
+        let response = ModelResponse {
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::Text("abcdefghi".to_string())],
+            },
+            provider_replay: Vec::new(),
+            usage: None,
+            stop_reason: ModelStopReason::Complete,
+            stop_details: None,
+        };
+
+        assert_eq!(
+            sidecar_response_to_tool_result(&call, response, args.max_output_tokens),
+            ToolResultMessage::success(
+                ToolCallId::new("call_web"),
+                "WebSearch",
+                "ab\n\n[tool output truncated: 5 characters omitted]\n\nhi",
+            )
+        );
     }
 
     #[test]
