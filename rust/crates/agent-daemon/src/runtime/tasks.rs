@@ -177,7 +177,22 @@ pub(super) fn register_task(
         .expect("task registry lock poisoned")
         .insert(task.action_row_id.clone(), task);
     if let Some(replaced) = replaced {
-        replaced.handle.abort();
+        // Only a superseded post-compaction runner (fenced by lease/generation)
+        // is safe to abort here. A non-leased replaced task is an ordinary
+        // tool/model runner hit by a re-dispatch race; aborting it mid-run
+        // strands its action, because the abort drops the future before the
+        // post-`run.await` mark_action_stale in spawn_claimed_dispatch. Drop its
+        // handle instead — the task detaches and runs to completion, and the
+        // duplicate runner no-ops (its action is already running). This restores
+        // the pre-#221 behavior for ordinary dispatch.
+        if replaced.post_compaction_dispatch_lease.is_some() {
+            replaced.handle.abort();
+        } else {
+            eprintln!(
+                "register_task: re-dispatch for {} replaced a live non-leased {:?} task; keeping it (no abort)",
+                replaced.action_row_id, replaced.kind
+            );
+        }
     }
     let _ = start.send(());
     Ok(())
