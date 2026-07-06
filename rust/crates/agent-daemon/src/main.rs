@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
     // abandoned as a failure.
     delegation_runner::sweep_running_delegations_on_boot(&state).await;
     spawn_pending_subagent_control_sweeper(&state);
+    spawn_stranded_action_reaper(&state);
     match state.repo.sessions_with_active_queued_inputs().await {
         Ok(session_ids) => {
             if !session_ids.is_empty() {
@@ -194,6 +195,98 @@ async fn main() -> Result<()> {
     drain_dispatch_tasks(&state).await;
     state.repo.close().await;
     Ok(())
+}
+
+// Recovers actions stranded in `running` with no live in-memory task. A task
+// cancellation (e.g. abort_session_tasks aborting a running tool turn, or any
+// dropped dispatch future) skips the post-run mark_action_stale in
+// spawn_claimed_dispatch, so without this backstop the action — and the
+// session — stays wedged until the next reboot. Pure recovery: it only touches
+// actions with no owning task that have been running past a grace period, so it
+// never races a live or just-finished turn.
+fn spawn_stranded_action_reaper(state: &AppState) {
+    const REAP_INTERVAL: Duration = Duration::from_secs(15);
+    const REAP_GRACE_SECS: f64 = 30.0;
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(REAP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let candidates = match state
+                .repo
+                .list_orphanable_running_actions(REAP_GRACE_SECS)
+                .await
+            {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    eprintln!("stranded-action reaper query failed: {error:#}");
+                    continue;
+                }
+            };
+            if candidates.is_empty() {
+                continue;
+            }
+            // A live task still owns its action id; only ids absent here are
+            // orphaned. Prune finished handles first so an aborted task's id
+            // (whose handle is finished/removed) is treated as orphaned.
+            let live: std::collections::HashSet<String> = {
+                let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
+                tasks.retain(|_, task| !task.handle.is_finished());
+                tasks.keys().cloned().collect()
+            };
+            for (session_id, action_row_id, attempt_id, kind) in candidates {
+                if live.contains(&action_row_id) {
+                    continue;
+                }
+                match state
+                    .repo
+                    .mark_action_stale(&session_id, &action_row_id, &attempt_id, None)
+                    .await
+                {
+                    Ok(true) => {
+                        let event_type = if kind == "model" {
+                            EventType::ModelError
+                        } else {
+                            EventType::ToolError
+                        };
+                        match state
+                            .repo
+                            .insert_event(
+                                &session_id,
+                                event_type,
+                                json!({
+                                    "action_row_id": action_row_id,
+                                    "error": "action abandoned without a running task; recovered by reaper",
+                                }),
+                            )
+                            .await
+                        {
+                            Ok(event) => publish_events(&state, vec![event]),
+                            Err(error) => eprintln!(
+                                "stranded-action reaper failed to record event {session_id}/{action_row_id}: {error:#}"
+                            ),
+                        }
+                        eprintln!(
+                            "reaped stranded {kind} action {session_id}/{action_row_id} (no live task)"
+                        );
+                        // Evict the resident session so the follow-up drive's
+                        // recover_if_needed reloads the stored transcript and
+                        // repairs the open tool turn the aborted task left
+                        // behind (recover_if_needed skips sessions still present
+                        // in `active`). Safe: an orphaned action has no live
+                        // task, so nothing is driving this session concurrently.
+                        state.active.lock().await.remove(&session_id);
+                        spawn_drive_until_blocked(&state, session_id, "reaper.stranded_action");
+                    }
+                    Ok(false) => {}
+                    Err(error) => eprintln!(
+                        "stranded-action reaper failed to stale-mark {session_id}/{action_row_id}: {error:#}"
+                    ),
+                }
+            }
+        }
+    });
 }
 
 fn spawn_pending_subagent_control_sweeper(state: &AppState) {

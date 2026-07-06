@@ -103,6 +103,32 @@ impl PostgresAgentStore {
         Ok(updated as u64)
     }
 
+    /// Ordinary (non post-compaction) actions still `running` past a grace
+    /// period. The runtime reaper stale-marks those with no live in-memory
+    /// task: a task cancellation (e.g. `abort_session_tasks` aborting a running
+    /// tool turn) drops the future before it can mark its action terminal,
+    /// which would otherwise strand the action — and the session — until the
+    /// next reboot. Returns (session_id, id, attempt_id, kind).
+    pub async fn list_orphanable_running_actions(
+        &self,
+        older_than_secs: f64,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let query = format!(
+            r#"
+            select session_id, id, attempt_id, kind::text
+            from actions
+            where status='running'
+              and not (payload ? '{POST_COMPACTION_DISPATCH_KEY}')
+              and updated_at < now() - make_interval(secs => $1)
+            "#,
+        );
+        let rows = sqlx::query_as::<_, (String, String, String, String)>(&query)
+            .bind(older_than_secs)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
     pub async fn post_compaction_dispatch_session_ids(&self) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar(&format!(
             r#"
