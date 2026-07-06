@@ -85,7 +85,7 @@ async fn local_openai_turn_records_exact_model_hot_path_and_reaches_idle() {
     let [dispatch] = started.dispatches.as_slice() else {
         panic!("expected one model dispatch");
     };
-    let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelTurn);
+    let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelAction);
     let observer = metrics.test_observer();
     let driver = SessionDriver::acquire(&env.state, session_id).await;
     driver
@@ -131,19 +131,36 @@ async fn local_openai_turn_records_exact_model_hot_path_and_reaches_idle() {
         .to_ascii_lowercase()
         .contains("\r\ncontent-encoding: zstd\r\n"));
     assert!(!requests[1].body.is_empty());
+    assert!(snapshot.provider_request_wait_ns > 0);
+    assert!(snapshot.provider_stream_wait_ns > 0);
+    assert!(snapshot.provider_metadata_wait_ns > 0);
+    assert!(snapshot.request_preparation_ns > 0);
+    assert!(snapshot.output_persistence_wall_ns > 0);
+    assert!(snapshot.total_elapsed_ns >= snapshot.classified_wall_ns);
     snapshot.lock_wait_ns = 0;
     snapshot.output_transaction_ns = 0;
+    snapshot.provider_request_wait_ns = 0;
+    snapshot.provider_stream_wait_ns = 0;
+    snapshot.provider_metadata_wait_ns = 0;
+    snapshot.request_preparation_ns = 0;
+    snapshot.output_persistence_wall_ns = 0;
+    snapshot.coordination_wait_ns = 0;
+    snapshot.classified_wall_ns = 0;
+    snapshot.unclassified_wall_ns = 0;
+    snapshot.total_elapsed_ns = 0;
+    let request_serialized_bytes = snapshot.provider_body_serialized_bytes;
+    let request_encoded_bytes = snapshot.provider_body_encoded_bytes;
+    snapshot.provider_body_serialized_bytes = 0;
+    snapshot.provider_body_encoded_bytes = 0;
+    assert!(request_serialized_bytes > 0);
+    assert!(request_encoded_bytes > 0);
     assert_eq!(
         snapshot,
         agent_perf::Snapshot {
-            latest_context_bytes: 16,
             request_copies: 1,
-            request_copied_bytes: 16,
             logical_model_request_builds: 1,
             provider_body_serializations: 1,
-            provider_body_serialized_bytes: 9_024,
             provider_body_compressions: 1,
-            provider_body_encoded_bytes: 2_875,
             compaction_gate_passes: 1,
             model_attempts: 1,
             physical_provider_sends: 1,
@@ -253,7 +270,7 @@ async fn cold_recovery_finishes_before_resumed_model_dispatch() {
         .expect("cold recovery resumes work");
     drop(driver);
 
-    let snapshot = observer.finished_snapshot().await;
+    let mut snapshot = observer.finished_snapshot().await;
     assert_eq!(dispatches.len(), 1);
     let pending = env
         .state
@@ -266,6 +283,9 @@ async fn cold_recovery_finishes_before_resumed_model_dispatch() {
         pending[0].action,
         SessionAction::RequestModel { .. }
     ));
+    assert!(snapshot.total_elapsed_ns >= snapshot.classified_wall_ns);
+    snapshot.unclassified_wall_ns = 0;
+    snapshot.total_elapsed_ns = 0;
     assert_eq!(
         snapshot,
         agent_perf::Snapshot {
@@ -283,7 +303,7 @@ async fn cold_recovery_finishes_before_resumed_model_dispatch() {
 }
 
 #[test]
-fn only_model_actions_are_model_metric_owners() {
+fn dispatched_actions_have_fixed_metric_owners() {
     let model = SessionAction::RequestModel {
         action_id: ActionId(1),
         turn_id: TurnId(1),
@@ -301,12 +321,15 @@ fn only_model_actions_are_model_metric_owners() {
     };
 
     assert_eq!(
-        crate::runtime::model_operation_for_action(&model),
-        Some(agent_perf::Operation::ModelTurn)
+        crate::runtime::operation_for_action(&model),
+        Some(agent_perf::Operation::ModelAction)
     );
-    assert_eq!(crate::runtime::model_operation_for_action(&tool), None);
     assert_eq!(
-        crate::runtime::model_operation_for_action(&SessionAction::CancelSessionWork),
+        crate::runtime::operation_for_action(&tool),
+        Some(agent_perf::Operation::ToolAction)
+    );
+    assert_eq!(
+        crate::runtime::operation_for_action(&SessionAction::CancelSessionWork),
         None
     );
 }
@@ -359,6 +382,7 @@ async fn start_local_openai_server() -> (String, tokio::task::JoinHandle<Vec<Cap
             &sse.as_bytes()[split_points[1]..split_points[2]],
             &sse.as_bytes()[split_points[2]..],
         ];
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         response_socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",

@@ -54,6 +54,7 @@ pub(super) async fn run_tool_turn(
 
     let tool_context =
         ToolContext::new(std::path::PathBuf::from(dispatch.config.outer_cwd.clone()));
+    let tool_execution = agent_perf::phase(agent_perf::Phase::ToolExecution);
     let mut result = if tool_call.tool_name == "LoadSkill" {
         let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
         load_skill_result(
@@ -89,6 +90,7 @@ pub(super) async fn run_tool_turn(
             ),
         }
     };
+    drop(tool_execution);
     escape_nul_in_tool_result(&mut result);
     let status = if matches!(result.status, ToolResultStatus::Success) {
         ActionStatus::Completed

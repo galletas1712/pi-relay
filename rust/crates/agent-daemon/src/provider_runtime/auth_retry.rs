@@ -33,12 +33,14 @@ where
         Err(error) if uses_codex_auth && error.status_code() == Some(401) => {
             agent_perf::provider_auth_retry();
             agent_perf::auth_refresh();
+            let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
             let credentials = refresh_codex_credentials()
                 .await
                 .map_err(|error| ProviderError::Provider(error.to_string()))?;
             let provider = provider_for_config(state, config, &credentials, session_id)
                 .await
                 .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            drop(preparation);
             call(provider, request).await
         }
         Err(error) => Err(error),

@@ -1,5 +1,6 @@
 use super::*;
 use std::process::Command;
+use std::time::Duration;
 
 #[test]
 fn snapshot_format_has_only_fixed_numeric_fields() {
@@ -14,14 +15,16 @@ fn snapshot_format_has_only_fixed_numeric_fields() {
 fn operation_and_outcome_names_are_fixed_and_exhaustive() {
     assert_eq!(
         [
-            Operation::ModelTurn.as_str(),
+            Operation::ModelAction.as_str(),
+            Operation::ToolAction.as_str(),
             Operation::ColdActivation.as_str(),
             Operation::TitleSidecar.as_str(),
             Operation::WebSidecar.as_str(),
             Operation::Compaction.as_str(),
         ],
         [
-            "model_turn",
+            "model_action",
+            "tool_action",
             "cold_activation",
             "title_sidecar",
             "web_sidecar",
@@ -51,19 +54,75 @@ fn operation_and_outcome_names_are_fixed_and_exhaustive() {
 }
 
 #[tokio::test]
+async fn nested_phases_are_exclusive_and_wall_covers_classified_time() {
+    let metrics = Metrics::for_test(Operation::ModelAction);
+
+    metrics
+        .scope(async {
+            let _preparation = phase(Phase::RequestPreparation);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            scope_phase(
+                Phase::ProviderRequestWait,
+                tokio::time::sleep(Duration::from_millis(2)),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        })
+        .await;
+    let snapshot = metrics.finish(Outcome::Completed);
+
+    assert!(snapshot.request_preparation_ns > 0);
+    assert!(snapshot.provider_request_wait_ns > 0);
+    assert_eq!(
+        snapshot.classified_wall_ns,
+        snapshot
+            .request_preparation_ns
+            .saturating_add(snapshot.provider_request_wait_ns)
+    );
+    assert!(snapshot.total_elapsed_ns >= snapshot.classified_wall_ns);
+    assert_eq!(
+        snapshot.unclassified_wall_ns,
+        snapshot
+            .total_elapsed_ns
+            .saturating_sub(snapshot.classified_wall_ns)
+    );
+}
+
+#[tokio::test]
+async fn dropped_phase_records_time_after_early_error() {
+    let metrics = Metrics::for_test(Operation::ModelAction);
+
+    let result: Result<(), ()> = metrics
+        .scope(async {
+            let _stream = phase(Phase::ProviderStreamWait);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Err(())
+        })
+        .await;
+    assert_eq!(result, Err(()));
+    let snapshot = metrics.finish(Outcome::Failed);
+
+    assert!(snapshot.provider_stream_wait_ns > 0);
+    assert!(snapshot.total_elapsed_ns >= snapshot.classified_wall_ns);
+}
+
+#[tokio::test]
 async fn dropped_owner_marks_aborted_collector_finished() {
-    let metrics = Metrics::for_test(Operation::ModelTurn);
+    let metrics = Metrics::for_test(Operation::ModelAction);
     let observer = metrics.test_observer();
+    tokio::time::sleep(Duration::from_millis(1)).await;
     drop(metrics);
 
-    assert_eq!(observer.finished_snapshot().await, Snapshot::default());
+    let snapshot = observer.finished_snapshot().await;
+    assert!(snapshot.total_elapsed_ns > 0);
+    assert_eq!(snapshot.unclassified_wall_ns, snapshot.total_elapsed_ns);
 }
 
 #[test]
 fn startup_env_probe_subprocess() {
     const CHILD: &str = "PI_RELAY_PERF_ENV_PROBE_CHILD";
     if let Ok(expected) = std::env::var(CHILD) {
-        let metrics = Metrics::new_if_enabled(Operation::ModelTurn);
+        let metrics = Metrics::new_if_enabled(Operation::ModelAction);
         assert_eq!(metrics.is_some(), expected == "enabled");
         if let Some(metrics) = metrics {
             metrics.finish(Outcome::Completed);
@@ -93,7 +152,7 @@ fn startup_env_probe_subprocess() {
 
 #[tokio::test]
 async fn scoped_metrics_aggregate_without_labels_or_content() {
-    let metrics = Metrics::for_test(Operation::ModelTurn);
+    let metrics = Metrics::for_test(Operation::ModelAction);
 
     metrics
         .scope(async {
@@ -102,10 +161,13 @@ async fn scoped_metrics_aggregate_without_labels_or_content() {
             provider_body_serialized(900);
             provider_body_compressed(300);
             physical_provider_send();
-            sse_received(20);
-            sse_scan_windows(40);
-            sse_frame();
-            sse_retained(20);
+            publish_sse(SseMetrics {
+                received_bytes: 20,
+                scan_windows: 40,
+                frames: 1,
+                peak_retained_bytes: 20,
+                ..SseMetrics::default()
+            });
         })
         .await;
 
@@ -131,8 +193,8 @@ async fn scoped_metrics_aggregate_without_labels_or_content() {
 }
 
 #[tokio::test]
-async fn back_to_back_model_turns_have_separate_collectors() {
-    let first = Metrics::for_test(Operation::ModelTurn);
+async fn back_to_back_model_actions_have_separate_collectors() {
+    let first = Metrics::for_test(Operation::ModelAction);
     first
         .scope(async {
             model_attempt();
@@ -141,7 +203,7 @@ async fn back_to_back_model_turns_have_separate_collectors() {
         .await;
     let first = first.finish(Outcome::Completed);
 
-    let second = Metrics::for_test(Operation::ModelTurn);
+    let second = Metrics::for_test(Operation::ModelAction);
     second.scope(async { model_attempt() }).await;
     let second = second.finish(Outcome::Failed);
 
@@ -157,18 +219,27 @@ async fn back_to_back_model_turns_have_separate_collectors() {
 
 #[tokio::test]
 async fn concurrent_sessions_have_separate_collectors() {
-    let first = Metrics::for_test(Operation::ModelTurn);
-    let second = Metrics::for_test(Operation::ModelTurn);
+    let first = Metrics::for_test(Operation::ModelAction);
+    let second = Metrics::for_test(Operation::ModelAction);
     let ((), ()) = tokio::join!(
         first.scope(async {
             model_attempt();
-            sse_received(10);
+            publish_sse(SseMetrics {
+                received_bytes: 10,
+                ..SseMetrics::default()
+            });
             tokio::task::yield_now().await;
-            sse_received(20);
+            publish_sse(SseMetrics {
+                received_bytes: 20,
+                ..SseMetrics::default()
+            });
         }),
         second.scope(async {
             model_attempt();
-            sse_received(7);
+            publish_sse(SseMetrics {
+                received_bytes: 7,
+                ..SseMetrics::default()
+            });
         }),
     );
 
@@ -178,7 +249,7 @@ async fn concurrent_sessions_have_separate_collectors() {
 
 #[tokio::test]
 async fn copies_use_each_explicit_or_latest_materialized_size() {
-    let metrics = Metrics::for_test(Operation::ModelTurn);
+    let metrics = Metrics::for_test(Operation::ModelAction);
 
     metrics
         .scope(async {

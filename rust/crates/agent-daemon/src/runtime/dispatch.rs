@@ -67,8 +67,7 @@ async fn spawn_dispatch(
     if matches!(&dispatch.action, SessionAction::RequestModel { .. }) {
         let _ = spawn_model_dispatch(state, session_id, dispatch, false, perf).await;
     } else {
-        debug_assert!(perf.is_none());
-        let _ = spawn_claimed_dispatch(state, session_id, dispatch, None);
+        let _ = spawn_claimed_dispatch(state, session_id, dispatch, perf);
     }
 }
 
@@ -89,10 +88,13 @@ pub(super) async fn spawn_model_dispatch(
         return Err(TaskRegistrationRejected);
     }
     if !already_claimed {
-        let claim = state.repo.claim_pending_model_action(
-            &session_id,
-            &dispatch.row_id,
-            &dispatch.attempt_id,
+        let claim = agent_perf::scope_phase(
+            agent_perf::Phase::CoordinationWait,
+            state.repo.claim_pending_model_action(
+                &session_id,
+                &dispatch.row_id,
+                &dispatch.attempt_id,
+            ),
         );
         let claimed = match perf.as_ref() {
             Some(perf) => perf.scope(claim).await,
@@ -144,12 +146,16 @@ fn spawn_claimed_dispatch(
     let post_compaction_dispatch_lease = dispatch.post_compaction_dispatch_lease.clone();
     let has_post_compaction_lease = post_compaction_dispatch_lease.is_some();
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let handoff_started = perf.as_ref().map(|_| std::time::Instant::now());
     let task_state = state.clone();
     let task_session_id = session_id.clone();
     let task_action_row_id = action_row_id.clone();
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
+        }
+        if let (Some(perf), Some(started)) = (perf.as_ref(), handoff_started) {
+            perf.coordination_wait(started.elapsed());
         }
         let run_operation = async move {
             #[cfg(test)]

@@ -14,8 +14,9 @@ The captured run used:
 
 Wall-clock and compression-size observations can vary with CPU scheduling,
 toolchain, zstd version, and platform. Deterministic counter snapshots are
-asserted in tests. Timings (`lock_wait_ns` and `output_transaction_ns`) are
-normalized to zero before exact aggregate comparison.
+asserted in tests. All `*_ns` fields are normalized to zero before exact
+aggregate comparison. `lock_wait_ns` and `output_transaction_ns` are narrower
+overlapping diagnostics and are not added to exclusive classified phase time.
 
 The database commands used a disposable local PostgreSQL administrator
 connection supplied through `PI_RELAY_TEST_DATABASE_URL`. The URL and
@@ -38,19 +39,19 @@ HTTP server; no provider credentials or external network were used.
 
 It asserts the GET `/models` and POST `/responses` requests, zstd wire
 encoding, non-empty body, persisted output, and idle state. The exact
-`model_turn` snapshot, after normalizing duration fields, is:
+`model_action` snapshot, after normalizing duration fields, is:
 
 ```text
 active_context_materializations=0
 active_context_materialized_bytes=0
-latest_context_bytes=16
+latest_context_bytes=0
 request_copies=1
-request_copied_bytes=16
+request_copied_bytes=0
 logical_model_request_builds=1
 provider_body_serializations=1
-provider_body_serialized_bytes=9024
+provider_body_serialized_bytes=<nonzero, toolchain/provider-catalog dependent>
 provider_body_compressions=1
-provider_body_encoded_bytes=2875
+provider_body_encoded_bytes=<nonzero, zstd/toolchain dependent>
 compaction_gate_passes=1
 accounting_passes=0
 logical_count_token_requests=0
@@ -60,10 +61,21 @@ model_retries=0
 physical_provider_sends=1
 provider_auth_retries=0
 auth_refreshes=0
+provider_failures_persisted=0
 sse_received_bytes=367
 sse_scan_windows=1073
 sse_frames=2
 sse_peak_retained_bytes=247
+provider_request_wait_ns=0
+provider_stream_wait_ns=0
+provider_metadata_wait_ns=0
+request_preparation_ns=0
+tool_execution_ns=0
+output_persistence_wall_ns=0
+coordination_wait_ns=0
+classified_wall_ns=0
+unclassified_wall_ns=0
+total_elapsed_ns=0
 session_registry_scans=1
 session_registry_entries_scanned=1
 dispatch_task_registry_scans=1
@@ -114,10 +126,21 @@ model_retries=0
 physical_provider_sends=0
 provider_auth_retries=0
 auth_refreshes=0
+provider_failures_persisted=0
 sse_received_bytes=0
 sse_scan_windows=0
 sse_frames=0
 sse_peak_retained_bytes=0
+provider_request_wait_ns=0
+provider_stream_wait_ns=0
+provider_metadata_wait_ns=0
+request_preparation_ns=0
+tool_execution_ns=0
+output_persistence_wall_ns=0
+coordination_wait_ns=0
+classified_wall_ns=0
+unclassified_wall_ns=0
+total_elapsed_ns=0
 session_registry_scans=0
 session_registry_entries_scanned=0
 dispatch_task_registry_scans=0
@@ -201,7 +224,10 @@ cargo test -p agent-provider \
 ```
 
 The many-frame and fragmented cases expose the current parser's rescanning
-cost; Stage 0 does not optimize it.
+cost; Stage 0 does not optimize it. Profiling runs the exact same two
+`position` searches as the unprofiled parser. It derives examined-window counts
+from each result in O(1), accumulates SSE counters and stream wait locally, and
+publishes once when the parser exits.
 
 ## Disabled-path overhead methodology
 
@@ -219,7 +245,7 @@ env -u PI_RELAY_PERF cargo run --release -p agent-perf \
 Shapes include:
 
 - 2,000,000 calls to one O(1) content hook;
-- 500,000 iterations of three high-frequency SSE hooks; and
+- 500,000 iterations of one batched SSE publication hook; and
 - eight reverse-order K=1,000 action scans, which prove the disabled path uses
   the original iterator and does no per-entry counter accumulation.
 
@@ -228,7 +254,7 @@ Three captured invocations produced these median overheads:
 | Shape | Run medians | Median range across runs |
 | --- | --- | --- |
 | O(1) hook | 598.005%, 601.531%, 601.851% | 598.005%..601.851% |
-| three SSE hooks | 1610.122%, 1910.912%, 1605.619% | 1605.619%..1910.912% |
+| historical three SSE hooks | 1610.122%, 1910.912%, 1605.619% | 1605.619%..1910.912% |
 | reverse K=1,000 | 2.204%, 2.394%, 2.332% | 2.204%..2.394% |
 
 The complete per-run 21-sample ranges are machine-noisy and emitted by the
@@ -236,9 +262,40 @@ command. In this capture they were 470.489%..676.910% for O(1),
 1597.383%..1930.845% for SSE, and -4.769%..38.201% for K. There is deliberately
 no wall-clock assertion: the earlier one-shot `<1%` claim was unsupported. The
 O(1)/SSE percentages are large because their no-hook baselines are nearly
-empty loops; they still quantify the cost of the cached enabled check. The
+empty loops. The historical SSE capture predates local response aggregation;
+the current live parser performs one cached enabled/task-local lookup and one
+publication per response, not per delimiter window. The
 K-shaped probe demonstrates that no additional per-entry work remains when
 disabled.
+
+## Live release runbook
+
+Run one provider and one scenario per daemon because fixed records
+intentionally contain no IDs:
+
+```sh
+cd rust
+cargo build --release -p agent-daemon
+PI_RELAY_PERF=1 ./target/release/pi-agentd 2>perf.stderr
+grep '^perf operation=' perf.stderr >perf-actions.log
+```
+
+`PI_RELAY_PERF` is enabled by presence, so `PI_RELAY_PERF=0` also enables it.
+The filtered records are fixed-shape and numeric-only. Existing free-form
+`PI_RELAY_PERF` RPC lines can contain identifiers and must not be archived as
+privacy-minimal data. Measure whole-task wall externally from input acceptance
+through the durable `session.idle` event; action records are not a user-turn
+trace.
+
+Exclusive fields are `provider_request_wait_ns`,
+`provider_stream_wait_ns`, `provider_metadata_wait_ns`,
+`request_preparation_ns`, `tool_execution_ns`,
+`output_persistence_wall_ns`, and `coordination_wait_ns`; they sum to
+`classified_wall_ns`. `unclassified_wall_ns` is the saturating remainder from
+`total_elapsed_ns`. Physical send counters exclude detached metadata GETs, but
+the caller-visible cold/shared metadata wait is included. Live context byte
+attribution is intentionally incomplete because the gate no longer rescans an
+already-built context solely for profiling.
 
 ## Reproduction commands
 

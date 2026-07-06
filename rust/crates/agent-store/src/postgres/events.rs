@@ -43,7 +43,11 @@ impl PostgresAgentStore {
     ) -> Result<EventFrame> {
         agent_perf::scoped_store_call();
         agent_perf::output_sql_statement_for_transition();
-        insert_event_row(&self.pool, session_id, event, data).await
+        agent_perf::scope_phase(
+            agent_perf::Phase::OutputPersistenceWall,
+            insert_event_row(&self.pool, session_id, event, data),
+        )
+        .await
     }
 
     pub async fn insert_events(

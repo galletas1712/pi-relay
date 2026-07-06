@@ -254,9 +254,11 @@ async fn run_native_compaction(
         config.provider.kind,
         model_context,
         |transcript| async move {
+            let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
             let request = native_compaction_request(state, config, session_id, transcript).await?;
             let credentials = Credentials::load();
             let provider = provider_for_config(state, config, &credentials, session_id).await?;
+            drop(preparation);
             compact_with_auth_retry(state, config, session_id, provider, request)
                 .await
                 .map_err(Into::into)

@@ -52,10 +52,11 @@ pub(crate) async fn recover_post_compaction_dispatches_on_boot(
     recover_post_compaction_dispatches_once(state).await
 }
 
-pub(crate) fn model_operation_for_action(action: &SessionAction) -> Option<agent_perf::Operation> {
+pub(crate) fn operation_for_action(action: &SessionAction) -> Option<agent_perf::Operation> {
     match action {
-        SessionAction::RequestModel { .. } => Some(agent_perf::Operation::ModelTurn),
-        SessionAction::RequestTool { .. } | SessionAction::CancelSessionWork => None,
+        SessionAction::RequestModel { .. } => Some(agent_perf::Operation::ModelAction),
+        SessionAction::RequestTool { .. } => Some(agent_perf::Operation::ToolAction),
+        SessionAction::CancelSessionWork => None,
     }
 }
 
@@ -186,6 +187,7 @@ pub(crate) struct SessionDriver {
 impl SessionDriver {
     pub(crate) async fn acquire(state: &AppState, session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
+        let _phase = agent_perf::phase(agent_perf::Phase::CoordinationWait);
         let started = agent_perf::is_recording().then(std::time::Instant::now);
         let lock = session_driver_lock(state, &session_id).await;
         let guard = lock.lock_owned().await;
@@ -237,6 +239,7 @@ impl SessionDriver {
         session_id: impl Into<String>,
     ) -> Option<Self> {
         let session_id = session_id.into();
+        let _phase = agent_perf::phase(agent_perf::Phase::CoordinationWait);
         let started = agent_perf::is_recording().then(std::time::Instant::now);
         let lock = session_driver_lock(state, &session_id).await;
         let guard = lock.try_lock_owned().ok()?;
@@ -435,7 +438,7 @@ impl SessionDriver {
                 self.session_id.clone(),
                 dispatch,
                 true,
-                agent_perf::Metrics::new_if_enabled(agent_perf::Operation::ModelTurn),
+                agent_perf::Metrics::new_if_enabled(agent_perf::Operation::ModelAction),
             )
             .await;
             if matches!(registration_id, Err(tasks::TaskRegistrationRejected)) {
@@ -1345,7 +1348,7 @@ impl SessionDriver {
         for dispatch in dispatches {
             match &dispatch.action {
                 SessionAction::RequestModel { .. } => {
-                    let perf = model_operation_for_action(&dispatch.action)
+                    let perf = operation_for_action(&dispatch.action)
                         .and_then(agent_perf::Metrics::new_if_enabled);
                     if let Some(ready_dispatch) =
                         self.prepare_model_dispatch(dispatch, perf).await?
@@ -1353,7 +1356,10 @@ impl SessionDriver {
                         ready.push(ready_dispatch);
                     }
                 }
-                SessionAction::RequestTool { .. } => ready.push((dispatch, None)),
+                SessionAction::RequestTool { .. } => ready.push((
+                    dispatch,
+                    agent_perf::Metrics::new_if_enabled(agent_perf::Operation::ToolAction),
+                )),
                 SessionAction::CancelSessionWork => {}
             }
         }
@@ -1366,16 +1372,13 @@ impl SessionDriver {
         dispatch: DispatchAction,
         perf: Option<agent_perf::Metrics>,
     ) -> std::result::Result<Option<(DispatchAction, Option<agent_perf::Metrics>)>, RpcError> {
-        let SessionAction::RequestModel { model_context, .. } = &dispatch.action else {
+        let SessionAction::RequestModel { .. } = &dispatch.action else {
             return Err(RpcError::new(
                 "invalid_dispatch",
                 "model metrics can only be attached to model actions",
             ));
         };
-        let gate = async {
-            agent_perf::observe_context(model_context.measured_content_bytes());
-            self.gate_model_dispatch(&dispatch).await
-        };
+        let gate = self.gate_model_dispatch(&dispatch);
         let is_ready = match perf.as_ref() {
             Some(perf) => perf.scope(gate).await,
             None => gate.await,

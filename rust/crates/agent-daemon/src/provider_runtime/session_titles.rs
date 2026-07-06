@@ -104,10 +104,7 @@ async fn run_title_refresh_worker(state: AppState, session_id: String) {
         };
         let generation = request.generation;
         let perf = agent_perf::Metrics::new_if_enabled(agent_perf::Operation::TitleSidecar);
-        let operation = async {
-            agent_perf::observe_context(request.model_context.measured_content_bytes());
-            refresh_session_title(&state, &session_id, request).await
-        };
+        let operation = refresh_session_title(&state, &session_id, request);
         let result = match perf.as_ref() {
             Some(perf) => perf.scope(operation).await,
             None => operation.await,

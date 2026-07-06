@@ -69,7 +69,8 @@ pub(super) async fn run_model_turn(
         .ok_or_else(|| RpcError::new("stale_action", "session is not active"))?;
     let dispatches = match result {
         Ok(response) => {
-            apply_model_response(
+            let provider_failed = response.stop_reason != agent_provider::ModelStopReason::Complete;
+            let dispatches = apply_model_response(
                 &state,
                 &session_id,
                 &driver,
@@ -79,7 +80,11 @@ pub(super) async fn run_model_turn(
                 turn_id,
                 response,
             )
-            .await?
+            .await?;
+            if provider_failed {
+                agent_perf::provider_failure_persisted();
+            }
+            dispatches
         }
         Err(error) => {
             if super::compaction::recover_model_context_overflow_with_compaction(
@@ -94,7 +99,7 @@ pub(super) async fn run_model_turn(
             }
             let message = error.error.to_string();
             let update_result = model_failure_update_result(&error);
-            driver
+            let dispatches = driver
                 .apply_agent_input(
                     active,
                     AgentInput::ModelFailed {
@@ -112,7 +117,9 @@ pub(super) async fn run_model_turn(
                         result: update_result,
                     }),
                 )
-                .await?
+                .await?;
+            agent_perf::provider_failure_persisted();
+            dispatches
         }
     };
     pause_after_model_transition_for_test(&dispatch).await;
@@ -344,7 +351,11 @@ async fn run_model_for_action_with_retries(
                     "model provider error for {session_id}/{} on attempt {attempt}/{MODEL_PROVIDER_MAX_ATTEMPTS}; retrying: {message}",
                     dispatch.row_id
                 );
-                tokio::time::sleep(model_retry_backoff(attempt)).await;
+                agent_perf::scope_phase(
+                    agent_perf::Phase::CoordinationWait,
+                    tokio::time::sleep(model_retry_backoff(attempt)),
+                )
+                .await;
             }
         }
     }

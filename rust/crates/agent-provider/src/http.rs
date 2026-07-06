@@ -10,6 +10,7 @@ pub(crate) async fn send_provider_generation_request(
 ) -> ProviderResult<reqwest::Response> {
     record_provider_send(&request)?;
     let timeout = Duration::from_secs(PROVIDER_RESPONSE_HEADER_TIMEOUT_SECS);
+    let _phase = agent_perf::phase(agent_perf::Phase::ProviderRequestWait);
     match tokio::time::timeout(timeout, request.send()).await {
         Ok(response) => response.map_err(ProviderError::Http),
         Err(_) => Err(ProviderError::Timeout(format!(

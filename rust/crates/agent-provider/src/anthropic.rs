@@ -1039,35 +1039,44 @@ impl AnthropicProvider {
 #[async_trait]
 impl ModelProvider for AnthropicProvider {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
+        let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
         let session_id = request
             .session_id
             .clone()
             .or_else(|| request.prompt_cache_key.clone())
             .unwrap_or_else(|| "pi-relay".to_string());
-        let metadata = self.resolved_model_metadata(&request.model).await;
-        let prepared = prepare_messages_request(request, &metadata)?;
-
-        let response = send_provider_generation_request(
-            self.client
-                .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
-                .header("accept", "text/event-stream")
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", prepared.beta_header)
-                .header("anthropic-dangerous-direct-browser-access", "true")
-                .header("User-Agent", CLAUDE_CODE_USER_AGENT)
-                .header("x-app", "cli")
-                .header("X-Claude-Code-Session-Id", session_id)
-                .header("x-client-request-id", client_request_id())
-                .json(&prepared.body),
-            "Anthropic /messages",
+        drop(preparation);
+        let metadata = agent_perf::scope_phase(
+            agent_perf::Phase::ProviderMetadataWait,
+            self.resolved_model_metadata(&request.model),
         )
-        .await?;
+        .await;
+        let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
+        let prepared = prepare_messages_request(request, &metadata)?;
+        let request = self
+            .client
+            .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
+            .header("accept", "text/event-stream")
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", prepared.beta_header)
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("User-Agent", CLAUDE_CODE_USER_AGENT)
+            .header("x-app", "cli")
+            .header("X-Claude-Code-Session-Id", session_id)
+            .header("x-client-request-id", client_request_id())
+            .json(&prepared.body);
+        drop(preparation);
+        let response = send_provider_generation_request(request, "Anthropic /messages").await?;
         parse_anthropic_stream(response).await
     }
 
     async fn model_metadata(&self, model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
-        let metadata = self.resolved_model_metadata(model).await;
+        let metadata = agent_perf::scope_phase(
+            agent_perf::Phase::ProviderMetadataWait,
+            self.resolved_model_metadata(model),
+        )
+        .await;
         Ok(Some(ProviderModelMetadata {
             max_input_tokens: metadata.max_input_tokens,
             recommended_auto_compact_tokens: metadata
@@ -1080,30 +1089,37 @@ impl ModelProvider for AnthropicProvider {
         &self,
         request: ProviderCompactionRequest,
     ) -> ProviderResult<ProviderCompactionResponse> {
+        let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
         let session_id = request
             .session_id
             .clone()
             .or_else(|| request.prompt_cache_key.clone())
             .unwrap_or_else(|| "pi-relay".to_string());
-        let metadata = self.resolved_model_metadata(&request.model).await;
-        let body = compaction_body_with_metadata(request, &metadata)?;
-
-        let response = send_provider_generation_request(
-            self.client
-                .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
-                .header("accept", "text/event-stream")
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", anthropic_compaction_beta_header())
-                .header("anthropic-dangerous-direct-browser-access", "true")
-                .header("User-Agent", CLAUDE_CODE_USER_AGENT)
-                .header("x-app", "cli")
-                .header("X-Claude-Code-Session-Id", session_id)
-                .header("x-client-request-id", client_request_id())
-                .json(&body),
-            "Anthropic native compaction /messages",
+        drop(preparation);
+        let metadata = agent_perf::scope_phase(
+            agent_perf::Phase::ProviderMetadataWait,
+            self.resolved_model_metadata(&request.model),
         )
-        .await?;
+        .await;
+        let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
+        let body = compaction_body_with_metadata(request, &metadata)?;
+        let request = self
+            .client
+            .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
+            .header("accept", "text/event-stream")
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", anthropic_compaction_beta_header())
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("User-Agent", CLAUDE_CODE_USER_AGENT)
+            .header("x-app", "cli")
+            .header("X-Claude-Code-Session-Id", session_id)
+            .header("x-client-request-id", client_request_id())
+            .json(&body);
+        drop(preparation);
+        let response =
+            send_provider_generation_request(request, "Anthropic native compaction /messages")
+                .await?;
         parse_anthropic_compaction_stream(response).await
     }
 
@@ -1111,12 +1127,19 @@ impl ModelProvider for AnthropicProvider {
         &self,
         request: ProviderTokenCountRequest,
     ) -> ProviderResult<ProviderTokenCountResponse> {
+        let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
         let session_id = request
             .session_id
             .clone()
             .or_else(|| request.prompt_cache_key.clone())
             .unwrap_or_else(|| "pi-relay".to_string());
-        let metadata = self.resolved_model_metadata(&request.model).await;
+        drop(preparation);
+        let metadata = agent_perf::scope_phase(
+            agent_perf::Phase::ProviderMetadataWait,
+            self.resolved_model_metadata(&request.model),
+        )
+        .await;
+        let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
         let prepared = prepare_count_tokens_request(request, &metadata)?;
 
         let request_builder = self
@@ -1145,7 +1168,12 @@ impl ModelProvider for AnthropicProvider {
         }
         agent_perf::physical_count_token_send();
         agent_perf::physical_provider_send();
-        let response = request_builder.send().await?;
+        drop(preparation);
+        let response = agent_perf::scope_phase(
+            agent_perf::Phase::ProviderRequestWait,
+            request_builder.send(),
+        )
+        .await?;
         let (status, text) = response_text(response).await?;
         ensure_success(status, &text, response_error_message)?;
         parse_anthropic_count_tokens(&text)
@@ -4117,6 +4145,7 @@ mod tests {
             assert!(lower.contains("anthropic-version: 2023-06-01\r\n"));
             assert!(!lower.contains("anthropic-beta:"));
             assert!(lower.contains("x-api-key: test-key\r\n"));
+            tokio::time::sleep(Duration::from_millis(10)).await;
 
             let mut capabilities = models_api_capabilities(json!({ "supported": true }));
             capabilities["effort"]["max"] = json!({ "supported": false });
@@ -4142,17 +4171,34 @@ mod tests {
 
         let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
         provider.base_url = base_url;
-        let first = provider.resolved_model_metadata("claude-sonnet-5").await;
+        let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelAction);
+        let first = metrics
+            .scope(provider.model_metadata("claude-sonnet-5"))
+            .await
+            .expect("metadata lookup succeeds")
+            .expect("Anthropic metadata is always available");
         server.await.expect("server completes");
         // The listener is now gone. A second successful authoritative result
         // proves that no second network request was attempted.
         let second = provider.resolved_model_metadata("claude-sonnet-5").await;
+        let snapshot = metrics.finish(agent_perf::Outcome::Completed);
 
-        assert_eq!(first, second);
-        assert_eq!(first.max_input_tokens, Some(444_444));
-        assert_eq!(first.max_tokens, 32_000);
-        assert!(first.capabilities.supports_effort(ReasoningEffort::XHigh));
-        assert!(!first.capabilities.supports_effort(ReasoningEffort::Max));
+        assert_eq!(
+            ProviderModelMetadata {
+                max_input_tokens: second.max_input_tokens,
+                recommended_auto_compact_tokens: second
+                    .max_input_tokens
+                    .map(anthropic_auto_compact_limit),
+            },
+            first
+        );
+        assert!(snapshot.provider_metadata_wait_ns > 0);
+        assert_eq!(snapshot.physical_provider_sends, 0);
+        assert!(snapshot.total_elapsed_ns >= snapshot.classified_wall_ns);
+        assert_eq!(second.max_input_tokens, Some(444_444));
+        assert_eq!(second.max_tokens, 32_000);
+        assert!(second.capabilities.supports_effort(ReasoningEffort::XHigh));
+        assert!(!second.capabilities.supports_effort(ReasoningEffort::Max));
 
         let request = |effort| ModelRequest {
             model: "claude-sonnet-5".to_string(),
@@ -4167,11 +4213,11 @@ mod tests {
             session_id: None,
             turn_id: None,
         };
-        let xhigh = messages_body_with_metadata(request(ReasoningEffort::XHigh), &first)
+        let xhigh = messages_body_with_metadata(request(ReasoningEffort::XHigh), &second)
             .expect("discovered xhigh is accepted");
         assert_eq!(xhigh["max_tokens"], 32_000);
         assert_eq!(xhigh["output_config"]["effort"], "xhigh");
-        assert!(messages_body_with_metadata(request(ReasoningEffort::Max), &first).is_err());
+        assert!(messages_body_with_metadata(request(ReasoningEffort::Max), &second).is_err());
     }
 
     #[tokio::test]

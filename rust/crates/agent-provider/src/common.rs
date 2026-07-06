@@ -7,7 +7,8 @@ pub(crate) async fn response_text(
     response: reqwest::Response,
 ) -> ProviderResult<(StatusCode, String)> {
     let status = response.status();
-    let bytes = response.bytes().await?;
+    let bytes =
+        agent_perf::scope_phase(agent_perf::Phase::ProviderStreamWait, response.bytes()).await?;
     Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
 }
 

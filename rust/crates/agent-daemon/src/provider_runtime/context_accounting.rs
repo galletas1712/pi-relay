@@ -25,12 +25,15 @@ pub(crate) async fn model_input_tokens_for_gate(
             count_claude_model_input_tokens_remotely(state, config, session_id, model_context).await
         }
         ProviderKind::OpenAi => {
-            estimate_codex_model_input_tokens_from_usage_anchor(
-                state,
-                config,
-                session_id,
-                context_leaf_id,
-                model_context,
+            agent_perf::scope_phase(
+                agent_perf::Phase::RequestPreparation,
+                estimate_codex_model_input_tokens_from_usage_anchor(
+                    state,
+                    config,
+                    session_id,
+                    context_leaf_id,
+                    model_context,
+                ),
             )
             .await
         }
@@ -43,6 +46,7 @@ async fn count_claude_model_input_tokens_remotely(
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<usize> {
+    let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
     // Claude has an authoritative remote preflight backend. Count the exact
     // local tool surface sent on the next /messages call, including web
     // wrappers now that they are normal client JSON tools.
@@ -66,6 +70,7 @@ async fn count_claude_model_input_tokens_remotely(
     let credentials = Credentials::load();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
     agent_perf::logical_count_token_request();
+    drop(preparation);
     Ok(
         count_tokens_with_auth_retry(state, config, session_id, provider, request)
             .await?

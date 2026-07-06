@@ -1,77 +1,121 @@
-# Model hot-path counters
+# Opt-in action profiler
 
-`agent-perf` is a workspace-internal Stage 0 measurement crate. Set
-`PI_RELAY_PERF` before process startup to emit one fixed-shape line when a
-measured operation finishes:
+`agent-perf` is a workspace-internal Stage 0 profiler for the unoptimized
+daemon. It is intentionally fixed-shape and numeric-only. Set `PI_RELAY_PERF`
+before process startup to emit one line when each measured operation finishes:
 
 ```text
-perf operation=model_turn outcome=completed active_context_materializations=...
+perf operation=model_action outcome=completed ... total_elapsed_ns=...
+perf operation=tool_action outcome=completed ... total_elapsed_ns=...
 ```
 
-The enabled flag is read once with `OnceLock`. A disabled process does not
-allocate collectors. Existing K-sized action scans and SSE parsing retain their
-original iterator paths rather than accumulating per-entry counters.
+The enabled flag is read once with `OnceLock`. Any present value enables it,
+including `PI_RELAY_PERF=0`. A disabled process allocates no collector. Records
+contain only integers and fixed operation/outcome strings: never IDs,
+provider/tool/model names, prompts, URLs, arguments, request or response bodies,
+replay, errors, or credentials.
 
-Records contain integers plus fixed operation/outcome names. They never contain
-IDs, prompts, replay, tool arguments, bodies, credentials, or URLs.
+## Ownership and outcomes
 
-## Ownership
+Every collector has one non-cloneable owner:
 
-Every collector has one non-cloneable owner and one operation:
-
-- `model_turn`: one model action, including its gate, claim, provider work,
-  completion persistence, and terminal cleanup;
+- `model_action`: one model action, from the generic dispatch gate through
+  claim, provider attempts, completion persistence, successor dispatch, and
+  terminal cleanup;
+- `tool_action`: one tool action, from generic action dispatch through setup,
+  handler/registry/delegation/web execution, completion persistence, successor
+  dispatch, and terminal cleanup;
 - `cold_activation`: loading an inactive runtime, ending before resumed warm
   dispatch;
 - `title_sidecar`: one title worker generation;
 - `web_sidecar`: one web sidecar provider request; and
 - `compaction`: one native compaction task.
 
-Tool actions never allocate `model_turn` collectors. Each successor or resumed
-model action allocates a fresh collector. Cold activation never lends its
-collector to warm dispatch. Pending-control reconciliation that runs before the
-inactive-runtime check is intentionally outside `cold_activation`.
+Collectors are not stitched into a user-turn context across spawned tasks.
+Each successor model/tool action owns a new record. Outcomes are `completed`,
+`failed`, `panicked`, `gate_blocked`, `claim_lost`, `harness_deferred`, and
+implicit `aborted` when an enabled owner is dropped. `provider_failures_persisted`
+distinguishes a provider failure/refusal/incomplete result whose durable failure
+transition succeeded from a genuinely successful model completion.
 
-Finishing consumes the owner. Outcomes distinguish `completed`, `failed`,
-`panicked`, `gate_blocked`, `claim_lost`, `harness_deferred`, and an implicit
-`aborted` record if an enabled owner is dropped. A record is not emitted until
-the task-local scope and all writers owned by the operation have ended.
+`total_elapsed_ns` starts when the enabled/test `Metrics` owner is allocated and
+is captured before stderr emission on finish or drop.
 
-## Field definitions and limits
+## Exclusive wall-clock fields
 
-| Fields | What they count |
+RAII phase guards survive ordinary error returns and account elapsed time when
+Rust runs destructors during cancellation or panic unwinding. Nested phases
+pause their parent. Therefore these fields are exclusive and their sum is
+`classified_wall_ns`:
+
+| Field | Boundary |
 | --- | --- |
-| `active_context_materializations`, `active_context_materialized_bytes`, `latest_context_bytes` | Active-context materializations, cumulative model-visible content bytes, and the most recently observed/materialized content bytes. These are deterministic content-size lower bounds, not allocator usage. |
-| `request_copies`, `request_copied_bytes` | Request clones at the auth-retry boundary and the latest context content bytes attributed to each clone. |
-| `logical_model_request_builds` | Daemon logical model-request builds. |
-| `provider_body_serializations`, `provider_body_serialized_bytes` | Buffered provider request-body serializations and bytes. OpenAI generation and compaction and Anthropic generation/count requests are covered. |
-| `provider_body_compressions`, `provider_body_encoded_bytes` | OpenAI zstd operations and compressed bytes. |
-| `compaction_gate_passes`, `accounting_passes` | Proactive model gate and model-input accounting passes. |
-| `logical_count_token_requests`, `physical_count_token_sends` | Logical count-token operations and actual HTTP sends. Auth retries can make physical sends exceed logical requests. |
-| `model_attempts`, `model_retries` | Provider attempts and actual retries after the stale-ownership fence. |
-| `physical_provider_sends`, `provider_auth_retries`, `auth_refreshes` | All instrumented provider HTTP sends at the send boundary, 401 retry paths, and credential refresh attempts. Count-token sends are both part of this total and the `physical_count_token_sends` subset. |
-| `sse_received_bytes`, `sse_scan_windows`, `sse_frames`, `sse_peak_retained_bytes` | Received bytes, delimiter windows checked by the current front-rescanning parser, complete/final frames, and peak framing input bytes. Scan windows are deliberately not called bytes scanned. |
-| `session_registry_scans`, `session_registry_entries_scanned`, `dispatch_task_registry_scans`, `dispatch_task_registry_entries_scanned`, `lock_wait_ns` | Existing weak session-lock cleanup, primary dispatch-task retain passes, entries present, and session-driver lock wait. Auxiliary title-task retention is excluded rather than attributed to a model turn. |
-| `output_sql_statements`, `output_transactions`, `output_transaction_ns` | SQL statements inside the scoped `persist_outputs` path plus the final idle-event insert; begun output transactions and time after successful begin. This is not a total SQL/transaction counter. |
-| `recovery_sql_statements` | Exactly the two explicit `load_stored_session` queries. It excludes control reconciliation, queue reset, post-compaction, config, workspace, and other recovery work. |
-| `scoped_store_calls` | Selected high-level repository calls on measured completion/cold paths, including action claim/preflight, reset, unfinished/pending/queue/activity/config/session/transcript, persistence, event cleanup, and post-compaction operations. Nested calls can each count. This is a call-shape diagnostic, not a SQL statement estimate. |
-| `cold_rows_loaded`, `cold_bytes_loaded` | Transcript rows loaded by `load_stored_session` and deterministic model-visible JSON payload bytes. |
-| `empty_persist_passes`, `empty_dispatch_passes` | Existing no-output persistence calls and empty pending-dispatch scans. |
-| `action_completion_scans`, `action_completion_entries_scanned` | Existing linear outstanding-action completion lookups and queue length examined. Tool actions have no model owner, so reverse-order K behavior is captured by the separate deterministic fixture. |
+| `provider_request_wait_ns` | Physical provider request upload and response-header await at `.send().await`. Includes ordinary generation, OpenAI compaction, and Anthropic token count. |
+| `provider_stream_wait_ns` | Only response chunk/body awaits: SSE `response.chunk().await`, non-success body awaits, and buffered unary bodies. Framing and JSON parsing are excluded. |
+| `provider_metadata_wait_ns` | Caller-visible shared model metadata resolution, including cold single-flight wait. Detached refresh tasks do not inherit the collector. |
+| `request_preparation_ns` | Logical prompt/request construction, config/credential/provider lookup, provider body shaping, serialization, and compression. Metadata and transport waits are excluded. |
+| `tool_execution_ns` | Only the selected LoadSkill, web, delegation, or tool-registry execution branch. Tool setup and completion orchestration are excluded. |
+| `output_persistence_wall_ns` | Output persistence from before pool `begin` through commit, plus standalone terminal event writes such as final `session.idle`. |
+| `coordination_wait_ns` | Session-driver acquisition, measured spawn/register/start handoff, model claim, and retry backoff. |
+| `classified_wall_ns` | Exclusive sum of the seven phase buckets. |
+| `unclassified_wall_ns` | Saturating `total_elapsed_ns - classified_wall_ns`; CPU work and boundaries not explicitly classified remain here. |
 
-The unreliable live `full_context_copied_bytes` aggregate was removed. The
-deterministic clone probe explicitly clones the same context at four named
-Stage 4 comparison sites: dispatch vector, session start, deferred subagent,
-and title worker.
+`lock_wait_ns` and `output_transaction_ns` are narrower diagnostics retained
+from the deterministic baseline. They overlap `coordination_wait_ns` and
+`output_persistence_wall_ns`, respectively, and **must not** be added to
+`classified_wall_ns`.
 
-## Reproduction
+## Numeric diagnostics
+
+The remaining counters preserve the Stage 0 shape:
+
+- context materialization/copy counters are deterministic content-size lower
+  bounds, not allocator usage. Live byte attribution is incomplete by design:
+  the profiler does not rescan an already-built `ModelContext` merely to
+  populate `latest_context_bytes`; clone bytes remain zero unless a size was
+  already observed in the same collector;
+- request build, serialization, compression, attempt/retry/auth counters
+  describe logical and physical provider work;
+- `physical_provider_sends` and `physical_count_token_sends` count instrumented
+  action-owned sends. Detached metadata GETs are deliberately excluded;
+- `sse_received_bytes`, `sse_scan_windows`, `sse_frames`, and
+  `sse_peak_retained_bytes` are accumulated locally per response and published
+  once on parser exit. The enabled parser runs the same delimiter searches as
+  the baseline and derives examined windows from the search results;
+- session/task registry, selected store call, SQL/transaction, cold-load,
+  empty-pass, and action-completion counters are narrow shape diagnostics, not
+  total CPU, query, allocation, or I/O measurements.
+
+Deterministic context/clone/scaling probes remain available in their existing
+ignored tests; they are not extra traversals in the live gate.
+
+## Release live run
+
+Use one provider and one scenario per daemon. Records intentionally have no
+session/action/turn IDs, so concurrent heterogeneous work cannot be correlated
+after capture.
+
+```sh
+cd rust
+cargo build --release -p agent-daemon
+
+# Launch the unoptimized runtime implementation with only profiling enabled.
+PI_RELAY_PERF=1 ./target/release/pi-agentd 2>perf.stderr
+
+# Archive only the privacy-minimal fixed records.
+grep '^perf operation=' perf.stderr >perf-actions.log
+```
+
+Use the daemon exactly as usual and run a long real-provider/tool scenario.
+Measure whole-task wall time separately, from external input acceptance through
+the durable `session.idle` event. Per-action records cannot replace that
+end-to-end measurement.
+
+Do not archive all lines containing `PI_RELAY_PERF` output as privacy-minimal
+data. Existing free-form RPC performance lines (for example `perf history.tree
+session=...`) can contain identifiers. Only lines matching
+`^perf operation=` have this profiler's fixed numeric-only contract.
 
 See
 [`rust/docs/perf/model-request-hot-path-baseline.md`](../../docs/perf/model-request-hot-path-baseline.md)
-for exact snapshots, commands, machine caveats, and the paired statistical
-overhead methodology.
-
-The two database baselines are ignored in the portable suite. Selecting either
-without `PI_RELAY_TEST_DATABASE_URL` fails with a clear requirement instead of
-silently returning. They create and drop isolated databases through the
-existing test helper. No test contacts a live provider.
+for loopback fixtures, exact deterministic counters, and validation commands.

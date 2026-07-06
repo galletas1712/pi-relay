@@ -62,9 +62,12 @@ fn run_sse(iterations: usize, hook: Hook) -> Duration {
     let started = Instant::now();
     for value in 0..iterations {
         if matches!(hook, Hook::Disabled) {
-            agent_perf::sse_received(black_box(1));
-            agent_perf::sse_scan_windows(black_box(64));
-            agent_perf::sse_retained(black_box(value % 4096));
+            agent_perf::publish_sse(agent_perf::SseMetrics {
+                received_bytes: black_box(1),
+                scan_windows: black_box(64),
+                peak_retained_bytes: black_box((value % 4096) as u64),
+                ..agent_perf::SseMetrics::default()
+            });
         }
         black_box(value);
     }

@@ -290,10 +290,7 @@ pub(crate) fn spawn_compaction(
             return;
         }
         let action_row_id = job.action_row_id.clone();
-        let operation = async {
-            agent_perf::observe_context(job.compaction_context.measured_content_bytes());
-            run_compaction_job(task_state.clone(), session_id.clone(), job, config).await
-        };
+        let operation = run_compaction_job(task_state.clone(), session_id.clone(), job, config);
         let result = match perf.as_ref() {
             Some(perf) => perf.scope(operation).await,
             None => operation.await,
@@ -495,7 +492,7 @@ async fn run_compaction_job(
             session_id.clone(),
             dispatch,
             true,
-            agent_perf::Metrics::new_if_enabled(agent_perf::Operation::ModelTurn),
+            agent_perf::Metrics::new_if_enabled(agent_perf::Operation::ModelAction),
         )
         .await;
         if matches!(registration_id, Err(TaskRegistrationRejected)) {

@@ -469,7 +469,7 @@ mod tests {
             store.append_transcript_item(TranscriptItem::UserMessage(UserMessage::text(
                 "x".repeat(bytes),
             )));
-            let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelTurn);
+            let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelAction);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime builds");

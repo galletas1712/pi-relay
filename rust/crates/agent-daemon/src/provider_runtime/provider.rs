@@ -29,8 +29,10 @@ pub(crate) async fn model_metadata_for_config(
     config: &SessionConfig,
     session_id: &str,
 ) -> Result<Option<ProviderModelMetadata>> {
+    let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
     let credentials = Credentials::load();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
+    drop(preparation);
     Ok(model_metadata_with_auth_retry(
         state,
         config,

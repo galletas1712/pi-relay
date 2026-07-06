@@ -31,8 +31,11 @@ pub(crate) async fn run_model(
     if let Some(result) = injected_model_result(config, session_id) {
         return result;
     }
-    let request =
-        build_model_request(state, config, session_id, Some(turn_id), model_context).await?;
+    let request = agent_perf::scope_phase(
+        agent_perf::Phase::RequestPreparation,
+        build_model_request(state, config, session_id, Some(turn_id), model_context),
+    )
+    .await?;
     complete_model_request(state, config, session_id, request).await
 }
 
@@ -145,7 +148,9 @@ pub(super) async fn complete_model_request(
     session_id: &str,
     request: ModelRequest,
 ) -> Result<ModelResponse> {
+    let _preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
     let credentials = Credentials::load();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
+    drop(_preparation);
     Ok(complete_with_auth_retry(state, config, session_id, provider, request).await?)
 }

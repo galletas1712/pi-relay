@@ -8,13 +8,14 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 static PERF_ENABLED: OnceLock<bool> = OnceLock::new();
 
 tokio::task_local! {
     static CURRENT: Arc<Counters>;
+    static PHASE_STATE: Arc<Mutex<PhaseState>>;
     static OUTPUT_PERSISTENCE: ();
 }
 
@@ -40,10 +41,21 @@ macro_rules! metric_fields {
             physical_provider_sends,
             provider_auth_retries,
             auth_refreshes,
+            provider_failures_persisted,
             sse_received_bytes,
             sse_scan_windows,
             sse_frames,
             sse_peak_retained_bytes,
+            provider_request_wait_ns,
+            provider_stream_wait_ns,
+            provider_metadata_wait_ns,
+            request_preparation_ns,
+            tool_execution_ns,
+            output_persistence_wall_ns,
+            coordination_wait_ns,
+            classified_wall_ns,
+            unclassified_wall_ns,
+            total_elapsed_ns,
             session_registry_scans,
             session_registry_entries_scanned,
             dispatch_task_registry_scans,
@@ -114,7 +126,8 @@ metric_fields!(define_snapshot);
 /// The bounded operation that owns a collector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
-    ModelTurn,
+    ModelAction,
+    ToolAction,
     ColdActivation,
     TitleSidecar,
     WebSidecar,
@@ -124,13 +137,26 @@ pub enum Operation {
 impl Operation {
     fn as_str(self) -> &'static str {
         match self {
-            Self::ModelTurn => "model_turn",
+            Self::ModelAction => "model_action",
+            Self::ToolAction => "tool_action",
             Self::ColdActivation => "cold_activation",
             Self::TitleSidecar => "title_sidecar",
             Self::WebSidecar => "web_sidecar",
             Self::Compaction => "compaction",
         }
     }
+}
+
+/// Exclusive wall-clock phase within one measured operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    ProviderRequestWait,
+    ProviderStreamWait,
+    ProviderMetadataWait,
+    RequestPreparation,
+    ToolExecution,
+    OutputPersistenceWall,
+    CoordinationWait,
 }
 
 /// Terminal state of a measured operation.
@@ -167,8 +193,39 @@ impl Outcome {
 pub struct Metrics {
     operation: Operation,
     counters: Arc<Counters>,
+    started: Instant,
     emit: bool,
     finished: bool,
+}
+
+#[derive(Debug, Default)]
+struct PhaseState {
+    stack: Vec<PhaseFrame>,
+}
+
+#[derive(Debug)]
+struct PhaseFrame {
+    phase: Phase,
+    started: Instant,
+}
+
+/// RAII owner for an exclusive phase observation.
+///
+/// Dropping the guard records elapsed time, including during unwinding or
+/// cancellation when Rust runs destructors.
+#[must_use]
+pub struct PhaseGuard {
+    active: Option<(Arc<Counters>, Arc<Mutex<PhaseState>>)>,
+}
+
+/// Per-response SSE observations published once when the parser exits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SseMetrics {
+    pub received_bytes: u64,
+    pub scan_windows: u64,
+    pub frames: u64,
+    pub peak_retained_bytes: u64,
+    pub stream_wait_ns: u64,
 }
 
 /// Read-only handle for deterministic tests after an operation has finished.
@@ -197,6 +254,7 @@ impl Metrics {
         Self {
             operation,
             counters: Arc::new(Counters::default()),
+            started: Instant::now(),
             emit,
             finished: false,
         }
@@ -217,7 +275,12 @@ impl Metrics {
 
     /// Run one operation with this collector installed on the current task.
     pub async fn scope<F: Future>(&self, future: F) -> F::Output {
-        CURRENT.scope(Arc::clone(&self.counters), future).await
+        CURRENT
+            .scope(
+                Arc::clone(&self.counters),
+                PHASE_STATE.scope(Arc::new(Mutex::new(PhaseState::default())), future),
+            )
+            .await
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -233,9 +296,18 @@ impl Metrics {
         );
     }
 
+    /// Record coordination before the task-local collector is installed.
+    pub fn coordination_wait(&self, duration: Duration) {
+        add_phase_duration(
+            &self.counters,
+            Phase::CoordinationWait,
+            duration_to_nanos(duration),
+        );
+    }
+
     /// Consume the operation owner and emit one fixed-shape aggregate.
     pub fn finish(mut self, outcome: Outcome) -> Snapshot {
-        let snapshot = self.snapshot();
+        let snapshot = self.final_snapshot();
         if self.emit {
             eprintln!(
                 "perf operation={} outcome={} {snapshot}",
@@ -247,17 +319,31 @@ impl Metrics {
         self.counters.finished.store(true, Ordering::Release);
         snapshot
     }
+
+    fn final_snapshot(&self) -> Snapshot {
+        let total_elapsed_ns = duration_to_nanos(self.started.elapsed());
+        self.counters
+            .total_elapsed_ns
+            .store(total_elapsed_ns, Ordering::Relaxed);
+        self.counters.unclassified_wall_ns.store(
+            total_elapsed_ns.saturating_sub(load(&self.counters.classified_wall_ns)),
+            Ordering::Relaxed,
+        );
+        self.snapshot()
+    }
 }
 
 impl Drop for Metrics {
     fn drop(&mut self) {
-        if self.emit && !self.finished {
-            let snapshot = self.snapshot();
-            eprintln!(
-                "perf operation={} outcome={} {snapshot}",
-                self.operation.as_str(),
-                Outcome::Aborted.as_str()
-            );
+        if !self.finished {
+            let snapshot = self.final_snapshot();
+            if self.emit {
+                eprintln!(
+                    "perf operation={} outcome={} {snapshot}",
+                    self.operation.as_str(),
+                    Outcome::Aborted.as_str()
+                );
+            }
         }
         self.counters.finished.store(true, Ordering::Release);
     }
@@ -265,11 +351,14 @@ impl Drop for Metrics {
 
 /// Whether a collector is installed on this task.
 pub fn is_recording() -> bool {
-    recording_enabled()
+    if !collector_lookup_enabled() {
+        return false;
+    }
+    CURRENT.try_with(|_| ()).is_ok()
 }
 
 pub fn active_context_materialized_by(measure: impl FnOnce() -> usize) {
-    if !recording_enabled() {
+    if !is_recording() {
         return;
     }
     active_context_materialized(measure());
@@ -320,7 +409,7 @@ count_hook!(model_retry, model_retries);
 count_hook!(physical_provider_send, physical_provider_sends);
 count_hook!(provider_auth_retry, provider_auth_retries);
 count_hook!(auth_refresh, auth_refreshes);
-count_hook!(sse_frame, sse_frames);
+count_hook!(provider_failure_persisted, provider_failures_persisted);
 count_hook!(recovery_sql_statement, recovery_sql_statements);
 count_hook!(scoped_store_call, scoped_store_calls);
 count_hook!(empty_persist_pass, empty_persist_passes);
@@ -340,19 +429,15 @@ pub fn provider_body_compressed(encoded_bytes: usize) {
     });
 }
 
-pub fn sse_received(bytes: usize) {
-    record(|counters| add_usize(&counters.sse_received_bytes, bytes));
-}
-
-pub fn sse_scan_windows(windows: usize) {
-    record(|counters| add_usize(&counters.sse_scan_windows, windows));
-}
-
-pub fn sse_retained(bytes: usize) {
+pub fn publish_sse(metrics: SseMetrics) {
     record(|counters| {
+        add(&counters.sse_received_bytes, metrics.received_bytes);
+        add(&counters.sse_scan_windows, metrics.scan_windows);
+        add(&counters.sse_frames, metrics.frames);
         counters
             .sse_peak_retained_bytes
-            .fetch_max(usize_to_u64(bytes), Ordering::Relaxed);
+            .fetch_max(metrics.peak_retained_bytes, Ordering::Relaxed);
+        add_phase_duration(counters, Phase::ProviderStreamWait, metrics.stream_wait_ns);
     });
 }
 
@@ -374,18 +459,79 @@ pub fn lock_wait(duration: Duration) {
     record(|counters| add(&counters.lock_wait_ns, duration_to_nanos(duration)));
 }
 
+/// Start an exclusive phase on the current collector.
+///
+/// A nested phase pauses its parent, then resumes it when the nested guard is
+/// dropped. Consequently phase fields do not double-count in
+/// `classified_wall_ns`.
+pub fn phase(phase: Phase) -> PhaseGuard {
+    if !collector_lookup_enabled() {
+        return PhaseGuard { active: None };
+    }
+    let Some(counters) = CURRENT.try_with(Arc::clone).ok() else {
+        return PhaseGuard { active: None };
+    };
+    let Some(state) = PHASE_STATE.try_with(Arc::clone).ok() else {
+        return PhaseGuard { active: None };
+    };
+    let now = Instant::now();
+    {
+        let mut state_ref = state.lock().expect("perf phase state lock poisoned");
+        if let Some(parent) = state_ref.stack.last() {
+            add_phase_duration(
+                &counters,
+                parent.phase,
+                duration_to_nanos(now.saturating_duration_since(parent.started)),
+            );
+        }
+        state_ref.stack.push(PhaseFrame {
+            phase,
+            started: now,
+        });
+    }
+    PhaseGuard {
+        active: Some((counters, state)),
+    }
+}
+
+pub async fn scope_phase<F: Future>(phase_name: Phase, future: F) -> F::Output {
+    let _phase = phase(phase_name);
+    future.await
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        let Some((counters, state)) = self.active.take() else {
+            return;
+        };
+        let now = Instant::now();
+        let mut state = state.lock().expect("perf phase state lock poisoned");
+        if let Some(frame) = state.stack.pop() {
+            add_phase_duration(
+                &counters,
+                frame.phase,
+                duration_to_nanos(now.saturating_duration_since(frame.started)),
+            );
+        }
+        if let Some(parent) = state.stack.last_mut() {
+            parent.started = now;
+        }
+    }
+}
+
 pub fn output_sql_statement_for_transition() {
     record(|counters| add(&counters.output_sql_statements, 1));
 }
 
 pub fn output_sql_statement() {
-    if recording_enabled() && OUTPUT_PERSISTENCE.try_with(|()| ()).is_ok() {
+    if is_recording() && OUTPUT_PERSISTENCE.try_with(|()| ()).is_ok() {
         record(|counters| add(&counters.output_sql_statements, 1));
     }
 }
 
 pub async fn scope_output_persistence<F: Future>(future: F) -> F::Output {
-    if recording_enabled() {
+    let future = scope_phase(Phase::OutputPersistenceWall, future);
+    if is_recording() {
         OUTPUT_PERSISTENCE.scope((), future).await
     } else {
         future.await
@@ -401,7 +547,7 @@ pub fn output_transaction_duration(duration: Duration) {
 }
 
 pub fn cold_loaded_by(rows: usize, measure: impl FnOnce() -> usize) {
-    if !recording_enabled() {
+    if !is_recording() {
         return;
     }
     cold_loaded(rows, measure());
@@ -426,22 +572,36 @@ fn enabled() -> bool {
 }
 
 fn record(operation: impl FnOnce(&Counters)) {
-    if !recording_enabled() {
+    if !collector_lookup_enabled() {
         return;
     }
     let _ = CURRENT.try_with(|counters| operation(counters));
 }
 
-fn recording_enabled() -> bool {
+fn collector_lookup_enabled() -> bool {
     if enabled() {
-        return CURRENT.try_with(|_| ()).is_ok();
+        return true;
     }
     #[cfg(any(test, feature = "test-support"))]
     {
-        CURRENT.try_with(|_| ()).is_ok()
+        true
     }
     #[cfg(not(any(test, feature = "test-support")))]
     false
+}
+
+fn add_phase_duration(counters: &Counters, phase: Phase, nanos: u64) {
+    let counter = match phase {
+        Phase::ProviderRequestWait => &counters.provider_request_wait_ns,
+        Phase::ProviderStreamWait => &counters.provider_stream_wait_ns,
+        Phase::ProviderMetadataWait => &counters.provider_metadata_wait_ns,
+        Phase::RequestPreparation => &counters.request_preparation_ns,
+        Phase::ToolExecution => &counters.tool_execution_ns,
+        Phase::OutputPersistenceWall => &counters.output_persistence_wall_ns,
+        Phase::CoordinationWait => &counters.coordination_wait_ns,
+    };
+    add(counter, nanos);
+    add(&counters.classified_wall_ns, nanos);
 }
 
 fn add(counter: &AtomicU64, value: u64) {

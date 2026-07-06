@@ -364,7 +364,7 @@ mod tests {
             for action_id in 1..=count {
                 actions.track_request(&model_request(action_id, action_id));
             }
-            let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelTurn);
+            let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelAction);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime builds");

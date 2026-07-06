@@ -490,13 +490,13 @@ async fn read_bounded_catalog_response(mut response: reqwest::Response) -> Provi
         });
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| ProviderError::ModelCatalog {
-            status: Some(status),
-            message: format!("failed to read Codex models response: {error}"),
-        })?
+    while let Some(chunk) =
+        agent_perf::scope_phase(agent_perf::Phase::ProviderStreamWait, response.chunk())
+            .await
+            .map_err(|error| ProviderError::ModelCatalog {
+                status: Some(status),
+                message: format!("failed to read Codex models response: {error}"),
+            })?
     {
         if body.len().saturating_add(chunk.len()) > CODEX_MODELS_MAX_BODY_BYTES {
             return Err(ProviderError::ModelCatalog {
@@ -984,21 +984,31 @@ mod catalog_tests {
         }))
         .expect("fixture serializes");
         let requests = Arc::new(AtomicUsize::new(0));
-        let (base_url, server) =
-            start_single_response_server("200 OK", body, Duration::ZERO, requests.clone()).await;
+        let (base_url, server) = start_single_response_server(
+            "200 OK",
+            body,
+            Duration::from_millis(10),
+            requests.clone(),
+        )
+        .await;
         let provider = test_provider(
             base_url,
             Some("account-id"),
             "access-token",
             OpenAiModelCatalogCache::default(),
         );
+        let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelAction);
 
         assert_eq!(provider.models_request_timeout, Duration::from_secs(5));
-        assert!(provider
-            .model_metadata("gpt-5.6-sol")
+        assert!(metrics
+            .scope(provider.model_metadata("gpt-5.6-sol"))
             .await
             .expect("metadata lookup succeeds")
             .is_some());
+        let snapshot = metrics.finish(agent_perf::Outcome::Completed);
+        assert!(snapshot.provider_metadata_wait_ns > 0);
+        assert_eq!(snapshot.physical_provider_sends, 0);
+        assert!(snapshot.total_elapsed_ns >= snapshot.classified_wall_ns);
         let raw = server.await.expect("server joins");
         let request = String::from_utf8(raw).expect("request is utf-8");
         let request_lower = request.to_ascii_lowercase();
@@ -1065,8 +1075,22 @@ mod catalog_tests {
             })
             .expect("content-length header");
 
+        assert!(snapshot.provider_request_wait_ns > 0);
+        assert!(snapshot.provider_stream_wait_ns > 0);
+        assert!(snapshot.provider_metadata_wait_ns > 0);
+        assert!(snapshot.request_preparation_ns > 0);
+        assert!(snapshot.total_elapsed_ns >= snapshot.classified_wall_ns);
         assert_eq!(
-            snapshot,
+            agent_perf::Snapshot {
+                provider_request_wait_ns: 0,
+                provider_stream_wait_ns: 0,
+                provider_metadata_wait_ns: 0,
+                request_preparation_ns: 0,
+                classified_wall_ns: 0,
+                unclassified_wall_ns: 0,
+                total_elapsed_ns: 0,
+                ..snapshot
+            },
             agent_perf::Snapshot {
                 provider_body_serializations: 1,
                 provider_body_serialized_bytes: content_length,
@@ -2545,7 +2569,11 @@ impl ModelProvider for OpenAiProvider {
     }
 
     async fn model_metadata(&self, model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
-        let metadata = self.resolved_model_metadata(model).await?;
+        let metadata = agent_perf::scope_phase(
+            agent_perf::Phase::ProviderMetadataWait,
+            self.resolved_model_metadata(model),
+        )
+        .await?;
         Ok(Some(ProviderModelMetadata {
             max_input_tokens: metadata.max_input_tokens,
             recommended_auto_compact_tokens: metadata.recommended_auto_compact_tokens,
@@ -2568,6 +2596,7 @@ impl ModelProvider for OpenAiProvider {
 
 impl OpenAiProvider {
     async fn complete_responses(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
+        let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
         // Lift the session id off the request before consuming it for the body.
         // This is the value the Codex CLI calls `thread_id`: the unique
         // pi-relay session identifier that doubles as the prompt-cache cohort
@@ -2586,24 +2615,27 @@ impl OpenAiProvider {
             .as_deref()
             .filter(|state| state.session_id() == session_id)
             .and_then(|state| state.turn_state_for_request(turn_id));
-        let metadata = self.resolved_model_metadata(&request.model).await?;
-        let body = responses_body_with_metadata(request, &session_id, &metadata)?;
-
-        let response = send_provider_generation_request(
-            zstd_json_request(
-                self.add_codex_headers(
-                    self.client
-                        .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
-                        .header(ACCEPT, "text/event-stream"),
-                    &session_id,
-                    &window_id,
-                    codex_turn_state.as_deref(),
-                ),
-                &body,
-            )?,
-            "OpenAI /responses",
+        drop(preparation);
+        let metadata = agent_perf::scope_phase(
+            agent_perf::Phase::ProviderMetadataWait,
+            self.resolved_model_metadata(&request.model),
         )
         .await?;
+        let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
+        let body = responses_body_with_metadata(request, &session_id, &metadata)?;
+        let request = zstd_json_request(
+            self.add_codex_headers(
+                self.client
+                    .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
+                    .header(ACCEPT, "text/event-stream"),
+                &session_id,
+                &window_id,
+                codex_turn_state.as_deref(),
+            ),
+            &body,
+        )?;
+        drop(preparation);
+        let response = send_provider_generation_request(request, "OpenAI /responses").await?;
         let response_success = response.status().is_success();
         let response_headers = OpenAiResponseHeaders::from_headers(response.headers());
         if let (Some(turn_state), Some(session_state)) = (
@@ -2625,13 +2657,20 @@ impl OpenAiProvider {
         &self,
         request: ProviderCompactionRequest,
     ) -> ProviderResult<ProviderCompactionResponse> {
+        let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
         let session_id = openai_session_id(&request.session_id, self.session_state.as_deref());
         let window_id = openai_window_id(
             &session_id,
             self.session_state.as_deref(),
             &request.transcript,
         );
-        let metadata = self.resolved_model_metadata(&request.model).await?;
+        drop(preparation);
+        let metadata = agent_perf::scope_phase(
+            agent_perf::Phase::ProviderMetadataWait,
+            self.resolved_model_metadata(&request.model),
+        )
+        .await?;
+        let preparation = agent_perf::phase(agent_perf::Phase::RequestPreparation);
         let body = compact_body_with_metadata(request, &session_id, &metadata)?;
 
         let request = self
@@ -2649,7 +2688,9 @@ impl OpenAiProvider {
             .timeout(Duration::from_secs(CODEX_COMPACT_REQUEST_TIMEOUT_SECS))
             .json(&body);
         record_provider_send(&request)?;
-        let response = request.send().await?;
+        drop(preparation);
+        let response =
+            agent_perf::scope_phase(agent_perf::Phase::ProviderRequestWait, request.send()).await?;
         let response_headers = OpenAiResponseHeaders::from_headers(response.headers());
         let (status, text) = response_text(response).await?;
         ensure_success(status, &text, response_error_message)?;
