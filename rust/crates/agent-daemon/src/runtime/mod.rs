@@ -202,11 +202,11 @@ impl SessionDriver {
         let persisted_active_leaf_id = stored.active_leaf_id.clone();
         let session = AgentSession::from_stored_session_interrupted(stored)
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
-        let active = Arc::new(Mutex::new(RuntimeSession {
+        let active = Arc::new(Mutex::new(RuntimeSession::new(
             session,
             config,
             persisted_active_leaf_id,
-        }));
+        )));
         self.state
             .active
             .lock()
@@ -300,11 +300,11 @@ impl SessionDriver {
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         self.state.active.lock().await.insert(
             self.session_id.clone(),
-            Arc::new(Mutex::new(RuntimeSession {
+            Arc::new(Mutex::new(RuntimeSession::new(
                 session,
                 config,
                 persisted_active_leaf_id,
-            })),
+            ))),
         );
         Ok(())
     }
@@ -465,7 +465,7 @@ impl SessionDriver {
         context_leaf_id: &str,
         turn_id: agent_vocab::TurnId,
         action_id: agent_vocab::ActionId,
-    ) -> std::result::Result<SessionConfig, RpcError> {
+    ) -> std::result::Result<crate::types::RuntimeConfig, RpcError> {
         let stored = self
             .state
             .repo
@@ -492,14 +492,13 @@ impl SessionDriver {
         session
             .restore_compacted_runtime(context_leaf_id, turn_id, action_id)
             .map_err(history_error_to_rpc)?;
-        self.state.active.lock().await.insert(
-            self.session_id.clone(),
-            Arc::new(Mutex::new(RuntimeSession {
-                session,
-                config: config.clone(),
-                persisted_active_leaf_id,
-            })),
-        );
+        let runtime = RuntimeSession::new(session, config.clone(), persisted_active_leaf_id);
+        let config = runtime.config.clone();
+        self.state
+            .active
+            .lock()
+            .await
+            .insert(self.session_id.clone(), Arc::new(Mutex::new(runtime)));
         Ok(config)
     }
 
@@ -688,11 +687,11 @@ impl SessionDriver {
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         self.state.active.lock().await.insert(
             self.session_id.clone(),
-            Arc::new(Mutex::new(RuntimeSession {
+            Arc::new(Mutex::new(RuntimeSession::new(
                 session,
                 config,
                 persisted_active_leaf_id,
-            })),
+            ))),
         );
         Ok(())
     }
@@ -1113,11 +1112,11 @@ impl SessionDriver {
             .resume_model_turn(checkpoint_leaf_id, turn_id, action_id)
             .map_err(history_error_to_rpc)?;
 
-        let active = Arc::new(Mutex::new(RuntimeSession {
+        let active = Arc::new(Mutex::new(RuntimeSession::new(
             session,
             config,
             persisted_active_leaf_id,
-        }));
+        )));
         self.state
             .active
             .lock()
@@ -1253,6 +1252,7 @@ impl SessionDriver {
             .workspaces
             .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
             .await?;
+        let config = crate::types::RuntimeConfig::from(config);
         let resolved = pending
             .into_iter()
             .map(|action| DispatchAction {
@@ -1297,7 +1297,7 @@ pub(crate) async fn replace_active_session_config(
 ) {
     let active = state.active.lock().await.get(session_id).cloned();
     if let Some(active) = active {
-        active.lock().await.config = config;
+        active.lock().await.replace_config(config);
     }
 }
 

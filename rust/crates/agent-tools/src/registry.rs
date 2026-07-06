@@ -220,7 +220,7 @@ impl ToolRegistry {
             .filter(|registered| registered.provider == provider)
             .map(|registered| registered.tool.clone())
             .collect::<Vec<_>>();
-        sort_tools_by_name(&mut tools);
+        sort_provider_tools(&mut tools);
         tools
     }
 
@@ -271,7 +271,9 @@ fn provider_tool_key(provider: ProviderKind, name: &str) -> String {
     format!("{}:{name}", provider.as_str())
 }
 
-pub(crate) fn sort_tools_by_name(tools: &mut [ProviderTool]) {
+/// Normalize provider declarations before storing them in an immutable
+/// request snapshot.
+pub fn sort_provider_tools(tools: &mut [ProviderTool]) {
     tools.sort_by(|left, right| {
         left.name
             .to_ascii_lowercase()

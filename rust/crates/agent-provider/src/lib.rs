@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use agent_tools::{ProviderTool, ToolRegistry};
+use agent_tools::{sort_provider_tools, ProviderTool, ToolRegistry};
 use agent_vocab::{
     AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, TranscriptItem,
     TurnId,
@@ -8,7 +8,6 @@ use agent_vocab::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::borrow::Cow;
 use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -140,6 +139,7 @@ pub mod anthropic;
 mod common;
 mod http;
 pub mod openai;
+mod request_body;
 mod sse;
 mod token_estimator;
 mod transcript;
@@ -174,15 +174,45 @@ impl ProviderModelInput {
         prompt: PromptSections,
         transcript: Vec<ModelTranscriptEntry>,
         tool_profile: ProviderToolProfile,
-        tools: Vec<ProviderTool>,
+        mut tools: Vec<ProviderTool>,
+        reasoning_effort: ReasoningEffort,
+    ) -> Self {
+        if tools.is_empty() {
+            tools = match tool_profile {
+                ProviderToolProfile::OpenAiCoding => ToolRegistry::with_builtin_tools()
+                    .provider_tools_for_provider(ProviderKind::OpenAi),
+                ProviderToolProfile::AnthropicCoding => ToolRegistry::with_builtin_tools()
+                    .provider_tools_for_provider(ProviderKind::Claude),
+                ProviderToolProfile::None | ProviderToolProfile::CustomDefinitions => Vec::new(),
+            };
+        } else {
+            sort_provider_tools(&mut tools);
+        }
+        Self::from_shared(
+            model,
+            Arc::new(prompt),
+            transcript,
+            tool_profile,
+            tools.into(),
+            reasoning_effort,
+        )
+    }
+
+    /// Build an input from immutable prompt and pre-sorted tool snapshots.
+    pub fn from_shared(
+        model: impl Into<String>,
+        prompt: Arc<PromptSections>,
+        transcript: Vec<ModelTranscriptEntry>,
+        tool_profile: ProviderToolProfile,
+        tools: Arc<[ProviderTool]>,
         reasoning_effort: ReasoningEffort,
     ) -> Self {
         Self {
             model: Arc::from(model.into()),
-            prompt: Arc::new(prompt),
+            prompt,
             transcript: transcript.into(),
             tool_profile,
-            tools: tools.into(),
+            tools,
             reasoning_effort,
             prompt_cache_key: None,
             session_id: None,
@@ -207,6 +237,20 @@ impl ProviderModelInput {
 
     pub fn tools(&self) -> &[ProviderTool] {
         &self.tools
+    }
+
+    pub(crate) fn tools_snapshot(&self) -> Arc<[ProviderTool]> {
+        Arc::clone(&self.tools)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn prompt_allocation(&self) -> *const PromptSections {
+        Arc::as_ptr(&self.prompt)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn tools_allocation(&self) -> (*const ProviderTool, usize) {
+        (self.tools.as_ptr(), self.tools.len())
     }
 
     pub fn reasoning_effort(&self) -> ReasoningEffort {
@@ -620,24 +664,6 @@ impl ProviderToolProfile {
     }
 }
 
-fn effective_provider_tools(
-    profile: ProviderToolProfile,
-    tools: &[ProviderTool],
-) -> Cow<'_, [ProviderTool]> {
-    if !tools.is_empty() {
-        return Cow::Borrowed(tools);
-    }
-    Cow::Owned(match profile {
-        ProviderToolProfile::OpenAiCoding => {
-            ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::OpenAi)
-        }
-        ProviderToolProfile::AnthropicCoding => {
-            ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::Claude)
-        }
-        ProviderToolProfile::None | ProviderToolProfile::CustomDefinitions => Vec::new(),
-    })
-}
-
 impl ModelTranscriptEntry {
     pub(crate) fn provider_replay_values_for(
         &self,
@@ -1030,6 +1056,117 @@ mod provider_error_tests {
         assert!(Arc::ptr_eq(&input.prompt, &sidecar_input.prompt));
         assert!(Arc::ptr_eq(&input.transcript, &sidecar_input.transcript));
         assert!(Arc::ptr_eq(&input.tools, &sidecar_input.tools));
+    }
+
+    #[test]
+    fn shared_input_retains_prompt_and_tool_snapshot_allocations() {
+        let prompt = Arc::new(PromptSections::stable("stable prompt"));
+        let tools: Arc<[ProviderTool]> = vec![ProviderTool::function_json_named(
+            ProviderKind::Claude,
+            "read",
+            "read a file",
+            serde_json::json!({ "type": "object" }),
+        )]
+        .into();
+        let input = ProviderModelInput::from_shared(
+            "test-model",
+            Arc::clone(&prompt),
+            Vec::new(),
+            ProviderToolProfile::AnthropicCoding,
+            Arc::clone(&tools),
+            ReasoningEffort::Medium,
+        );
+
+        assert_eq!(input.prompt_allocation(), Arc::as_ptr(&prompt));
+        assert_eq!(input.tools_allocation(), (tools.as_ptr(), tools.len()));
+    }
+
+    #[test]
+    fn owned_constructor_restores_complete_openai_coding_tool_fallback() {
+        let expected =
+            ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::OpenAi);
+        let input = ProviderModelInput::new(
+            "test-model",
+            PromptSections::default(),
+            Vec::new(),
+            ProviderToolProfile::OpenAiCoding,
+            Vec::new(),
+            ReasoningEffort::Medium,
+        );
+
+        assert_eq!(input.tools(), expected);
+        assert_eq!(
+            input
+                .tools()
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "apply_patch",
+                "Bash",
+                "cancel_delegation",
+                "delegate_readonly_tasks",
+                "delegate_writing_task",
+                "Grep",
+                "inspect_delegation",
+                "interrupt_subagent",
+                "LoadSkill",
+                "steer_subagent",
+                "web_fetch",
+                "web_search",
+            ]
+        );
+    }
+
+    #[test]
+    fn owned_constructor_restores_complete_anthropic_coding_tool_fallback() {
+        let expected =
+            ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::Claude);
+        let input = ProviderModelInput::new(
+            "test-model",
+            PromptSections::default(),
+            Vec::new(),
+            ProviderToolProfile::AnthropicCoding,
+            Vec::new(),
+            ReasoningEffort::Medium,
+        );
+
+        assert_eq!(input.tools(), expected);
+        assert_eq!(
+            input
+                .tools()
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Bash",
+                "cancel_delegation",
+                "delegate_readonly_tasks",
+                "delegate_writing_task",
+                "Grep",
+                "inspect_delegation",
+                "interrupt_subagent",
+                "LoadSkill",
+                "steer_subagent",
+                "str_replace_based_edit_tool",
+                "web_fetch",
+                "web_search",
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_constructor_keeps_empty_coding_tool_snapshot_empty() {
+        let input = ProviderModelInput::from_shared(
+            "test-model",
+            Arc::new(PromptSections::default()),
+            Vec::new(),
+            ProviderToolProfile::OpenAiCoding,
+            Arc::from([]),
+            ReasoningEffort::Medium,
+        );
+
+        assert!(input.tools().is_empty());
     }
 
     #[test]

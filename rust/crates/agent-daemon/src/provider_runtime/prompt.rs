@@ -9,15 +9,12 @@ use agent_tools::ProviderTool;
 use agent_vocab::ProviderKind;
 use anyhow::{anyhow, Context};
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::state::AppState;
 
-pub(super) async fn assemble_agent_prompt(
-    _state: &AppState,
-    config: &SessionConfig,
-    _session_id: &str,
-) -> anyhow::Result<agent_provider::PromptSections> {
-    Ok(agent_provider::PromptSections::stable(
+pub(crate) fn prompt_snapshot(config: &SessionConfig) -> Arc<agent_provider::PromptSections> {
+    Arc::new(agent_provider::PromptSections::stable(
         config.system_prompt.clone(),
     ))
 }
@@ -109,49 +106,51 @@ pub(crate) fn provider_tools_for_session(
     state: &AppState,
     provider: ProviderKind,
     profile: PromptProfile,
-) -> Vec<ProviderTool> {
-    provider_tools_for_profile(state.tools.provider_tools_for_provider(provider), profile)
+) -> Arc<[ProviderTool]> {
+    state.provider_tools.get(provider, profile)
 }
 
+#[cfg(test)]
 fn provider_tools_for_profile(
     tools: Vec<ProviderTool>,
     profile: PromptProfile,
-) -> Vec<ProviderTool> {
-    tools
-        .into_iter()
-        .filter(|tool| tool_allowed_for_profile(tool, profile))
-        .collect()
-}
-
-fn tool_allowed_for_profile(tool: &ProviderTool, profile: PromptProfile) -> bool {
-    if profile == PromptProfile::Parent {
-        return true;
+) -> Arc<[ProviderTool]> {
+    match profile {
+        PromptProfile::Parent => tools.into(),
+        PromptProfile::Subagent => tools
+            .into_iter()
+            .filter(|tool| {
+                !matches!(
+                    tool.canonical_name.as_str(),
+                    "delegate_writing_task"
+                        | "delegate_readonly_tasks"
+                        | "inspect_delegation"
+                        | "cancel_delegation"
+                        | "steer_subagent"
+                        | "interrupt_subagent"
+                )
+            })
+            .collect::<Vec<_>>()
+            .into(),
     }
-    !matches!(
-        tool.canonical_name.as_str(),
-        "delegate_writing_task"
-            | "delegate_readonly_tasks"
-            | "inspect_delegation"
-            | "cancel_delegation"
-            | "steer_subagent"
-            | "interrupt_subagent"
-    )
 }
 
 fn tool_specs(state: &AppState, provider: ProviderKind, profile: PromptProfile) -> Vec<ToolSpec> {
     tool_specs_from_provider_tools(provider_tools_for_session(state, provider, profile))
 }
 
-fn tool_specs_from_provider_tools(tools: Vec<ProviderTool>) -> Vec<ToolSpec> {
+fn tool_specs_from_provider_tools(tools: Arc<[ProviderTool]>) -> Vec<ToolSpec> {
     tools
-        .into_iter()
+        .iter()
         .map(|tool| {
             ToolSpec::new(
-                tool.name,
-                tool.description,
-                tool.input_schema,
-                tool.canonical_name,
-                tool.prompt_alias.unwrap_or_else(|| "other".to_string()),
+                tool.name.clone(),
+                tool.description.clone(),
+                tool.input_schema.clone(),
+                tool.canonical_name.clone(),
+                tool.prompt_alias
+                    .clone()
+                    .unwrap_or_else(|| "other".to_string()),
             )
         })
         .collect()
@@ -559,8 +558,8 @@ mod tests {
             .map(|tool| tool.canonical_name)
             .collect::<Vec<_>>();
         let parent_provider_names = parent_provider_tools
-            .into_iter()
-            .map(|tool| tool.canonical_name)
+            .iter()
+            .map(|tool| tool.canonical_name.clone())
             .collect::<Vec<_>>();
         assert_eq!(parent_spec_names, parent_provider_names);
         assert!(parent_spec_names.contains(&"delegate_writing_task".to_string()));
@@ -577,8 +576,8 @@ mod tests {
             .map(|tool| tool.canonical_name)
             .collect::<Vec<_>>();
         let subagent_provider_names = subagent_provider_tools
-            .into_iter()
-            .map(|tool| tool.canonical_name)
+            .iter()
+            .map(|tool| tool.canonical_name.clone())
             .collect::<Vec<_>>();
         assert_eq!(subagent_spec_names, subagent_provider_names);
         assert!(subagent_spec_names.contains(&"LoadSkill".to_string()));

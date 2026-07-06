@@ -8,9 +8,10 @@ use anyhow::Result;
 
 use crate::auth::Credentials;
 use crate::state::AppState;
+use crate::types::RuntimeConfig;
 
 use super::auth_retry::{complete_with_auth_retry, PreparedModelRequestState};
-use super::prompt::{assemble_agent_prompt, effective_prompt_profile, provider_tools_for_session};
+use super::prompt::{effective_prompt_profile, provider_tools_for_session};
 use super::provider::{provider_for_config, ProviderHandle};
 use super::transcript::provider_transcript_owned;
 
@@ -156,8 +157,9 @@ pub(crate) async fn build_model_request(
     turn_id: Option<TurnId>,
     model_context: &ModelContext,
 ) -> Result<ModelRequest> {
+    let config = RuntimeConfig::from(config.clone());
     let input =
-        build_provider_model_input(state, config, session_id, model_context.clone()).await?;
+        build_provider_model_input(state, &config, session_id, model_context.clone()).await?;
     let mut request = ModelRequest::new(input);
     if let Some(turn_id) = turn_id {
         request = request.with_turn_id(turn_id);
@@ -168,15 +170,14 @@ pub(crate) async fn build_model_request(
 
 pub(crate) async fn build_provider_model_input(
     state: &AppState,
-    config: &SessionConfig,
+    config: &RuntimeConfig,
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<Arc<ProviderModelInput>> {
-    let prompt = assemble_agent_prompt(state, config, session_id).await?;
     Ok(Arc::new(
-        ProviderModelInput::new(
+        ProviderModelInput::from_shared(
             config.provider.model.clone(),
-            prompt,
+            Arc::clone(config.prompt()),
             provider_transcript_owned(model_context),
             ProviderToolProfile::for_provider(config.provider.kind),
             provider_tools_for_session(

@@ -1,4 +1,6 @@
-use agent_tools::{tool_display, ProviderTool, ToolDisplayInput};
+#[cfg(test)]
+use agent_tools::ProviderTool;
+use agent_tools::{tool_display, ToolDisplayInput};
 use agent_vocab::{
     AssistantItem, AssistantMessage, ContentBlock, ProviderKind, ProviderReplayItem,
     ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem, TurnId, UserMessage,
@@ -27,6 +29,7 @@ use crate::sse::read_json_sse_text;
 use crate::{
     common::{ensure_success, push_text_item, response_excerpt, response_text},
     http::send_provider_generation_request,
+    request_body::ProviderRequestBody,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
     ModelTranscriptEntry, PreparedModelRequest, ProviderCompactionRequest,
@@ -585,7 +588,9 @@ fn test_openai_model_metadata(model: &str) -> OpenAiModelMetadata {
 #[cfg(test)]
 fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Value> {
     let metadata = test_openai_model_metadata(&request.model);
-    responses_body_with_metadata(request, session_id, &metadata)
+    responses_body_with_metadata(&request, session_id, &metadata)?
+        .materialize()
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -2031,7 +2036,9 @@ fn response_daemon_tool_result_item(
 #[cfg(test)]
 fn compact_body(request: ProviderCompactionRequest, session_id: &str) -> ProviderResult<Value> {
     let metadata = test_openai_model_metadata(&request.model);
-    compact_body_with_metadata(request, session_id, &metadata)
+    compact_body_with_metadata(request, session_id, &metadata)?
+        .materialize()
+        .map_err(Into::into)
 }
 
 fn openai_daemon_observation_call_id(observation: &agent_vocab::DaemonToolObservation) -> String {
@@ -2832,12 +2839,11 @@ fn responses_body_with_metadata(
     request: impl Borrow<ModelRequest>,
     session_id: &str,
     metadata: &OpenAiModelMetadata,
-) -> ProviderResult<Value> {
+) -> ProviderResult<ProviderRequestBody> {
     let request = request.borrow();
     let reasoning_effort = openai_reasoning_effort(metadata, request.reasoning_effort())?;
     let tool_profile = request.tool_profile();
-    let request_tools = crate::effective_provider_tools(tool_profile, request.tools());
-    let tools = response_tools(tool_profile, &request_tools)?;
+    validate_response_tools(tool_profile)?;
     // Cache cohort priority, highest to lowest:
     //   1. Explicit override from `ProviderConfig.prompt_cache.key` (lets
     //      operators force a particular bucket from config).
@@ -2858,7 +2864,7 @@ fn responses_body_with_metadata(
             request.transcript(),
             request.transcript_suffix(),
         )?,
-        "tools": tools,
+        "tools": null,
         "tool_choice": "auto",
         "parallel_tool_calls": metadata.supports_parallel_tool_calls,
         "reasoning": {
@@ -2873,7 +2879,13 @@ fn responses_body_with_metadata(
     if let Some(max_output_tokens) = request.max_tokens {
         body["max_output_tokens"] = json!(max_output_tokens);
     }
-    Ok(body)
+    Ok(match tool_profile {
+        ProviderToolProfile::None => ProviderRequestBody::with_empty_tools(body),
+        ProviderToolProfile::CustomDefinitions | ProviderToolProfile::OpenAiCoding => {
+            ProviderRequestBody::with_tools(body, request.tools_snapshot())
+        }
+        ProviderToolProfile::AnthropicCoding => unreachable!(),
+    })
 }
 
 // The compaction endpoint is unary, so keep streaming-only `/responses` fields
@@ -2883,14 +2895,13 @@ fn compact_body_with_metadata(
     request: impl Borrow<ProviderCompactionRequest>,
     session_id: &str,
     metadata: &OpenAiModelMetadata,
-) -> ProviderResult<Value> {
+) -> ProviderResult<ProviderRequestBody> {
     let request = request.borrow();
     let reasoning_effort = openai_reasoning_effort(metadata, request.reasoning_effort())?;
     let tool_profile = request.tool_profile();
-    let request_tools = crate::effective_provider_tools(tool_profile, request.tools());
-    let tools = response_tools(tool_profile, &request_tools)?;
+    validate_response_tools(tool_profile)?;
     let prompt_cache_key = request.prompt_cache_key().unwrap_or(session_id);
-    Ok(json!({
+    let body = json!({
         "model": request.model(),
         "instructions": request.prompt().stable_prefix.as_deref().unwrap_or_default(),
         "input": response_input_items(
@@ -2899,44 +2910,32 @@ fn compact_body_with_metadata(
             request.transcript(),
             &[],
         )?,
-        "tools": tools,
+        "tools": null,
         "parallel_tool_calls": metadata.supports_parallel_tool_calls,
         "reasoning": {
             "effort": reasoning_effort,
         },
         "service_tier": OPENAI_PRIORITY_SERVICE_TIER,
         "prompt_cache_key": prompt_cache_key,
-    }))
+    });
+    Ok(match tool_profile {
+        ProviderToolProfile::None => ProviderRequestBody::with_empty_tools(body),
+        ProviderToolProfile::CustomDefinitions | ProviderToolProfile::OpenAiCoding => {
+            ProviderRequestBody::with_tools(body, request.tools_snapshot())
+        }
+        ProviderToolProfile::AnthropicCoding => unreachable!(),
+    })
 }
 
-fn response_tools(
-    profile: ProviderToolProfile,
-    tools: &[ProviderTool],
-) -> ProviderResult<Vec<Value>> {
+fn validate_response_tools(profile: ProviderToolProfile) -> ProviderResult<()> {
     match profile {
-        ProviderToolProfile::None => Ok(Vec::new()),
-        ProviderToolProfile::CustomDefinitions | ProviderToolProfile::OpenAiCoding => {
-            Ok(response_provider_tools(tools))
-        }
+        ProviderToolProfile::None
+        | ProviderToolProfile::CustomDefinitions
+        | ProviderToolProfile::OpenAiCoding => Ok(()),
         ProviderToolProfile::AnthropicCoding => Err(ProviderError::Provider(
             "Anthropic coding tools cannot be sent to OpenAI".to_string(),
         )),
     }
-}
-
-fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
-    let mut tools = tools.iter().collect::<Vec<_>>();
-    tools.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.canonical_name.cmp(&right.canonical_name))
-    });
-    tools
-        .into_iter()
-        .map(|tool| tool.declaration.clone())
-        .collect()
 }
 
 fn openai_reasoning_effort(
@@ -4331,7 +4330,7 @@ mod tests {
             prompt: PromptSections::default(),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::OpenAiCoding,
-            tools: Vec::new(),
+            tools: first_party_tools(ProviderKind::OpenAi),
             max_tokens: None,
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,

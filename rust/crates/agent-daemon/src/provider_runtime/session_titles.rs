@@ -11,6 +11,7 @@ use crate::runtime::{
     clear_event_buffer_if_idle, publish_events, replace_active_session_config, SessionDriver,
 };
 use crate::state::AppState;
+use crate::types::RuntimeConfig;
 
 use super::{run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 
@@ -20,6 +21,27 @@ const TITLE_SIDECAR_TIMEOUT_SECS: u64 = 45;
 #[derive(Clone, Default)]
 pub(crate) struct SessionTitleScheduler {
     pending: Arc<StdMutex<HashMap<String, Arc<PendingTitleRefresh>>>>,
+}
+
+impl SessionTitleScheduler {
+    fn schedule(&self, session_id: String, request: PendingTitleRefresh) -> bool {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let generation = pending
+            .get(&session_id)
+            .map(|request| request.generation.saturating_add(1))
+            .unwrap_or(1);
+        pending.insert(
+            session_id,
+            Arc::new(PendingTitleRefresh {
+                generation,
+                ..request
+            }),
+        );
+        generation == 1
+    }
 }
 
 fn pending_generation_matches(state: &AppState, session_id: &str, generation: u64) -> bool {
@@ -35,7 +57,7 @@ fn pending_generation_matches(state: &AppState, session_id: &str, generation: u6
 #[derive(Debug)]
 struct PendingTitleRefresh {
     generation: u64,
-    config: SessionConfig,
+    config: RuntimeConfig,
     input: Arc<ProviderModelInput>,
     title_at_submit: Option<String>,
     prompt: &'static str,
@@ -44,7 +66,7 @@ struct PendingTitleRefresh {
 pub(crate) fn schedule_session_title_refresh_for_model_turn(
     state: &AppState,
     session_id: impl Into<String>,
-    config: &SessionConfig,
+    config: &RuntimeConfig,
     turn_id: TurnId,
     input: Arc<ProviderModelInput>,
 ) {
@@ -59,28 +81,16 @@ pub(crate) fn schedule_session_title_refresh_for_model_turn(
     let state = state.clone();
     let session_id = session_id.into();
     let config = config.clone();
-    let should_spawn = {
-        let mut pending = state
-            .session_titles
-            .pending
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let generation = pending
-            .get(&session_id)
-            .map(|request| request.generation.saturating_add(1))
-            .unwrap_or(1);
-        pending.insert(
-            session_id.clone(),
-            Arc::new(PendingTitleRefresh {
-                generation,
-                config,
-                input,
-                title_at_submit,
-                prompt,
-            }),
-        );
-        generation == 1
-    };
+    let should_spawn = state.session_titles.schedule(
+        session_id.clone(),
+        PendingTitleRefresh {
+            generation: 0,
+            config,
+            input,
+            title_at_submit,
+            prompt,
+        },
+    );
 
     if should_spawn {
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();

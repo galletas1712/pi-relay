@@ -24,7 +24,8 @@ pub(crate) use compaction::{
 pub(crate) use connections::ProviderConnectionRegistry;
 pub(crate) use context_accounting::{model_input_accounting_for_gate, ModelInputAccounting};
 pub(crate) use prompt::{
-    current_pi_template, effective_prompt_profile, provider_tools_for_session, render_pi_prompt,
+    current_pi_template, effective_prompt_profile, prompt_snapshot, provider_tools_for_session,
+    render_pi_prompt,
 };
 pub(crate) use provider::model_metadata_for_config;
 #[cfg(test)]

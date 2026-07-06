@@ -27,7 +27,7 @@ use crate::provider_runtime::{
     ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::*;
-use crate::state::AppState;
+use crate::state::{AppState, ProviderToolSnapshots};
 use crate::types::*;
 use crate::workspaces::{validate_remote_branch, validate_workspace_dir, WorkspaceManager};
 
@@ -64,6 +64,8 @@ async fn main() -> Result<()> {
     let (events, _) = broadcast::channel(1024);
     let workspaces = WorkspaceManager::from_default_state_dir()?;
     let prompt_root = find_prompt_root(std::env::current_dir()?)?;
+    let tools = Arc::new(ToolRegistry::with_builtin_tools());
+    let provider_tools = ProviderToolSnapshots::new(&tools);
     let state = AppState {
         repo,
         active: Arc::new(Mutex::new(HashMap::new())),
@@ -76,7 +78,8 @@ async fn main() -> Result<()> {
         post_compaction_recovery_task: Arc::new(StdMutex::new(None)),
         shutting_down: Arc::new(AtomicBool::new(false)),
         events,
-        tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        tools,
+        provider_tools,
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         workspaces,
@@ -517,7 +520,7 @@ async fn tools_list(state: &AppState, params: Value) -> std::result::Result<Valu
     })?;
     let profile = tools_list_profile(state, &params).await?;
     let tools = provider_tools_for_session(state, provider, profile)
-        .into_iter()
+        .iter()
         .map(|tool| {
             json!({
                 "name": tool.name,
@@ -808,7 +811,7 @@ async fn session_configure(
     };
     let events = state.repo.configure_session(&session_id, &config).await?;
     if let Some(active) = driver.active_session().await {
-        active.lock().await.config = config.clone();
+        active.lock().await.replace_config(config.clone());
     }
     publish_events(state, events);
     clear_event_buffer_if_idle(state, &session_id).await?;

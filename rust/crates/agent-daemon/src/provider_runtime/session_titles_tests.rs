@@ -1,6 +1,66 @@
 use super::*;
+use agent_provider::ProviderToolProfile;
 use agent_session::ModelContext;
-use agent_vocab::{AssistantItem, TranscriptItem, TurnId, UserMessage};
+use agent_store::SessionConfig;
+use agent_vocab::{
+    AssistantItem, ProviderConfig, ProviderKind, ReasoningEffort, TranscriptItem, TurnId,
+    UserMessage,
+};
+use serde_json::json;
+
+fn runtime_config(system_prompt: &str) -> RuntimeConfig {
+    SessionConfig {
+        project_id: None,
+        outer_cwd: "/tmp".to_string(),
+        workspaces: Vec::new(),
+        system_prompt: system_prompt.to_string(),
+        provider: ProviderConfig {
+            kind: ProviderKind::Claude,
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache: None,
+        },
+        metadata: json!({}),
+    }
+    .into()
+}
+
+#[test]
+fn pending_title_schedule_retains_runtime_config_and_prompt_allocations() {
+    let scheduler = SessionTitleScheduler::default();
+    let config = runtime_config(&"large stable prompt".repeat(1_000));
+    let input = Arc::new(ProviderModelInput::from_shared(
+        "claude-opus-4-8",
+        Arc::clone(config.prompt()),
+        vec![TranscriptItem::UserMessage(UserMessage::text("title this")).into()],
+        ProviderToolProfile::AnthropicCoding,
+        Arc::from([]),
+        ReasoningEffort::High,
+    ));
+    let config_allocation = config.config_allocation();
+    let prompt_allocation = Arc::as_ptr(config.prompt());
+
+    assert!(scheduler.schedule(
+        "session-1".to_string(),
+        PendingTitleRefresh {
+            generation: 0,
+            config: config.clone(),
+            input,
+            title_at_submit: None,
+            prompt: TITLE_INITIAL_PROMPT,
+        },
+    ));
+
+    let pending = scheduler
+        .pending
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let request = pending.get("session-1").expect("scheduled title refresh");
+    assert_eq!(request.config.config_allocation(), config_allocation);
+    assert_eq!(Arc::as_ptr(request.config.prompt()), prompt_allocation);
+    assert_eq!(request.input.prompt_allocation(), prompt_allocation);
+}
 
 #[test]
 fn sanitize_title_trims_quotes_and_punctuation() {
