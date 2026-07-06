@@ -6,12 +6,15 @@
 
 #![forbid(unsafe_code)]
 
+use std::fs::{File, OpenOptions};
 use std::future::Future;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 static PERF_ENABLED: OnceLock<bool> = OnceLock::new();
+static PERF_SINK: OnceLock<PerfSink> = OnceLock::new();
 
 tokio::task_local! {
     static CURRENT: Arc<Counters>;
@@ -56,6 +59,8 @@ macro_rules! metric_fields {
             classified_wall_ns,
             unclassified_wall_ns,
             total_elapsed_ns,
+            nested_operation_ns,
+            exclusive_elapsed_ns,
             session_registry_scans,
             session_registry_entries_scanned,
             dispatch_task_registry_scans,
@@ -201,6 +206,8 @@ pub struct Metrics {
 #[derive(Debug, Default)]
 struct PhaseState {
     stack: Vec<PhaseFrame>,
+    suspension_depth: usize,
+    suspension_started: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -216,6 +223,22 @@ struct PhaseFrame {
 #[must_use]
 pub struct PhaseGuard {
     active: Option<(Arc<Counters>, Arc<Mutex<PhaseState>>)>,
+}
+
+/// Suspends the outer collector while a nested collector owns the current task.
+struct NestedOperationGuard {
+    outer: Option<NestedOperation>,
+}
+
+struct NestedOperation {
+    counters: Arc<Counters>,
+    phase_state: Arc<Mutex<PhaseState>>,
+}
+
+enum PerfSink {
+    File(Mutex<File>),
+    Stderr,
+    Disabled,
 }
 
 /// Per-response SSE observations published once when the parser exits.
@@ -275,6 +298,7 @@ impl Metrics {
 
     /// Run one operation with this collector installed on the current task.
     pub async fn scope<F: Future>(&self, future: F) -> F::Output {
+        let _nested_operation = NestedOperationGuard::suspend_outer(&self.counters);
         CURRENT
             .scope(
                 Arc::clone(&self.counters),
@@ -306,27 +330,36 @@ impl Metrics {
     }
 
     /// Consume the operation owner and emit one fixed-shape aggregate.
-    pub fn finish(mut self, outcome: Outcome) -> Snapshot {
+    pub fn finish(self, outcome: Outcome) -> Snapshot {
+        self.finish_with(outcome, emit_record)
+    }
+
+    fn finish_with(
+        mut self,
+        outcome: Outcome,
+        emitter: impl FnOnce(Operation, Outcome, Snapshot),
+    ) -> Snapshot {
         let snapshot = self.final_snapshot();
-        if self.emit {
-            eprintln!(
-                "perf operation={} outcome={} {snapshot}",
-                self.operation.as_str(),
-                outcome.as_str()
-            );
-        }
         self.finished = true;
         self.counters.finished.store(true, Ordering::Release);
+        if self.emit {
+            emitter(self.operation, outcome, snapshot);
+        }
         snapshot
     }
 
     fn final_snapshot(&self) -> Snapshot {
         let total_elapsed_ns = duration_to_nanos(self.started.elapsed());
+        let exclusive_elapsed_ns =
+            total_elapsed_ns.saturating_sub(load(&self.counters.nested_operation_ns));
         self.counters
             .total_elapsed_ns
             .store(total_elapsed_ns, Ordering::Relaxed);
+        self.counters
+            .exclusive_elapsed_ns
+            .store(exclusive_elapsed_ns, Ordering::Relaxed);
         self.counters.unclassified_wall_ns.store(
-            total_elapsed_ns.saturating_sub(load(&self.counters.classified_wall_ns)),
+            exclusive_elapsed_ns.saturating_sub(load(&self.counters.classified_wall_ns)),
             Ordering::Relaxed,
         );
         self.snapshot()
@@ -337,15 +370,73 @@ impl Drop for Metrics {
     fn drop(&mut self) {
         if !self.finished {
             let snapshot = self.final_snapshot();
+            self.finished = true;
+            self.counters.finished.store(true, Ordering::Release);
             if self.emit {
-                eprintln!(
-                    "perf operation={} outcome={} {snapshot}",
-                    self.operation.as_str(),
-                    Outcome::Aborted.as_str()
+                emit_record(self.operation, Outcome::Aborted, snapshot);
+            }
+        } else {
+            self.counters.finished.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl NestedOperationGuard {
+    fn suspend_outer(nested_counters: &Arc<Counters>) -> Self {
+        let Some(counters) = CURRENT.try_with(Arc::clone).ok() else {
+            return Self { outer: None };
+        };
+        if Arc::ptr_eq(&counters, nested_counters) {
+            return Self { outer: None };
+        }
+        let Some(phase_state) = PHASE_STATE.try_with(Arc::clone).ok() else {
+            return Self { outer: None };
+        };
+        let mut state = phase_state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.suspension_depth == 0 {
+            let started = Instant::now();
+            if let Some(parent) = state.stack.last() {
+                add_phase_duration(
+                    &counters,
+                    parent.phase,
+                    duration_to_nanos(started.saturating_duration_since(parent.started)),
                 );
             }
+            state.suspension_started = Some(started);
         }
-        self.counters.finished.store(true, Ordering::Release);
+        state.suspension_depth = state.suspension_depth.saturating_add(1);
+        drop(state);
+        Self {
+            outer: Some(NestedOperation {
+                counters,
+                phase_state,
+            }),
+        }
+    }
+}
+
+impl Drop for NestedOperationGuard {
+    fn drop(&mut self) {
+        let Some(outer) = self.outer.take() else {
+            return;
+        };
+        let mut state = outer
+            .phase_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.suspension_depth = state.suspension_depth.saturating_sub(1);
+        if state.suspension_depth == 0 {
+            let finished = Instant::now();
+            if let Some(started) = state.suspension_started.take() {
+                add(
+                    &outer.counters.nested_operation_ns,
+                    duration_to_nanos(finished.saturating_duration_since(started)),
+                );
+            }
+            if let Some(parent) = state.stack.last_mut() {
+                parent.started = finished;
+            }
+        }
     }
 }
 
@@ -476,13 +567,15 @@ pub fn phase(phase: Phase) -> PhaseGuard {
     };
     let now = Instant::now();
     {
-        let mut state_ref = state.lock().expect("perf phase state lock poisoned");
-        if let Some(parent) = state_ref.stack.last() {
-            add_phase_duration(
-                &counters,
-                parent.phase,
-                duration_to_nanos(now.saturating_duration_since(parent.started)),
-            );
+        let mut state_ref = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state_ref.suspension_depth == 0 {
+            if let Some(parent) = state_ref.stack.last() {
+                add_phase_duration(
+                    &counters,
+                    parent.phase,
+                    duration_to_nanos(now.saturating_duration_since(parent.started)),
+                );
+            }
         }
         state_ref.stack.push(PhaseFrame {
             phase,
@@ -505,16 +598,20 @@ impl Drop for PhaseGuard {
             return;
         };
         let now = Instant::now();
-        let mut state = state.lock().expect("perf phase state lock poisoned");
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(frame) = state.stack.pop() {
-            add_phase_duration(
-                &counters,
-                frame.phase,
-                duration_to_nanos(now.saturating_duration_since(frame.started)),
-            );
+            if state.suspension_depth == 0 {
+                add_phase_duration(
+                    &counters,
+                    frame.phase,
+                    duration_to_nanos(now.saturating_duration_since(frame.started)),
+                );
+            }
         }
-        if let Some(parent) = state.stack.last_mut() {
-            parent.started = now;
+        if state.suspension_depth == 0 {
+            if let Some(parent) = state.stack.last_mut() {
+                parent.started = now;
+            }
         }
     }
 }
@@ -569,6 +666,40 @@ pub fn action_completion_scan(entries: usize) {
 
 fn enabled() -> bool {
     *PERF_ENABLED.get_or_init(|| std::env::var_os("PI_RELAY_PERF").is_some())
+}
+
+fn emit_record(operation: Operation, outcome: Outcome, snapshot: Snapshot) {
+    let sink = PERF_SINK.get_or_init(|| match std::env::var_os("PI_RELAY_PERF_FILE") {
+        Some(path) => OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map(|file| PerfSink::File(Mutex::new(file)))
+            .unwrap_or(PerfSink::Disabled),
+        None => PerfSink::Stderr,
+    });
+    match sink {
+        PerfSink::File(file) => {
+            let mut file = file.lock().unwrap_or_else(PoisonError::into_inner);
+            write_record(&mut *file, operation, outcome, snapshot);
+        }
+        PerfSink::Stderr => write_record(&mut io::stderr().lock(), operation, outcome, snapshot),
+        PerfSink::Disabled => {}
+    }
+}
+
+fn write_record(
+    writer: &mut dyn Write,
+    operation: Operation,
+    outcome: Outcome,
+    snapshot: Snapshot,
+) {
+    let record = format!(
+        "perf operation={} outcome={} {snapshot}\n",
+        operation.as_str(),
+        outcome.as_str()
+    );
+    let _ = writer.write_all(record.as_bytes());
 }
 
 fn record(operation: impl FnOnce(&Counters)) {

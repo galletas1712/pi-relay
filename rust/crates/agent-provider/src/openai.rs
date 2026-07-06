@@ -1089,6 +1089,7 @@ mod catalog_tests {
                 classified_wall_ns: 0,
                 unclassified_wall_ns: 0,
                 total_elapsed_ns: 0,
+                exclusive_elapsed_ns: 0,
                 ..snapshot
             },
             agent_perf::Snapshot {

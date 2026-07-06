@@ -76,6 +76,8 @@ coordination_wait_ns=0
 classified_wall_ns=0
 unclassified_wall_ns=0
 total_elapsed_ns=0
+nested_operation_ns=0
+exclusive_elapsed_ns=0
 session_registry_scans=1
 session_registry_entries_scanned=1
 dispatch_task_registry_scans=1
@@ -141,6 +143,8 @@ coordination_wait_ns=0
 classified_wall_ns=0
 unclassified_wall_ns=0
 total_elapsed_ns=0
+nested_operation_ns=0
+exclusive_elapsed_ns=0
 session_registry_scans=0
 session_registry_entries_scanned=0
 dispatch_task_registry_scans=0
@@ -276,26 +280,57 @@ intentionally contain no IDs:
 ```sh
 cd rust
 cargo build --release -p agent-daemon
-PI_RELAY_PERF=1 ./target/release/pi-agentd 2>perf.stderr
-grep '^perf operation=' perf.stderr >perf-actions.log
+umask 077
+rm -f ./perf-actions.log
+PI_RELAY_PERF=1 PI_RELAY_PERF_FILE=./perf-actions.log \
+  ./target/release/pi-agentd
 ```
 
 `PI_RELAY_PERF` is enabled by presence, so `PI_RELAY_PERF=0` also enables it.
-The filtered records are fixed-shape and numeric-only. Existing free-form
-`PI_RELAY_PERF` RPC lines can contain identifiers and must not be archived as
-privacy-minimal data. Measure whole-task wall externally from input acceptance
-through the durable `session.idle` event; action records are not a user-turn
-trace.
+`PI_RELAY_PERF_FILE` is a dedicated profiler-only sink opened once on first
+emission, created if absent, and written under a process-local lock. It uses
+append mode and never truncates or changes an existing file's permissions, so
+remove stale output and use `umask 077` before each launch. Use one daemon per
+file. Sink open/write failures are best-effort and do not alter daemon behavior.
+Without the file setting, records fall back to stderr for convenience, but a
+filter over mixed stderr is not a privacy/authenticity boundary because
+provider-controlled multiline text can imitate records.
 
 Exclusive fields are `provider_request_wait_ns`,
 `provider_stream_wait_ns`, `provider_metadata_wait_ns`,
 `request_preparation_ns`, `tool_execution_ns`,
 `output_persistence_wall_ns`, and `coordination_wait_ns`; they sum to
-`classified_wall_ns`. `unclassified_wall_ns` is the saturating remainder from
-`total_elapsed_ns`. Physical send counters exclude detached metadata GETs, but
-the caller-visible cold/shared metadata wait is included. Live context byte
-attribution is intentionally incomplete because the gate no longer rescans an
-already-built context solely for profiling.
+`classified_wall_ns`. `total_elapsed_ns` is inclusive owner wall,
+`nested_operation_ns` is time spent in synchronous child collector scopes, and
+`exclusive_elapsed_ns = total_elapsed_ns - nested_operation_ns`, saturating.
+The outer phase is suspended during a nested operation, and
+`unclassified_wall_ns = exclusive_elapsed_ns - classified_wall_ns`,
+saturating.
+
+Interpret each record independently:
+
+- `provider_wait = provider_request_wait_ns + provider_stream_wait_ns +
+  provider_metadata_wait_ns`;
+- model daemon/outside-provider time is
+  `exclusive_elapsed_ns - provider_wait`;
+- tool daemon/outside-tool time is
+  `exclusive_elapsed_ns - tool_execution_ns`;
+- `classified_wall_ns` is the seven-bucket exclusive sum; and
+- `unclassified_wall_ns` is only the unbucketed exclusive remainder, not all
+  daemon overhead.
+
+All subtraction and addition in these formulas is saturating. Synchronous
+nested scope intervals are disjoint from the parent exclusive duration, but
+inclusive totals are not: do not add a `web_sidecar` record to an inclusive
+parent tool interval. Independently spawned portions of successor operations
+and other concurrent operations, especially title sidecars, can still overlap;
+shared metadata wait can also be observed by multiple callers. With no IDs or
+timestamps these records cannot form a disjoint scenario total. Measure
+whole-scenario wall externally from input acceptance through durable
+`session.idle`; action records are not a user-turn trace. Physical send counters
+exclude detached metadata GETs, but caller-visible cold/shared metadata wait is
+included. Live context byte attribution is intentionally incomplete because
+the gate no longer rescans an already-built context solely for profiling.
 
 ## Reproduction commands
 

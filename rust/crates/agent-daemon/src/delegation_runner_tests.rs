@@ -148,6 +148,8 @@ async fn local_openai_turn_records_exact_model_hot_path_and_reaches_idle() {
     snapshot.classified_wall_ns = 0;
     snapshot.unclassified_wall_ns = 0;
     snapshot.total_elapsed_ns = 0;
+    snapshot.nested_operation_ns = 0;
+    snapshot.exclusive_elapsed_ns = 0;
     let request_serialized_bytes = snapshot.provider_body_serialized_bytes;
     let request_encoded_bytes = snapshot.provider_body_encoded_bytes;
     snapshot.provider_body_serialized_bytes = 0;
@@ -286,6 +288,8 @@ async fn cold_recovery_finishes_before_resumed_model_dispatch() {
     assert!(snapshot.total_elapsed_ns >= snapshot.classified_wall_ns);
     snapshot.unclassified_wall_ns = 0;
     snapshot.total_elapsed_ns = 0;
+    snapshot.nested_operation_ns = 0;
+    snapshot.exclusive_elapsed_ns = 0;
     assert_eq!(
         snapshot,
         agent_perf::Snapshot {

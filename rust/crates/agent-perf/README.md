@@ -39,7 +39,21 @@ distinguishes a provider failure/refusal/incomplete result whose durable failure
 transition succeeded from a genuinely successful model completion.
 
 `total_elapsed_ns` starts when the enabled/test `Metrics` owner is allocated and
-is captured before stderr emission on finish or drop.
+is captured before best-effort emission on finish or drop. It is inclusive
+owner wall time. When a scope synchronously starts another collector on the
+same task, the outer collector is suspended for the full nested scope:
+
+- `nested_operation_ns` is the outer owner's inclusive time spent in nested
+  collector scopes;
+- `exclusive_elapsed_ns = total_elapsed_ns - nested_operation_ns`, saturating;
+- the outer active phase is paused, so none of the nested duration enters the
+  outer phase fields; and
+- `unclassified_wall_ns = exclusive_elapsed_ns - classified_wall_ns`,
+  saturating.
+
+This makes the synchronous nested scope interval disjoint from the parent's
+exclusive duration. Task-local collectors are not inherited by detached or
+concurrent spawned tasks.
 
 ## Exclusive wall-clock fields
 
@@ -58,7 +72,7 @@ pause their parent. Therefore these fields are exclusive and their sum is
 | `output_persistence_wall_ns` | Output persistence from before pool `begin` through commit, plus standalone terminal event writes such as final `session.idle`. |
 | `coordination_wait_ns` | Session-driver acquisition, measured spawn/register/start handoff, model claim, and retry backoff. |
 | `classified_wall_ns` | Exclusive sum of the seven phase buckets. |
-| `unclassified_wall_ns` | Saturating `total_elapsed_ns - classified_wall_ns`; CPU work and boundaries not explicitly classified remain here. |
+| `unclassified_wall_ns` | Saturating `exclusive_elapsed_ns - classified_wall_ns`; CPU work and boundaries not explicitly classified remain here. |
 
 `lock_wait_ns` and `output_transaction_ns` are narrower diagnostics retained
 from the deterministic baseline. They overlap `coordination_wait_ns` and
@@ -99,11 +113,14 @@ after capture.
 cd rust
 cargo build --release -p agent-daemon
 
-# Launch the unoptimized runtime implementation with only profiling enabled.
-PI_RELAY_PERF=1 ./target/release/pi-agentd 2>perf.stderr
+# A fresh file plus a restrictive creation mask prevents stale records and
+# access by other users. PI_RELAY_PERF_FILE is append-only and never truncates.
+umask 077
+rm -f ./perf-actions.log
 
-# Archive only the privacy-minimal fixed records.
-grep '^perf operation=' perf.stderr >perf-actions.log
+# Launch the unoptimized runtime with the dedicated profiler-only sink.
+PI_RELAY_PERF=1 PI_RELAY_PERF_FILE=./perf-actions.log \
+  ./target/release/pi-agentd
 ```
 
 Use the daemon exactly as usual and run a long real-provider/tool scenario.
@@ -111,10 +128,38 @@ Measure whole-task wall time separately, from external input acceptance through
 the durable `session.idle` event. Per-action records cannot replace that
 end-to-end measurement.
 
-Do not archive all lines containing `PI_RELAY_PERF` output as privacy-minimal
-data. Existing free-form RPC performance lines (for example `perf history.tree
-session=...`) can contain identifiers. Only lines matching
-`^perf operation=` have this profiler's fixed numeric-only contract.
+`PI_RELAY_PERF_FILE` is opened once on first emission, created if absent, and
+opened in append mode. It is never truncated and retains an existing file's
+permissions, so remove stale output before every run and use `umask 077` when
+creating it. One process-local lock serializes each attempted complete fixed
+record line; use one daemon per output file. Open and write failures are ignored
+and cannot change daemon behavior. When no file is configured, records go to
+stderr as a best-effort convenience, but filtering mixed stderr is **not** a
+privacy or authenticity boundary: provider-controlled multiline errors can
+imitate a profiler line. Only the dedicated file has the profiler-only sink
+contract.
+
+Interpret timing strictly per operation:
+
+- `provider_wait = provider_request_wait_ns + provider_stream_wait_ns +
+  provider_metadata_wait_ns`, saturating;
+- for a `model_action`, daemon/outside-provider time is
+  `exclusive_elapsed_ns - provider_wait`, saturating;
+- for a `tool_action`, daemon/outside-tool time is
+  `exclusive_elapsed_ns - tool_execution_ns`, saturating;
+- `classified_wall_ns` is the sum of the seven exclusive phase buckets; and
+- `unclassified_wall_ns` is only the part of exclusive elapsed time not in
+  those buckets. It is not all daemon overhead.
+
+Synchronous nested scope intervals are disjoint from the parent's exclusive
+duration. Inclusive `total_elapsed_ns` still contains `nested_operation_ns`, so
+do not add a `web_sidecar` duration to its parent tool's inclusive total.
+Independently spawned portions of successor operations and other concurrent
+operations, especially title sidecars, can overlap; shared metadata wait can
+also be observed by multiple callers. Records have no IDs or timestamps, so
+they cannot be summed into a whole-scenario partition. Whole-scenario wall
+remains the external interval from input acceptance through durable
+`session.idle`.
 
 See
 [`rust/docs/perf/model-request-hot-path-baseline.md`](../../docs/perf/model-request-hot-path-baseline.md)
