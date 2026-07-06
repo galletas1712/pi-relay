@@ -1,5 +1,7 @@
+#[cfg(test)]
+use agent_provider::PromptSections;
 use agent_provider::{
-    ModelTranscriptEntry, PromptSections, ProviderCompactionRequest, ProviderCompactionResponse,
+    ModelTranscriptEntry, ProviderCompactionRequest, ProviderCompactionResponse,
     ProviderModelInput, ProviderModelMetadata, ProviderToolProfile,
 };
 use agent_session::ModelContext;
@@ -16,7 +18,8 @@ use crate::state::AppState;
 
 use super::auth_retry::compact_with_auth_retry;
 use super::prompt::{
-    effective_prompt_profile, provider_tools_for_session, render_pi_compaction_prompt,
+    effective_prompt_profile, prompt_snapshot, provider_tools_for_session,
+    render_pi_compaction_prompt,
 };
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
@@ -317,13 +320,13 @@ pub(crate) async fn native_compaction_request(
     } else {
         None
     };
-    let input = ProviderModelInput::new(
+    let input = ProviderModelInput::from_shared(
         config.provider.model.clone(),
         // Compaction uses the stable prompt plus transcript/model history. Any
         // previous post-compaction delegation ledger already present in the
         // transcript is ordinary prior summary text; fresh parent state is
         // appended to the stored compaction result after the provider returns.
-        PromptSections::stable(config.system_prompt.clone()),
+        prompt_snapshot(config),
         transcript,
         ProviderToolProfile::for_provider(config.provider.kind),
         provider_tools_for_session(

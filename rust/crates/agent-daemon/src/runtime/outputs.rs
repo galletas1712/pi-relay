@@ -1,9 +1,9 @@
 use agent_core::AgentInput;
 use agent_session::{SessionAction, SessionEvent, TranscriptStorageNode};
-use agent_store::{InputPriority, PersistedAction, QueuedInputContent, SessionConfig};
+use agent_store::{InputPriority, PersistedAction, QueuedInputContent};
 use agent_vocab::{ProviderReplayItem, TranscriptItem};
 
-use crate::types::{DispatchAction, RpcError, RuntimeSession};
+use crate::types::{DispatchAction, RpcError, RuntimeConfig, RuntimeSession};
 
 pub(crate) fn agent_input_from_queued_priority(
     priority: InputPriority,
@@ -73,7 +73,7 @@ pub(super) fn attach_provider_replay(
 
 pub(crate) fn attach_dispatch_config(
     persisted_actions: Vec<PersistedAction>,
-    config: &SessionConfig,
+    config: &RuntimeConfig,
 ) -> Vec<DispatchAction> {
     persisted_actions
         .into_iter()

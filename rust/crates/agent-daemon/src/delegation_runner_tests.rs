@@ -71,8 +71,9 @@ impl Drop for TempDir {
 }
 
 use crate::provider_runtime::{
-    append_delegation_ledger_to_output, build_model_request, native_compaction_request,
-    CompactionOutput, CompactionSummaryKind, ProviderConnectionRegistry, SessionTitleScheduler,
+    append_delegation_ledger_to_output, build_model_request, build_provider_model_input,
+    native_compaction_request, CompactionOutput, CompactionSummaryKind, ProviderConnectionRegistry,
+    SessionTitleScheduler,
 };
 use crate::runtime::{
     apply_model_response, collect_runtime_outputs, recover_post_compaction_dispatches_on_boot,
@@ -81,7 +82,7 @@ use crate::runtime::{
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart,
 };
-use crate::state::{AppState, RunningTask, TaskRegistrationId};
+use crate::state::{AppState, ProviderToolSnapshots, RunningTask, TaskRegistrationId};
 use crate::types::{DispatchAction, ModelDispatchInput, RuntimeSession};
 use crate::workspaces::WorkspaceManager;
 
@@ -148,8 +149,10 @@ impl ModelProvider for TrackingOpenAiProvider {
     }
 }
 
+type AccountingInputPointers = Arc<StdMutex<Vec<(&'static str, usize, usize, usize)>>>;
+
 struct AccountingProvider {
-    input_pointers: Arc<StdMutex<Vec<(&'static str, usize)>>>,
+    input_pointers: AccountingInputPointers,
     count_tokens: usize,
 }
 
@@ -159,7 +162,12 @@ impl ModelProvider for AccountingProvider {
         self.input_pointers
             .lock()
             .expect("input pointer lock")
-            .push(("generation", std::ptr::from_ref(&*request) as usize));
+            .push((
+                "generation",
+                std::ptr::from_ref(&*request) as usize,
+                request.prompt_allocation() as usize,
+                request.tools_allocation().0 as usize,
+            ));
         Ok(ModelResponse {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::Text("accounted completion".to_string())],
@@ -192,7 +200,12 @@ impl ModelProvider for AccountingProvider {
         self.input_pointers
             .lock()
             .expect("input pointer lock")
-            .push(("count", std::ptr::from_ref(&*request) as usize));
+            .push((
+                "count",
+                std::ptr::from_ref(&*request) as usize,
+                request.prompt_allocation() as usize,
+                request.tools_allocation().0 as usize,
+            ));
         Ok(ProviderTokenCountResponse {
             input_tokens: self.count_tokens,
             original_input_tokens: None,
@@ -254,6 +267,8 @@ async fn test_env() -> Option<TestEnv> {
     let state_dir = TempDir::new("state");
     let cwd = TempDir::new("cwd");
     let (events, _rx) = broadcast::channel(1024);
+    let tools = Arc::new(ToolRegistry::with_builtin_tools());
+    let provider_tools = ProviderToolSnapshots::new(&tools);
     let state = AppState {
         repo: Arc::new(store),
         active: Arc::new(Mutex::new(HashMap::new())),
@@ -266,7 +281,8 @@ async fn test_env() -> Option<TestEnv> {
         post_compaction_recovery_task: Arc::new(StdMutex::new(None)),
         shutting_down: Arc::new(AtomicBool::new(false)),
         events,
-        tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        tools,
+        provider_tools,
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
@@ -303,6 +319,8 @@ fn test_app_state(
     prompt_root: PathBuf,
 ) -> AppState {
     let (events, _rx) = broadcast::channel(1024);
+    let tools = Arc::new(ToolRegistry::with_builtin_tools());
+    let provider_tools = ProviderToolSnapshots::new(&tools);
     AppState {
         repo: Arc::new(store),
         active: Arc::new(Mutex::new(HashMap::new())),
@@ -315,7 +333,8 @@ fn test_app_state(
         post_compaction_recovery_task: Arc::new(StdMutex::new(None)),
         shutting_down: Arc::new(AtomicBool::new(false)),
         events,
-        tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        tools,
+        provider_tools,
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
@@ -429,7 +448,7 @@ fn claude_accounting_config(
 
 async fn install_accounting_provider(
     env: &TestEnv,
-    input_pointers: &Arc<StdMutex<Vec<(&'static str, usize)>>>,
+    input_pointers: &AccountingInputPointers,
     count_tokens: usize,
 ) {
     env.state
@@ -656,7 +675,7 @@ async fn ordinary_codex_retry_without_account_reuses_provider_and_prepared_bytes
         attempt_id: persisted.attempt_id,
         post_compaction_dispatch_lease: None,
         action: persisted.action,
-        config,
+        config: config.into(),
         model_input: ModelDispatchInput::Unmaterialized,
     };
     let input = Arc::new(
@@ -757,11 +776,7 @@ async fn fresh_model_context_is_shallow_through_persistence_and_moves_at_provide
             "auto_title_disabled": true,
         }),
     );
-    let mut runtime = RuntimeSession {
-        session: AgentSession::new(),
-        config: config.clone(),
-        persisted_active_leaf_id: None,
-    };
+    let mut runtime = RuntimeSession::new(AgentSession::new(), config.clone(), None);
     runtime
         .session
         .enqueue_input(AgentInput::follow_up_message(content.clone()))
@@ -810,7 +825,7 @@ async fn fresh_model_context_is_shallow_through_persistence_and_moves_at_provide
         attempt_id: persisted.attempt_id,
         post_compaction_dispatch_lease: None,
         action: persisted.action,
-        config,
+        config: config.into(),
         model_input: ModelDispatchInput::Unmaterialized,
     };
     let action_identity = match &dispatch.action {
@@ -897,7 +912,7 @@ async fn below_limit_claude_gate_and_generation_share_one_provider_input() {
             ]),
             context_leaf_id: Some("user-leaf".to_string()),
         },
-        config,
+        config: config.into(),
         model_input: ModelDispatchInput::Unmaterialized,
     };
     let driver = SessionDriver::acquire(&env.state, session_id).await;
@@ -919,6 +934,17 @@ async fn below_limit_claude_gate_and_generation_share_one_provider_input() {
     .await
     .expect("generation call succeeds")
     .is_ok());
+    let next_input = build_provider_model_input(
+        &env.state,
+        &dispatch.config,
+        session_id,
+        ModelContext::new(),
+    )
+    .await
+    .expect("subsequent input builds");
+    assert_ne!(Arc::as_ptr(input), Arc::as_ptr(&next_input));
+    assert_eq!(input.prompt_allocation(), next_input.prompt_allocation());
+    assert_eq!(input.tools_allocation(), next_input.tools_allocation());
 
     {
         let pointers = input_pointers.lock().expect("input pointer lock");
@@ -926,6 +952,8 @@ async fn below_limit_claude_gate_and_generation_share_one_provider_input() {
         assert_eq!(pointers[0].0, "count");
         assert_eq!(pointers[1].0, "generation");
         assert_eq!(pointers[0].1, pointers[1].1);
+        assert_eq!(pointers[0].2, pointers[1].2);
+        assert_eq!(pointers[0].3, pointers[1].3);
     }
 
     drop(driver);
@@ -1005,7 +1033,7 @@ async fn proactive_gate_persists_exact_accounting_tokens_before() {
         attempt_id: persisted.attempt_id,
         post_compaction_dispatch_lease: None,
         action: persisted.action,
-        config,
+        config: config.into(),
         model_input: ModelDispatchInput::Unmaterialized,
     };
     let driver = SessionDriver::acquire(&env.state, session_id).await;
@@ -1111,11 +1139,11 @@ async fn true_empty_active_output_pass_opens_no_transaction_or_events() {
     };
     let session_id = "empty-active-output";
     let project_id = Uuid::new_v4();
-    let active = Arc::new(Mutex::new(RuntimeSession {
-        session: AgentSession::new(),
-        config: session_config(&env, project_id, json!({})),
-        persisted_active_leaf_id: None,
-    }));
+    let active = Arc::new(Mutex::new(RuntimeSession::new(
+        AgentSession::new(),
+        session_config(&env, project_id, json!({})),
+        None,
+    )));
     let mut events = env.state.events.subscribe();
     let driver = SessionDriver::acquire(&env.state, session_id).await;
     env.state.repo.close().await;
@@ -1347,6 +1375,8 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
     restarted_store.migrate().await.expect("restart migrates");
     let restarted_state_dir = TempDir::new("restart-state");
     let (events, _rx) = broadcast::channel(1024);
+    let tools = Arc::new(ToolRegistry::with_builtin_tools());
+    let provider_tools = ProviderToolSnapshots::new(&tools);
     let restarted_state = AppState {
         repo: Arc::new(restarted_store),
         active: Arc::new(Mutex::new(HashMap::new())),
@@ -1359,7 +1389,8 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
         post_compaction_recovery_task: Arc::new(StdMutex::new(None)),
         shutting_down: Arc::new(AtomicBool::new(false)),
         events,
-        tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        tools,
+        provider_tools,
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(restarted_state_dir.path().to_path_buf()),
@@ -1476,16 +1507,17 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
     else {
         unreachable!()
     };
+    let config = restarted_state
+        .repo
+        .load_session_config(session_id)
+        .await
+        .expect("load recovered config");
     let terminal_dispatch = DispatchAction {
         row_id: resumed.row_id.clone(),
         attempt_id: resumed.attempt_id.clone(),
         post_compaction_dispatch_lease: Some(reclaimed_lease),
         action: crashed_claim.pending.action,
-        config: restarted_state
-            .repo
-            .load_session_config(session_id)
-            .await
-            .expect("load recovered config"),
+        config: config.into(),
         model_input: crate::types::ModelDispatchInput::Unmaterialized,
     };
     apply_model_response(
@@ -2917,16 +2949,17 @@ async fn unexpected_ordinary_turn_stops_discard_partial_content_and_replay() {
             }),
         )
         .expect("valid replay");
+        let config = session_config(
+            &env,
+            project_id,
+            json!({ "created_by": "test", "harness": true }),
+        );
         let dispatch = DispatchAction {
             row_id: persisted.row_id,
             attempt_id: persisted.attempt_id,
             post_compaction_dispatch_lease: None,
             action: persisted.action,
-            config: session_config(
-                &env,
-                project_id,
-                json!({ "created_by": "test", "harness": true }),
-            ),
+            config: config.into(),
             model_input: crate::types::ModelDispatchInput::Unmaterialized,
         };
         apply_model_response(

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    borrow::{Borrow, Cow},
+    borrow::Borrow,
     collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
@@ -22,6 +22,7 @@ use crate::{
         compaction_summary_text, ensure_success, push_text_item, response_excerpt, response_text,
     },
     http::send_provider_generation_request,
+    request_body::ProviderRequestBody,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
     ModelTranscriptEntry, NativeCompactionErrorKind, PreparedModelRequest,
@@ -391,7 +392,7 @@ fn compaction_body_with_metadata(
         // Native compaction is a text-only sampling request. Supplying no
         // tools avoids Anthropic's documented null compaction-block failure.
         tool_profile: ProviderToolProfile::None,
-        tools: Cow::Borrowed(&[]),
+        tools: Arc::from([]),
         max_tokens: Some(max_tokens),
         reasoning_effort: Some(request.reasoning_effort()),
         capabilities: metadata.capabilities,
@@ -410,7 +411,7 @@ fn compaction_body_with_metadata(
             "instructions": instructions,
         }],
     });
-    Ok(rendered.body)
+    Ok(rendered.body.into_body_without_tools())
 }
 
 fn ensure_compaction_terminal_user_message(body: &mut Value) {
@@ -1228,7 +1229,10 @@ impl ModelProvider for AnthropicProvider {
 #[cfg(test)]
 fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
     let metadata = static_anthropic_model_metadata(&request.model);
-    Ok(prepare_messages_request(request, &metadata)?.body)
+    prepare_messages_request(request, &metadata)?
+        .body
+        .materialize()
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1236,11 +1240,14 @@ fn messages_body_with_metadata(
     request: ModelRequest,
     metadata: &AnthropicModelMetadata,
 ) -> ProviderResult<Value> {
-    Ok(prepare_messages_request(request, metadata)?.body)
+    prepare_messages_request(request, metadata)?
+        .body
+        .materialize()
+        .map_err(Into::into)
 }
 
 struct PreparedAnthropicRequest {
-    body: Value,
+    body: ProviderRequestBody,
     beta_header: String,
     replays_compaction: bool,
 }
@@ -1264,7 +1271,7 @@ fn prepare_messages_request(
         transcript: request.transcript(),
         transcript_suffix: request.transcript_suffix(),
         tool_profile,
-        tools: crate::effective_provider_tools(tool_profile, request.tools()),
+        tools: request.tools_snapshot(),
         max_tokens: Some(max_tokens),
         reasoning_effort: Some(request.reasoning_effort()),
         capabilities: metadata.capabilities,
@@ -1282,7 +1289,10 @@ fn prepare_messages_request(
 #[cfg(test)]
 fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value> {
     let metadata = static_anthropic_model_metadata(&request.model);
-    Ok(prepare_count_tokens_request(request, &metadata)?.body)
+    prepare_count_tokens_request(request, &metadata)?
+        .body
+        .materialize()
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1290,7 +1300,10 @@ fn count_tokens_body_with_metadata(
     request: ProviderTokenCountRequest,
     metadata: &AnthropicModelMetadata,
 ) -> ProviderResult<Value> {
-    Ok(prepare_count_tokens_request(request, metadata)?.body)
+    prepare_count_tokens_request(request, metadata)?
+        .body
+        .materialize()
+        .map_err(Into::into)
 }
 
 fn prepare_count_tokens_request(
@@ -1308,7 +1321,7 @@ fn prepare_count_tokens_request(
         transcript: request.transcript(),
         transcript_suffix: &[],
         tool_profile,
-        tools: crate::effective_provider_tools(tool_profile, request.tools()),
+        tools: request.tools_snapshot(),
         // Anthropic's /messages/count_tokens endpoint accepts the same prompt,
         // message, thinking, and tool-shaping fields as /messages, but rejects
         // generation-only budgets such as max_tokens.
@@ -1328,7 +1341,7 @@ struct AnthropicRequestBodyInput<'a> {
     transcript: &'a [ModelTranscriptEntry],
     transcript_suffix: &'a [ModelTranscriptEntry],
     tool_profile: ProviderToolProfile,
-    tools: Cow<'a, [ProviderTool]>,
+    tools: Arc<[ProviderTool]>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
     capabilities: AnthropicModelCapabilities,
@@ -1337,7 +1350,7 @@ struct AnthropicRequestBodyInput<'a> {
 }
 
 struct RenderedAnthropicRequest {
-    body: Value,
+    body: ProviderRequestBody,
     replays_compaction: bool,
 }
 
@@ -1389,20 +1402,25 @@ fn anthropic_request_body(
     {
         body["system"] = Value::Array(system_blocks);
     }
-    let tools = anthropic_tools(input.tool_profile, &input.tools)?;
-    if !tools.is_empty() {
+    let include_tools = anthropic_tools(input.tool_profile, !input.tools.is_empty())?;
+    if include_tools {
         // Intentionally no tool-level `cache_control` breakpoint. Anthropic
         // hashes the cumulative prefix in `tools -> system -> messages` order,
         // so the breakpoint on the stable system block already covers the
         // tools array via the cumulative hash. Spending one of the 4 allowed
         // breakpoints on the last tool would buy zero additional caching and
         // costs us a slot we use for the deep-history transcript marker.
-        body["tools"] = Value::Array(tools);
+        body["tools"] = Value::Null;
         body["tool_choice"] = json!({ "type": "auto" });
     }
     if input.max_tokens.is_some() {
         body["stream"] = json!(true);
     }
+    let body = if include_tools {
+        ProviderRequestBody::with_tools(body, input.tools)
+    } else {
+        ProviderRequestBody::without_tools(body)
+    };
     Ok(RenderedAnthropicRequest {
         body,
         replays_compaction: rendered.replays_compaction,
@@ -1519,34 +1537,16 @@ fn response_error_message(body: &str) -> String {
         .unwrap_or_else(|| response_excerpt(body))
 }
 
-fn anthropic_tools(
-    profile: ProviderToolProfile,
-    tools: &[ProviderTool],
-) -> ProviderResult<Vec<Value>> {
+fn anthropic_tools(profile: ProviderToolProfile, has_tools: bool) -> ProviderResult<bool> {
     match profile {
-        ProviderToolProfile::None => Ok(Vec::new()),
+        ProviderToolProfile::None => Ok(false),
         ProviderToolProfile::CustomDefinitions | ProviderToolProfile::AnthropicCoding => {
-            Ok(anthropic_provider_tools(tools))
+            Ok(has_tools)
         }
         ProviderToolProfile::OpenAiCoding => Err(ProviderError::Provider(
             "OpenAI coding tools cannot be sent to Claude".to_string(),
         )),
     }
-}
-
-fn anthropic_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
-    let mut tools = tools.iter().collect::<Vec<_>>();
-    tools.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.canonical_name.cmp(&right.canonical_name))
-    });
-    tools
-        .into_iter()
-        .map(|tool| tool.declaration.clone())
-        .collect()
 }
 
 /// 1-hour ephemeral cache control. Use only on prefixes that are stable enough

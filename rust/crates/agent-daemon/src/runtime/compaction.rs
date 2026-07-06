@@ -258,7 +258,7 @@ async fn block_and_spawn_auto_compaction(
         state,
         session_id.to_string(),
         created.job,
-        dispatch.config.clone(),
+        (*dispatch.config).clone(),
     )
     .is_err()
     {
@@ -531,7 +531,7 @@ async fn run_compaction_job(
 
 fn resumed_model_dispatch(
     claimed: agent_store::ClaimedPostCompactionDispatch,
-    config: SessionConfig,
+    config: crate::types::RuntimeConfig,
 ) -> DispatchAction {
     DispatchAction {
         row_id: claimed.pending.row_id,
@@ -583,7 +583,7 @@ async fn install_runtime_compaction_checkpoint(
     state: &AppState,
     session_id: &str,
     job: &CompactionJob,
-) -> std::result::Result<SessionConfig, RpcError> {
+) -> std::result::Result<crate::types::RuntimeConfig, RpcError> {
     let stored = state.repo.load_stored_session(session_id).await?;
     let persisted_active_leaf_id = stored.active_leaf_id.clone();
     let config = state.repo.load_session_config(session_id).await?;
@@ -611,21 +611,21 @@ async fn install_runtime_compaction_checkpoint(
             .restore_compacted_runtime(&active_leaf_id, *turn_id, action_id)
             .map_err(history_error_to_rpc)?;
     }
-    if let Some(active) = state.active.lock().await.get(session_id).cloned() {
+    let config = if let Some(active) = state.active.lock().await.get(session_id).cloned() {
         let mut runtime = active.lock().await;
         runtime.session = session;
-        runtime.config = config.clone();
+        runtime.replace_config(config.clone());
         runtime.persisted_active_leaf_id = persisted_active_leaf_id;
+        runtime.config.clone()
     } else {
+        let runtime = RuntimeSession::new(session, config.clone(), persisted_active_leaf_id);
+        let config = runtime.config.clone();
         state.active.lock().await.insert(
             session_id.to_string(),
-            std::sync::Arc::new(tokio::sync::Mutex::new(RuntimeSession {
-                session,
-                config: config.clone(),
-                persisted_active_leaf_id,
-            })),
+            std::sync::Arc::new(tokio::sync::Mutex::new(runtime)),
         );
-    }
+        config
+    };
     Ok(config)
 }
 
@@ -833,6 +833,7 @@ mod tests {
             metadata: serde_json::json!({}),
         };
         let expected_config = config.clone();
+        let config = crate::types::RuntimeConfig::from(config);
 
         let dispatch = resumed_model_dispatch(claimed, config);
 
@@ -864,6 +865,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&dispatch.config.provider).expect("provider config serializes"),
             serde_json::to_value(&expected_config.provider).expect("provider config serializes")
+        );
+        assert_eq!(
+            dispatch.config.prompt().stable_prefix.as_deref(),
+            Some(expected_config.system_prompt.as_str())
         );
         assert_eq!(dispatch.action, action);
         let SessionAction::RequestModel { model_context, .. } = dispatch.action else {

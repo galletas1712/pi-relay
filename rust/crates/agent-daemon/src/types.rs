@@ -1,3 +1,7 @@
+use std::ops::Deref;
+use std::sync::Arc;
+
+use agent_provider::PromptSections;
 use agent_session::{AgentSession, SessionAction};
 use agent_store::{PostCompactionDispatchLease, SessionConfig};
 use serde::{Deserialize, Serialize};
@@ -10,6 +14,10 @@ pub(crate) struct RpcRequest {
     #[serde(default)]
     pub(crate) params: Value,
 }
+
+#[cfg(test)]
+#[path = "types_tests.rs"]
+mod runtime_session_tests;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct RpcResponse {
@@ -30,8 +38,61 @@ pub(crate) struct RpcErrorBody {
 
 pub(crate) struct RuntimeSession {
     pub(crate) session: AgentSession,
-    pub(crate) config: SessionConfig,
+    pub(crate) config: RuntimeConfig,
     pub(crate) persisted_active_leaf_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeConfig {
+    config: Arc<SessionConfig>,
+    prompt: Arc<PromptSections>,
+}
+
+impl RuntimeConfig {
+    pub(crate) fn prompt(&self) -> &Arc<PromptSections> {
+        &self.prompt
+    }
+
+    #[cfg(test)]
+    pub(crate) fn config_allocation(&self) -> *const SessionConfig {
+        Arc::as_ptr(&self.config)
+    }
+}
+
+impl From<SessionConfig> for RuntimeConfig {
+    fn from(config: SessionConfig) -> Self {
+        let prompt = crate::provider_runtime::prompt_snapshot(&config);
+        Self {
+            config: Arc::new(config),
+            prompt,
+        }
+    }
+}
+
+impl Deref for RuntimeConfig {
+    type Target = SessionConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+impl RuntimeSession {
+    pub(crate) fn new(
+        session: AgentSession,
+        config: SessionConfig,
+        persisted_active_leaf_id: Option<String>,
+    ) -> Self {
+        Self {
+            session,
+            config: config.into(),
+            persisted_active_leaf_id,
+        }
+    }
+
+    pub(crate) fn replace_config(&mut self, config: SessionConfig) {
+        self.config = config.into();
+    }
 }
 
 #[derive(Debug)]
@@ -40,7 +101,7 @@ pub(crate) struct DispatchAction {
     pub(crate) attempt_id: String,
     pub(crate) post_compaction_dispatch_lease: Option<PostCompactionDispatchLease>,
     pub(crate) action: SessionAction,
-    pub(crate) config: SessionConfig,
+    pub(crate) config: RuntimeConfig,
     pub(crate) model_input: ModelDispatchInput,
 }
 
