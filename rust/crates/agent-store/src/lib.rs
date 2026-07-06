@@ -230,7 +230,7 @@ pub struct Project {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventFrame {
     pub event_id: i64,
     pub event: EventType,
@@ -667,7 +667,7 @@ pub enum TranscriptEntryBodyMode {
     Full,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TranscriptEntryRecord {
     pub id: String,
     pub parent_id: Option<String>,

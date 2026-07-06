@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(test)]
+use std::{cell::Cell, future::Future};
 
 use agent_session::{
     ModelContext, ModelContextEntry, StoredSession, StoredTranscriptEntry, TranscriptStorageNode,
@@ -26,6 +28,43 @@ const DEFAULT_TRANSCRIPT_INDEX_LIMIT: i64 = 1000;
 const MAX_TRANSCRIPT_INDEX_LIMIT: i64 = 5000;
 const DEFAULT_TRANSCRIPT_TURN_LIMIT: i64 = 50;
 const MAX_TRANSCRIPT_TURN_LIMIT: i64 = 200;
+// Seven arrays plus the session ID stay far below PostgreSQL's 65,535 bind
+// limit. Cap each statement to bound accumulated transcript JSON payloads.
+const TRANSCRIPT_INSERT_BATCH_CAPACITY: usize = 128;
+
+#[cfg(test)]
+tokio::task_local! {
+    static TRANSCRIPT_INSERT_STATEMENTS: Cell<usize>;
+    static TRANSCRIPT_ENTRY_RECORD_READS: Cell<usize>;
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct TranscriptQueryCounts {
+    pub(super) insert_statements: usize,
+    pub(super) entry_record_reads: usize,
+}
+
+#[cfg(test)]
+pub(super) async fn with_transcript_query_counts<F>(future: F) -> (F::Output, TranscriptQueryCounts)
+where
+    F: Future,
+{
+    TRANSCRIPT_INSERT_STATEMENTS
+        .scope(Cell::new(0), async {
+            TRANSCRIPT_ENTRY_RECORD_READS
+                .scope(Cell::new(0), async {
+                    let output = future.await;
+                    let counts = TranscriptQueryCounts {
+                        insert_statements: TRANSCRIPT_INSERT_STATEMENTS.with(Cell::get),
+                        entry_record_reads: TRANSCRIPT_ENTRY_RECORD_READS.with(Cell::get),
+                    };
+                    (output, counts)
+                })
+                .await
+        })
+        .await
+}
 
 fn provider_replay_select(body_mode: TranscriptEntryBodyMode) -> &'static str {
     match body_mode {
@@ -981,6 +1020,8 @@ pub(crate) async fn transcript_entry_record_tx(
     entry_id: &str,
     body_mode: TranscriptEntryBodyMode,
 ) -> Result<Option<TranscriptEntryRecord>> {
+    #[cfg(test)]
+    let _ = TRANSCRIPT_ENTRY_RECORD_READS.try_with(|count| count.set(count.get() + 1));
     let provider_replay_select = provider_replay_select(body_mode);
     let query = format!(
         r#"
@@ -1141,14 +1182,152 @@ pub(super) async fn insert_entry_tx(
     session_id: &str,
     entry: &TranscriptStorageNode,
 ) -> Result<Option<TranscriptEntryRecord>> {
-    let stored = StoredTranscriptEntry {
-        id: entry.id.clone(),
-        parent_id: entry.parent_id.clone(),
-        timestamp_ms: entry.timestamp_ms,
-        item: entry.item.clone(),
-        provider_replay: entry.provider_replay.clone(),
-    };
-    insert_stored_entry_tx(tx, session_id, &stored).await
+    Ok(
+        insert_entries_tx(tx, session_id, std::slice::from_ref(entry))
+            .await?
+            .pop(),
+    )
+}
+
+pub(super) async fn insert_entries_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    entries: &[TranscriptStorageNode],
+) -> Result<Vec<TranscriptEntryRecord>> {
+    let mut records = Vec::with_capacity(entries.len());
+    for batch in entries.chunks(TRANSCRIPT_INSERT_BATCH_CAPACITY) {
+        let ids = batch
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        let parent_ids = batch
+            .iter()
+            .map(|entry| entry.parent_id.clone())
+            .collect::<Vec<_>>();
+        let timestamp_ms = batch
+            .iter()
+            .map(|entry| entry.timestamp_ms as i64)
+            .collect::<Vec<_>>();
+        let items = batch
+            .iter()
+            .map(|entry| serde_json::to_value(&entry.item))
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        let provider_replay = batch
+            .iter()
+            .map(|entry| serde_json::to_value(&entry.provider_replay))
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        let turn_ids = batch
+            .iter()
+            .map(|entry| entry.item.turn_id().map(|turn_id| turn_id.0 as i64))
+            .collect::<Vec<_>>();
+        let user_messages = batch
+            .iter()
+            .map(|entry| matches!(entry.item, TranscriptItem::UserMessage(_)))
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        let _ = TRANSCRIPT_INSERT_STATEMENTS.try_with(|count| count.set(count.get() + 1));
+        let rows = sqlx::query(
+            r#"
+            with input as materialized (
+                select id, parent_id, timestamp_ms, item, provider_replay, turn_id,
+                    user_message, input_ordinal
+                from unnest(
+                    $2::text[],
+                    $3::text[],
+                    $4::bigint[],
+                    $5::jsonb[],
+                    $6::jsonb[],
+                    $7::bigint[],
+                    $8::boolean[]
+                ) with ordinality as input(
+                    id,
+                    parent_id,
+                    timestamp_ms,
+                    item,
+                    provider_replay,
+                    turn_id,
+                    user_message,
+                    input_ordinal
+                )
+            ),
+            first_input as materialized (
+                select distinct on (id)
+                    id,
+                    timestamp_ms,
+                    user_message,
+                    input_ordinal
+                from input
+                order by id, input_ordinal
+            ),
+            inserted as (
+                insert into transcript_entries (
+                    session_id,
+                    id,
+                    parent_id,
+                    timestamp_ms,
+                    item,
+                    provider_replay,
+                    turn_id
+                )
+                select
+                    $1::text,
+                    id,
+                    parent_id,
+                    timestamp_ms,
+                    item,
+                    provider_replay,
+                    turn_id
+                from input
+                order by input_ordinal
+                on conflict (session_id, id) do nothing
+                returning id, parent_id, timestamp_ms, sequence, item
+            ),
+            updated_session as (
+                update sessions
+                set last_user_message_timestamp_ms = greatest(
+                    coalesce(sessions.last_user_message_timestamp_ms, 0),
+                    inserted_users.timestamp_ms
+                )
+                from (
+                    select max(first_input.timestamp_ms) as timestamp_ms
+                    from inserted
+                    join first_input using (id)
+                    where first_input.user_message
+                ) inserted_users
+                where sessions.id=$1
+                    and inserted_users.timestamp_ms is not null
+                returning sessions.id
+            )
+            select
+                inserted.id,
+                inserted.parent_id,
+                inserted.timestamp_ms,
+                inserted.sequence,
+                inserted.item,
+                '[]'::jsonb as provider_replay,
+                (select count(*) from updated_session) as updated_sessions
+            from inserted
+            join first_input using (id)
+            order by first_input.input_ordinal
+            "#,
+        )
+        .bind(session_id)
+        .bind(ids)
+        .bind(parent_ids)
+        .bind(timestamp_ms)
+        .bind(items)
+        .bind(provider_replay)
+        .bind(turn_ids)
+        .bind(user_messages)
+        .fetch_all(&mut **tx)
+        .await?;
+        records.extend(
+            rows.into_iter()
+                .map(|row| row_to_transcript_entry(&row))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    Ok(records)
 }
 
 pub(super) async fn insert_stored_entry_tx(
@@ -1156,51 +1335,14 @@ pub(super) async fn insert_stored_entry_tx(
     session_id: &str,
     entry: &StoredTranscriptEntry,
 ) -> Result<Option<TranscriptEntryRecord>> {
-    let turn_id = entry.item.turn_id().map(|turn_id| turn_id.0 as i64);
-    let row = sqlx::query(
-        r#"
-        insert into transcript_entries (session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id)
-        values ($1::text, $2::text, $3::text, $4, $5, $6, $7::bigint)
-        on conflict (session_id, id) do nothing
-        returning id, parent_id, timestamp_ms, sequence, item
-        "#,
-    )
-    .bind(session_id)
-    .bind(&entry.id)
-    .bind(&entry.parent_id)
-    .bind(entry.timestamp_ms as i64)
-    .bind(serde_json::to_value(&entry.item)?)
-    .bind(serde_json::to_value(&entry.provider_replay)?)
-    .bind(turn_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if row.is_some() && matches!(entry.item, TranscriptItem::UserMessage(_)) {
-        sqlx::query(
-            r#"
-            update sessions
-            set last_user_message_timestamp_ms = greatest(
-                coalesce(last_user_message_timestamp_ms, 0),
-                $2
-            )
-            where id=$1
-            "#,
-        )
-        .bind(session_id)
-        .bind(entry.timestamp_ms as i64)
-        .execute(&mut **tx)
-        .await?;
-    }
-    row.map(|row| {
-        Ok(TranscriptEntryRecord {
-            id: row.get("id"),
-            parent_id: row.get("parent_id"),
-            timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
-            sequence: row.get("sequence"),
-            item: serde_json::from_value(row.get("item"))?,
-            provider_replay: Vec::new(),
-        })
-    })
-    .transpose()
+    let storage_node = TranscriptStorageNode {
+        id: entry.id.clone(),
+        parent_id: entry.parent_id.clone(),
+        timestamp_ms: entry.timestamp_ms,
+        item: entry.item.clone(),
+        provider_replay: entry.provider_replay.clone(),
+    };
+    insert_entry_tx(tx, session_id, &storage_node).await
 }
 
 pub(super) fn model_context_from_entries(entries: Vec<StoredTranscriptEntry>) -> ModelContext {
@@ -1323,13 +1465,62 @@ mod tests {
     }
 
     fn entry(id: &str, parent_id: Option<&str>, item: TranscriptItem) -> TranscriptStorageNode {
+        entry_at(id, parent_id, 1, item)
+    }
+
+    fn entry_at(
+        id: &str,
+        parent_id: Option<&str>,
+        timestamp_ms: u64,
+        item: TranscriptItem,
+    ) -> TranscriptStorageNode {
         TranscriptStorageNode {
             id: id.to_string(),
             parent_id: parent_id.map(str::to_string),
-            timestamp_ms: 1,
+            timestamp_ms,
             item,
             provider_replay: Vec::new(),
         }
+    }
+
+    fn with_timestamp(
+        mut entry: TranscriptStorageNode,
+        timestamp_ms: u64,
+    ) -> TranscriptStorageNode {
+        entry.timestamp_ms = timestamp_ms;
+        entry
+    }
+
+    fn expected_record(entry: &TranscriptStorageNode, sequence: i64) -> TranscriptEntryRecord {
+        TranscriptEntryRecord {
+            id: entry.id.clone(),
+            parent_id: entry.parent_id.clone(),
+            timestamp_ms: entry.timestamp_ms,
+            sequence,
+            item: entry.item.clone(),
+            provider_replay: entry.provider_replay.clone(),
+        }
+    }
+
+    fn expected_inserted_record(
+        entry: &TranscriptStorageNode,
+        sequence: i64,
+    ) -> TranscriptEntryRecord {
+        TranscriptEntryRecord {
+            provider_replay: Vec::new(),
+            ..expected_record(entry, sequence)
+        }
+    }
+
+    async fn insert_entries(
+        store: &PostgresAgentStore,
+        session_id: &str,
+        entries: &[TranscriptStorageNode],
+    ) -> Result<Vec<TranscriptEntryRecord>> {
+        let mut tx = store.pool.begin().await?;
+        let records = insert_entries_tx(&mut tx, session_id, entries).await?;
+        tx.commit().await?;
+        Ok(records)
     }
 
     fn turn_started(id: &str, parent_id: Option<&str>, turn_id: u64) -> TranscriptStorageNode {
@@ -1444,6 +1635,515 @@ mod tests {
             entry_id: entry.id.clone(),
             item: entry.item.clone(),
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_insert_returns_complete_records_for_single_and_rich_batches() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "bounded-insert-records";
+        create_session(store, session_id).await;
+
+        let first = with_timestamp(user_message("entry_user", None, "héllo 世界"), 10);
+        assert_eq!(
+            insert_entries(store, session_id, std::slice::from_ref(&first))
+                .await
+                .expect("single entry inserts"),
+            vec![expected_inserted_record(&first, 1)]
+        );
+
+        let rich_entries = vec![
+            with_timestamp(turn_started("entry_start", Some("entry_user"), 42), 20),
+            with_timestamp(
+                assistant_message_with_replay("entry_assistant", Some("entry_start"), "replayed"),
+                30,
+            ),
+            with_timestamp(tool_result("entry_tool", Some("entry_assistant")), 40),
+            with_timestamp(
+                compaction_summary("entry_compaction", None, session_id, "entry_tool"),
+                50,
+            ),
+            with_timestamp(
+                assistant_message("entry_branch", Some("entry_start"), "branch"),
+                60,
+            ),
+        ];
+        let expected = rich_entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| expected_inserted_record(entry, index as i64 + 2))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            insert_entries(store, session_id, &rich_entries)
+                .await
+                .expect("rich batch inserts"),
+            expected
+        );
+        assert_eq!(
+            store
+                .transcript_entry_records(session_id, TranscriptEntryBodyMode::Full)
+                .await
+                .expect("complete entries load"),
+            [
+                vec![expected_record(&first, 1)],
+                rich_entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| expected_record(entry, index as i64 + 2))
+                    .collect(),
+            ]
+            .concat()
+        );
+        let stored_turn_ids = sqlx::query_as::<_, (String, Option<i64>)>(
+            "select id, turn_id from transcript_entries where session_id=$1 order by sequence",
+        )
+        .bind(session_id)
+        .fetch_all(&store.pool)
+        .await
+        .expect("turn ids load");
+        assert_eq!(
+            stored_turn_ids,
+            vec![
+                ("entry_user".to_string(), None),
+                ("entry_start".to_string(), Some(42)),
+                ("entry_assistant".to_string(), None),
+                ("entry_tool".to_string(), None),
+                ("entry_compaction".to_string(), Some(0)),
+                ("entry_branch".to_string(), None),
+            ]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn output_persistence_keeps_conflict_fallback_entry_lookup() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "bounded-output-conflict-fallback";
+        create_session(store, session_id).await;
+
+        let original = with_timestamp(user_message("entry_user", None, "original"), 10);
+        insert_entries(store, session_id, std::slice::from_ref(&original))
+            .await
+            .expect("original inserts");
+        let conflicting = with_timestamp(user_message("entry_user", None, "replacement"), 99);
+        let events = vec![appended_event(&conflicting)];
+        let (result, counts) = with_transcript_query_counts(store.persist_outputs(
+            session_id,
+            OutputBatch::new(
+                std::slice::from_ref(&conflicting),
+                Some("entry_user"),
+                &events,
+                &[],
+            ),
+        ))
+        .await;
+        let (frames, _) = result.expect("conflicting output remains idempotent");
+
+        assert_eq!(
+            counts,
+            TranscriptQueryCounts {
+                insert_statements: 1,
+                entry_record_reads: 1,
+            }
+        );
+        assert_eq!(
+            frames[0].data["entry"],
+            json!({
+                "id": "entry_user",
+                "parent_id": null,
+                "timestamp_ms": 10,
+                "sequence": 1,
+                "item": {
+                    "type": "user_message",
+                    "content": [{
+                        "type": "text",
+                        "text": "original",
+                    }],
+                },
+            })
+        );
+        assert_eq!(
+            store
+                .transcript_entry_records(session_id, TranscriptEntryBodyMode::Full)
+                .await
+                .expect("entry loads"),
+            vec![expected_record(&original, 1)]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn output_persistence_batches_transcript_rows_without_requerying_returned_entries() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "bounded-output-events";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            with_timestamp(turn_started("entry_start", None, 7), 10),
+            with_timestamp(user_message("entry_user", Some("entry_start"), "hello"), 20),
+            with_timestamp(
+                assistant_message("entry_assistant", Some("entry_user"), "done"),
+                30,
+            ),
+            with_timestamp(
+                turn_finished("entry_finish", Some("entry_assistant"), 7),
+                40,
+            ),
+        ];
+        let events = vec![appended_event(&entries[1])];
+        let (result, counts) = with_transcript_query_counts(store.persist_outputs(
+            session_id,
+            OutputBatch::new(&entries, Some("entry_finish"), &events, &[]),
+        ))
+        .await;
+        let (frames, actions) = result.expect("outputs persist");
+
+        assert!(actions.is_empty());
+        assert_eq!(
+            counts,
+            TranscriptQueryCounts {
+                insert_statements: 1,
+                entry_record_reads: 0,
+            }
+        );
+        let user_record = expected_inserted_record(&entries[1], 2);
+        assert_eq!(
+            frames,
+            vec![EventFrame {
+                event_id: 2,
+                event: EventType::TranscriptAppended,
+                session_id: session_id.to_string(),
+                data: json!({
+                    "entry_id": "entry_user",
+                    "item": entries[1].item,
+                    "entry": user_record,
+                    "tree_node": tree_node_from_entry(&user_record),
+                    "active_leaf_id": "entry_finish",
+                    "session_revision": 1,
+                    "queue_revision": 0,
+                    "transcript_revision": 1,
+                }),
+            }]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_insert_mixed_conflicts_returns_only_new_records_in_input_order() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "bounded-insert-conflicts";
+        create_session(store, session_id).await;
+
+        let original = with_timestamp(user_message("entry_existing", None, "original"), 10);
+        assert_eq!(
+            insert_entries(store, session_id, std::slice::from_ref(&original))
+                .await
+                .expect("original inserts"),
+            vec![expected_inserted_record(&original, 1)]
+        );
+
+        let duplicate = with_timestamp(
+            user_message("entry_existing", Some("wrong-parent"), "replacement"),
+            999,
+        );
+        let new_a = assistant_message("entry_new_a", Some("entry_existing"), "a");
+        let new_b = tool_result("entry_new_b", Some("entry_new_a"));
+        let batch = vec![duplicate.clone(), new_a.clone(), duplicate, new_b.clone()];
+        assert_eq!(
+            insert_entries(store, session_id, &batch)
+                .await
+                .expect("mixed batch inserts"),
+            vec![
+                expected_inserted_record(&new_a, 3),
+                expected_inserted_record(&new_b, 5),
+            ]
+        );
+        assert_eq!(
+            store
+                .transcript_entry_records(session_id, TranscriptEntryBodyMode::Full)
+                .await
+                .expect("entries load"),
+            vec![
+                expected_record(&original, 1),
+                expected_record(&new_a, 3),
+                expected_record(&new_b, 5),
+            ]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_insert_updates_last_user_timestamp_only_for_new_user_entries() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "bounded-insert-user-timestamp";
+        create_session(store, session_id).await;
+
+        insert_entries(
+            store,
+            session_id,
+            &[with_timestamp(
+                assistant_message("entry_non_user_first", None, "not a user"),
+                900,
+            )],
+        )
+        .await
+        .expect("non-user inserts");
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<i64>>(
+                "select last_user_message_timestamp_ms from sessions where id=$1",
+            )
+            .bind(session_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("initial timestamp loads"),
+            None
+        );
+
+        let duplicate_user = with_timestamp(
+            user_message(
+                "entry_duplicate_user",
+                Some("entry_non_user_first"),
+                "original",
+            ),
+            50,
+        );
+        insert_entries(store, session_id, std::slice::from_ref(&duplicate_user))
+            .await
+            .expect("duplicate seed inserts");
+        sqlx::query("update sessions set last_user_message_timestamp_ms=250 where id=$1")
+            .bind(session_id)
+            .execute(&store.pool)
+            .await
+            .expect("prior timestamp sets");
+
+        let batch = vec![
+            with_timestamp(
+                user_message("entry_user_300", Some("entry_duplicate_user"), "300"),
+                300,
+            ),
+            with_timestamp(
+                assistant_message("entry_non_user", Some("entry_user_300"), "not a user"),
+                900,
+            ),
+            with_timestamp(
+                user_message("entry_user_100", Some("entry_non_user"), "100"),
+                100,
+            ),
+            with_timestamp(
+                user_message("entry_duplicate_user", None, "conflict"),
+                1_000,
+            ),
+            with_timestamp(
+                user_message("entry_user_400", Some("entry_user_100"), "400"),
+                400,
+            ),
+        ];
+        insert_entries(store, session_id, &batch)
+            .await
+            .expect("timestamp batch inserts");
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<i64>>(
+                "select last_user_message_timestamp_ms from sessions where id=$1",
+            )
+            .bind(session_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("timestamp loads"),
+            Some(400)
+        );
+
+        sqlx::query("update sessions set last_user_message_timestamp_ms=700 where id=$1")
+            .bind(session_id)
+            .execute(&store.pool)
+            .await
+            .expect("greater prior timestamp sets");
+        insert_entries(
+            store,
+            session_id,
+            &[with_timestamp(
+                user_message("entry_user_600", Some("entry_user_400"), "600"),
+                600,
+            )],
+        )
+        .await
+        .expect("lower user timestamp inserts");
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<i64>>(
+                "select last_user_message_timestamp_ms from sessions where id=$1",
+            )
+            .bind(session_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("timestamp reloads"),
+            Some(700)
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_insert_statement_count_follows_batch_capacity() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let cases = [
+            (0, 0),
+            (1, 1),
+            (TRANSCRIPT_INSERT_BATCH_CAPACITY, 1),
+            (TRANSCRIPT_INSERT_BATCH_CAPACITY + 1, 2),
+            (TRANSCRIPT_INSERT_BATCH_CAPACITY * 2 + 1, 3),
+        ];
+
+        for (case_index, (entry_count, expected_statements)) in cases.into_iter().enumerate() {
+            let session_id = format!("bounded-insert-statements-{case_index}");
+            create_session(store, &session_id).await;
+            let entries = (0..entry_count)
+                .map(|index| TranscriptStorageNode {
+                    id: format!("entry_{case_index}_{index}"),
+                    parent_id: (index > 0).then(|| format!("entry_{case_index}_{}", index - 1)),
+                    timestamp_ms: index as u64,
+                    item: TranscriptItem::AssistantMessage(AssistantMessage {
+                        items: vec![AssistantItem::Text(index.to_string())],
+                    }),
+                    provider_replay: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let (result, counts) =
+                with_transcript_query_counts(insert_entries(store, &session_id, &entries)).await;
+            assert_eq!(result.expect("boundary batch inserts").len(), entry_count);
+            assert_eq!(
+                counts,
+                TranscriptQueryCounts {
+                    insert_statements: expected_statements,
+                    entry_record_reads: 0,
+                }
+            );
+        }
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_insert_is_concurrently_idempotent() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "bounded-insert-concurrent";
+        create_session(store, session_id).await;
+        let entries = vec![
+            assistant_message("entry_a", None, "a"),
+            assistant_message("entry_b", Some("entry_a"), "b"),
+            assistant_message("entry_c", Some("entry_b"), "c"),
+        ];
+
+        let pool_a = store.pool.clone();
+        let pool_b = store.pool.clone();
+        let entries_a = entries.clone();
+        let entries_b = entries.clone();
+        let insert_a = async move {
+            let mut tx = pool_a.begin().await?;
+            let records = insert_entries_tx(&mut tx, session_id, &entries_a).await?;
+            tx.commit().await?;
+            Result::<Vec<TranscriptEntryRecord>>::Ok(records)
+        };
+        let insert_b = async move {
+            let mut tx = pool_b.begin().await?;
+            let records = insert_entries_tx(&mut tx, session_id, &entries_b).await?;
+            tx.commit().await?;
+            Result::<Vec<TranscriptEntryRecord>>::Ok(records)
+        };
+        let (records_a, records_b) = tokio::join!(insert_a, insert_b);
+        let records_a = records_a.expect("first concurrent insert succeeds");
+        let records_b = records_b.expect("second concurrent insert succeeds");
+        assert_eq!(records_a.len() + records_b.len(), entries.len());
+        assert!(records_a.is_empty() || records_b.is_empty());
+        assert_eq!(
+            store
+                .transcript_entry_records(session_id, TranscriptEntryBodyMode::Full)
+                .await
+                .expect("concurrent entries load")
+                .into_iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            vec![
+                "entry_a".to_string(),
+                "entry_b".to_string(),
+                "entry_c".to_string(),
+            ]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_insert_error_rolls_back_prior_batches() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "bounded-insert-rollback";
+        create_session(store, session_id).await;
+        let mut entries = (0..TRANSCRIPT_INSERT_BATCH_CAPACITY)
+            .map(|index| assistant_message(&format!("entry_{index}"), None, "ok"))
+            .collect::<Vec<_>>();
+        entries.push(assistant_message("entry_bad\0", None, "bad"));
+
+        let mut tx = store.pool.begin().await.expect("transaction starts");
+        let error = insert_entries_tx(&mut tx, session_id, &entries)
+            .await
+            .expect_err("NUL id must fail");
+        assert!(!error.to_string().is_empty());
+        tx.rollback().await.expect("failed insert rolls back");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from transcript_entries where session_id=$1",
+            )
+            .bind(session_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("entry count loads"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<i64>>(
+                "select last_user_message_timestamp_ms from sessions where id=$1",
+            )
+            .bind(session_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("timestamp loads"),
+            None
+        );
+
+        db.cleanup().await;
     }
 
     #[tokio::test]

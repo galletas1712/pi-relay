@@ -18,7 +18,7 @@ use super::events::{insert_event_tx, insert_session_event_tx};
 use super::queue::{bump_revisions_tx, queue_event_payload, queue_state_tx};
 use super::rows::row_text;
 use super::sql::{action_is_unfinished, lock_session_tx, QUEUED_INPUT_DISPATCH_ORDER};
-use super::transcript::{insert_entry_tx, session_state_for_event_tx};
+use super::transcript::{insert_entries_tx, session_state_for_event_tx};
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
@@ -94,15 +94,12 @@ pub(super) async fn persist_outputs_tx(
         }
     }
 
-    let mut entry_records_by_id = HashMap::new();
-    for entry in entries {
-        if let Some(record) = insert_entry_tx(tx, session_id, entry)
-            .await
-            .with_context(|| format!("insert transcript entry {}", entry.id))?
-        {
-            entry_records_by_id.insert(record.id.clone(), record);
-        }
-    }
+    let entry_records_by_id = insert_entries_tx(tx, session_id, entries)
+        .await
+        .context("insert transcript entries")?
+        .into_iter()
+        .map(|record| (record.id.clone(), record))
+        .collect::<HashMap<_, _>>();
     sqlx::query("update sessions set active_leaf_id=$2::text, updated_at=now() where id=$1")
         .bind(session_id)
         .bind(active_leaf_id)
