@@ -12,7 +12,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::future::Future;
 
-use crate::auth::Credentials;
 use crate::delegation_context::compaction_delegation_ledger;
 use crate::state::AppState;
 
@@ -258,7 +257,7 @@ async fn run_native_compaction(
         model_context,
         |transcript| async move {
             let request = native_compaction_request(state, config, session_id, transcript).await?;
-            let credentials = Credentials::load();
+            let credentials = state.credentials.snapshot();
             let provider = provider_for_config(state, config, &credentials, session_id).await?;
             compact_with_auth_retry(state, config, session_id, provider, request)
                 .await

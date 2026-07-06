@@ -76,6 +76,7 @@ const CODEX_MODELS_MAX_EFFORTS: usize = 16;
 const CODEX_MODELS_MAX_EFFORT_BYTES: usize = 64;
 const CODEX_MODELS_SUCCESS_TTL: Duration = Duration::from_secs(5 * 60);
 const CODEX_MODELS_FAILURE_TTL: Duration = Duration::from_secs(30);
+static NEXT_CREDENTIAL_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
@@ -83,6 +84,7 @@ pub struct OpenAiProvider {
     session_state: Option<Arc<OpenAiCodexSessionState>>,
     access_token: String,
     account_id: Option<String>,
+    credential_generation: u64,
     /// Persistent Codex installation identifier (UUID), read from
     /// `~/.codex/installation_id` by the daemon and passed through as the
     /// `x-codex-installation-id` header on every request. Optional because
@@ -196,7 +198,7 @@ struct OpenAiCatalogKey {
 #[derive(Clone, PartialEq, Eq)]
 enum OpenAiCatalogIdentity {
     Account(String),
-    TokenFingerprint([u8; 32]),
+    CredentialGeneration(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1433,7 +1435,7 @@ mod catalog_tests {
     }
 
     #[test]
-    fn catalog_identity_uses_account_or_noncredential_token_fingerprint() {
+    fn catalog_identity_uses_account_or_nonsecret_credential_generation() {
         let cache = OpenAiModelCatalogCache::default();
         let account_a = test_provider(
             "https://example.invalid".to_string(),
@@ -1452,21 +1454,28 @@ mod catalog_tests {
             "a refreshed token for the same account reuses the catalog"
         );
 
-        let anonymous_a = test_provider(
+        let mut anonymous_a = test_provider(
             "https://example.invalid".to_string(),
             None,
             "token-a",
             cache.clone(),
         );
-        let anonymous_b = test_provider(
+        let mut anonymous_b = test_provider(
             "https://example.invalid".to_string(),
             None,
-            "token-b",
+            "token-a",
             cache,
         );
+        anonymous_a.set_credential_generation(1);
+        anonymous_b.set_credential_generation(1);
+        assert!(
+            anonymous_a.catalog_key() == anonymous_b.catalog_key(),
+            "unrelated provider mutations leave anonymous catalog identity stable"
+        );
+        anonymous_b.set_credential_generation(2);
         assert!(
             anonymous_a.catalog_key() != anonymous_b.catalog_key(),
-            "accounts without an id are isolated by token fingerprint"
+            "accounts without an id are isolated by credential generation"
         );
         assert!(
             !format!("{:?}", anonymous_a.model_catalog_cache).contains("token-a"),
@@ -2274,6 +2283,7 @@ impl OpenAiProvider {
             session_state: None,
             access_token: access_token.into(),
             account_id,
+            credential_generation: NEXT_CREDENTIAL_GENERATION.fetch_add(1, Ordering::Relaxed),
             installation_id,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             model_catalog_cache,
@@ -2313,6 +2323,7 @@ impl OpenAiProvider {
             session_state: Some(session_state),
             access_token: access_token.into(),
             account_id,
+            credential_generation: NEXT_CREDENTIAL_GENERATION.fetch_add(1, Ordering::Relaxed),
             installation_id,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             model_catalog_cache,
@@ -2325,6 +2336,10 @@ impl OpenAiProvider {
     #[cfg(feature = "test-utils")]
     pub fn set_base_url_for_test(&mut self, base_url: String) {
         self.base_url = base_url;
+    }
+
+    pub fn set_credential_generation(&mut self, credential_generation: u64) {
+        self.credential_generation = credential_generation;
     }
 
     #[cfg(feature = "test-utils")]
@@ -2355,12 +2370,7 @@ impl OpenAiProvider {
     fn catalog_key(&self) -> OpenAiCatalogKey {
         let identity = match self.account_id.as_ref() {
             Some(account_id) => OpenAiCatalogIdentity::Account(account_id.clone()),
-            None => {
-                let mut hasher = Sha256::new();
-                hasher.update(b"pi-relay codex model catalog identity\0");
-                hasher.update(self.access_token.as_bytes());
-                OpenAiCatalogIdentity::TokenFingerprint(hasher.finalize().into())
-            }
+            None => OpenAiCatalogIdentity::CredentialGeneration(self.credential_generation),
         };
         OpenAiCatalogKey {
             base_url: self.base_url.trim_end_matches('/').to_string(),
@@ -4317,6 +4327,7 @@ mod tests {
             session_state: Some(session_state),
             access_token: "token".to_string(),
             account_id: Some("account-1".to_string()),
+            credential_generation: 0,
             installation_id: None,
             base_url,
             model_catalog_cache: model_catalog_cache.clone(),

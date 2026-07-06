@@ -6,7 +6,6 @@ use agent_store::SessionConfig;
 use agent_vocab::TurnId;
 use anyhow::Result;
 
-use crate::auth::Credentials;
 use crate::state::AppState;
 use crate::types::RuntimeConfig;
 
@@ -34,7 +33,7 @@ pub(crate) async fn run_model(
         return result;
     }
     if call.provider.is_none() {
-        let credentials = Credentials::load();
+        let credentials = state.credentials.snapshot();
         call.provider = Some(provider_for_config(state, config, &credentials, session_id).await?);
     }
     let provider = call
@@ -198,7 +197,7 @@ pub(super) async fn complete_model_request(
     session_id: &str,
     request: ModelRequest,
 ) -> Result<ModelResponse> {
-    let credentials = Credentials::load();
+    let credentials = state.credentials.snapshot();
     let mut provider = provider_for_config(state, config, &credentials, session_id).await?;
     let mut prepared = PreparedModelRequestState::default();
     Ok(complete_with_auth_retry(

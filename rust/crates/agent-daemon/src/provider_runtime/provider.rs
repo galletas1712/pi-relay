@@ -2,7 +2,7 @@ use agent_provider::{ModelProvider, ProviderModelMetadata};
 use agent_store::SessionConfig;
 use anyhow::Result;
 
-use crate::auth::Credentials;
+use crate::auth::CredentialSnapshot;
 use crate::state::AppState;
 
 use super::auth_retry::model_metadata_with_auth_retry;
@@ -11,12 +11,13 @@ pub(super) struct ProviderHandle {
     pub(super) provider: Box<dyn ModelProvider>,
     pub(super) uses_codex_auth: bool,
     pub(super) codex_account_id: Option<String>,
+    pub(super) credentials: CredentialSnapshot,
 }
 
 pub(super) async fn provider_for_config(
     state: &AppState,
     config: &SessionConfig,
-    credentials: &Credentials,
+    credentials: &CredentialSnapshot,
     session_id: &str,
 ) -> Result<ProviderHandle> {
     state
@@ -30,7 +31,7 @@ pub(crate) async fn model_metadata_for_config(
     config: &SessionConfig,
     session_id: &str,
 ) -> Result<Option<ProviderModelMetadata>> {
-    let credentials = Credentials::load();
+    let credentials = state.credentials.snapshot();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
     Ok(model_metadata_with_auth_retry(
         state,

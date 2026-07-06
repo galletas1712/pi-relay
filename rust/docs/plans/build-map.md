@@ -624,8 +624,8 @@ The "dev harness" is NOT a fake provider — it's a per-session flag + two RPCs.
 `session_uses_harness(&config)` and if true returns WITHOUT a provider call, leaving the action `pending`. The test
 client then calls `harness.model.complete` (synthetic assistant message) or `harness.model.fail`. NO testcontainers — a
 real Postgres DB is created per test from `PI_RELAY_TEST_DATABASE_URL`. **For the real-model e2e: NO connections table,
-NO auth/login RPC. `Credentials::load()` is called FRESH per request from the daemon PROCESS env + filesystem** (verified
-auth.rs:21-35). A fresh empty DB needs NOTHING seeded for auth.
+NO auth/login RPC. Credentials are loaded once at daemon startup from the process env + filesystem and published as an
+immutable process-local snapshot.** A fresh empty DB needs NOTHING seeded for auth.
 
 ### key_locations
 | path | symbol | lines | role |
@@ -635,11 +635,11 @@ auth.rs:21-35). A fresh empty DB needs NOTHING seeded for auth.
 | rust/crates/agent-daemon/src/main.rs | harness_model_complete / harness_model_fail | 1662-1760 | The two harness RPC handlers. complete: session_id, action_row_id, assistant. |
 | rust/crates/agent-daemon/src/types.rs | RpcMethod::HarnessModelComplete / Fail | 78-79, 117-118 | "harness.model.complete" / "harness.model.fail". |
 | rust/crates/agent-store/src/postgres/actions.rs | load_harness_model_action / claim_pending_model_action | 69-88, 267 | Store fns the harness RPCs use. |
-| rust/crates/agent-daemon/src/auth.rs | Credentials::load | 21-35 | THE credential source. No DB, no RPC. (Verified.) |
+| rust/crates/agent-daemon/src/auth.rs | CredentialManager / Credentials::load | credential source | Startup snapshot plus explicit provider-auth recovery. No DB, no RPC. |
 | rust/crates/agent-daemon/src/auth.rs | read_claude_code_config_api_key_from_home / read_codex_auth | 58-125 | Anthropic key must start sk-ant-; checks ~/.claude/config.json then ~/.claude.json. Codex token at ~/.codex/auth.json /tokens/access_token. (Verified.) |
 | rust/crates/agent-daemon/src/auth.rs | refresh_codex_credentials | 141-189 | On Codex 401, refresh via OAuth refresh_token, rewrite auth.json. |
 | rust/crates/agent-daemon/src/provider_runtime/connections.rs | ProviderConnectionRegistry / provider_for_config | 41-157 | In-memory per-session cache (HashMap), NOT a DB connections table. OpenAi needs codex_access_token; Anthropic needs anthropic_api_key. |
-| rust/crates/agent-daemon/src/provider_runtime/requests.rs | complete_model_request | 65-74 | Real dispatch: Credentials::load() then provider_for_config then complete_with_auth_retry (creds re-read every time). |
+| rust/crates/agent-daemon/src/provider_runtime/requests.rs | complete_model_request | provider dispatch | Real dispatch clones the current credential snapshot, constructs a per-call provider handle, then runs one bounded auth retry. |
 | rust/crates/agent-daemon/src/config.rs | Config::from_env_and_args | 11-46 | --database-url (or DATABASE_URL, required), --bind (or PI_AGENTD_BIND, default 127.0.0.1:8787). NO API-key flag. |
 | rust/crates/agent-daemon/src/main.rs | main | 55-82 | Boot: Config → connect → migrate → ProviderConnectionRegistry::new → TcpListener::bind. WebSocket RPC server. |
 | rust/crates/agent-provider/src/openai.rs | OpenAiModelCatalogCache / ModelProvider::model_metadata | provider adapter | Authenticated account-scoped private Codex catalog; exact model/effort validation and OpenAI threshold policy. |
@@ -675,7 +675,7 @@ at /home/schwinns/pi-relay-wf/rust). Postgres tests SKIP (not fail) when env uns
 ### gotchas
 - Harness is a metadata flag + two RPCs, NOT a mock provider type. No FakeProvider struct exists.
 - No CLI/env to flip the whole daemon into harness mode — strictly per-session metadata.
-- Credentials::load() runs FRESH on EVERY model request — process env + HOME only. No DB connections table.
+- Credentials load once at startup; routine provider resolution clones the process-local snapshot. Explicit auth recovery is the only cold reload/refresh path.
 - ProviderConnectionRegistry is an in-memory cache, NOT the "connections table".
 - Anthropic key rejected unless it starts sk-ant- (silently dropped otherwise → "ANTHROPIC_API_KEY not found").
 - Postgres tests require PI_RELAY_TEST_DATABASE_URL pointing at a role that can CREATE/DROP DATABASE; tests SILENTLY SKIP
@@ -821,10 +821,11 @@ feed desiredSessionIds (App.tsx:1062-1064).
 
 # 4. Provider credentials for the fresh-DB real-model e2e (riskiest unknown — RESOLVED)
 
-**There is nothing to seed in the database for auth.** Verified directly against `auth.rs:21-35`: `Credentials::load()`
-runs FRESH on every model request and reads creds ENTIRELY from the daemon PROCESS's environment + HOME filesystem. There
-is NO connections table, NO auth/login RPC, NO `--api-key` CLI flag (config.rs:11-46 has only `--database-url`/`--bind`).
-`ProviderConnectionRegistry` (connections.rs) is an in-memory cache, not a DB table.
+**There is nothing to seed in the database for auth.** `CredentialManager` loads credentials from the daemon process's
+environment + HOME filesystem once at startup. Routine requests use its immutable process-local snapshot; Codex 401
+refresh and Anthropic 401/403 external-rotation reload are explicit cold paths. There is NO connections table, NO
+auth/login RPC, NO `--api-key` CLI flag (config.rs has only `--database-url`/`--bind`).
+`ProviderConnectionRegistry` (connections.rs) is an in-memory transport/session/model-cache registry, not a DB table.
 
 **To let a brand-new daemon (fresh empty DB) make real GPT + Claude calls:**
 1. **Launch:** `pi-agentd --database-url postgres://.../<fresh_db> [--bind 127.0.0.1:<port>]`. `store.migrate()` fully

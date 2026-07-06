@@ -7,9 +7,10 @@ use agent_provider::{
 };
 use agent_store::SessionConfig;
 
-use crate::auth::refresh_codex_credentials;
+use crate::auth::{CredentialManager, CredentialSnapshot};
 use crate::state::AppState;
 
+use super::connections::ProviderConnectionRegistry;
 use super::provider::{provider_for_config, ProviderHandle};
 
 #[derive(Default)]
@@ -17,11 +18,11 @@ pub(super) struct PreparedModelRequestState {
     request: Option<PreparedModelRequest>,
 }
 
-/// Run a provider call, and on a Codex 401 refresh credentials once and retry
-/// against a freshly built provider. `call` is invoked at most twice, so the
-/// request must be cloneable and the closure must be re-runnable.
-async fn with_codex_auth_retry<Req, Resp, F, Fut>(
-    state: &AppState,
+/// Run a provider call, and on an authentication failure perform at most one
+/// provider-specific cold credential recovery before retrying.
+async fn with_auth_retry<Req, Resp, F, Fut>(
+    credentials: &CredentialManager,
+    connections: &ProviderConnectionRegistry,
     config: &SessionConfig,
     session_id: &str,
     provider: ProviderHandle,
@@ -34,19 +35,52 @@ where
     Fut: Future<Output = std::result::Result<Resp, ProviderError>>,
 {
     let uses_codex_auth = provider.uses_codex_auth;
+    let observed_credentials = provider.credentials.clone();
     let (first_attempt, auth_retry) = auth_attempt_requests(request);
     match call(provider, first_attempt).await {
         Ok(response) => Ok(response),
-        Err(error) if uses_codex_auth && error.status_code() == Some(401) => {
-            let credentials = refresh_codex_credentials()
-                .await
-                .map_err(|error| ProviderError::Provider(error.to_string()))?;
-            let provider = provider_for_config(state, config, &credentials, session_id)
-                .await
-                .map_err(|error| ProviderError::Provider(error.to_string()))?;
-            call(provider, auth_retry).await
+        Err(error) if is_recoverable_auth_error(uses_codex_auth, &error) => {
+            let credentials =
+                recover_credentials(credentials, uses_codex_auth, &observed_credentials).await?;
+            match credentials {
+                Some(credentials) => {
+                    let provider = connections
+                        .provider_for_config(config.provider.kind, &credentials, session_id)
+                        .await
+                        .map_err(|error| ProviderError::Provider(error.to_string()))?;
+                    call(provider, auth_retry).await
+                }
+                None => Err(error),
+            }
         }
         Err(error) => Err(error),
+    }
+}
+
+async fn recover_credentials(
+    credentials: &CredentialManager,
+    uses_codex_auth: bool,
+    observed: &CredentialSnapshot,
+) -> std::result::Result<Option<CredentialSnapshot>, ProviderError> {
+    if uses_codex_auth {
+        credentials
+            .refresh_codex(observed)
+            .await
+            .map(Some)
+            .map_err(|error| ProviderError::Provider(error.to_string()))
+    } else {
+        credentials
+            .reload_anthropic(observed)
+            .await
+            .map_err(|error| ProviderError::Provider(error.to_string()))
+    }
+}
+
+fn is_recoverable_auth_error(uses_codex_auth: bool, error: &ProviderError) -> bool {
+    match error.status_code() {
+        Some(401) => true,
+        Some(403) => !uses_codex_auth,
+        _ => false,
     }
 }
 
@@ -77,8 +111,9 @@ pub(super) async fn model_metadata_with_auth_retry(
     provider: ProviderHandle,
     model: String,
 ) -> std::result::Result<Option<ProviderModelMetadata>, ProviderError> {
-    with_codex_auth_retry(
-        state,
+    with_auth_retry(
+        &state.credentials,
+        &state.provider_connections,
         config,
         session_id,
         provider,
@@ -99,8 +134,9 @@ pub(super) async fn count_tokens_with_auth_retry(
     provider: ProviderHandle,
     request: ProviderTokenCountRequest,
 ) -> std::result::Result<ProviderTokenCountResponse, ProviderError> {
-    with_codex_auth_retry(
-        state,
+    with_auth_retry(
+        &state.credentials,
+        &state.provider_connections,
         config,
         session_id,
         provider,
@@ -120,6 +156,7 @@ pub(super) async fn complete_with_auth_retry(
 ) -> std::result::Result<ModelResponse, ProviderError> {
     let uses_codex_auth = provider.uses_codex_auth;
     let account_id = provider.codex_account_id.clone();
+    let observed_credentials = provider.credentials.clone();
     let first_attempt = async {
         ensure_compatible_prepared_request(provider, &request, prepared).await?;
         complete_with_provider(provider, request.clone(), prepared.request.as_ref()).await
@@ -127,21 +164,29 @@ pub(super) async fn complete_with_auth_retry(
     .await;
     match first_attempt {
         Ok(response) => Ok(response),
-        Err(error) if uses_codex_auth && error.status_code() == Some(401) => {
-            let credentials = refresh_codex_credentials()
-                .await
-                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        Err(error) if is_recoverable_auth_error(uses_codex_auth, &error) => {
+            let credentials =
+                recover_credentials(&state.credentials, uses_codex_auth, &observed_credentials)
+                    .await?;
+            let Some(credentials) = credentials else {
+                return Err(error);
+            };
             let refreshed_provider = provider_for_config(state, config, &credentials, session_id)
                 .await
                 .map_err(|error| ProviderError::Provider(error.to_string()))?;
-            install_refreshed_provider(
-                provider,
-                refreshed_provider,
-                account_id.as_deref(),
-                &request,
-                prepared,
-            )
-            .await?;
+            if uses_codex_auth {
+                install_refreshed_provider(
+                    provider,
+                    refreshed_provider,
+                    account_id.as_deref(),
+                    &request,
+                    prepared,
+                )
+                .await?;
+            } else {
+                *provider = refreshed_provider;
+                ensure_compatible_prepared_request(provider, &request, prepared).await?;
+            }
             complete_with_provider(provider, request, prepared.request.as_ref()).await
         }
         Err(error) => Err(error),
@@ -183,8 +228,9 @@ pub(super) async fn compact_with_auth_retry(
     provider: ProviderHandle,
     request: ProviderCompactionRequest,
 ) -> std::result::Result<ProviderCompactionResponse, ProviderError> {
-    with_codex_auth_retry(
-        state,
+    with_auth_retry(
+        &state.credentials,
+        &state.provider_connections,
         config,
         session_id,
         provider,

@@ -9,7 +9,10 @@ use serde_json::{json, Value};
 use std::{
     borrow::Borrow,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{watch, Mutex};
@@ -44,6 +47,7 @@ const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
 const MODEL_CACHE_CAPACITY: usize = 64;
 const MODEL_CACHE_SUCCESS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const MODEL_CACHE_FAILURE_TTL: Duration = Duration::from_secs(60);
+static NEXT_CREDENTIAL_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 // Anthropic's documented per-breakpoint backward lookback when matching a new
 // request against existing cache entries. We use this to decide when the tail
@@ -55,14 +59,25 @@ const MODEL_CACHE_FAILURE_TTL: Duration = Duration::from_secs(60);
 // See: https://docs.claude.com/en/docs/build-with-claude/prompt-caching
 const TRANSCRIPT_LOOKBACK_BLOCKS: usize = 18;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    credential_generation: u64,
     model_cache: AnthropicModelCache,
     #[cfg(test)]
     preparation_stats: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Debug for AnthropicProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnthropicProvider")
+            .field("api_key", &"[REDACTED]")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
@@ -514,9 +529,16 @@ pub struct AnthropicModelCache {
 
 #[derive(Debug, Default)]
 struct AnthropicModelCacheState {
-    entries: HashMap<String, CachedAnthropicModel>,
+    entries: HashMap<AnthropicModelCacheKey, CachedAnthropicModel>,
     next_generation: u64,
     access_counter: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AnthropicModelCacheKey {
+    base_url: String,
+    credential_generation: u64,
+    model: String,
 }
 
 #[derive(Debug, Clone)]
@@ -550,12 +572,12 @@ enum ModelCacheDecision {
 }
 
 impl AnthropicModelCache {
-    async fn decision(&self, model: &str, now: Instant) -> ModelCacheDecision {
+    async fn decision(&self, key: &AnthropicModelCacheKey, now: Instant) -> ModelCacheDecision {
         let mut state = self.state.lock().await;
         state.access_counter = state.access_counter.saturating_add(1);
         let last_access = state.access_counter;
 
-        if let Some(cached) = state.entries.get_mut(model) {
+        if let Some(cached) = state.entries.get_mut(key) {
             cached.last_access = last_access;
             if cached
                 .model
@@ -577,9 +599,11 @@ impl AnthropicModelCache {
                 return ModelCacheDecision::Wait(refresh.clone());
             }
         } else {
-            state.evict_for_insert();
+            if !state.evict_for_insert() {
+                return ModelCacheDecision::Return(None);
+            }
             state.entries.insert(
-                model.to_string(),
+                key.clone(),
                 CachedAnthropicModel {
                     fetched_at: None,
                     retry_after: None,
@@ -599,7 +623,7 @@ impl AnthropicModelCache {
         };
         let cached = state
             .entries
-            .get_mut(model)
+            .get_mut(key)
             .expect("model cache entry exists before refresh");
         cached.retry_after = None;
         cached.refresh = Some(refresh.clone());
@@ -608,7 +632,7 @@ impl AnthropicModelCache {
 
     async fn commit_refresh(
         &self,
-        model: &str,
+        key: &AnthropicModelCacheKey,
         generation: u64,
         resolved: Option<AnthropicModelMetadata>,
         now: Instant,
@@ -616,7 +640,7 @@ impl AnthropicModelCache {
         let mut state = self.state.lock().await;
         state.access_counter = state.access_counter.saturating_add(1);
         let last_access = state.access_counter;
-        let Some(cached) = state.entries.get_mut(model) else {
+        let Some(cached) = state.entries.get_mut(key) else {
             // An explicitly abandoned generation may have become eligible for
             // eviction. Do not recreate or overwrite newer cache state.
             return resolved;
@@ -646,9 +670,9 @@ impl AnthropicModelCache {
         effective
     }
 
-    async fn abandon_refresh(&self, model: &str, generation: u64) {
+    async fn abandon_refresh(&self, key: &AnthropicModelCacheKey, generation: u64) {
         let mut state = self.state.lock().await;
-        let Some(cached) = state.entries.get_mut(model) else {
+        let Some(cached) = state.entries.get_mut(key) else {
             return;
         };
         if cached
@@ -663,12 +687,13 @@ impl AnthropicModelCache {
 }
 
 impl AnthropicModelCacheState {
-    fn evict_for_insert(&mut self) {
+    fn evict_for_insert(&mut self) -> bool {
         while self.entries.len() >= MODEL_CACHE_CAPACITY {
             if !self.evict_oldest_settled() {
-                break;
+                return false;
             }
         }
+        true
     }
 
     fn trim_to_capacity(&mut self) {
@@ -685,13 +710,13 @@ impl AnthropicModelCacheState {
             .iter()
             .filter(|(_, cached)| cached.refresh.is_none())
             .min_by_key(|(_, cached)| cached.last_access)
-            .map(|(model, _)| model.clone())
+            .map(|(key, _)| key.clone())
         {
             self.entries.remove(&oldest);
             true
         } else {
             // Every entry is refreshing. Preserve their single-flight state
-            // and allow temporary overflow until a refresh settles.
+            // and reject admission until a refresh settles.
             false
         }
     }
@@ -977,21 +1002,36 @@ impl AnthropicProvider {
             client,
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
+            credential_generation: NEXT_CREDENTIAL_GENERATION.fetch_add(1, Ordering::Relaxed),
             model_cache,
             #[cfg(test)]
             preparation_stats: Arc::default(),
         }
     }
 
+    pub fn set_credential_generation(&mut self, credential_generation: u64) {
+        self.credential_generation = credential_generation;
+    }
+
+    fn model_cache_key(&self, model: &str) -> AnthropicModelCacheKey {
+        AnthropicModelCacheKey {
+            base_url: self.base_url.trim_end_matches('/').to_string(),
+            credential_generation: self.credential_generation,
+            model: model.to_string(),
+        }
+    }
+
     async fn resolved_model_metadata(&self, model: &str) -> AnthropicModelMetadata {
         let fallback = static_anthropic_model_metadata(model);
+        let key = self.model_cache_key(model);
         loop {
-            let decision = self.model_cache.decision(model, Instant::now()).await;
+            let decision = self.model_cache.decision(&key, Instant::now()).await;
             let refresh = match decision {
                 ModelCacheDecision::Return(metadata) => return metadata.unwrap_or(fallback),
                 ModelCacheDecision::Wait(refresh) => refresh,
                 ModelCacheDecision::Start { refresh, sender } => {
                     self.spawn_model_refresh(
+                        key.clone(),
                         model.to_string(),
                         fallback.clone(),
                         refresh.generation,
@@ -1007,13 +1047,14 @@ impl AnthropicProvider {
             // Clear only that generation and retry so waiters cannot remain
             // permanently attached to an abandoned in-flight entry.
             self.model_cache
-                .abandon_refresh(model, refresh.generation)
+                .abandon_refresh(&key, refresh.generation)
                 .await;
         }
     }
 
     fn spawn_model_refresh(
         &self,
+        key: AnthropicModelCacheKey,
         model: String,
         fallback: AnthropicModelMetadata,
         generation: u64,
@@ -1032,7 +1073,7 @@ impl AnthropicProvider {
             };
             let effective = provider
                 .model_cache
-                .commit_refresh(&model, generation, resolved, Instant::now())
+                .commit_refresh(&key, generation, resolved, Instant::now())
                 .await;
             let _ = sender.send(ModelRefreshStatus::Finished(effective));
         });
@@ -3106,6 +3147,17 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
+    fn provider_debug_redacts_api_key() {
+        let provider =
+            AnthropicProvider::new_with_client(reqwest::Client::new(), "sk-ant-secret-fragment");
+
+        let debug = format!("{provider:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("secret-fragment"));
+    }
+
+    #[test]
     fn metadata_threshold_preserves_one_million_special_case_and_generic_policy() {
         assert_eq!(anthropic_auto_compact_limit(1_000_000), 500_000);
         assert_eq!(anthropic_auto_compact_limit(200_000), 170_000);
@@ -3249,22 +3301,25 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let server_captured = captured.clone();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("model lookup accepted");
-            let (headers, body) = read_http_request(&mut socket).await;
-            assert!(headers.starts_with("GET /v1/models/claude-opus-4-8 HTTP/1.1\r\n"));
-            assert_eq!(body, Value::Null);
-            write_json_response(
-                &mut socket,
-                &json!({
-                    "id": "claude-opus-4-8",
-                    "max_input_tokens": 1_000_000,
-                    "max_tokens": 128_000,
-                    "capabilities": models_api_capabilities(json!({ "supported": true })),
-                }),
-            )
-            .await;
+            for expected_key in ["old-key", "new-key"] {
+                let (mut socket, _) = listener.accept().await.expect("model lookup accepted");
+                let (headers, body) = read_http_request(&mut socket).await;
+                assert!(headers.starts_with("GET /v1/models/claude-opus-4-8 HTTP/1.1\r\n"));
+                assert!(headers
+                    .to_ascii_lowercase()
+                    .contains(&format!("x-api-key: {expected_key}\r\n")));
+                assert_eq!(body, Value::Null);
+                write_json_response(
+                    &mut socket,
+                    &json!({
+                        "id": "claude-opus-4-8",
+                        "max_input_tokens": 1_000_000,
+                        "max_tokens": 128_000,
+                        "capabilities": models_api_capabilities(json!({ "supported": true })),
+                    }),
+                )
+                .await;
 
-            for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.expect("messages request accepted");
                 let (headers, body) = read_http_request(&mut socket).await;
                 let header = |name: &str| {
@@ -3293,6 +3348,7 @@ mod tests {
             cache.clone(),
         );
         first.base_url = base_url.clone();
+        first.set_credential_generation(1);
         let request = test_model_request(
             "claude-opus-4-8",
             vec![TranscriptItem::UserMessage(UserMessage::text("secret prompt")).into()],
@@ -3321,6 +3377,7 @@ mod tests {
         let mut refreshed =
             AnthropicProvider::new_with_client_and_cache(reqwest::Client::new(), "new-key", cache);
         refreshed.base_url = base_url;
+        refreshed.set_credential_generation(2);
         let refreshed_prepared = refreshed
             .prepare_model_request(&request, Some(&prepared))
             .await
@@ -4270,6 +4327,14 @@ mod tests {
         metadata
     }
 
+    fn test_model_cache_key(model: &str) -> AnthropicModelCacheKey {
+        AnthropicModelCacheKey {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            credential_generation: 1,
+            model: model.to_string(),
+        }
+    }
+
     #[test]
     fn models_api_null_capabilities_preserves_authoritative_limits() {
         let discovered: ModelsApiModel = serde_json::from_value(json!({
@@ -4486,6 +4551,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotated_credential_generation_does_not_reuse_negative_or_capability_cache() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (expected_key, status, max_tokens) in [
+                ("old-key", "500 Internal Server Error", None),
+                ("new-key", "200 OK", Some(12_345)),
+            ] {
+                let (mut socket, _) = listener.accept().await.expect("request accepted");
+                let (headers, body) = read_http_request(&mut socket).await;
+                assert!(headers
+                    .to_ascii_lowercase()
+                    .contains(&format!("x-api-key: {expected_key}\r\n")));
+                assert_eq!(body, Value::Null);
+                let body = max_tokens.map_or_else(
+                    || {
+                        json!({
+                            "type": "error",
+                            "error": {"type": "api_error", "message": "nope"},
+                        })
+                    },
+                    |max_tokens| {
+                        json!({
+                            "id": "claude-future",
+                            "max_input_tokens": 321_000,
+                            "max_tokens": max_tokens,
+                            "capabilities": null,
+                        })
+                    },
+                );
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response writes");
+            }
+        });
+
+        let cache = AnthropicModelCache::default();
+        let mut old = AnthropicProvider::new_with_client_and_cache(
+            reqwest::Client::new(),
+            "old-key",
+            cache.clone(),
+        );
+        old.base_url = base_url.clone();
+        old.set_credential_generation(1);
+        let old_metadata = old.resolved_model_metadata("claude-future").await;
+        assert_eq!(
+            old_metadata,
+            static_anthropic_model_metadata("claude-future")
+        );
+
+        let mut new =
+            AnthropicProvider::new_with_client_and_cache(reqwest::Client::new(), "new-key", cache);
+        new.base_url = base_url;
+        new.set_credential_generation(2);
+        let new_metadata = new.resolved_model_metadata("claude-future").await;
+        server.await.expect("server completes");
+
+        assert_eq!(new_metadata.max_input_tokens, Some(321_000));
+        assert_eq!(new_metadata.max_tokens, 12_345);
+    }
+
+    #[tokio::test]
     async fn sonnet_45_models_api_failure_projects_200k_window_and_170k_recommendation() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -4669,29 +4804,30 @@ mod tests {
     async fn late_failed_generation_cannot_overwrite_newer_success() {
         let cache = AnthropicModelCache::default();
         let now = Instant::now();
-        let first = match cache.decision("model", now).await {
+        let key = test_model_cache_key("model");
+        let first = match cache.decision(&key, now).await {
             ModelCacheDecision::Start { refresh, .. } => refresh,
             _ => panic!("cold cache should start a refresh"),
         };
-        cache.abandon_refresh("model", first.generation).await;
-        let second = match cache.decision("model", now).await {
+        cache.abandon_refresh(&key, first.generation).await;
+        let second = match cache.decision(&key, now).await {
             ModelCacheDecision::Start { refresh, .. } => refresh,
             _ => panic!("abandoned refresh should allow a newer generation"),
         };
         let success = test_model_metadata("model", 8_192);
         assert_eq!(
             cache
-                .commit_refresh("model", second.generation, Some(success.clone()), now)
+                .commit_refresh(&key, second.generation, Some(success.clone()), now)
                 .await,
             Some(success.clone())
         );
         assert_eq!(
             cache
-                .commit_refresh("model", first.generation, None, now)
+                .commit_refresh(&key, first.generation, None, now)
                 .await,
             Some(success.clone())
         );
-        match cache.decision("model", now).await {
+        match cache.decision(&key, now).await {
             ModelCacheDecision::Return(Some(cached)) => assert_eq!(cached, success),
             _ => panic!("newer success must remain cached"),
         }
@@ -4701,28 +4837,29 @@ mod tests {
     async fn expired_success_survives_failed_refresh_with_retry_backoff() {
         let cache = AnthropicModelCache::default();
         let now = Instant::now();
-        let initial = match cache.decision("model", now).await {
+        let key = test_model_cache_key("model");
+        let initial = match cache.decision(&key, now).await {
             ModelCacheDecision::Start { refresh, .. } => refresh,
             _ => panic!("cold cache should start a refresh"),
         };
         let success = test_model_metadata("model", 8_192);
         cache
-            .commit_refresh("model", initial.generation, Some(success.clone()), now)
+            .commit_refresh(&key, initial.generation, Some(success.clone()), now)
             .await;
 
         let expired = now + MODEL_CACHE_SUCCESS_TTL;
-        let refresh = match cache.decision("model", expired).await {
+        let refresh = match cache.decision(&key, expired).await {
             ModelCacheDecision::Start { refresh, .. } => refresh,
             _ => panic!("expired success should refresh"),
         };
         assert_eq!(
             cache
-                .commit_refresh("model", refresh.generation, None, expired)
+                .commit_refresh(&key, refresh.generation, None, expired)
                 .await,
             Some(success.clone())
         );
         match cache
-            .decision("model", expired + MODEL_CACHE_FAILURE_TTL / 2)
+            .decision(&key, expired + MODEL_CACHE_FAILURE_TTL / 2)
             .await
         {
             ModelCacheDecision::Return(Some(cached)) => assert_eq!(cached, success),
@@ -4731,7 +4868,7 @@ mod tests {
         assert!(matches!(
             cache
                 .decision(
-                    "model",
+                    &key,
                     expired + MODEL_CACHE_FAILURE_TTL + Duration::from_nanos(1)
                 )
                 .await,
@@ -4743,26 +4880,27 @@ mod tests {
     async fn cold_failure_is_negative_cached_until_retry_backoff_expires() {
         let cache = AnthropicModelCache::default();
         let now = Instant::now();
-        let initial = match cache.decision("model", now).await {
+        let key = test_model_cache_key("model");
+        let initial = match cache.decision(&key, now).await {
             ModelCacheDecision::Start { refresh, .. } => refresh,
             _ => panic!("cold cache should start a refresh"),
         };
         assert_eq!(
             cache
-                .commit_refresh("model", initial.generation, None, now)
+                .commit_refresh(&key, initial.generation, None, now)
                 .await,
             None
         );
         assert!(matches!(
             cache
-                .decision("model", now + MODEL_CACHE_FAILURE_TTL / 2)
+                .decision(&key, now + MODEL_CACHE_FAILURE_TTL / 2)
                 .await,
             ModelCacheDecision::Return(None)
         ));
         assert!(matches!(
             cache
                 .decision(
-                    "model",
+                    &key,
                     now + MODEL_CACHE_FAILURE_TTL + Duration::from_nanos(1)
                 )
                 .await,
@@ -4776,13 +4914,14 @@ mod tests {
         let now = Instant::now();
         for index in 0..=MODEL_CACHE_CAPACITY {
             let model = format!("model-{index}");
-            let refresh = match cache.decision(&model, now).await {
+            let key = test_model_cache_key(&model);
+            let refresh = match cache.decision(&key, now).await {
                 ModelCacheDecision::Start { refresh, .. } => refresh,
                 _ => panic!("new model should start a refresh"),
             };
             cache
                 .commit_refresh(
-                    &model,
+                    &key,
                     refresh.generation,
                     Some(test_model_metadata(&model, 8_192)),
                     now,
@@ -4792,111 +4931,116 @@ mod tests {
 
         let state = cache.state.lock().await;
         assert_eq!(state.entries.len(), MODEL_CACHE_CAPACITY);
-        assert!(!state.entries.contains_key("model-0"));
-        assert!(state
-            .entries
-            .contains_key(&format!("model-{MODEL_CACHE_CAPACITY}")));
+        assert!(!state.entries.contains_key(&test_model_cache_key("model-0")));
+        assert!(state.entries.contains_key(&test_model_cache_key(&format!(
+            "model-{MODEL_CACHE_CAPACITY}"
+        ))));
     }
 
     #[tokio::test]
-    async fn capacity_pressure_preserves_in_flight_refresh_and_waiters() {
+    async fn all_refreshing_capacity_rejects_new_models_and_preserves_waiters() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::sync::oneshot;
+        use tokio::sync::{oneshot, watch};
 
-        const MODEL: &str = "claude-capacity-pressure";
+        const PRESSURE: usize = MODEL_CACHE_CAPACITY * 4;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener binds");
         let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
         let server_requests = Arc::clone(&requests);
-        let (request_started_tx, request_started_rx) = oneshot::channel();
-        let (respond_tx, respond_rx) = oneshot::channel();
+        let (capacity_reached_tx, capacity_reached_rx) = oneshot::channel();
+        let (pressure_complete_tx, pressure_complete_rx) = oneshot::channel();
+        let (release_tx, release_rx) = watch::channel(false);
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("request accepted");
-            server_requests.fetch_add(1, Ordering::SeqCst);
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            loop {
-                let read = socket.read(&mut buffer).await.expect("request reads");
-                if read == 0 {
-                    return false;
-                }
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
+            let mut handlers = tokio::task::JoinSet::new();
+            for _ in 0..MODEL_CACHE_CAPACITY {
+                let (socket, _) = listener.accept().await.expect("request accepted");
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let mut release_rx = release_rx.clone();
+                handlers.spawn(async move {
+                    let mut socket = socket;
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 1024];
+                    loop {
+                        let read = socket.read(&mut buffer).await.expect("request reads");
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    while !*release_rx.borrow_and_update() {
+                        release_rx.changed().await.expect("release sender remains");
+                    }
+                    let body = json!({
+                        "id": "discovered",
+                        "max_input_tokens": 321_000,
+                        "max_tokens": 12_345,
+                        "capabilities": null
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("response writes");
+                });
             }
-            let request = String::from_utf8(request).expect("request is utf8");
-            assert!(request.starts_with(&format!("GET /v1/models/{MODEL} HTTP/1.1\r\n")));
-            let _ = request_started_tx.send(());
-            let _ = respond_rx.await;
-
-            let body = json!({
-                "id": MODEL,
-                "max_input_tokens": 321_000,
-                "max_tokens": 12_345,
-                "capabilities": null
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("response writes");
-            drop(socket);
-
-            match tokio::time::timeout(Duration::from_millis(200), listener.accept()).await {
-                Err(_) => true,
-                Ok(Ok((_socket, _))) => {
+            capacity_reached_tx
+                .send(())
+                .expect("capacity observer remains");
+            let no_overflow = tokio::select! {
+                result = listener.accept() => {
+                    let (_socket, _) = result.expect("overflow request accepted");
                     server_requests.fetch_add(1, Ordering::SeqCst);
                     false
                 }
-                Ok(Err(error)) => panic!("duplicate request check failed: {error}"),
+                result = pressure_complete_rx => {
+                    result.expect("pressure completion sender remains");
+                    true
+                }
+            };
+            release_tx.send(true).expect("request handlers remain");
+            while let Some(result) = handlers.join_next().await {
+                result.expect("request handler completes");
             }
+            no_overflow
         });
 
         let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
         provider.base_url = base_url;
         let provider = Arc::new(provider);
         let cache = provider.model_cache.clone();
-        let leader_provider = Arc::clone(&provider);
-        let leader =
-            tokio::spawn(async move { leader_provider.resolved_model_metadata(MODEL).await });
-        request_started_rx
+        let mut admitted = tokio::task::JoinSet::new();
+        for index in 0..MODEL_CACHE_CAPACITY {
+            let provider = Arc::clone(&provider);
+            admitted.spawn(async move {
+                provider
+                    .resolved_model_metadata(&format!("admitted-{index}"))
+                    .await
+            });
+        }
+        capacity_reached_rx
             .await
-            .expect("model refresh starts its GET");
+            .expect("all cache refreshes start their GET");
 
+        let admitted_key = provider.model_cache_key("admitted-0");
         let original_generation = {
             let state = cache.state.lock().await;
-            state.entries[MODEL]
+            assert_eq!(state.entries.len(), MODEL_CACHE_CAPACITY);
+            assert!(state.entries.values().all(|entry| entry.refresh.is_some()));
+            state.entries[&admitted_key]
                 .refresh
                 .as_ref()
                 .expect("model refresh remains in flight")
                 .generation
         };
-
-        // All pressure entries remain in flight, so there is no settled entry
-        // to evict. The cache must temporarily hold 65 entries rather than
-        // discard MODEL's refresh state.
-        let mut pressure_refreshes = Vec::new();
-        for index in 0..MODEL_CACHE_CAPACITY {
-            let pressure_model = format!("pressure-{index}");
-            match cache.decision(&pressure_model, Instant::now()).await {
-                ModelCacheDecision::Start { refresh, sender } => {
-                    pressure_refreshes.push((pressure_model, refresh, sender));
-                }
-                _ => panic!("new pressure model should start a refresh"),
-            }
-        }
-        {
-            let state = cache.state.lock().await;
-            assert_eq!(state.entries.len(), MODEL_CACHE_CAPACITY + 1);
-            assert!(state.entries.values().all(|entry| entry.refresh.is_some()));
-        }
 
         let before_waiter = {
             let state = cache.state.lock().await;
@@ -4904,16 +5048,18 @@ mod tests {
         };
         let waiter_provider = Arc::clone(&provider);
         let waiter =
-            tokio::spawn(async move { waiter_provider.resolved_model_metadata(MODEL).await });
+            tokio::spawn(
+                async move { waiter_provider.resolved_model_metadata("admitted-0").await },
+            );
 
-        // Wait until the second provider request has consulted the cache, then
-        // prove it attached to the original generation rather than starting a
-        // replacement GET.
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let attached = {
                     let state = cache.state.lock().await;
-                    let cached = state.entries.get(MODEL).expect("in-flight model retained");
+                    let cached = state
+                        .entries
+                        .get(&admitted_key)
+                        .expect("in-flight model retained");
                     cached.last_access > before_waiter
                         && cached
                             .refresh
@@ -4928,33 +5074,50 @@ mod tests {
         })
         .await
         .expect("second request attaches to original refresh");
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), MODEL_CACHE_CAPACITY);
 
-        respond_tx.send(()).expect("server may finish response");
-        let first = leader.await.expect("leader completes");
-        let second = waiter.await.expect("waiter completes");
+        let mut rejected = tokio::task::JoinSet::new();
+        for index in 0..PRESSURE {
+            let provider = Arc::clone(&provider);
+            rejected.spawn(async move {
+                let model = format!("rejected-{index}");
+                let metadata = provider.resolved_model_metadata(&model).await;
+                (model, metadata)
+            });
+        }
+        while let Some(result) = tokio::time::timeout(Duration::from_secs(1), rejected.join_next())
+            .await
+            .expect("capacity-rejected lookup returns without waiting")
+        {
+            let (model, metadata) = result.expect("capacity-rejected lookup completes");
+            assert_eq!(metadata, static_anthropic_model_metadata(&model));
+        }
+        {
+            let state = cache.state.lock().await;
+            assert_eq!(state.entries.len(), MODEL_CACHE_CAPACITY);
+            assert!(state.entries.values().all(|entry| entry.refresh.is_some()));
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), MODEL_CACHE_CAPACITY);
+        pressure_complete_tx
+            .send(())
+            .expect("server awaits pressure completion");
+
         assert!(
             server.await.expect("server completes"),
-            "no duplicate model GET should be accepted"
+            "no Models API request should start beyond the cache cap"
         );
-        for metadata in [&first, &second] {
-            assert_eq!(metadata.id, MODEL);
+        while let Some(result) = admitted.join_next().await {
+            let metadata = result.expect("admitted lookup completes");
+            assert_eq!(metadata.id, "discovered");
             assert_eq!(metadata.max_input_tokens, Some(321_000));
             assert_eq!(metadata.max_tokens, 12_345);
         }
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let waiter_metadata = waiter.await.expect("waiter completes");
+        assert_eq!(waiter_metadata.id, "discovered");
+        assert_eq!(waiter_metadata.max_input_tokens, Some(321_000));
+        assert_eq!(waiter_metadata.max_tokens, 12_345);
+        assert_eq!(requests.load(Ordering::SeqCst), MODEL_CACHE_CAPACITY);
 
-        for (model, refresh, sender) in pressure_refreshes {
-            let effective = cache
-                .commit_refresh(
-                    &model,
-                    refresh.generation,
-                    Some(test_model_metadata(&model, 8_192)),
-                    Instant::now(),
-                )
-                .await;
-            let _ = sender.send(ModelRefreshStatus::Finished(effective));
-        }
         let state = cache.state.lock().await;
         assert_eq!(state.entries.len(), MODEL_CACHE_CAPACITY);
         assert!(state.entries.values().all(|entry| entry.refresh.is_none()));
