@@ -28,7 +28,8 @@ where
     Fut: Future<Output = std::result::Result<Resp, ProviderError>>,
 {
     let uses_codex_auth = provider.uses_codex_auth;
-    match call(provider, request.clone()).await {
+    let (first_attempt, auth_retry) = auth_attempt_requests(request);
+    match call(provider, first_attempt).await {
         Ok(response) => Ok(response),
         Err(error) if uses_codex_auth && error.status_code() == Some(401) => {
             let credentials = refresh_codex_credentials()
@@ -37,10 +38,14 @@ where
             let provider = provider_for_config(state, config, &credentials, session_id)
                 .await
                 .map_err(|error| ProviderError::Provider(error.to_string()))?;
-            call(provider, request).await
+            call(provider, auth_retry).await
         }
         Err(error) => Err(error),
     }
+}
+
+fn auth_attempt_requests<Req: Clone>(request: Req) -> (Req, Req) {
+    (request.clone(), request)
 }
 
 pub(super) async fn model_metadata_with_auth_retry(
@@ -60,6 +65,10 @@ pub(super) async fn model_metadata_with_auth_retry(
     )
     .await
 }
+
+#[cfg(test)]
+#[path = "auth_retry_tests.rs"]
+mod tests;
 
 pub(super) async fn count_tokens_with_auth_retry(
     state: &AppState,

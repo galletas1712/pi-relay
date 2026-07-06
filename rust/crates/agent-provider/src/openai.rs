@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, HashMap, HashSet},
     io::Cursor,
     sync::{
@@ -594,7 +595,7 @@ mod catalog_tests {
     }
 
     fn model_request(model: &str, effort: ReasoningEffort) -> ModelRequest {
-        ModelRequest {
+        test_model_request! {
             model: model.to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::default(),
@@ -610,7 +611,7 @@ mod catalog_tests {
     }
 
     fn compact_request(model: &str, effort: ReasoningEffort) -> ProviderCompactionRequest {
-        ProviderCompactionRequest {
+        test_compaction_request! {
             model: model.to_string(),
             prompt: PromptSections::default(),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
@@ -2512,11 +2513,12 @@ impl OpenAiProvider {
         // and as every routing header (session_id, x-client-request-id,
         // etc.). Falling back to a fresh UUID keeps the CLI / test paths
         // functional, but the daemon always supplies a real session id.
-        let session_id = openai_session_id(&request.session_id, self.session_state.as_deref());
+        let session_id = openai_session_id(request.session_id(), self.session_state.as_deref());
         let window_id = openai_window_id(
             &session_id,
             self.session_state.as_deref(),
-            &request.transcript,
+            request.transcript(),
+            request.transcript_suffix(),
         );
         let turn_id = request.turn_id;
         let codex_turn_state = self
@@ -2524,8 +2526,8 @@ impl OpenAiProvider {
             .as_deref()
             .filter(|state| state.session_id() == session_id)
             .and_then(|state| state.turn_state_for_request(turn_id));
-        let metadata = self.resolved_model_metadata(&request.model).await?;
-        let body = responses_body_with_metadata(request, &session_id, &metadata)?;
+        let metadata = self.resolved_model_metadata(request.model()).await?;
+        let body = responses_body_with_metadata(&request, &session_id, &metadata)?;
 
         let response = send_provider_generation_request(
             zstd_json_request(
@@ -2563,14 +2565,15 @@ impl OpenAiProvider {
         &self,
         request: ProviderCompactionRequest,
     ) -> ProviderResult<ProviderCompactionResponse> {
-        let session_id = openai_session_id(&request.session_id, self.session_state.as_deref());
+        let session_id = openai_session_id(request.session_id(), self.session_state.as_deref());
         let window_id = openai_window_id(
             &session_id,
             self.session_state.as_deref(),
-            &request.transcript,
+            request.transcript(),
+            &[],
         );
-        let metadata = self.resolved_model_metadata(&request.model).await?;
-        let body = compact_body_with_metadata(request, &session_id, &metadata)?;
+        let metadata = self.resolved_model_metadata(request.model()).await?;
+        let body = compact_body_with_metadata(&request, &session_id, &metadata)?;
 
         let response = self
             .add_codex_headers(
@@ -2598,11 +2601,11 @@ impl OpenAiProvider {
 }
 
 fn openai_session_id(
-    request_session_id: &Option<String>,
+    request_session_id: Option<&str>,
     session_state: Option<&OpenAiCodexSessionState>,
 ) -> String {
     request_session_id
-        .clone()
+        .map(str::to_string)
         .or_else(|| session_state.map(|state| state.session_id().to_string()))
         .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
@@ -2611,8 +2614,10 @@ fn openai_window_id(
     session_id: &str,
     session_state: Option<&OpenAiCodexSessionState>,
     transcript: &[ModelTranscriptEntry],
+    transcript_suffix: &[ModelTranscriptEntry],
 ) -> String {
-    let transcript_generation = codex_window_generation(transcript);
+    let transcript_generation =
+        codex_window_generation(transcript).max(codex_window_generation(transcript_suffix));
     if let Some(state) = session_state.filter(|state| state.session_id() == session_id) {
         state.observe_transcript_generation(transcript_generation);
         state.window_id()
@@ -2673,13 +2678,14 @@ fn response_error_message(body: &str) -> String {
 }
 
 fn responses_body_with_metadata(
-    request: ModelRequest,
+    request: impl Borrow<ModelRequest>,
     session_id: &str,
     metadata: &OpenAiModelMetadata,
 ) -> ProviderResult<Value> {
-    let reasoning_effort = openai_reasoning_effort(metadata, request.reasoning_effort)?;
-    let tool_profile = request.tool_profile;
-    let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
+    let request = request.borrow();
+    let reasoning_effort = openai_reasoning_effort(metadata, request.reasoning_effort())?;
+    let tool_profile = request.tool_profile();
+    let request_tools = crate::effective_provider_tools(tool_profile, request.tools());
     let tools = response_tools(tool_profile, &request_tools)?;
     // Cache cohort priority, highest to lowest:
     //   1. Explicit override from `ProviderConfig.prompt_cache.key` (lets
@@ -2691,13 +2697,16 @@ fn responses_body_with_metadata(
     //      while still maximising in-session prefix reuse.
     //   3. Fresh UUID/test fallback supplied by `openai_session_id` when
     //      neither the request nor provider session state has an id.
-    let prompt_cache_key = request
-        .prompt_cache_key
-        .unwrap_or_else(|| session_id.to_string());
+    let prompt_cache_key = request.prompt_cache_key().unwrap_or(session_id);
     let mut body = json!({
-        "model": request.model,
-        "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
-        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
+        "model": request.model(),
+        "instructions": request.prompt().stable_prefix.as_deref().unwrap_or_default(),
+        "input": response_input_items(
+            request.prompt().dynamic_context.as_deref(),
+            request.prompt(),
+            request.transcript(),
+            request.transcript_suffix(),
+        )?,
         "tools": tools,
         "tool_choice": "auto",
         "parallel_tool_calls": metadata.supports_parallel_tool_calls,
@@ -2720,21 +2729,25 @@ fn responses_body_with_metadata(
 // out. This is a valid subset of Codex CLI's current `CompactionInput`: pi-relay
 // has no text/verbosity request control to forward yet.
 fn compact_body_with_metadata(
-    request: ProviderCompactionRequest,
+    request: impl Borrow<ProviderCompactionRequest>,
     session_id: &str,
     metadata: &OpenAiModelMetadata,
 ) -> ProviderResult<Value> {
-    let reasoning_effort = openai_reasoning_effort(metadata, request.reasoning_effort)?;
-    let tool_profile = request.tool_profile;
-    let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
+    let request = request.borrow();
+    let reasoning_effort = openai_reasoning_effort(metadata, request.reasoning_effort())?;
+    let tool_profile = request.tool_profile();
+    let request_tools = crate::effective_provider_tools(tool_profile, request.tools());
     let tools = response_tools(tool_profile, &request_tools)?;
-    let prompt_cache_key = request
-        .prompt_cache_key
-        .unwrap_or_else(|| session_id.to_string());
+    let prompt_cache_key = request.prompt_cache_key().unwrap_or(session_id);
     Ok(json!({
-        "model": request.model,
-        "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
-        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
+        "model": request.model(),
+        "instructions": request.prompt().stable_prefix.as_deref().unwrap_or_default(),
+        "input": response_input_items(
+            request.prompt().dynamic_context.as_deref(),
+            request.prompt(),
+            request.transcript(),
+            &[],
+        )?,
         "tools": tools,
         "parallel_tool_calls": metadata.supports_parallel_tool_calls,
         "reasoning": {
@@ -2761,7 +2774,7 @@ fn response_tools(
 }
 
 fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
-    let mut tools = tools.to_vec();
+    let mut tools = tools.iter().collect::<Vec<_>>();
     tools.sort_by(|left, right| {
         left.name
             .to_ascii_lowercase()
@@ -2769,7 +2782,10 @@ fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.canonical_name.cmp(&right.canonical_name))
     });
-    tools.iter().map(|tool| tool.declaration.clone()).collect()
+    tools
+        .into_iter()
+        .map(|tool| tool.declaration.clone())
+        .collect()
 }
 
 fn openai_reasoning_effort(
@@ -2890,9 +2906,11 @@ fn response_input_items(
     dynamic_context: Option<&str>,
     prompt: &crate::PromptSections,
     transcript: &[ModelTranscriptEntry],
+    transcript_suffix: &[ModelTranscriptEntry],
 ) -> ProviderResult<Vec<Value>> {
     let mut items = Vec::new();
     items.extend(transcript_to_response_items(prompt, transcript)?);
+    items.extend(transcript_to_response_items(prompt, transcript_suffix)?);
     if let Some(dynamic_context) = dynamic_context.filter(|value| !value.trim().is_empty()) {
         items.push(json!({
             "type": "message",
@@ -3565,7 +3583,7 @@ fn openai_usage(value: &Value) -> Option<ProviderUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PromptSections;
+    use crate::{PromptSections, ProviderModelInput};
     use agent_vocab::{CompactionSummary, ToolCall, ToolResultMessage, TurnId};
     use reqwest::header::HeaderValue;
 
@@ -3580,6 +3598,47 @@ mod tests {
 
     fn first_party_tools(provider: ProviderKind) -> Vec<ProviderTool> {
         agent_tools::ToolRegistry::with_builtin_tools().provider_tools_for_provider(provider)
+    }
+
+    #[test]
+    fn responses_body_split_suffix_matches_contiguous_transcript() {
+        let prefix: Vec<ModelTranscriptEntry> =
+            vec![TranscriptItem::UserMessage(UserMessage::text("normal turn")).into()];
+        let suffix =
+            ModelTranscriptEntry::from(TranscriptItem::UserMessage(UserMessage::text("sidecar")));
+        let contiguous = responses_body(
+            test_model_request! {
+                model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: Some(1),
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![prefix[0].clone(), suffix.clone()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: None,
+                session_id: Some("session-1".to_string()),
+                turn_id: None,
+            },
+            "session-1",
+        )
+        .expect("contiguous body renders");
+        let split_input = Arc::new(
+            ProviderModelInput::new(
+                "gpt-5.5",
+                PromptSections::stable("stable rules"),
+                prefix,
+                ProviderToolProfile::None,
+                Vec::new(),
+                ReasoningEffort::Medium,
+            )
+            .with_session_id("session-1"),
+        );
+        let mut split_request = ModelRequest::new(split_input).with_transcript_suffix(vec![suffix]);
+        split_request.transcript_cache_prefix_len = Some(1);
+        let split = responses_body(split_request, "session-1").expect("split body renders");
+
+        assert_eq!(split, contiguous);
     }
 
     #[test]
@@ -3757,7 +3816,7 @@ mod tests {
         // stay on the supported subset rather than the full streaming
         // `/responses` envelope. pi-relay has no text/verbosity control yet.
         let body = compact_body(
-            ProviderCompactionRequest {
+            test_compaction_request! {
                 model: "gpt-5.5".to_string(),
                 prompt: PromptSections::new(
                     Some("stable rules".to_string()),
@@ -3796,7 +3855,7 @@ mod tests {
     #[test]
     fn compact_body_prefers_explicit_prompt_cache_key_override() {
         let body = compact_body(
-            ProviderCompactionRequest {
+            test_compaction_request! {
                 model: "gpt-5.5".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
@@ -3820,7 +3879,7 @@ mod tests {
         let transcript = vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()];
 
         assert_eq!(
-            openai_window_id("thread-1", None, &transcript),
+            openai_window_id("thread-1", None, &transcript, &[]),
             "thread-1:0"
         );
     }
@@ -3840,7 +3899,7 @@ mod tests {
         ];
 
         assert_eq!(
-            openai_window_id("thread-1", None, &transcript),
+            openai_window_id("thread-1", None, &transcript, &[]),
             "thread-1:42"
         );
     }
@@ -3963,18 +4022,20 @@ mod tests {
                 now,
             )
             .await;
-        let make_request = |turn_id| ModelRequest {
-            model: "gpt-5.5".to_string(),
-            transcript_cache_prefix_len: None,
-            prompt: PromptSections::default(),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::OpenAiCoding,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::Medium,
-            prompt_cache_key: None,
-            session_id: Some("session-1".to_string()),
-            turn_id: Some(turn_id),
+        let make_request = |turn_id| {
+            test_model_request! {
+                model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::default(),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::OpenAiCoding,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: None,
+                session_id: Some("session-1".to_string()),
+                turn_id: Some(turn_id),
+            }
         };
 
         provider
@@ -4252,7 +4313,7 @@ mod tests {
     #[test]
     fn codex_auth_adds_priority_service_tier() {
         let body = responses_body(
-            ModelRequest {
+            test_model_request! {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::default(),
@@ -4276,7 +4337,7 @@ mod tests {
     #[test]
     fn responses_body_sets_openai_request_shape() {
         let body = responses_body(
-            ModelRequest {
+            test_model_request! {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::new(
@@ -4328,26 +4389,25 @@ mod tests {
     #[test]
     fn responses_body_sends_gpt56_max_reasoning() {
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            let body =
-                responses_body(
-                    ModelRequest {
-                        model: model.to_string(),
-                        transcript_cache_prefix_len: None,
-                        prompt: PromptSections::default(),
-                        transcript: vec![
-                            TranscriptItem::UserMessage(UserMessage::text("hello")).into()
-                        ],
-                        tool_profile: ProviderToolProfile::None,
-                        tools: Vec::new(),
-                        max_tokens: None,
-                        reasoning_effort: ReasoningEffort::Max,
-                        prompt_cache_key: None,
-                        session_id: None,
-                        turn_id: None,
-                    },
-                    "test-session",
-                )
-                .expect("responses body renders");
+            let body = responses_body(
+                test_model_request! {
+                    model: model.to_string(),
+                    transcript_cache_prefix_len: None,
+                    prompt: PromptSections::default(),
+                    transcript: vec![
+                        TranscriptItem::UserMessage(UserMessage::text("hello")).into()
+                    ],
+                    tool_profile: ProviderToolProfile::None,
+                    tools: Vec::new(),
+                    max_tokens: None,
+                    reasoning_effort: ReasoningEffort::Max,
+                    prompt_cache_key: None,
+                    session_id: None,
+                    turn_id: None,
+                },
+                "test-session",
+            )
+            .expect("responses body renders");
 
             assert_eq!(body["reasoning"]["effort"], "max", "{model}");
         }
@@ -4358,7 +4418,7 @@ mod tests {
         let mut metadata = test_openai_model_metadata("gpt-5.5");
         metadata.supported_reasoning_efforts.remove("max");
         let error = responses_body_with_metadata(
-            ModelRequest {
+            test_model_request! {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::default(),
@@ -4388,7 +4448,7 @@ mod tests {
         // requests with the same session id must produce the same cohort
         // even when their dynamic context and transcripts differ.
         let first = responses_body(
-            ModelRequest {
+            test_model_request! {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::new(
@@ -4408,7 +4468,7 @@ mod tests {
         )
         .expect("responses body renders");
         let second = responses_body(
-            ModelRequest {
+            test_model_request! {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::new(
@@ -4442,7 +4502,7 @@ mod tests {
         // id fallback, so operators can pin a custom cohort via
         // `ProviderConfig.prompt_cache.key`.
         let body = responses_body(
-            ModelRequest {
+            test_model_request! {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -4468,7 +4528,7 @@ mod tests {
         // ModelProvider trait into the cache key: when the daemon passes a
         // session id, it lands as the prompt_cache_key.
         let body = responses_body(
-            ModelRequest {
+            test_model_request! {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -4491,7 +4551,7 @@ mod tests {
     #[test]
     fn responses_body_keeps_dynamic_context_out_of_instructions_and_tail_positioned() {
         let body = responses_body(
-            ModelRequest {
+            test_model_request! {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::new(
@@ -4520,7 +4580,7 @@ mod tests {
     #[test]
     fn responses_body_sorts_tools_for_cache_stability() {
         let body = responses_body(
-            ModelRequest {
+            test_model_request! {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable agent rules"),
@@ -4557,7 +4617,7 @@ mod tests {
     #[test]
     fn responses_body_renders_openai_native_coding_tools() {
         let body = responses_body(
-            ModelRequest {
+            test_model_request! {
                 model: "gpt-5.5".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable agent rules"),

@@ -1,6 +1,6 @@
 use agent_provider::{
     ModelTranscriptEntry, PromptSections, ProviderCompactionRequest, ProviderCompactionResponse,
-    ProviderModelMetadata, ProviderToolProfile,
+    ProviderModelInput, ProviderModelMetadata, ProviderToolProfile,
 };
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
@@ -274,7 +274,7 @@ where
     F: FnOnce(Vec<ModelTranscriptEntry>) -> Fut,
     Fut: Future<Output = Result<ProviderCompactionResponse>>,
 {
-    let result = compact(provider_transcript(model_context)).await?;
+    let result = compact(provider_transcript(&model_context)).await?;
     Ok(native_compaction_output(provider, result))
 }
 
@@ -317,24 +317,33 @@ pub(crate) async fn native_compaction_request(
     } else {
         None
     };
-    Ok(ProviderCompactionRequest {
-        model: config.provider.model.clone(),
+    let input = ProviderModelInput::new(
+        config.provider.model.clone(),
         // Compaction uses the stable prompt plus transcript/model history. Any
         // previous post-compaction delegation ledger already present in the
         // transcript is ordinary prior summary text; fresh parent state is
         // appended to the stored compaction result after the provider returns.
-        prompt: PromptSections::stable(config.system_prompt.clone()),
+        PromptSections::stable(config.system_prompt.clone()),
         transcript,
-        tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: provider_tools_for_session(
+        ProviderToolProfile::for_provider(config.provider.kind),
+        provider_tools_for_session(
             state,
             config.provider.kind,
             effective_prompt_profile(state, config, session_id).await?,
         ),
-        reasoning_effort: config.provider.reasoning_effort,
-        prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
-        session_id: Some(session_id.to_string()),
-        compaction_instructions,
+        config.provider.reasoning_effort,
+    )
+    .with_session_id(session_id);
+    let input = match config.provider.prompt_cache_key() {
+        Some(prompt_cache_key) => input.with_prompt_cache_key(prompt_cache_key),
+        None => input,
+    };
+    let request = ProviderCompactionRequest::new(std::sync::Arc::new(input));
+    Ok(match compaction_instructions {
+        Some(compaction_instructions) => {
+            request.with_compaction_instructions(compaction_instructions)
+        }
+        None => request,
     })
 }
 
@@ -407,7 +416,7 @@ mod tests {
             self.compact_transcripts
                 .lock()
                 .expect("recorded transcripts lock")
-                .push(request.transcript);
+                .push(request.transcript().to_vec());
             if self.fail_compact {
                 Err(ProviderError::Status {
                     status: 413,
@@ -424,17 +433,17 @@ mod tests {
     }
 
     fn provider_request(transcript: Vec<ModelTranscriptEntry>) -> ProviderCompactionRequest {
-        ProviderCompactionRequest {
-            model: "claude-opus-4-8".to_string(),
-            prompt: PromptSections::stable("test prompt"),
+        let input = ProviderModelInput::new(
+            "claude-opus-4-8",
+            PromptSections::stable("test prompt"),
             transcript,
-            tool_profile: ProviderToolProfile::AnthropicCoding,
-            tools: Vec::new(),
-            reasoning_effort: agent_vocab::ReasoningEffort::High,
-            prompt_cache_key: None,
-            session_id: Some("test-session".to_string()),
-            compaction_instructions: Some("compact".to_string()),
-        }
+            ProviderToolProfile::AnthropicCoding,
+            Vec::new(),
+            agent_vocab::ReasoningEffort::High,
+        )
+        .with_session_id("test-session");
+        ProviderCompactionRequest::new(std::sync::Arc::new(input))
+            .with_compaction_instructions("compact".to_string())
     }
 
     #[tokio::test]

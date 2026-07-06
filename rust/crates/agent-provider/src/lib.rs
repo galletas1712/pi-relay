@@ -8,7 +8,132 @@ use agent_vocab::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
+use std::ops::Deref;
+use std::sync::Arc;
 use thiserror::Error;
+
+#[cfg(test)]
+macro_rules! test_provider_model_input {
+    (
+        model: $model:expr,
+        prompt: $prompt:expr,
+        transcript: $transcript:expr,
+        tool_profile: $tool_profile:expr,
+        tools: $tools:expr,
+        reasoning_effort: $reasoning_effort:expr,
+        prompt_cache_key: $prompt_cache_key:expr,
+        session_id: $session_id:expr $(,)?
+    ) => {{
+        let prompt_cache_key: Option<String> = $prompt_cache_key;
+        let session_id: Option<String> = $session_id;
+        let mut input = $crate::ProviderModelInput::new(
+            $model,
+            $prompt,
+            $transcript,
+            $tool_profile,
+            $tools,
+            $reasoning_effort,
+        );
+        if let Some(prompt_cache_key) = prompt_cache_key {
+            input.set_prompt_cache_key(prompt_cache_key);
+        }
+        if let Some(session_id) = session_id {
+            input = input.with_session_id(session_id);
+        }
+        std::sync::Arc::new(input)
+    }};
+}
+
+#[cfg(test)]
+macro_rules! test_model_request {
+    (
+        model: $model:expr,
+        transcript_cache_prefix_len: $transcript_cache_prefix_len:expr,
+        prompt: $prompt:expr,
+        transcript: $transcript:expr,
+        tool_profile: $tool_profile:expr,
+        tools: $tools:expr,
+        max_tokens: $max_tokens:expr,
+        reasoning_effort: $reasoning_effort:expr,
+        prompt_cache_key: $prompt_cache_key:expr,
+        session_id: $session_id:expr,
+        turn_id: $turn_id:expr $(,)?
+    ) => {{
+        let input = test_provider_model_input!(
+            model: $model,
+            prompt: $prompt,
+            transcript: $transcript,
+            tool_profile: $tool_profile,
+            tools: $tools,
+            reasoning_effort: $reasoning_effort,
+            prompt_cache_key: $prompt_cache_key,
+            session_id: $session_id,
+        );
+        let mut request = $crate::ModelRequest::new(input);
+        request.transcript_cache_prefix_len = $transcript_cache_prefix_len;
+        request.max_tokens = $max_tokens;
+        request.turn_id = $turn_id;
+        request
+    }};
+}
+
+#[cfg(test)]
+macro_rules! test_compaction_request {
+    (
+        model: $model:expr,
+        prompt: $prompt:expr,
+        transcript: $transcript:expr,
+        tool_profile: $tool_profile:expr,
+        tools: $tools:expr,
+        reasoning_effort: $reasoning_effort:expr,
+        prompt_cache_key: $prompt_cache_key:expr,
+        session_id: $session_id:expr,
+        compaction_instructions: $compaction_instructions:expr $(,)?
+    ) => {{
+        let input = test_provider_model_input!(
+            model: $model,
+            prompt: $prompt,
+            transcript: $transcript,
+            tool_profile: $tool_profile,
+            tools: $tools,
+            reasoning_effort: $reasoning_effort,
+            prompt_cache_key: $prompt_cache_key,
+            session_id: $session_id,
+        );
+        let mut request = $crate::ProviderCompactionRequest::new(input);
+        request.compaction_instructions = $compaction_instructions;
+        request
+    }};
+}
+
+#[cfg(test)]
+macro_rules! test_token_count_request {
+    (
+        model: $model:expr,
+        prompt: $prompt:expr,
+        transcript: $transcript:expr,
+        tool_profile: $tool_profile:expr,
+        tools: $tools:expr,
+        max_tokens: $max_tokens:expr,
+        reasoning_effort: $reasoning_effort:expr,
+        prompt_cache_key: $prompt_cache_key:expr,
+        session_id: $session_id:expr $(,)?
+    ) => {{
+        let mut request = $crate::ProviderTokenCountRequest::new(test_provider_model_input!(
+            model: $model,
+            prompt: $prompt,
+            transcript: $transcript,
+            tool_profile: $tool_profile,
+            tools: $tools,
+            reasoning_effort: $reasoning_effort,
+            prompt_cache_key: $prompt_cache_key,
+            session_id: $session_id,
+        ));
+        request.max_tokens = $max_tokens;
+        request
+    }};
+}
 
 pub mod anthropic;
 mod common;
@@ -24,10 +149,106 @@ pub use token_estimator::{
 };
 pub use transcript::normalize_transcript_for_provider;
 
+/// Immutable provider-visible input shared by generation, accounting, and
+/// retry operations.
+///
+/// Large prompt, transcript, and tool projections are independently
+/// reference-counted so a request that changes small routing metadata can
+/// retain the same provider-visible allocations.
+#[derive(Debug, Clone)]
+pub struct ProviderModelInput {
+    model: Arc<str>,
+    prompt: Arc<PromptSections>,
+    transcript: Arc<[ModelTranscriptEntry]>,
+    tool_profile: ProviderToolProfile,
+    tools: Arc<[ProviderTool]>,
+    reasoning_effort: ReasoningEffort,
+    prompt_cache_key: Option<Arc<str>>,
+    session_id: Option<Arc<str>>,
+}
+
+impl ProviderModelInput {
+    pub fn new(
+        model: impl Into<String>,
+        prompt: PromptSections,
+        transcript: Vec<ModelTranscriptEntry>,
+        tool_profile: ProviderToolProfile,
+        tools: Vec<ProviderTool>,
+        reasoning_effort: ReasoningEffort,
+    ) -> Self {
+        Self {
+            model: Arc::from(model.into()),
+            prompt: Arc::new(prompt),
+            transcript: transcript.into(),
+            tool_profile,
+            tools: tools.into(),
+            reasoning_effort,
+            prompt_cache_key: None,
+            session_id: None,
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn prompt(&self) -> &PromptSections {
+        &self.prompt
+    }
+
+    pub fn transcript(&self) -> &[ModelTranscriptEntry] {
+        &self.transcript
+    }
+
+    pub fn tool_profile(&self) -> ProviderToolProfile {
+        self.tool_profile
+    }
+
+    pub fn tools(&self) -> &[ProviderTool] {
+        &self.tools
+    }
+
+    pub fn reasoning_effort(&self) -> ReasoningEffort {
+        self.reasoning_effort
+    }
+
+    pub fn prompt_cache_key(&self) -> Option<&str> {
+        self.prompt_cache_key.as_deref()
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    pub fn with_prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
+        self.prompt_cache_key = Some(Arc::from(prompt_cache_key.into()));
+        self
+    }
+
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(Arc::from(session_id.into()));
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    fn set_prompt_cache_key(&mut self, prompt_cache_key: impl Into<String>) {
+        self.prompt_cache_key = Some(Arc::from(prompt_cache_key.into()));
+    }
+
+    fn set_session_id_if_missing(&mut self, session_id: impl Into<String>) {
+        self.session_id
+            .get_or_insert_with(|| Arc::from(session_id.into()));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
-    pub model: String,
-    pub prompt: PromptSections,
+    input: Arc<ProviderModelInput>,
+    transcript_suffix: Arc<[ModelTranscriptEntry]>,
     /// If set, providers that support transcript cache markers should place
     /// those markers only within the first `n` transcript entries.
     ///
@@ -36,29 +257,55 @@ pub struct ModelRequest {
     /// provider-visible prefix stays identical to the regular request, and the
     /// sidecar-only suffix does not become the cache breakpoint.
     pub transcript_cache_prefix_len: Option<usize>,
-    pub transcript: Vec<ModelTranscriptEntry>,
-    pub tool_profile: ProviderToolProfile,
-    pub tools: Vec<ProviderTool>,
     pub max_tokens: Option<u32>,
-    pub reasoning_effort: ReasoningEffort,
-    /// Explicit override for the provider's prompt-cache routing key. OpenAI
-    /// uses this first, then falls back to the request/session routing id. When
-    /// neither the request nor provider session state carries an id, OpenAI
-    /// generates a fresh UUID for CLI/test paths before building the body.
-    pub prompt_cache_key: Option<String>,
-    /// Stable identifier for the pi-relay session that owns this request.
-    /// Mirrors Codex CLI's `thread_id` semantics: it doubles as the prompt
-    /// cache key when no explicit override is set (so each session gets its
-    /// own routing bucket and stays
-    /// under OpenAI's ~15 RPM per-shard ceiling) and as the value of the
-    /// `session_id` / `thread_id` / `x-client-request-id` headers.
-    pub session_id: Option<String>,
     /// Turn identifier for the user turn that owns this model request.
     ///
     /// Codex treats `x-codex-turn-state` as turn-scoped sticky routing state:
     /// any value returned by an upstream request should be replayed by later
     /// requests for the same turn, but must not leak into future turns.
     pub turn_id: Option<TurnId>,
+}
+
+impl ModelRequest {
+    pub fn new(input: Arc<ProviderModelInput>) -> Self {
+        Self {
+            input,
+            transcript_suffix: Arc::from([]),
+            transcript_cache_prefix_len: None,
+            max_tokens: None,
+            turn_id: None,
+        }
+    }
+
+    pub fn transcript_suffix(&self) -> &[ModelTranscriptEntry] {
+        &self.transcript_suffix
+    }
+
+    pub fn with_transcript_suffix(mut self, suffix: Vec<ModelTranscriptEntry>) -> Self {
+        self.transcript_suffix = suffix.into();
+        self
+    }
+
+    pub fn with_turn_id(mut self, turn_id: TurnId) -> Self {
+        self.turn_id = Some(turn_id);
+        self
+    }
+
+    pub fn set_prompt_cache_key(&mut self, prompt_cache_key: impl Into<String>) {
+        Arc::make_mut(&mut self.input).set_prompt_cache_key(prompt_cache_key);
+    }
+
+    pub fn set_session_id_if_missing(&mut self, session_id: impl Into<String>) {
+        Arc::make_mut(&mut self.input).set_session_id_if_missing(session_id);
+    }
+}
+
+impl Deref for ModelRequest {
+    type Target = ProviderModelInput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,18 +334,33 @@ impl std::fmt::Display for NativeCompactionErrorKind {
 
 #[derive(Debug, Clone)]
 pub struct ProviderCompactionRequest {
-    pub model: String,
-    pub prompt: PromptSections,
-    pub transcript: Vec<ModelTranscriptEntry>,
-    pub tool_profile: ProviderToolProfile,
-    pub tools: Vec<ProviderTool>,
-    pub reasoning_effort: ReasoningEffort,
-    pub prompt_cache_key: Option<String>,
-    pub session_id: Option<String>,
+    input: Arc<ProviderModelInput>,
     /// Provider-native summary instructions. Providers with a dedicated
     /// compaction endpoint may ignore this when their wire contract derives
     /// instructions from `prompt`.
     pub compaction_instructions: Option<String>,
+}
+
+impl ProviderCompactionRequest {
+    pub fn new(input: Arc<ProviderModelInput>) -> Self {
+        Self {
+            input,
+            compaction_instructions: None,
+        }
+    }
+
+    pub fn with_compaction_instructions(mut self, compaction_instructions: String) -> Self {
+        self.compaction_instructions = Some(compaction_instructions);
+        self
+    }
+}
+
+impl Deref for ProviderCompactionRequest {
+    type Target = ProviderModelInput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,15 +374,25 @@ pub struct ProviderCompactionResponse {
 
 #[derive(Debug, Clone)]
 pub struct ProviderTokenCountRequest {
-    pub model: String,
-    pub prompt: PromptSections,
-    pub transcript: Vec<ModelTranscriptEntry>,
-    pub tool_profile: ProviderToolProfile,
-    pub tools: Vec<ProviderTool>,
+    input: Arc<ProviderModelInput>,
     pub max_tokens: Option<u32>,
-    pub reasoning_effort: ReasoningEffort,
-    pub prompt_cache_key: Option<String>,
-    pub session_id: Option<String>,
+}
+
+impl ProviderTokenCountRequest {
+    pub fn new(input: Arc<ProviderModelInput>) -> Self {
+        Self {
+            input,
+            max_tokens: None,
+        }
+    }
+}
+
+impl Deref for ProviderTokenCountRequest {
+    type Target = ProviderModelInput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,12 +435,12 @@ impl ProviderToolProfile {
 
 fn effective_provider_tools(
     profile: ProviderToolProfile,
-    tools: Vec<ProviderTool>,
-) -> Vec<ProviderTool> {
+    tools: &[ProviderTool],
+) -> Cow<'_, [ProviderTool]> {
     if !tools.is_empty() {
-        return tools;
+        return Cow::Borrowed(tools);
     }
-    match profile {
+    Cow::Owned(match profile {
         ProviderToolProfile::OpenAiCoding => {
             ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::OpenAi)
         }
@@ -176,7 +448,7 @@ fn effective_provider_tools(
             ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::Claude)
         }
         ProviderToolProfile::None | ProviderToolProfile::CustomDefinitions => Vec::new(),
-    }
+    })
 }
 
 impl ModelTranscriptEntry {
@@ -519,6 +791,37 @@ pub trait ModelProvider: Send + Sync {
 mod provider_error_tests {
     use super::*;
     use agent_vocab::{ReplayDisplay, ReplayDisplayKind};
+
+    #[test]
+    fn operation_requests_share_one_logical_input_allocation() {
+        let input = Arc::new(ProviderModelInput::new(
+            "test-model",
+            PromptSections::stable("stable prompt"),
+            vec![
+                TranscriptItem::UserMessage(agent_vocab::UserMessage::text("large transcript"))
+                    .into(),
+            ],
+            ProviderToolProfile::None,
+            Vec::new(),
+            ReasoningEffort::Medium,
+        ));
+        let generation = ModelRequest::new(input.clone());
+        let count = ProviderTokenCountRequest::new(input.clone());
+        let compaction = ProviderCompactionRequest::new(input.clone());
+        let sidecar_input = input
+            .as_ref()
+            .clone()
+            .with_reasoning_effort(ReasoningEffort::Low);
+
+        assert!(std::ptr::eq::<ProviderModelInput>(&*generation, &*count));
+        assert!(std::ptr::eq::<ProviderModelInput>(
+            &*generation,
+            &*compaction
+        ));
+        assert!(Arc::ptr_eq(&input.prompt, &sidecar_input.prompt));
+        assert!(Arc::ptr_eq(&input.transcript, &sidecar_input.transcript));
+        assert!(Arc::ptr_eq(&input.tools, &sidecar_input.tools));
+    }
 
     #[test]
     fn context_overflow_classifier_matches_known_provider_messages() {

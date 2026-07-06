@@ -29,13 +29,11 @@ pub(crate) async fn run_model_sidecar(
 ) -> Result<ModelResponse> {
     let sidecar_session_id = request.sidecar_session_id;
     let mut model_request = request.request;
-    model_request.prompt_cache_key = Some(request.prompt_cache_key);
+    model_request.set_prompt_cache_key(request.prompt_cache_key);
     // Preserve an owner session id when the caller built the sidecar from a
     // normal model request; providers use that id as part of cache routing. If
     // there is no owner session, isolate the request under the sidecar id.
-    model_request
-        .session_id
-        .get_or_insert_with(|| sidecar_session_id.clone());
+    model_request.set_session_id_if_missing(sidecar_session_id.clone());
     model_request.turn_id = None;
     let result =
         async { complete_model_request(state, config, &sidecar_session_id, model_request).await }

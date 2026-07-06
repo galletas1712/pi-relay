@@ -28,8 +28,10 @@ pub(crate) use prompt::{
 };
 pub(crate) use provider::model_metadata_for_config;
 #[cfg(test)]
+pub(crate) use requests::build_model_request;
+#[cfg(test)]
 pub(crate) use requests::injected_provider_start_count;
-pub(crate) use requests::{build_model_request, run_model};
+pub(crate) use requests::{build_provider_model_input, run_model};
 pub(crate) use session_titles::{
     schedule_session_title_refresh_for_model_turn, SessionTitleScheduler,
 };

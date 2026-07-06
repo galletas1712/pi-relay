@@ -160,14 +160,12 @@ fn spawn_claimed_dispatch(
             {
                 std::future::pending::<()>().await;
             }
-            match dispatch.action.clone() {
-                SessionAction::RequestModel { .. } => {
-                    run_model_turn(task_state.clone(), session_id.clone(), dispatch).await
-                }
-                SessionAction::RequestTool { .. } => {
-                    run_tool_turn(task_state.clone(), session_id.clone(), dispatch).await
-                }
-                SessionAction::CancelSessionWork => Ok(()),
+            if matches!(&dispatch.action, SessionAction::RequestModel { .. }) {
+                run_model_turn(task_state.clone(), session_id.clone(), dispatch).await
+            } else if matches!(&dispatch.action, SessionAction::RequestTool { .. }) {
+                run_tool_turn(task_state.clone(), session_id.clone(), dispatch).await
+            } else {
+                Ok(())
             }
         })
         .catch_unwind();

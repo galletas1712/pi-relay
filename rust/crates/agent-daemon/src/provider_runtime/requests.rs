@@ -1,4 +1,6 @@
-use agent_provider::{ModelRequest, ModelResponse, ProviderToolProfile};
+use std::sync::Arc;
+
+use agent_provider::{ModelRequest, ModelResponse, ProviderModelInput, ProviderToolProfile};
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
 use agent_vocab::TurnId;
@@ -10,7 +12,7 @@ use crate::state::AppState;
 use super::auth_retry::complete_with_auth_retry;
 use super::prompt::{assemble_agent_prompt, effective_prompt_profile, provider_tools_for_session};
 use super::provider::provider_for_config;
-use super::transcript::provider_transcript;
+use super::transcript::provider_transcript_owned;
 
 pub(crate) fn model_prompt_cache_key(config: &SessionConfig, session_id: &str) -> String {
     config
@@ -25,14 +27,17 @@ pub(crate) async fn run_model(
     config: &SessionConfig,
     session_id: &str,
     turn_id: TurnId,
-    model_context: ModelContext,
+    input: Arc<ProviderModelInput>,
 ) -> Result<ModelResponse> {
     #[cfg(test)]
     if let Some(result) = injected_model_result(config, session_id) {
         return result;
     }
-    let request =
-        build_model_request(state, config, session_id, Some(turn_id), model_context).await?;
+    let mut request = ModelRequest::new(input).with_turn_id(turn_id);
+    // Provider adapters apply authoritative discovered/static output
+    // ceilings. Do not pre-clamp here or stale daemon metadata could override
+    // a newer Models API result.
+    request.max_tokens = config.provider.max_tokens;
     complete_model_request(state, config, session_id, request).await
 }
 
@@ -108,34 +113,47 @@ pub(crate) fn injected_provider_start_count(session_id: &str) -> usize {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 pub(crate) async fn build_model_request(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
     turn_id: Option<TurnId>,
-    model_context: ModelContext,
+    model_context: &ModelContext,
 ) -> Result<ModelRequest> {
+    let input =
+        build_provider_model_input(state, config, session_id, model_context.clone()).await?;
+    let mut request = ModelRequest::new(input);
+    if let Some(turn_id) = turn_id {
+        request = request.with_turn_id(turn_id);
+    }
+    request.max_tokens = config.provider.max_tokens;
+    Ok(request)
+}
+
+pub(crate) async fn build_provider_model_input(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+    model_context: ModelContext,
+) -> Result<Arc<ProviderModelInput>> {
     let prompt = assemble_agent_prompt(state, config, session_id).await?;
-    Ok(ModelRequest {
-        model: config.provider.model.clone(),
-        transcript_cache_prefix_len: None,
-        prompt,
-        transcript: provider_transcript(model_context),
-        tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: provider_tools_for_session(
-            state,
-            config.provider.kind,
-            effective_prompt_profile(state, config, session_id).await?,
-        ),
-        // Provider adapters apply authoritative discovered/static output
-        // ceilings. Do not pre-clamp here or stale daemon metadata could
-        // override a newer Models API result.
-        max_tokens: config.provider.max_tokens,
-        reasoning_effort: config.provider.reasoning_effort,
-        prompt_cache_key: Some(model_prompt_cache_key(config, session_id)),
-        session_id: Some(session_id.to_string()),
-        turn_id,
-    })
+    Ok(Arc::new(
+        ProviderModelInput::new(
+            config.provider.model.clone(),
+            prompt,
+            provider_transcript_owned(model_context),
+            ProviderToolProfile::for_provider(config.provider.kind),
+            provider_tools_for_session(
+                state,
+                config.provider.kind,
+                effective_prompt_profile(state, config, session_id).await?,
+            ),
+            config.provider.reasoning_effort,
+        )
+        .with_prompt_cache_key(model_prompt_cache_key(config, session_id))
+        .with_session_id(session_id),
+    ))
 }
 
 pub(super) async fn complete_model_request(

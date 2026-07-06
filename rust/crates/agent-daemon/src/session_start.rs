@@ -217,6 +217,8 @@ async fn start_prepared_session_with_driver(
         )
         .await?;
     runtime.persisted_active_leaf_id.clone_from(&active_leaf_id);
+    drop(events);
+    drop(actions);
 
     if frames.is_empty() {
         return Ok(StartedSession {
@@ -227,7 +229,7 @@ async fn start_prepared_session_with_driver(
             dispatches: Vec::new(),
         });
     }
-    let dispatches = attach_dispatch_config(persisted_actions, &config);
+    let mut dispatches = attach_dispatch_config(persisted_actions, &config);
 
     state
         .active
@@ -236,7 +238,9 @@ async fn start_prepared_session_with_driver(
         .insert(session_id.clone(), Arc::new(Mutex::new(runtime)));
     publish_events(state, frames);
     match dispatch_mode {
-        PreparedSessionDispatchMode::Auto => driver.dispatch(dispatches.clone()).await?,
+        PreparedSessionDispatchMode::Auto => {
+            driver.dispatch(std::mem::take(&mut dispatches)).await?
+        }
         PreparedSessionDispatchMode::Deferred => {}
     }
 

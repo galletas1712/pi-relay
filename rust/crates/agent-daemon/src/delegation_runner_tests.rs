@@ -10,9 +10,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use agent_core::AgentInput;
 use agent_provider::{ModelResponse, ModelStopDetails, ModelStopReason, ModelTranscriptEntry};
 use agent_session::{
-    AgentSession, ModelContext, ModelContextEntry, SessionAction, TranscriptStorageNode,
+    AgentSession, ModelContext, ModelContextEntry, SessionAction, SessionEvent,
+    TranscriptStorageNode,
 };
 use agent_store::{
     ActionKind, ActionStatus, ActionUpdate, CompactionCompletion, CompactionScope,
@@ -67,15 +69,14 @@ use crate::provider_runtime::{
     CompactionOutput, CompactionSummaryKind, ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::{
-    apply_model_response, recover_post_compaction_dispatches_on_boot, runner_start_count,
-    take_tasks, SessionDriver,
+    apply_model_response, collect_runtime_outputs, recover_post_compaction_dispatches_on_boot,
+    runner_start_count, take_tasks, SessionDriver,
 };
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart,
 };
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
-use crate::types::DispatchAction;
-use crate::types::RuntimeSession;
+use crate::types::{DispatchAction, ModelDispatchInput, RuntimeSession};
 use crate::workspaces::WorkspaceManager;
 
 use super::{
@@ -350,10 +351,152 @@ async fn empty_dispatch_stops_after_the_pending_query() {
         .await
         .expect("missing session has no pending actions");
 
-    assert!(dispatched.is_empty());
+    assert_eq!(dispatched, 0);
     assert_eq!(runner_start_count(session_id, "model"), 0);
     assert_eq!(runner_start_count(session_id, "tool"), 0);
     assert!(env.state.tasks.lock().expect("tasks lock").is_empty());
+    drop(driver);
+    env.cleanup().await;
+}
+
+fn model_user_text_ptr(action: &SessionAction) -> *const u8 {
+    let SessionAction::RequestModel { model_context, .. } = action else {
+        panic!("expected model action");
+    };
+    let Some(TranscriptItem::UserMessage(message)) = model_context.transcript_items().last() else {
+        panic!("expected model context to end in a user message");
+    };
+    message
+        .as_text()
+        .expect("expected text-only user message")
+        .as_ptr()
+}
+
+#[tokio::test]
+async fn fresh_model_context_is_shallow_through_persistence_and_moves_at_provider_gate() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let session_id = "fresh-model-context-owned-projection";
+    let content = UserMessage::text("ordinary persisted model input ".repeat(4_096));
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "model context ownership", &[], json!({}))
+        .await
+        .expect("create project");
+    let config = session_config(
+        &env,
+        project_id,
+        json!({
+            "compaction": { "config": { "auto_enabled": false } },
+            "auto_title_disabled": true,
+        }),
+    );
+    let mut runtime = RuntimeSession {
+        session: AgentSession::new(),
+        config: config.clone(),
+        persisted_active_leaf_id: None,
+    };
+    runtime
+        .session
+        .enqueue_input(AgentInput::follow_up_message(content.clone()))
+        .expect("fresh input is accepted");
+
+    let (entries, events, actions, active_leaf_id) = collect_runtime_outputs(&mut runtime);
+    let action = actions.first().expect("fresh input requests a model");
+    let SessionEvent::ActionRequested {
+        action: event_action,
+    } = events
+        .iter()
+        .find(|event| matches!(event, SessionEvent::ActionRequested { .. }))
+        .expect("action requested event")
+    else {
+        unreachable!()
+    };
+    let context_text_ptr = model_user_text_ptr(action);
+    assert_eq!(model_user_text_ptr(event_action), context_text_ptr);
+
+    let (_, mut persisted_actions) = env
+        .state
+        .repo
+        .start_session_outputs(
+            session_id,
+            &config,
+            &entries,
+            active_leaf_id.as_deref(),
+            &events,
+            &actions,
+            InputPriority::FollowUp,
+            &content,
+            None,
+        )
+        .await
+        .expect("fresh outputs persist");
+    let persisted = persisted_actions
+        .pop()
+        .expect("persistence returns the dispatch action");
+    assert_eq!(persisted.action, *action);
+    assert_eq!(model_user_text_ptr(&persisted.action), context_text_ptr);
+    drop(events);
+    drop(actions);
+
+    let mut dispatch = DispatchAction {
+        row_id: persisted.row_id,
+        attempt_id: persisted.attempt_id,
+        post_compaction_dispatch_lease: None,
+        action: persisted.action,
+        config,
+        model_input: ModelDispatchInput::Unmaterialized,
+    };
+    let action_identity = match &dispatch.action {
+        SessionAction::RequestModel {
+            action_id,
+            turn_id,
+            context_leaf_id,
+            ..
+        } => (*action_id, *turn_id, context_leaf_id.clone()),
+        SessionAction::RequestTool { .. } | SessionAction::CancelSessionWork => unreachable!(),
+    };
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    assert!(driver
+        .gate_model_dispatch(&mut dispatch)
+        .await
+        .expect("ordinary model dispatch passes the gate"));
+
+    let SessionAction::RequestModel {
+        action_id,
+        turn_id,
+        model_context,
+        context_leaf_id,
+    } = &dispatch.action
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (*action_id, *turn_id, context_leaf_id.clone()),
+        action_identity
+    );
+    assert_eq!(model_context, &ModelContext::new());
+    let ModelDispatchInput::Shared(input) = &dispatch.model_input else {
+        panic!("provider input was materialized at the dispatch gate");
+    };
+    let Some(ModelTranscriptEntry {
+        item: TranscriptItem::UserMessage(message),
+        ..
+    }) = input.transcript().last()
+    else {
+        panic!("provider input should end in the user message");
+    };
+    assert_eq!(
+        message
+            .as_text()
+            .expect("expected text-only provider message")
+            .as_ptr(),
+        context_text_ptr
+    );
+
     drop(driver);
     env.cleanup().await;
 }
@@ -407,9 +550,7 @@ async fn nonempty_dispatch_still_resolves_and_dispatches_the_action() {
         .await
         .expect("pending action dispatches");
 
-    assert_eq!(dispatched.len(), 1);
-    assert_eq!(dispatched[0].action, action);
-    assert_eq!(dispatched[0].config.project_id, Some(project_id));
+    assert_eq!(dispatched, 1);
     drop(driver);
     env.cleanup().await;
 }
@@ -797,6 +938,7 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
             .load_session_config(session_id)
             .await
             .expect("load recovered config"),
+        model_input: crate::types::ModelDispatchInput::Unmaterialized,
     };
     apply_model_response(
         &restarted_state,
@@ -2237,6 +2379,7 @@ async fn unexpected_ordinary_turn_stops_discard_partial_content_and_replay() {
                 project_id,
                 json!({ "created_by": "test", "harness": true }),
             ),
+            model_input: crate::types::ModelDispatchInput::Unmaterialized,
         };
         apply_model_response(
             &env.state,
@@ -3897,11 +4040,17 @@ async fn structural_subagent_stays_subagent_profile_after_session_configure() {
         .expect("subagent config");
     config.metadata = json!({ "prompt_profile": "parent" });
     config.system_prompt = "Subagent prompt".to_string();
-    let request = build_model_request(&env.state, &config, "impl_child", None, ModelContext::new())
-        .await
-        .expect("build structurally-subagent model request");
+    let request = build_model_request(
+        &env.state,
+        &config,
+        "impl_child",
+        None,
+        &ModelContext::new(),
+    )
+    .await
+    .expect("build structurally-subagent model request");
     let request_tool_names = request
-        .tools
+        .tools()
         .iter()
         .map(|tool| tool.canonical_name.clone())
         .collect::<Vec<_>>();
@@ -4282,32 +4431,32 @@ async fn parent_model_context_does_not_inject_current_delegations() {
         .await
         .expect("parent config");
     config.system_prompt = "PI stable prompt".to_string();
-    let request = build_model_request(&env.state, &config, "parent", None, ModelContext::new())
+    let request = build_model_request(&env.state, &config, "parent", None, &ModelContext::new())
         .await
         .expect("build model request");
 
     assert_eq!(
-        request.prompt.stable_prefix.as_deref(),
+        request.prompt().stable_prefix.as_deref(),
         Some("PI stable prompt")
     );
     assert!(
-        request.prompt.dynamic_context.is_none(),
+        request.prompt().dynamic_context.is_none(),
         "normal parent turns should not receive current-delegations dynamic context"
     );
     assert_eq!(
-        request.prompt.render_joined().as_deref(),
+        request.prompt().render_joined().as_deref(),
         Some("PI stable prompt")
     );
     assert!(
         !request
-            .prompt
+            .prompt()
             .render_joined()
             .unwrap_or_default()
             .contains("## Current delegations"),
         "normal parent prompt must be stable PI/system prompt only"
     );
     let parent_tool_names = request
-        .tools
+        .tools()
         .iter()
         .map(|tool| tool.canonical_name.as_str())
         .collect::<Vec<_>>();
@@ -4348,24 +4497,24 @@ async fn subagent_model_context_does_not_get_parent_delegation_summary() {
         .await
         .expect("subagent config");
     config.system_prompt = "Subagent PI prompt".to_string();
-    let request = build_model_request(&env.state, &config, "impl_busy", None, ModelContext::new())
+    let request = build_model_request(&env.state, &config, "impl_busy", None, &ModelContext::new())
         .await
         .expect("build subagent model request");
 
     assert_eq!(
-        request.prompt.stable_prefix.as_deref(),
+        request.prompt().stable_prefix.as_deref(),
         Some("Subagent PI prompt")
     );
     assert!(
-        request.prompt.dynamic_context.is_none(),
+        request.prompt().dynamic_context.is_none(),
         "subagents should not receive parent current-delegations context"
     );
     assert_eq!(
-        request.prompt.render_joined().as_deref(),
+        request.prompt().render_joined().as_deref(),
         Some("Subagent PI prompt")
     );
     let subagent_tool_names = request
-        .tools
+        .tools()
         .iter()
         .map(|tool| tool.canonical_name.as_str())
         .collect::<Vec<_>>();
@@ -4560,14 +4709,14 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         .expect("build native compaction request");
 
     assert_eq!(
-        native_request.prompt.stable_prefix.as_deref(),
+        native_request.prompt().stable_prefix.as_deref(),
         Some("PI stable prompt")
     );
     assert!(
-        native_request.prompt.dynamic_context.is_none(),
+        native_request.prompt().dynamic_context.is_none(),
         "compaction ledger must not be PromptSections.dynamic_context"
     );
-    let native_input_texts = compaction_input_texts(&native_request.transcript);
+    let native_input_texts = compaction_input_texts(native_request.transcript());
     assert!(native_input_texts
         .iter()
         .any(|text| text.contains("older provider summary")));
@@ -4735,11 +4884,11 @@ async fn subagent_compaction_excludes_parent_delegation_ledger_and_sibling_state
     .await
     .expect("build native subagent compaction request");
     assert_eq!(
-        native_request.transcript.len(),
+        native_request.transcript().len(),
         2,
         "subagent native compaction should not append parent delegation state"
     );
-    let native_joined = user_texts(&native_request.transcript).join("\n\n");
+    let native_joined = user_texts(native_request.transcript()).join("\n\n");
     assert!(native_joined.contains("delegated task context"));
     assert!(!native_joined.contains("## Delegation state at compaction time"));
     assert!(!native_joined.contains("## Current delegations"));

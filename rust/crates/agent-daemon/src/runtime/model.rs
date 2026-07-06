@@ -1,12 +1,14 @@
 use agent_core::AgentInput;
-use agent_session::{ModelContext, SessionAction, SessionInput};
+use agent_session::{SessionAction, SessionInput};
 use agent_store::{ActionStatus, ActionUpdate};
 use agent_vocab::TurnId;
 use serde_json::{json, Value};
 
-use crate::provider_runtime::{run_model, schedule_session_title_refresh_for_model_turn};
+use crate::provider_runtime::{
+    build_provider_model_input, run_model, schedule_session_title_refresh_for_model_turn,
+};
 use crate::state::AppState;
-use crate::types::{DispatchAction, RpcError};
+use crate::types::{DispatchAction, ModelDispatchInput, RpcError};
 
 use super::SessionDriver;
 
@@ -15,26 +17,30 @@ const MODEL_PROVIDER_MAX_ATTEMPTS: usize = 5;
 pub(super) async fn run_model_turn(
     state: AppState,
     session_id: String,
-    dispatch: DispatchAction,
+    mut dispatch: DispatchAction,
 ) -> std::result::Result<(), RpcError> {
-    let original_action = dispatch.action.clone();
     let SessionAction::RequestModel {
-        action_id,
-        turn_id,
-        model_context,
-        context_leaf_id,
-    } = original_action
+        action_id, turn_id, ..
+    } = &dispatch.action
     else {
         return Ok(());
     };
-    let dispatch = DispatchAction {
-        action: SessionAction::RequestModel {
-            action_id,
-            turn_id,
-            model_context: model_context.clone(),
-            context_leaf_id,
-        },
-        ..dispatch
+    let action_id = *action_id;
+    let turn_id = *turn_id;
+    let input = match std::mem::take(&mut dispatch.model_input) {
+        ModelDispatchInput::Shared(input) => input,
+        ModelDispatchInput::Unmaterialized => {
+            let SessionAction::RequestModel { model_context, .. } = &mut dispatch.action else {
+                unreachable!()
+            };
+            build_provider_model_input(
+                &state,
+                &dispatch.config,
+                &session_id,
+                std::mem::take(model_context),
+            )
+            .await?
+        }
     };
     // Title generation is a sidecar fork at the same transcript checkpoint as
     // the model turn: immediately after the user message, before assistant
@@ -44,12 +50,11 @@ pub(super) async fn run_model_turn(
         session_id.clone(),
         &dispatch.config,
         turn_id,
-        &model_context,
+        input.clone(),
     );
 
     let result =
-        run_model_for_action_with_retries(&state, &session_id, &dispatch, turn_id, model_context)
-            .await?;
+        run_model_for_action_with_retries(&state, &session_id, &dispatch, turn_id, input).await?;
     let driver = SessionDriver::acquire(&state, &session_id).await;
     if !state
         .repo
@@ -276,7 +281,7 @@ async fn run_model_for_action_with_retries(
     session_id: &str,
     dispatch: &DispatchAction,
     turn_id: TurnId,
-    model_context: ModelContext,
+    input: std::sync::Arc<agent_provider::ProviderModelInput>,
 ) -> std::result::Result<
     std::result::Result<agent_provider::ModelResponse, ModelProviderFailure>,
     RpcError,
@@ -299,14 +304,7 @@ async fn run_model_for_action_with_retries(
                 "action attempt is no longer running",
             ));
         }
-        let result = run_model(
-            state,
-            &dispatch.config,
-            session_id,
-            turn_id,
-            model_context.clone(),
-        )
-        .await;
+        let result = run_model(state, &dispatch.config, session_id, turn_id, input.clone()).await;
         match result {
             Ok(response) => return Ok(Ok(response)),
             Err(error) => {

@@ -7,8 +7,9 @@ use agent_store::{
 use agent_vocab::TranscriptItem;
 
 use crate::provider_runtime::{
-    compaction_auto_state, compaction_config_with_model_metadata, model_input_tokens_for_gate,
-    model_metadata_for_config, parse_compaction_policy, run_compaction,
+    build_provider_model_input, compaction_auto_state, compaction_config_with_model_metadata,
+    model_input_tokens_for_gate, model_metadata_for_config, parse_compaction_policy,
+    run_compaction,
 };
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
@@ -22,39 +23,60 @@ use super::tasks::{
 use super::{history_error_to_rpc, session_uses_harness, SessionDriver};
 
 impl SessionDriver {
-    pub(super) async fn gate_model_dispatch(
+    pub(crate) async fn gate_model_dispatch(
         &self,
-        dispatch: &DispatchAction,
+        dispatch: &mut DispatchAction,
     ) -> std::result::Result<bool, RpcError> {
+        if session_uses_harness(&dispatch.config) {
+            return Ok(true);
+        }
+        let bare_compacted_root = match &dispatch.action {
+            SessionAction::RequestModel { model_context, .. } => matches!(
+                model_context.transcript_items().last(),
+                Some(TranscriptItem::CompactionSummary(_))
+            ),
+            SessionAction::RequestTool { .. } | SessionAction::CancelSessionWork => {
+                return Ok(true);
+            }
+        };
+        let model_context = match &mut dispatch.action {
+            SessionAction::RequestModel { model_context, .. } => std::mem::take(model_context),
+            SessionAction::RequestTool { .. } | SessionAction::CancelSessionWork => unreachable!(),
+        };
+        let input = build_provider_model_input(
+            &self.state,
+            &dispatch.config,
+            &self.session_id,
+            model_context,
+        )
+        .await?;
         let Some(eligible) =
             check_compaction_eligible(&self.state, &self.session_id, dispatch).await
         else {
+            dispatch.model_input = crate::types::ModelDispatchInput::Shared(input);
             return Ok(true);
         };
         let Some(limit) = eligible.limit else {
-            return Ok(true);
-        };
-        let SessionAction::RequestModel {
-            model_context,
-            context_leaf_id,
-            ..
-        } = &dispatch.action
-        else {
+            dispatch.model_input = crate::types::ModelDispatchInput::Shared(input);
             return Ok(true);
         };
         // A bare compacted root is already the smallest possible transcript.
-        if matches!(
-            model_context.transcript_items().last(),
-            Some(TranscriptItem::CompactionSummary(_))
-        ) {
+        if bare_compacted_root {
+            dispatch.model_input = crate::types::ModelDispatchInput::Shared(input);
             return Ok(true);
         }
+        let SessionAction::RequestModel {
+            context_leaf_id, ..
+        } = &dispatch.action
+        else {
+            unreachable!()
+        };
         let tokens = match model_input_tokens_for_gate(
             &self.state,
             &dispatch.config,
             &self.session_id,
             context_leaf_id.as_deref(),
-            model_context.clone(),
+            input.clone(),
         )
         .await
         {
@@ -69,6 +91,7 @@ impl SessionDriver {
             }
         };
         if tokens < limit {
+            dispatch.model_input = crate::types::ModelDispatchInput::Shared(input);
             return Ok(true);
         }
 
@@ -405,22 +428,15 @@ async fn run_compaction_job(
                 return Ok(());
             }
         };
-        let dispatch = DispatchAction {
-            row_id: resumed.row_id.clone(),
-            attempt_id: resumed.attempt_id.clone(),
-            post_compaction_dispatch_lease: None,
-            action: resumed.action.clone(),
-            config: resumed_config,
-        };
         // Harness sessions deliberately expose pending model actions to the
         // development RPC instead of owning an internal runner.
-        if session_uses_harness(&dispatch.config) {
+        if session_uses_harness(&resumed_config) {
             return Ok(());
         }
         let intent = agent_store::PostCompactionDispatchIntent {
             session_id: session_id.clone(),
-            row_id: dispatch.row_id.clone(),
-            attempt_id: dispatch.attempt_id.clone(),
+            row_id: resumed.row_id.clone(),
+            attempt_id: resumed.attempt_id.clone(),
         };
         let claimed = match state
             .repo
@@ -470,7 +486,8 @@ async fn run_compaction_job(
             attempt_id: claimed.pending.attempt_id,
             post_compaction_dispatch_lease: Some(claimed.lease),
             action: claimed.pending.action,
-            config: dispatch.config,
+            config: resumed_config,
+            model_input: crate::types::ModelDispatchInput::Unmaterialized,
         };
         let lease = dispatch.post_compaction_dispatch_lease.clone();
         let registration_id =
