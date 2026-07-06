@@ -1,7 +1,7 @@
 use agent_tools::limit_tool_output;
-use agent_vocab::{ProviderReplayItem, TranscriptItem};
+use agent_vocab::{ProviderKind, ProviderReplayItem, ToolCall, TranscriptItem};
 
-use crate::{canonical_tool_call_for_provider, ModelTranscriptEntry};
+use crate::{canonical_tool_name_for_provider, ModelTranscriptEntry};
 
 pub fn normalize_transcript_for_provider(
     transcript: Vec<ModelTranscriptEntry>,
@@ -39,16 +39,27 @@ fn normalize_transcript_item_for_provider(
         TranscriptItem::AssistantMessage(mut message) => {
             for item in &mut message.items {
                 if let agent_vocab::AssistantItem::ToolCall(call) = item {
-                    *call = canonical_tool_call_for_provider(provider, call);
+                    canonicalize_owned_tool_call_for_provider(provider, call);
                 }
             }
             TranscriptItem::AssistantMessage(message)
         }
-        TranscriptItem::ToolCallStarted { turn_id, tool_call } => TranscriptItem::ToolCallStarted {
+        TranscriptItem::ToolCallStarted {
             turn_id,
-            tool_call: canonical_tool_call_for_provider(provider, &tool_call),
-        },
+            mut tool_call,
+        } => {
+            canonicalize_owned_tool_call_for_provider(provider, &mut tool_call);
+            TranscriptItem::ToolCallStarted { turn_id, tool_call }
+        }
         item => item,
+    }
+}
+
+fn canonicalize_owned_tool_call_for_provider(provider: ProviderKind, call: &mut ToolCall) {
+    let tool_name = canonical_tool_name_for_provider(provider, &call.tool_name);
+    if tool_name != call.tool_name {
+        let tool_name = tool_name.to_string();
+        call.tool_name = tool_name;
     }
 }
 
