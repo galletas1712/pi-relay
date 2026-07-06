@@ -1,16 +1,21 @@
 use std::{
-    env,
+    env, fmt,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CODEX_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Credentials {
     pub(crate) codex_access_token: Option<String>,
     pub(crate) codex_account_id: Option<String>,
@@ -18,8 +23,277 @@ pub(crate) struct Credentials {
     pub(crate) anthropic_api_key: Option<String>,
 }
 
+impl fmt::Debug for Credentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Credentials")
+            .field(
+                "codex_access_token",
+                &self.codex_access_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "codex_account_id",
+                &self.codex_account_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "codex_installation_id",
+                &self.codex_installation_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "anthropic_api_key",
+                &self.anthropic_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CredentialSnapshot {
+    generation: u64,
+    codex_generation: u64,
+    anthropic_generation: u64,
+    credentials: Arc<Credentials>,
+}
+
+impl CredentialSnapshot {
+    #[cfg(test)]
+    pub(crate) fn for_tests(credentials: Credentials) -> Self {
+        Self {
+            generation: 1,
+            codex_generation: 1,
+            anthropic_generation: 1,
+            credentials: Arc::new(credentials),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn codex_generation(&self) -> u64 {
+        self.codex_generation
+    }
+
+    pub(crate) fn anthropic_generation(&self) -> u64 {
+        self.anthropic_generation
+    }
+
+    pub(crate) fn credentials(&self) -> &Credentials {
+        &self.credentials
+    }
+}
+
+impl fmt::Debug for CredentialSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialSnapshot")
+            .field("generation", &self.generation)
+            .field("credentials", &self.credentials)
+            .finish()
+    }
+}
+
+type CredentialLoader = dyn Fn() -> Credentials + Send + Sync;
+
+#[async_trait]
+pub(crate) trait CodexCredentialRefresher: Send + Sync {
+    async fn refresh(&self, prior: &Credentials) -> Result<Credentials>;
+}
+
+struct SystemCodexCredentialRefresher;
+
+#[async_trait]
+impl CodexCredentialRefresher for SystemCodexCredentialRefresher {
+    async fn refresh(&self, prior: &Credentials) -> Result<Credentials> {
+        refresh_codex_credentials(prior).await
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CredentialManager {
+    current: Arc<StdMutex<CredentialSnapshot>>,
+    codex_recovery_lock: Arc<Mutex<()>>,
+    anthropic_recovery_lock: Arc<Mutex<()>>,
+    loader: Arc<CredentialLoader>,
+    codex_refresher: Arc<dyn CodexCredentialRefresher>,
+}
+
+impl fmt::Debug for CredentialManager {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialManager")
+            .field("generation", &self.snapshot().generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CredentialManager {
+    pub(crate) fn from_system() -> Self {
+        Self::from_dependencies(
+            Arc::new(Credentials::load),
+            Arc::new(SystemCodexCredentialRefresher),
+        )
+    }
+
+    fn from_dependencies(
+        loader: Arc<CredentialLoader>,
+        codex_refresher: Arc<dyn CodexCredentialRefresher>,
+    ) -> Self {
+        let credentials = Arc::new(loader());
+        Self {
+            current: Arc::new(StdMutex::new(CredentialSnapshot {
+                generation: 1,
+                codex_generation: 1,
+                anthropic_generation: 1,
+                credentials,
+            })),
+            codex_recovery_lock: Arc::new(Mutex::new(())),
+            anthropic_recovery_lock: Arc::new(Mutex::new(())),
+            loader,
+            codex_refresher,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(credentials: Credentials) -> Self {
+        let loader_credentials = credentials.clone();
+        Self::from_dependencies(
+            Arc::new(move || loader_credentials.clone()),
+            Arc::new(SystemCodexCredentialRefresher),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_with(
+        loader: Arc<CredentialLoader>,
+        codex_refresher: Arc<dyn CodexCredentialRefresher>,
+    ) -> Self {
+        Self::from_dependencies(loader, codex_refresher)
+    }
+
+    pub(crate) fn snapshot(&self) -> CredentialSnapshot {
+        self.current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    pub(crate) async fn refresh_codex(
+        &self,
+        observed: &CredentialSnapshot,
+    ) -> Result<CredentialSnapshot> {
+        let _recovery = self.codex_recovery_lock.lock().await;
+        let current = self.snapshot();
+        if current.codex_generation > observed.codex_generation {
+            return Ok(current);
+        }
+
+        let refreshed = self.codex_refresher.refresh(current.credentials()).await?;
+        if refreshed.codex_access_token.is_none() {
+            return Err(anyhow!(
+                "Codex token refresh did not produce an access token"
+            ));
+        }
+        self.publish_codex_after(current.codex_generation, refreshed)
+    }
+
+    pub(crate) async fn reload_anthropic(
+        &self,
+        observed: &CredentialSnapshot,
+    ) -> Result<Option<CredentialSnapshot>> {
+        let _recovery = self.anthropic_recovery_lock.lock().await;
+        let current = self.snapshot();
+        if current.anthropic_generation > observed.anthropic_generation {
+            return Ok(Some(current));
+        }
+
+        let loaded = (self.loader)();
+        let Some(loaded_api_key) = loaded.anthropic_api_key else {
+            return Ok(None);
+        };
+        if current.credentials.anthropic_api_key.as_ref() == Some(&loaded_api_key) {
+            return Ok(None);
+        }
+        Ok(Some(self.publish_anthropic_after(
+            current.anthropic_generation,
+            loaded_api_key,
+        )?))
+    }
+
+    fn publish_codex_after(
+        &self,
+        expected_codex_generation: u64,
+        refreshed: Credentials,
+    ) -> Result<CredentialSnapshot> {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if current.codex_generation != expected_codex_generation {
+            return Err(anyhow!(
+                "Codex credential generation changed while publishing authentication recovery"
+            ));
+        }
+        let generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("credential generation overflow"))?;
+        let codex_generation = current
+            .codex_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Codex credential generation overflow"))?;
+        let mut credentials = current.credentials.as_ref().clone();
+        credentials.codex_access_token = refreshed.codex_access_token;
+        credentials.codex_account_id = refreshed.codex_account_id;
+        credentials.codex_installation_id = refreshed.codex_installation_id;
+        let replacement = CredentialSnapshot {
+            generation,
+            codex_generation,
+            anthropic_generation: current.anthropic_generation,
+            credentials: Arc::new(credentials),
+        };
+        *current = replacement.clone();
+        Ok(replacement)
+    }
+
+    fn publish_anthropic_after(
+        &self,
+        expected_anthropic_generation: u64,
+        api_key: String,
+    ) -> Result<CredentialSnapshot> {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if current.anthropic_generation != expected_anthropic_generation {
+            return Err(anyhow!(
+                "Anthropic credential generation changed while publishing authentication recovery"
+            ));
+        }
+        let generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("credential generation overflow"))?;
+        let anthropic_generation = current
+            .anthropic_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Anthropic credential generation overflow"))?;
+        let mut credentials = current.credentials.as_ref().clone();
+        credentials.anthropic_api_key = Some(api_key);
+        let replacement = CredentialSnapshot {
+            generation,
+            codex_generation: current.codex_generation,
+            anthropic_generation,
+            credentials: Arc::new(credentials),
+        };
+        *current = replacement.clone();
+        Ok(replacement)
+    }
+}
+
 impl Credentials {
-    pub(crate) fn load() -> Self {
+    fn load() -> Self {
         let codex = read_codex_auth();
         Self {
             codex_access_token: env::var("CODEX_ACCESS_TOKEN")
@@ -84,7 +358,7 @@ fn read_claude_code_config_api_key_from_home(home: &Path) -> Option<String> {
     None
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct CodexAuthSnapshot {
     path: Option<PathBuf>,
     access_token: Option<String>,
@@ -138,7 +412,7 @@ struct CodexRefreshResponse {
     refresh_token: Option<String>,
 }
 
-pub(crate) async fn refresh_codex_credentials() -> Result<Credentials> {
+async fn refresh_codex_credentials(prior: &Credentials) -> Result<Credentials> {
     let snapshot = read_codex_auth();
     let refresh_token = env::var("CODEX_REFRESH_TOKEN")
         .ok()
@@ -149,6 +423,7 @@ pub(crate) async fn refresh_codex_credentials() -> Result<Credentials> {
 
     let response = reqwest::Client::new()
         .post(CODEX_REFRESH_TOKEN_URL)
+        .timeout(CODEX_REFRESH_TIMEOUT)
         .header("Content-Type", "application/json")
         .json(&CodexRefreshRequest {
             client_id: CODEX_CLIENT_ID,
@@ -156,19 +431,21 @@ pub(crate) async fn refresh_codex_credentials() -> Result<Credentials> {
             refresh_token,
         })
         .send()
-        .await?;
+        .await
+        .map_err(|_| anyhow!("Codex token refresh request failed"))?;
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
         return Err(anyhow!(
-            "Codex token refresh failed with HTTP {}: {}",
-            status.as_u16(),
-            refresh_error_message(&body)
+            "Codex token refresh failed with HTTP {}",
+            status.as_u16()
         ));
     }
 
-    let refreshed = response.json::<CodexRefreshResponse>().await?;
+    let refreshed = response
+        .json::<CodexRefreshResponse>()
+        .await
+        .map_err(|_| anyhow!("Codex token refresh response was invalid"))?;
     let mut refreshed_snapshot = snapshot;
     if let Some(path) = refreshed_snapshot.path.clone() {
         refreshed_snapshot = persist_codex_refresh(&path, &refreshed)?;
@@ -177,9 +454,10 @@ pub(crate) async fn refresh_codex_credentials() -> Result<Credentials> {
         refreshed_snapshot.refresh_token = refreshed.refresh_token;
     }
 
-    let mut credentials = Credentials::load();
+    let mut credentials = prior.clone();
     credentials.codex_access_token = refreshed_snapshot.access_token;
     credentials.codex_account_id = refreshed_snapshot.account_id;
+    credentials.codex_installation_id = read_codex_installation_id();
     if credentials.codex_access_token.is_none() {
         return Err(anyhow!(
             "Codex token refresh did not produce an access token"
@@ -241,91 +519,6 @@ fn persist_codex_refresh(
     Ok(read_codex_auth())
 }
 
-fn refresh_error_message(body: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
-        if let Some(message) = value
-            .pointer("/error/message")
-            .or_else(|| value.get("message"))
-            .and_then(Value::as_str)
-        {
-            return message.to_string();
-        }
-        if let Some(code) = value
-            .pointer("/error/code")
-            .or_else(|| value.get("code"))
-            .and_then(Value::as_str)
-        {
-            return code.to_string();
-        }
-    }
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        "empty response body".to_string()
-    } else {
-        trimmed.chars().take(240).collect()
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_home() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("pi-relay-auth-test-{nanos}"))
-    }
-
-    #[test]
-    fn reads_claude_code_config_primary_api_key() {
-        let home = temp_home();
-        let claude_dir = home.join(".claude");
-        std::fs::create_dir_all(&claude_dir).expect("create claude dir");
-        std::fs::write(
-            claude_dir.join("config.json"),
-            r#"{"primaryApiKey":"sk-ant-test-config"}"#,
-        )
-        .expect("write config");
-
-        let key = read_claude_code_config_api_key_from_home(&home);
-
-        assert_eq!(key.as_deref(), Some("sk-ant-test-config"));
-        std::fs::remove_dir_all(home).expect("remove temp home");
-    }
-
-    #[test]
-    fn falls_back_to_root_claude_json() {
-        let home = temp_home();
-        std::fs::create_dir_all(&home).expect("create temp home");
-        std::fs::write(
-            home.join(".claude.json"),
-            r#"{"primaryApiKey":"sk-ant-test-root"}"#,
-        )
-        .expect("write claude json");
-
-        let key = read_claude_code_config_api_key_from_home(&home);
-
-        assert_eq!(key.as_deref(), Some("sk-ant-test-root"));
-        std::fs::remove_dir_all(home).expect("remove temp home");
-    }
-
-    #[test]
-    fn ignores_non_anthropic_primary_key() {
-        let home = temp_home();
-        let claude_dir = home.join(".claude");
-        std::fs::create_dir_all(&claude_dir).expect("create claude dir");
-        std::fs::write(
-            claude_dir.join("config.json"),
-            r#"{"primaryApiKey":"not-an-anthropic-key"}"#,
-        )
-        .expect("write config");
-
-        let key = read_claude_code_config_api_key_from_home(&home);
-
-        assert_eq!(key, None);
-        std::fs::remove_dir_all(home).expect("remove temp home");
-    }
-}
+#[path = "auth_tests.rs"]
+mod tests;

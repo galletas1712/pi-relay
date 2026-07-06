@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::auth::CredentialManager;
 use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
 use crate::runtime::SessionLockRegistry;
 use crate::types::RuntimeSession;
@@ -106,6 +107,7 @@ pub(crate) struct AppState {
     pub(crate) events: broadcast::Sender<EventFrame>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) provider_tools: ProviderToolSnapshots,
+    pub(crate) credentials: CredentialManager,
     pub(crate) provider_connections: ProviderConnectionRegistry,
     pub(crate) session_titles: SessionTitleScheduler,
     pub(crate) workspaces: WorkspaceManager,

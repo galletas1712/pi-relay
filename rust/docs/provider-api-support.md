@@ -119,8 +119,9 @@ The private catalog is not a universal static model list. The sanitized
 not appear below `0.142.2`. The adapter therefore uses one
 `CODEX_CLIENT_VERSION = "0.142.3"` constant for both the query and
 Codex-shaped User-Agent. It caches the whole catalog in memory for five minutes,
-scoped by Codex base URL plus account id (or a nonlogged token fingerprint when
-the account id is absent). Concurrent cold callers share one detached refresh.
+scoped by Codex base URL plus account id (or the non-secret process-local
+credential generation when the account id is absent). Concurrent cold callers
+share one detached refresh.
 
 Sol, Terra, and Luna reported current/max windows of 372,000 and null automatic
 limits, which derives a 334,800 recommendation. Sol and Terra advertised

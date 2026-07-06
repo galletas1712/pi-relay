@@ -17,6 +17,7 @@ mod subagents;
 mod types;
 mod workspaces;
 
+use crate::auth::CredentialManager;
 use crate::codec::{
     from_params, parse_assistant_message, parse_user_message, required_string, required_uuid,
     transcript_store_from_stored,
@@ -66,6 +67,7 @@ async fn main() -> Result<()> {
     let prompt_root = find_prompt_root(std::env::current_dir()?)?;
     let tools = Arc::new(ToolRegistry::with_builtin_tools());
     let provider_tools = ProviderToolSnapshots::new(&tools);
+    let credentials = CredentialManager::from_system();
     let state = AppState {
         repo,
         active: Arc::new(Mutex::new(HashMap::new())),
@@ -80,6 +82,7 @@ async fn main() -> Result<()> {
         events,
         tools,
         provider_tools,
+        credentials,
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         workspaces,

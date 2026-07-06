@@ -9,7 +9,6 @@ use agent_store::{SessionConfig, TokenUsageEstimate};
 use agent_vocab::{ProviderKind, TranscriptItem};
 use anyhow::Result;
 
-use crate::auth::Credentials;
 use crate::state::AppState;
 
 use super::auth_retry::count_tokens_with_auth_retry;
@@ -66,7 +65,7 @@ async fn count_claude_model_input_tokens_remotely(
     let mut request = ProviderTokenCountRequest::new(input);
     request.max_tokens = config.provider.max_tokens;
 
-    let credentials = Credentials::load();
+    let credentials = state.credentials.snapshot();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
     Ok(
         count_tokens_with_auth_retry(state, config, session_id, provider, request)
