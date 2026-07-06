@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::sse::read_json_sse_text;
 use crate::{
     common::{ensure_success, push_text_item, response_excerpt, response_text},
-    http::send_provider_generation_request,
+    http::{record_provider_send, send_provider_generation_request},
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
     ModelTranscriptEntry, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
@@ -1024,6 +1024,61 @@ mod catalog_tests {
         let header_end = request.find("\r\n\r\n").expect("headers end") + 4;
         assert_eq!(request.len(), header_end, "models request has no body");
         assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn compact_request_records_body_and_physical_send_in_compaction_operation() {
+        let response = serde_json::to_vec(&json!({
+            "output": [{ "type": "compaction", "encrypted_content": "opaque" }]
+        }))
+        .expect("fixture serializes");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) =
+            start_single_response_server("200 OK", response, Duration::ZERO, requests.clone())
+                .await;
+        let cache = OpenAiModelCatalogCache::default();
+        let provider = test_provider(base_url, None, "access-token", cache.clone());
+        let key = provider.catalog_key();
+        {
+            let mut state = cache.state.lock().await;
+            state.active_key = Some(key);
+            state.catalog = Some(fixture_catalog("gpt-5.6-sol"));
+            state.fetched_at = Some(Instant::now());
+        }
+        let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::Compaction);
+
+        metrics
+            .scope(
+                provider.compact_responses(compact_request("gpt-5.6-sol", ReasoningEffort::High)),
+            )
+            .await
+            .expect("compaction succeeds");
+        let snapshot = metrics.finish(agent_perf::Outcome::Completed);
+        let request = String::from_utf8(server.await.expect("server joins"))
+            .expect("request headers are utf-8");
+        let content_length = request
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .expect("content-length header");
+
+        assert_eq!(
+            snapshot,
+            agent_perf::Snapshot {
+                provider_body_serializations: 1,
+                provider_body_serialized_bytes: content_length,
+                physical_provider_sends: 1,
+                ..agent_perf::Snapshot::default()
+            }
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            request.lines().next(),
+            Some("POST /responses/compact HTTP/1.1")
+        );
     }
 
     #[tokio::test]
@@ -2263,6 +2318,13 @@ impl OpenAiProvider {
         }
     }
 
+    /// Override the fixed endpoint for deterministic loopback tests.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_base_url_for_test(&mut self, base_url: String) {
+        self.base_url = base_url;
+    }
+
     fn catalog_key(&self) -> OpenAiCatalogKey {
         let identity = match self.account_id.as_ref() {
             Some(account_id) => OpenAiCatalogIdentity::Account(account_id.clone()),
@@ -2572,7 +2634,7 @@ impl OpenAiProvider {
         let metadata = self.resolved_model_metadata(&request.model).await?;
         let body = compact_body_with_metadata(request, &session_id, &metadata)?;
 
-        let response = self
+        let request = self
             .add_codex_headers(
                 self.client
                     .post(format!(
@@ -2585,9 +2647,9 @@ impl OpenAiProvider {
                 None,
             )
             .timeout(Duration::from_secs(CODEX_COMPACT_REQUEST_TIMEOUT_SECS))
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        record_provider_send(&request)?;
+        let response = request.send().await?;
         let response_headers = OpenAiResponseHeaders::from_headers(response.headers());
         let (status, text) = response_text(response).await?;
         ensure_success(status, &text, response_error_message)?;
@@ -2626,6 +2688,7 @@ fn zstd_json_request(
     body: &Value,
 ) -> ProviderResult<reqwest::RequestBuilder> {
     let json = serde_json::to_vec(body)?;
+    agent_perf::provider_body_serialized(json.len());
     let compressed =
         match zstd::stream::encode_all(Cursor::new(json), CODEX_REQUEST_COMPRESSION_LEVEL) {
             Ok(compressed) => compressed,
@@ -2635,6 +2698,7 @@ fn zstd_json_request(
                 )));
             }
         };
+    agent_perf::provider_body_compressed(compressed.len());
     Ok(request
         .header(CONTENT_TYPE, "application/json")
         .header(CONTENT_ENCODING, "zstd")

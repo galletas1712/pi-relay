@@ -299,6 +299,10 @@ async fn run_model_for_action_with_retries(
                 "action attempt is no longer running",
             ));
         }
+        if attempt > 1 {
+            agent_perf::model_retry();
+        }
+        agent_perf::model_attempt();
         let result = run_model(
             state,
             &dispatch.config,

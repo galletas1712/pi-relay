@@ -34,6 +34,18 @@ fn provider_replay_select(body_mode: TranscriptEntryBodyMode) -> &'static str {
     }
 }
 
+fn json_value_payload_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+        Value::String(value) => value.len(),
+        Value::Array(values) => values.iter().map(json_value_payload_bytes).sum(),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| key.len() + json_value_payload_bytes(value))
+            .sum(),
+    }
+}
+
 fn aliased_provider_replay_select(alias: &str, body_mode: TranscriptEntryBodyMode) -> String {
     match body_mode {
         TranscriptEntryBodyMode::Full => format!("{alias}.provider_replay"),
@@ -206,6 +218,8 @@ async fn active_branch_entry_records_between_tx(
 
 impl PostgresAgentStore {
     pub async fn load_stored_session(&self, session_id: &str) -> Result<StoredSession> {
+        agent_perf::scoped_store_call();
+        agent_perf::recovery_sql_statement();
         let session_row = sqlx::query("select active_leaf_id, metadata from sessions where id=$1")
             .bind(session_id)
             .fetch_optional(&self.pool)
@@ -286,6 +300,7 @@ impl PostgresAgentStore {
     }
 
     pub async fn active_leaf_is_turn_boundary(&self, session_id: &str) -> Result<bool> {
+        agent_perf::scoped_store_call();
         let active_leaf_id = self.active_leaf_id(session_id).await?;
         self.transcript_leaf_is_turn_boundary(session_id, active_leaf_id.as_deref())
             .await
@@ -595,12 +610,21 @@ impl PostgresAgentStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<StoredTranscriptEntry>> {
+        agent_perf::recovery_sql_statement();
         let rows = sqlx::query(
             "select id, parent_id, timestamp_ms, item, provider_replay from transcript_entries where session_id=$1 order by sequence",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
+        agent_perf::cold_loaded_by(rows.len(), || {
+            rows.iter()
+                .map(|row| {
+                    json_value_payload_bytes(&row.get::<Value, _>("item"))
+                        + json_value_payload_bytes(&row.get::<Value, _>("provider_replay"))
+                })
+                .sum()
+        });
         rows.into_iter()
             .map(|row| row_to_stored_entry(&row))
             .collect()
@@ -841,6 +865,7 @@ impl PostgresAgentStore {
         entries: &[StoredTranscriptEntry],
         active_leaf_id: Option<&str>,
     ) -> Result<Vec<EventFrame>> {
+        agent_perf::scoped_store_call();
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let mut inserted_records = HashMap::new();
@@ -946,6 +971,7 @@ pub(crate) async fn session_state_for_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
 ) -> Result<SessionEventState> {
+    agent_perf::output_sql_statement();
     let row = sqlx::query(
         r#"
         select active_leaf_id, session_revision, queue_revision, transcript_revision,
@@ -1157,6 +1183,7 @@ pub(super) async fn insert_stored_entry_tx(
     entry: &StoredTranscriptEntry,
 ) -> Result<Option<TranscriptEntryRecord>> {
     let turn_id = entry.item.turn_id().map(|turn_id| turn_id.0 as i64);
+    agent_perf::output_sql_statement();
     let row = sqlx::query(
         r#"
         insert into transcript_entries (session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id)
@@ -1175,6 +1202,7 @@ pub(super) async fn insert_stored_entry_tx(
     .fetch_optional(&mut **tx)
     .await?;
     if row.is_some() && matches!(entry.item, TranscriptItem::UserMessage(_)) {
+        agent_perf::output_sql_statement();
         sqlx::query(
             r#"
             update sessions

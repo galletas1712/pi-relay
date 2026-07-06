@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+agent-perf = { workspace = true }
 agent-session = { workspace = true }
 agent-vocab = { workspace = true }
 anyhow = { workspace = true }

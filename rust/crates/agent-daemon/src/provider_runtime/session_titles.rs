@@ -103,8 +103,25 @@ async fn run_title_refresh_worker(state: AppState, session_id: String) {
             return;
         };
         let generation = request.generation;
-        if let Err(error) = refresh_session_title(&state, &session_id, request).await {
+        let perf = agent_perf::Metrics::new_if_enabled(agent_perf::Operation::TitleSidecar);
+        let operation = async {
+            agent_perf::observe_context(request.model_context.measured_content_bytes());
+            refresh_session_title(&state, &session_id, request).await
+        };
+        let result = match perf.as_ref() {
+            Some(perf) => perf.scope(operation).await,
+            None => operation.await,
+        };
+        if let Err(error) = &result {
             eprintln!("session title refresh failed for {session_id}: {error:#}");
+        }
+        if let Some(perf) = perf {
+            let outcome = if result.is_ok() {
+                agent_perf::Outcome::Completed
+            } else {
+                agent_perf::Outcome::Failed
+            };
+            perf.finish(outcome);
         }
         finish_pending_generation(&state, &session_id, generation);
     }

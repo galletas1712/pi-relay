@@ -8,6 +8,64 @@ pub struct ModelContextEntry {
     pub provider_replay: Vec<ProviderReplayItem>,
 }
 
+fn transcript_item_bytes(item: &TranscriptItem) -> usize {
+    match item {
+        TranscriptItem::TurnStarted { .. } | TranscriptItem::TurnFinished { .. } => 0,
+        TranscriptItem::UserMessage(message) => message
+            .content
+            .iter()
+            .map(|block| match block {
+                agent_vocab::ContentBlock::Text { text } => text.len(),
+                agent_vocab::ContentBlock::Image { image } => {
+                    image.mime_type.len()
+                        + match &image.source {
+                            agent_vocab::ImageSource::Base64(value)
+                            | agent_vocab::ImageSource::Url(value) => value.len(),
+                        }
+                }
+            })
+            .sum(),
+        TranscriptItem::AssistantMessage(message) => message
+            .items
+            .iter()
+            .map(|item| match item {
+                agent_vocab::AssistantItem::Text(text) => text.len(),
+                agent_vocab::AssistantItem::ToolCall(call) => {
+                    call.id.as_str().len() + call.tool_name.len() + call.args_json.len()
+                }
+            })
+            .sum(),
+        TranscriptItem::ToolCallStarted { tool_call, .. } => {
+            tool_call.id.as_str().len() + tool_call.tool_name.len() + tool_call.args_json.len()
+        }
+        TranscriptItem::ToolResult(result) => {
+            result.tool_call_id.as_str().len() + result.tool_name.len() + result.output.len()
+        }
+        TranscriptItem::CompactionSummary(summary) => {
+            summary.source_session_id.len() + summary.source_leaf_id.len() + summary.summary.len()
+        }
+        TranscriptItem::DaemonToolObservation(observation) => {
+            observation.tool_call_id.as_str().len()
+                + observation.tool_name.len()
+                + observation.args_json.len()
+                + json_value_payload_bytes(&observation.result_json)
+                + observation.summary.as_ref().map_or(0, String::len)
+        }
+    }
+}
+
+fn json_value_payload_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
+        serde_json::Value::String(value) => value.len(),
+        serde_json::Value::Array(values) => values.iter().map(json_value_payload_bytes).sum(),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| key.len() + json_value_payload_bytes(value))
+            .sum(),
+    }
+}
+
 /// Materialized model context for one transcript path.
 ///
 /// The transcript store is canonical; `ModelContext` is a derived view over a
@@ -66,6 +124,36 @@ impl ModelContext {
 
     pub fn transcript_items(&self) -> &[TranscriptItem] {
         &self.items
+    }
+
+    /// Model-visible payload bytes used by deterministic copy probes.
+    ///
+    /// This is a content-size observation, not allocator or serialized wire
+    /// usage. Structural fields and container capacity are intentionally not
+    /// included.
+    pub fn measured_content_bytes(&self) -> usize {
+        self.items
+            .iter()
+            .zip(&self.provider_replay)
+            .map(|(item, replay)| {
+                transcript_item_bytes(item).saturating_add(
+                    replay
+                        .iter()
+                        .map(|item| {
+                            item.raw_json.len()
+                                + item
+                                    .display
+                                    .as_ref()
+                                    .map(|display| {
+                                        display.pretty_name.len()
+                                            + display.input_summary.as_ref().map_or(0, String::len)
+                                    })
+                                    .unwrap_or_default()
+                        })
+                        .sum::<usize>(),
+                )
+            })
+            .sum()
     }
 
     pub fn into_transcript_items(self) -> Vec<TranscriptItem> {
@@ -320,6 +408,33 @@ mod tests {
     #[test]
     fn empty_transcript_is_a_turn_boundary() {
         assert!(ModelContext::new().is_turn_boundary());
+    }
+
+    #[test]
+    #[ignore = "allocates four 10 MiB contexts; deterministic clone-cost probe"]
+    fn common_context_clone_cost_probe() {
+        const MIB: usize = 10;
+        const CLONES: usize = 4;
+        let context = ModelContext::from_transcript_items(vec![TranscriptItem::UserMessage(
+            UserMessage::text("x".repeat(MIB * 1024 * 1024)),
+        )]);
+
+        let started = std::time::Instant::now();
+        let copies = std::iter::repeat_with(|| context.clone())
+            .take(CLONES)
+            .collect::<Vec<_>>();
+        let elapsed = started.elapsed();
+        let copied_bytes = copies
+            .iter()
+            .map(ModelContext::measured_content_bytes)
+            .sum::<usize>();
+
+        assert_eq!(copied_bytes, MIB * 1024 * 1024 * CLONES);
+        eprintln!(
+            "perf fixture=common_context_clones clone_sites=dispatch_vector,session_start,deferred_subagent,title_worker clones={CLONES} copied_bytes={copied_bytes} elapsed_ns={} mib_per_second={:.1}",
+            elapsed.as_nanos(),
+            MIB as f64 * CLONES as f64 / elapsed.as_secs_f64()
+        );
     }
 
     #[test]

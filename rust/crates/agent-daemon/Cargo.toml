@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 agent-core = { workspace = true }
+agent-perf = { workspace = true }
 agent-provider = { workspace = true }
 agent-prompt = { workspace = true }
 agent-session = { workspace = true }
@@ -31,4 +32,6 @@ tokio-tungstenite = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+agent-perf = { workspace = true, features = ["test-support"] }
+agent-provider = { workspace = true, features = ["test-support"] }
 sqlx = { workspace = true }

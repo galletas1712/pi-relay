@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use agent_session::{SessionAction, SessionEvent};
 use anyhow::{anyhow, Context, Result};
@@ -27,10 +28,23 @@ impl PostgresAgentStore {
         session_id: &str,
         batch: OutputBatch<'_>,
     ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
-        let mut tx = self.pool.begin().await?;
-        let (frames, dispatch) = persist_outputs_tx(&mut tx, session_id, batch).await?;
-        tx.commit().await?;
-        Ok((frames, dispatch))
+        agent_perf::scoped_store_call();
+        agent_perf::scope_output_persistence(async {
+            let mut tx = self.pool.begin().await?;
+            agent_perf::output_transaction_started();
+            let started = agent_perf::is_recording().then(Instant::now);
+            let result = async {
+                let (frames, dispatch) = persist_outputs_tx(&mut tx, session_id, batch).await?;
+                tx.commit().await?;
+                Ok((frames, dispatch))
+            }
+            .await;
+            if let Some(started) = started {
+                agent_perf::output_transaction_duration(started.elapsed());
+            }
+            result
+        })
+        .await
     }
 }
 
@@ -54,6 +68,17 @@ pub(super) async fn persist_outputs_tx(
     let had_actions = !actions.is_empty();
     let had_session_events = !session_events.is_empty();
     let transcript_changed = !entries.is_empty();
+    if !had_action_update
+        && !had_accepted_input
+        && !had_actions
+        && !had_session_events
+        && !transcript_changed
+        && consumed_input.is_none()
+        && control_interrupt_input_id.is_none()
+    {
+        agent_perf::empty_persist_pass();
+    }
+    agent_perf::output_sql_statement();
     let consumed_input_event = consumed_input.as_ref().map(|input| {
         json!({
             "input_id": input.id,
@@ -98,6 +123,7 @@ pub(super) async fn persist_outputs_tx(
             entry_records_by_id.insert(record.id.clone(), record);
         }
     }
+    agent_perf::output_sql_statement();
     sqlx::query("update sessions set active_leaf_id=$2::text, updated_at=now() where id=$1")
         .bind(session_id)
         .bind(active_leaf_id)
@@ -149,6 +175,7 @@ pub(super) async fn persist_outputs_tx(
                     )
                 "#,
         );
+        agent_perf::output_sql_statement();
         let updated = sqlx::query(&consume_query)
             .bind(&input.id)
             .bind(session_id)
@@ -168,6 +195,7 @@ pub(super) async fn persist_outputs_tx(
         let mut input_id = None;
         if let Some(client_input_id) = input.client_input_id.as_deref() {
             let id = format!("input_{}", Uuid::new_v4());
+            agent_perf::output_sql_statement();
             let inserted = sqlx::query(
                 r#"
                     insert into queued_inputs (id, session_id, priority, content, status, client_input_id)
@@ -299,6 +327,7 @@ pub(super) async fn persist_outputs_tx(
               )
             "#
         );
+        agent_perf::output_sql_statement();
         let updated = sqlx::query(&mark_interrupt_applied)
             .bind(session_id)
             .bind(input_id)
@@ -344,6 +373,7 @@ pub(super) async fn persist_outputs_tx(
               and {unfinished_actions}
             "#
         );
+        agent_perf::output_sql_statement();
         sqlx::query(&interrupt_target_action)
             .bind(session_id)
             .bind(input_id)
@@ -366,6 +396,7 @@ pub(super) async fn persist_outputs_tx(
                 where session_id=$1 and {unfinished_actions}
                 "#
             );
+            agent_perf::output_sql_statement();
             sqlx::query(&query)
                 .bind(session_id)
                 .execute(&mut **tx)
@@ -377,6 +408,7 @@ pub(super) async fn persist_outputs_tx(
         let (kind, action_id, turn_id, payload) = action_payload(action)?;
         let row_id = format!("action_{}", Uuid::new_v4());
         let attempt_id = Uuid::new_v4().to_string();
+        agent_perf::output_sql_statement();
         sqlx::query(
             r#"
             insert into actions (id, session_id, turn_id, action_id, attempt_id, kind, status, payload)
@@ -523,6 +555,7 @@ async fn complete_action_tx(
                 )
             "#
     );
+    agent_perf::output_sql_statement();
     if let Some(row) = sqlx::query(&select_query)
         .bind(session_id)
         .bind(&update.row_id)
@@ -587,6 +620,7 @@ async fn complete_action_tx(
                 )
             "#
     );
+    agent_perf::output_sql_statement();
     let updated = sqlx::query(&update_query)
         .bind(session_id)
         .bind(&update.row_id)

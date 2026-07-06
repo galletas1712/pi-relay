@@ -82,6 +82,7 @@ pub(super) async fn lock_session_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: &str,
 ) -> anyhow::Result<()> {
+    agent_perf::output_sql_statement();
     let locked = sqlx::query("select id from sessions where id=$1 for update")
         .bind(session_id)
         .fetch_optional(&mut **tx)

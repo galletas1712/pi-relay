@@ -17,6 +17,7 @@ fn abort_matching_tasks(
     tasks: &mut HashMap<String, RunningTask>,
     session_id: &str,
 ) -> Vec<ActionKind> {
+    agent_perf::dispatch_task_registry_scan(tasks.len());
     tasks.retain(|_, task| !task.handle.is_finished());
     let action_row_ids = tasks
         .iter()
@@ -127,6 +128,7 @@ pub(super) fn is_shutting_down(state: &AppState) -> bool {
 
 pub(crate) fn session_has_live_tasks(state: &AppState, session_id: &str) -> bool {
     let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
+    agent_perf::dispatch_task_registry_scan(tasks.len());
     tasks.retain(|_, task| !task.handle.is_finished());
     tasks.values().any(|task| task.session_id == session_id)
 }
@@ -207,8 +209,11 @@ pub(super) fn unregister_task(
     remove_task_if_owner(&mut tasks, action_row_id, registration_id).is_some()
 }
 
-pub(super) fn prune_finished_tasks(state: &AppState) {
+pub(super) fn prune_finished_tasks(state: &AppState, perf: Option<&agent_perf::Metrics>) {
     let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
+    if let Some(perf) = perf {
+        perf.dispatch_task_registry_scan(tasks.len());
+    }
     tasks.retain(|_, task| !task.handle.is_finished());
 }
 

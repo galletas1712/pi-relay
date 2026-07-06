@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+test-support = []
+
 [dependencies]
+agent-perf = { workspace = true }
 agent-tools = { workspace = true }
 agent-vocab = { workspace = true }
 async-trait = { workspace = true }
@@ -17,3 +21,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 zstd = "0.13"
+
+[dev-dependencies]
+agent-perf = { workspace = true, features = ["test-support"] }

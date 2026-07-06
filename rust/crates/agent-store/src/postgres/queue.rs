@@ -199,6 +199,7 @@ impl PostgresAgentStore {
     }
 
     pub async fn take_next_queued_input(&self, session_id: &str) -> Result<Option<QueuedInput>> {
+        agent_perf::scoped_store_call();
         self.take_next_queued_input_matching(session_id, None).await
     }
 
@@ -676,6 +677,7 @@ impl PostgresAgentStore {
     }
 
     pub async fn reset_abandoned_consuming_inputs(&self, session_id: &str) -> Result<()> {
+        agent_perf::scoped_store_call();
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let updated = sqlx::query(
@@ -741,6 +743,7 @@ pub(super) async fn queue_state_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
 ) -> Result<QueueState> {
+    agent_perf::output_sql_statement();
     let session = sqlx::query(
         r#"
             select session_revision, queue_revision, transcript_revision
@@ -769,10 +772,12 @@ pub(super) async fn queue_state_tx(
             order by {QUEUED_INPUT_DISPATCH_ORDER}
             "#
     );
+    agent_perf::output_sql_statement();
     let queued_rows = sqlx::query(&queued_inputs_query)
         .bind(session_id)
         .fetch_all(&mut **tx)
         .await?;
+    agent_perf::output_sql_statement();
     let unfinished_actions = sqlx::query_scalar::<_, bool>(
         "select exists(select 1 from actions where session_id=$1 and status in ('pending','blocked','running'))",
     )
@@ -860,6 +865,7 @@ pub(super) async fn bump_revisions_tx(
     queue_changed: bool,
     transcript_changed: bool,
 ) -> Result<()> {
+    agent_perf::output_sql_statement();
     sqlx::query(
         r#"
             update sessions

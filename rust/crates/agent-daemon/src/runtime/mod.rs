@@ -52,6 +52,13 @@ pub(crate) async fn recover_post_compaction_dispatches_on_boot(
     recover_post_compaction_dispatches_once(state).await
 }
 
+pub(crate) fn model_operation_for_action(action: &SessionAction) -> Option<agent_perf::Operation> {
+    match action {
+        SessionAction::RequestModel { .. } => Some(agent_perf::Operation::ModelTurn),
+        SessionAction::RequestTool { .. } | SessionAction::CancelSessionWork => None,
+    }
+}
+
 async fn recover_post_compaction_dispatches_once(state: &AppState) -> anyhow::Result<usize> {
     if tasks::is_shutting_down(state) {
         return Ok(0);
@@ -162,6 +169,7 @@ pub(crate) fn ensure_expected_active_leaf_matches(
 
 async fn session_driver_lock(state: &AppState, session_id: &str) -> Arc<Mutex<()>> {
     let mut locks = state.session_driver_locks.lock().await;
+    agent_perf::session_registry_scan(locks.len());
     locks.retain(|_, lock| Arc::strong_count(lock) > 1);
     locks
         .entry(session_id.to_string())
@@ -178,8 +186,12 @@ pub(crate) struct SessionDriver {
 impl SessionDriver {
     pub(crate) async fn acquire(state: &AppState, session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
+        let started = agent_perf::is_recording().then(std::time::Instant::now);
         let lock = session_driver_lock(state, &session_id).await;
         let guard = lock.lock_owned().await;
+        if let Some(started) = started {
+            agent_perf::lock_wait(started.elapsed());
+        }
         Self {
             state: state.clone(),
             session_id,
@@ -225,8 +237,12 @@ impl SessionDriver {
         session_id: impl Into<String>,
     ) -> Option<Self> {
         let session_id = session_id.into();
+        let started = agent_perf::is_recording().then(std::time::Instant::now);
         let lock = session_driver_lock(state, &session_id).await;
         let guard = lock.try_lock_owned().ok()?;
+        if let Some(started) = started {
+            agent_perf::lock_wait(started.elapsed());
+        }
         Some(Self {
             state: state.clone(),
             session_id,
@@ -419,6 +435,7 @@ impl SessionDriver {
                 self.session_id.clone(),
                 dispatch,
                 true,
+                agent_perf::Metrics::new_if_enabled(agent_perf::Operation::ModelTurn),
             )
             .await;
             if matches!(registration_id, Err(tasks::TaskRegistrationRejected)) {
@@ -586,6 +603,26 @@ impl SessionDriver {
         {
             return Ok(());
         }
+        let perf = agent_perf::Metrics::new_if_enabled(agent_perf::Operation::ColdActivation);
+        let result = match perf.as_ref() {
+            Some(perf) => perf.scope(self.recover_inactive_session()).await,
+            None => self.recover_inactive_session().await,
+        };
+        let outcome = if result.is_ok() {
+            agent_perf::Outcome::Completed
+        } else {
+            agent_perf::Outcome::Failed
+        };
+        if let Some(perf) = perf {
+            perf.finish(outcome);
+        }
+        if result? {
+            self.drive_until_blocked().await?;
+        }
+        Ok(())
+    }
+
+    async fn recover_inactive_session(&self) -> std::result::Result<bool, RpcError> {
         self.state
             .repo
             .reset_abandoned_consuming_inputs(&self.session_id)
@@ -597,7 +634,7 @@ impl SessionDriver {
             .await?
             .is_empty();
         if self.recover_post_compaction_dispatches().await? > 0 || had_post_compaction_intent {
-            return Ok(());
+            return Ok(false);
         }
         if self
             .state
@@ -606,7 +643,7 @@ impl SessionDriver {
             .await?
         {
             self.reconcile_abandoned_boundary_session().await?;
-            return Ok(());
+            return Ok(false);
         }
         let stored = self
             .state
@@ -616,7 +653,7 @@ impl SessionDriver {
         let store = transcript_store_from_stored(&stored)?;
         if store.is_turn_boundary() {
             self.reconcile_abandoned_boundary_session().await?;
-            return Ok(());
+            return Ok(false);
         }
         let recovered = AgentSession::from_stored_session(stored.clone())
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
@@ -647,9 +684,9 @@ impl SessionDriver {
         publish_events(&self.state, events);
         clear_event_buffer_if_idle(&self.state, &self.session_id).await?;
         if should_continue {
-            self.drive_until_blocked().await?;
+            self.ensure_active_loaded_scoped().await?;
         }
-        Ok(())
+        Ok(should_continue)
     }
 
     pub(crate) async fn ensure_active_loaded(&self) -> std::result::Result<(), RpcError> {
@@ -662,6 +699,23 @@ impl SessionDriver {
         {
             return Ok(());
         }
+        let perf = agent_perf::Metrics::new_if_enabled(agent_perf::Operation::ColdActivation);
+        let result = match perf.as_ref() {
+            Some(perf) => perf.scope(self.ensure_active_loaded_scoped()).await,
+            None => self.ensure_active_loaded_scoped().await,
+        };
+        let outcome = if result.is_ok() {
+            agent_perf::Outcome::Completed
+        } else {
+            agent_perf::Outcome::Failed
+        };
+        if let Some(perf) = perf {
+            perf.finish(outcome);
+        }
+        result
+    }
+
+    async fn ensure_active_loaded_scoped(&self) -> std::result::Result<(), RpcError> {
         let config = self
             .state
             .repo
@@ -708,6 +762,28 @@ impl SessionDriver {
         &self,
     ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
         self.ensure_active_loaded().await?;
+        self.drive_loaded_until_blocked().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drive_with_cold_metrics(
+        &self,
+        perf: agent_perf::Metrics,
+    ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
+        let result = perf.scope(self.ensure_active_loaded_scoped()).await;
+        let outcome = if result.is_ok() {
+            agent_perf::Outcome::Completed
+        } else {
+            agent_perf::Outcome::Failed
+        };
+        perf.finish(outcome);
+        result?;
+        self.drive_loaded_until_blocked().await
+    }
+
+    async fn drive_loaded_until_blocked(
+        &self,
+    ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
         let mut dispatched_all = Vec::new();
         loop {
             let active = self.active_session().await;
@@ -1214,6 +1290,19 @@ impl SessionDriver {
         self.dispatch_pending_or_direct(dispatches).await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn dispatch_model_with_metrics(
+        &self,
+        dispatch: DispatchAction,
+        perf: agent_perf::Metrics,
+    ) -> std::result::Result<(), RpcError> {
+        let Some(ready) = self.prepare_model_dispatch(dispatch, Some(perf)).await? else {
+            return Ok(());
+        };
+        dispatch_all(&self.state, &self.session_id, vec![ready]).await;
+        Ok(())
+    }
+
     pub(crate) async fn dispatch_ready_actions(
         &self,
     ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
@@ -1222,6 +1311,9 @@ impl SessionDriver {
             .repo
             .pending_actions_for_dispatch(&self.session_id)
             .await?;
+        if pending.is_empty() {
+            agent_perf::empty_dispatch_pass();
+        }
         let config = self
             .state
             .repo
@@ -1253,16 +1345,56 @@ impl SessionDriver {
         for dispatch in dispatches {
             match &dispatch.action {
                 SessionAction::RequestModel { .. } => {
-                    if self.gate_model_dispatch(&dispatch).await? {
-                        ready.push(dispatch);
+                    let perf = model_operation_for_action(&dispatch.action)
+                        .and_then(agent_perf::Metrics::new_if_enabled);
+                    if let Some(ready_dispatch) =
+                        self.prepare_model_dispatch(dispatch, perf).await?
+                    {
+                        ready.push(ready_dispatch);
                     }
                 }
-                SessionAction::RequestTool { .. } => ready.push(dispatch),
+                SessionAction::RequestTool { .. } => ready.push((dispatch, None)),
                 SessionAction::CancelSessionWork => {}
             }
         }
         dispatch_all(&self.state, &self.session_id, ready).await;
         Ok(())
+    }
+
+    async fn prepare_model_dispatch(
+        &self,
+        dispatch: DispatchAction,
+        perf: Option<agent_perf::Metrics>,
+    ) -> std::result::Result<Option<(DispatchAction, Option<agent_perf::Metrics>)>, RpcError> {
+        let SessionAction::RequestModel { model_context, .. } = &dispatch.action else {
+            return Err(RpcError::new(
+                "invalid_dispatch",
+                "model metrics can only be attached to model actions",
+            ));
+        };
+        let gate = async {
+            agent_perf::observe_context(model_context.measured_content_bytes());
+            self.gate_model_dispatch(&dispatch).await
+        };
+        let is_ready = match perf.as_ref() {
+            Some(perf) => perf.scope(gate).await,
+            None => gate.await,
+        };
+        match is_ready {
+            Ok(true) => Ok(Some((dispatch, perf))),
+            Ok(false) => {
+                if let Some(perf) = perf {
+                    perf.finish(agent_perf::Outcome::GateBlocked);
+                }
+                Ok(None)
+            }
+            Err(error) => {
+                if let Some(perf) = perf {
+                    perf.finish(agent_perf::Outcome::Failed);
+                }
+                Err(error)
+            }
+        }
     }
 }
 

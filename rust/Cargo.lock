@@ -14,6 +14,7 @@ name = "agent-daemon"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-perf",
  "agent-prompt",
  "agent-provider",
  "agent-session",
@@ -37,6 +38,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-perf"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "agent-prompt"
 version = "0.1.0"
 dependencies = [
@@ -48,6 +56,7 @@ dependencies = [
 name = "agent-provider"
 version = "0.1.0"
 dependencies = [
+ "agent-perf",
  "agent-tools",
  "agent-vocab",
  "async-trait",
@@ -67,9 +76,11 @@ name = "agent-session"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-perf",
  "agent-vocab",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -77,6 +88,7 @@ dependencies = [
 name = "agent-store"
 version = "0.1.0"
 dependencies = [
+ "agent-perf",
  "agent-session",
  "agent-vocab",
  "anyhow",

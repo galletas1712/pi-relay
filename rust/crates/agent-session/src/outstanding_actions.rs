@@ -47,7 +47,18 @@ impl OutstandingActions {
             return false;
         };
         let target = completion.target();
-        let Some(position) = self.pending.iter().position(|action| action == &target) else {
+        let position = if agent_perf::is_recording() {
+            let mut entries_scanned = 0;
+            let position = self.pending.iter().position(|action| {
+                entries_scanned += 1;
+                action == &target
+            });
+            agent_perf::action_completion_scan(entries_scanned);
+            position
+        } else {
+            self.pending.iter().position(|action| action == &target)
+        };
+        let Some(position) = position else {
             return false;
         };
 
@@ -343,5 +354,44 @@ mod tests {
         actions.track_request(&model_request(1, 1));
         actions.clear();
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    #[ignore = "deterministic Stage 0 scaling fixture; run explicitly"]
+    fn reverse_order_completion_scaling_k_1_10_100_1000() {
+        for count in [1_u64, 10, 100, 1_000] {
+            let mut actions = OutstandingActions::default();
+            for action_id in 1..=count {
+                actions.track_request(&model_request(action_id, action_id));
+            }
+            let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelTurn);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime builds");
+            let started = std::time::Instant::now();
+            runtime.block_on(metrics.scope(async {
+                for action_id in (1..=count).rev() {
+                    assert!(actions.accept_completion(&AgentInput::ModelCompleted {
+                        action_id: ActionId(action_id),
+                        turn_id: TurnId(action_id),
+                        assistant: AssistantMessage { items: Vec::new() },
+                    }));
+                }
+            }));
+            let elapsed = started.elapsed();
+            let snapshot = metrics.snapshot();
+            assert_eq!(snapshot.action_completion_scans, count);
+            assert_eq!(
+                snapshot.action_completion_entries_scanned,
+                count.saturating_mul(count.saturating_add(1)) / 2
+            );
+            eprintln!(
+                "perf fixture=reverse_action_completion k={count} scans={} entries_scanned={} elapsed_ns={} entries_per_second={:.0}",
+                snapshot.action_completion_scans,
+                snapshot.action_completion_entries_scanned,
+                elapsed.as_nanos(),
+                snapshot.action_completion_entries_scanned as f64 / elapsed.as_secs_f64()
+            );
+        }
     }
 }

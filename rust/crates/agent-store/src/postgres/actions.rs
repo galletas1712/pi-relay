@@ -122,6 +122,7 @@ impl PostgresAgentStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<PostCompactionDispatchIntent>> {
+        agent_perf::scoped_store_call();
         let rows = sqlx::query(&format!(
             r#"
             select session_id, id, attempt_id
@@ -177,6 +178,7 @@ impl PostgresAgentStore {
         lease_duration: Duration,
     ) -> std::result::Result<Option<ClaimedPostCompactionDispatch>, PostCompactionDispatchClaimError>
     {
+        agent_perf::scoped_store_call();
         let mut tx = self
             .pool
             .begin()
@@ -355,6 +357,7 @@ impl PostgresAgentStore {
         lease: &PostCompactionDispatchLease,
         lease_duration: Duration,
     ) -> Result<bool> {
+        agent_perf::scoped_store_call();
         let duration_ms = i64::try_from(lease_duration.as_millis())
             .map_err(|_| anyhow!("post-compaction dispatch lease duration is too large"))?
             .max(1);
@@ -437,6 +440,7 @@ impl PostgresAgentStore {
     }
 
     pub async fn has_unfinished_actions(&self, session_id: &str) -> Result<bool> {
+        agent_perf::scoped_store_call();
         let unfinished_actions = action_is_unfinished(None);
         let query = format!(
             "select exists(select 1 from actions where session_id=$1 and {unfinished_actions})"
@@ -540,6 +544,7 @@ impl PostgresAgentStore {
         attempt_id: &str,
         post_compaction_dispatch_lease: Option<&PostCompactionDispatchLease>,
     ) -> Result<bool> {
+        agent_perf::scoped_store_call();
         let lease_owner = post_compaction_dispatch_lease.map(|lease| lease.owner_id.as_str());
         let lease_generation =
             post_compaction_dispatch_lease.map(|lease| lease.generation.to_string());
@@ -690,6 +695,7 @@ impl PostgresAgentStore {
         attempt_id: &str,
         post_compaction_dispatch_lease: Option<&PostCompactionDispatchLease>,
     ) -> Result<bool> {
+        agent_perf::scoped_store_call();
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let unfinished_actions = action_is_unfinished(None);
@@ -746,6 +752,7 @@ impl PostgresAgentStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<PendingDispatchAction>> {
+        agent_perf::scoped_store_call();
         let rows = sqlx::query(&format!(
             r#"
             select session_id, id, attempt_id, kind, action_id, turn_id, payload
@@ -811,6 +818,7 @@ impl PostgresAgentStore {
         action_row_id: &str,
         attempt_id: &str,
     ) -> Result<bool> {
+        agent_perf::scoped_store_call();
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let updated = sqlx::query(

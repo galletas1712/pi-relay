@@ -170,9 +170,25 @@ async fn run_provider_web_sidecar(
     user_prompt: String,
     max_output_tokens: Option<usize>,
 ) -> ToolResultMessage {
-    let request = build_web_sidecar_request(config, session_id, call, tool, user_prompt);
-
-    match run_model_sidecar(state, config, request).await {
+    let perf = agent_perf::Metrics::new_if_enabled(agent_perf::Operation::WebSidecar);
+    let operation = async {
+        agent_perf::observe_context(user_prompt.len());
+        let request = build_web_sidecar_request(config, session_id, call, tool, user_prompt);
+        run_model_sidecar(state, config, request).await
+    };
+    let result = match perf.as_ref() {
+        Some(perf) => perf.scope(operation).await,
+        None => operation.await,
+    };
+    let outcome = if result.is_ok() {
+        agent_perf::Outcome::Completed
+    } else {
+        agent_perf::Outcome::Failed
+    };
+    if let Some(perf) = perf {
+        perf.finish(outcome);
+    }
+    match result {
         Ok(response) => sidecar_response_to_tool_result(call, response, max_output_tokens),
         Err(error) => ToolResultMessage::error(
             call.id.clone(),

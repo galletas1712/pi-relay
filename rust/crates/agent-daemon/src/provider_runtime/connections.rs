@@ -21,6 +21,10 @@ pub(crate) struct ProviderConnectionRegistry {
     anthropic_model_cache: AnthropicModelCache,
     openai_model_catalog_cache: OpenAiModelCatalogCache,
     connections: Arc<Mutex<HashMap<ProviderConnectionKey, Arc<ProviderConnection>>>>,
+    #[cfg(test)]
+    test_openai_base_url: Option<String>,
+    #[cfg(test)]
+    test_credentials: Option<Credentials>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -53,6 +57,24 @@ impl ProviderConnectionRegistry {
             anthropic_model_cache: AnthropicModelCache::default(),
             openai_model_catalog_cache: OpenAiModelCatalogCache::default(),
             connections: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            test_openai_base_url: None,
+            #[cfg(test)]
+            test_credentials: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_openai(base_url: String) -> Self {
+        Self {
+            test_openai_base_url: Some(base_url),
+            test_credentials: Some(Credentials {
+                codex_access_token: Some("test-access-token".to_string()),
+                codex_account_id: Some("test-account".to_string()),
+                codex_installation_id: Some("test-installation".to_string()),
+                anthropic_api_key: None,
+            }),
+            ..Self::new()
         }
     }
 
@@ -63,7 +85,13 @@ impl ProviderConnectionRegistry {
         session_id: &str,
     ) -> Result<ProviderHandle> {
         let connection = self.get_or_create(session_id, provider).await;
-        connection.provider_handle(credentials)
+        #[cfg(test)]
+        let credentials = self.test_credentials.as_ref().unwrap_or(credentials);
+        connection.provider_handle(
+            credentials,
+            #[cfg(test)]
+            self.test_openai_base_url.as_deref(),
+        )
     }
 
     pub(crate) async fn mark_compacted(
@@ -120,9 +148,17 @@ impl ProviderConnectionRegistry {
 }
 
 impl ProviderConnection {
-    fn provider_handle(&self, credentials: &Credentials) -> Result<ProviderHandle> {
+    fn provider_handle(
+        &self,
+        credentials: &Credentials,
+        #[cfg(test)] openai_base_url: Option<&str>,
+    ) -> Result<ProviderHandle> {
         match self {
-            ProviderConnection::OpenAi(connection) => connection.provider_handle(credentials),
+            ProviderConnection::OpenAi(connection) => connection.provider_handle(
+                credentials,
+                #[cfg(test)]
+                openai_base_url,
+            ),
             ProviderConnection::Anthropic(connection) => connection.provider_handle(credentials),
         }
     }
@@ -138,18 +174,29 @@ impl ProviderConnection {
 }
 
 impl OpenAiCodexConnection {
-    fn provider_handle(&self, credentials: &Credentials) -> Result<ProviderHandle> {
+    fn provider_handle(
+        &self,
+        credentials: &Credentials,
+        #[cfg(test)] base_url: Option<&str>,
+    ) -> Result<ProviderHandle> {
+        let provider = OpenAiProvider::codex_with_client_session_and_cache(
+            self.client.clone(),
+            self.state.clone(),
+            credentials.codex_access_token.clone().ok_or_else(|| {
+                anyhow!("~/.codex ChatGPT token not found for OpenAI subscription transport")
+            })?,
+            credentials.codex_account_id.clone(),
+            credentials.codex_installation_id.clone(),
+            self.model_catalog_cache.clone(),
+        );
+        #[cfg(test)]
+        let mut provider = provider;
+        #[cfg(test)]
+        if let Some(base_url) = base_url {
+            provider.set_base_url_for_test(base_url.to_string());
+        }
         Ok(ProviderHandle {
-            provider: Box::new(OpenAiProvider::codex_with_client_session_and_cache(
-                self.client.clone(),
-                self.state.clone(),
-                credentials.codex_access_token.clone().ok_or_else(|| {
-                    anyhow!("~/.codex ChatGPT token not found for OpenAI subscription transport")
-                })?,
-                credentials.codex_account_id.clone(),
-                credentials.codex_installation_id.clone(),
-                self.model_catalog_cache.clone(),
-            )),
+            provider: Box::new(provider),
             uses_codex_auth: true,
         })
     }

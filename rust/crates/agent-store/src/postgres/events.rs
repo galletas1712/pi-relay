@@ -27,6 +27,7 @@ impl PostgresAgentStore {
     }
 
     pub async fn clear_session_events(&self, session_id: &str) -> Result<()> {
+        agent_perf::scoped_store_call();
         sqlx::query("delete from events where session_id=$1")
             .bind(session_id)
             .execute(&self.pool)
@@ -40,6 +41,8 @@ impl PostgresAgentStore {
         event: EventType,
         data: Value,
     ) -> Result<EventFrame> {
+        agent_perf::scoped_store_call();
+        agent_perf::output_sql_statement_for_transition();
         insert_event_row(&self.pool, session_id, event, data).await
     }
 
@@ -192,6 +195,7 @@ async fn insert_event_row<'e, E>(
 where
     E: Executor<'e, Database = Postgres>,
 {
+    agent_perf::output_sql_statement();
     let row = sqlx::query(
         "insert into events (session_id, type, payload) values ($1::text, $2::text, $3) returning id, session_id, type, payload",
     )

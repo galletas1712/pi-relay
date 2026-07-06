@@ -31,6 +31,8 @@ where
     match call(provider, request.clone()).await {
         Ok(response) => Ok(response),
         Err(error) if uses_codex_auth && error.status_code() == Some(401) => {
+            agent_perf::provider_auth_retry();
+            agent_perf::auth_refresh();
             let credentials = refresh_codex_credentials()
                 .await
                 .map_err(|error| ProviderError::Provider(error.to_string()))?;
@@ -68,6 +70,7 @@ pub(super) async fn count_tokens_with_auth_retry(
     provider: ProviderHandle,
     request: ProviderTokenCountRequest,
 ) -> std::result::Result<ProviderTokenCountResponse, ProviderError> {
+    agent_perf::request_copied();
     with_codex_auth_retry(
         state,
         config,
@@ -86,6 +89,7 @@ pub(super) async fn complete_with_auth_retry(
     provider: ProviderHandle,
     request: ModelRequest,
 ) -> std::result::Result<ModelResponse, ProviderError> {
+    agent_perf::request_copied();
     with_codex_auth_retry(
         state,
         config,
@@ -104,6 +108,7 @@ pub(super) async fn compact_with_auth_retry(
     provider: ProviderHandle,
     request: ProviderCompactionRequest,
 ) -> std::result::Result<ProviderCompactionResponse, ProviderError> {
+    agent_perf::request_copied();
     with_codex_auth_retry(
         state,
         config,

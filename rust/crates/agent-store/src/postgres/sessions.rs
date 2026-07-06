@@ -164,6 +164,7 @@ impl PostgresAgentStore {
     }
 
     pub async fn reset_auto_compaction_failures(&self, session_id: &str) -> Result<()> {
+        agent_perf::scoped_store_call();
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let mut metadata = session_metadata_tx(&mut tx, session_id).await?;
@@ -509,6 +510,7 @@ impl PostgresAgentStore {
     }
 
     pub async fn load_session_config(&self, session_id: &str) -> Result<SessionConfig> {
+        agent_perf::scoped_store_call();
         let row = sqlx::query(
             r#"
             select
@@ -539,6 +541,7 @@ impl PostgresAgentStore {
     }
 
     pub async fn session_subagent_type(&self, session_id: &str) -> Result<Option<SubagentType>> {
+        agent_perf::scoped_store_call();
         let raw: Option<String> =
             sqlx::query_scalar("select subagent_type from sessions where id=$1")
                 .bind(session_id)
@@ -560,6 +563,7 @@ impl PostgresAgentStore {
     }
 
     pub async fn activity(&self, session_id: &str) -> Result<SessionActivity> {
+        agent_perf::scoped_store_call();
         if self.has_unfinished_actions(session_id).await? {
             return Ok(SessionActivity::Running);
         }

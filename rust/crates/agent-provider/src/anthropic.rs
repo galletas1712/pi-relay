@@ -98,6 +98,7 @@ fn validate_anthropic_hosted_tool_result(block_type: &str, content: &Value) -> P
             )))
         }
     }
+
     Ok(())
 }
 
@@ -940,6 +941,13 @@ impl AnthropicProvider {
         }
     }
 
+    /// Override the fixed endpoint for deterministic loopback tests.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_base_url_for_test(&mut self, base_url: String) {
+        self.base_url = base_url;
+    }
+
     async fn resolved_model_metadata(&self, model: &str) -> AnthropicModelMetadata {
         let fallback = static_anthropic_model_metadata(model);
         loop {
@@ -1111,7 +1119,7 @@ impl ModelProvider for AnthropicProvider {
         let metadata = self.resolved_model_metadata(&request.model).await;
         let prepared = prepare_count_tokens_request(request, &metadata)?;
 
-        let response = self
+        let request_builder = self
             .client
             .post(format!(
                 "{}/messages/count_tokens",
@@ -1126,9 +1134,18 @@ impl ModelProvider for AnthropicProvider {
             .header("x-app", "cli")
             .header("X-Claude-Code-Session-Id", session_id)
             .header("x-client-request-id", client_request_id())
-            .json(&prepared.body)
-            .send()
-            .await?;
+            .json(&prepared.body);
+        if agent_perf::is_recording() {
+            if let Some(measured) = request_builder.try_clone() {
+                let measured = measured.build()?;
+                if let Some(body) = measured.body().and_then(reqwest::Body::as_bytes) {
+                    agent_perf::provider_body_serialized(body.len());
+                }
+            }
+        }
+        agent_perf::physical_count_token_send();
+        agent_perf::physical_provider_send();
+        let response = request_builder.send().await?;
         let (status, text) = response_text(response).await?;
         ensure_success(status, &text, response_error_message)?;
         parse_anthropic_count_tokens(&text)

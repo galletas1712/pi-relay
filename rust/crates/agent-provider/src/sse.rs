@@ -13,6 +13,26 @@ pub(crate) enum SseEvent {
     Done,
 }
 
+fn sse_frame_boundary_counted(buffer: &[u8]) -> Option<(usize, usize)> {
+    if !agent_perf::is_recording() {
+        return sse_frame_boundary(buffer);
+    }
+    // The current scanner starts both delimiter searches at byte zero on every
+    // pass. Count the window start positions actually examined by each search;
+    // Stage 2 will replace the algorithm and keep this counter as its proof.
+    let mut scanned = 0;
+    let lf = buffer.windows(2).position(|window| {
+        scanned += 1;
+        window == b"\n\n"
+    });
+    let crlf = buffer.windows(4).position(|window| {
+        scanned += 1;
+        window == b"\r\n\r\n"
+    });
+    agent_perf::sse_scan_windows(scanned);
+    sse_boundary_from_positions(lf, crlf)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SseControl {
     Continue,
@@ -34,6 +54,8 @@ pub(crate) async fn read_provider_json_sse_response(
     let status = response.status();
     if !status.is_success() {
         let bytes = response.bytes().await?;
+        agent_perf::sse_received(bytes.len());
+        agent_perf::sse_retained(bytes.len());
         let text = String::from_utf8_lossy(&bytes).into_owned();
         return Err(ProviderError::Status {
             status: status.as_u16(),
@@ -53,7 +75,29 @@ pub(crate) async fn read_provider_json_sse_response(
         let Some(chunk) = chunk else {
             break;
         };
+        agent_perf::sse_received(chunk.len());
         buffer.extend_from_slice(&chunk);
+        agent_perf::sse_retained(buffer.len());
+        if process_complete_sse_frames(&mut buffer, &mut on_event)? == SseControl::Stop {
+            return Ok(SseStreamEnd::Terminal);
+        }
+    }
+    if process_final_sse_frame(&buffer, &mut on_event)? == SseControl::Stop {
+        return Ok(SseStreamEnd::Terminal);
+    }
+    Ok(SseStreamEnd::Eof)
+}
+
+#[cfg(test)]
+fn read_json_sse_chunks(
+    chunks: impl IntoIterator<Item = Vec<u8>>,
+    mut on_event: impl FnMut(SseEvent) -> ProviderResult<SseControl>,
+) -> ProviderResult<SseStreamEnd> {
+    let mut buffer = Vec::new();
+    for chunk in chunks {
+        agent_perf::sse_received(chunk.len());
+        buffer.extend_from_slice(&chunk);
+        agent_perf::sse_retained(buffer.len());
         if process_complete_sse_frames(&mut buffer, &mut on_event)? == SseControl::Stop {
             return Ok(SseStreamEnd::Terminal);
         }
@@ -83,7 +127,8 @@ fn process_complete_sse_frames(
     buffer: &mut Vec<u8>,
     on_event: &mut impl FnMut(SseEvent) -> ProviderResult<SseControl>,
 ) -> ProviderResult<SseControl> {
-    while let Some((frame_end, separator_len)) = sse_frame_boundary(buffer) {
+    while let Some((frame_end, separator_len)) = sse_frame_boundary_counted(buffer) {
+        agent_perf::sse_frame();
         let frame = buffer[..frame_end].to_vec();
         buffer.drain(..frame_end + separator_len);
         if process_sse_frame(&frame, on_event)? == SseControl::Stop {
@@ -100,6 +145,7 @@ fn process_final_sse_frame(
     if frame.iter().all(u8::is_ascii_whitespace) {
         return Ok(SseControl::Continue);
     }
+    agent_perf::sse_frame();
     process_sse_frame(frame, on_event)
 }
 
@@ -146,6 +192,10 @@ fn sse_frame_data(frame: &[u8]) -> Option<SseFrame> {
 fn sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
     let lf = buffer.windows(2).position(|window| window == b"\n\n");
     let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    sse_boundary_from_positions(lf, crlf)
+}
+
+fn sse_boundary_from_positions(lf: Option<usize>, crlf: Option<usize>) -> Option<(usize, usize)> {
     match (lf, crlf) {
         (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
         (Some(_), Some(crlf)) => Some((crlf, 4)),
@@ -215,5 +265,87 @@ mod tests {
             events,
             vec![SseEvent::Json(json!({"type": "message_stop"}))]
         );
+    }
+
+    #[test]
+    fn instrumentation_aggregates_one_byte_chunks() {
+        let input = b"data: {\"value\":1}\n\n";
+        let chunks = input.iter().map(|byte| vec![*byte]);
+        let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelTurn);
+        let mut events = Vec::new();
+
+        let end = tokio_test_scope(&metrics, || {
+            read_json_sse_chunks(chunks, |event| {
+                events.push(event);
+                Ok(SseControl::Continue)
+            })
+        });
+
+        assert_eq!(end.expect("sse parses"), SseStreamEnd::Eof);
+        assert_eq!(events, vec![SseEvent::Json(json!({"value": 1}))]);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.sse_received_bytes, input.len() as u64);
+        assert_eq!(snapshot.sse_frames, 1);
+        assert_eq!(snapshot.sse_peak_retained_bytes, input.len() as u64);
+        assert_eq!(snapshot.sse_scan_windows, 307);
+    }
+
+    #[test]
+    #[ignore = "1 MiB adversarial fragmentation complexity probe"]
+    fn instrumentation_aggregates_large_fragmented_frame() {
+        let payload = "x".repeat(1024 * 1024);
+        let input = format!("data: {{\"payload\":\"{payload}\"}}\n\n");
+        let chunks = input
+            .as_bytes()
+            .chunks(4093)
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelTurn);
+        let mut frames = 0;
+
+        tokio_test_scope(&metrics, || {
+            read_json_sse_chunks(chunks, |_| {
+                frames += 1;
+                Ok(SseControl::Continue)
+            })
+        })
+        .expect("sse parses");
+
+        assert_eq!(frames, 1);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.sse_received_bytes, input.len() as u64);
+        assert_eq!(snapshot.sse_frames, 1);
+        assert_eq!(snapshot.sse_peak_retained_bytes, input.len() as u64);
+        assert_eq!(snapshot.sse_scan_windows, 271_382_824);
+    }
+
+    #[test]
+    fn instrumentation_aggregates_many_frames_in_one_backlog() {
+        const FRAMES: usize = 1_000;
+        let frame = b"data: {\"ok\":true}\n\n";
+        let chunks = [frame.repeat(FRAMES)];
+        let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelTurn);
+        let mut frames = 0;
+
+        tokio_test_scope(&metrics, || {
+            read_json_sse_chunks(chunks, |_| {
+                frames += 1;
+                Ok(SseControl::Continue)
+            })
+        })
+        .expect("sse parses");
+
+        assert_eq!(frames, FRAMES);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.sse_received_bytes, (frame.len() * FRAMES) as u64);
+        assert_eq!(snapshot.sse_frames, FRAMES as u64);
+        assert_eq!(snapshot.sse_scan_windows, 9_524_500);
+    }
+
+    fn tokio_test_scope<T>(metrics: &agent_perf::Metrics, operation: impl FnOnce() -> T) -> T {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime builds");
+        runtime.block_on(metrics.scope(async { operation() }))
     }
 }

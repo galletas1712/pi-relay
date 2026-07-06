@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/agent-perf",
     "crates/agent-vocab",
     "crates/agent-core",
     "crates/agent-session",
@@ -16,6 +17,7 @@ edition = "2021"
 publish = false
 
 [workspace.dependencies]
+agent-perf = { path = "crates/agent-perf" }
 agent-vocab = { path = "crates/agent-vocab" }
 agent-core = { path = "crates/agent-core" }
 agent-session = { path = "crates/agent-session" }

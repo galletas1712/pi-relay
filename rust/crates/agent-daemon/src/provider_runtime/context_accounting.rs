@@ -19,6 +19,7 @@ pub(crate) async fn model_input_tokens_for_gate(
     context_leaf_id: Option<&str>,
     model_context: ModelContext,
 ) -> Result<usize> {
+    agent_perf::accounting_pass();
     match config.provider.kind {
         ProviderKind::Claude => {
             count_claude_model_input_tokens_remotely(state, config, session_id, model_context).await
@@ -64,6 +65,7 @@ async fn count_claude_model_input_tokens_remotely(
 
     let credentials = Credentials::load();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
+    agent_perf::logical_count_token_request();
     Ok(
         count_tokens_with_auth_retry(state, config, session_id, provider, request)
             .await?

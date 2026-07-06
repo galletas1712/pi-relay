@@ -20,10 +20,10 @@ use super::tool::run_tool_turn;
 pub(super) async fn dispatch_all(
     state: &AppState,
     session_id: &str,
-    dispatches: Vec<DispatchAction>,
+    dispatches: Vec<(DispatchAction, Option<agent_perf::Metrics>)>,
 ) {
-    for dispatch in dispatches {
-        spawn_dispatch(state.clone(), session_id.to_string(), dispatch).await;
+    for (dispatch, perf) in dispatches {
+        spawn_dispatch(state.clone(), session_id.to_string(), dispatch, perf).await;
     }
 }
 
@@ -58,11 +58,17 @@ pub(crate) fn runner_start_count(session_id: &str, kind: &str) -> usize {
         .unwrap_or_default()
 }
 
-async fn spawn_dispatch(state: AppState, session_id: String, dispatch: DispatchAction) {
+async fn spawn_dispatch(
+    state: AppState,
+    session_id: String,
+    dispatch: DispatchAction,
+    perf: Option<agent_perf::Metrics>,
+) {
     if matches!(&dispatch.action, SessionAction::RequestModel { .. }) {
-        let _ = spawn_model_dispatch(state, session_id, dispatch, false).await;
+        let _ = spawn_model_dispatch(state, session_id, dispatch, false, perf).await;
     } else {
-        let _ = spawn_claimed_dispatch(state, session_id, dispatch);
+        debug_assert!(perf.is_none());
+        let _ = spawn_claimed_dispatch(state, session_id, dispatch, None);
     }
 }
 
@@ -71,44 +77,62 @@ pub(super) async fn spawn_model_dispatch(
     session_id: String,
     dispatch: DispatchAction,
     already_claimed: bool,
+    perf: Option<agent_perf::Metrics>,
 ) -> Result<Option<TaskRegistrationId>, TaskRegistrationRejected> {
     if session_uses_harness(&dispatch.config) {
+        if let Some(perf) = perf {
+            perf.finish(agent_perf::Outcome::HarnessDeferred);
+        }
         return Ok(None);
     }
     if is_shutting_down(&state) {
         return Err(TaskRegistrationRejected);
     }
     if !already_claimed {
-        match state
-            .repo
-            .claim_pending_model_action(&session_id, &dispatch.row_id, &dispatch.attempt_id)
-            .await
-        {
+        let claim = state.repo.claim_pending_model_action(
+            &session_id,
+            &dispatch.row_id,
+            &dispatch.attempt_id,
+        );
+        let claimed = match perf.as_ref() {
+            Some(perf) => perf.scope(claim).await,
+            None => claim.await,
+        };
+        match claimed {
             Ok(true) => {}
-            Ok(false) => return Ok(None),
+            Ok(false) => {
+                if let Some(perf) = perf {
+                    perf.finish(agent_perf::Outcome::ClaimLost);
+                }
+                return Ok(None);
+            }
             Err(error) => {
                 eprintln!(
                     "failed to claim model action {session_id}/{}: {error:#}",
                     dispatch.row_id
                 );
+                if let Some(perf) = perf {
+                    perf.finish(agent_perf::Outcome::Failed);
+                }
                 return Ok(None);
             }
         }
     }
-    spawn_claimed_dispatch(state, session_id, dispatch).map(Some)
+    spawn_claimed_dispatch(state, session_id, dispatch, perf).map(Some)
 }
 
 fn spawn_claimed_dispatch(
     state: AppState,
     session_id: String,
     dispatch: DispatchAction,
+    perf: Option<agent_perf::Metrics>,
 ) -> Result<TaskRegistrationId, TaskRegistrationRejected> {
     let event_type = match &dispatch.action {
         SessionAction::RequestModel { .. } => EventType::ModelError,
         SessionAction::RequestTool { .. } => EventType::ToolError,
         SessionAction::CancelSessionWork => unreachable!("cancel work is not dispatched"),
     };
-    prune_finished_tasks(&state);
+    prune_finished_tasks(&state, perf.as_ref());
     let action_row_id = dispatch.row_id.clone();
     let action_kind = match &dispatch.action {
         SessionAction::RequestModel { .. } => ActionKind::Model,
@@ -127,171 +151,187 @@ fn spawn_claimed_dispatch(
         if start_rx.await.is_err() {
             return;
         }
-        #[cfg(test)]
-        record_runner_start(&session_id, &dispatch.action);
-        let row_id = dispatch.row_id.clone();
-        let attempt_id = dispatch.attempt_id.clone();
-        let lease = dispatch.post_compaction_dispatch_lease.clone();
-        let heartbeat_interval = post_compaction_heartbeat_interval(&dispatch.config);
-        // Guard against a panic in the model/tool turn: a bare panic unwinds
-        // past the terminal-state handling below, stranding the action in
-        // `running` forever with no stale-mark and no timeout. catch_unwind
-        // turns it into an error we route through the same stale + ToolError
-        // path as a returned error (and logs it so the panic is still visible).
-        let run = AssertUnwindSafe(async {
+        let run_operation = async move {
             #[cfg(test)]
-            if dispatch
-                .config
-                .metadata
-                .pointer("/fault_injection/pause_model_dispatch_before_provider")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
-                std::future::pending::<()>().await;
-            }
-            #[cfg(test)]
-            if matches!(&dispatch.action, SessionAction::RequestTool { .. })
-                && dispatch
+            record_runner_start(&session_id, &dispatch.action);
+            let row_id = dispatch.row_id.clone();
+            let attempt_id = dispatch.attempt_id.clone();
+            let lease = dispatch.post_compaction_dispatch_lease.clone();
+            let heartbeat_interval = post_compaction_heartbeat_interval(&dispatch.config);
+            // Guard against a panic in the model/tool turn: a bare panic unwinds
+            // past the terminal-state handling below, stranding the action in
+            // `running` forever with no stale-mark and no timeout. catch_unwind
+            // turns it into an error we route through the same stale + ToolError
+            // path as a returned error (and logs it so the panic is still visible).
+            let run = AssertUnwindSafe(async {
+                #[cfg(test)]
+                if dispatch
                     .config
                     .metadata
-                    .pointer("/fault_injection/pause_tool_dispatch_before_run")
+                    .pointer("/fault_injection/pause_model_dispatch_before_provider")
                     .and_then(serde_json::Value::as_bool)
                     == Some(true)
-            {
-                std::future::pending::<()>().await;
-            }
-            match dispatch.action.clone() {
-                SessionAction::RequestModel { .. } => {
-                    run_model_turn(task_state.clone(), session_id.clone(), dispatch).await
+                {
+                    std::future::pending::<()>().await;
                 }
-                SessionAction::RequestTool { .. } => {
-                    run_tool_turn(task_state.clone(), session_id.clone(), dispatch).await
+                #[cfg(test)]
+                if matches!(&dispatch.action, SessionAction::RequestTool { .. })
+                    && dispatch
+                        .config
+                        .metadata
+                        .pointer("/fault_injection/pause_tool_dispatch_before_run")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                {
+                    std::future::pending::<()>().await;
                 }
-                SessionAction::CancelSessionWork => Ok(()),
-            }
-        })
-        .catch_unwind();
-        let result = if let Some(lease) = lease.as_ref() {
-            let state = task_state.clone();
-            let lease = lease.clone();
-            let heartbeat_session_id = session_id.clone();
-            let heartbeat_row_id = row_id.clone();
-            let heartbeat_attempt_id = attempt_id.clone();
-            let heartbeat = async move {
-                let mut interval = tokio::time::interval(heartbeat_interval);
-                interval.tick().await;
-                loop {
+                match dispatch.action.clone() {
+                    SessionAction::RequestModel { .. } => {
+                        run_model_turn(task_state.clone(), session_id.clone(), dispatch).await
+                    }
+                    SessionAction::RequestTool { .. } => {
+                        run_tool_turn(task_state.clone(), session_id.clone(), dispatch).await
+                    }
+                    SessionAction::CancelSessionWork => Ok(()),
+                }
+            })
+            .catch_unwind();
+            let result = if let Some(lease) = lease.as_ref() {
+                let state = task_state.clone();
+                let lease = lease.clone();
+                let heartbeat_session_id = session_id.clone();
+                let heartbeat_row_id = row_id.clone();
+                let heartbeat_attempt_id = attempt_id.clone();
+                let heartbeat = async move {
+                    let mut interval = tokio::time::interval(heartbeat_interval);
                     interval.tick().await;
-                    match state
-                        .repo
-                        .renew_post_compaction_dispatch_lease(
-                            &heartbeat_session_id,
-                            &heartbeat_row_id,
-                            &heartbeat_attempt_id,
-                            &lease,
-                            POST_COMPACTION_DISPATCH_LEASE_DURATION,
-                        )
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            state.post_compaction_recovery_notify.notify_one();
-                            break;
-                        }
-                        Err(error) => {
-                            eprintln!(
+                    loop {
+                        interval.tick().await;
+                        match state
+                            .repo
+                            .renew_post_compaction_dispatch_lease(
+                                &heartbeat_session_id,
+                                &heartbeat_row_id,
+                                &heartbeat_attempt_id,
+                                &lease,
+                                POST_COMPACTION_DISPATCH_LEASE_DURATION,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                state.post_compaction_recovery_notify.notify_one();
+                                break;
+                            }
+                            Err(error) => {
+                                eprintln!(
                                 "failed to renew post-compaction dispatch lease {heartbeat_session_id}/{heartbeat_row_id}: {error:#}"
                             );
-                            state.post_compaction_recovery_notify.notify_one();
-                            break;
+                                state.post_compaction_recovery_notify.notify_one();
+                                break;
+                            }
                         }
                     }
+                };
+                tokio::pin!(heartbeat);
+                tokio::pin!(run);
+                tokio::select! {
+                    result = &mut run => result,
+                    () = &mut heartbeat => {
+                        // A false renewal can mean this same runner just committed
+                        // its terminal or reactive-compaction transition. Wake
+                        // recovery and stop renewing, but keep awaiting the runner
+                        // so it can register the durable follow-up. If ownership
+                        // was truly lost, the replacement registration aborts this
+                        // task after expiry.
+                        run.await
+                    },
+                }
+            } else {
+                run.await
+            };
+            let (result, outcome) = match result {
+                Ok(Ok(())) => (Ok(()), agent_perf::Outcome::Completed),
+                Ok(Err(error)) => (Err(error), agent_perf::Outcome::Failed),
+                Err(panic) => {
+                    let detail = panic
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    eprintln!("dispatch task panicked {session_id}/{row_id}: {detail}");
+                    (
+                        Err(RpcError::new(
+                            "dispatch_panicked",
+                            format!("dispatch task panicked: {detail}"),
+                        )),
+                        agent_perf::Outcome::Panicked,
+                    )
                 }
             };
-            tokio::pin!(heartbeat);
-            tokio::pin!(run);
-            tokio::select! {
-                result = &mut run => result,
-                () = &mut heartbeat => {
-                    // A false renewal can mean this same runner just committed
-                    // its terminal or reactive-compaction transition. Wake
-                    // recovery and stop renewing, but keep awaiting the runner
-                    // so it can register the durable follow-up. If ownership
-                    // was truly lost, the replacement registration aborts this
-                    // task after expiry.
-                    run.await
-                },
+            if !unregister_task(&task_state, &row_id, &task_registration_id) {
+                return agent_perf::Outcome::ClaimLost;
             }
-        } else {
-            run.await
-        };
-        let result = match result {
-            Ok(inner) => inner,
-            Err(panic) => {
-                let detail = panic
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                eprintln!("dispatch task panicked {session_id}/{row_id}: {detail}");
-                Err(RpcError::new(
-                    "dispatch_panicked",
-                    format!("dispatch task panicked: {detail}"),
-                ))
+            if lease.is_some() {
+                task_state.post_compaction_recovery_notify.notify_one();
             }
-        };
-        if !unregister_task(&task_state, &row_id, &task_registration_id) {
-            return;
-        }
-        if lease.is_some() {
-            task_state.post_compaction_recovery_notify.notify_one();
-        }
-        if let Err(error) = result {
-            eprintln!(
-                "dispatch task failed {session_id}/{row_id}: {}: {}",
-                error.code, error.message
-            );
-            let marked_stale = match task_state
-                .repo
-                .mark_action_stale(&session_id, &row_id, &attempt_id, lease.as_ref())
-                .await
-            {
-                Ok(marked_stale) => marked_stale,
-                Err(stale_error) => {
-                    eprintln!("failed to mark action stale {session_id}/{row_id}: {stale_error:#}");
-                    false
-                }
-            };
-            if !marked_stale {
-                return;
-            }
-            match task_state
-                .repo
-                .insert_event(
-                    &session_id,
-                    event_type,
-                    json!({
-                        "action_row_id": row_id,
-                        "error": error.message,
-                    }),
-                )
-                .await
-            {
-                Ok(event) => {
-                    publish_events(&task_state, vec![event]);
-                    if let Err(clear_error) =
-                        clear_event_buffer_if_idle(&task_state, &session_id).await
-                    {
+            if let Err(error) = result {
+                eprintln!(
+                    "dispatch task failed {session_id}/{row_id}: {}: {}",
+                    error.code, error.message
+                );
+                let marked_stale = match task_state
+                    .repo
+                    .mark_action_stale(&session_id, &row_id, &attempt_id, lease.as_ref())
+                    .await
+                {
+                    Ok(marked_stale) => marked_stale,
+                    Err(stale_error) => {
                         eprintln!(
-                            "failed to clear idle event buffer {session_id}: {}: {}",
-                            clear_error.code, clear_error.message
+                            "failed to mark action stale {session_id}/{row_id}: {stale_error:#}"
                         );
+                        false
                     }
+                };
+                if !marked_stale {
+                    return agent_perf::Outcome::ClaimLost;
                 }
-                Err(event_error) => eprintln!(
+                match task_state
+                    .repo
+                    .insert_event(
+                        &session_id,
+                        event_type,
+                        json!({
+                            "action_row_id": row_id,
+                            "error": error.message,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(event) => {
+                        publish_events(&task_state, vec![event]);
+                        if let Err(clear_error) =
+                            clear_event_buffer_if_idle(&task_state, &session_id).await
+                        {
+                            eprintln!(
+                                "failed to clear idle event buffer {session_id}: {}: {}",
+                                clear_error.code, clear_error.message
+                            );
+                        }
+                    }
+                    Err(event_error) => eprintln!(
                     "failed to record dispatch failure event {session_id}/{row_id}: {event_error:#}"
                 ),
+                }
             }
+            outcome
+        };
+        let outcome = match perf.as_ref() {
+            Some(perf) => perf.scope(run_operation).await,
+            None => run_operation.await,
+        };
+        if let Some(perf) = perf {
+            perf.finish(outcome);
         }
     });
     register_task(

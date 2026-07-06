@@ -26,6 +26,7 @@ impl SessionDriver {
         &self,
         dispatch: &DispatchAction,
     ) -> std::result::Result<bool, RpcError> {
+        agent_perf::compaction_gate_pass();
         let Some(eligible) =
             check_compaction_eligible(&self.state, &self.session_id, dispatch).await
         else {
@@ -275,7 +276,7 @@ pub(crate) fn spawn_compaction(
     job: CompactionJob,
     config: SessionConfig,
 ) -> Result<(), TaskRegistrationRejected> {
-    prune_finished_tasks(state);
+    prune_finished_tasks(state, None);
     let action_row_id = job.action_row_id.clone();
     let task_state = state.clone();
     let task_session_id = session_id.clone();
@@ -283,16 +284,24 @@ pub(crate) fn spawn_compaction(
     let registration_id = TaskRegistrationId::new();
     let task_registration_id = registration_id.clone();
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let perf = agent_perf::Metrics::new_if_enabled(agent_perf::Operation::Compaction);
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
         }
         let action_row_id = job.action_row_id.clone();
-        let result = run_compaction_job(task_state.clone(), session_id.clone(), job, config).await;
+        let operation = async {
+            agent_perf::observe_context(job.compaction_context.measured_content_bytes());
+            run_compaction_job(task_state.clone(), session_id.clone(), job, config).await
+        };
+        let result = match perf.as_ref() {
+            Some(perf) => perf.scope(operation).await,
+            None => operation.await,
+        };
         if !unregister_task(&task_state, &action_row_id, &task_registration_id) {
             return;
         }
-        if let Err(error) = result {
+        if let Err(error) = &result {
             eprintln!(
                 "compaction task failed {session_id}: {}: {}",
                 error.code, error.message
@@ -307,6 +316,14 @@ pub(crate) fn spawn_compaction(
                     recovery_error.code, recovery_error.message
                 );
             }
+        }
+        if let Some(perf) = perf {
+            let outcome = if result.is_ok() {
+                agent_perf::Outcome::Completed
+            } else {
+                agent_perf::Outcome::Failed
+            };
+            perf.finish(outcome);
         }
     });
     register_task(
@@ -473,8 +490,14 @@ async fn run_compaction_job(
             config: dispatch.config,
         };
         let lease = dispatch.post_compaction_dispatch_lease.clone();
-        let registration_id =
-            spawn_model_dispatch(state.clone(), session_id.clone(), dispatch, true).await;
+        let registration_id = spawn_model_dispatch(
+            state.clone(),
+            session_id.clone(),
+            dispatch,
+            true,
+            agent_perf::Metrics::new_if_enabled(agent_perf::Operation::ModelTurn),
+        )
+        .await;
         if matches!(registration_id, Err(TaskRegistrationRejected)) {
             // Shutdown owns the runner barrier now. Keep the exact durable
             // lease for expiry/recovery on the next boot.

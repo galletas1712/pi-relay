@@ -177,14 +177,16 @@ impl TranscriptStore {
     /// Materialize the full active path in model-visible order.
     pub fn model_context(&self) -> ModelContext {
         let path = self.active_path_entries();
-        ModelContext::from_entries(
+        let context = ModelContext::from_entries(
             path.into_iter()
                 .map(|entry| ModelContextEntry {
                     item: entry.item,
                     provider_replay: entry.provider_replay,
                 })
                 .collect(),
-        )
+        );
+        agent_perf::active_context_materialized_by(|| context.measured_content_bytes());
+        context
     }
 
     pub fn append_root_item(
@@ -456,5 +458,35 @@ mod tests {
 
         assert!(store.is_turn_boundary());
         assert_eq!(store.model_context().last_turn_id(), TurnId(4));
+    }
+
+    #[test]
+    #[ignore = "allocates up to 100 MiB; deterministic Stage 0 scaling fixture"]
+    fn model_context_materialization_scaling_1_10_100_mib() {
+        for mib in [1_usize, 10, 100] {
+            let bytes = mib * 1024 * 1024;
+            let mut store = TranscriptStore::new();
+            store.append_transcript_item(TranscriptItem::UserMessage(UserMessage::text(
+                "x".repeat(bytes),
+            )));
+            let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelTurn);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime builds");
+            let started = std::time::Instant::now();
+            let context = runtime.block_on(metrics.scope(async { store.model_context() }));
+            let elapsed = started.elapsed();
+
+            assert_eq!(context.transcript_items().len(), 1);
+            let snapshot = metrics.snapshot();
+            assert_eq!(snapshot.active_context_materializations, 1);
+            assert_eq!(snapshot.active_context_materialized_bytes, bytes as u64);
+            eprintln!(
+                "perf fixture=model_context mib={mib} materialized_bytes={} elapsed_ns={} mib_per_second={:.1}",
+                snapshot.active_context_materialized_bytes,
+                elapsed.as_nanos(),
+                mib as f64 / elapsed.as_secs_f64()
+            );
+        }
     }
 }

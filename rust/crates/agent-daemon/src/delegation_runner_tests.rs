@@ -28,12 +28,418 @@ use agent_vocab::{
 };
 use serde_json::json;
 use sqlx::Row;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
 /// A unique temp directory removed on drop, so tests need no `tempfile` dep.
 struct TempDir {
     path: PathBuf,
+}
+
+#[tokio::test]
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL and creates an isolated database"]
+async fn local_openai_turn_records_exact_model_hot_path_and_reaches_idle() {
+    let (base_url, server) = start_local_openai_server().await;
+    let mut env = test_env()
+        .await
+        .expect("PI_RELAY_TEST_DATABASE_URL is required for this ignored baseline test");
+    env.state.provider_connections = ProviderConnectionRegistry::with_test_openai(base_url);
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "model perf aggregate", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "model_perf_local_openai";
+    let mut config = session_config(
+        &env,
+        project_id,
+        json!({
+            "created_by": "test",
+            "auto_title_disabled": true,
+            "compaction": {
+                "config": {
+                    "auto_enabled": false
+                }
+            }
+        }),
+    );
+    config.outer_cwd = "/tmp".to_string();
+    let started = start_prepared_session(
+        &env.state,
+        PreparedSessionStart {
+            session_id: session_id.to_string(),
+            config,
+            priority: InputPriority::FollowUp,
+            content: UserMessage::text("ordinary request"),
+            client_input_id: None,
+            parent_session_id: None,
+            subagent_type: None,
+            delegation_id: None,
+            dispatch_mode: PreparedSessionDispatchMode::Deferred,
+        },
+    )
+    .await
+    .expect("session starts");
+    let [dispatch] = started.dispatches.as_slice() else {
+        panic!("expected one model dispatch");
+    };
+    let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ModelTurn);
+    let observer = metrics.test_observer();
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    driver
+        .dispatch_model_with_metrics(dispatch.clone(), metrics)
+        .await
+        .expect("model dispatch starts");
+    drop(driver);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if env
+                .state
+                .repo
+                .activity(session_id)
+                .await
+                .expect("load activity")
+                == agent_store::SessionActivity::Idle
+                && env
+                    .state
+                    .tasks
+                    .lock()
+                    .expect("task registry lock")
+                    .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("local provider model turn reaches idle");
+
+    let mut snapshot = observer.finished_snapshot().await;
+    let requests = server.await.expect("local provider server joins");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0]
+        .headers
+        .starts_with("GET /models?client_version="));
+    assert!(requests[0].body.is_empty());
+    assert!(requests[1].headers.starts_with("POST /responses HTTP/1.1"));
+    assert!(requests[1]
+        .headers
+        .to_ascii_lowercase()
+        .contains("\r\ncontent-encoding: zstd\r\n"));
+    assert!(!requests[1].body.is_empty());
+    snapshot.lock_wait_ns = 0;
+    snapshot.output_transaction_ns = 0;
+    assert_eq!(
+        snapshot,
+        agent_perf::Snapshot {
+            latest_context_bytes: 16,
+            request_copies: 1,
+            request_copied_bytes: 16,
+            logical_model_request_builds: 1,
+            provider_body_serializations: 1,
+            provider_body_serialized_bytes: 9_024,
+            provider_body_compressions: 1,
+            provider_body_encoded_bytes: 2_875,
+            compaction_gate_passes: 1,
+            model_attempts: 1,
+            physical_provider_sends: 1,
+            sse_received_bytes: 367,
+            sse_scan_windows: 1_073,
+            sse_frames: 2,
+            sse_peak_retained_bytes: 247,
+            session_registry_scans: 1,
+            session_registry_entries_scanned: 1,
+            dispatch_task_registry_scans: 1,
+            output_sql_statements: 18,
+            output_transactions: 2,
+            scoped_store_calls: 15,
+            empty_persist_passes: 1,
+            empty_dispatch_passes: 1,
+            action_completion_scans: 1,
+            action_completion_entries_scanned: 1,
+            ..agent_perf::Snapshot::default()
+        }
+    );
+    env.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL and creates an isolated database"]
+async fn cold_recovery_finishes_before_resumed_model_dispatch() {
+    let env = test_env()
+        .await
+        .expect("PI_RELAY_TEST_DATABASE_URL is required for this ignored baseline test");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "cold recovery perf", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "perf_cold_resume";
+    let turn_id = TurnId(7);
+    let entries = vec![
+        TranscriptStorageNode {
+            id: "cold_turn".to_string(),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::TurnStarted { turn_id },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "cold_user".to_string(),
+            parent_id: Some("cold_turn".to_string()),
+            timestamp_ms: 2,
+            item: TranscriptItem::UserMessage(UserMessage::text("completed cold turn")),
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "cold_finished".to_string(),
+            parent_id: Some("cold_user".to_string()),
+            timestamp_ms: 3,
+            item: TranscriptItem::TurnFinished {
+                turn_id,
+                outcome: TurnOutcome::Graceful,
+            },
+            provider_replay: Vec::new(),
+        },
+    ];
+    let config = session_config(
+        &env,
+        project_id,
+        json!({
+            "created_by": "test",
+            "harness": true,
+            "auto_title_disabled": true,
+            "compaction": { "config": { "auto_enabled": false } }
+        }),
+    );
+    env.state
+        .repo
+        .start_session_outputs(
+            session_id,
+            &config,
+            &entries,
+            Some("cold_finished"),
+            &[],
+            &[],
+            InputPriority::FollowUp,
+            &UserMessage::text("completed cold turn"),
+            None,
+        )
+        .await
+        .expect("seed cold stored session");
+    env.state
+        .repo
+        .enqueue_user_input(
+            session_id,
+            InputPriority::FollowUp,
+            &UserMessage::text("resume from cold queue"),
+            None,
+            None,
+        )
+        .await
+        .expect("queue work for cold session");
+
+    let metrics = agent_perf::Metrics::for_test(agent_perf::Operation::ColdActivation);
+    let observer = metrics.test_observer();
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    let dispatches = driver
+        .drive_with_cold_metrics(metrics)
+        .await
+        .expect("cold recovery resumes work");
+    drop(driver);
+
+    let snapshot = observer.finished_snapshot().await;
+    assert_eq!(dispatches.len(), 1);
+    let pending = env
+        .state
+        .repo
+        .pending_actions_for_dispatch(session_id)
+        .await
+        .expect("load resumed action");
+    assert_eq!(pending.len(), 1);
+    assert!(matches!(
+        pending[0].action,
+        SessionAction::RequestModel { .. }
+    ));
+    assert_eq!(
+        snapshot,
+        agent_perf::Snapshot {
+            active_context_materializations: 1,
+            active_context_materialized_bytes: 19,
+            latest_context_bytes: 19,
+            recovery_sql_statements: 2,
+            scoped_store_calls: 2,
+            cold_rows_loaded: 3,
+            cold_bytes_loaded: 116,
+            ..agent_perf::Snapshot::default()
+        }
+    );
+    env.cleanup().await;
+}
+
+#[test]
+fn only_model_actions_are_model_metric_owners() {
+    let model = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::new(),
+        context_leaf_id: None,
+    };
+    let tool = SessionAction::RequestTool {
+        action_id: ActionId(2),
+        turn_id: TurnId(1),
+        tool_call: ToolCall {
+            id: ToolCallId::from_u64(1),
+            tool_name: "Bash".to_string(),
+            args_json: "{}".to_string(),
+        },
+    };
+
+    assert_eq!(
+        crate::runtime::model_operation_for_action(&model),
+        Some(agent_perf::Operation::ModelTurn)
+    );
+    assert_eq!(crate::runtime::model_operation_for_action(&tool), None);
+    assert_eq!(
+        crate::runtime::model_operation_for_action(&SessionAction::CancelSessionWork),
+        None
+    );
+}
+
+struct CapturedHttpRequest {
+    headers: String,
+    body: Vec<u8>,
+}
+
+async fn start_local_openai_server() -> (String, tokio::task::JoinHandle<Vec<CapturedHttpRequest>>)
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("local provider listener binds");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("local provider address")
+    );
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+
+        let (mut models_socket, _) = listener.accept().await.expect("models request accepted");
+        requests.push(read_http_request(&mut models_socket).await);
+        let models = json!({
+            "models": [{
+                "slug": "gpt-5.2",
+                "context_window": 200_000,
+                "max_context_window": 200_000,
+                "auto_compact_token_limit": 180_000,
+                "supported_reasoning_levels": [{ "effort": "medium" }],
+                "supports_parallel_tool_calls": true
+            }]
+        })
+        .to_string();
+        write_http_response(&mut models_socket, "application/json", models.as_bytes()).await;
+
+        let (mut response_socket, _) = listener.accept().await.expect("responses request accepted");
+        requests.push(read_http_request(&mut response_socket).await);
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":",
+            "{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",",
+            "\"content\":[{\"type\":\"output_text\",\"text\":\"local completion\",\"annotations\":[]}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",",
+            "\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}}\n\n"
+        );
+        let split_points = [17, 119, 247];
+        let fragments = [
+            &sse.as_bytes()[..split_points[0]],
+            &sse.as_bytes()[split_points[0]..split_points[1]],
+            &sse.as_bytes()[split_points[1]..split_points[2]],
+            &sse.as_bytes()[split_points[2]..],
+        ];
+        response_socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .expect("SSE headers write");
+        for fragment in fragments {
+            let chunk_header = format!("{:x}\r\n", fragment.len());
+            response_socket
+                .write_all(chunk_header.as_bytes())
+                .await
+                .expect("SSE chunk header writes");
+            response_socket
+                .write_all(fragment)
+                .await
+                .expect("SSE chunk writes");
+            response_socket
+                .write_all(b"\r\n")
+                .await
+                .expect("SSE chunk terminator writes");
+            response_socket.flush().await.expect("SSE chunk flushes");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        response_socket
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("SSE final chunk writes");
+        requests
+    });
+    (base_url, server)
+}
+
+async fn read_http_request(socket: &mut tokio::net::TcpStream) -> CapturedHttpRequest {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 4096];
+    let (header_end, content_length) = loop {
+        let read = socket.read(&mut buffer).await.expect("HTTP request reads");
+        assert!(read > 0, "HTTP request closed before headers");
+        bytes.extend_from_slice(&buffer[..read]);
+        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or_default();
+        break (header_end + 4, content_length);
+    };
+    while bytes.len() < header_end + content_length {
+        let read = socket
+            .read(&mut buffer)
+            .await
+            .expect("HTTP request body reads");
+        assert!(read > 0, "HTTP request closed before body");
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    CapturedHttpRequest {
+        headers: String::from_utf8(bytes[..header_end].to_vec()).expect("HTTP headers are UTF-8"),
+        body: bytes[header_end..header_end + content_length].to_vec(),
+    }
+}
+
+async fn write_http_response(socket: &mut tokio::net::TcpStream, content_type: &str, body: &[u8]) {
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    socket
+        .write_all(headers.as_bytes())
+        .await
+        .expect("HTTP response headers write");
+    socket
+        .write_all(body)
+        .await
+        .expect("HTTP response body writes");
 }
 
 impl TempDir {
