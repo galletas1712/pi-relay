@@ -9,9 +9,9 @@ use anyhow::Result;
 use crate::auth::Credentials;
 use crate::state::AppState;
 
-use super::auth_retry::complete_with_auth_retry;
+use super::auth_retry::{complete_with_auth_retry, PreparedModelRequestState};
 use super::prompt::{assemble_agent_prompt, effective_prompt_profile, provider_tools_for_session};
-use super::provider::provider_for_config;
+use super::provider::{provider_for_config, ProviderHandle};
 use super::transcript::provider_transcript_owned;
 
 pub(crate) fn model_prompt_cache_key(config: &SessionConfig, session_id: &str) -> String {
@@ -26,19 +26,54 @@ pub(crate) async fn run_model(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
-    turn_id: TurnId,
-    input: Arc<ProviderModelInput>,
+    call: &mut PreparedModelCall,
 ) -> Result<ModelResponse> {
     #[cfg(test)]
     if let Some(result) = injected_model_result(config, session_id) {
         return result;
     }
-    let mut request = ModelRequest::new(input).with_turn_id(turn_id);
-    // Provider adapters apply authoritative discovered/static output
-    // ceilings. Do not pre-clamp here or stale daemon metadata could override
-    // a newer Models API result.
-    request.max_tokens = config.provider.max_tokens;
-    complete_model_request(state, config, session_id, request).await
+    if call.provider.is_none() {
+        let credentials = Credentials::load();
+        call.provider = Some(provider_for_config(state, config, &credentials, session_id).await?);
+    }
+    let provider = call
+        .provider
+        .as_mut()
+        .expect("provider was installed for the prepared model call");
+    Ok(complete_with_auth_retry(
+        state,
+        config,
+        session_id,
+        provider,
+        call.request.clone(),
+        &mut call.prepared,
+    )
+    .await?)
+}
+
+pub(crate) struct PreparedModelCall {
+    request: ModelRequest,
+    prepared: PreparedModelRequestState,
+    provider: Option<ProviderHandle>,
+}
+
+impl PreparedModelCall {
+    pub(crate) fn new(
+        input: Arc<ProviderModelInput>,
+        turn_id: TurnId,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        let mut request = ModelRequest::new(input).with_turn_id(turn_id);
+        // Provider adapters apply authoritative discovered/static output
+        // ceilings. Do not pre-clamp here or stale daemon metadata could
+        // override a newer Models API result.
+        request.max_tokens = max_tokens;
+        Self {
+            request,
+            prepared: PreparedModelRequestState::default(),
+            provider: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +198,15 @@ pub(super) async fn complete_model_request(
     request: ModelRequest,
 ) -> Result<ModelResponse> {
     let credentials = Credentials::load();
-    let provider = provider_for_config(state, config, &credentials, session_id).await?;
-    Ok(complete_with_auth_retry(state, config, session_id, provider, request).await?)
+    let mut provider = provider_for_config(state, config, &credentials, session_id).await?;
+    let mut prepared = PreparedModelRequestState::default();
+    Ok(complete_with_auth_retry(
+        state,
+        config,
+        session_id,
+        &mut provider,
+        request,
+        &mut prepared,
+    )
+    .await?)
 }

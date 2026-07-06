@@ -4,7 +4,7 @@ use agent_vocab::{
     ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem, TurnId, UserMessage,
 };
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, ACCEPT, CONTENT_ENCODING, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, ACCEPT};
 use reqwest::redirect::Policy;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -29,8 +29,9 @@ use crate::{
     http::send_provider_generation_request,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
-    ModelTranscriptEntry, ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
-    ProviderModelMetadata, ProviderResult, ProviderToolProfile, ProviderUsage,
+    ModelTranscriptEntry, PreparedModelRequest, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderError, ProviderModelMetadata, ProviderResult,
+    ProviderToolProfile, ProviderUsage,
 };
 
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
@@ -87,6 +88,52 @@ pub struct OpenAiProvider {
     base_url: String,
     model_catalog_cache: OpenAiModelCatalogCache,
     models_request_timeout: Duration,
+    #[cfg(any(test, feature = "test-utils"))]
+    preparation_stats: Arc<OpenAiPreparationStats>,
+}
+
+fn prepared_openai_session_id(
+    request_session_id: Option<&str>,
+    session_state: Option<&OpenAiCodexSessionState>,
+) -> ProviderResult<String> {
+    request_session_id
+        .map(str::to_string)
+        .or_else(|| session_state.map(|state| state.session_id().to_string()))
+        .ok_or_else(|| {
+            ProviderError::Provider(
+                "prepared OpenAI request requires a stable session identity".to_string(),
+            )
+        })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Default)]
+struct OpenAiPreparationStats {
+    serializations: AtomicU64,
+    compressions: AtomicU64,
+}
+
+#[derive(Clone)]
+pub(crate) struct OpenAiPreparedRequestMetadata {
+    body_shape: OpenAiPreparedBodyShape,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct OpenAiPreparedBodyShape {
+    model: String,
+    reasoning_effort: &'static str,
+    supports_parallel_tool_calls: bool,
+}
+
+fn openai_prepared_body_shape(
+    metadata: &OpenAiModelMetadata,
+    reasoning_effort: ReasoningEffort,
+) -> ProviderResult<OpenAiPreparedBodyShape> {
+    Ok(OpenAiPreparedBodyShape {
+        model: metadata.slug.clone(),
+        reasoning_effort: openai_reasoning_effort(metadata, reasoning_effort)?,
+        supports_parallel_tool_calls: metadata.supports_parallel_tool_calls,
+    })
 }
 
 /// Shared HTTP client for fixed private Codex endpoints.
@@ -513,7 +560,7 @@ async fn read_bounded_catalog_response(mut response: reqwest::Response) -> Provi
     Ok(body)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 fn test_openai_model_metadata(model: &str) -> OpenAiModelMetadata {
     OpenAiModelMetadata {
         slug: model.to_string(),
@@ -2224,6 +2271,8 @@ impl OpenAiProvider {
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             model_catalog_cache,
             models_request_timeout: CODEX_MODELS_REQUEST_TIMEOUT,
+            #[cfg(any(test, feature = "test-utils"))]
+            preparation_stats: Arc::default(),
         }
     }
 
@@ -2261,7 +2310,39 @@ impl OpenAiProvider {
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             model_catalog_cache,
             models_request_timeout: CODEX_MODELS_REQUEST_TIMEOUT,
+            #[cfg(any(test, feature = "test-utils"))]
+            preparation_stats: Arc::default(),
         }
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn set_base_url_for_test(&mut self, base_url: String) {
+        self.base_url = base_url;
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub async fn install_model_metadata_for_test(&self, model: &str) {
+        let metadata = test_openai_model_metadata(model);
+        let mut state = self.model_catalog_cache.state.lock().await;
+        state.active_key = Some(self.catalog_key());
+        state.catalog = Some(Arc::new(OpenAiModelCatalog {
+            models: [(metadata.slug.clone(), Arc::new(metadata))]
+                .into_iter()
+                .collect(),
+        }));
+        state.fetched_at = Some(Instant::now());
+        state.failure = None;
+        state.refresh = None;
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn preparation_counts_for_test(&self) -> (u64, u64) {
+        (
+            self.preparation_stats
+                .serializations
+                .load(Ordering::Relaxed),
+            self.preparation_stats.compressions.load(Ordering::Relaxed),
+        )
     }
 
     fn catalog_key(&self) -> OpenAiCatalogKey {
@@ -2479,8 +2560,73 @@ fn codex_user_agent() -> &'static str {
 
 #[async_trait]
 impl ModelProvider for OpenAiProvider {
-    async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
-        self.complete_responses(request).await
+    async fn complete(&self, mut request: ModelRequest) -> ProviderResult<ModelResponse> {
+        if request.session_id().is_none() && self.session_state.is_none() {
+            request.set_session_id_if_missing(Uuid::new_v4().to_string());
+        }
+        let prepared = self
+            .prepare_model_request(&request, None)
+            .await?
+            .expect("OpenAI always prepares ordinary model requests");
+        self.complete_prepared(request, prepared).await
+    }
+
+    async fn prepare_model_request(
+        &self,
+        request: &ModelRequest,
+        existing: Option<&PreparedModelRequest>,
+    ) -> ProviderResult<Option<PreparedModelRequest>> {
+        let session_id =
+            prepared_openai_session_id(request.session_id(), self.session_state.as_deref())?;
+        let metadata = self.resolved_model_metadata(request.model()).await?;
+        if let Some(existing) = existing
+            .filter(|existing| request.session_id().is_some() && existing.matches_request(request))
+        {
+            let prepared_metadata = existing.openai_metadata()?;
+            if openai_prepared_body_shape(&metadata, request.reasoning_effort())?
+                == prepared_metadata.body_shape
+            {
+                return Ok(Some(existing.clone()));
+            }
+        }
+        observe_openai_window_generation(
+            &session_id,
+            self.session_state.as_deref(),
+            request.transcript(),
+            request.transcript_suffix(),
+        );
+        let body = responses_body_with_metadata(request, &session_id, &metadata)?;
+        let body_shape = openai_prepared_body_shape(&metadata, request.reasoning_effort())?;
+        let json = serde_json::to_vec(&body)?;
+        #[cfg(any(test, feature = "test-utils"))]
+        self.preparation_stats
+            .serializations
+            .fetch_add(1, Ordering::Relaxed);
+        let compressed =
+            zstd::stream::encode_all(Cursor::new(json), CODEX_REQUEST_COMPRESSION_LEVEL).map_err(
+                |error| {
+                    ProviderError::Provider(format!(
+                        "failed to zstd-compress OpenAI request body: {error}"
+                    ))
+                },
+            )?;
+        #[cfg(any(test, feature = "test-utils"))]
+        self.preparation_stats
+            .compressions
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(PreparedModelRequest::openai(
+            request,
+            compressed,
+            OpenAiPreparedRequestMetadata { body_shape },
+        )))
+    }
+
+    async fn complete_prepared(
+        &self,
+        request: ModelRequest,
+        prepared: PreparedModelRequest,
+    ) -> ProviderResult<ModelResponse> {
+        self.complete_prepared_responses(request, prepared).await
     }
 
     async fn model_metadata(&self, model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
@@ -2506,14 +2652,25 @@ impl ModelProvider for OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    async fn complete_responses(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
+    async fn complete_prepared_responses(
+        &self,
+        request: ModelRequest,
+        prepared: PreparedModelRequest,
+    ) -> ProviderResult<ModelResponse> {
+        if !prepared.matches_request(&request) {
+            return Err(ProviderError::Provider(
+                "prepared OpenAI request no longer matches its logical input".to_string(),
+            ));
+        }
         // Lift the session id off the request before consuming it for the body.
         // This is the value the Codex CLI calls `thread_id`: the unique
         // pi-relay session identifier that doubles as the prompt-cache cohort
         // and as every routing header (session_id, x-client-request-id,
         // etc.). Falling back to a fresh UUID keeps the CLI / test paths
         // functional, but the daemon always supplies a real session id.
-        let session_id = openai_session_id(request.session_id(), self.session_state.as_deref());
+        let _ = prepared.openai_metadata()?;
+        let session_id =
+            prepared_openai_session_id(request.session_id(), self.session_state.as_deref())?;
         let window_id = openai_window_id(
             &session_id,
             self.session_state.as_deref(),
@@ -2526,11 +2683,8 @@ impl OpenAiProvider {
             .as_deref()
             .filter(|state| state.session_id() == session_id)
             .and_then(|state| state.turn_state_for_request(turn_id));
-        let metadata = self.resolved_model_metadata(request.model()).await?;
-        let body = responses_body_with_metadata(&request, &session_id, &metadata)?;
-
         let response = send_provider_generation_request(
-            zstd_json_request(
+            prepared.request_with_body(
                 self.add_codex_headers(
                     self.client
                         .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
@@ -2539,7 +2693,6 @@ impl OpenAiProvider {
                     &window_id,
                     codex_turn_state.as_deref(),
                 ),
-                &body,
             )?,
             "OpenAI /responses",
         )
@@ -2566,6 +2719,12 @@ impl OpenAiProvider {
         request: ProviderCompactionRequest,
     ) -> ProviderResult<ProviderCompactionResponse> {
         let session_id = openai_session_id(request.session_id(), self.session_state.as_deref());
+        observe_openai_window_generation(
+            &session_id,
+            self.session_state.as_deref(),
+            request.transcript(),
+            &[],
+        );
         let window_id = openai_window_id(
             &session_id,
             self.session_state.as_deref(),
@@ -2616,34 +2775,26 @@ fn openai_window_id(
     transcript: &[ModelTranscriptEntry],
     transcript_suffix: &[ModelTranscriptEntry],
 ) -> String {
-    let transcript_generation =
-        codex_window_generation(transcript).max(codex_window_generation(transcript_suffix));
     if let Some(state) = session_state.filter(|state| state.session_id() == session_id) {
-        state.observe_transcript_generation(transcript_generation);
         state.window_id()
     } else {
+        let transcript_generation =
+            codex_window_generation(transcript).max(codex_window_generation(transcript_suffix));
         format!("{session_id}:{transcript_generation}")
     }
 }
 
-fn zstd_json_request(
-    request: reqwest::RequestBuilder,
-    body: &Value,
-) -> ProviderResult<reqwest::RequestBuilder> {
-    let json = serde_json::to_vec(body)?;
-    let compressed =
-        match zstd::stream::encode_all(Cursor::new(json), CODEX_REQUEST_COMPRESSION_LEVEL) {
-            Ok(compressed) => compressed,
-            Err(error) => {
-                return Err(ProviderError::Provider(format!(
-                    "failed to zstd-compress OpenAI request body: {error}"
-                )));
-            }
-        };
-    Ok(request
-        .header(CONTENT_TYPE, "application/json")
-        .header(CONTENT_ENCODING, "zstd")
-        .body(compressed))
+fn observe_openai_window_generation(
+    session_id: &str,
+    session_state: Option<&OpenAiCodexSessionState>,
+    transcript: &[ModelTranscriptEntry],
+    transcript_suffix: &[ModelTranscriptEntry],
+) {
+    if let Some(state) = session_state.filter(|state| state.session_id() == session_id) {
+        state.observe_transcript_generation(
+            codex_window_generation(transcript).max(codex_window_generation(transcript_suffix)),
+        );
+    }
 }
 
 fn codex_window_generation(transcript: &[ModelTranscriptEntry]) -> u64 {
@@ -3600,6 +3751,19 @@ mod tests {
         agent_tools::ToolRegistry::with_builtin_tools().provider_tools_for_provider(provider)
     }
 
+    async fn install_test_model_metadata(provider: &OpenAiProvider, metadata: OpenAiModelMetadata) {
+        let mut state = provider.model_catalog_cache.state.lock().await;
+        state.active_key = Some(provider.catalog_key());
+        state.catalog = Some(Arc::new(OpenAiModelCatalog {
+            models: [(metadata.slug.clone(), Arc::new(metadata))]
+                .into_iter()
+                .collect(),
+        }));
+        state.fetched_at = Some(Instant::now());
+        state.failure = None;
+        state.refresh = None;
+    }
+
     #[test]
     fn responses_body_split_suffix_matches_contiguous_transcript() {
         let prefix: Vec<ModelTranscriptEntry> =
@@ -3741,32 +3905,50 @@ mod tests {
         assert!(request.headers().get(HEADER_WINDOW_ID).is_some());
     }
 
-    #[test]
-    fn zstd_json_request_sets_codex_compression_headers_and_body() {
-        let provider = OpenAiProvider::codex("access-token", None, None);
-        let body = json!({
-            "model": "gpt-5.5",
-            "input": ["hello"],
-            "padding": "x".repeat(1024),
-        });
-
-        let request =
-            zstd_json_request(provider.client.post("https://example.com/responses"), &body)
-                .expect("request should compress")
-                .build()
-                .expect("request builds");
+    #[tokio::test]
+    async fn prepared_request_serializes_and_compresses_stage4_body_once() {
+        let provider = OpenAiProvider::codex("access-token", Some("account-id".to_string()), None);
+        install_test_model_metadata(&provider, test_openai_model_metadata("gpt-5.5")).await;
+        let request = test_model_request! {
+            model: "gpt-5.5".to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::new(
+                Some("stable rules".to_string()),
+                Some("cwd: /tmp/project".to_string()),
+            ),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: Some(4096),
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: Some("cache-key".to_string()),
+            session_id: Some("session-1".to_string()),
+            turn_id: Some(TurnId(7)),
+        };
+        let expected = responses_body(request.clone(), "session-1").expect("fixture renders");
+        let prepared = provider
+            .prepare_model_request(&request, None)
+            .await
+            .expect("preparation succeeds")
+            .expect("OpenAI prepares bytes");
+        let cloned = prepared.clone();
+        let request = prepared
+            .request_with_body(provider.client.post("https://example.com/responses"))
+            .expect("prepared body attaches")
+            .build()
+            .expect("request builds");
 
         assert_eq!(
             request
                 .headers()
-                .get(CONTENT_ENCODING)
+                .get(reqwest::header::CONTENT_ENCODING)
                 .and_then(|value| value.to_str().ok()),
             Some("zstd")
         );
         assert_eq!(
             request
                 .headers()
-                .get(CONTENT_TYPE)
+                .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok()),
             Some("application/json")
         );
@@ -3774,10 +3956,113 @@ mod tests {
             .body()
             .and_then(reqwest::Body::as_bytes)
             .expect("compressed body should be buffered");
+        assert_eq!(
+            encoded.as_ptr(),
+            prepared.body_allocation().expect("prepared allocation").0
+        );
         let decoded = zstd::stream::decode_all(std::io::Cursor::new(encoded))
             .expect("compressed body should decode");
         let decoded: Value = serde_json::from_slice(&decoded).expect("decoded body should be JSON");
-        assert_eq!(decoded, body);
+        assert_eq!(decoded, expected);
+        assert_eq!(
+            provider
+                .preparation_stats
+                .serializations
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            provider
+                .preparation_stats
+                .compressions
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            prepared.body_allocation().expect("body allocation"),
+            cloned.body_allocation().expect("cloned body allocation")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_request_reprepares_once_for_incompatible_capability_shape() {
+        let provider = OpenAiProvider::codex("access-token", Some("account-id".to_string()), None);
+        install_test_model_metadata(&provider, test_openai_model_metadata("gpt-5.5")).await;
+        let request = test_model_request! {
+            model: "gpt-5.5".to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+            session_id: Some("session-1".to_string()),
+            turn_id: Some(TurnId(7)),
+        };
+        let prepared = provider
+            .prepare_model_request(&request, None)
+            .await
+            .expect("first preparation succeeds")
+            .expect("OpenAI prepares bytes");
+        let reused = provider
+            .prepare_model_request(&request, Some(&prepared))
+            .await
+            .expect("unchanged capability check succeeds")
+            .expect("OpenAI retains bytes");
+        assert_eq!(
+            reused.body_allocation().expect("reused allocation"),
+            prepared.body_allocation().expect("prepared allocation")
+        );
+        assert_eq!(
+            provider
+                .preparation_stats
+                .serializations
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let mut changed_metadata = test_openai_model_metadata("gpt-5.5");
+        changed_metadata.supports_parallel_tool_calls = false;
+        install_test_model_metadata(&provider, changed_metadata).await;
+        let reprepared = provider
+            .prepare_model_request(&request, Some(&prepared))
+            .await
+            .expect("changed capability reprepares")
+            .expect("OpenAI prepares replacement bytes");
+        assert_ne!(
+            reprepared
+                .body_allocation()
+                .expect("replacement allocation"),
+            prepared.body_allocation().expect("prepared allocation")
+        );
+        let reused_replacement = provider
+            .prepare_model_request(&request, Some(&reprepared))
+            .await
+            .expect("replacement capability check succeeds")
+            .expect("OpenAI retains replacement bytes");
+        assert_eq!(
+            reused_replacement
+                .body_allocation()
+                .expect("reused replacement allocation"),
+            reprepared
+                .body_allocation()
+                .expect("replacement allocation")
+        );
+        assert_eq!(
+            (
+                provider
+                    .preparation_stats
+                    .serializations
+                    .load(Ordering::Relaxed),
+                provider
+                    .preparation_stats
+                    .compressions
+                    .load(Ordering::Relaxed),
+            ),
+            (2, 2)
+        );
     }
 
     #[test]
@@ -3920,7 +4205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_complete_replays_turn_state_on_followup_request_only_same_turn() {
+    async fn prepared_codex_retry_reuses_bytes_and_reads_updated_turn_state_at_send_time() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3929,8 +4214,10 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
         let captured_turn_states = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let server_turn_states = captured_turn_states.clone();
+        let captured_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let server_authorizations = captured_authorizations.clone();
         let server = tokio::spawn(async move {
-            for _ in 0..3 {
+            for attempt in 0..4 {
                 let (mut stream, _) = listener.accept().await.expect("request accepted");
                 let mut buffer = Vec::new();
                 let mut chunk = [0; 1024];
@@ -3971,10 +4258,42 @@ mod tests {
                             .then(|| value.trim().to_string())
                     });
                 server_turn_states.lock().await.push(turn_state);
+                server_authorizations.lock().await.push(
+                    headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find_map(|(name, value)| {
+                            name.eq_ignore_ascii_case("authorization")
+                                .then(|| value.trim().to_string())
+                        }),
+                );
 
-                let sse = r#"data: {"type":"response.completed","response":{"id":"resp_1"}}
+                if attempt == 0 {
+                    let body = r#"{"error":{"message":"expired token"}}"#;
+                    let response = format!(
+                        "HTTP/1.1 401 Unauthorized\r\n\
+                         content-type: application/json\r\n\
+                         content-length: {}\r\n\
+                         connection: close\r\n\
+                         \r\n\
+                         {body}",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("401 response writes");
+                    continue;
+                }
+                let sse = if attempt == 1 {
+                    r#"data: {"type":"response.created","response":{"id":"resp_1"}}
 
-"#;
+"#
+                } else {
+                    r#"data: {"type":"response.completed","response":{"id":"resp_1"}}
+
+"#
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\n\
                      content-type: text/event-stream\r\n\
@@ -3998,63 +4317,95 @@ mod tests {
             client: OpenAiCodexHttpClient::new(),
             session_state: Some(session_state),
             access_token: "token".to_string(),
-            account_id: None,
+            account_id: Some("account-1".to_string()),
             installation_id: None,
             base_url,
             model_catalog_cache: model_catalog_cache.clone(),
             models_request_timeout: CODEX_MODELS_REQUEST_TIMEOUT,
+            preparation_stats: Arc::default(),
         };
-        let key = provider.catalog_key();
-        let now = Instant::now();
-        let CatalogCacheDecision::Start { refresh, .. } =
-            model_catalog_cache.decision(&key, now).await
-        else {
-            panic!("empty test cache starts a refresh");
+        install_test_model_metadata(&provider, test_openai_model_metadata("gpt-5.5")).await;
+        let mut request = test_model_request! {
+            model: "gpt-5.5".to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::default(),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::OpenAiCoding,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+            session_id: Some("session-1".to_string()),
+            turn_id: Some(TurnId(1)),
         };
-        let metadata = Arc::new(test_openai_model_metadata("gpt-5.5"));
-        model_catalog_cache
-            .commit_refresh(
-                &key,
-                refresh.generation,
-                &Ok(Arc::new(OpenAiModelCatalog {
-                    models: [("gpt-5.5".to_string(), metadata)].into_iter().collect(),
-                })),
-                now,
-            )
-            .await;
-        let make_request = |turn_id| {
-            test_model_request! {
-                model: "gpt-5.5".to_string(),
-                transcript_cache_prefix_len: None,
-                prompt: PromptSections::default(),
-                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-                tool_profile: ProviderToolProfile::OpenAiCoding,
-                tools: Vec::new(),
-                max_tokens: None,
-                reasoning_effort: ReasoningEffort::Medium,
-                prompt_cache_key: None,
-                session_id: Some("session-1".to_string()),
-                turn_id: Some(turn_id),
-            }
-        };
-
-        provider
-            .complete(make_request(TurnId(1)))
+        let prepared = provider
+            .prepare_model_request(&request, None)
             .await
-            .expect("first request completes");
+            .expect("first request prepares")
+            .expect("OpenAI prepares bytes");
+        let allocation = prepared.body_allocation().expect("prepared body");
         provider
-            .complete(make_request(TurnId(1)))
+            .complete_prepared(request.clone(), prepared.clone())
+            .await
+            .expect_err("first physical response rejects expired auth");
+        let mut refreshed = provider.clone();
+        refreshed.access_token = "refreshed-token".to_string();
+        let refreshed_prepared = refreshed
+            .prepare_model_request(&request, Some(&prepared))
+            .await
+            .expect("refreshed provider validates prepared bytes")
+            .expect("OpenAI retains prepared bytes");
+        assert_eq!(
+            refreshed_prepared
+                .body_allocation()
+                .expect("refreshed allocation"),
+            allocation
+        );
+        refreshed
+            .complete_prepared(request.clone(), refreshed_prepared.clone())
+            .await
+            .expect_err("refreshed response is unterminated after returning turn state");
+        refreshed
+            .complete_prepared(request.clone(), refreshed_prepared.clone())
             .await
             .expect("same-turn request completes");
-        provider
-            .complete(make_request(TurnId(2)))
+        assert_eq!(
+            prepared.body_allocation().expect("prepared body"),
+            allocation
+        );
+        request.turn_id = Some(TurnId(2));
+        refreshed
+            .complete_prepared(request, refreshed_prepared)
             .await
             .expect("next-turn request completes");
         server.await.expect("server finishes");
 
         assert_eq!(
             *captured_turn_states.lock().await,
-            vec![None, Some("sticky-state".to_string()), None]
+            vec![None, None, Some("sticky-state".to_string()), None,]
+        );
+        assert_eq!(
+            *captured_authorizations.lock().await,
+            vec![
+                Some("Bearer token".to_string()),
+                Some("Bearer refreshed-token".to_string()),
+                Some("Bearer refreshed-token".to_string()),
+                Some("Bearer refreshed-token".to_string()),
+            ]
+        );
+        assert_eq!(
+            provider
+                .preparation_stats
+                .serializations
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            provider
+                .preparation_stats
+                .compressions
+                .load(Ordering::Relaxed),
+            1
         );
     }
 

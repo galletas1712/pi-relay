@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::provider_runtime::{
     build_provider_model_input, run_model, schedule_session_title_refresh_for_model_turn,
+    PreparedModelCall,
 };
 use crate::state::AppState;
 use crate::types::{DispatchAction, ModelDispatchInput, RpcError};
@@ -276,7 +277,7 @@ fn model_response_error(response: &agent_provider::ModelResponse) -> Option<Stri
     }
 }
 
-async fn run_model_for_action_with_retries(
+pub(crate) async fn run_model_for_action_with_retries(
     state: &AppState,
     session_id: &str,
     dispatch: &DispatchAction,
@@ -287,6 +288,7 @@ async fn run_model_for_action_with_retries(
     RpcError,
 > {
     let max_attempts = model_provider_max_attempts_for_test(&dispatch.config);
+    let mut call = PreparedModelCall::new(input, turn_id, dispatch.config.provider.max_tokens);
     for attempt in 1..=max_attempts {
         if attempt > 1
             && !state
@@ -304,7 +306,7 @@ async fn run_model_for_action_with_retries(
                 "action attempt is no longer running",
             ));
         }
-        let result = run_model(state, &dispatch.config, session_id, turn_id, input.clone()).await;
+        let result = run_model(state, &dispatch.config, session_id, &mut call).await;
         match result {
             Ok(response) => return Ok(Ok(response)),
             Err(error) => {
@@ -346,7 +348,7 @@ async fn run_model_for_action_with_retries(
     unreachable!("retry loop either returns provider result or stale action")
 }
 
-struct ModelProviderFailure {
+pub(crate) struct ModelProviderFailure {
     error: agent_provider::ProviderError,
     attempts: usize,
 }

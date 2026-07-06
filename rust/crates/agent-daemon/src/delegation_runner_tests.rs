@@ -11,7 +11,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_core::AgentInput;
-use agent_provider::{ModelResponse, ModelStopDetails, ModelStopReason, ModelTranscriptEntry};
+use agent_provider::{
+    openai::{OpenAiCodexHttpClient, OpenAiCodexSessionState, OpenAiProvider},
+    ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
+    ModelTranscriptEntry, PreparedModelRequest, PromptSections, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderModelInput, ProviderResult, ProviderToolProfile,
+};
 use agent_session::{
     AgentSession, ModelContext, ModelContextEntry, SessionAction, SessionEvent,
     TranscriptStorageNode,
@@ -70,7 +75,7 @@ use crate::provider_runtime::{
 };
 use crate::runtime::{
     apply_model_response, collect_runtime_outputs, recover_post_compaction_dispatches_on_boot,
-    runner_start_count, take_tasks, SessionDriver,
+    run_model_for_action_with_retries, runner_start_count, take_tasks, SessionDriver,
 };
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart,
@@ -90,6 +95,57 @@ use crate::delegation_tools::{
 use crate::{enqueue_session_input, SessionInputRequest};
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(90_000);
+
+struct TrackingOpenAiProvider {
+    provider: OpenAiProvider,
+    body_allocations: Arc<StdMutex<Vec<(usize, usize)>>>,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for TrackingOpenAiProvider {
+    async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
+        self.provider.complete(request).await
+    }
+
+    async fn prepare_model_request(
+        &self,
+        request: &ModelRequest,
+        existing: Option<&PreparedModelRequest>,
+    ) -> ProviderResult<Option<PreparedModelRequest>> {
+        let prepared = self
+            .provider
+            .prepare_model_request(request, existing)
+            .await?;
+        if let Some(prepared) = &prepared {
+            let (pointer, length) = prepared.body_allocation()?;
+            self.body_allocations
+                .lock()
+                .expect("body allocation lock")
+                .push((pointer as usize, length));
+        }
+        Ok(prepared)
+    }
+
+    async fn complete_prepared(
+        &self,
+        request: ModelRequest,
+        prepared: PreparedModelRequest,
+    ) -> ProviderResult<ModelResponse> {
+        let (pointer, length) = prepared.body_allocation()?;
+        self.body_allocations
+            .lock()
+            .expect("body allocation lock")
+            .push((pointer as usize, length));
+        self.provider.complete_prepared(request, prepared).await
+    }
+
+    async fn compact(
+        &self,
+        request: ProviderCompactionRequest,
+    ) -> ProviderResult<ProviderCompactionResponse> {
+        self.provider.compact(request).await
+    }
+}
 
 struct TestEnv {
     state: AppState,
@@ -335,6 +391,226 @@ async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
         )
         .await
         .expect("create parent");
+}
+
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::new();
+    let mut chunk = [0; 1024];
+    let header_end = loop {
+        let read = stream.read(&mut chunk).await.expect("request reads");
+        assert!(read > 0, "request closed before headers");
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(header_end) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+        {
+            break header_end;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("content-length").then(|| {
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("content length parses")
+            })
+        })
+        .expect("buffered request has a content length");
+    while request.len() < header_end + content_length {
+        let read = stream.read(&mut chunk).await.expect("request body reads");
+        assert!(read > 0, "request closed before body");
+        request.extend_from_slice(&chunk[..read]);
+    }
+    request
+}
+
+#[tokio::test]
+async fn ordinary_codex_retry_without_account_reuses_provider_and_prepared_bytes() {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let session_id = "ordinary-codex-retry-without-account";
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "ordinary Codex retry", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, session_id).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener binds");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let wire_bodies = Arc::new(Mutex::new(Vec::new()));
+    let server_bodies = Arc::clone(&wire_bodies);
+    let server = tokio::spawn(async move {
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().await.expect("request accepted");
+            let request = read_http_request(&mut stream).await;
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request has header boundary")
+                + 4;
+            server_bodies
+                .lock()
+                .await
+                .push(request[header_end..].to_vec());
+            if attempt == 0 {
+                let body = r#"{"error":{"message":"temporary provider failure"}}"#;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("retryable response writes");
+            } else {
+                let body =
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n";
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("successful response writes");
+            }
+        }
+    });
+
+    let mut provider = OpenAiProvider::codex_with_client_and_session(
+        OpenAiCodexHttpClient::new(),
+        Arc::new(OpenAiCodexSessionState::new(session_id)),
+        "valid-access-token",
+        None,
+        None,
+    );
+    provider.set_base_url_for_test(base_url);
+    provider.install_model_metadata_for_test("test-model").await;
+    let preparation_observer = provider.clone();
+    let body_allocations = Arc::new(StdMutex::new(Vec::new()));
+    env.state
+        .provider_connections
+        .install_test_provider(
+            Box::new(TrackingOpenAiProvider {
+                provider,
+                body_allocations: Arc::clone(&body_allocations),
+            }),
+            true,
+            None,
+        )
+        .await;
+
+    let action = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::new(),
+        context_leaf_id: Some("retry-entry".to_string()),
+    };
+    let entry = TranscriptStorageNode {
+        id: "retry-entry".to_string(),
+        parent_id: None,
+        timestamp_ms: 1,
+        item: TranscriptItem::UserMessage(UserMessage::text("retry this request")),
+        provider_replay: Vec::new(),
+    };
+    let (_, mut persisted) = env
+        .state
+        .repo
+        .persist_outputs(
+            session_id,
+            OutputBatch::new(
+                std::slice::from_ref(&entry),
+                Some(&entry.id),
+                &[],
+                std::slice::from_ref(&action),
+            ),
+        )
+        .await
+        .expect("model action persists");
+    let persisted = persisted.pop().expect("model action returns");
+    assert!(env
+        .state
+        .repo
+        .claim_pending_model_action(session_id, &persisted.row_id, &persisted.attempt_id)
+        .await
+        .expect("model action claims"));
+    let mut config = session_config(
+        &env,
+        project_id,
+        json!({
+            "fault_injection": { "model_provider_max_attempts": 2 },
+        }),
+    );
+    config.provider.model = "test-model".to_string();
+    let dispatch = DispatchAction {
+        row_id: persisted.row_id,
+        attempt_id: persisted.attempt_id,
+        post_compaction_dispatch_lease: None,
+        action: persisted.action,
+        config,
+        model_input: ModelDispatchInput::Unmaterialized,
+    };
+    let input = Arc::new(
+        ProviderModelInput::new(
+            "test-model",
+            PromptSections::stable("stable prompt"),
+            vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
+                UserMessage::text("retry this request"),
+            ))],
+            ProviderToolProfile::None,
+            Vec::new(),
+            ReasoningEffort::Medium,
+        )
+        .with_session_id(session_id),
+    );
+
+    assert!(
+        run_model_for_action_with_retries(&env.state, session_id, &dispatch, TurnId(1), input,)
+            .await
+            .expect("daemon retry lifecycle succeeds")
+            .is_ok()
+    );
+    server.await.expect("server completes");
+
+    assert_eq!(preparation_observer.preparation_counts_for_test(), (1, 1));
+    assert_eq!(
+        env.state.provider_connections.provider_construction_count(),
+        1
+    );
+    {
+        let allocations = body_allocations.lock().expect("body allocation lock");
+        assert_eq!(allocations.len(), 4);
+        assert!(allocations
+            .iter()
+            .all(|allocation| allocation == &allocations[0]));
+    }
+    let wire_bodies = wire_bodies.lock().await;
+    assert_eq!(wire_bodies.len(), 2);
+    assert_eq!(wire_bodies[0], wire_bodies[1]);
+
+    env.cleanup().await;
 }
 
 #[tokio::test]
