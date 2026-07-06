@@ -38,6 +38,8 @@ pub(crate) use errors::{
 pub(crate) use events::{clear_event_buffer_if_idle, publish_events};
 #[cfg(test)]
 pub(crate) use model::apply_model_response;
+#[cfg(test)]
+pub(crate) use model::run_model_for_action_with_retries;
 use outputs::attach_provider_replay;
 pub(crate) use outputs::{
     agent_input_from_queued_priority, attach_dispatch_config, collect_runtime_outputs,

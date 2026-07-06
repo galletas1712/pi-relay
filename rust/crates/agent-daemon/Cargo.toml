@@ -31,4 +31,5 @@ tokio-tungstenite = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+agent-provider = { workspace = true, features = ["test-utils"] }
 sqlx = { workspace = true }

@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
 use thiserror::Error;
@@ -249,6 +250,7 @@ impl ProviderModelInput {
 pub struct ModelRequest {
     input: Arc<ProviderModelInput>,
     transcript_suffix: Arc<[ModelTranscriptEntry]>,
+    body_generation: Arc<()>,
     /// If set, providers that support transcript cache markers should place
     /// those markers only within the first `n` transcript entries.
     ///
@@ -271,6 +273,7 @@ impl ModelRequest {
         Self {
             input,
             transcript_suffix: Arc::from([]),
+            body_generation: Arc::new(()),
             transcript_cache_prefix_len: None,
             max_tokens: None,
             turn_id: None,
@@ -283,6 +286,7 @@ impl ModelRequest {
 
     pub fn with_transcript_suffix(mut self, suffix: Vec<ModelTranscriptEntry>) -> Self {
         self.transcript_suffix = suffix.into();
+        self.body_generation = Arc::new(());
         self
     }
 
@@ -293,10 +297,22 @@ impl ModelRequest {
 
     pub fn set_prompt_cache_key(&mut self, prompt_cache_key: impl Into<String>) {
         Arc::make_mut(&mut self.input).set_prompt_cache_key(prompt_cache_key);
+        self.body_generation = Arc::new(());
     }
 
     pub fn set_session_id_if_missing(&mut self, session_id: impl Into<String>) {
-        Arc::make_mut(&mut self.input).set_session_id_if_missing(session_id);
+        if self.input.session_id().is_none() {
+            Arc::make_mut(&mut self.input).set_session_id_if_missing(session_id);
+            self.body_generation = Arc::new(());
+        }
+    }
+
+    fn prepared_body_generation(&self) -> PreparedBodyGeneration {
+        PreparedBodyGeneration {
+            marker: self.body_generation.clone(),
+            transcript_cache_prefix_len: self.transcript_cache_prefix_len,
+            max_tokens: self.max_tokens,
+        }
     }
 }
 
@@ -414,6 +430,177 @@ pub struct ProviderTokenCountResponse {
 pub struct ProviderModelMetadata {
     pub max_input_tokens: Option<usize>,
     pub recommended_auto_compact_tokens: Option<usize>,
+}
+
+#[derive(Clone)]
+struct PreparedBodyGeneration {
+    marker: Arc<()>,
+    transcript_cache_prefix_len: Option<usize>,
+    max_tokens: Option<u32>,
+}
+
+impl PreparedBodyGeneration {
+    fn matches(&self, request: &ModelRequest) -> bool {
+        Arc::ptr_eq(&self.marker, &request.body_generation)
+            && self.transcript_cache_prefix_len == request.transcript_cache_prefix_len
+            && self.max_tokens == request.max_tokens
+    }
+}
+
+struct OpaqueBodyGeneration;
+
+impl fmt::Debug for OpaqueBodyGeneration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<opaque>")
+    }
+}
+
+#[derive(Clone)]
+enum PreparedModelRequestInner {
+    OpenAi(openai::OpenAiPreparedRequestMetadata),
+    Anthropic(anthropic::AnthropicPreparedRequestMetadata),
+}
+
+/// Opaque, provider-owned bytes for one ordinary model generation request.
+///
+/// The artifact contains no credentials or mutable physical-attempt headers.
+/// Provider adapters validate its private body-shaping metadata before reuse
+/// after a provider or capability refresh.
+#[derive(Clone)]
+pub struct PreparedModelRequest {
+    body_template: Arc<reqwest::Request>,
+    content_type: &'static str,
+    content_encoding: Option<&'static str>,
+    body_generation: PreparedBodyGeneration,
+    inner: PreparedModelRequestInner,
+}
+
+impl PreparedModelRequest {
+    pub(crate) fn openai(
+        request: &ModelRequest,
+        bytes: Vec<u8>,
+        metadata: openai::OpenAiPreparedRequestMetadata,
+    ) -> Self {
+        Self::new(
+            request,
+            bytes,
+            Some("zstd"),
+            PreparedModelRequestInner::OpenAi(metadata),
+        )
+    }
+
+    pub(crate) fn anthropic(
+        request: &ModelRequest,
+        bytes: Vec<u8>,
+        metadata: anthropic::AnthropicPreparedRequestMetadata,
+    ) -> Self {
+        Self::new(
+            request,
+            bytes,
+            None,
+            PreparedModelRequestInner::Anthropic(metadata),
+        )
+    }
+
+    fn new(
+        request: &ModelRequest,
+        bytes: Vec<u8>,
+        content_encoding: Option<&'static str>,
+        inner: PreparedModelRequestInner,
+    ) -> Self {
+        let mut body_template = reqwest::Request::new(
+            reqwest::Method::POST,
+            reqwest::Url::parse("http://prepared.invalid/")
+                .expect("static prepared request URL is valid"),
+        );
+        *body_template.body_mut() = Some(bytes.into());
+        Self {
+            body_template: Arc::new(body_template),
+            content_type: "application/json",
+            content_encoding,
+            body_generation: request.prepared_body_generation(),
+            inner,
+        }
+    }
+
+    pub(crate) fn matches_request(&self, request: &ModelRequest) -> bool {
+        self.body_generation.matches(request)
+    }
+
+    pub(crate) fn request_with_body(
+        &self,
+        mut request: reqwest::RequestBuilder,
+    ) -> ProviderResult<reqwest::RequestBuilder> {
+        let mut template = self.body_template.try_clone().ok_or_else(|| {
+            ProviderError::Provider("prepared model request body was not reusable".to_string())
+        })?;
+        let body = template.body_mut().take().ok_or_else(|| {
+            ProviderError::Provider("prepared model request body was missing".to_string())
+        })?;
+        request = request.header(reqwest::header::CONTENT_TYPE, self.content_type);
+        if let Some(content_encoding) = self.content_encoding {
+            request = request.header(reqwest::header::CONTENT_ENCODING, content_encoding);
+        }
+        Ok(request.body(body))
+    }
+
+    pub(crate) fn openai_metadata(&self) -> ProviderResult<&openai::OpenAiPreparedRequestMetadata> {
+        match &self.inner {
+            PreparedModelRequestInner::OpenAi(metadata) => Ok(metadata),
+            PreparedModelRequestInner::Anthropic(_) => Err(ProviderError::Provider(
+                "prepared model request belongs to a different provider".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn anthropic_metadata(
+        &self,
+    ) -> ProviderResult<&anthropic::AnthropicPreparedRequestMetadata> {
+        match &self.inner {
+            PreparedModelRequestInner::Anthropic(metadata) => Ok(metadata),
+            PreparedModelRequestInner::OpenAi(_) => Err(ProviderError::Provider(
+                "prepared model request belongs to a different provider".to_string(),
+            )),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn body_allocation(&self) -> ProviderResult<(*const u8, usize)> {
+        let body = self.body_bytes()?;
+        Ok((body.as_ptr(), body.len()))
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn body_bytes(&self) -> ProviderResult<&[u8]> {
+        self.body_template
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .ok_or_else(|| {
+                ProviderError::Provider("prepared model request body was missing".to_string())
+            })
+    }
+}
+
+impl fmt::Debug for PreparedModelRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let provider = match self.inner {
+            PreparedModelRequestInner::OpenAi(_) => "openai",
+            PreparedModelRequestInner::Anthropic(_) => "claude",
+        };
+        let body_len = self
+            .body_template
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .map_or(0, <[u8]>::len);
+        formatter
+            .debug_struct("PreparedModelRequest")
+            .field("provider", &provider)
+            .field("body_len", &body_len)
+            .field("content_type", &self.content_type)
+            .field("content_encoding", &self.content_encoding)
+            .field("body_generation", &OpaqueBodyGeneration)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -767,6 +954,28 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse>;
+
+    /// Prepare provider-specific ordinary-generation bytes for reuse.
+    ///
+    /// Custom providers may retain the legacy `complete` lifecycle by using
+    /// this default. Built-in providers return an opaque prepared artifact.
+    async fn prepare_model_request(
+        &self,
+        _request: &ModelRequest,
+        _existing: Option<&PreparedModelRequest>,
+    ) -> ProviderResult<Option<PreparedModelRequest>> {
+        Ok(None)
+    }
+
+    /// Send a prepared request with the implementation's current attempt
+    /// headers and credentials.
+    async fn complete_prepared(
+        &self,
+        request: ModelRequest,
+        _prepared: PreparedModelRequest,
+    ) -> ProviderResult<ModelResponse> {
+        self.complete(request).await
+    }
 
     async fn model_metadata(&self, _model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
         Ok(None)

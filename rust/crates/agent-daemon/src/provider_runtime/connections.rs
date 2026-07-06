@@ -1,5 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use agent_provider::{
     anthropic::{AnthropicModelCache, AnthropicProvider},
     openai::{
@@ -21,6 +26,10 @@ pub(crate) struct ProviderConnectionRegistry {
     anthropic_model_cache: AnthropicModelCache,
     openai_model_catalog_cache: OpenAiModelCatalogCache,
     connections: Arc<Mutex<HashMap<ProviderConnectionKey, Arc<ProviderConnection>>>>,
+    #[cfg(test)]
+    injected_providers: Arc<Mutex<VecDeque<ProviderHandle>>>,
+    #[cfg(test)]
+    provider_constructions: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -53,6 +62,10 @@ impl ProviderConnectionRegistry {
             anthropic_model_cache: AnthropicModelCache::default(),
             openai_model_catalog_cache: OpenAiModelCatalogCache::default(),
             connections: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            injected_providers: Arc::default(),
+            #[cfg(test)]
+            provider_constructions: Arc::default(),
         }
     }
 
@@ -62,8 +75,37 @@ impl ProviderConnectionRegistry {
         credentials: &Credentials,
         session_id: &str,
     ) -> Result<ProviderHandle> {
+        #[cfg(test)]
+        {
+            self.provider_constructions.fetch_add(1, Ordering::Relaxed);
+            if let Some(provider) = self.injected_providers.lock().await.pop_front() {
+                return Ok(provider);
+            }
+        }
         let connection = self.get_or_create(session_id, provider).await;
         connection.provider_handle(credentials)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_test_provider(
+        &self,
+        provider: Box<dyn agent_provider::ModelProvider>,
+        uses_codex_auth: bool,
+        codex_account_id: Option<String>,
+    ) {
+        self.injected_providers
+            .lock()
+            .await
+            .push_back(ProviderHandle {
+                provider,
+                uses_codex_auth,
+                codex_account_id,
+            });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_construction_count(&self) -> usize {
+        self.provider_constructions.load(Ordering::Relaxed)
     }
 
     pub(crate) async fn mark_compacted(
@@ -151,6 +193,7 @@ impl OpenAiCodexConnection {
                 self.model_catalog_cache.clone(),
             )),
             uses_codex_auth: true,
+            codex_account_id: credentials.codex_account_id.clone(),
         })
     }
 }
@@ -166,6 +209,7 @@ impl AnthropicConnection {
                 self.model_cache.clone(),
             )),
             uses_codex_auth: false,
+            codex_account_id: None,
         })
     }
 }

@@ -10,9 +10,10 @@ use std::{
     borrow::{Borrow, Cow},
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::sync::{watch, Mutex};
+use uuid::Uuid;
 
 #[cfg(test)]
 use crate::sse::read_json_sse_text;
@@ -23,9 +24,10 @@ use crate::{
     http::send_provider_generation_request,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
-    ModelTranscriptEntry, NativeCompactionErrorKind, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderError, ProviderModelMetadata, ProviderResult,
-    ProviderTokenCountRequest, ProviderTokenCountResponse, ProviderToolProfile, ProviderUsage,
+    ModelTranscriptEntry, NativeCompactionErrorKind, PreparedModelRequest,
+    ProviderCompactionRequest, ProviderCompactionResponse, ProviderError, ProviderModelMetadata,
+    ProviderResult, ProviderTokenCountRequest, ProviderTokenCountResponse, ProviderToolProfile,
+    ProviderUsage,
 };
 
 const DEFAULT_MAX_OUTPUT_BUDGET: u32 = 64_000;
@@ -58,6 +60,40 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     model_cache: AnthropicModelCache,
+    #[cfg(test)]
+    preparation_stats: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AnthropicPreparedRequestMetadata {
+    body_shape: AnthropicPreparedBodyShape,
+    beta_header: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AnthropicPreparedBodyShape {
+    max_tokens: u32,
+    capabilities: AnthropicModelCapabilities,
+    replays_compaction: bool,
+    replay_max_input_tokens: Option<usize>,
+}
+
+fn anthropic_prepared_body_shape(
+    request: &ModelRequest,
+    metadata: &AnthropicModelMetadata,
+    replays_compaction: bool,
+) -> AnthropicPreparedBodyShape {
+    AnthropicPreparedBodyShape {
+        max_tokens: request
+            .max_tokens
+            .unwrap_or(DEFAULT_MAX_OUTPUT_BUDGET)
+            .min(metadata.max_tokens),
+        capabilities: metadata.capabilities,
+        replays_compaction,
+        replay_max_input_tokens: replays_compaction
+            .then_some(metadata.max_input_tokens)
+            .flatten(),
+    }
 }
 
 fn validate_anthropic_hosted_tool_result(block_type: &str, content: &Value) -> ProviderResult<()> {
@@ -941,6 +977,8 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
             model_cache,
+            #[cfg(test)]
+            preparation_stats: Arc::default(),
         }
     }
 
@@ -1035,26 +1073,77 @@ impl AnthropicProvider {
 #[async_trait]
 impl ModelProvider for AnthropicProvider {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
+        let prepared = self
+            .prepare_model_request(&request, None)
+            .await?
+            .expect("Anthropic always prepares ordinary model requests");
+        self.complete_prepared(request, prepared).await
+    }
+
+    async fn prepare_model_request(
+        &self,
+        request: &ModelRequest,
+        existing: Option<&PreparedModelRequest>,
+    ) -> ProviderResult<Option<PreparedModelRequest>> {
+        let metadata = self.resolved_model_metadata(request.model()).await;
+        if let Some(existing) = existing.filter(|existing| existing.matches_request(request)) {
+            let existing_metadata = existing.anthropic_metadata()?;
+            if anthropic_prepared_body_shape(
+                request,
+                &metadata,
+                existing_metadata.body_shape.replays_compaction,
+            ) == existing_metadata.body_shape
+            {
+                return Ok(Some(existing.clone()));
+            }
+        }
+        let prepared = prepare_messages_request(request, &metadata)?;
+        let body_shape =
+            anthropic_prepared_body_shape(request, &metadata, prepared.replays_compaction);
+        let bytes = serde_json::to_vec(&prepared.body)?;
+        #[cfg(test)]
+        self.preparation_stats
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(PreparedModelRequest::anthropic(
+            request,
+            bytes,
+            AnthropicPreparedRequestMetadata {
+                body_shape,
+                beta_header: prepared.beta_header,
+            },
+        )))
+    }
+
+    async fn complete_prepared(
+        &self,
+        request: ModelRequest,
+        prepared: PreparedModelRequest,
+    ) -> ProviderResult<ModelResponse> {
+        if !prepared.matches_request(&request) {
+            return Err(ProviderError::Provider(
+                "prepared Anthropic request no longer matches its logical input".to_string(),
+            ));
+        }
         let session_id = request
             .session_id()
             .or_else(|| request.prompt_cache_key())
             .unwrap_or("pi-relay");
-        let metadata = self.resolved_model_metadata(request.model()).await;
-        let prepared = prepare_messages_request(&request, &metadata)?;
+        let prepared_metadata = prepared.anthropic_metadata()?;
 
         let response = send_provider_generation_request(
-            self.client
-                .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
-                .header("accept", "text/event-stream")
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", prepared.beta_header)
-                .header("anthropic-dangerous-direct-browser-access", "true")
-                .header("User-Agent", CLAUDE_CODE_USER_AGENT)
-                .header("x-app", "cli")
-                .header("X-Claude-Code-Session-Id", session_id)
-                .header("x-client-request-id", client_request_id())
-                .json(&prepared.body),
+            prepared.request_with_body(
+                self.client
+                    .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
+                    .header("accept", "text/event-stream")
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-beta", &prepared_metadata.beta_header)
+                    .header("anthropic-dangerous-direct-browser-access", "true")
+                    .header("User-Agent", CLAUDE_CODE_USER_AGENT)
+                    .header("x-app", "cli")
+                    .header("X-Claude-Code-Session-Id", session_id)
+                    .header("x-client-request-id", client_request_id()),
+            )?,
             "Anthropic /messages",
         )
         .await?;
@@ -1153,6 +1242,7 @@ fn messages_body_with_metadata(
 struct PreparedAnthropicRequest {
     body: Value,
     beta_header: String,
+    replays_compaction: bool,
 }
 
 fn prepare_messages_request(
@@ -1253,13 +1343,15 @@ struct RenderedAnthropicRequest {
 
 impl RenderedAnthropicRequest {
     fn prepare(self) -> PreparedAnthropicRequest {
+        let replays_compaction = self.replays_compaction;
         PreparedAnthropicRequest {
             body: self.body,
-            beta_header: if self.replays_compaction {
+            beta_header: if replays_compaction {
                 anthropic_compaction_beta_header()
             } else {
                 anthropic_beta_header().to_string()
             },
+            replays_compaction,
         }
     }
 }
@@ -1382,11 +1474,7 @@ fn append_dynamic_context_message(prompt: &crate::PromptSections, messages: &mut
 }
 
 fn client_request_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("pi-relay-{nanos}")
+    format!("pi-relay-{}", Uuid::new_v4())
 }
 
 fn anthropic_reasoning_effort(
@@ -3150,6 +3238,126 @@ mod tests {
             .write_all(response.as_bytes())
             .await
             .expect("SSE response writes");
+    }
+
+    #[tokio::test]
+    async fn prepared_retry_reuses_raw_bytes_with_fresh_auth_and_request_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let server_captured = captured.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("model lookup accepted");
+            let (headers, body) = read_http_request(&mut socket).await;
+            assert!(headers.starts_with("GET /v1/models/claude-opus-4-8 HTTP/1.1\r\n"));
+            assert_eq!(body, Value::Null);
+            write_json_response(
+                &mut socket,
+                &json!({
+                    "id": "claude-opus-4-8",
+                    "max_input_tokens": 1_000_000,
+                    "max_tokens": 128_000,
+                    "capabilities": models_api_capabilities(json!({ "supported": true })),
+                }),
+            )
+            .await;
+
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("messages request accepted");
+                let (headers, body) = read_http_request(&mut socket).await;
+                let header = |name: &str| {
+                    headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find_map(|(candidate, value)| {
+                            candidate
+                                .eq_ignore_ascii_case(name)
+                                .then(|| value.trim().to_string())
+                        })
+                };
+                server_captured.lock().await.push((
+                    header("x-api-key").expect("API key"),
+                    header("x-client-request-id").expect("request ID"),
+                    body,
+                ));
+                write_ordinary_sse_response(&mut socket).await;
+            }
+        });
+
+        let cache = AnthropicModelCache::default();
+        let mut first = AnthropicProvider::new_with_client_and_cache(
+            reqwest::Client::new(),
+            "old-key",
+            cache.clone(),
+        );
+        first.base_url = base_url.clone();
+        let request = test_model_request(
+            "claude-opus-4-8",
+            vec![TranscriptItem::UserMessage(UserMessage::text("secret prompt")).into()],
+        );
+        let expected = messages_body(request.clone()).expect("Stage 4 fixture renders");
+        let prepared = first
+            .prepare_model_request(&request, None)
+            .await
+            .expect("preparation succeeds")
+            .expect("Anthropic prepares bytes");
+        let allocation = prepared.body_allocation().expect("prepared allocation");
+        let decoded: Value = serde_json::from_slice(prepared.body_bytes().expect("prepared bytes"))
+            .expect("prepared bytes are JSON");
+        assert_eq!(decoded, expected);
+        assert_eq!(
+            first
+                .preparation_stats
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        first
+            .complete_prepared(request.clone(), prepared.clone())
+            .await
+            .expect("first send completes");
+
+        let mut refreshed =
+            AnthropicProvider::new_with_client_and_cache(reqwest::Client::new(), "new-key", cache);
+        refreshed.base_url = base_url;
+        let refreshed_prepared = refreshed
+            .prepare_model_request(&request, Some(&prepared))
+            .await
+            .expect("compatibility check succeeds")
+            .expect("Anthropic retains prepared bytes");
+        assert_eq!(
+            refreshed_prepared
+                .body_allocation()
+                .expect("refreshed prepared allocation"),
+            allocation
+        );
+        refreshed
+            .complete_prepared(request, refreshed_prepared)
+            .await
+            .expect("refreshed send completes");
+        server.await.expect("server completes");
+
+        assert_eq!(
+            prepared.body_allocation().expect("prepared allocation"),
+            allocation
+        );
+        assert_eq!(
+            refreshed
+                .preparation_stats
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let captured = captured.lock().await;
+        assert_eq!(captured[0].0, "old-key");
+        assert_eq!(captured[1].0, "new-key");
+        assert_ne!(captured[0].1, captured[1].1);
+        assert_eq!(captured[0].2, expected);
+        assert_eq!(captured[1].2, expected);
+        let debug = format!("{prepared:?}");
+        for secret in ["secret prompt", "old-key", "new-key"] {
+            assert!(!debug.contains(secret));
+        }
     }
 
     fn native_compaction_error_kind(error: &ProviderError) -> NativeCompactionErrorKind {

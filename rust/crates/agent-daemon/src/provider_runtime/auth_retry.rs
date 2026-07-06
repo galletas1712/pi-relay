@@ -1,8 +1,9 @@
 use std::future::Future;
 
 use agent_provider::{
-    ModelRequest, ModelResponse, ProviderCompactionRequest, ProviderCompactionResponse,
-    ProviderError, ProviderModelMetadata, ProviderTokenCountRequest, ProviderTokenCountResponse,
+    ModelRequest, ModelResponse, PreparedModelRequest, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderError, ProviderModelMetadata, ProviderTokenCountRequest,
+    ProviderTokenCountResponse,
 };
 use agent_store::SessionConfig;
 
@@ -10,6 +11,11 @@ use crate::auth::refresh_codex_credentials;
 use crate::state::AppState;
 
 use super::provider::{provider_for_config, ProviderHandle};
+
+#[derive(Default)]
+pub(super) struct PreparedModelRequestState {
+    request: Option<PreparedModelRequest>,
+}
 
 /// Run a provider call, and on a Codex 401 refresh credentials once and retry
 /// against a freshly built provider. `call` is invoked at most twice, so the
@@ -42,6 +48,22 @@ where
         }
         Err(error) => Err(error),
     }
+}
+
+async fn install_refreshed_provider(
+    provider: &mut ProviderHandle,
+    refreshed_provider: ProviderHandle,
+    previous_account_id: Option<&str>,
+    request: &ModelRequest,
+    prepared: &mut PreparedModelRequestState,
+) -> std::result::Result<(), ProviderError> {
+    let same_account = previous_account_id.is_some()
+        && previous_account_id == refreshed_provider.codex_account_id.as_deref();
+    *provider = refreshed_provider;
+    if !same_account {
+        prepared.request = None;
+    }
+    ensure_compatible_prepared_request(provider, request, prepared).await
 }
 
 fn auth_attempt_requests<Req: Clone>(request: Req) -> (Req, Req) {
@@ -92,18 +114,66 @@ pub(super) async fn complete_with_auth_retry(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
-    provider: ProviderHandle,
+    provider: &mut ProviderHandle,
     request: ModelRequest,
+    prepared: &mut PreparedModelRequestState,
 ) -> std::result::Result<ModelResponse, ProviderError> {
-    with_codex_auth_retry(
-        state,
-        config,
-        session_id,
-        provider,
-        request,
-        |provider, request| async move { provider.provider.complete(request).await },
-    )
-    .await
+    let uses_codex_auth = provider.uses_codex_auth;
+    let account_id = provider.codex_account_id.clone();
+    let first_attempt = async {
+        ensure_compatible_prepared_request(provider, &request, prepared).await?;
+        complete_with_provider(provider, request.clone(), prepared.request.as_ref()).await
+    }
+    .await;
+    match first_attempt {
+        Ok(response) => Ok(response),
+        Err(error) if uses_codex_auth && error.status_code() == Some(401) => {
+            let credentials = refresh_codex_credentials()
+                .await
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            let refreshed_provider = provider_for_config(state, config, &credentials, session_id)
+                .await
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            install_refreshed_provider(
+                provider,
+                refreshed_provider,
+                account_id.as_deref(),
+                &request,
+                prepared,
+            )
+            .await?;
+            complete_with_provider(provider, request, prepared.request.as_ref()).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn ensure_compatible_prepared_request(
+    provider: &ProviderHandle,
+    request: &ModelRequest,
+    prepared: &mut PreparedModelRequestState,
+) -> std::result::Result<(), ProviderError> {
+    prepared.request = provider
+        .provider
+        .prepare_model_request(request, prepared.request.as_ref())
+        .await?;
+    Ok(())
+}
+
+async fn complete_with_provider(
+    provider: &ProviderHandle,
+    request: ModelRequest,
+    prepared: Option<&PreparedModelRequest>,
+) -> std::result::Result<ModelResponse, ProviderError> {
+    match prepared {
+        Some(prepared) => {
+            provider
+                .provider
+                .complete_prepared(request, prepared.clone())
+                .await
+        }
+        None => provider.provider.complete(request).await,
+    }
 }
 
 pub(super) async fn compact_with_auth_retry(

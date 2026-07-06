@@ -10,6 +10,7 @@ use super::auth_retry::model_metadata_with_auth_retry;
 pub(super) struct ProviderHandle {
     pub(super) provider: Box<dyn ModelProvider>,
     pub(super) uses_codex_auth: bool,
+    pub(super) codex_account_id: Option<String>,
 }
 
 pub(super) async fn provider_for_config(
