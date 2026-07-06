@@ -226,7 +226,9 @@ call dispatches to the `Edit` executor for that provider.
   (the crate carries no tokenizer). Over-budget output keeps a 3/5 head and 2/5
   tail with a `[tool output truncated: N characters omitted]` marker on a char
   boundary. `Bash`, `WebSearch`, and `WebFetch` honor a per-call
-  `max_output_tokens` override.
+  `max_output_tokens` override. For the web tools, this is a local
+  post-response truncation cap; it is not forwarded to the provider as a
+  generation parameter.
 - **`ProviderKind` is `{ OpenAi, Claude }`.** OpenAI always routes through the
   ChatGPT/Codex subscription transport; "codex" is an auth transport, not a
   provider kind.
