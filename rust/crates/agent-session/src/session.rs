@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crate::action::SessionAction;
 use crate::event::SessionEvent;
@@ -35,6 +35,11 @@ pub struct AgentSession {
     pub(crate) transcript_store: TranscriptStore,
     outstanding_actions: OutstandingActions,
     action_outbox: VecDeque<SessionAction>,
+    // Queued IDs permit constant-time completion removal. Completed IDs are
+    // tombstones applied by the next ordered outbox drain/filter.
+    queued_action_ids: HashSet<ActionId>,
+    completed_action_ids: HashSet<ActionId>,
+    cancel_session_work_queued: bool,
     event_outbox: VecDeque<SessionEvent>,
 }
 
@@ -51,6 +56,9 @@ impl AgentSession {
             transcript_store: TranscriptStore::new(),
             outstanding_actions: OutstandingActions::default(),
             action_outbox: VecDeque::new(),
+            queued_action_ids: HashSet::new(),
+            completed_action_ids: HashSet::new(),
+            cancel_session_work_queued: false,
             event_outbox: VecDeque::new(),
         }
     }
@@ -374,7 +382,20 @@ impl AgentSession {
     /// Transcript items are drained into the store inside `drive`, so there is no
     /// analogous `drain_transcript_items` on the session.
     pub fn drain_actions(&mut self) -> Vec<SessionAction> {
-        self.action_outbox.drain(..).collect()
+        let completed_action_ids = &self.completed_action_ids;
+        let actions = self
+            .action_outbox
+            .drain(..)
+            .filter(|action| {
+                action
+                    .action_id()
+                    .is_none_or(|action_id| !completed_action_ids.contains(&action_id))
+            })
+            .collect();
+        self.queued_action_ids.clear();
+        self.completed_action_ids.clear();
+        self.cancel_session_work_queued = false;
+        actions
     }
 
     pub fn drain_events(&mut self) -> Vec<SessionEvent> {
@@ -416,6 +437,9 @@ impl AgentSession {
         self.core = AgentCoreLoop::resume_running_model(turn_id, action_id);
         self.outstanding_actions.clear();
         self.action_outbox.clear();
+        self.queued_action_ids.clear();
+        self.completed_action_ids.clear();
+        self.cancel_session_work_queued = false;
         let action = SessionAction::RequestModel {
             action_id,
             turn_id,
@@ -456,8 +480,7 @@ impl AgentSession {
 
         self.core = AgentCoreLoop::resume_running_model(turn_id, action_id);
         self.outstanding_actions.clear();
-        self.action_outbox
-            .retain(|action| matches!(action, SessionAction::CancelSessionWork));
+        self.retain_cancel_session_work();
 
         let action = SessionAction::RequestModel {
             action_id,
@@ -527,6 +550,16 @@ impl AgentSession {
     }
 
     fn queue_session_action(&mut self, action: SessionAction) {
+        match action.action_id() {
+            Some(action_id) => {
+                assert!(
+                    self.queued_action_ids.insert(action_id),
+                    "duplicate queued action id {}",
+                    action_id.0
+                );
+            }
+            None => self.cancel_session_work_queued = true,
+        }
         self.event_outbox.push_back(SessionEvent::ActionRequested {
             action: action.clone(),
         });
@@ -536,20 +569,11 @@ impl AgentSession {
     fn invalidate_session_work(&mut self, _invalidation_reason: &str) {
         let had_tracked_work = !self.outstanding_actions.is_empty();
         let had_active_core_work = !self.core.is_idle();
-        let had_start_action = self.action_outbox.iter().any(|action| {
-            matches!(
-                action,
-                SessionAction::RequestModel { .. } | SessionAction::RequestTool { .. }
-            )
-        });
-        let had_existing_cancel = self
-            .action_outbox
-            .iter()
-            .any(|action| matches!(action, SessionAction::CancelSessionWork));
+        let had_start_action = !self.queued_action_ids.is_empty();
+        let had_existing_cancel = self.cancel_session_work_queued;
 
         self.outstanding_actions.clear();
-        self.action_outbox
-            .retain(|action| matches!(action, SessionAction::CancelSessionWork));
+        self.retain_cancel_session_work();
 
         if (had_active_core_work || had_tracked_work || had_start_action) && !had_existing_cancel {
             self.queue_session_action(SessionAction::CancelSessionWork);
@@ -557,13 +581,26 @@ impl AgentSession {
     }
 
     fn drop_completed_action_from_outbox(&mut self, input: &AgentInput) {
-        let position = self
-            .action_outbox
-            .iter()
-            .position(|action| action.matches_completion(input));
-        if let Some(position) = position {
-            self.action_outbox.remove(position);
+        let action_id = match input {
+            AgentInput::ModelCompleted { action_id, .. }
+            | AgentInput::ModelFailed { action_id, .. }
+            | AgentInput::ToolCompleted { action_id, .. } => *action_id,
+            AgentInput::Interrupt
+            | AgentInput::Steer { .. }
+            | AgentInput::FollowUp { .. }
+            | AgentInput::DaemonObservation { .. } => return,
+        };
+        if self.queued_action_ids.remove(&action_id) {
+            self.completed_action_ids.insert(action_id);
         }
+    }
+
+    fn retain_cancel_session_work(&mut self) {
+        self.action_outbox
+            .retain(|action| matches!(action, SessionAction::CancelSessionWork));
+        self.queued_action_ids.clear();
+        self.completed_action_ids.clear();
+        self.cancel_session_work_queued = !self.action_outbox.is_empty();
     }
 
     #[cfg(test)]
@@ -575,8 +612,7 @@ impl AgentSession {
         // longer driving; reset the queue so a rehydrated session does not
         // block edits forever.
         self.outstanding_actions.clear();
-        self.action_outbox
-            .retain(|action| matches!(action, SessionAction::CancelSessionWork));
+        self.retain_cancel_session_work();
     }
 
     fn close_transcript_store_open_turn(

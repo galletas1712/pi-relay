@@ -286,6 +286,7 @@ mod tests {
                 &AgentState::RunningTools {
                     turn_id: TurnId(1),
                     tools: Vec::new(),
+                    tool_index_by_action_id: std::collections::HashMap::new(),
                     next_result_index: 0,
                 },
                 TurnId(99)
@@ -297,6 +298,7 @@ mod tests {
                 &AgentState::RunningTools {
                     turn_id: TurnId(1),
                     tools: Vec::new(),
+                    tool_index_by_action_id: std::collections::HashMap::new(),
                     next_result_index: 0,
                 },
                 TurnId(99)

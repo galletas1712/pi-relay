@@ -1,4 +1,3 @@
-use agent_core::AgentInput;
 use agent_vocab::{ActionId, ToolCall, ToolCallId, TurnId};
 
 use crate::model_context::ModelContext;
@@ -30,14 +29,13 @@ pub enum SessionAction {
 }
 
 impl SessionAction {
-    pub(crate) fn matches_completion(&self, input: &AgentInput) -> bool {
-        matches!(
-            (
-                CompletionTarget::from_session_action(self),
-                CompletionTarget::from_input(input)
-            ),
-            (Some(action), Some(input)) if action == input
-        )
+    pub(crate) fn action_id(&self) -> Option<ActionId> {
+        match self {
+            Self::RequestModel { action_id, .. } | Self::RequestTool { action_id, .. } => {
+                Some(*action_id)
+            }
+            Self::CancelSessionWork => None,
+        }
     }
 }
 
@@ -49,37 +47,6 @@ pub(crate) struct CompletionTarget {
 }
 
 impl CompletionTarget {
-    pub(crate) fn from_input(input: &AgentInput) -> Option<Self> {
-        match input {
-            AgentInput::ModelCompleted {
-                action_id, turn_id, ..
-            }
-            | AgentInput::ModelFailed {
-                action_id, turn_id, ..
-            } => Some(Self {
-                action_id: *action_id,
-                turn_id: *turn_id,
-                tool: None,
-            }),
-            AgentInput::ToolCompleted {
-                action_id,
-                turn_id,
-                result,
-            } => Some(Self {
-                action_id: *action_id,
-                turn_id: *turn_id,
-                tool: Some(CompletionToolTarget {
-                    id: result.tool_call_id.clone(),
-                    name: result.tool_name.clone(),
-                }),
-            }),
-            AgentInput::Interrupt
-            | AgentInput::Steer { .. }
-            | AgentInput::FollowUp { .. }
-            | AgentInput::DaemonObservation { .. } => None,
-        }
-    }
-
     pub(crate) fn from_core_action(action: &agent_core::AgentAction) -> Option<Self> {
         match action {
             agent_core::AgentAction::RequestModel { action_id, turn_id } => Some(Self {
