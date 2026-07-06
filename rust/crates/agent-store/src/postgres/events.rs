@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(test)]
+use std::{cell::Cell, future::Future};
 
 use agent_session::{SessionAction, SessionActionKind, SessionEvent};
 use agent_vocab::TranscriptItem;
@@ -16,6 +18,81 @@ use super::transcript::{
     session_state_for_event_tx, transcript_entry_record_tx, tree_node_from_entry, SessionEventState,
 };
 use super::PostgresAgentStore;
+
+// Three fixed binds (session ID plus type and payload arrays) stay far below
+// PostgreSQL's bind limit. The cap bounds accumulated event JSON per statement.
+pub(super) const EVENT_INSERT_BATCH_CAPACITY: usize = 128;
+
+const INSERT_EVENT_ROWS_SQL: &str = r#"
+with input as materialized (
+    select event_type, payload, input_ordinal
+    from unnest($2::text[], $3::jsonb[])
+        with ordinality as input(event_type, payload, input_ordinal)
+),
+allocated as materialized (
+    select
+        nextval(pg_get_serial_sequence('events', 'id')::regclass) as id,
+        input_ordinal
+    from (
+        select input_ordinal
+        from input
+        order by input_ordinal
+    ) ordered_input
+),
+inserted as (
+    insert into events (id, session_id, type, payload)
+    select allocated.id, $1::text, input.event_type, input.payload
+    from allocated
+    join input using (input_ordinal)
+    returning id, session_id, type, payload
+)
+select inserted.id, inserted.session_id, inserted.type, inserted.payload
+from inserted
+join allocated using (id)
+order by allocated.input_ordinal
+"#;
+
+#[derive(Debug)]
+pub(super) struct EventRow {
+    event_type: EventType,
+    payload: Value,
+}
+
+impl EventRow {
+    pub(super) fn new(event_type: EventType, payload: Value) -> Self {
+        Self {
+            event_type,
+            payload,
+        }
+    }
+
+    pub(super) fn with_activity_hint(event_type: EventType, mut payload: Value) -> Self {
+        if let Some(activity) = event_activity_hint(event_type) {
+            ensure_payload_object(&mut payload)
+                .entry("activity".to_string())
+                .or_insert_with(|| serde_json::to_value(activity).unwrap_or(Value::Null));
+        }
+        Self::new(event_type, payload)
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static EVENT_INSERT_STATEMENTS: Cell<usize>;
+}
+
+#[cfg(test)]
+pub(super) async fn with_event_insert_statement_count<F>(future: F) -> (F::Output, usize)
+where
+    F: Future,
+{
+    EVENT_INSERT_STATEMENTS
+        .scope(Cell::new(0), async {
+            let output = future.await;
+            (output, EVENT_INSERT_STATEMENTS.with(Cell::get))
+        })
+        .await
+}
 
 impl PostgresAgentStore {
     pub async fn last_event_id(&self, session_id: &str) -> Result<i64> {
@@ -40,7 +117,12 @@ impl PostgresAgentStore {
         event: EventType,
         data: Value,
     ) -> Result<EventFrame> {
-        insert_event_row(&self.pool, session_id, event, data).await
+        Ok(
+            insert_event_row_batch(&self.pool, session_id, vec![EventRow::new(event, data)])
+                .await?
+                .pop()
+                .expect("one input event returns one frame"),
+        )
     }
 
     pub async fn insert_events(
@@ -49,10 +131,11 @@ impl PostgresAgentStore {
         events: Vec<(EventType, Value)>,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        let mut frames = Vec::with_capacity(events.len());
-        for (event_type, payload) in events {
-            frames.push(insert_event_tx(&mut tx, session_id, event_type, payload).await?);
-        }
+        let rows = events
+            .into_iter()
+            .map(|(event_type, payload)| EventRow::new(event_type, payload))
+            .collect::<Vec<_>>();
+        let frames = insert_event_rows_tx(&mut tx, session_id, rows).await?;
         tx.commit().await?;
         Ok(frames)
     }
@@ -166,41 +249,74 @@ pub(super) async fn insert_event_tx(
     event_type: EventType,
     payload: Value,
 ) -> Result<EventFrame> {
-    insert_event_row(&mut **tx, session_id, event_type, payload).await
+    Ok(
+        insert_event_rows_tx(tx, session_id, vec![EventRow::new(event_type, payload)])
+            .await?
+            .pop()
+            .expect("one input event returns one frame"),
+    )
 }
 
 pub(super) async fn insert_event_with_activity_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     event_type: EventType,
-    mut payload: Value,
+    payload: Value,
 ) -> Result<EventFrame> {
-    if let Some(activity) = event_activity_hint(event_type) {
-        ensure_payload_object(&mut payload)
-            .entry("activity".to_string())
-            .or_insert_with(|| serde_json::to_value(activity).unwrap_or(Value::Null));
-    }
-    insert_event_tx(tx, session_id, event_type, payload).await
+    Ok(insert_event_rows_tx(
+        tx,
+        session_id,
+        vec![EventRow::with_activity_hint(event_type, payload)],
+    )
+    .await?
+    .pop()
+    .expect("one input event returns one frame"))
 }
 
-async fn insert_event_row<'e, E>(
+pub(super) async fn insert_event_rows_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    event_rows: Vec<EventRow>,
+) -> Result<Vec<EventFrame>> {
+    let mut frames = Vec::with_capacity(event_rows.len());
+    let mut event_rows = event_rows.into_iter();
+    loop {
+        let batch = event_rows
+            .by_ref()
+            .take(EVENT_INSERT_BATCH_CAPACITY)
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        frames.extend(insert_event_row_batch(&mut **tx, session_id, batch).await?);
+    }
+    Ok(frames)
+}
+
+async fn insert_event_row_batch<'e, E>(
     executor: E,
     session_id: &str,
-    event_type: EventType,
-    payload: Value,
-) -> Result<EventFrame>
+    event_rows: Vec<EventRow>,
+) -> Result<Vec<EventFrame>>
 where
     E: Executor<'e, Database = Postgres>,
 {
-    let row = sqlx::query(
-        "insert into events (session_id, type, payload) values ($1::text, $2::text, $3) returning id, session_id, type, payload",
-    )
-    .bind(session_id)
-    .bind(event_type.as_str())
-    .bind(payload)
-    .fetch_one(executor)
-    .await?;
-    row_to_event(row)
+    if event_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (event_types, payloads) = event_rows
+        .into_iter()
+        .map(|row| (row.event_type.as_str(), row.payload))
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+    #[cfg(test)]
+    let _ = EVENT_INSERT_STATEMENTS.try_with(|count| count.set(count.get() + 1));
+    let rows = sqlx::query(INSERT_EVENT_ROWS_SQL)
+        .bind(session_id)
+        .bind(event_types)
+        .bind(payloads)
+        .fetch_all(executor)
+        .await?;
+    rows.into_iter().map(row_to_event).collect()
 }
 
 fn ensure_payload_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
@@ -227,6 +343,7 @@ fn event_activity_hint(event_type: EventType) -> Option<SessionActivity> {
     }
 }
 
+#[allow(dead_code)]
 pub(super) async fn insert_session_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
@@ -235,9 +352,22 @@ pub(super) async fn insert_session_event_tx(
     entries_by_id: &HashMap<String, TranscriptEntryRecord>,
     action_rows: &HashMap<ActionKey, String>,
 ) -> Result<Vec<EventFrame>> {
+    let rows =
+        session_event_rows_tx(tx, session_id, event, state, entries_by_id, action_rows).await?;
+    insert_event_rows_tx(tx, session_id, rows).await
+}
+
+pub(super) async fn session_event_rows_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    event: &SessionEvent,
+    state: Option<&SessionEventState>,
+    entries_by_id: &HashMap<String, TranscriptEntryRecord>,
+    action_rows: &HashMap<ActionKey, String>,
+) -> Result<Vec<EventRow>> {
     match event {
         SessionEvent::TranscriptItemAppended { entry_id, item } => {
-            insert_transcript_item_events_tx(
+            transcript_item_event_rows_tx(
                 tx,
                 session_id,
                 state,
@@ -249,72 +379,49 @@ pub(super) async fn insert_session_event_tx(
         }
         SessionEvent::ActionRequested {
             action: SessionAction::CancelSessionWork,
-        } => Ok(vec![
-            insert_event_with_activity_tx(
-                tx,
-                session_id,
-                EventType::SessionWorkCancelled,
-                json!({}),
-            )
-            .await?,
-        ]),
+        } => Ok(vec![EventRow::with_activity_hint(
+            EventType::SessionWorkCancelled,
+            json!({}),
+        )]),
         SessionEvent::ActionRequested { action } => {
             let (kind, action_id, _, payload) = action_payload(action)?;
             let row_id = action_rows.get(&ActionKey::new(kind, action_id)).cloned();
-            let mut frames = vec![insert_event_with_activity_tx(
-                tx,
-                session_id,
+            let mut rows = vec![EventRow::with_activity_hint(
                 EventType::ActionRequested,
                 json!({ "kind": kind, "action_id": action_id, "action_row_id": row_id, "payload": payload }),
-            )
-            .await?];
+            )];
             let event_name = match action {
                 SessionAction::RequestModel { .. } => Some(EventType::ModelRequested),
                 SessionAction::RequestTool { .. } => Some(EventType::ToolRequested),
                 SessionAction::CancelSessionWork => None,
             };
             if let Some(event_name) = event_name {
-                frames.push(
-                    insert_event_with_activity_tx(
-                        tx,
-                        session_id,
-                        event_name,
-                        json!({ "action_row_id": row_id, "action_id": action_id }),
-                    )
-                    .await?,
-                );
+                rows.push(EventRow::with_activity_hint(
+                    event_name,
+                    json!({ "action_row_id": row_id, "action_id": action_id }),
+                ));
             }
-            Ok(frames)
+            Ok(rows)
         }
         SessionEvent::ActionCompleted { kind, id } => {
             let event_name = match kind {
                 SessionActionKind::Model => EventType::ModelCompleted,
                 SessionActionKind::Tool => EventType::ToolCompleted,
             };
-            Ok(vec![
-                insert_event_with_activity_tx(
-                    tx,
-                    session_id,
-                    event_name,
-                    json!({ "action_id": id }),
-                )
-                .await?,
-            ])
+            Ok(vec![EventRow::with_activity_hint(
+                event_name,
+                json!({ "action_id": id }),
+            )])
         }
         SessionEvent::ActionFailed { kind, id, error } => {
             let event_name = match kind {
                 SessionActionKind::Model => EventType::ModelError,
                 SessionActionKind::Tool => EventType::ToolError,
             };
-            Ok(vec![
-                insert_event_with_activity_tx(
-                    tx,
-                    session_id,
-                    event_name,
-                    json!({ "action_id": id, "error": error }),
-                )
-                .await?,
-            ])
+            Ok(vec![EventRow::with_activity_hint(
+                event_name,
+                json!({ "action_id": id, "error": error }),
+            )])
         }
     }
 }
@@ -327,6 +434,18 @@ pub(super) async fn insert_transcript_item_events_tx(
     entry_id: &str,
     item: &TranscriptItem,
 ) -> Result<Vec<EventFrame>> {
+    let rows = transcript_item_event_rows_tx(tx, session_id, state, entry, entry_id, item).await?;
+    insert_event_rows_tx(tx, session_id, rows).await
+}
+
+async fn transcript_item_event_rows_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    state: Option<&SessionEventState>,
+    entry: Option<&TranscriptEntryRecord>,
+    entry_id: &str,
+    item: &TranscriptItem,
+) -> Result<Vec<EventRow>> {
     let fallback_state;
     let state = if let Some(state) = state {
         state
@@ -353,59 +472,43 @@ pub(super) async fn insert_transcript_item_events_tx(
         })
     });
     let tree_node = record.map(tree_node_from_entry);
-    let mut frames = vec![
-        insert_event_with_activity_tx(
-            tx,
-            session_id,
-            EventType::TranscriptAppended,
-            json!({
-                "entry_id": entry_id,
-                "item": item,
-                "entry": entry_payload,
-                "tree_node": tree_node,
-                "active_leaf_id": state.active_leaf_id,
-                "session_revision": state.session_revision,
-                "queue_revision": state.queue_revision,
-                "transcript_revision": state.transcript_revision,
-            }),
-        )
-        .await?,
-    ];
+    let mut rows = vec![EventRow::with_activity_hint(
+        EventType::TranscriptAppended,
+        json!({
+            "entry_id": entry_id,
+            "item": item,
+            "entry": entry_payload,
+            "tree_node": tree_node,
+            "active_leaf_id": state.active_leaf_id,
+            "session_revision": state.session_revision,
+            "queue_revision": state.queue_revision,
+            "transcript_revision": state.transcript_revision,
+        }),
+    )];
     match item {
         TranscriptItem::TurnStarted { turn_id } => {
-            frames.push(
-                insert_event_with_activity_tx(
-                    tx,
-                    session_id,
-                    EventType::TurnStarted,
-                    json!({ "turn_id": turn_id.0, "entry_id": entry_id }),
-                )
-                .await?,
-            );
+            rows.push(EventRow::with_activity_hint(
+                EventType::TurnStarted,
+                json!({ "turn_id": turn_id.0, "entry_id": entry_id }),
+            ));
         }
         TranscriptItem::TurnFinished { turn_id, outcome } => {
-            frames.push(
-                insert_event_with_activity_tx(
-                    tx,
-                    session_id,
-                    EventType::TurnFinished,
-                    json!({ "turn_id": turn_id.0, "outcome": outcome, "entry_id": entry_id }),
-                )
-                .await?,
-            );
+            rows.push(EventRow::with_activity_hint(
+                EventType::TurnFinished,
+                json!({ "turn_id": turn_id.0, "outcome": outcome, "entry_id": entry_id }),
+            ));
         }
         TranscriptItem::AssistantMessage(message) => {
-            frames.push(
-                insert_event_with_activity_tx(
-                    tx,
-                    session_id,
-                    EventType::AssistantMessage,
-                    json!({ "entry_id": entry_id, "assistant": message }),
-                )
-                .await?,
-            );
+            rows.push(EventRow::with_activity_hint(
+                EventType::AssistantMessage,
+                json!({ "entry_id": entry_id, "assistant": message }),
+            ));
         }
         _ => {}
     }
-    Ok(frames)
+    Ok(rows)
 }
+
+#[cfg(test)]
+#[path = "events_tests.rs"]
+mod tests;

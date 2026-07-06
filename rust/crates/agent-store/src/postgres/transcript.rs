@@ -17,6 +17,8 @@ use crate::{
     TranscriptTurnDetailResult, TranscriptTurnsResult,
 };
 
+#[cfg(test)]
+use super::events::with_event_insert_statement_count;
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
 use super::queue::bump_revisions_tx;
 use super::rows::{row_to_stored_entry, row_to_transcript_entry};
@@ -1358,7 +1360,7 @@ pub(super) fn model_context_from_entries(entries: Vec<StoredTranscriptEntry>) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use agent_session::{SessionEvent, TranscriptStorageNode};
@@ -1376,14 +1378,14 @@ mod tests {
 
     static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(30_000);
 
-    struct TestDb {
-        store: PostgresAgentStore,
+    pub(crate) struct TestDb {
+        pub(crate) store: PostgresAgentStore,
         admin_url: String,
         name: String,
     }
 
     impl TestDb {
-        async fn cleanup(self) {
+        pub(crate) async fn cleanup(self) {
             self.store.close().await;
             if let Ok(admin) = sqlx::PgPool::connect(&self.admin_url).await {
                 let _ = sqlx::query(&format!(r#"drop database if exists "{}""#, self.name))
@@ -1394,7 +1396,7 @@ mod tests {
         }
     }
 
-    async fn test_store() -> Option<TestDb> {
+    pub(crate) async fn test_store() -> Option<TestDb> {
         let admin_url = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok()?;
         let name = format!(
             "pi_relay_transcript_test_{}_{}",
@@ -1452,7 +1454,7 @@ mod tests {
         }
     }
 
-    async fn create_session(store: &PostgresAgentStore, session_id: &str) {
+    pub(crate) async fn create_session(store: &PostgresAgentStore, session_id: &str) {
         let project_id = Uuid::new_v4();
         store
             .create_project(project_id, "transcript test", &[], json!({}))
@@ -1735,18 +1737,20 @@ mod tests {
             .expect("original inserts");
         let conflicting = with_timestamp(user_message("entry_user", None, "replacement"), 99);
         let events = vec![appended_event(&conflicting)];
-        let (result, counts) = with_transcript_query_counts(store.persist_outputs(
-            session_id,
-            OutputBatch::new(
-                std::slice::from_ref(&conflicting),
-                Some("entry_user"),
-                &events,
-                &[],
-            ),
-        ))
-        .await;
+        let ((result, event_statements), counts) =
+            with_transcript_query_counts(with_event_insert_statement_count(store.persist_outputs(
+                session_id,
+                OutputBatch::new(
+                    std::slice::from_ref(&conflicting),
+                    Some("entry_user"),
+                    &events,
+                    &[],
+                ),
+            )))
+            .await;
         let (frames, _) = result.expect("conflicting output remains idempotent");
 
+        assert_eq!(event_statements, 1);
         assert_eq!(
             counts,
             TranscriptQueryCounts {
