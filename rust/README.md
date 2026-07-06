@@ -79,7 +79,7 @@ Credentials are loaded at model-call time, not stored on the session:
 - `provider.kind = "openai"` uses the ChatGPT/Codex subscription transport
   (`CODEX_ACCESS_TOKEN` or `~/.codex/auth.json`, including `tokens.account_id`).
   pi-relay does not support plain OpenAI API-key auth for OpenAI models.
-- `provider.kind = "anthropic"` / `"claude"` uses `ANTHROPIC_API_KEY` or Claude
+- `provider.kind = "claude"` uses `ANTHROPIC_API_KEY` or Claude
   Code's `primaryApiKey` from `~/.claude/config.json` / `~/.claude.json`.
 
 Provider/model tuning (`reasoning_effort`, optional `max_tokens`,

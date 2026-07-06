@@ -430,33 +430,6 @@ impl PostgresAgentStore {
         Ok(())
     }
 
-    /// Low-level attempt-fenced cancellation CAS. User-visible
-    /// `delegation.cancel` uses
-    /// `cancel_running_delegation_and_queued_partials` so the status transition
-    /// and stale partial-wakeup cleanup commit atomically. This helper remains
-    /// for tests/simulations of race windows and updates exactly one row iff the
-    /// caller observed the current attempt and the delegation is still
-    /// `running`.
-    pub async fn cancel_running_delegation(
-        &self,
-        delegation_id: &str,
-        attempt_id: &str,
-    ) -> Result<bool> {
-        let updated = sqlx::query(
-            r#"
-            update delegations
-            set status='cancelled', updated_at=now()
-            where id=$1 and attempt_id=$2 and status='running'
-            "#,
-        )
-        .bind(delegation_id)
-        .bind(attempt_id)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(updated == 1)
-    }
-
     /// Attempt-fenced cancellation CAS that also cancels any active
     /// partial wakeups for the same delegation attempt in the same transaction.
     ///
@@ -672,44 +645,6 @@ impl PostgresAgentStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(events)
-    }
-
-    /// Boot-time defense in depth for the cancellation crash gap that existed
-    /// before `cancel_running_delegation_and_queued_partials`: if a delegation is
-    /// already `cancelled`, any active deterministic partial wakeups for its
-    /// attempt are stale and must not wake the top-level parent. Start from the
-    /// active queue so boot cost is proportional to stale queued/consuming
-    /// partials, not all historical cancelled delegations.
-    pub async fn repair_cancelled_delegation_partial_wakeups(&self) -> Result<Vec<EventFrame>> {
-        let stale = self
-            .list_cancelled_delegations_with_active_partial_wakeups()
-            .await?;
-        let mut events = Vec::new();
-        for delegation in stale {
-            let mut tx = self.pool.begin().await?;
-            lock_session_tx(&mut tx, &delegation.parent_session_id).await?;
-            let input_ids = cancel_active_partial_delegation_wakeups_tx(
-                &mut tx,
-                &delegation.parent_session_id,
-                &delegation.id,
-                &delegation.attempt_id,
-                "cancelled_delegation_boot_repair",
-            )
-            .await?;
-            events.extend(
-                partial_wakeup_cancellation_events_tx(
-                    &mut tx,
-                    &delegation.parent_session_id,
-                    &delegation.id,
-                    &delegation.attempt_id,
-                    "cancelled_delegation_boot_repair",
-                    input_ids,
-                )
-                .await?,
-            );
-            tx.commit().await?;
-        }
         Ok(events)
     }
 
@@ -1656,30 +1591,6 @@ impl PostgresAgentStore {
         Ok(SubagentBoundaryInterruptResult::Applied { interrupted })
     }
 
-    /// Enqueue a parent wakeup with the deterministic delegation/attempt key.
-    /// This legacy text-steer compatibility path remains idempotent via the
-    /// unique `(session_id, client_input_id)` index, so boot repair or a replay
-    /// can call it again without creating a duplicate. Current delegation
-    /// completion delivery uses `enqueue_delegation_observation` so daemon facts
-    /// are stored as a typed observation rather than human/user message text.
-    pub async fn enqueue_delegation_steer(
-        &self,
-        parent_session_id: &str,
-        steer_message: &str,
-        steer_client_input_id: &str,
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        enqueue_steer_tx(
-            &mut tx,
-            parent_session_id,
-            steer_message,
-            steer_client_input_id,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// Enqueue a partial parent wakeup only if the delegation attempt is still
     /// running and no other active partial wakeup for the same attempt is
     /// already queued or being consumed.
@@ -1890,56 +1801,32 @@ impl PostgresAgentStore {
         Ok(subagents)
     }
 
-    /// Completed delegations that may need boot-time publication repair. The
-    /// normal barrier claims the terminal status before writing files/enqueueing
-    /// the parent wakeup observation; if the daemon crashes in that narrow gap,
-    /// these rows are no longer `running` and therefore are not covered by the
-    /// ordinary running-delegation sweep.
+    /// Completed delegations missing their deterministic publication row. The
+    /// normal barrier claims terminal status before writing files and enqueueing
+    /// the parent observation; a crash in that narrow gap leaves no
+    /// `delegation-steer:{delegation_id}:{attempt_id}` input. Starting from the
+    /// missing queue row keeps boot work proportional to actual crash gaps
+    /// instead of replaying every historical terminal delegation.
     pub async fn list_completed_delegations_for_repair(&self) -> Result<Vec<Delegation>> {
         let rows = sqlx::query(
             r#"
-            select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
-            from delegations
-            where status in ('done', 'done_with_failures')
-            order by updated_at, id
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(row_to_delegation).collect()
-    }
-
-    async fn list_cancelled_delegations_with_active_partial_wakeups(
-        &self,
-    ) -> Result<Vec<Delegation>> {
-        let rows = sqlx::query(
-            r#"
-            with active_partial_wakeups as (
-                select distinct
-                       q.session_id as parent_session_id,
-                       split_part(q.client_input_id, ':', 2) as delegation_id,
-                       split_part(q.client_input_id, ':', 3) as attempt_id
-                from queued_inputs q
-                where q.priority='steer'
-                  and q.status in ('queued', 'consuming')
-                  and q.content->>'type' = 'daemon_tool_observation'
-                  and q.client_input_id like 'delegation-steer:%:%:%'
-            )
-            select distinct d.id,
+            select d.id,
                    d.parent_session_id,
                    d.workflow,
                    d.label,
                    d.kind,
                    d.status,
                    d.attempt_id,
-                   d.expected_subagents,
-                   d.updated_at
-            from active_partial_wakeups q
-            join delegations d
-              on d.id = q.delegation_id
-             and d.parent_session_id = q.parent_session_id
-             and d.attempt_id = q.attempt_id
-             and d.status='cancelled'
+                   d.expected_subagents
+            from delegations d
+            where d.status in ('done', 'done_with_failures')
+              and not exists (
+                  select 1
+                  from queued_inputs q
+                  where q.session_id=d.parent_session_id
+                    and q.client_input_id=
+                        'delegation-steer:' || d.id || ':' || d.attempt_id
+              )
             order by d.updated_at, d.id
             "#,
         )
@@ -2015,25 +1902,6 @@ async fn partial_wakeup_cancellation_events_tx(
     )
     .await?;
     Ok(vec![event])
-}
-
-/// Insert a text steer as a durable queued input inside the caller's
-/// transaction, idempotent on `(session_id, client_input_id)`. A re-run with
-/// the same key inserts nothing and emits no duplicate event. Mirrors the steer
-/// branch of `enqueue_user_input`.
-async fn enqueue_steer_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    parent_session_id: &str,
-    message: &str,
-    client_input_id: &str,
-) -> Result<bool> {
-    enqueue_steer_content_tx(
-        tx,
-        parent_session_id,
-        QueuedInputContent::user_message(UserMessage::text(message)),
-        client_input_id,
-    )
-    .await
 }
 
 async fn enqueue_steer_content_tx(

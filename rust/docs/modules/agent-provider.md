@@ -72,7 +72,7 @@ or non-retryable.
 - `is_context_overflow()` — status `413`, or messages matching `prompt is too long` / `context_length_exceeded` / `context …(length|window|too large|exceed|maximum)`. A bare 400 is *not* treated as overflow (Anthropic `count_tokens` returns 400 for unsupported server tools).
 - `retry_diagnostic()` — returns status / timeout / reqwest diagnostic details that the daemon records after retry exhaustion.
 
-`ProviderKind` is `{ OpenAi, Claude }` only; it parses `"openai"`, `"claude"`, and `"anthropic"`. ("codex" is not a provider kind — it is the auth transport OpenAI always uses.)
+`ProviderKind` is `{ OpenAi, Claude }` only and parses exactly `"openai"` and `"claude"`. `"anthropic"` and `"codex"` are not provider kinds; Codex is the auth transport OpenAI always uses.
 
 ## How it works
 

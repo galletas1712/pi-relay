@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::ids::ToolCallId;
-use crate::message::{ToolCall, ToolResultMessage, ToolResultStatus, UserMessage};
+use crate::message::{ToolCall, ToolResultMessage, ToolResultStatus};
 
 /// A daemon-authored tool observation that should be durable in the transcript
 /// but must not imply the model chose a tool call.
@@ -89,56 +89,6 @@ impl DaemonToolObservation {
             self.summary.as_deref(),
             &self.result_json,
         )
-    }
-
-    pub fn into_user_message(self) -> Result<UserMessage, serde_json::Error> {
-        self.render_text().map(UserMessage::text)
-    }
-}
-
-/// Legacy/fallback text wrapper for daemon-authored observations. New code
-/// should prefer [`DaemonToolObservation`] in transcripts; this wrapper remains
-/// for old text fallback renderers and compatibility tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DaemonObservation(DaemonToolObservation);
-
-impl DaemonObservation {
-    pub fn inspect_delegation(
-        delegation_id: impl Into<String>,
-        summary: Option<String>,
-        snapshot: Value,
-    ) -> Self {
-        Self(DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("daemon_observation_fallback"),
-            delegation_id,
-            summary,
-            snapshot,
-        ))
-    }
-
-    pub fn action(&self) -> &str {
-        &self.0.tool_name
-    }
-
-    pub fn subject_id(&self) -> Option<String> {
-        self.0.args_value().ok().and_then(|value| {
-            value
-                .get("delegation_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-    }
-
-    pub fn json_payload(&self) -> &Value {
-        &self.0.result_json
-    }
-
-    pub fn render_text(&self) -> Result<String, serde_json::Error> {
-        self.0.render_text()
-    }
-
-    pub fn into_user_message(self) -> Result<UserMessage, serde_json::Error> {
-        self.render_text().map(UserMessage::text)
     }
 }
 

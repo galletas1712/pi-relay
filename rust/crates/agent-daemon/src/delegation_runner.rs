@@ -395,21 +395,15 @@ async fn classify_subagents(
 
 /// Boot crash sweep:
 ///
-/// 1. Cancel any active partial wakeups that survived a pre-fix crash after a
-///    delegation's status had already reached `cancelled`. This must run before
-///    any boot-time path can drive the parent, otherwise a different repaired
-///    delegation for the same parent could resume the parent into the stale
-///    partial.
-/// 2. Complete every `running` delegation whose subagents are all terminal. A
+/// 1. Complete every `running` delegation whose subagents are all terminal. A
 ///    crash before the terminal-status claim leaves such a delegation `running`
 ///    with every subagent idle; the ordinary barrier path handles it.
-/// 3. Repair already-completed delegations that may have crashed after the
+/// 2. Repair already-completed delegations that may have crashed after the
 ///    status CAS but before normal handoff files and the parent wakeup
 ///    observation were published. This repair is idempotent and only covers `done` /
 ///    `done_with_failures`; cancelled delegations remain transcript-only and
 ///    are never reactivated.
 pub(crate) async fn sweep_running_delegations_on_boot(state: &AppState) {
-    repair_cancelled_delegation_partial_wakeups_on_boot(state).await;
     publish_running_delegation_partial_observations_on_boot(state).await;
 
     let ready = match state.repo.sweep_running_delegations().await {
@@ -525,19 +519,6 @@ async fn repair_completed_delegation_publication(
         drive_parent_after_wakeup(state, &delegation.parent_session_id).await;
     }
     Ok(())
-}
-
-async fn repair_cancelled_delegation_partial_wakeups_on_boot(state: &AppState) {
-    match state
-        .repo
-        .repair_cancelled_delegation_partial_wakeups()
-        .await
-    {
-        Ok(events) => publish_events(state, events),
-        Err(error) => eprintln!(
-            "boot delegation sweep could not repair cancelled delegation partial wakeups: {error:#}"
-        ),
-    }
 }
 
 #[cfg(test)]
