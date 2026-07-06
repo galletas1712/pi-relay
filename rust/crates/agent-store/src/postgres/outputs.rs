@@ -14,7 +14,7 @@ use crate::{
 use super::action_records::{
     action_event_matches_row, action_payload, ActionKey, POST_COMPACTION_DISPATCH_KEY,
 };
-use super::events::{insert_event_tx, insert_session_event_tx};
+use super::events::{insert_event_rows_tx, session_event_rows_tx, EventRow};
 use super::queue::{bump_revisions_tx, queue_event_payload, queue_state_tx};
 use super::rows::row_text;
 use super::sql::{action_is_unfinished, lock_session_tx, QUEUED_INPUT_DISPATCH_ORDER};
@@ -107,7 +107,6 @@ pub(super) async fn persist_outputs_tx(
         .await
         .context("update session active leaf")?;
 
-    let mut frames = Vec::new();
     if let Some(input) = consumed_input {
         let consume_query = format!(
             r#"
@@ -416,31 +415,20 @@ pub(super) async fn persist_outputs_tx(
     if session_changed {
         bump_revisions_tx(tx, session_id, queue_changed, transcript_changed).await?;
     }
+    let mut event_rows = Vec::new();
     if consumed_input_event.is_some() || accepted_input_event.is_some() {
         let queue = queue_state_tx(tx, session_id).await?;
         if let Some(payload) = consumed_input_event {
-            frames.push(
-                insert_event_tx(
-                    tx,
-                    session_id,
-                    EventType::InputConsumed,
-                    queue_event_payload(&queue, payload),
-                )
-                .await
-                .context("insert input.consumed event")?,
-            );
+            event_rows.push(EventRow::new(
+                EventType::InputConsumed,
+                queue_event_payload(&queue, payload),
+            ));
         }
         if let Some(payload) = accepted_input_event {
-            frames.push(
-                insert_event_tx(
-                    tx,
-                    session_id,
-                    EventType::InputAccepted,
-                    queue_event_payload(&queue, payload),
-                )
-                .await
-                .context("insert input.accepted event")?,
-            );
+            event_rows.push(EventRow::new(
+                EventType::InputAccepted,
+                queue_event_payload(&queue, payload),
+            ));
         }
     }
     // This is the daemon progress hot path: after persisting output entries, do
@@ -457,8 +445,8 @@ pub(super) async fn persist_outputs_tx(
         None
     };
     for event in session_events {
-        frames.extend(
-            insert_session_event_tx(
+        event_rows.extend(
+            session_event_rows_tx(
                 tx,
                 session_id,
                 event,
@@ -467,9 +455,12 @@ pub(super) async fn persist_outputs_tx(
                 &action_rows,
             )
             .await
-            .with_context(|| format!("insert session event {event:?}"))?,
+            .with_context(|| format!("construct session event {event:?}"))?,
         );
     }
+    let frames = insert_event_rows_tx(tx, session_id, event_rows)
+        .await
+        .context("insert output events")?;
     Ok((frames, dispatch))
 }
 
