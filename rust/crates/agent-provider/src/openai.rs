@@ -4754,6 +4754,7 @@ mod tests {
 data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"README.md\"}"}}
 
 data: {"type":"response.completed","response":{"id":"resp_1"}}
+
 "#;
 
         let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
@@ -4783,6 +4784,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
 data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_bash","name":"Bash","arguments":"{\"command\":\"pwd\",\"timeout_ms\":120000}","status":"completed"}}
 
 data: {"type":"response.completed","response":{"id":"resp_1"}}
+
 "#;
 
         let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
@@ -4800,10 +4802,50 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     }
 
     #[test]
+    fn responses_sse_rejects_unterminated_output_item_done_and_completed() {
+        let item = json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": "must not be admitted",
+                "annotations": [],
+            }],
+        });
+        let done = json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": item,
+        });
+        for (name, sse) in [
+            ("response.output_item.done", format!("data: {done}\n")),
+            (
+                "response.completed",
+                format!(
+                    "data: {done}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\"}}}}\n"
+                ),
+            ),
+        ] {
+            let error = parse_responses_sse(&sse, ProviderKind::OpenAi)
+                .expect_err("unterminated OpenAI event cannot complete a response");
+            match error {
+                ProviderError::Provider(message) => assert_eq!(
+                    message, "provider SSE stream ended with an incomplete frame at EOF",
+                    "{name}"
+                ),
+                other => panic!("{name}: expected provider error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn responses_sse_requires_added_client_action_done_when_terminal_output_omits_it() {
         let sse = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"read"}}
 
 data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}
+
 "#;
 
         let error = parse_responses_sse(sse, ProviderKind::OpenAi)
@@ -4816,6 +4858,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
         let sse = r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}
 
 data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}}
+
 "#;
 
         let error = parse_responses_sse(sse, ProviderKind::OpenAi)
@@ -5473,6 +5516,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
     fn responses_sse_accepts_private_minimal_completion_without_output() {
         let response = parse_responses_sse(
             r#"data: {"type":"response.completed","response":{"id":"resp_1"}}
+
 "#,
             ProviderKind::OpenAi,
         )
@@ -5725,6 +5769,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
     #[test]
     fn responses_sse_parses_usage_cache_metrics() {
         let sse = r#"data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":80}}}}
+
 "#;
 
         let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
@@ -5742,6 +5787,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
         let sse = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"incomplete","content":[{"type":"output_text","text":"partial","annotations":[]}]}}
 
 data: {"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":100,"output_tokens":64,"total_tokens":164,"input_tokens_details":{"cached_tokens":80}}}}
+
 "#;
 
         let error = parse_responses_sse(sse, ProviderKind::OpenAi)
@@ -5791,6 +5837,7 @@ data: {"type":"response.output_item.done","output_index":1,"item":{"type":"messa
         let sse = r#"data: {"type":"response.future_progress","opaque":{"value":1}}
 
 data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}
+
 "#;
 
         let response = parse_responses_sse(sse, ProviderKind::OpenAi)
@@ -5860,6 +5907,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
     #[test]
     fn responses_sse_maps_transient_failed_events_to_status() {
         let sse = r#"data: {"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"retry later"}}}
+
 "#;
 
         let error = parse_responses_sse(sse, ProviderKind::OpenAi).expect_err("sse should fail");
@@ -5877,6 +5925,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
     #[test]
     fn responses_sse_maps_unknown_failed_events_to_transient_error() {
         let sse = r#"data: {"type":"response.failed","response":{"error":{"code":"backend_restart","message":"try again"}}}
+
 "#;
 
         let error = parse_responses_sse(sse, ProviderKind::OpenAi).expect_err("sse should fail");
@@ -5897,6 +5946,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
 data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_refusal","role":"assistant","status":"completed","content":[{"type":"output_text","text":"unsafe partial","annotations":[]},{"type":"refusal","refusal":"I cannot help with that request."}]}}
 
 data: {"type":"response.completed","response":{"id":"resp_refusal","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}
+
 "#;
 
         let response =
@@ -5947,6 +5997,7 @@ data: {"type":"response.completed","response":{"id":"resp_refusal","status":"com
         let missing_execution = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"tool_search_call"}}
 
 data: {"type":"response.completed","response":{"id":"resp_1"}}
+
 "#;
         let error = parse_responses_sse(missing_execution, ProviderKind::OpenAi)
             .expect_err("tool search without an execution mode must fail closed");
@@ -5957,6 +6008,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
 data: {"type":"response.output_item.done","output_index":1,"item":{"type":"future_action"}}
 
 data: {"type":"response.completed","response":{"id":"resp_1"}}
+
 "#;
         let error = parse_responses_sse(sse, ProviderKind::OpenAi)
             .expect_err("unknown output item types must fail closed");

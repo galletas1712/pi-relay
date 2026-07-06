@@ -5503,6 +5503,7 @@ mod tests {
         for sse in [
             r#"
 data: {"type":"message_start","message":{"content":[{"type":"compaction","content":"inline"}],"usage":{"input_tokens":150000,"output_tokens":0}}}
+
 "#,
             r#"
 data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":150000,"output_tokens":0}}}
@@ -5510,6 +5511,7 @@ data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":15
 data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
 
 data: {"type":"content_block_delta","index":0,"delta":{"type":"compaction_delta","content":"unexpected"}}
+
 "#,
             r#"
 data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":150000,"output_tokens":0}}}
@@ -5529,6 +5531,7 @@ data: {"type":"content_block_stop","index":1}
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
 
 data: {"type":"message_stop"}
+
 "#,
             r#"
 data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":150000,"output_tokens":0}}}
@@ -5548,6 +5551,7 @@ data: {"type":"content_block_stop","index":1}
 data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
 
 data: {"type":"message_stop"}
+
 "#,
             r#"
 data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":150000,"output_tokens":0}}}
@@ -5559,6 +5563,7 @@ data: {"type":"content_block_stop","index":0}
 data: {"type":"message_delta","delta":{"stop_reason":"compaction"}}
 
 data: {"type":"message_stop"}
+
 "#,
             r#"
 data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":150000,"output_tokens":0}}}
@@ -5566,6 +5571,7 @@ data: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":15
 data: {"type":"message_delta","delta":{"stop_reason":"compaction"}}
 
 data: {"type":"message_stop"}
+
 "#,
         ] {
             let error = parse_anthropic_sse(sse)
@@ -6251,6 +6257,25 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn compaction_sse_rejects_unterminated_trailing_valid_and_malformed_frames() {
+        let complete = compaction_sse(&valid_compaction_sse_events());
+        for (name, tail) in [
+            ("valid", "data: {\"type\":\"ping\"}\n"),
+            ("malformed", "data: {not-json}\n"),
+        ] {
+            let error = parse_anthropic_compaction_sse(&format!("{complete}{tail}"))
+                .expect_err("unterminated trailing frame must invalidate compaction");
+            match error {
+                ProviderError::Provider(message) => assert_eq!(
+                    message, "provider SSE stream ended with an incomplete frame at EOF",
+                    "{name}"
+                ),
+                other => panic!("{name}: expected decoder provider error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn anthropic_sse_accumulates_text_tool_calls_usage_and_stops_at_message_stop() {
         let sse = r#"
 event: message_start
@@ -6330,6 +6355,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":40,"cache_creation_input_tokens":15}}
 
 data: {"type":"message_stop"}
+
 "#;
 
         let response = parse_anthropic_sse(sse).expect("repeated cumulative deltas parse");
@@ -6406,6 +6432,7 @@ data: {"type":"content_block_stop","index":3}
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
 
 data: {"type":"message_stop"}
+
 "#;
 
         let response = parse_anthropic_sse(sse).expect("valid multiblock stream parses");
@@ -7027,6 +7054,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"
 data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"category":"policy","explanation":"cannot comply"}}}
 
 data: {"type":"message_stop"}
+
 "#,
         )
         .expect("nonconflicting terminal details merge");
@@ -7201,6 +7229,7 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"text","te
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
 
 data: {"type":"content_block_stop","index":0}
+
 "#;
         for (name, suffix) in [("EOF", ""), ("done sentinel", "\ndata: [DONE]\n\n")] {
             let error = parse_anthropic_sse(&format!("{prefix}{suffix}")).expect_err(name);
@@ -7210,6 +7239,39 @@ data: {"type":"content_block_stop","index":0}
             "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {not-json}\n\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn anthropic_sse_rejects_unterminated_content_block_stop_and_message_stop() {
+        let content_prefix = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"must not be admitted\"}}\n\n",
+        );
+        for (name, sse) in [
+            (
+                "content_block_stop",
+                format!("{content_prefix}data: {{\"type\":\"content_block_stop\",\"index\":0}}\n"),
+            ),
+            (
+                "message_stop",
+                format!(
+                    "{content_prefix}data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+                     data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}}}}\n\n\
+                     data: {{\"type\":\"message_stop\"}}\n"
+                ),
+            ),
+        ] {
+            let error = parse_anthropic_sse(&sse)
+                .expect_err("unterminated Anthropic event cannot complete a response");
+            match error {
+                ProviderError::Provider(message) => assert_eq!(
+                    message, "provider SSE stream ended with an incomplete frame at EOF",
+                    "{name}"
+                ),
+                other => panic!("{name}: expected provider error, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -7225,6 +7287,7 @@ data: {"type":"ping"}
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
 
 data: {"type":"message_stop"}
+
 "#,
         )
         .expect("unknown nonterminal event is forward compatible");
@@ -7240,6 +7303,7 @@ data: {"type":"message_start","message":{"id":"msg_refused","type":"message","ro
 data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"cyber","explanation":"This request was declined because it could enable cyber harm."}},"usage":{"output_tokens":0}}
 
 data: {"type":"message_stop"}
+
 "#;
 
         let response = parse_anthropic_sse(sse).expect("refusal is a terminal response");
@@ -7298,6 +7362,7 @@ data: {"type":"content_block_stop","index":3}
 data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":null,"explanation":null}},"usage":{"output_tokens":22}}
 
 data: {"type":"message_stop"}
+
 "#;
 
         let response = parse_anthropic_sse(sse).expect("refusal is a terminal response");
@@ -7321,6 +7386,7 @@ data: {"type":"message_stop"}
         let sse = r#"
 event: error
 data: {"type":"error","error":{"type":"overloaded_error","message":"server overloaded"}}
+
 "#;
 
         let error = parse_anthropic_sse(sse).expect_err("sse should fail");
