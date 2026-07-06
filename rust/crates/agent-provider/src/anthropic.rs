@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    borrow::{Borrow, Cow},
     collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -323,9 +324,10 @@ fn compaction_body(request: ProviderCompactionRequest) -> ProviderResult<Value> 
 }
 
 fn compaction_body_with_metadata(
-    request: ProviderCompactionRequest,
+    request: impl Borrow<ProviderCompactionRequest>,
     metadata: &AnthropicModelMetadata,
 ) -> ProviderResult<Value> {
+    let request = request.borrow();
     if !metadata.capabilities.native_compaction {
         return Err(ProviderError::native_compaction(
             NativeCompactionErrorKind::Unsupported,
@@ -337,6 +339,7 @@ fn compaction_body_with_metadata(
     }
     let instructions = request
         .compaction_instructions
+        .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             ProviderError::Provider(
@@ -345,15 +348,16 @@ fn compaction_body_with_metadata(
         })?;
     let max_tokens = metadata.max_tokens.min(DEFAULT_MAX_OUTPUT_BUDGET);
     let mut rendered = anthropic_request_body(AnthropicRequestBodyInput {
-        model: request.model,
-        prompt: request.prompt,
-        transcript: request.transcript,
+        model: request.model(),
+        prompt: request.prompt(),
+        transcript: request.transcript(),
+        transcript_suffix: &[],
         // Native compaction is a text-only sampling request. Supplying no
         // tools avoids Anthropic's documented null compaction-block failure.
         tool_profile: ProviderToolProfile::None,
-        tools: Vec::new(),
+        tools: Cow::Borrowed(&[]),
         max_tokens: Some(max_tokens),
-        reasoning_effort: Some(request.reasoning_effort),
+        reasoning_effort: Some(request.reasoning_effort()),
         capabilities: metadata.capabilities,
         cache_transcript: true,
         transcript_cache_prefix_len: None,
@@ -1032,12 +1036,11 @@ impl AnthropicProvider {
 impl ModelProvider for AnthropicProvider {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
         let session_id = request
-            .session_id
-            .clone()
-            .or_else(|| request.prompt_cache_key.clone())
-            .unwrap_or_else(|| "pi-relay".to_string());
-        let metadata = self.resolved_model_metadata(&request.model).await;
-        let prepared = prepare_messages_request(request, &metadata)?;
+            .session_id()
+            .or_else(|| request.prompt_cache_key())
+            .unwrap_or("pi-relay");
+        let metadata = self.resolved_model_metadata(request.model()).await;
+        let prepared = prepare_messages_request(&request, &metadata)?;
 
         let response = send_provider_generation_request(
             self.client
@@ -1073,12 +1076,11 @@ impl ModelProvider for AnthropicProvider {
         request: ProviderCompactionRequest,
     ) -> ProviderResult<ProviderCompactionResponse> {
         let session_id = request
-            .session_id
-            .clone()
-            .or_else(|| request.prompt_cache_key.clone())
-            .unwrap_or_else(|| "pi-relay".to_string());
-        let metadata = self.resolved_model_metadata(&request.model).await;
-        let body = compaction_body_with_metadata(request, &metadata)?;
+            .session_id()
+            .or_else(|| request.prompt_cache_key())
+            .unwrap_or("pi-relay");
+        let metadata = self.resolved_model_metadata(request.model()).await;
+        let body = compaction_body_with_metadata(&request, &metadata)?;
 
         let response = send_provider_generation_request(
             self.client
@@ -1104,12 +1106,11 @@ impl ModelProvider for AnthropicProvider {
         request: ProviderTokenCountRequest,
     ) -> ProviderResult<ProviderTokenCountResponse> {
         let session_id = request
-            .session_id
-            .clone()
-            .or_else(|| request.prompt_cache_key.clone())
-            .unwrap_or_else(|| "pi-relay".to_string());
-        let metadata = self.resolved_model_metadata(&request.model).await;
-        let prepared = prepare_count_tokens_request(request, &metadata)?;
+            .session_id()
+            .or_else(|| request.prompt_cache_key())
+            .unwrap_or("pi-relay");
+        let metadata = self.resolved_model_metadata(request.model()).await;
+        let prepared = prepare_count_tokens_request(&request, &metadata)?;
 
         let response = self
             .client
@@ -1155,10 +1156,11 @@ struct PreparedAnthropicRequest {
 }
 
 fn prepare_messages_request(
-    request: ModelRequest,
+    request: impl Borrow<ModelRequest>,
     metadata: &AnthropicModelMetadata,
 ) -> ProviderResult<PreparedAnthropicRequest> {
-    let tool_profile = request.tool_profile;
+    let request = request.borrow();
+    let tool_profile = request.tool_profile();
     // The Messages API requires `max_tokens`. Keep 64k as the ordinary-turn
     // target recommended for xhigh/max agentic work, but clamp both defaults
     // and explicit overrides to the model's authoritative output ceiling.
@@ -1167,13 +1169,14 @@ fn prepare_messages_request(
         .unwrap_or(DEFAULT_MAX_OUTPUT_BUDGET)
         .min(metadata.max_tokens);
     let mut rendered = anthropic_request_body(AnthropicRequestBodyInput {
-        model: request.model,
-        prompt: request.prompt,
-        transcript: request.transcript,
+        model: request.model(),
+        prompt: request.prompt(),
+        transcript: request.transcript(),
+        transcript_suffix: request.transcript_suffix(),
         tool_profile,
-        tools: crate::effective_provider_tools(tool_profile, request.tools),
+        tools: crate::effective_provider_tools(tool_profile, request.tools()),
         max_tokens: Some(max_tokens),
-        reasoning_effort: Some(request.reasoning_effort),
+        reasoning_effort: Some(request.reasoning_effort()),
         capabilities: metadata.capabilities,
         cache_transcript: true,
         transcript_cache_prefix_len: request.transcript_cache_prefix_len,
@@ -1201,24 +1204,26 @@ fn count_tokens_body_with_metadata(
 }
 
 fn prepare_count_tokens_request(
-    request: ProviderTokenCountRequest,
+    request: impl Borrow<ProviderTokenCountRequest>,
     metadata: &AnthropicModelMetadata,
 ) -> ProviderResult<PreparedAnthropicRequest> {
+    let request = request.borrow();
     // Keep this as close as possible to `messages_body`: Anthropic's token
     // count endpoint accepts the same input-shaping fields (system, tools,
     // thinking/output config) but does not need a generation budget.
-    let tool_profile = request.tool_profile;
+    let tool_profile = request.tool_profile();
     let mut rendered = anthropic_request_body(AnthropicRequestBodyInput {
-        model: request.model,
-        prompt: request.prompt,
-        transcript: request.transcript,
+        model: request.model(),
+        prompt: request.prompt(),
+        transcript: request.transcript(),
+        transcript_suffix: &[],
         tool_profile,
-        tools: crate::effective_provider_tools(tool_profile, request.tools),
+        tools: crate::effective_provider_tools(tool_profile, request.tools()),
         // Anthropic's /messages/count_tokens endpoint accepts the same prompt,
         // message, thinking, and tool-shaping fields as /messages, but rejects
         // generation-only budgets such as max_tokens.
         max_tokens: None,
-        reasoning_effort: Some(request.reasoning_effort),
+        reasoning_effort: Some(request.reasoning_effort()),
         capabilities: metadata.capabilities,
         cache_transcript: false,
         transcript_cache_prefix_len: None,
@@ -1227,12 +1232,13 @@ fn prepare_count_tokens_request(
     Ok(rendered.prepare())
 }
 
-struct AnthropicRequestBodyInput {
-    model: String,
-    prompt: crate::PromptSections,
-    transcript: Vec<ModelTranscriptEntry>,
+struct AnthropicRequestBodyInput<'a> {
+    model: &'a str,
+    prompt: &'a crate::PromptSections,
+    transcript: &'a [ModelTranscriptEntry],
+    transcript_suffix: &'a [ModelTranscriptEntry],
     tool_profile: ProviderToolProfile,
-    tools: Vec<ProviderTool>,
+    tools: Cow<'a, [ProviderTool]>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
     capabilities: AnthropicModelCapabilities,
@@ -1259,7 +1265,7 @@ impl RenderedAnthropicRequest {
 }
 
 fn anthropic_request_body(
-    input: AnthropicRequestBodyInput,
+    input: AnthropicRequestBodyInput<'_>,
 ) -> ProviderResult<RenderedAnthropicRequest> {
     let capabilities = input.capabilities;
     let rendered = transcript_to_messages_for_request(&input)?;
@@ -1286,7 +1292,9 @@ fn anthropic_request_body(
         }
         body["output_config"] = json!({ "effort": effort });
     }
-    if let Some(system_blocks) = anthropic_system_blocks(&input.prompt, &input.transcript) {
+    if let Some(system_blocks) =
+        anthropic_system_blocks(input.prompt, input.transcript, input.transcript_suffix)
+    {
         body["system"] = Value::Array(system_blocks);
     }
     let tools = anthropic_tools(input.tool_profile, &input.tools)?;
@@ -1315,28 +1323,48 @@ struct RenderedAnthropicMessages {
 }
 
 fn transcript_to_messages_for_request(
-    input: &AnthropicRequestBodyInput,
+    input: &AnthropicRequestBodyInput<'_>,
 ) -> ProviderResult<RenderedAnthropicMessages> {
     if !input.cache_transcript {
-        let mut rendered = render_transcript_messages(&input.prompt, &input.transcript)?;
-        append_dynamic_context_message(&input.prompt, &mut rendered.messages);
+        let mut rendered = render_transcript_messages(input.prompt, input.transcript)?;
+        let suffix = render_transcript_messages(input.prompt, input.transcript_suffix)?;
+        rendered.messages.extend(suffix.messages);
+        rendered.replays_compaction |= suffix.replays_compaction;
+        append_dynamic_context_message(input.prompt, &mut rendered.messages);
         return Ok(rendered);
     }
     let Some(prefix_len) = input.transcript_cache_prefix_len else {
-        let mut rendered = render_transcript_messages(&input.prompt, &input.transcript)?;
+        let mut rendered = render_transcript_messages(input.prompt, input.transcript)?;
+        let suffix = render_transcript_messages(input.prompt, input.transcript_suffix)?;
+        rendered.messages.extend(suffix.messages);
+        rendered.replays_compaction |= suffix.replays_compaction;
         add_transcript_cache_breakpoints(&mut rendered.messages);
-        append_dynamic_context_message(&input.prompt, &mut rendered.messages);
+        append_dynamic_context_message(input.prompt, &mut rendered.messages);
         return Ok(rendered);
     };
 
-    let prefix_len = prefix_len.min(input.transcript.len());
-    let (prefix, suffix) = input.transcript.split_at(prefix_len);
-    let mut rendered = render_transcript_messages(&input.prompt, prefix)?;
+    let prefix_len = prefix_len.min(
+        input
+            .transcript
+            .len()
+            .saturating_add(input.transcript_suffix.len()),
+    );
+    let prefix_base_len = prefix_len.min(input.transcript.len());
+    let (prefix, base_suffix) = input.transcript.split_at(prefix_base_len);
+    let suffix_prefix_len = prefix_len.saturating_sub(prefix_base_len);
+    let (suffix_prefix, suffix_tail) = input.transcript_suffix.split_at(suffix_prefix_len);
+    let mut rendered = render_transcript_messages(input.prompt, prefix)?;
+    let suffix_prefix = render_transcript_messages(input.prompt, suffix_prefix)?;
+    rendered.messages.extend(suffix_prefix.messages);
+    rendered.replays_compaction |= suffix_prefix.replays_compaction;
     add_transcript_cache_breakpoints(&mut rendered.messages);
-    let suffix = render_transcript_messages(&input.prompt, suffix)?;
-    rendered.messages.extend(suffix.messages);
-    rendered.replays_compaction |= suffix.replays_compaction;
-    append_dynamic_context_message(&input.prompt, &mut rendered.messages);
+    let base_suffix = render_transcript_messages(input.prompt, base_suffix)?;
+    rendered.messages.extend(base_suffix.messages);
+    rendered.replays_compaction |= base_suffix.replays_compaction;
+    let suffix_tail = render_transcript_messages(input.prompt, suffix_tail)?;
+    rendered.messages.extend(suffix_tail.messages);
+    rendered.replays_compaction |= suffix_tail.replays_compaction;
+    append_dynamic_context_message(input.prompt, &mut rendered.messages);
     Ok(rendered)
 }
 
@@ -1419,7 +1447,7 @@ fn anthropic_tools(
 }
 
 fn anthropic_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
-    let mut tools = tools.to_vec();
+    let mut tools = tools.iter().collect::<Vec<_>>();
     tools.sort_by(|left, right| {
         left.name
             .to_ascii_lowercase()
@@ -1427,7 +1455,10 @@ fn anthropic_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.canonical_name.cmp(&right.canonical_name))
     });
-    tools.iter().map(|tool| tool.declaration.clone()).collect()
+    tools
+        .into_iter()
+        .map(|tool| tool.declaration.clone())
+        .collect()
 }
 
 /// 1-hour ephemeral cache control. Use only on prefixes that are stable enough
@@ -1454,10 +1485,11 @@ fn cache_control_5m() -> Value {
 fn anthropic_system_blocks(
     prompt: &crate::PromptSections,
     transcript: &[ModelTranscriptEntry],
+    transcript_suffix: &[ModelTranscriptEntry],
 ) -> Option<Vec<Value>> {
     let mut blocks = vec![json!({
         "type": "text",
-        "text": attribution_header(prompt, transcript),
+        "text": attribution_header(prompt, transcript, transcript_suffix),
     })];
     if let Some(stable) = &prompt.stable_prefix {
         blocks.push(json!({
@@ -1472,8 +1504,9 @@ fn anthropic_system_blocks(
 fn attribution_header(
     prompt: &crate::PromptSections,
     transcript: &[ModelTranscriptEntry],
+    transcript_suffix: &[ModelTranscriptEntry],
 ) -> String {
-    let fingerprint = attribution_fingerprint(prompt, transcript);
+    let fingerprint = attribution_fingerprint(prompt, transcript, transcript_suffix);
     format!(
         "x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}.{fingerprint}; cc_entrypoint=cli;"
     )
@@ -1498,11 +1531,13 @@ fn attribution_header(
 fn attribution_fingerprint(
     prompt: &crate::PromptSections,
     transcript: &[ModelTranscriptEntry],
+    transcript_suffix: &[ModelTranscriptEntry],
 ) -> String {
     let text = prompt
         .stable_prefix
         .as_deref()
         .or_else(|| first_user_text(transcript))
+        .or_else(|| first_user_text(transcript_suffix))
         .unwrap_or_default();
     let chars = [
         text.chars().nth(4).unwrap_or('0'),
@@ -2978,7 +3013,7 @@ fn merge_json_value(current: &mut Value, update: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PromptSections;
+    use crate::{PromptSections, ProviderModelInput};
     use agent_vocab::ToolResultMessage;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3015,10 +3050,10 @@ mod tests {
     }
 
     fn test_compaction_request(transcript: Vec<ModelTranscriptEntry>) -> ProviderCompactionRequest {
-        ProviderCompactionRequest {
+        test_compaction_request! {
             model: "claude-opus-4-8".to_string(),
             prompt: PromptSections::stable("stable rules"),
-            transcript,
+            transcript: transcript,
             tool_profile: ProviderToolProfile::AnthropicCoding,
             tools: first_party_tools(ProviderKind::Claude),
             reasoning_effort: ReasoningEffort::High,
@@ -3032,11 +3067,11 @@ mod tests {
     }
 
     fn test_model_request(model: &str, transcript: Vec<ModelTranscriptEntry>) -> ModelRequest {
-        ModelRequest {
+        test_model_request! {
             model: model.to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
-            transcript,
+            transcript: transcript,
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: Some(1024),
@@ -3449,15 +3484,26 @@ mod tests {
             ])
         );
 
-        let mut dynamic_request =
-            test_compaction_request(vec![TranscriptItem::AssistantMessage(AssistantMessage {
+        let dynamic_request = test_compaction_request! {
+            model: "claude-opus-4-8".to_string(),
+            prompt: PromptSections::new(
+                Some("stable rules".to_string()),
+                Some("volatile dynamic context".to_string()),
+            ),
+            transcript: vec![TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call("toolu_dynamic"))],
             })
-            .into()]);
-        dynamic_request.prompt = PromptSections::new(
-            Some("stable rules".to_string()),
-            Some("volatile dynamic context".to_string()),
-        );
+            .into()],
+            tool_profile: ProviderToolProfile::AnthropicCoding,
+            tools: first_party_tools(ProviderKind::Claude),
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+            session_id: Some("session-1".to_string()),
+            compaction_instructions: Some(
+                "Preserve actionable state. Do not call tools; respond with summary text only."
+                    .to_string(),
+            ),
+        };
         let dynamic = compaction_body(dynamic_request).expect("dynamic user tail is repaired");
         assert_eq!(
             dynamic["messages"][1]["content"],
@@ -3514,11 +3560,20 @@ mod tests {
         }
 
         for unsupported in ["claude-sonnet-4-5", "claude-unknown"] {
-            let mut request = test_compaction_request(vec![TranscriptItem::UserMessage(
-                UserMessage::text("history"),
-            )
-            .into()]);
-            request.model = unsupported.to_string();
+            let request = test_compaction_request! {
+                model: unsupported.to_string(),
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("history")).into()],
+                tool_profile: ProviderToolProfile::AnthropicCoding,
+                tools: first_party_tools(ProviderKind::Claude),
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: Some("session-1".to_string()),
+                compaction_instructions: Some(
+                    "Preserve actionable state. Do not call tools; respond with summary text only."
+                        .to_string(),
+                ),
+            };
             let error = compaction_body(request).expect_err("unsupported model must fail locally");
             assert_eq!(
                 native_compaction_error_kind(&error),
@@ -3545,7 +3600,7 @@ mod tests {
 
     #[test]
     fn messages_body_omits_adaptive_thinking_for_non_adaptive_models() {
-        let body = messages_body(ModelRequest {
+        let body = messages_body(test_model_request! {
             model: "claude-sonnet-4-5".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
@@ -3607,7 +3662,7 @@ mod tests {
 
     #[test]
     fn messages_body_enables_adaptive_thinking_for_opus_48() {
-        let body = messages_body(ModelRequest {
+        let body = messages_body(test_model_request! {
             model: "claude-opus-4-8".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
@@ -3642,7 +3697,7 @@ mod tests {
         for effort in [ReasoningEffort::None, ReasoningEffort::Minimal] {
             // Sidecars call the same `complete` path and therefore use this
             // ordinary Messages body builder without daemon-side shaping.
-            let ordinary = messages_body(ModelRequest {
+            let ordinary = messages_body(test_model_request! {
                 model: "claude-opus-4-8".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -3658,16 +3713,25 @@ mod tests {
             .expect("ordinary adaptive request renders");
             assert_eq!(ordinary["output_config"]["effort"], "low");
 
-            let mut compact_request = test_compaction_request(vec![TranscriptItem::UserMessage(
-                UserMessage::text("history"),
-            )
-            .into()]);
-            compact_request.reasoning_effort = effort;
+            let compact_request = test_compaction_request! {
+                model: "claude-opus-4-8".to_string(),
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("history")).into()],
+                tool_profile: ProviderToolProfile::AnthropicCoding,
+                tools: first_party_tools(ProviderKind::Claude),
+                reasoning_effort: effort,
+                prompt_cache_key: None,
+                session_id: Some("session-1".to_string()),
+                compaction_instructions: Some(
+                    "Preserve actionable state. Do not call tools; respond with summary text only."
+                        .to_string(),
+                ),
+            };
             let compact =
                 compaction_body(compact_request).expect("compact adaptive request renders");
             assert_eq!(compact["output_config"]["effort"], "low");
 
-            let count = count_tokens_body(ProviderTokenCountRequest {
+            let count = count_tokens_body(test_token_count_request! {
                 model: "claude-opus-4-8".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
@@ -3687,23 +3751,22 @@ mod tests {
     fn sonnet_5_and_fable_5_use_default_on_adaptive_thinking_and_all_efforts() {
         for model in ["claude-sonnet-5", "claude-fable-5"] {
             for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
-                let body =
-                    messages_body(ModelRequest {
-                        model: model.to_string(),
-                        transcript_cache_prefix_len: None,
-                        prompt: PromptSections::stable("stable rules"),
-                        transcript: vec![
-                            TranscriptItem::UserMessage(UserMessage::text("hello")).into()
-                        ],
-                        tool_profile: ProviderToolProfile::None,
-                        tools: Vec::new(),
-                        max_tokens: None,
-                        reasoning_effort: effort,
-                        prompt_cache_key: None,
-                        session_id: None,
-                        turn_id: None,
-                    })
-                    .expect("body renders");
+                let body = messages_body(test_model_request! {
+                    model: model.to_string(),
+                    transcript_cache_prefix_len: None,
+                    prompt: PromptSections::stable("stable rules"),
+                    transcript: vec![
+                        TranscriptItem::UserMessage(UserMessage::text("hello")).into()
+                    ],
+                    tool_profile: ProviderToolProfile::None,
+                    tools: Vec::new(),
+                    max_tokens: None,
+                    reasoning_effort: effort,
+                    prompt_cache_key: None,
+                    session_id: None,
+                    turn_id: None,
+                })
+                .expect("body renders");
 
                 assert!(
                     body.get("thinking").is_none(),
@@ -3719,18 +3782,20 @@ mod tests {
     fn discovered_output_limit_clamps_default_and_explicit_budgets() {
         let mut metadata = static_anthropic_model_metadata("claude-sonnet-5");
         metadata.max_tokens = 32_000;
-        let request = |max_tokens| ModelRequest {
-            model: "claude-sonnet-5".to_string(),
-            transcript_cache_prefix_len: None,
-            prompt: PromptSections::stable("stable rules"),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens,
-            reasoning_effort: ReasoningEffort::High,
-            prompt_cache_key: None,
-            session_id: None,
-            turn_id: None,
+        let request = |max_tokens| {
+            test_model_request! {
+                model: "claude-sonnet-5".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: max_tokens,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            }
         };
 
         assert_eq!(
@@ -4038,7 +4103,7 @@ mod tests {
         assert!(metadata.capabilities.supports_effort(ReasoningEffort::High));
         assert!(metadata.capabilities.supports_effort(ReasoningEffort::Max));
 
-        let request = ModelRequest {
+        let request = test_model_request! {
             model: "claude-sonnet-5".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
@@ -4137,18 +4202,20 @@ mod tests {
         assert!(first.capabilities.supports_effort(ReasoningEffort::XHigh));
         assert!(!first.capabilities.supports_effort(ReasoningEffort::Max));
 
-        let request = |effort| ModelRequest {
-            model: "claude-sonnet-5".to_string(),
-            transcript_cache_prefix_len: None,
-            prompt: PromptSections::stable("stable rules"),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: effort,
-            prompt_cache_key: None,
-            session_id: None,
-            turn_id: None,
+        let request = |effort| {
+            test_model_request! {
+                model: "claude-sonnet-5".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: effort,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            }
         };
         let xhigh = messages_body_with_metadata(request(ReasoningEffort::XHigh), &first)
             .expect("discovered xhigh is accepted");
@@ -4687,7 +4754,7 @@ mod tests {
 
     #[test]
     fn count_tokens_body_matches_message_input_shape_without_generation_budget_by_default() {
-        let request = ProviderTokenCountRequest {
+        let request = test_token_count_request! {
             model: "claude-opus-4-7".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
@@ -4726,7 +4793,7 @@ mod tests {
 
     #[test]
     fn count_tokens_body_omits_generation_budget_even_when_configured() {
-        let request = ProviderTokenCountRequest {
+        let request = test_token_count_request! {
             model: "claude-sonnet-4-5".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
@@ -4750,7 +4817,7 @@ mod tests {
             vec![TranscriptItem::UserMessage(UserMessage::text("ordinary turn")).into()];
         let metadata = static_anthropic_model_metadata("claude-opus-4-8");
         let ordinary = prepare_messages_request(
-            ModelRequest {
+            test_model_request! {
                 model: "claude-opus-4-8".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -4767,7 +4834,7 @@ mod tests {
         )
         .expect("ordinary body renders");
         let count = prepare_count_tokens_request(
-            ProviderTokenCountRequest {
+            test_token_count_request! {
                 model: "claude-opus-4-8".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: transcript.clone(),
@@ -4811,7 +4878,7 @@ mod tests {
 
         let metadata = static_anthropic_model_metadata("claude-opus-4-8");
         let ordinary = prepare_messages_request(
-            ModelRequest {
+            test_model_request! {
                 model: "claude-opus-4-8".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -4853,7 +4920,7 @@ mod tests {
         );
 
         let count = prepare_count_tokens_request(
-            ProviderTokenCountRequest {
+            test_token_count_request! {
                 model: "claude-opus-4-8".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
@@ -4939,7 +5006,7 @@ mod tests {
         let mut metadata = static_anthropic_model_metadata("claude-sonnet-4-6");
         metadata.max_input_tokens = Some(200_000);
         let ordinary = messages_body_with_metadata(
-            ModelRequest {
+            test_model_request! {
                 model: "claude-sonnet-4-6".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -4971,7 +5038,7 @@ mod tests {
 
         metadata.max_input_tokens = Some(20_000);
         let clamped = messages_body_with_metadata(
-            ModelRequest {
+            test_model_request! {
                 model: "claude-sonnet-4-6".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -4993,7 +5060,7 @@ mod tests {
         );
 
         let count = count_tokens_body_with_metadata(
-            ProviderTokenCountRequest {
+            test_token_count_request! {
                 model: "claude-sonnet-4-6".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
@@ -5033,7 +5100,7 @@ mod tests {
                 }),
                 provider_replay,
             };
-            let ordinary = messages_body(ModelRequest {
+            let ordinary = messages_body(test_model_request! {
                 model: "claude-opus-4-8".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -5047,7 +5114,7 @@ mod tests {
                 turn_id: None,
             })
             .expect("ordinary body renders");
-            let count = count_tokens_body(ProviderTokenCountRequest {
+            let count = count_tokens_body(test_token_count_request! {
                 model: "claude-opus-4-8".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
@@ -5084,7 +5151,7 @@ mod tests {
                 )
                 .unwrap()],
             };
-            let body = messages_body(ModelRequest {
+            let body = messages_body(test_model_request! {
                 model: "claude-opus-4-8".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -5122,7 +5189,7 @@ mod tests {
                 }),
                 provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
             };
-            let error = messages_body(ModelRequest {
+            let error = messages_body(test_model_request! {
                 model: "claude-opus-4-8".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -5151,18 +5218,20 @@ mod tests {
                 agent_vocab::TurnId(7),
             ))
         };
-        let request = |entry| ModelRequest {
-            model: "claude-opus-4-8".to_string(),
-            transcript_cache_prefix_len: None,
-            prompt: PromptSections::stable("stable rules"),
-            transcript: vec![entry],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::High,
-            prompt_cache_key: None,
-            session_id: None,
-            turn_id: None,
+        let request = |entry| {
+            test_model_request! {
+                model: "claude-opus-4-8".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![entry],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            }
         };
 
         let block = json!({
@@ -5263,7 +5332,7 @@ mod tests {
 
     #[test]
     fn messages_body_sorts_tools_for_cache_stability() {
-        let body = messages_body(ModelRequest {
+        let body = messages_body(test_model_request! {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
@@ -5300,7 +5369,7 @@ mod tests {
 
     #[test]
     fn count_tokens_body_counts_the_same_local_tool_surface() {
-        let body = count_tokens_body(ProviderTokenCountRequest {
+        let body = count_tokens_body(test_token_count_request! {
             model: "claude-opus-4-7".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hi")).into()],
@@ -5346,7 +5415,7 @@ mod tests {
 
     #[test]
     fn messages_body_renders_anthropic_native_coding_tools() {
-        let body = messages_body(ModelRequest {
+        let body = messages_body(test_model_request! {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
@@ -5397,7 +5466,7 @@ mod tests {
 
     #[test]
     fn messages_body_marks_latest_transcript_block_for_cache() {
-        let body = messages_body(ModelRequest {
+        let body = messages_body(test_model_request! {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
@@ -5433,7 +5502,7 @@ mod tests {
 
     #[test]
     fn messages_body_keeps_sidecar_suffix_out_of_cache_prefix() {
-        let body = messages_body(ModelRequest {
+        let body = messages_body(test_model_request! {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: Some(1),
             prompt: PromptSections::stable("stable rules"),
@@ -5463,8 +5532,44 @@ mod tests {
     }
 
     #[test]
+    fn messages_body_split_suffix_matches_contiguous_cache_prefix() {
+        let prefix: Vec<ModelTranscriptEntry> =
+            vec![TranscriptItem::UserMessage(UserMessage::text("normal user turn")).into()];
+        let suffix = ModelTranscriptEntry::from(TranscriptItem::UserMessage(UserMessage::text(
+            "sidecar title prompt",
+        )));
+        let contiguous = messages_body(test_model_request! {
+            model: "claude-opus-4-7".to_string(),
+            transcript_cache_prefix_len: Some(1),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![prefix[0].clone(), suffix.clone()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::XHigh,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        })
+        .expect("contiguous body renders");
+        let split_input = Arc::new(ProviderModelInput::new(
+            "claude-opus-4-7",
+            PromptSections::stable("stable rules"),
+            prefix,
+            ProviderToolProfile::None,
+            Vec::new(),
+            ReasoningEffort::XHigh,
+        ));
+        let mut split_request = ModelRequest::new(split_input).with_transcript_suffix(vec![suffix]);
+        split_request.transcript_cache_prefix_len = Some(1);
+        let split = messages_body(split_request).expect("split body renders");
+
+        assert_eq!(split, contiguous);
+    }
+
+    #[test]
     fn messages_body_tail_positions_dynamic_context_out_of_system() {
-        let body = messages_body(ModelRequest {
+        let body = messages_body(test_model_request! {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::new(
@@ -5852,7 +5957,7 @@ data: {"type":"message_stop"}
                 provider_replay: restored,
             };
 
-            let ordinary = messages_body(ModelRequest {
+            let ordinary = messages_body(test_model_request! {
                 model: "claude-opus-4-8".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
@@ -5866,7 +5971,7 @@ data: {"type":"message_stop"}
                 turn_id: None,
             })
             .expect("ordinary continuation body renders");
-            let count = count_tokens_body(ProviderTokenCountRequest {
+            let count = count_tokens_body(test_token_count_request! {
                 model: "claude-opus-4-8".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
@@ -7544,7 +7649,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
 
     #[test]
     fn stable_system_block_keeps_one_hour_ttl() {
-        let body = messages_body(ModelRequest {
+        let body = messages_body(test_model_request! {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
@@ -7580,11 +7685,11 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
             .into(),
             TranscriptItem::UserMessage(UserMessage::text("turn 2")).into(),
         ];
-        let body = messages_body(ModelRequest {
+        let body = messages_body(test_model_request! {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
-            transcript,
+            transcript: transcript,
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -7624,11 +7729,11 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
                 .into(),
             );
         }
-        let body = messages_body(ModelRequest {
+        let body = messages_body(test_model_request! {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
-            transcript,
+            transcript: transcript,
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -7678,7 +7783,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         // different opening user messages must produce the same fingerprint —
         // that's the whole point of deriving it from `stable_prefix`.
         let make_body = |first_user: &str| {
-            messages_body(ModelRequest {
+            messages_body(test_model_request! {
                 model: "claude-opus-4-7".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("a stable system prompt long enough to fingerprint"),
@@ -7710,7 +7815,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         // Sanity check: changing the stable system prompt SHOULD change the
         // fingerprint, otherwise it would be useless for routing.
         let make_body = |stable: &str| {
-            messages_body(ModelRequest {
+            messages_body(test_model_request! {
                 model: "claude-opus-4-7".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable(stable),

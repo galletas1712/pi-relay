@@ -83,6 +83,7 @@ pub(crate) fn attach_dispatch_config(
             post_compaction_dispatch_lease: None,
             action: action.action,
             config: config.clone(),
+            model_input: crate::types::ModelDispatchInput::Unmaterialized,
         })
         .collect()
 }

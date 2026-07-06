@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use agent_provider::ModelTranscriptEntry;
-use agent_session::ModelContext;
+use agent_provider::{ModelRequest, ModelTranscriptEntry, ProviderModelInput};
 use agent_store::SessionConfig;
 use agent_vocab::{AssistantItem, ReasoningEffort, TranscriptItem, TurnId, UserMessage};
 use serde_json::Value;
@@ -13,14 +12,14 @@ use crate::runtime::{
 };
 use crate::state::AppState;
 
-use super::{build_model_request, run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
+use super::{run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 
 const TITLE_MAX_CHARS: usize = 64;
 const TITLE_SIDECAR_TIMEOUT_SECS: u64 = 45;
 
 #[derive(Clone, Default)]
 pub(crate) struct SessionTitleScheduler {
-    pending: Arc<StdMutex<HashMap<String, PendingTitleRefresh>>>,
+    pending: Arc<StdMutex<HashMap<String, Arc<PendingTitleRefresh>>>>,
 }
 
 fn pending_generation_matches(state: &AppState, session_id: &str, generation: u64) -> bool {
@@ -33,11 +32,11 @@ fn pending_generation_matches(state: &AppState, session_id: &str, generation: u6
         .is_some_and(|request| request.generation == generation)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingTitleRefresh {
     generation: u64,
     config: SessionConfig,
-    model_context: ModelContext,
+    input: Arc<ProviderModelInput>,
     title_at_submit: Option<String>,
     prompt: &'static str,
 }
@@ -47,12 +46,12 @@ pub(crate) fn schedule_session_title_refresh_for_model_turn(
     session_id: impl Into<String>,
     config: &SessionConfig,
     turn_id: TurnId,
-    model_context: &ModelContext,
+    input: Arc<ProviderModelInput>,
 ) {
     if session_title_disabled(config) {
         return;
     }
-    let Some(prompt) = title_prompt_for_model_turn(turn_id, model_context) else {
+    let Some(prompt) = title_prompt_for_model_input(turn_id, &input) else {
         return;
     };
     let title_at_submit = metadata_title(&config.metadata);
@@ -60,7 +59,6 @@ pub(crate) fn schedule_session_title_refresh_for_model_turn(
     let state = state.clone();
     let session_id = session_id.into();
     let config = config.clone();
-    let model_context = model_context.clone();
     let should_spawn = {
         let mut pending = state
             .session_titles
@@ -73,13 +71,13 @@ pub(crate) fn schedule_session_title_refresh_for_model_turn(
             .unwrap_or(1);
         pending.insert(
             session_id.clone(),
-            PendingTitleRefresh {
+            Arc::new(PendingTitleRefresh {
                 generation,
                 config,
-                model_context,
+                input,
                 title_at_submit,
                 prompt,
-            },
+            }),
         );
         generation == 1
     };
@@ -110,7 +108,10 @@ async fn run_title_refresh_worker(state: AppState, session_id: String) {
     }
 }
 
-fn take_next_pending_request(state: &AppState, session_id: &str) -> Option<PendingTitleRefresh> {
+fn take_next_pending_request(
+    state: &AppState,
+    session_id: &str,
+) -> Option<Arc<PendingTitleRefresh>> {
     state
         .session_titles
         .pending
@@ -137,7 +138,7 @@ fn finish_pending_generation(state: &AppState, session_id: &str, generation: u64
 async fn refresh_session_title(
     state: &AppState,
     session_id: &str,
-    request: PendingTitleRefresh,
+    request: Arc<PendingTitleRefresh>,
 ) -> anyhow::Result<()> {
     let current_config = state.repo.load_session_config(session_id).await?;
     if session_title_disabled(&current_config)
@@ -180,26 +181,23 @@ async fn generate_session_title(
     session_id: &str,
     request: &PendingTitleRefresh,
 ) -> anyhow::Result<Option<String>> {
-    let mut model_request = build_model_request(
-        state,
-        &request.config,
-        session_id,
-        None,
-        request.model_context.clone(),
-    )
-    .await?;
-    let cache_prefix_len = model_request.transcript.len();
+    let cache_prefix_len = request.input.transcript().len();
+    let input = Arc::new(
+        request
+            .input
+            .as_ref()
+            .clone()
+            .with_reasoning_effort(ReasoningEffort::Low),
+    );
+    let mut model_request =
+        ModelRequest::new(input).with_transcript_suffix(vec![ModelTranscriptEntry::from(
+            TranscriptItem::UserMessage(UserMessage::text(request.prompt)),
+        )]);
     model_request.transcript_cache_prefix_len = Some(cache_prefix_len);
     // No max_output_tokens: the OpenAI/Codex `/responses` backend rejects that
     // parameter for some models (e.g. gpt-5.6-sol returns HTTP 400
     // "Unsupported parameter: max_output_tokens"). The short-title prompt plus
     // TITLE_MAX_CHARS truncation already bound the output.
-    model_request.reasoning_effort = ReasoningEffort::Low;
-    model_request
-        .transcript
-        .push(ModelTranscriptEntry::from(TranscriptItem::UserMessage(
-            UserMessage::text(request.prompt),
-        )));
     let sidecar_session_id = title_sidecar_session_id(session_id);
     let response = match tokio::time::timeout(
         Duration::from_secs(TITLE_SIDECAR_TIMEOUT_SECS),
@@ -208,8 +206,8 @@ async fn generate_session_title(
             &request.config,
             ModelSidecarRequest {
                 prompt_cache_key: model_request
-                    .prompt_cache_key
-                    .clone()
+                    .prompt_cache_key()
+                    .map(str::to_string)
                     .unwrap_or_else(|| session_id.to_string()),
                 sidecar_session_id: sidecar_session_id.clone(),
                 request: model_request,
@@ -351,19 +349,49 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+#[cfg(test)]
 fn title_prompt_for_model_turn(
     turn_id: TurnId,
-    model_context: &ModelContext,
+    model_context: &agent_session::ModelContext,
 ) -> Option<&'static str> {
-    let Some(TranscriptItem::UserMessage(_)) = model_context.transcript_items().last() else {
-        return None;
-    };
     let user_message_count = model_context
         .transcript_items()
         .iter()
         .filter(|item| matches!(item, TranscriptItem::UserMessage(_)))
         .take(2)
         .count();
+    title_prompt_for_items(
+        turn_id,
+        model_context.transcript_items().last(),
+        user_message_count,
+    )
+}
+
+fn title_prompt_for_model_input(
+    turn_id: TurnId,
+    input: &ProviderModelInput,
+) -> Option<&'static str> {
+    let user_message_count = input
+        .transcript()
+        .iter()
+        .filter(|entry| matches!(entry.item, TranscriptItem::UserMessage(_)))
+        .take(2)
+        .count();
+    title_prompt_for_items(
+        turn_id,
+        input.transcript().last().map(|entry| &entry.item),
+        user_message_count,
+    )
+}
+
+fn title_prompt_for_items(
+    turn_id: TurnId,
+    last_item: Option<&TranscriptItem>,
+    user_message_count: usize,
+) -> Option<&'static str> {
+    let Some(TranscriptItem::UserMessage(_)) = last_item else {
+        return None;
+    };
     Some(if turn_id == TurnId::first() && user_message_count == 1 {
         TITLE_INITIAL_PROMPT
     } else {

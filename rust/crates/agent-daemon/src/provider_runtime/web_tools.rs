@@ -1,5 +1,6 @@
 use agent_provider::{
-    ModelRequest, ModelResponse, ModelTranscriptEntry, PromptSections, ProviderToolProfile,
+    ModelRequest, ModelResponse, ModelTranscriptEntry, PromptSections, ProviderModelInput,
+    ProviderToolProfile,
 };
 use agent_store::SessionConfig;
 use agent_tools::{
@@ -193,25 +194,25 @@ fn build_web_sidecar_request(
     ModelSidecarRequest {
         prompt_cache_key: sidecar_session_id.clone(),
         sidecar_session_id,
-        request: ModelRequest {
-            model: config.provider.model.clone(),
-            transcript_cache_prefix_len: None,
-            prompt: PromptSections::stable(
+        request: {
+            let input = ProviderModelInput::new(
+                config.provider.model.clone(),
+                PromptSections::stable(
                 "You are a web-tool executor for pi-relay. Use the provided web tool to satisfy the requested tool call. Return a concise tool result for the caller and include source URLs whenever available. Do not ask follow-up questions.",
-            ),
-            transcript: vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
-                UserMessage::text(user_prompt),
-            ))],
-            tool_profile: ProviderToolProfile::CustomDefinitions,
-            tools: vec![tool],
-            max_tokens: match config.provider.kind {
+                ),
+                vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
+                    UserMessage::text(user_prompt),
+                ))],
+                ProviderToolProfile::CustomDefinitions,
+                vec![tool],
+                config.provider.reasoning_effort,
+            );
+            let mut request = ModelRequest::new(std::sync::Arc::new(input));
+            request.max_tokens = match config.provider.kind {
                 ProviderKind::OpenAi => None,
                 ProviderKind::Claude => config.provider.max_tokens,
-            },
-            reasoning_effort: config.provider.reasoning_effort,
-            prompt_cache_key: None,
-            session_id: None,
-            turn_id: None,
+            };
+            request
         },
     }
 }

@@ -398,6 +398,7 @@ impl SessionDriver {
                 post_compaction_dispatch_lease: Some(claimed.lease),
                 action: claimed.pending.action,
                 config,
+                model_input: crate::types::ModelDispatchInput::Unmaterialized,
             };
             if session_uses_harness(&dispatch.config) {
                 // Harness/manual completion accepts running actions, so consume
@@ -713,19 +714,13 @@ impl SessionDriver {
             .ok_or_else(|| RpcError::new(code, message))
     }
 
-    pub(crate) async fn drive_until_blocked(
-        &self,
-    ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
+    pub(crate) async fn drive_until_blocked(&self) -> std::result::Result<(), RpcError> {
         self.ensure_active_loaded().await?;
-        let mut dispatched_all = Vec::new();
         loop {
             let active = self.active_session().await;
             let Some(active) = active else { break };
             if let Some(dispatches) = self.consume_ready_steer(active.clone()).await? {
-                if self
-                    .dispatch_and_check(dispatches, &mut dispatched_all)
-                    .await?
-                {
+                if self.dispatch_and_check(dispatches).await? {
                     break;
                 }
                 continue;
@@ -733,10 +728,7 @@ impl SessionDriver {
             let dispatched = self
                 .persist_active_outputs(active.clone(), None, None, None, Vec::new())
                 .await?;
-            if self
-                .dispatch_and_check(dispatched, &mut dispatched_all)
-                .await?
-            {
+            if self.dispatch_and_check(dispatched).await? {
                 break;
             }
 
@@ -773,10 +765,7 @@ impl SessionDriver {
                     let dispatched = self
                         .persist_active_outputs(active, None, Some(queued), None, Vec::new())
                         .await?;
-                    if self
-                        .dispatch_and_check(dispatched, &mut dispatched_all)
-                        .await?
-                    {
+                    if self.dispatch_and_check(dispatched).await? {
                         break;
                     }
                 }
@@ -797,7 +786,7 @@ impl SessionDriver {
             clear_event_buffer_if_idle(&self.state, &self.session_id).await?;
             break;
         }
-        Ok(dispatched_all)
+        Ok(())
     }
 
     /// Dispatch freshly persisted actions, then check readiness. Returns whether
@@ -806,17 +795,14 @@ impl SessionDriver {
     async fn dispatch_and_check(
         &self,
         dispatched: Vec<DispatchAction>,
-        dispatched_all: &mut Vec<DispatchAction>,
     ) -> std::result::Result<bool, RpcError> {
         let has_dispatched_work = !dispatched.is_empty();
-        dispatched_all.extend(dispatched.clone());
         self.dispatch(dispatched).await?;
         if has_dispatched_work {
             return Ok(true);
         }
         let pending_dispatched = self.dispatch_ready_actions().await?;
-        if !pending_dispatched.is_empty() {
-            dispatched_all.extend(pending_dispatched);
+        if pending_dispatched > 0 {
             return Ok(true);
         }
         Ok(false)
@@ -1247,16 +1233,14 @@ impl SessionDriver {
         self.dispatch_pending_or_direct(dispatches).await
     }
 
-    pub(crate) async fn dispatch_ready_actions(
-        &self,
-    ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
+    pub(crate) async fn dispatch_ready_actions(&self) -> std::result::Result<usize, RpcError> {
         let pending = self
             .state
             .repo
             .pending_actions_for_dispatch(&self.session_id)
             .await?;
         if pending.is_empty() {
-            return Ok(Vec::new());
+            return Ok(0);
         }
         let config = self
             .state
@@ -1275,10 +1259,12 @@ impl SessionDriver {
                 post_compaction_dispatch_lease: None,
                 action: action.action,
                 config: config.clone(),
+                model_input: crate::types::ModelDispatchInput::Unmaterialized,
             })
             .collect::<Vec<_>>();
-        self.dispatch_pending_or_direct(resolved.clone()).await?;
-        Ok(resolved)
+        let dispatched = resolved.len();
+        self.dispatch_pending_or_direct(resolved).await?;
+        Ok(dispatched)
     }
 
     async fn dispatch_pending_or_direct(
@@ -1286,10 +1272,10 @@ impl SessionDriver {
         dispatches: Vec<DispatchAction>,
     ) -> std::result::Result<(), RpcError> {
         let mut ready = Vec::new();
-        for dispatch in dispatches {
+        for mut dispatch in dispatches {
             match &dispatch.action {
                 SessionAction::RequestModel { .. } => {
-                    if self.gate_model_dispatch(&dispatch).await? {
+                    if self.gate_model_dispatch(&mut dispatch).await? {
                         ready.push(dispatch);
                     }
                 }

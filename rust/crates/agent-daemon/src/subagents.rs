@@ -134,7 +134,7 @@ pub(crate) async fn spawn_subagent(
     let task = request.task;
     let initial_task = child_initial_task_message(&request.parent_session_id, &task);
     let subagent_type = request.subagent_type;
-    let started = start_prepared_session(
+    let mut started = start_prepared_session(
         state,
         PreparedSessionStart {
             session_id: child_session_id.clone(),
@@ -163,7 +163,7 @@ pub(crate) async fn spawn_subagent(
         Err(error) => {
             cleanup_failed_spawn(
                 state,
-                &started.session_id,
+                &child_session_id,
                 subagent_type,
                 "parent lifecycle event failure",
             )
@@ -173,19 +173,23 @@ pub(crate) async fn spawn_subagent(
     };
     publish_events(state, parent_events);
 
-    let child_driver = SessionDriver::acquire(state, &started.session_id).await;
-    if let Err(error) = child_driver.dispatch(started.dispatches.clone()).await {
+    let child_session_id = started.session_id.clone();
+    let child_driver = SessionDriver::acquire(state, &child_session_id).await;
+    if let Err(error) = child_driver
+        .dispatch(std::mem::take(&mut started.dispatches))
+        .await
+    {
         publish_subagent_parent_dispatch_failed_event(
             state,
             &request.parent_session_id,
-            &started.session_id,
+            &child_session_id,
             &resolved_role_name,
             &error,
         )
         .await;
         cleanup_failed_spawn(
             state,
-            &started.session_id,
+            &child_session_id,
             subagent_type,
             "initial dispatch failure",
         )

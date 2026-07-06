@@ -1,4 +1,6 @@
-use agent_provider::{ProviderTokenCountRequest, ProviderToolProfile};
+use std::sync::Arc;
+
+use agent_provider::{ProviderModelInput, ProviderTokenCountRequest};
 use agent_session::{ModelContext, ModelContextEntry, TranscriptStorageNode};
 use agent_store::SessionConfig;
 use agent_vocab::{ProviderKind, TranscriptItem};
@@ -8,7 +10,6 @@ use crate::auth::Credentials;
 use crate::state::AppState;
 
 use super::auth_retry::count_tokens_with_auth_retry;
-use super::prompt::{assemble_agent_prompt, effective_prompt_profile, provider_tools_for_session};
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
 
@@ -17,19 +18,18 @@ pub(crate) async fn model_input_tokens_for_gate(
     config: &SessionConfig,
     session_id: &str,
     context_leaf_id: Option<&str>,
-    model_context: ModelContext,
+    input: Arc<ProviderModelInput>,
 ) -> Result<usize> {
     match config.provider.kind {
         ProviderKind::Claude => {
-            count_claude_model_input_tokens_remotely(state, config, session_id, model_context).await
+            count_claude_model_input_tokens_remotely(state, config, session_id, input).await
         }
         ProviderKind::OpenAi => {
             estimate_codex_model_input_tokens_from_usage_anchor(
                 state,
-                config,
                 session_id,
                 context_leaf_id,
-                model_context,
+                input,
             )
             .await
         }
@@ -40,27 +40,13 @@ async fn count_claude_model_input_tokens_remotely(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
-    model_context: ModelContext,
+    input: Arc<ProviderModelInput>,
 ) -> Result<usize> {
     // Claude has an authoritative remote preflight backend. Count the exact
     // local tool surface sent on the next /messages call, including web
     // wrappers now that they are normal client JSON tools.
-    let prompt = assemble_agent_prompt(state, config, session_id).await?;
-    let request = ProviderTokenCountRequest {
-        model: config.provider.model.clone(),
-        prompt,
-        transcript: provider_transcript(model_context),
-        tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: provider_tools_for_session(
-            state,
-            config.provider.kind,
-            effective_prompt_profile(state, config, session_id).await?,
-        ),
-        max_tokens: config.provider.max_tokens,
-        reasoning_effort: config.provider.reasoning_effort,
-        prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
-        session_id: Some(session_id.to_string()),
-    };
+    let mut request = ProviderTokenCountRequest::new(input);
+    request.max_tokens = config.provider.max_tokens;
 
     let credentials = Credentials::load();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
@@ -73,10 +59,9 @@ async fn count_claude_model_input_tokens_remotely(
 
 async fn estimate_codex_model_input_tokens_from_usage_anchor(
     state: &AppState,
-    config: &SessionConfig,
     session_id: &str,
     context_leaf_id: Option<&str>,
-    model_context: ModelContext,
+    input: Arc<ProviderModelInput>,
 ) -> Result<usize> {
     // The Codex/ChatGPT backend has no usable remote count endpoint: probing
     // /responses/input_tokens returns a Cloudflare challenge instead of a
@@ -101,7 +86,7 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
                     })
                     .collect(),
             );
-            let suffix_transcript = provider_transcript(suffix_context);
+            let suffix_transcript = provider_transcript(&suffix_context);
             // The usage anchor already accounts for the prompt that was sent
             // with that older model action. Normal daemon requests no longer
             // append daemon-owned dynamic context, so only estimate the local
@@ -117,7 +102,7 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
         }
     }
 
-    estimate_model_input_tokens_from_local_heuristic(state, config, session_id, model_context).await
+    estimate_model_input_tokens_from_local_heuristic(&input)
 }
 
 fn suffix_after_first_model_generated_item(
@@ -131,16 +116,9 @@ fn suffix_after_first_model_generated_item(
     entries.into_iter().skip(start).collect()
 }
 
-async fn estimate_model_input_tokens_from_local_heuristic(
-    state: &AppState,
-    config: &SessionConfig,
-    session_id: &str,
-    model_context: ModelContext,
-) -> Result<usize> {
-    let prompt = assemble_agent_prompt(state, config, session_id).await?;
-    let transcript = provider_transcript(model_context);
+fn estimate_model_input_tokens_from_local_heuristic(input: &ProviderModelInput) -> Result<usize> {
     Ok(agent_provider::estimate_model_input_tokens(
-        &prompt,
-        &transcript,
+        input.prompt(),
+        input.transcript(),
     )?)
 }

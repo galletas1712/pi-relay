@@ -34,13 +34,21 @@ pub(crate) struct RuntimeSession {
     pub(crate) persisted_active_leaf_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct DispatchAction {
     pub(crate) row_id: String,
     pub(crate) attempt_id: String,
     pub(crate) post_compaction_dispatch_lease: Option<PostCompactionDispatchLease>,
     pub(crate) action: SessionAction,
     pub(crate) config: SessionConfig,
+    pub(crate) model_input: ModelDispatchInput,
+}
+
+#[derive(Debug, Default)]
+pub(crate) enum ModelDispatchInput {
+    #[default]
+    Unmaterialized,
+    Shared(std::sync::Arc<agent_provider::ProviderModelInput>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

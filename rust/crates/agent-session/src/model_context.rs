@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use agent_vocab::{
     ProviderReplayItem, ToolCall, ToolResultMessage, TranscriptItem, TurnId, TurnOutcome,
 };
@@ -16,6 +18,11 @@ pub struct ModelContextEntry {
 /// same type to make copied or restored open turns structurally complete.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ModelContext {
+    data: Arc<ModelContextData>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ModelContextData {
     items: Vec<TranscriptItem>,
     provider_replay: Vec<Vec<ProviderReplayItem>>,
 }
@@ -28,8 +35,10 @@ impl ModelContext {
     pub fn from_transcript_items(items: Vec<TranscriptItem>) -> Self {
         let provider_replay = vec![Vec::new(); items.len()];
         Self {
-            items,
-            provider_replay,
+            data: Arc::new(ModelContextData {
+                items,
+                provider_replay,
+            }),
         }
     }
 
@@ -41,41 +50,53 @@ impl ModelContext {
             provider_replay.push(entry.provider_replay);
         }
         Self {
-            items,
-            provider_replay,
+            data: Arc::new(ModelContextData {
+                items,
+                provider_replay,
+            }),
         }
     }
 
-    pub(crate) fn close_open_turn(mut self) -> Self {
-        Self::close_open_turn_items(&mut self.items);
-        self.provider_replay.resize_with(self.items.len(), Vec::new);
-        self
+    pub(crate) fn close_open_turn(self) -> Self {
+        let mut data = self.into_data();
+        Self::close_open_turn_items(&mut data.items);
+        data.provider_replay.resize_with(data.items.len(), Vec::new);
+        Self {
+            data: Arc::new(data),
+        }
     }
 
-    pub(crate) fn close_open_turn_to_boundary(mut self) -> Self {
-        Self::close_open_turn_items_to_boundary(&mut self.items, TurnOutcome::Crashed);
-        self.provider_replay.resize_with(self.items.len(), Vec::new);
-        self
+    pub(crate) fn close_open_turn_to_boundary(self) -> Self {
+        let mut data = self.into_data();
+        Self::close_open_turn_items_to_boundary(&mut data.items, TurnOutcome::Crashed);
+        data.provider_replay.resize_with(data.items.len(), Vec::new);
+        Self {
+            data: Arc::new(data),
+        }
     }
 
-    pub(crate) fn close_open_turn_to_interrupted_boundary(mut self) -> Self {
-        Self::close_open_turn_items_to_boundary(&mut self.items, TurnOutcome::Interrupted);
-        self.provider_replay.resize_with(self.items.len(), Vec::new);
-        self
+    pub(crate) fn close_open_turn_to_interrupted_boundary(self) -> Self {
+        let mut data = self.into_data();
+        Self::close_open_turn_items_to_boundary(&mut data.items, TurnOutcome::Interrupted);
+        data.provider_replay.resize_with(data.items.len(), Vec::new);
+        Self {
+            data: Arc::new(data),
+        }
     }
 
     pub fn transcript_items(&self) -> &[TranscriptItem] {
-        &self.items
+        &self.data.items
     }
 
     pub fn into_transcript_items(self) -> Vec<TranscriptItem> {
-        self.items
+        self.into_data().items
     }
 
     pub fn into_entries(self) -> Vec<ModelContextEntry> {
-        self.items
+        let data = self.into_data();
+        data.items
             .into_iter()
-            .zip(self.provider_replay)
+            .zip(data.provider_replay)
             .map(|(item, provider_replay)| ModelContextEntry {
                 item,
                 provider_replay,
@@ -83,8 +104,16 @@ impl ModelContext {
             .collect()
     }
 
+    pub fn entries(&self) -> impl Iterator<Item = (&TranscriptItem, &[ProviderReplayItem])> {
+        self.data
+            .items
+            .iter()
+            .zip(&self.data.provider_replay)
+            .map(|(item, replay)| (item, replay.as_slice()))
+    }
+
     pub fn is_turn_boundary(&self) -> bool {
-        match self.items.last() {
+        match self.data.items.last() {
             Some(TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_)) => {
                 true
             }
@@ -94,7 +123,8 @@ impl ModelContext {
     }
 
     pub fn last_turn_id(&self) -> TurnId {
-        self.items
+        self.data
+            .items
             .iter()
             .rev()
             .find_map(TranscriptItem::turn_id)
@@ -115,10 +145,12 @@ impl ModelContext {
 
     pub fn split_before_open_turn(&self) -> Option<(Self, Vec<ModelContextEntry>)> {
         let (open_turn_items, open_turn_replay) = self.open_turn_slices()?;
-        let turn_start = self.items.len() - open_turn_items.len();
+        let turn_start = self.data.items.len() - open_turn_items.len();
         let prefix = Self {
-            items: self.items[..turn_start].to_vec(),
-            provider_replay: self.provider_replay[..turn_start].to_vec(),
+            data: Arc::new(ModelContextData {
+                items: self.data.items[..turn_start].to_vec(),
+                provider_replay: self.data.provider_replay[..turn_start].to_vec(),
+            }),
         };
         let suffix = open_turn_items
             .iter()
@@ -133,15 +165,22 @@ impl ModelContext {
     }
 
     fn open_turn_slices(&self) -> Option<(&[TranscriptItem], &[Vec<ProviderReplayItem>])> {
-        let (_, turn_start) = Self::open_turn_start(&self.items)?;
+        let (_, turn_start) = Self::open_turn_start(&self.data.items)?;
         Some((
-            &self.items[turn_start..],
-            &self.provider_replay[turn_start..],
+            &self.data.items[turn_start..],
+            &self.data.provider_replay[turn_start..],
         ))
     }
 
     pub fn open_turn_ready_to_continue(&self) -> Option<TurnId> {
-        Self::open_turn_ready_to_continue_items(&self.items)
+        Self::open_turn_ready_to_continue_items(&self.data.items)
+    }
+
+    fn into_data(self) -> ModelContextData {
+        match Arc::try_unwrap(self.data) {
+            Ok(data) => data,
+            Err(data) => (*data).clone(),
+        }
     }
 
     fn close_open_turn_items(items: &mut Vec<TranscriptItem>) {
@@ -401,6 +440,36 @@ mod tests {
             suffix[3].item,
             TranscriptItem::ToolCallStarted { .. }
         ));
+    }
+
+    #[test]
+    fn closing_shared_context_preserves_the_unmodified_clone() {
+        let context = ModelContext::from_transcript_items(vec![
+            TranscriptItem::TurnStarted { turn_id: TurnId(7) },
+            TranscriptItem::UserMessage(UserMessage::text("hello")),
+        ]);
+        let shared = context.clone();
+
+        let closed = context.close_open_turn_to_boundary();
+
+        assert_eq!(
+            shared,
+            ModelContext::from_transcript_items(vec![
+                TranscriptItem::TurnStarted { turn_id: TurnId(7) },
+                TranscriptItem::UserMessage(UserMessage::text("hello")),
+            ])
+        );
+        assert_eq!(
+            closed,
+            ModelContext::from_transcript_items(vec![
+                TranscriptItem::TurnStarted { turn_id: TurnId(7) },
+                TranscriptItem::UserMessage(UserMessage::text("hello")),
+                TranscriptItem::TurnFinished {
+                    turn_id: TurnId(7),
+                    outcome: TurnOutcome::Crashed,
+                },
+            ])
+        );
     }
 
     #[test]
