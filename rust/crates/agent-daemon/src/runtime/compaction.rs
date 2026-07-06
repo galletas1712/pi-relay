@@ -8,8 +8,8 @@ use agent_vocab::TranscriptItem;
 
 use crate::provider_runtime::{
     build_provider_model_input, compaction_auto_state, compaction_config_with_model_metadata,
-    model_input_tokens_for_gate, model_metadata_for_config, parse_compaction_policy,
-    run_compaction,
+    model_input_accounting_for_gate, model_metadata_for_config, parse_compaction_policy,
+    run_compaction, ModelInputAccounting,
 };
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
@@ -71,7 +71,7 @@ impl SessionDriver {
         else {
             unreachable!()
         };
-        let tokens = match model_input_tokens_for_gate(
+        let accounting = match model_input_accounting_for_gate(
             &self.state,
             &dispatch.config,
             &self.session_id,
@@ -80,17 +80,17 @@ impl SessionDriver {
         )
         .await
         {
-            Ok(tokens) => tokens,
+            Ok(accounting) => accounting,
             Err(error) => {
                 let provider_error = error.downcast_ref::<agent_provider::ProviderError>();
                 if provider_error.is_some_and(agent_provider::ProviderError::is_context_overflow) {
-                    limit
+                    ModelInputAccounting::overflow_fallback(limit)
                 } else {
                     return Err(error.into());
                 }
             }
         };
-        if tokens < limit {
+        if accounting.tokens() < limit {
             dispatch.model_input = crate::types::ModelDispatchInput::Shared(input);
             return Ok(true);
         }
@@ -100,9 +100,7 @@ impl SessionDriver {
             &self.session_id,
             dispatch,
             ActionStatus::Pending,
-            AutoCompactionReason::Threshold { tokens, limit },
-            Some(tokens),
-            Some(limit),
+            AutoCompactionReason::Threshold { accounting, limit },
         )
         .await?;
         Ok(false)
@@ -190,22 +188,39 @@ async fn check_compaction_eligible(
 enum AutoCompactionReason {
     /// Pre-dispatch gate: the measured/estimated context exceeded the
     /// configured auto-compaction threshold.
-    Threshold { tokens: usize, limit: usize },
+    Threshold {
+        accounting: ModelInputAccounting,
+        limit: usize,
+    },
     /// Post-dispatch recovery: the provider rejected the request with a
     /// context-window overflow error.
-    Overflow { provider_error: String },
+    Overflow {
+        provider_error: String,
+        limit: Option<usize>,
+    },
 }
 
 impl AutoCompactionReason {
-    fn into_trigger_reason(self) -> String {
-        match self {
-            Self::Threshold { tokens, limit } => {
-                format!("threshold: model_context_tokens {tokens} >= auto_limit_tokens {limit}")
-            }
-            Self::Overflow { provider_error } => {
-                format!("provider context overflow before model completion: {provider_error}")
-            }
-        }
+    fn into_trigger(self) -> (CompactionTrigger, Option<usize>, Option<usize>) {
+        let (reason, tokens_before, limit) = match self {
+            Self::Threshold { accounting, limit } => (
+                format!(
+                    "threshold: model_context_tokens {} >= auto_limit_tokens {limit}",
+                    accounting.tokens()
+                ),
+                Some(accounting.tokens()),
+                Some(limit),
+            ),
+            Self::Overflow {
+                provider_error,
+                limit,
+            } => (
+                format!("provider context overflow before model completion: {provider_error}"),
+                None,
+                limit,
+            ),
+        };
+        (CompactionTrigger::Auto { reason }, tokens_before, limit)
     }
 }
 
@@ -219,12 +234,8 @@ async fn block_and_spawn_auto_compaction(
     dispatch: &DispatchAction,
     expected_status: ActionStatus,
     reason: AutoCompactionReason,
-    tokens_before: Option<usize>,
-    limit: Option<usize>,
 ) -> std::result::Result<(), RpcError> {
-    let trigger = CompactionTrigger::Auto {
-        reason: reason.into_trigger_reason(),
-    };
+    let (trigger, tokens_before, limit) = reason.into_trigger();
     let created = state
         .repo
         .block_model_action_for_compaction(
@@ -481,14 +492,7 @@ async fn run_compaction_job(
             )
             .await;
         };
-        let dispatch = DispatchAction {
-            row_id: claimed.pending.row_id,
-            attempt_id: claimed.pending.attempt_id,
-            post_compaction_dispatch_lease: Some(claimed.lease),
-            action: claimed.pending.action,
-            config: resumed_config,
-            model_input: crate::types::ModelDispatchInput::Unmaterialized,
-        };
+        let dispatch = resumed_model_dispatch(claimed, resumed_config);
         let lease = dispatch.post_compaction_dispatch_lease.clone();
         let registration_id =
             spawn_model_dispatch(state.clone(), session_id.clone(), dispatch, true).await;
@@ -523,6 +527,20 @@ async fn run_compaction_job(
     }
     driver.drive_until_blocked().await?;
     Ok(())
+}
+
+fn resumed_model_dispatch(
+    claimed: agent_store::ClaimedPostCompactionDispatch,
+    config: SessionConfig,
+) -> DispatchAction {
+    DispatchAction {
+        row_id: claimed.pending.row_id,
+        attempt_id: claimed.pending.attempt_id,
+        post_compaction_dispatch_lease: Some(claimed.lease),
+        action: claimed.pending.action,
+        config,
+        model_input: crate::types::ModelDispatchInput::Unmaterialized,
+    }
 }
 
 fn continuation_suffix_for_scope(
@@ -667,9 +685,8 @@ pub(super) async fn recover_model_context_overflow_with_compaction(
         ActionStatus::Running,
         AutoCompactionReason::Overflow {
             provider_error: provider_error.to_string(),
+            limit: eligible.limit,
         },
-        None,
-        eligible.limit,
     )
     .await?;
     Ok(true)
@@ -679,9 +696,11 @@ pub(super) async fn recover_model_context_overflow_with_compaction(
 mod tests {
     use super::*;
     use agent_session::ModelContext;
+    use agent_store::{ClaimedPostCompactionDispatch, PendingDispatchAction};
     use agent_vocab::{
         ActionId, AssistantItem, AssistantMessage, CompactionSummary, DaemonToolObservation,
-        ToolCall, ToolCallId, ToolResultMessage, ToolResultStatus, TurnId, UserMessage,
+        ProviderConfig, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId,
+        ToolResultMessage, ToolResultStatus, TurnId, UserMessage,
     };
 
     fn compaction_job(model_context: ModelContext, scope: CompactionScope) -> CompactionJob {
@@ -752,6 +771,113 @@ mod tests {
         assert_eq!(suffix.len(), 1);
         assert_eq!(suffix[0].item, TranscriptItem::UserMessage(user));
         assert!(suffix[0].provider_replay.is_empty());
+    }
+
+    #[test]
+    fn resumed_model_dispatch_preserves_claimed_checkpoint_and_stays_unmaterialized() {
+        let replay = ProviderReplayItem::new(
+            ProviderKind::Claude,
+            &serde_json::json!({
+                "type": "compaction",
+                "content": "opaque checkpoint",
+            }),
+        )
+        .expect("replay serializes");
+        let checkpoint_context = ModelContext::from_entries(vec![
+            ModelContextEntry {
+                item: TranscriptItem::CompactionSummary(CompactionSummary::new(
+                    "session",
+                    "old-leaf",
+                    "new checkpoint summary",
+                    Some(123_457),
+                    TurnId(1),
+                )),
+                provider_replay: vec![replay.clone()],
+            },
+            ModelContextEntry {
+                item: TranscriptItem::UserMessage(UserMessage::text("retained instruction")),
+                provider_replay: Vec::new(),
+            },
+        ]);
+        let action = SessionAction::RequestModel {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            model_context: checkpoint_context.clone(),
+            context_leaf_id: Some("new-checkpoint-leaf".to_string()),
+        };
+        let lease = agent_store::PostCompactionDispatchLease {
+            owner_id: "owner".to_string(),
+            generation: 2,
+            context_leaf_id: "new-checkpoint-leaf".to_string(),
+        };
+        let claimed = ClaimedPostCompactionDispatch {
+            pending: PendingDispatchAction {
+                row_id: "model-action".to_string(),
+                attempt_id: "model-attempt".to_string(),
+                action: action.clone(),
+            },
+            lease: lease.clone(),
+        };
+        let config = SessionConfig {
+            project_id: None,
+            outer_cwd: "/tmp".to_string(),
+            workspaces: Vec::new(),
+            system_prompt: "new prompt".to_string(),
+            provider: ProviderConfig {
+                kind: ProviderKind::Claude,
+                model: "new-model".to_string(),
+                reasoning_effort: ReasoningEffort::Medium,
+                max_tokens: Some(4_096),
+                prompt_cache: None,
+            },
+            metadata: serde_json::json!({}),
+        };
+        let expected_config = config.clone();
+
+        let dispatch = resumed_model_dispatch(claimed, config);
+
+        assert_eq!(
+            (dispatch.row_id.as_str(), dispatch.attempt_id.as_str()),
+            ("model-action", "model-attempt")
+        );
+        assert!(matches!(
+            dispatch.model_input,
+            crate::types::ModelDispatchInput::Unmaterialized
+        ));
+        assert_eq!(dispatch.post_compaction_dispatch_lease, Some(lease));
+        assert_eq!(
+            (
+                &dispatch.config.project_id,
+                &dispatch.config.outer_cwd,
+                &dispatch.config.workspaces,
+                &dispatch.config.system_prompt,
+                &dispatch.config.metadata,
+            ),
+            (
+                &expected_config.project_id,
+                &expected_config.outer_cwd,
+                &expected_config.workspaces,
+                &expected_config.system_prompt,
+                &expected_config.metadata,
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(&dispatch.config.provider).expect("provider config serializes"),
+            serde_json::to_value(&expected_config.provider).expect("provider config serializes")
+        );
+        assert_eq!(dispatch.action, action);
+        let SessionAction::RequestModel { model_context, .. } = dispatch.action else {
+            unreachable!()
+        };
+        assert_eq!(model_context, checkpoint_context);
+        assert_eq!(
+            model_context
+                .entries()
+                .next()
+                .expect("checkpoint entry exists")
+                .1,
+            std::slice::from_ref(&replay)
+        );
     }
 
     #[test]

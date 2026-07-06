@@ -5000,6 +5000,54 @@ mod tests {
     }
 
     #[test]
+    fn generation_and_count_share_input_with_distinct_operation_bodies() {
+        let input = Arc::new(ProviderModelInput::new(
+            "claude-opus-4-7",
+            PromptSections::stable("stable rules"),
+            vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            ProviderToolProfile::CustomDefinitions,
+            vec![test_tool(
+                ProviderKind::Claude,
+                "read",
+                "read a file",
+                json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+            )],
+            ReasoningEffort::Medium,
+        ));
+        let mut generation = ModelRequest::new(Arc::clone(&input));
+        generation.max_tokens = Some(4_096);
+        let mut count = ProviderTokenCountRequest::new(input);
+        count.max_tokens = generation.max_tokens;
+
+        assert!(std::ptr::eq::<ProviderModelInput>(&*generation, &*count));
+        let generation = messages_body(generation).expect("generation body renders");
+        let count = count_tokens_body(count).expect("count body renders");
+
+        for field in ["model", "system", "tools", "thinking", "output_config"] {
+            assert_eq!(generation[field], count[field], "{field} must match");
+        }
+        assert_eq!(
+            generation["messages"][0]["content"][0]["text"],
+            count["messages"][0]["content"][0]["text"]
+        );
+        assert_eq!(
+            generation["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(count["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(generation["max_tokens"], 4_096);
+        assert_eq!(generation["stream"], true);
+        assert!(count.get("max_tokens").is_none());
+        assert!(count.get("stream").is_none());
+    }
+
+    #[test]
     fn count_tokens_body_omits_generation_budget_even_when_configured() {
         let request = test_token_count_request! {
             model: "claude-sonnet-4-5".to_string(),

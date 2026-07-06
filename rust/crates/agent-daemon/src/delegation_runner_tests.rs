@@ -15,7 +15,8 @@ use agent_provider::{
     openai::{OpenAiCodexHttpClient, OpenAiCodexSessionState, OpenAiProvider},
     ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
     ModelTranscriptEntry, PreparedModelRequest, PromptSections, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderModelInput, ProviderResult, ProviderToolProfile,
+    ProviderCompactionResponse, ProviderModelInput, ProviderModelMetadata, ProviderResult,
+    ProviderTokenCountRequest, ProviderTokenCountResponse, ProviderToolProfile,
 };
 use agent_session::{
     AgentSession, ModelContext, ModelContextEntry, SessionAction, SessionEvent,
@@ -144,6 +145,58 @@ impl ModelProvider for TrackingOpenAiProvider {
         request: ProviderCompactionRequest,
     ) -> ProviderResult<ProviderCompactionResponse> {
         self.provider.compact(request).await
+    }
+}
+
+struct AccountingProvider {
+    input_pointers: Arc<StdMutex<Vec<(&'static str, usize)>>>,
+    count_tokens: usize,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for AccountingProvider {
+    async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
+        self.input_pointers
+            .lock()
+            .expect("input pointer lock")
+            .push(("generation", std::ptr::from_ref(&*request) as usize));
+        Ok(ModelResponse {
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::Text("accounted completion".to_string())],
+            },
+            provider_replay: Vec::new(),
+            usage: None,
+            stop_reason: ModelStopReason::Complete,
+            stop_details: None,
+        })
+    }
+
+    async fn model_metadata(&self, _model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
+        Ok(Some(ProviderModelMetadata {
+            max_input_tokens: Some(200_000),
+            recommended_auto_compact_tokens: Some(100_000),
+        }))
+    }
+
+    async fn compact(
+        &self,
+        _request: ProviderCompactionRequest,
+    ) -> ProviderResult<ProviderCompactionResponse> {
+        panic!("accounting provider must not compact")
+    }
+
+    async fn count_tokens(
+        &self,
+        request: ProviderTokenCountRequest,
+    ) -> ProviderResult<ProviderTokenCountResponse> {
+        self.input_pointers
+            .lock()
+            .expect("input pointer lock")
+            .push(("count", std::ptr::from_ref(&*request) as usize));
+        Ok(ProviderTokenCountResponse {
+            input_tokens: self.count_tokens,
+            original_input_tokens: None,
+        })
     }
 }
 
@@ -356,6 +409,40 @@ fn session_config(env: &TestEnv, project_id: Uuid, metadata: serde_json::Value) 
         },
         metadata,
     }
+}
+
+fn claude_accounting_config(
+    env: &TestEnv,
+    project_id: Uuid,
+    metadata: serde_json::Value,
+) -> SessionConfig {
+    let mut config = session_config(env, project_id, metadata);
+    config.provider = ProviderConfig {
+        kind: ProviderKind::Claude,
+        model: "claude-accounting-test".to_string(),
+        reasoning_effort: ReasoningEffort::Medium,
+        max_tokens: Some(4_096),
+        prompt_cache: None,
+    };
+    config
+}
+
+async fn install_accounting_provider(
+    env: &TestEnv,
+    input_pointers: &Arc<StdMutex<Vec<(&'static str, usize)>>>,
+    count_tokens: usize,
+) {
+    env.state
+        .provider_connections
+        .install_test_provider(
+            Box::new(AccountingProvider {
+                input_pointers: Arc::clone(input_pointers),
+                count_tokens,
+            }),
+            false,
+            None,
+        )
+        .await;
 }
 
 fn subagent_test_metadata(role: &str, subagent_type: SubagentType) -> serde_json::Value {
@@ -772,6 +859,191 @@ async fn fresh_model_context_is_shallow_through_persistence_and_moves_at_provide
             .as_ptr(),
         context_text_ptr
     );
+
+    drop(driver);
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn below_limit_claude_gate_and_generation_share_one_provider_input() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let session_id = "claude-accounting-input-reuse";
+    let project_id = Uuid::new_v4();
+    let input_pointers = Arc::new(StdMutex::new(Vec::new()));
+    for _ in 0..3 {
+        install_accounting_provider(&env, &input_pointers, 99_999).await;
+    }
+    let config = claude_accounting_config(
+        &env,
+        project_id,
+        json!({
+            "compaction": { "config": { "auto_limit_tokens": 100_000 } },
+            "auto_title_disabled": true,
+        }),
+    );
+    let mut dispatch = DispatchAction {
+        row_id: "model-action".to_string(),
+        attempt_id: "model-attempt".to_string(),
+        post_compaction_dispatch_lease: None,
+        action: SessionAction::RequestModel {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            model_context: ModelContext::from_transcript_items(vec![
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage(UserMessage::text("reuse this logical input")),
+            ]),
+            context_leaf_id: Some("user-leaf".to_string()),
+        },
+        config,
+        model_input: ModelDispatchInput::Unmaterialized,
+    };
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+
+    assert!(driver
+        .gate_model_dispatch(&mut dispatch)
+        .await
+        .expect("below-limit gate succeeds"));
+    let ModelDispatchInput::Shared(input) = &dispatch.model_input else {
+        panic!("gate should retain its materialized provider input");
+    };
+    assert!(run_model_for_action_with_retries(
+        &env.state,
+        session_id,
+        &dispatch,
+        TurnId(1),
+        Arc::clone(input),
+    )
+    .await
+    .expect("generation call succeeds")
+    .is_ok());
+
+    {
+        let pointers = input_pointers.lock().expect("input pointer lock");
+        assert_eq!(pointers.len(), 2);
+        assert_eq!(pointers[0].0, "count");
+        assert_eq!(pointers[1].0, "generation");
+        assert_eq!(pointers[0].1, pointers[1].1);
+    }
+
+    drop(driver);
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn proactive_gate_persists_exact_accounting_tokens_before() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    const GATE_TOKENS: usize = 123_457;
+    let session_id = "proactive-exact-accounting-tokens";
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "exact proactive accounting", &[], json!({}))
+        .await
+        .expect("create project");
+    let input_pointers = Arc::new(StdMutex::new(Vec::new()));
+    for _ in 0..2 {
+        install_accounting_provider(&env, &input_pointers, GATE_TOKENS).await;
+    }
+    let config = claude_accounting_config(
+        &env,
+        project_id,
+        json!({
+            "compaction": { "config": { "auto_limit_tokens": 100_000 } },
+            "fault_injection": { "pause_compaction_dispatch_before_provider": true },
+            "auto_title_disabled": true,
+        }),
+    );
+    let entries = vec![
+        TranscriptStorageNode {
+            id: "proactive-turn".to_string(),
+            parent_id: None,
+            timestamp_ms: 1_700_000_000_000,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "proactive-user".to_string(),
+            parent_id: Some("proactive-turn".to_string()),
+            timestamp_ms: 1_700_000_000_001,
+            item: TranscriptItem::UserMessage(UserMessage::text("compact this exact input")),
+            provider_replay: Vec::new(),
+        },
+    ];
+    let action = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::from_transcript_items(
+            entries.iter().map(|entry| entry.item.clone()).collect(),
+        ),
+        context_leaf_id: Some("proactive-user".to_string()),
+    };
+    let (_, mut persisted) = env
+        .state
+        .repo
+        .start_session_outputs(
+            session_id,
+            &config,
+            &entries,
+            Some("proactive-user"),
+            &[],
+            &[action],
+            InputPriority::FollowUp,
+            &UserMessage::text("compact this exact input"),
+            None,
+        )
+        .await
+        .expect("session and model action persist");
+    let persisted = persisted.pop().expect("model action returns");
+    let mut dispatch = DispatchAction {
+        row_id: persisted.row_id,
+        attempt_id: persisted.attempt_id,
+        post_compaction_dispatch_lease: None,
+        action: persisted.action,
+        config,
+        model_input: ModelDispatchInput::Unmaterialized,
+    };
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+
+    assert!(!driver
+        .gate_model_dispatch(&mut dispatch)
+        .await
+        .expect("over-limit gate starts compaction"));
+    assert!(matches!(
+        dispatch.model_input,
+        ModelDispatchInput::Unmaterialized
+    ));
+    let pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+        .await
+        .expect("connect assertion pool");
+    let payload: serde_json::Value =
+        sqlx::query_scalar("select payload from actions where session_id=$1 and kind='compaction'")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load compaction job payload");
+    assert_eq!(payload["context_tokens"], json!(GATE_TOKENS));
+    assert_eq!(payload["auto_limit_tokens"], json!(100_000));
+    assert_eq!(
+        payload["reason"],
+        json!(format!(
+            "threshold: model_context_tokens {GATE_TOKENS} >= auto_limit_tokens 100000"
+        ))
+    );
+    let event_payload: serde_json::Value = sqlx::query_scalar(
+        "select payload from events where session_id=$1 and type='compaction.requested'",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load compaction requested event");
+    assert_eq!(event_payload["tokens_before"], json!(GATE_TOKENS));
+    pool.close().await;
 
     drop(driver);
     env.cleanup().await;

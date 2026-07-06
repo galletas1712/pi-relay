@@ -22,7 +22,7 @@ pub(crate) use compaction::{
     run_compaction, CompactionAutoState,
 };
 pub(crate) use connections::ProviderConnectionRegistry;
-pub(crate) use context_accounting::model_input_tokens_for_gate;
+pub(crate) use context_accounting::{model_input_accounting_for_gate, ModelInputAccounting};
 pub(crate) use prompt::{
     current_pi_template, effective_prompt_profile, provider_tools_for_session, render_pi_prompt,
 };
