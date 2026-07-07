@@ -1664,8 +1664,8 @@ model-visible tool definitions for that provider, because the tool surface is
 provider-shaped (e.g. OpenAI `apply_patch` vs Anthropic `text_editor_20250728`
 for editing). Callers may pass `session_id` so the daemon can derive the actual
 session profile; if omitted, parent/global behavior is preserved. Parent/default
-sessions see the registered builtins (`edit`, `bash`, `grep`, `web_search`,
-`web_fetch`, `LoadSkill`) plus delegation tools (`delegate_writing_task`,
+sessions see the registered builtins (`edit`, `bash`, `web_search`, `web_fetch`,
+`LoadSkill`) plus delegation tools (`delegate_writing_task`,
 `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`,
 `steer_subagent`, `interrupt_subagent`). Structurally subagent sessions get the filtered subagent
 surface without delegation tools. `prompt_profile` may be supplied only as a
@@ -1980,7 +1980,6 @@ Use `harness.model.complete` to request real tools:
 - `edit` success and missing-target error (`apply_patch` for OpenAI,
   `text_editor_20250728` for Anthropic).
 - `bash` success, non-zero exit, malformed args, and timeout.
-- `grep` success and no-match.
 - Multiple tool calls in one assistant response.
 
 Verify there is no approval event, tools emit `tool.requested`/`tool.started`,

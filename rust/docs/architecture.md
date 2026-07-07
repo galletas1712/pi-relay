@@ -59,7 +59,7 @@ agent-vocab      shared ids, message blocks, tool calls/results,
 | `agent-session` | Durable transcript forest, model-context materialization, resume, switch, compaction, and the provider-replay lane. | [modules/agent-session.md](modules/agent-session.md) |
 | `agent-store` | Postgres-only session/transcript/queue/action/event persistence plus recovery and revision/queue projections. | [modules/agent-store.md](modules/agent-store.md) |
 | `agent-provider` | `ModelProvider` plus OpenAI/Codex (Responses) and Anthropic (Messages) adapters, prompt-cache shaping, and provider compaction. | [modules/agent-provider.md](modules/agent-provider.md) |
-| `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`grep`/`web_search`/`web_fetch`/`LoadSkill`/delegation tools. | [modules/agent-tools.md](modules/agent-tools.md) |
+| `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`web_search`/`web_fetch`/`LoadSkill`/delegation tools. | [modules/agent-tools.md](modules/agent-tools.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. | [modules/agent-daemon.md](modules/agent-daemon.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt from session/workspace/tool/skill context. | [modules/agent-prompt.md](modules/agent-prompt.md) |
 

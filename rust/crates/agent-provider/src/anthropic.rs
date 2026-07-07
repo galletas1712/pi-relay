@@ -5325,7 +5325,6 @@ mod tests {
                 "cancel_delegation",
                 "delegate_readonly_tasks",
                 "delegate_writing_task",
-                "Grep",
                 "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
@@ -5363,31 +5362,32 @@ mod tests {
 
         assert_eq!(body["tools"][0]["name"], "Bash");
         assert!(body["tools"][0].get("type").is_none());
+        assert!(body["tools"][0]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("prefer `rg` over `grep`")));
         assert_eq!(body["tools"][1]["name"], "cancel_delegation");
         assert!(body["tools"][1].get("type").is_none());
         assert_eq!(body["tools"][2]["name"], "delegate_readonly_tasks");
         assert!(body["tools"][2].get("type").is_none());
         assert_eq!(body["tools"][3]["name"], "delegate_writing_task");
         assert!(body["tools"][3].get("type").is_none());
-        assert_eq!(body["tools"][4]["name"], "Grep");
+        assert_eq!(body["tools"][4]["name"], "inspect_delegation");
         assert!(body["tools"][4].get("type").is_none());
-        assert_eq!(body["tools"][5]["name"], "inspect_delegation");
+        assert_eq!(body["tools"][5]["name"], "interrupt_subagent");
         assert!(body["tools"][5].get("type").is_none());
-        assert_eq!(body["tools"][6]["name"], "interrupt_subagent");
+        assert_eq!(body["tools"][6]["name"], "LoadSkill");
         assert!(body["tools"][6].get("type").is_none());
-        assert_eq!(body["tools"][7]["name"], "LoadSkill");
+        assert_eq!(body["tools"][7]["name"], "steer_subagent");
         assert!(body["tools"][7].get("type").is_none());
-        assert_eq!(body["tools"][8]["name"], "steer_subagent");
-        assert!(body["tools"][8].get("type").is_none());
-        assert_eq!(body["tools"][9]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][9]["name"], "str_replace_based_edit_tool");
-        assert_eq!(body["tools"][10]["name"], "web_fetch");
+        assert_eq!(body["tools"][8]["type"], "text_editor_20250728");
+        assert_eq!(body["tools"][8]["name"], "str_replace_based_edit_tool");
+        assert_eq!(body["tools"][9]["name"], "web_fetch");
+        assert!(body["tools"][9].get("type").is_none());
+        assert_eq!(body["tools"][10]["name"], "web_search");
         assert!(body["tools"][10].get("type").is_none());
-        assert_eq!(body["tools"][11]["name"], "web_search");
-        assert!(body["tools"][11].get("type").is_none());
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
-        for index in 0..12 {
+        for index in 0..11 {
             assert!(
                 body["tools"][index].get("cache_control").is_none(),
                 "tool {index} should not carry cache_control"

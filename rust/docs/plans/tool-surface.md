@@ -5,7 +5,7 @@ Status: partially implemented. Last reviewed 2026-07-02.
 ## Motivation
 
 The tool surface is deliberately small and mostly provider-neutral today:
-`Bash`, `Grep`, the web wrappers, `LoadSkill`, and the delegation tools are
+`Bash`, the web wrappers, `LoadSkill`, and the delegation tools are
 uniform JSON tools, and only edit diverges to provider-native schemas. That
 keeps dispatch, caching, and replay simple, but it leaves quality on the table
 in four places:
@@ -35,8 +35,6 @@ See [agent-tools](../modules/agent-tools.md) for the full registry. In brief:
   (`text_editor_20250728`), both executed by local runtimes.
 - **Bash** is one uniform JSON function/client tool for both providers, backed
   by a stateless `bash -lc` subprocess rooted at the session `cwd`.
-- **Grep** is one uniform JSON function/client tool for both providers, backed
-  by ripgrep.
 - **web_search** / **web_fetch** are uniform JSON local wrappers (web_search has
   no backend; web_fetch does a bounded HTTP fetch).
 - **LoadSkill** activates a named skill.
@@ -183,5 +181,4 @@ default.
   search/fetch blocks is undecided.
 - **Concurrency.** A persistent terminal is stateful, so tool calls against it
   must serialize (Anthropic `tool_choice` would start with
-  `disable_parallel_tool_use: true`). Read-only `grep` could tolerate
-  concurrency — worth a per-runtime concurrency policy rather than a global lock.
+  `disable_parallel_tool_use: true`).

@@ -430,7 +430,7 @@ automatically fall back to a different model.
 
 Tool definitions and execution live outside `agent-core`. The core only models
 tool requests and tool results. The daemon's builtin registry currently owns the
-actual `edit`, `bash`, `grep`, `web_search`, `web_fetch`, `LoadSkill`, and
+actual `edit`, `bash`, `web_search`, `web_fetch`, `LoadSkill`, and
 delegation-tool behavior and always executes allowed tool calls. (`web_search`
 is registered but has no configured backend yet, so it returns an error result.)
 
@@ -441,12 +441,12 @@ choice.
 
 Coding tools split into two posture buckets:
 
-- **Uniform custom function tools** for `bash` and `grep`. Both providers see
-  the same JSON-schema function tool, generated from a single builtin
-  definition in `agent-tools`. The pi-relay runtime is stateless per call
-  (fresh `bash -lc` per `bash` invocation, fresh `rg` per `grep` invocation),
+- **Uniform custom function tool** for `bash`. Both providers see the same
+  JSON-schema function tool, generated from a single builtin definition in
+  `agent-tools`. The pi-relay runtime starts a fresh `bash -lc` per invocation,
   so the model-facing contract should match what the runtime can actually
-  honor. Using Anthropic's native `bash_20250124` would have advertised a
+  honor. Its description directs file and text searches to `rg` instead of
+  `grep`. Using Anthropic's native `bash_20250124` would have advertised a
   persistent shell session with a `restart` op that the runtime does not
   back, which is worse than losing the small training prior associated with
   the native tool name.

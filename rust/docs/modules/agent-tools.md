@@ -61,7 +61,6 @@ semantics justify it.
 |--------------|-------------------------------------------|-------------------------------------------------|--------------------|----------------------------------|
 | `Edit`       | `apply_patch` (custom Lark grammar)       | `str_replace_based_edit_tool` (`text_editor_20250728`) | `edit`      | `ApplyPatchTool` / `TextEditorTool` |
 | `Bash`       | `Bash` (JSON function)                    | `Bash` (JSON client tool)                       | `shell`            | `BashTool`                       |
-| `Grep`       | `Grep` (JSON function)                    | `Grep` (JSON client tool)                       | `workspace_search` | `GrepTool`                       |
 | `WebSearch`  | `web_search` (JSON function)              | `web_search` (JSON client tool)                 | `web_search`       | `WebSearchTool`                  |
 | `WebFetch`   | `web_fetch` (JSON function)               | `web_fetch` (JSON client tool)                  | `web_fetch`        | `WebFetchTool`                   |
 | `LoadSkill`  | `LoadSkill` (JSON function)               | `LoadSkill` (JSON client tool)                  | `skill_loader`     | runtime-handled (no registry executor) |
@@ -107,17 +106,8 @@ runtime can back. There is no `workdir` override; the model chains with `&&` or
 calls `cd` inline (the announced cwd lives in the dynamic prompt context). The
 default timeout is `ToolContext`'s 30s; the model may pass `timeout_ms` and
 `max_output_tokens` per call. Output is `exit: … / stdout: … / stderr: …`;
-non-zero exit returns an error `ToolResult`.
-
-### grep — uniform custom function
-
-One `GrepTool`, registered identically as `Grep` for both providers; inputs are
-small enough that a strict JSON schema costs little. Shells out to `rg` directly
-(no shell interpolation) with `--line-number --column --hidden --glob !.git`,
-rooted at the session cwd, returning paths relative to it. `path` is normalized
-(absolute paths under cwd are made relative, `./` components stripped).
-Optional `case_sensitive`, `context`, `max_matches`. `rg` exit code 1 (no
-matches) is still a success result.
+non-zero exit returns an error `ToolResult`. The model-visible description
+directs file and text searches to `rg` instead of `grep`.
 
 ### web_search / web_fetch — local JSON wrappers
 

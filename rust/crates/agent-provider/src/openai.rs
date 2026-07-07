@@ -4578,6 +4578,9 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "apply_patch");
         assert_eq!(body["tools"][1]["type"], "function");
         assert_eq!(body["tools"][1]["name"], "Bash");
+        assert!(body["tools"][1]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("prefer `rg` over `grep`")));
         assert_eq!(body["tools"][2]["type"], "function");
         assert_eq!(body["tools"][2]["name"], "cancel_delegation");
         assert_eq!(body["tools"][3]["type"], "function");
@@ -4585,19 +4588,17 @@ mod tests {
         assert_eq!(body["tools"][4]["type"], "function");
         assert_eq!(body["tools"][4]["name"], "delegate_writing_task");
         assert_eq!(body["tools"][5]["type"], "function");
-        assert_eq!(body["tools"][5]["name"], "Grep");
+        assert_eq!(body["tools"][5]["name"], "inspect_delegation");
         assert_eq!(body["tools"][6]["type"], "function");
-        assert_eq!(body["tools"][6]["name"], "inspect_delegation");
+        assert_eq!(body["tools"][6]["name"], "interrupt_subagent");
         assert_eq!(body["tools"][7]["type"], "function");
-        assert_eq!(body["tools"][7]["name"], "interrupt_subagent");
+        assert_eq!(body["tools"][7]["name"], "LoadSkill");
         assert_eq!(body["tools"][8]["type"], "function");
-        assert_eq!(body["tools"][8]["name"], "LoadSkill");
+        assert_eq!(body["tools"][8]["name"], "steer_subagent");
         assert_eq!(body["tools"][9]["type"], "function");
-        assert_eq!(body["tools"][9]["name"], "steer_subagent");
+        assert_eq!(body["tools"][9]["name"], "web_fetch");
         assert_eq!(body["tools"][10]["type"], "function");
-        assert_eq!(body["tools"][10]["name"], "web_fetch");
-        assert_eq!(body["tools"][11]["type"], "function");
-        assert_eq!(body["tools"][11]["name"], "web_search");
+        assert_eq!(body["tools"][10]["name"], "web_search");
     }
 
     #[test]

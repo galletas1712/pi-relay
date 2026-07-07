@@ -8,8 +8,7 @@ use serde_json::{json, Value};
 use crate::context::ToolContext;
 use crate::error::{ToolError, ToolResult};
 use crate::tools::{
-    ApplyPatchTool, BashTool, GrepTool, TextEditorTool, WebFetchTool, WebSearchTool,
-    APPLY_PATCH_LARK_GRAMMAR,
+    ApplyPatchTool, BashTool, TextEditorTool, WebFetchTool, WebSearchTool, APPLY_PATCH_LARK_GRAMMAR,
 };
 
 #[async_trait]
@@ -502,7 +501,6 @@ impl ToolExtension for FirstPartyToolExtension {
         );
         register_edit(registry);
         register_uniform(registry, "Bash", "shell", BashTool);
-        register_uniform(registry, "Grep", "workspace_search", GrepTool);
         register_uniform(registry, "WebSearch", "web_search", WebSearchTool);
         register_uniform(registry, "WebFetch", "web_fetch", WebFetchTool);
     }
@@ -611,20 +609,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_definitions_expose_current_coding_tools() {
+    fn provider_definitions_expose_bash_guidance_without_grep() {
         let registry = ToolRegistry::with_builtin_tools();
-        let names = [
-            registry.definitions_for_provider(ProviderKind::OpenAi),
-            registry.definitions_for_provider(ProviderKind::Claude),
-        ]
-        .concat()
-        .into_iter()
-        .map(|definition| definition.name)
-        .collect::<Vec<_>>();
+        for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
+            let definitions = registry.definitions_for_provider(provider);
+            assert!(definitions
+                .iter()
+                .any(|definition| definition.name == "Edit"));
+            assert!(!definitions
+                .iter()
+                .any(|definition| definition.name == "Grep"));
+            let bash = definitions
+                .iter()
+                .find(|definition| definition.name == "Bash")
+                .expect("Bash definition");
+            assert!(bash.description.contains("prefer `rg` over `grep`"));
+        }
+    }
 
-        assert!(names.contains(&"Bash".to_string()));
-        assert!(names.contains(&"Edit".to_string()));
-        assert!(names.contains(&"Grep".to_string()));
+    #[tokio::test]
+    async fn grep_is_not_dispatchable() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let call = ToolCall {
+            id: agent_vocab::ToolCallId::new("call_grep"),
+            tool_name: "Grep".to_string(),
+            args_json: json!({ "pattern": "needle" }).to_string(),
+        };
+        let ctx = ToolContext::new(".");
+
+        for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
+            let error = registry
+                .execute(provider, &call, &ctx)
+                .await
+                .expect_err("Grep must not remain executable");
+            assert!(matches!(
+                error,
+                ToolError::UnknownTool(ref name) if name == "Grep"
+            ));
+        }
     }
 
     #[test]
@@ -649,7 +671,6 @@ mod tests {
                 "cancel_delegation",
                 "delegate_readonly_tasks",
                 "delegate_writing_task",
-                "Grep",
                 "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
@@ -665,7 +686,6 @@ mod tests {
                 "cancel_delegation",
                 "delegate_readonly_tasks",
                 "delegate_writing_task",
-                "Grep",
                 "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
@@ -699,7 +719,6 @@ mod tests {
                 "cancel_delegation",
                 "delegate_readonly_tasks",
                 "delegate_writing_task",
-                "Grep",
                 "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
@@ -715,7 +734,6 @@ mod tests {
                 "cancel_delegation",
                 "delegate_readonly_tasks",
                 "delegate_writing_task",
-                "Grep",
                 "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
