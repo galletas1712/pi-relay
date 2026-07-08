@@ -3,7 +3,6 @@ import {
 	ArchiveRestore,
 	ArrowUp,
 	Bot,
-	Edit3,
 	Folder,
 	Network,
 	PanelRightOpen,
@@ -16,6 +15,7 @@ import {
 	X
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
+import { ActionMenu, type ActionMenuItem } from "./actionMenu.tsx";
 import { COMMANDS } from "./slash.ts";
 import {
 	isArchivedSession,
@@ -368,24 +368,26 @@ export const Sidebar = memo(function Sidebar({
 					) : null}
 				</div>
 			) : null}
-			<div className="session-list" role="listbox" aria-label="sessions" aria-busy={sessionsLoading || sessionsFetching}>
-				{filteredSessions.map((session) => (
-					<SessionRow
-						key={session.session_id}
-						session={session}
-						selected={session.session_id === selectedId}
-						onSelect={() => onSelectSession(session.session_id)}
-						onRename={() => onRename(session)}
-						onArchiveToggle={() => onArchiveToggle(session)}
-						onDelete={() => onDelete(session)}
-					/>
-				))}
-				{filteredSessions.length === 0 && !sessionsError ? (
-					<div className="empty-list">
-						{sessionsLoading ? "Loading sessions…" : sessionsFetching ? "Refreshing sessions…" : "No sessions"}
-					</div>
-				) : null}
-			</div>
+			<nav className="session-list" aria-label="Sessions" aria-busy={sessionsLoading || sessionsFetching}>
+				<ul className="session-list-items">
+					{filteredSessions.map((session) => (
+						<SessionRow
+							key={session.session_id}
+							session={session}
+							selected={session.session_id === selectedId}
+							onSelect={() => onSelectSession(session.session_id)}
+							onRename={() => onRename(session)}
+							onArchiveToggle={() => onArchiveToggle(session)}
+							onDelete={() => onDelete(session)}
+						/>
+					))}
+					{filteredSessions.length === 0 && !sessionsError ? (
+						<li className="empty-list">
+							{sessionsLoading ? "Loading sessions…" : sessionsFetching ? "Refreshing sessions…" : "No sessions"}
+						</li>
+					) : null}
+				</ul>
+			</nav>
 		</aside>
 	);
 });
@@ -416,57 +418,64 @@ export function ProjectList({
 					<Plus size={13} />
 				</button>
 			</div>
-			<div className="project-list" role="listbox" aria-label="projects">
-				<button
-					className={`project-row ${selectedProjectId === null ? "selected" : ""}`}
-					type="button"
-					onClick={() => onSelectProject(null)}
-					title="Ephemeral host sessions start from your home directory"
-				>
-					<Folder size={14} />
-					<span className="project-main">
-						<span className="project-title">Host</span>
-						<span className="project-cwd">Ephemeral sessions</span>
-					</span>
-				</button>
-				{projects.map((project) => (
-					<button
-						className={`project-row ${project.project_id === selectedProjectId ? "selected" : ""}`}
+			<nav aria-label="Projects">
+				<ul className="project-list">
+					<li className={`project-row ${selectedProjectId === null ? "selected" : ""}`}>
+						<button
+							className="project-row-primary"
 							type="button"
-							key={project.project_id}
-							onClick={() => onSelectProject(project.project_id)}
-							title={projectWorkspaceSummary(project)}
+							onClick={() => onSelectProject(null)}
+							title="Ephemeral host sessions start from your home directory"
+							aria-current={selectedProjectId === null ? "page" : undefined}
 						>
-						<Folder size={14} />
-						<span className="project-main">
-								<span className="project-title">{projectTitle(project)}</span>
-								<span className="project-cwd">{project.workspaces.length} workspaces</span>
-						</span>
-						<span
-							className="session-row-action"
-							role="button"
-							tabIndex={0}
-							title="edit project"
-							aria-label={`edit ${projectTitle(project)}`}
-							onClick={(event) => {
-								event.stopPropagation();
-								onEditProject(project);
-							}}
-							onKeyDown={(event) => {
-								if (event.key !== "Enter" && event.key !== " ") return;
-								event.preventDefault();
-								event.stopPropagation();
-								onEditProject(project);
-							}}
-						>
-							<Edit3 size={13} />
-						</span>
-					</button>
-				))}
-
-			</div>
+							<Folder size={14} aria-hidden />
+							<span className="project-main">
+								<span className="project-title">Host</span>
+								<span className="project-cwd">Ephemeral sessions</span>
+							</span>
+						</button>
+					</li>
+					{projects.map((project) => {
+						const title = projectTitle(project);
+						const selected = project.project_id === selectedProjectId;
+						return (
+							<li className={`project-row ${selected ? "selected" : ""}`} key={project.project_id}>
+								<button
+									className="project-row-primary"
+									type="button"
+									onClick={() => onSelectProject(project.project_id)}
+									title={projectWorkspaceSummary(project)}
+									aria-current={selected ? "page" : undefined}
+								>
+									<Folder size={14} aria-hidden />
+									<span className="project-main">
+										<span className="project-title">{title}</span>
+										<span className="project-cwd">{project.workspaces.length} workspaces</span>
+									</span>
+								</button>
+								<ActionMenu
+									triggerLabel={`Open project actions for ${title}`}
+									items={projectMenuItems(project, onEditProject)}
+								/>
+							</li>
+						);
+					})}
+				</ul>
+			</nav>
 		</div>
 	);
+}
+
+export function projectMenuItems(project: Project, onEditProject: (project: Project) => void): ActionMenuItem[] {
+	return [
+		{
+			id: "settings",
+			label: "Project settings…",
+			icon: <SquarePen size={15} aria-hidden />,
+			focusDestination: "dialog",
+			onSelect: () => onEditProject(project),
+		},
+	];
 }
 
 export function SidebarToolbar({
@@ -627,82 +636,86 @@ export function SessionRow({
 	const idleAndQuiet = session.activity === "idle" && !(session.has_running_delegations ?? false);
 	const canArchive = idleAndQuiet;
 	const canDelete = idleAndQuiet;
-	const ArchiveIcon = archived ? ArchiveRestore : Archive;
+	const title = sessionTitle(session);
+	const statusLabel = `${archived ? "archived" : status} session`;
 	return (
-		<button className={`session-row ${selected ? "selected" : ""} ${archived ? "archived" : ""}`} type="button" onClick={onSelect}>
-			<span className={`status-rail ${archived ? "archived" : status}`} />
-			<span className="session-main">
-				<span className="session-title">{sessionTitle(session)}</span>
-				<span className="session-sub">
-					{archived ? "archived - " : ""}{session.provider.model}
-				</span>
-				<span className="session-leaf">
-					{session.active_leaf_id ? session.active_leaf_id.slice(0, 6) : "root"}
-				</span>
-			</span>
-			<span className="session-row-actions" aria-label="session actions">
+		<li className={`session-row ${selected ? "selected" : ""} ${archived ? "archived" : ""}`}>
+			<button
+				className="session-row-primary"
+				type="button"
+				onClick={onSelect}
+				aria-current={selected ? "page" : undefined}
+			>
 				<span
-					className="session-row-action"
-					role="button"
-					tabIndex={0}
-					title="rename session"
-					aria-label={`rename ${sessionTitle(session)}`}
-					onClick={(event) => {
-						event.stopPropagation();
-						onRename();
-					}}
-					onKeyDown={(event) => {
-						if (event.key !== "Enter" && event.key !== " ") return;
-						event.preventDefault();
-						event.stopPropagation();
-						onRename();
-					}}
-				>
-					<Edit3 size={13} />
+					className={`status-rail ${archived ? "archived" : status}`}
+					role="img"
+					aria-label={statusLabel}
+					title={statusLabel}
+				/>
+				<span className="session-main">
+					<span className="session-title">{title}</span>
+					<span className="session-sub">
+						{archived ? "archived - " : ""}{session.provider.model}
+					</span>
+					<span className="session-leaf">
+						{session.active_leaf_id ? session.active_leaf_id.slice(0, 6) : "root"}
+					</span>
 				</span>
-				<span
-					className={`session-row-action ${canArchive ? "" : "disabled"}`}
-					role="button"
-					tabIndex={canArchive ? 0 : -1}
-					title={canArchive ? (archived ? "unarchive session" : "archive session") : "only idle sessions with no running subagents can be archived"}
-					aria-label={`${archived ? "unarchive" : "archive"} ${sessionTitle(session)}`}
-					aria-disabled={!canArchive}
-					onClick={(event) => {
-						event.stopPropagation();
-						if (canArchive) onArchiveToggle();
-					}}
-					onKeyDown={(event) => {
-						if (!canArchive || (event.key !== "Enter" && event.key !== " ")) return;
-						event.preventDefault();
-						event.stopPropagation();
-						onArchiveToggle();
-					}}
-				>
-					<ArchiveIcon size={13} />
-				</span>
-				<span
-					className={`session-row-action danger ${canDelete ? "" : "disabled"}`}
-					role="button"
-					tabIndex={canDelete ? 0 : -1}
-					title={canDelete ? "delete session" : "only idle sessions with no running subagents can be deleted"}
-					aria-label={`delete ${sessionTitle(session)}`}
-					aria-disabled={!canDelete}
-					onClick={(event) => {
-						event.stopPropagation();
-						if (canDelete) onDelete();
-					}}
-					onKeyDown={(event) => {
-						if (!canDelete || (event.key !== "Enter" && event.key !== " ")) return;
-						event.preventDefault();
-						event.stopPropagation();
-						onDelete();
-					}}
-				>
-					<Trash2 size={13} />
-				</span>
-			</span>
-		</button>
+			</button>
+			<ActionMenu
+				triggerLabel={`Open session actions for ${title}`}
+				items={sessionMenuItems({ archived, canArchive, canDelete, onRename, onArchiveToggle, onDelete })}
+			/>
+		</li>
 	);
+}
+
+const IDLE_SESSION_ACTION_REASON = "Available when the session and its subagents are idle.";
+
+export function sessionMenuItems({
+	archived,
+	canArchive,
+	canDelete,
+	onRename,
+	onArchiveToggle,
+	onDelete,
+}: {
+	archived: boolean;
+	canArchive: boolean;
+	canDelete: boolean;
+	onRename: () => void;
+	onArchiveToggle: () => void;
+	onDelete: () => void;
+}): ActionMenuItem[] {
+	const ArchiveIcon = archived ? ArchiveRestore : Archive;
+	return [
+		{
+			id: "rename",
+			label: "Rename…",
+			icon: <SquarePen size={15} aria-hidden />,
+			focusDestination: "dialog",
+			onSelect: onRename,
+		},
+		{
+			id: archived ? "unarchive" : "archive",
+			label: archived ? "Unarchive" : "Archive",
+			icon: <ArchiveIcon size={15} aria-hidden />,
+			disabled: !canArchive,
+			disabledReason: !canArchive ? IDLE_SESSION_ACTION_REASON : undefined,
+			onSelect: onArchiveToggle,
+		},
+		{
+			id: "delete",
+			label: "Delete…",
+			icon: <Trash2 size={15} aria-hidden />,
+			disabled: !canDelete,
+			disabledReason: !canDelete ? IDLE_SESSION_ACTION_REASON : undefined,
+			destructive: true,
+			separatorBefore: true,
+			focusDestination: "dialog",
+			onSelect: onDelete,
+		},
+	];
 }
 
 export function LogHeader({

@@ -2821,7 +2821,7 @@ const MarkdownView = memo(function MarkdownView({ text }: { text: string }) {
 	);
 });
 
-function RenameSessionDialog({
+export function RenameSessionDialog({
 	value,
 	onChange,
 	onClose,
@@ -2873,7 +2873,7 @@ function RenameSessionDialog({
 	);
 }
 
-function DeleteSessionDialog({
+export function DeleteSessionDialog({
 	session,
 	deleting,
 	onClose,
@@ -2909,7 +2909,7 @@ function DeleteSessionDialog({
 					<p className="muted">This removes the transcript, queued inputs, actions, and events for this session. This cannot be undone.</p>
 				</div>
 				<div className="rename-actions">
-					<button type="button" className="secondary-button" onClick={onClose} disabled={deleting}>
+					<button type="button" className="secondary-button" onClick={onClose} disabled={deleting} autoFocus>
 						Cancel
 					</button>
 					<button type="button" className="primary-button destructive" onClick={onConfirm} disabled={deleting}>
@@ -2921,7 +2921,7 @@ function DeleteSessionDialog({
 	);
 }
 
-function ProjectDialog({
+export function ProjectDialog({
 	state,
 	onChange,
 	onClose,
