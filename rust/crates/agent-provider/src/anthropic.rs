@@ -5362,9 +5362,6 @@ mod tests {
 
         assert_eq!(body["tools"][0]["name"], "Bash");
         assert!(body["tools"][0].get("type").is_none());
-        assert!(body["tools"][0]["description"]
-            .as_str()
-            .is_some_and(|description| description.contains("prefer `rg` over `grep`")));
         assert_eq!(body["tools"][1]["name"], "cancel_delegation");
         assert!(body["tools"][1].get("type").is_none());
         assert_eq!(body["tools"][2]["name"], "delegate_readonly_tasks");

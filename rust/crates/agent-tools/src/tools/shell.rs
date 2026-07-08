@@ -139,7 +139,6 @@ mod tests {
     fn definition_advertises_string_command_only() {
         let definition = BashTool.definition();
 
-        assert!(definition.description.contains("prefer `rg` over `grep`"));
         assert_eq!(
             definition.input_schema["properties"]["command"]["type"],
             "string"

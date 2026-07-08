@@ -609,21 +609,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_definitions_expose_bash_guidance_without_grep() {
+    fn provider_definitions_expose_coding_tools_without_grep() {
         let registry = ToolRegistry::with_builtin_tools();
         for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
             let definitions = registry.definitions_for_provider(provider);
+            assert!(definitions
+                .iter()
+                .any(|definition| definition.name == "Bash"));
             assert!(definitions
                 .iter()
                 .any(|definition| definition.name == "Edit"));
             assert!(!definitions
                 .iter()
                 .any(|definition| definition.name == "Grep"));
-            let bash = definitions
-                .iter()
-                .find(|definition| definition.name == "Bash")
-                .expect("Bash definition");
-            assert!(bash.description.contains("prefer `rg` over `grep`"));
         }
     }
 

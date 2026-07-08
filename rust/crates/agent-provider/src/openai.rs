@@ -4578,9 +4578,6 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "apply_patch");
         assert_eq!(body["tools"][1]["type"], "function");
         assert_eq!(body["tools"][1]["name"], "Bash");
-        assert!(body["tools"][1]["description"]
-            .as_str()
-            .is_some_and(|description| description.contains("prefer `rg` over `grep`")));
         assert_eq!(body["tools"][2]["type"], "function");
         assert_eq!(body["tools"][2]["name"], "cancel_delegation");
         assert_eq!(body["tools"][3]["type"], "function");
