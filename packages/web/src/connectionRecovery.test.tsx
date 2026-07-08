@@ -348,7 +348,6 @@ describe("representative connection gates", () => {
 				modelOptions={[{ id: "gpt-test", label: "GPT test" }]}
 				modelValue="gpt-test"
 				modelDisabled
-				modelDisabledTitle={WAITING_FOR_CONNECTION}
 				reasoningDisabled
 				controlsBlockedReason={WAITING_FOR_CONNECTION}
 				reasoningEfforts={["medium"]}
@@ -416,7 +415,7 @@ describe("representative connection gates", () => {
 		expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(false);
 	});
 
-	it("gates delegation Cancel/Re-run and history switching while local navigation remains present", () => {
+	it("gates delegation Cancel and history switching while local navigation remains present", () => {
 		render(
 			<RunBoardDelegationList
 				parentSessionId="parent-1"
@@ -440,13 +439,11 @@ describe("representative connection gates", () => {
 				showAllDelegations
 				onToggleShowAllDelegations={() => undefined}
 				onCancelDelegation={() => undefined}
-				onReRunDelegation={() => undefined}
 				mutationBlockedReason={WAITING_FOR_CONNECTION}
 			/>,
 		);
 		expect((screen.getByRole("button", { name: /cancel/i }) as HTMLButtonElement).disabled).toBe(true);
-		expect((screen.getByRole("button", { name: /re-run/i }) as HTMLButtonElement).disabled).toBe(true);
-		expect(screen.getAllByText(WAITING_FOR_CONNECTION).length).toBeGreaterThanOrEqual(2);
+		expect(screen.getByText(WAITING_FOR_CONNECTION)).toBeTruthy();
 		cleanup();
 
 		render(
@@ -471,11 +468,10 @@ describe("representative connection gates", () => {
 				showAllDelegations={false}
 				onToggleShowAllDelegations={() => undefined}
 				onCancelDelegation={() => undefined}
-				onReRunDelegation={() => undefined}
 				remoteReadBlockedReason={WAITING_FOR_CONNECTION}
 			/>,
 		);
-		expect((screen.getByRole("button", { name: "see more" }) as HTMLButtonElement).disabled).toBe(true);
+		expect((screen.getByRole("button", { name: "See more" }) as HTMLButtonElement).disabled).toBe(true);
 		expect(screen.getByText(WAITING_FOR_CONNECTION).getAttribute("tabindex")).toBe("0");
 
 		rerender(
@@ -487,11 +483,10 @@ describe("representative connection gates", () => {
 				expandedDelegationsAvailable
 				onToggleShowAllDelegations={() => undefined}
 				onCancelDelegation={() => undefined}
-				onReRunDelegation={() => undefined}
 				remoteReadBlockedReason={WAITING_FOR_CONNECTION}
 			/>,
 		);
-		expect((screen.getByRole("button", { name: "see more" }) as HTMLButtonElement).disabled).toBe(false);
+		expect((screen.getByRole("button", { name: "See more" }) as HTMLButtonElement).disabled).toBe(false);
 	});
 
 	it("gates terminal resume with a visible focusable reason", () => {

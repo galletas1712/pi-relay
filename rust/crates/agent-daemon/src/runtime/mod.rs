@@ -898,7 +898,7 @@ impl SessionDriver {
         // sets a delegation_id). A delegation member's completion is delivered as
         // ONE typed delegation wakeup observation,
         // NOT a per-child idle. Fire the once-gate WITHOUT writing a
-        // parent-visible SubagentIdle row (so events_after / the run board never
+        // parent-visible SubagentIdle row (so events_after / the product UI never
         // surface per-child idle), then — on that single firing — destroy the RO
         // snapshot and run the barrier. The barrier is single-flighted by the DB
         // delegation-row CAS, so concurrent terminal children wake the parent exactly

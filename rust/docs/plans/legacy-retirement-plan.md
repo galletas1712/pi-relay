@@ -226,7 +226,7 @@ Shared code the live `stage.*` path reuses. Touching any of it breaks stages.
 | `subagents.rs:298-313` full-vs-RO workspace branch (`fork_session_from_parent`) | RO fanout's private snapshot; full's in-place dirs. |
 | `subagents.rs:315-342` `subagent_metadata` + `child_system_prompt` + `ChildPromptRole` | Child config/prompt for stage members. |
 | `subagents.rs:377-444` `start_prepared_session` wiring, parent spawn events, dispatch, `cleanup_failed_spawn` | Stage member lifecycle + the RO-teardown safety (`cleanup_failed_spawn` must keep the Full/ReadOnly split at 675-686 — deleting it would delete the parent's workspace). |
-| `subagents.rs:446-482` `subagent_parent_spawn_events` (`SubagentSpawned`/`Running`) | Drives the run board + barrier. |
+| `subagents.rs:446-482` `subagent_parent_spawn_events` (`SubagentSpawned`/`Running`) | Drives the Agents outline refresh + barrier. |
 | `subagents.rs:484-535` `subagent_lifecycle_payload` + `publish_subagent_parent_running_if_child` | Parent-visible running event (called from session_start/runtime). |
 | `subagents.rs:537-600` `publish_subagent_parent_dispatch_failed_event` (+ test shim) | Stage spawn-failure compensation (FIX E). |
 | `subagents.rs:639-657` `require_known_subagent` | Scope check reused by stage RPCs/cancel. |
@@ -236,7 +236,7 @@ Shared code the live `stage.*` path reuses. Touching any of it breaks stages.
 | `registry.rs` `stage_*_definition` (328-470) + `python_repl_definition` (306-326) | The model-facing tool surface. (Update the PythonRepl *description* text at 308-309/319 to drop "subagent delegation"; the tool stays.) |
 | `repl.rs` `ReplRegistry`, `PythonRepl` (transport), `repl_exec`, exec protocol, `kill_all`, `provider_runtime/repl_tools.rs` | The PythonRepl scripting escape hatch. |
 | store: `SubagentType`, `insert_subagent_idle_event_once`, `claim_subagent_idle_once`, `list_stage_subagents`, stage tables/repo | Shared persistence. |
-| web: `RunBoard`, `SubagentRow`, `steerableSubagentId`, `StageSubagent`, `Stage`, `stage.*` API methods, `steerSubagent`, `subagent.{running,idle}` notice handlers | The live run board. |
+| web: `RunBoard`, `SubagentRow`, `steerableSubagentId`, `StageSubagent`, `Stage`, `stage.*` API methods, `steerSubagent`, `subagent.{running,idle}` notice handlers | Historical symbol names for the live Agents outline. |
 
 **Most dangerous mistake:** the keep-vs-remove line runs *through the middle of
 `subagents.rs` and `repl.rs`*, not at file boundaries. A remover who deletes
@@ -316,7 +316,8 @@ Run after each major step; all must pass and the new surface must be unaffected:
 - [ ] web: `tsc --noEmit`, `vitest run` (esp. `runBoard.test.ts`), `vite build`.
 - [ ] **delegation smoke test (new surface unaffected):** start a session, call
       `delegate_readonly_tasks` with 2 tasks and `delegate_writing_task` with 1, confirm
-      the run board shows live subagents, the barrier fires once, the handoff dir is
+      the flat Agents outline shows live subagents without ambient headings/
+      progress/outcomes, the barrier fires once, the handoff dir is
       written (per-subagent `final_message.md`/`transcript.md`; structured state via
       `inspect_delegation`), `delegation.read_handoff_file` reads them,
       `delegation.cancel` cancels a running delegation, and

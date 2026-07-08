@@ -55,7 +55,7 @@ pub struct DelegationProgress {
     pub failed: i32,
 }
 
-/// Compact status fields for a subagent in the run-board list.
+/// Compact status fields for a subagent in `delegation.list`.
 ///
 /// Unlike `delegation.status` / inspect snapshots this deliberately avoids
 /// loading the full active branch or touching handoff files. Terminality is
@@ -128,9 +128,9 @@ impl PostgresAgentStore {
     /// Compact subagent rows for `delegation.list`.
     ///
     /// This is intentionally set-based: it avoids `active_branch` hydration,
-    /// per-subagent `activity()` calls, and handoff filesystem probes. The run
-    /// board only needs enough state to draw status dots, open a subagent, and
-    /// decide whether re-run can fetch a task prompt on demand.
+    /// per-subagent `activity()` calls, and handoff filesystem probes. The
+    /// product surface only needs enough state to draw status icons, open a
+    /// subagent, and expose task-prompt handoff availability for inspection.
     pub async fn delegation_subagent_overview(
         &self,
         delegation_id: &str,
@@ -298,7 +298,7 @@ impl PostgresAgentStore {
         rows.iter().map(row_to_delegation).collect()
     }
 
-    /// A bounded page of delegations for the run board, newest first.
+    /// A bounded page of delegations for the product Agents outline, newest first.
     ///
     /// Fetching all historical delegations made the common selected-session
     /// poll scale with the lifetime of the parent session even though the UI
@@ -1782,9 +1782,8 @@ impl PostgresAgentStore {
                 .get("role_name")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            // The subagent's task prompt, persisted at spawn — carried in
-            // delegation.list so the run board can re-run a delegation from
-            // the delegation data itself.
+            // The subagent's task prompt is persisted at spawn and carried in
+            // delegation.list so inspection can expose its handoff file.
             let task = metadata
                 .get("task")
                 .and_then(Value::as_str)

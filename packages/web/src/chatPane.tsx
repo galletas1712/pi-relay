@@ -173,13 +173,6 @@ const ChatHeader = memo(function ChatHeader({
 }: ChatHeaderProps) {
 	const archived = session ? isArchivedSession(session) : false;
 	const modelDisabled = modelLocked || modelControlsDisabled || !!mutationBlockedReason;
-	const configurationBlockedReason =
-		mutationBlockedReason ??
-		(modelControlsDisabled
-			? "Available when the session is idle."
-			: modelLocked
-				? "Model is locked after the first transcript entry."
-				: null);
 	const displayedModelOptions = modelOptions.some((option) => option.id === modelValue)
 		? modelOptions
 		: [{ id: modelValue, label: modelValue }, ...modelOptions];
@@ -195,9 +188,9 @@ const ChatHeader = memo(function ChatHeader({
 			modelOptions={displayedModelOptions}
 			modelValue={modelValue}
 			modelDisabled={modelDisabled}
-			modelDisabledTitle={modelLocked ? "Model is locked after the first transcript entry" : configurationBlockedReason ?? "Model"}
+			modelLocked={modelLocked}
 			reasoningDisabled={modelControlsDisabled || !!mutationBlockedReason}
-			controlsBlockedReason={configurationBlockedReason}
+			controlsBlockedReason={mutationBlockedReason}
 			reasoningEfforts={displayedEfforts}
 			reasoningEffort={reasoningEffort}
 			rightOpen={rightOpen}

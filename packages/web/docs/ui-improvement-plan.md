@@ -82,7 +82,7 @@ Line citations describe the repository state used to write this plan and may mov
 | Immutable send routing | Composer routing uses the captured session ID, requires a matching snapshot, and routes root follow-up versus parent-scoped subagent steering without rereading current selection (`packages/web/src/composerRouting.ts:30-86`). | Preserve this capture-at-intent pattern for every message and mutation. |
 | Stale-response protection | Selected-session refreshes verify the current selected ID before committing, coalesce requests per session, and ignore late selection changes (`packages/web/src/App.tsx:878-938`). Cache reducers reject session-mismatched entry, branch, tree, queue, and turn payloads and reject stale revision/page combinations where applicable (`packages/web/src/selectedSessionCache.ts:112-218`, `packages/web/src/selectedSessionCache/turns.ts:6-21`). | Generalize the guard from a single selection to root/conversation/focus stores; never weaken it. |
 | Warm per-session cache | The selected-session store retains a map of session caches and repoints without evicting other sessions (`packages/web/src/selectedSessionStore.ts:20-69`). | Conversation switching within a root run should remain fast and must not force a full reload. |
-| Scroll persistence | Sticky-bottom and explicit scroll positions are saved per session, restored after content is ready, and maintained through resize (`packages/web/src/transcript.tsx:233-369`). | Keep per-conversation scroll keys, including across Conversation/Execution route changes. |
+| Scroll safety | Sticky-bottom and explicit scroll positions are saved per session, restored after content is ready, and maintained through resize (`packages/web/src/transcript.tsx:233-369`). | Preserve manual scroll-up, sticky-bottom behavior, and viewport anchoring while a conversation remains active. **Superseded for navigation entry:** entering a root/subagent chat through navigation, direct-link refresh, Back/Forward, or history branch switch starts at the destination transcript's latest/bottom rather than restoring an old mid-transcript position. A dedicated next PR implements this policy. |
 | Bounded/lazy transcript loading | The app loads a 50-turn page and lazily fetches older turns/detail (`packages/web/src/App.tsx:113-114`, `packages/web/src/transcript.tsx:483-507`). | Measure before virtualizing; do not discard paging and lazy detail. |
 | Live-work feedback | Current-turn detail and a server-anchored elapsed “Working…” indicator expose progress (`packages/web/src/transcript.tsx:420-444`, `packages/web/src/transcript.tsx:535-537`). | Preserve live visibility while reducing ambient motion elsewhere. |
 | Visual identity and theme foundations | Light/dark Gruvbox tokens, Geist Sans/Mono, and Space Grotesk are declared centrally (`packages/web/src/styles.css:1-32`, `packages/web/src/styles.css:112-154`). | Correct contrast and hierarchy in place rather than replacing the palette or typography. |
@@ -105,13 +105,13 @@ Consequences:
 
 **Confirmed current source facts:**
 
-- `delegation.list` is explicitly a bounded, newest-first page for one parent session and is documented as a lightweight run-board feed (`rust/docs/websocket-rpc.md:1544-1548`).
+- `delegation.list` is explicitly a bounded, newest-first page for one parent session and is documented as the lightweight Agents-outline feed (`rust/docs/websocket-rpc.md:1550-1554`).
 - The daemon defaults to 3 rows, caps the request at 100, fetches one extra row only to compute `has_more`, and exposes no cursor in the current request (`rust/crates/agent-daemon/src/delegation_tools.rs:1472-1491`, `rust/crates/agent-daemon/src/delegation_tools.rs:1517-1544`).
 - The frontend model is `Delegation[]`, each with direct `subagents[]`; the list response has `has_more` but no cursor (`packages/web/src/types.ts:124-174`).
 - Subagent prompt profiles exclude all delegation tools, and the child contract explicitly says nested delegation is unavailable (`rust/crates/agent-daemon/src/provider_runtime/prompt.rs:551-590`, `rust/crates/agent-daemon/src/subagents.rs:459-469`).
 - Current event frames have an ID, name, session ID, and data but no event timestamp in the web type (`packages/web/src/types.ts:117-122`).
 - `events.subscribe` is a reconnect stream, not historical notification storage; initial subscribe does not replay history (`rust/docs/websocket-rpc.md:395-401`). The event buffer is empty once a session is idle (`rust/docs/websocket-rpc.md:1865-1868`).
-- The run board has no dedicated delegation event and relies on lifecycle invalidation plus a two-second poll while work is running (`packages/web/src/App.tsx:1178-1188`, `packages/web/src/App.tsx:596-602`).
+- The Agents outline has no dedicated delegation event and relies on lifecycle invalidation plus a two-second poll while work is running (`packages/web/src/App.tsx:1915-1920`, `packages/web/src/App.tsx:596-602`).
 - Existing handoff reads are limited to task prompt, final message, transcript, and cancelled transcript names (`packages/web/src/types.ts:176-184`, `rust/docs/websocket-rpc.md:1586-1606`).
 
 Therefore:
@@ -125,7 +125,7 @@ Therefore:
 
 | Issue | Confirmed current source fact | Target correction |
 | --- | --- | --- |
-| Right panel overload | The Inspector tabs are “Run board” and “Inspector”; Run Board contains navigation, status, cancel, and rerun while Inspector contains raw session/pending/tool/slash diagnostics (`packages/web/src/panels.tsx:232-269`, `packages/web/src/panels.tsx:804-950`). | Run Navigator becomes a user-facing navigation surface; Debug Inspector becomes a separate drawer/command. |
+| Right panel overload | The Inspector's Agents surface and technical Inspector share the right panel; the former historically mixed navigation, visible status/progress/outcomes, and controls while the latter contains raw diagnostics. | Agents is a flat icon-led outline with task/role labels and scoped cancellation only; Debug Inspector remains the destination for raw IDs and metadata. Delegated work is not restartable from the product surface. |
 | Nested interactive rows | Project and session rows are `<button>` elements containing focusable `role="button"` spans (`packages/web/src/panels.tsx:394-439`, `packages/web/src/panels.tsx:585-680`). | Use one semantic row link/button plus one sibling overflow Menu trigger. |
 | Dialog semantics incomplete | Custom scrims add `role="dialog"`/`aria-modal`, but shared focus trap, background inerting, Escape policy, and focus restoration are not centralized (`packages/web/src/App.tsx:2624-2657`, `packages/web/src/App.tsx:2688-2725`). | Adopt a shared Dialog/AlertDialog primitive with a documented modality contract. |
 | Mobile history dead end | Alternate branches are collapsed by default (`packages/web/src/historyPickerCompact.tsx:69-86`), but mobile CSS hides `.branch-toggle` while descendants remain filtered (`packages/web/src/styles.css:3854-3865`). | Keep a visible expand control or do not collapse alternate descendants at that breakpoint. |
@@ -146,7 +146,7 @@ Therefore:
 2. **One concept, one authoritative surface.** The Run Navigator and Execution workspace may summarize the same root projection for different purposes, but must not become competing mutable boards.
 3. **Conversation is not execution focus.** Reading or messaging an agent must not silently re-root the execution context.
 4. **Progressive disclosure over permanent chrome.** Keep summaries scannable; reveal tools, diagnostics, queue details, and raw IDs on demand.
-5. **Text plus icon, never color alone.** Status, outcome, selection, and attention need readable labels and semantic icons.
+5. **Semantic icon, never color alone.** Common state uses distinct icon shapes with accessible names/tooltips; persistent visible prose is reserved for state that requires user action.
 6. **Navigation before inspection.** Preserve the session navigator and center workspace before showing Run Navigator or Debug Inspector columns.
 7. **URLs are state.** Major destinations and meaningful selections must survive refresh and browser history.
 8. **Backend truth over frontend inference.** Unknown, bounded, or live-only data must be labeled as such.
@@ -235,8 +235,8 @@ Implementation note: create a small route adapter/state reducer rather than addi
 | Open a handoff or other durable detail | Add its typed detail query while preserving `conversation` and `focus` | Preserve conversation and derived recipient | Push so Back closes/restores the prior detail state. |
 | Choose “Open conversation” for an agent | Open Conversation route for that agent | Set conversation and recipient to the agent | Push. Root remains pinned. |
 | Choose “Message agent” from Execution | Open Conversation for that agent and focus the composer | Conversation changes to the agent, so the derived recipient changes explicitly | Push. There is no in-place recipient-only state. |
-| Switch transcript branch/history | Mutate only `conversationSessionId`'s transcript branch | Recipient unchanged | Route is stable; mutation result may replace branch-specific optional state, not root/focus. |
-| Browser Back/Forward | Restore all route-backed dimensions atomically | Re-derive recipient from restored conversation; recover draft and scroll by conversation/session keys | Never emit a mutation or write an independent recipient. |
+| Switch transcript branch/history | Mutate only `conversationSessionId`'s transcript branch and initialize the destination transcript at latest/bottom | Recipient unchanged | Route is stable; mutation result may replace branch-specific optional state, not root/focus. |
+| Browser Back/Forward | Restore all route-backed dimensions atomically and initialize the destination transcript at latest/bottom | Re-derive recipient from restored conversation; recover its draft | Never emit a mutation or write an independent recipient. Do not restore an old mid-transcript position on entry. |
 | Parse an explicit root default or invalid optional Execution `conversation` | Canonicalize to omitted `conversation`; warn for invalid values | Root conversation and recipient after validation/fallback | Replace; never push a correction entry. |
 | Open Debug Inspector | Toggle separate diagnostic drawer | No identity changes | Preference, not browser history, unless deep-linked diagnostics become a requirement. |
 
@@ -257,14 +257,21 @@ Required rules:
 - Stop captures the exact conversation session and active generation/leaf information available to the API.
 - Steer captures root parent ID, child session ID, and client control ID.
 - Cancel captures root parent ID and delegation ID; when multiple agents are affected, an AlertDialog names/counts them.
-- Rerun captures the delegation revision/attempt identity once the backend exposes it.
 - Queue edit/delete/reorder captures session ID, input ID, and queue revision.
 - Settings capture session/project ID and applicable revision.
 - Success or failure updates only the targeted entity's pending/error state even if the user navigates elsewhere.
 
 ## 7. Target layouts and wireframes
 
-Wireframes show hierarchy, not final visual styling.
+Wireframes show hierarchy, not final visual styling. In every wireframe and
+phase, the Run Navigator's Agents outline follows one overriding presentation
+rule: render a flat list led by shape-distinct, accessibly
+named status icons. Needs-attention / Active / Recent may determine ordering
+internally, but are never visible headings. Kind, status and outcome phrases,
+progress/count summaries, IDs, and passive badges are not ambient row content;
+they belong in explicit Handoffs/Debug detail. The only visible count exception
+is task-scoped safety copy, such as how many unfinished agents/slots a confirmed
+cancellation will affect.
 
 ### 7.1 Wide three-pane (1440px and above when the measured fit passes)
 
@@ -272,15 +279,15 @@ Wireframes show hierarchy, not final visual styling.
 +----------------------+--------------------------------------------------+----------------------+
 | Session navigation   | Root title        Conversation | Execution       | Run Navigator        |
 | 260-288              +--------------------------------------------------+ 260-300              |
-|                      |                                                  | Needs attention      |
-| Projects             |              active workspace                    |  ! failed review     |
-| Sessions             |              center hard min ~720                |  ! handoff ready      |
-|  status + title      |                                                  |                      |
-|  one overflow menu   |   Conversation transcript OR Execution view     | Active               |
-|                      |                                                  |  • implementer 2/3   |
+|                      |                                                  |  ⓧ Review checkout   |
+| Projects             |              active workspace                    |    reviewer          |
+| Sessions             |              center hard min ~720                |  ◌ Apply patch       |
+|  icon + title        |                                                  |    implementer       |
+|  one overflow menu   |   Conversation transcript OR Execution view     |  ✓ Verify release    |
+|                      |                                                  |    tester            |
 |                      |                                                  |                      |
-|                      |                                                  | Recent               |
-|                      |                                                  |  ✓ audit completed   |
+|                      |                                                  | Flat icon-led rows;  |
+|                      |                                                  | no section headings  |
 +----------------------+--------------------------------------------------+----------------------+
 ```
 
@@ -331,7 +338,7 @@ Wireframes show hierarchy, not final visual styling.
 ```text
 +----------------------------------------------------------------------------+
 | Root run / Conversation: reviewer                         [settings] [⋯]   |
-| status text + icon · exact last activity time                               |
+| shape-distinct status icon (named for AT/tooltip) · exact last activity time |
 +----------------------------------------------------------------------------+
 |                         shared content rail                                |
 |                                                                            |
@@ -358,23 +365,33 @@ Wireframes show hierarchy, not final visual styling.
 +----------------------------------------------------------------------------+
 | Execution / Overview        [Outline] [Map later]       [Activity] [Handoffs]|
 +----------------------------------------------------------------------------+
-| Root run  ✓ idle      2 delegations · 3 agents · 1 needs attention          |
+| Root run                                                                    |
 |                                                                            |
-| v Implement change                         done with failures · 2/2         |
-|   ├─ ! implementer                         failed · final message available |
-|   └─ ✓ reviewer                            done   · handoff available       |
+|   △ Implement change                                                       |
+|     ├─ ⓧ Apply patch                                                       |
+|     │    implementer                                                       |
+|     └─ ✓ Verify checkout                                                   |
+|          reviewer                                                          |
 |                                                                            |
-| v Investigate UI                           running · 2/3                    |
-|   ├─ • explorer A                          running                          |
-|   ├─ • explorer B                          running                          |
-|   └─ … explorer C                          queued                           |
+|   ◌ Investigate UI                                                         |
+|     ├─ ◌ Audit navigation                                                  |
+|     │    explorer                                                          |
+|     ├─ ◌ Trace queries                                                     |
+|     │    explorer                                                          |
+|     └─ ◷ Test fallback                                                     |
+|          tester                                                            |
 |                                                                            |
-| Focus details: explorer A                                                    |
-| Task, known status/outcome, progress, actions, [Open conversation]          |
+| Focus details: Audit navigation                                             |
+| [Open conversation] [Handoffs] [Debug details]                              |
 +----------------------------------------------------------------------------+
 ```
 
-This is a direct hierarchy, not a DAG. If the optional Map later visualizes this same data, a visible Outline/Table remains available with equivalent content and actions.
+This is a direct hierarchy, not a DAG. Icons have shape-distinct accessible
+status names and tooltips; the rows do not repeat status/outcome prose or
+progress/counts. Detailed task, outcome, handoff, and protocol data loads only
+through focused Handoffs/Debug inspection. If the optional Map later visualizes
+this same data, a visible Outline/Table remains available with equivalent
+accessible state semantics and actions.
 
 ## 8. Responsive geometry and panel behavior
 
@@ -433,34 +450,42 @@ Acceptance details:
 
 - A root execution query stays keyed to the root while a child conversation loads.
 - Refreshing any canonical route restores the same workspace, root, effective conversation and derived recipient, focus, and optional handoff. An Execution URL without `conversation` restores the root conversation by definition.
-- Back/Forward does not lose drafts or scroll position and does not re-send actions.
+- Back/Forward does not lose drafts or re-send actions. Destination chat entry
+  initializes at latest/bottom; it does not restore an old mid-transcript
+  position. Manual scroll-up/sticky-bottom behavior resumes after initialization.
 - Invalid required path/focus/handoff IDs render owned Retry/Back/Unavailable state rather than blanking the app; invalid optional Execution `conversation` values visibly fall back to root and are canonicalized with replace.
 
 ### 9.2 Run Navigator and Execution workspace
 
 **Outcome:** replace the overloaded right Run Board with an attention-first view.
 
-Run Navigator sections:
-
-1. **Needs attention:** known failed/done-with-failures/cancelled work, actionable load failures, or explicitly available completion/handoff requiring review. Never infer an outcome from missing data.
-2. **Active:** running/queued delegations and agents, with text + icon status and progress such as `2 of 3`.
-3. **Recent:** bounded known completions from the available page. Until cursor paging exists, label limits (“Recent from loaded delegations”) rather than implying completeness.
+The Agents outline keeps the Needs-attention -> Active -> Recent ordering model
+underneath, but does not render those groups as dashboard headings. The default
+surface is one flat, whitespace-separated outline. Actionable load failures
+remain visible; missing outcomes are never inferred or described.
 
 Row requirements:
 
-- The whole row is one navigation target; no nested buttons.
-- Show status icon **and text**, primary label/role, progress, and known outcome.
-- Use a sibling overflow Menu for actions such as Open conversation, View handoffs, Cancel, or Rerun.
+- The whole child row is one navigation target; active task rows may additionally expose a compact cancel icon.
+- Top-level task rows show one shape-distinct, accessibly named status icon plus
+  the task label; child rows use the short session name and role policy below.
+- Child rows use the existing canonical short session name (`sessionTitle` from
+  already-known/warmed session metadata) as the primary line and role as quiet
+  secondary text. Until metadata is available, show neutral **Agent**—never a
+  sliced technical ID. Do not add per-row requests or a second naming model.
+- The child row's accessible name includes short name, role when present, and
+  status; status remains icon-only visually.
+- Do not show kind labels, status phrases, progress counts, outcome labels, missing-outcome copy, or passive badges/pills.
 - Keep raw IDs, “full,” `readonly_fanout`, and protocol statuses in details/debug, not as primary labels.
-- Do not pulse every active row. A static icon/text treatment is sufficient; reserve motion for the currently observed live operation and honor reduced motion.
-- Use owned Loading/Empty/Error/Retry panels for each section.
+- Do not pulse active rows. Only pending cancellation may spin, and reduced motion remains honored.
+- Use owned Loading/Empty/Error/Retry state only when actionable.
 
 Execution Overview:
 
 - Build a normalized direct hierarchy from the root `delegation.list` response.
 - Outline is authoritative and supports keyboard navigation with ordinary links/buttons; do not prematurely use `role=tree` unless full APG tree keyboard semantics are implemented.
 - Show root -> delegation -> direct agents only.
-- Show a focused details region with task label/role, progress, known outcome/status, handoff availability, and scoped actions.
+- Keep the default outline minimal; task prompts, outcomes, handoffs, and raw metadata belong to focused Handoffs/Debug inspection rather than ambient rows.
 - If `has_more=true`, say that older delegations are not loaded and offer the backend-supported action available at that phase; do not present the outline as complete.
 
 Activity:
@@ -563,7 +588,6 @@ Implementation slices:
 - **Stop** always names or exposes the exact conversation being stopped.
 - **Send guidance** identifies the target agent.
 - **Cancel delegation** states how many agents may be affected and uses AlertDialog when more than one can be affected.
-- **Rerun** identifies the source delegation and handles missing task prompts as an owned error.
 - Show pending state on the initiating control and suppress duplicates per target, not globally.
 - Keep draft input enabled while disconnected, but disable connection-requiring actions with a visible explanation.
 
@@ -588,6 +612,13 @@ Implementation slices:
 - Add a **Jump to latest** / `N new events` affordance when live content arrives while the reader is not sticky-bottom.
 - Preserve current previous/next turn controls as secondary navigation; the new-event affordance solves a different problem.
 - Do not auto-scroll readers who moved away from the bottom.
+- **Dedicated next PR — destination initialization:** root/subagent navigation,
+  direct-link refresh, Back/Forward, and history branch switch initialize the
+  destination transcript at latest/bottom. The Switch dialog opens scrolled to
+  the active/latest target or bottom. After initialization, respect manual
+  scroll-up and sticky-bottom behavior; loading older turns preserves the
+  viewport anchor. This supersedes restoring an old mid-transcript scroll when
+  entering a chat via navigation.
 
 **Code and tools**
 
@@ -638,11 +669,10 @@ rename:session-123
 archive:session-123
 queue-delete:session-123:input-456
 cancel:root-1:delegation-2
-rerun:root-1:delegation-2
 settings:project-7
 ```
 
-Required coverage: rename, archive/unarchive, project/session settings, queue promote/edit/delete/reorder, stop, guidance, delegation cancel, rerun, handoff load, and destructive delete.
+Required coverage: rename, archive/unarchive, project/session settings, queue promote/edit/delete/reorder, stop, guidance, delegation cancel, handoff load, and destructive delete.
 
 **Owned state panels**
 
@@ -700,7 +730,7 @@ Primitive requirements:
 | Disclosure | Button with `aria-expanded` and controlled content. Native `<details>` is reserved for truly binary disclosure. |
 | AsyncButton | Idle/pending/success/error state, duplicate suppression, stable label/width where useful, and `aria-busy`/live copy without focus loss. |
 | IconButton | Required accessible name, target-size contract, tooltip only as enhancement, visible focus. |
-| StatusIcon | Icon plus text/accessible label; forced-colors treatment; no color-only meaning. |
+| StatusIcon | Shape-distinct icon with accessible name/tooltip; forced-colors treatment; visible prose only for actionable state; no color-only meaning. |
 | StatePanel | Owned title, explanation, Retry/action, semantic busy/error state, and no-layout-jump option. |
 | CopyButton | Clipboard fallback/error, copied feedback announced without replacing focus, and explicit copied object label. |
 | Combobox | APG keyboard/focus semantics, stable active option, no nested interactive option controls. |
@@ -725,11 +755,13 @@ Native `<dialog>` may be evaluated, but it is not a complete primitive by itself
 
 - Shared dialogs/drawers own focus transfer, trap, inert background, Escape, and restoration.
 - Route navigation uses real links and current-page semantics; local tabs follow APG.
-- A Map always has a visible Outline/Table equivalent with the same statuses, labels, and actions.
-- Status is never color-only; labels must remain available at zoom and in forced colors.
-- Batch live announcements into meaningful summaries such as “2 agents updated; 1 needs attention.”
+- A Map always has a visible Outline/Table equivalent with the same accessible state semantics, task/role labels, and actions.
+- Status is never color-only: common state has a distinct shape and accessible name/tooltip; state requiring action also has persistent visible owned copy.
+- Batch live announcements into meaningful summaries such as “Two agent tasks changed.”
 - Do not move DOM focus, reorder the focused row, close a menu, or replace the active option due to live updates.
-- Preserve stable React keys and row positions within attention sections; if an entity changes sections while focused, defer movement until focus leaves or provide a controlled announcement.
+- Preserve stable React keys and row positions within the internally
+  attention-ordered flat list; if an entity's ordering class changes while
+  focused, defer movement until focus leaves or provide a controlled announcement.
 - Meet 40-44px coarse-pointer target rectangles.
 - Verify safe areas, 200-400% zoom/reflow, forced colors, reduced motion, keyboard-only use, and no horizontal page overflow.
 - Fix mobile history first: retain a visible expand/collapse control with a touch-sized hit area, or render alternate descendants expanded when that control cannot fit.
@@ -744,20 +776,23 @@ The following can ship without backend schema changes:
 - Route/state separation.
 - Conversation/Execution IA and responsive shell.
 - Direct root -> delegation -> direct-agent Outline from currently loaded `delegation.list`.
-- Run Navigator sections based only on known loaded statuses/progress.
+- Flat icon-led Agents ordering based only on known loaded state; no visible
+  sections, status/outcome prose, or ambient progress/counts.
 - Live Activity scoped to the current connection and clearly labeled non-retained.
 - On-demand reads for currently known Handoffs.
 - Debug Inspector separation, primitives, semantic rows, contrast, transcript/composer changes, connection gating, and owned async states.
 
-Limitations must be visible: bounded delegation list, direct topology, unknown outcomes where absent, and non-retained live events.
+Limitations must be visible where they change decisions: bounded delegation
+list, direct topology, and non-retained live events. Unknown outcomes are never
+inferred or surfaced as ambient “missing outcome” copy.
 
 ### 10.2 Backend-dependent contracts
 
 | Capability | Proposed contract work | Why it is required | Dependent UI |
 | --- | --- | --- | --- |
-| Complete delegation history | Add cursor-paged `delegation.list` or a new root execution endpoint with stable ordering, `next_cursor`, and filters; remove the 100-row completeness ceiling for pagination. | Current list is bounded/newest-first/per-parent with only `has_more`. | Complete Outline/Recent/Handoffs coverage. |
-| Aggregate root execution projection | If multiple calls are otherwise expensive, add one projection returning root, delegations, direct agents, known attention status, progress, and handoff availability with a projection revision. | Prevent client N+1 and cross-query inconsistency while keeping root pinned. | Run Navigator and Overview convergence. |
-| Delegation metadata | Add created/started/completed/updated timestamps, duration or enough timestamps to compute it, attempt/revision, last-change time, known outcome, and handoff availability metadata. | Current web `Delegation` has no timestamps/revision and list examples leave outcomes/files null. | Exact status recency, duration, safe rerun, attention sorting. |
+| Complete delegation history | Add cursor-paged `delegation.list` or a new root execution endpoint with stable ordering, `next_cursor`, and filters; remove the 100-row completeness ceiling for pagination. | Current list is bounded/newest-first/per-parent with only `has_more`. | Complete Outline/Handoffs coverage without exposing an ambient Recent section. |
+| Aggregate root execution projection | If multiple calls are otherwise expensive, add one projection returning root, delegations, direct agents, known state, cancellation-scope progress, and handoff availability with a projection revision. | Prevent client N+1 and cross-query inconsistency while keeping root pinned. Progress supports scoped cancellation, not ambient row counts. | Run Navigator and Overview convergence. |
+| Delegation metadata | Add created/started/completed/updated timestamps, duration or enough timestamps to compute it, attempt/revision, last-change time, known outcome, and handoff availability metadata. | Current web `Delegation` has no timestamps/revision and list examples leave outcomes/files null. | Detail inspection and internal ordering; ambient rows remain icon + task/role only. |
 | Change notification | Emit a root/delegation projection-change event containing root/parent ID and new revision, or a lightweight invalidation topic. | Current UI infers invalidation from subagent events and polls. | Efficient stable Run Navigator/Outline updates. |
 | Durable execution events | Store/query timestamped normalized execution events with cursor pagination and stable IDs; define retention. Include event timestamp, root, entity ref, event kind, user-safe summary fields, and technical detail reference. | Reconnect events are not history and clear after idle. | Retained Activity timeline and deep links. |
 | Handoff index | Return typed handoff metadata (kind, agent, delegation, availability, created/updated time, size, content type, safe display name) separately from content. | Current API reads one known file but does not provide a complete durable index. | Complete Handoffs list, filters, safe loading. |
@@ -828,7 +863,8 @@ Deliverables, in priority order:
 5. Add persistent connection/retry banner and owned Error/Retry panels for key queries.
 6. Distinguish no data/no matches/archived hidden/load failure.
 7. Raise actionable microtext and coarse-pointer targets.
-8. Add status text/icon pairing and forced-colors basics.
+8. Add shape-distinct, accessibly named status icons and forced-colors basics;
+   do not add ambient visible status prose to Agents rows.
 
 Exit gate:
 
@@ -861,7 +897,9 @@ Exit gate:
 - Root and conversation can differ without changing the root execution query.
 - Conversation and Execution deep links—including absent, valid non-root, and invalid Execution `conversation` queries—pass refresh, canonicalization, and Back/Forward browser tests.
 - Focus-only changes never alter the effective conversation or recipient; explicit Message/Open conversation actions navigate to Conversation.
-- Drafts and scroll survive route transitions.
+- Drafts survive route transitions. A dedicated next PR makes every destination
+  chat entry start at latest/bottom while preserving manual scroll behavior
+  after initialization.
 - Mutation-target safety tests prove selection/focus changes cannot retarget an in-flight action.
 - Overlay background inerting and focus restoration pass.
 
@@ -878,7 +916,9 @@ Deliverables:
 - Route-backed Conversation and Execution destinations.
 - Execution Overview/Activity/Handoffs route structure.
 - Authoritative direct hierarchy Outline with honest completeness labels.
-- Attention-oriented Run Navigator with Needs attention / Active / Recent.
+- Minimal flat icon-led Agents outline using Needs-attention / Active / Recent
+  only as internal ordering, with no visible headings, kind/status/outcome
+  phrases, progress/counts, or passive badges.
 - New responsive geometry: compact below 1000px, two-pane medium from 1000-1439px, and conditional three-pane wide from 1440px with measured center-fit fallbacks.
 - Debug Inspector moved to separate drawer/command.
 - Initial Live Activity explanation/state and currently known Handoffs access.
@@ -908,7 +948,7 @@ Deliverables:
 - Combined model/reasoning Popover.
 - Header actions Menu and command-palette actions.
 - Queue count/tray with desktop Popover/mobile Sheet and row Menus.
-- Scoped Stop/Send guidance/Cancel/Rerun with confirmations and per-entity pending states.
+- Scoped Stop/Send guidance/Cancel with confirmations and per-entity pending states. Delegated-work restart is explicitly excluded.
 - Wider project settings, future-session semantics, and delete-empty-project action.
 - Task-centered terminology pass with raw terms retained in debug/details.
 - Persistent per-entity mutation failures and Archive Undo.
@@ -963,7 +1003,8 @@ Deliverables:
 - Cursor-paged complete delegation/root execution history.
 - Projection revisions and change notifications.
 - Durable timestamped execution events.
-- Delegation timestamps, duration inputs, outcome, revision/attempt, and handoff availability.
+- Delegation timestamps, duration inputs, outcome, revision/attempt, and handoff
+  availability for explicit detail views and internal ordering, not ambient rows.
 - Handoff metadata index and complete Handoffs browsing.
 - Upgrade Live Activity to retained Activity only after durable data is deployed and capability-negotiated.
 
@@ -972,7 +1013,8 @@ Exit gate:
 - Pagination tests prove no gaps/duplicates under concurrent updates.
 - Activity survives disconnect, daemon restart, and idle event-buffer clearing.
 - Every retained event displays a backend timestamp.
-- Run Navigator/Outline/Handoffs communicate complete versus filtered results correctly.
+- Run Navigator/Outline/Handoffs communicate complete versus filtered results
+  correctly without adding ambient row counts/status/outcome prose.
 - Old-daemon fallback remains honest and usable.
 
 ### Phase 7 — Optional Map and advanced graph
@@ -1046,7 +1088,11 @@ Parallel opportunities:
 - Root execution remains stable while conversation subject and focus change independently; recipient always follows the validated conversation and never execution focus.
 - Every action visibly communicates and immutably captures its target.
 - Conversation and Execution deep links restore the effective conversation and derived recipient on refresh; absent Execution `conversation` means root.
-- Needs attention / Active / Recent rows show text + icon status, known progress/outcomes, and use full-row navigation.
+- Agents task rows show one shape-distinct accessible status icon plus task.
+  Child rows show canonical short session name as primary text and quiet role
+  underneath, use neutral Agent until metadata warms, and never expose technical
+  IDs. Full-row navigation omits visible group headings, kind/status/outcome
+  phrases, progress/counts, IDs, and passive badges.
 - Technical inspection is separate from the Run Navigator.
 - Outline accurately describes only loaded direct topology and its completeness.
 - Activity fidelity and Handoff types are labeled honestly.
@@ -1058,7 +1104,8 @@ Parallel opportunities:
 - Dialogs/drawers trap/restore focus appropriately and inert the background.
 - Menus, route nav/tabs, popovers, disclosures, comboboxes, list/tree controls, and async actions meet their documented semantics.
 - Live updates neither steal focus nor unexpectedly reorder the focused item.
-- Status/outcome/selection is understandable without color.
+- Visible and announced state/selection is understandable without color;
+  outcomes remain in explicit Handoffs/Debug detail rather than ambient rows.
 - Outline/Table provides parity for any Map.
 - Touch targets meet the agreed coarse-pointer minimum.
 - The app reflows without lost functionality at 200% and 400% zoom and has no page-level horizontal overflow.
@@ -1095,15 +1142,15 @@ This is the required future validation plan; this document does not claim these 
 | --- | --- |
 | Route parser/serializer | Project and Host routes; every workspace/execution view; typed `conversation`/focus/handoff refs; absent-root defaults; canonical default elision; valid non-root round trip; malformed, unknown, and wrong-root conversation fallback with replace; invalid required IDs; legacy fallback. |
 | State reducer | Root/conversation/focus independence; recipient derivation with no independent persistence; explicit Message/Open conversation transition; focus-only replace versus destination/detail push; atomic Back/Forward restore; panel preference constraints. |
-| Mutation capture | Navigate after rename/archive/queue/cancel/rerun/Stop/Send guidance click; response updates only captured target; duplicate suppression per entity. |
+| Mutation capture | Navigate after rename/archive/queue/cancel/Stop/Send guidance click; response updates only captured target; duplicate suppression per entity. |
 | Cache/query keys | Root projection stays keyed to root while child transcript changes; stale revision/session responses no-op. |
-| Run grouping | Needs attention/Active/Recent classification from only known data; unknown outcome; bounded/incomplete labels; stable focused row. |
-| Outline | Direct hierarchy, `has_more`, no children, partial progress, failed/cancelled statuses, keyboard navigation, no DAG copy. |
+| Agents ordering | Needs attention/Active/Recent classification from only known data; flat output without those headings; no inferred/missing-outcome copy; bounded/incomplete state; stable focused row. |
+| Outline | Direct hierarchy, `has_more`, no children, partial server data, exhaustive shape-distinct status glyph mapping including queued/fallback, no ambient progress/outcome prose, keyboard navigation, no DAG copy. |
 | Async panels | Loading, empty, no matches, archived hidden, error, retry, unavailable, live-only. |
 | Primitives | Focus lifecycle, Escape, busy dismissal, outside click, keyboard semantics, ARIA linkage, restoration, nested overlay policy. |
-| Contrast/status | Token pairs in both themes; text/icon status independent of color; forced-colors snapshots where tooling permits. |
+| Contrast/status | Token pairs in both themes; shape/accessibility-name status independent of color; forced-colors snapshots where tooling permits. |
 | History | Alternate branch collapsed/expanded at compact width; every descendant reachable. |
-| Transcript | Show-details order, timestamps, code Copy/expand, new-event count, non-sticky scroll, tool group modes, reduced motion. |
+| Transcript | Show-details order, timestamps, code Copy/expand, new-event count, destination latest/bottom initialization, post-initialization non-sticky scroll, older-page viewport anchoring, tool group modes, reduced motion. |
 | Combobox | Enter/Escape/Tab/arrows, active descendant, no matches, IME/composition safety, screen-reader names. |
 | Queue | State labels, menu actions, revision conflicts, per-row pending/error, desktop Popover/mobile Sheet. |
 
@@ -1132,7 +1179,7 @@ At every relevant width test both light and dark, keyboard and pointer, empty/lo
 3. Open an Execution deep link without `conversation`; verify root conversation/recipient defaults. Open malformed, unknown, and wrong-root values; verify visible root fallback, canonical replace, and no extra Back entry.
 4. Initiate mutation, navigate, receive success/failure; verify no retargeting.
 5. Refresh every canonical deep link, including non-root conversation context and selected handoff.
-6. Back/Forward across roots, conversations, execution views, focus replacements, and pushed details; verify recipient derivation, drafts, and scroll.
+6. Back/Forward across roots, conversations, execution views, focus replacements, and pushed details; verify recipient derivation, drafts, and destination transcript latest/bottom initialization.
 7. Disconnect during drafting and during each mutation class; reconnect/retry without duplicate commit.
 8. Live updates while a row/menu/dialog/combobox option is focused; verify no focus theft or surprise reorder.
 9. Multiple-agent cancellation confirmation and pending state.
@@ -1183,7 +1230,7 @@ Set numeric product thresholds after Phase 0 baseline; correctness/accessibility
 | --- | --- |
 | Misdirected message or mutation | **Zero** known incidents; automated target-capture tests for every mutation. |
 | Draft loss after failed send/navigation | **Zero** in automated scenarios and telemetry-reported recovery failures. |
-| Time from opening a root to locating a failed/blocked agent | Material reduction from baseline; validate Needs attention. |
+| Time from opening a root to locating a failed/blocked agent | Material reduction from baseline; validate icon semantics and internal attention ordering without headings. |
 | Steps/time to open an agent conversation and return to execution focus | Material reduction from baseline. |
 | Route restoration success | 100% in canonical-route test suite. |
 | Blocking load errors with visible Retry | 100% of owned query surfaces. |
@@ -1192,7 +1239,7 @@ Set numeric product thresholds after Phase 0 baseline; correctness/accessibility
 | Unexpected focus movement during live update | Zero in interaction suite/manual scenarios. |
 | Center under minimum due to auto-open pane | Zero at matrix widths/zoom. |
 | Transcript interaction latency | No regression beyond Phase 0 budget; virtualization remains measurement-driven. |
-| Queue/cancel/rerun duplicate requests | Zero duplicates from repeated activation while target is pending. |
+| Queue/cancel duplicate requests | Zero duplicates from repeated activation while target is pending. |
 
 ### 15.2 Proposed privacy-safe instrumentation
 
@@ -1268,7 +1315,7 @@ Use existing configuration/flag infrastructure if present; do not create a perma
 | Route migration loses resume/drafts | User work loss | URL-first/legacy fallback, preserve existing draft/scroll keys, migration tests, staged telemetry. |
 | Bounded backend data looks complete | Misleading execution decisions | Visible incomplete labels, `has_more` state, no global totals until backend supports them. |
 | Live Activity is mistaken for history | Lost trust after refresh | Heading “Live Activity,” retained-data explanation, never cache/synthesize as durable. |
-| Attention section churn moves focus | Accessibility and control errors | Stable keys/order, defer focused-row movement, batch updates and announcements. |
+| Attention-order churn moves focus | Accessibility and control errors | Stable keys/order, defer focused-row movement, batch updates and announcements. |
 | Overlay proliferation regresses focus | Keyboard/screen-reader traps | Shared primitives, overlay stack policy, initial/restore focus tests before adoption. |
 | New two-/three-pane thresholds fail on real laptops/zoom | Cramped center | Preferred/hard geometry rules, 899/900/999/1000/1366/1439/1440 and zoom tests, compact/overlay fallback, and no auto-open below a minimum. |
 | Contrast correction loses Gruvbox feel | Aesthetic rejection | Prototype a small set of token candidates in both themes; validate before global mapping. |
@@ -1297,13 +1344,13 @@ These are bounded decisions, not reasons to defer the architecture:
 | ID | Recommendation / required outcome | Primary phase(s) | Verification |
 | --- | --- | --- | --- |
 | R01 | Preserve progressive transcript disclosure and controlled tool detail | 0, 5 | Component/interaction regression tests |
-| R02 | Preserve per-session drafts, scroll, stale-response guards, warm cache | 0, 2, 5 | State, routing, long-transcript tests |
+| R02 | Preserve per-session drafts, stale-response guards, warm cache, and post-initialization scroll safety | 0, 2, 5 | State, routing, long-transcript tests |
 | R03 | Keep Gruvbox, Geist/Space Grotesk, light/dark, reduced motion | 1, 5 | Visual/contrast/motion matrix |
 | R04 | Split root, conversation, execution focus, and mutation target; derive recipient only from conversation | 2 | Reducer, recipient-derivation, and in-flight retarget tests |
 | R05 | Route-backed Conversation and Execution with typed Execution `conversation`, canonical defaults, validation, and push/replace semantics | 2, 3 | Deep-link/refresh/canonicalization/Back/Forward tests |
 | R06 | Execution has Overview, Activity, Handoffs; Overview has Outline first | 3 | Route and IA tests |
 | R07 | Do not call direct topology a DAG | 3, 7 | Copy review and fixtures |
-| R08 | Replace Run Board with Needs attention / Active / Recent Run Navigator | 3 | Navigation/status tests and old-board removal gate |
+| R08 | Replace Run Board with a flat icon-led Agents outline; child rows use canonical short session name over quiet role with neutral Agent fallback; Needs-attention / Active / Recent are internal ordering only; forbid visible headings, kind/status/outcome phrases, ambient progress/counts, technical IDs, and passive badges | 3 | Warm-name/fallback/update tests, exhaustive status-to-Lucide-glyph semantics (including queued/fallback), forbidden-copy, navigation, and flat-list style tests |
 | R09 | Separate Debug Inspector | 3 | Command/menu and focus-restore tests |
 | R10 | Honest bounded/newest-first/per-parent handling | 3, 6 | `has_more` states and pagination tests |
 | R11 | Live Activity before durable retained Activity | 3, 6 | Copy/capability tests and restart scenario |
@@ -1318,7 +1365,7 @@ These are bounded decisions, not reasons to defer the architecture:
 | R20 | Combined model/reasoning Popover | 4 | Keyboard/state/locking tests |
 | R21 | Header actions plus retained slash commands | 4 | Menu, command palette, slash tests |
 | R22 | Compact queue tray, row menus, labels, supported Undo only | 4, 5, 6 | Desktop/mobile/revision/Undo tests |
-| R23 | Scoped Stop/Guidance/Cancel/Rerun, confirmation, pending | 4 | Target capture and multi-agent AlertDialog tests |
+| R23 | Scoped Stop/Guidance/Cancel, confirmation, pending; no delegated-work restart | 4 | Target capture, multi-agent AlertDialog, and no-rerun source guard tests |
 | R24 | Project future-session semantics and delete-empty-project | 4 | Copy, success, `project_not_empty` tests |
 | R25 | Persistent connection banner and owned state panels | 1, 4 | Offline/retry/state distinction tests |
 | R26 | Shared accessible primitives and complete modality contracts | 1, 2 | Unit a11y + manual AT |
@@ -1344,7 +1391,7 @@ These are bounded decisions, not reasons to defer the architecture:
 | R46 | Complete cursor-paged delegation history | 6 | Store/API pagination tests |
 | R47 | Aggregate root projection if needed, with revisions/change event | 6 | Contract/load/convergence tests |
 | R48 | Durable timestamped execution events | 6 | Idle/reconnect/restart tests |
-| R49 | Delegation timestamps/duration/revision/outcome | 6 | Contract and UI rendering tests |
+| R49 | Delegation timestamps/duration/revision/outcome for explicit detail/internal ordering, not ambient Agents rows | 6 | Contract, detail rendering, and forbidden ambient-copy tests |
 | R50 | General artifact metadata only if scope expands | Deferred | Product/API review gate |
 | R51 | Actual nesting/dependency edges before true graph/DAG | 7/deferred | Backend consistency tests |
 | R52 | Ctrl/Cmd+K command palette | 2, 4 | Keyboard/navigation tests |
@@ -1352,6 +1399,7 @@ These are bounded decisions, not reasons to defer the architecture:
 | R54 | Metrics, observability, rollout flags, migration, rollback | 0-7 | Dashboard and rollout checklist |
 | R55 | No duplicate authoritative run surfaces | 3 | Feature-flag/product-path audit |
 | R56 | No wholesale rebrand or premature graph/durable timeline claims | All | Design/content review |
+| R57 | Destination chat entry starts at latest/bottom for root/subagent navigation, direct-link refresh, Back/Forward, and branch switch; Switch dialog opens at active/latest or bottom; later manual scroll/sticky behavior and older-turn viewport anchors remain stable. This supersedes old mid-transcript restoration on navigation. | Dedicated next PR, then 5 | Route/refresh/Back/Forward/branch-switch interaction tests plus viewport-anchor tests |
 
 ## 20. Overall Definition of Done
 

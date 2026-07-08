@@ -95,11 +95,6 @@
 	--elev-pop: 0 12px 40px color-mix(in oklch, var(--foreground) 14%, transparent);
 }
 
-.chip-button:disabled {
-	cursor: not-allowed;
-	opacity: 0.55;
-}
-
 .queue-blocked-reason,
 .history-blocked-reason {
 	margin: 7px 10px 0;
@@ -374,46 +369,7 @@ pre {
 	border-bottom: 1px solid var(--border);
 }
 
-.activity-counts {
-	display: flex;
-	flex-wrap: wrap;
-	min-width: 0;
-	gap: 6px;
-}
-
-.activity-chip {
-	display: inline-flex;
-	align-items: center;
-	gap: 5px;
-	font-family: var(--font-sans);
-	font-size: var(--text-2xs);
-	font-weight: 500;
-	letter-spacing: 0;
-	text-transform: lowercase;
-	color: var(--muted-foreground);
-}
-
-.activity-chip.running {
-	border-color: color-mix(in oklch, var(--primary) 35%, var(--border));
-	color: var(--primary);
-}
-
-.activity-chip.idle {
-	border-color: color-mix(in oklch, var(--success) 35%, var(--border));
-	color: var(--success);
-}
-
-.activity-chip.archived {
-	border-color: var(--border);
-}
-
-.activity-chip .count {
-	color: var(--foreground);
-	font-variant-numeric: tabular-nums;
-}
-
 .connection-pill,
-.activity-chip,
 .session-state {
 	border: 1px solid var(--border);
 	border-radius: 999px;
@@ -531,16 +487,7 @@ pre {
 	font-size: var(--text-xs);
 }
 
-.project-main {
-	display: flex;
-	min-width: 0;
-	flex: 1;
-	flex-direction: column;
-	gap: 1px;
-}
-
-.project-title,
-.project-cwd {
+.project-title {
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
@@ -551,10 +498,27 @@ pre {
 	font-weight: 600;
 }
 
-.project-cwd {
-	font-family: var(--font-sans);
-	font-size: var(--text-xs);
+.project-folder-count {
+	position: relative;
+	display: inline-flex;
+	width: 24px;
+	height: 22px;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: center;
 	color: var(--muted-foreground);
+}
+
+.project-folder-count > span {
+	position: absolute;
+	inset: 8px 0 auto;
+	overflow: hidden;
+	color: var(--foreground);
+	font-size: var(--text-xs);
+	font-weight: 700;
+	line-height: 0.8;
+	text-align: center;
+	text-overflow: clip;
 }
 
 .toolbar-actions {
@@ -721,8 +685,8 @@ pre {
 	overflow: hidden;
 }
 
-/* `.status-rail` is the sidebar session-row activity bar. Agent rows use an icon
- * plus visible status copy, so only the sidebar modifiers remain here. */
+/* `.status-rail` is the sidebar session-row activity bar. Agent rows use
+ * shape-distinct icons with accessible names, so these modifiers stay scoped. */
 .status-rail {
 	width: 3px;
 	align-self: stretch;
@@ -764,13 +728,11 @@ pre {
 }
 
 .session-sub,
-.session-leaf,
 .muted {
 	color: var(--muted-foreground);
 }
 
-.session-sub,
-.session-leaf {
+.session-sub {
 	font-size: var(--text-xs);
 }
 
@@ -3561,45 +3523,9 @@ pre {
 	gap: 0;
 }
 
-.run-board-group {
+.run-board-outline {
 	display: flex;
 	flex-direction: column;
-	gap: 0;
-}
-
-.run-board-group + .run-board-group {
-	border-top: 1px solid var(--border);
-}
-
-.run-board-group > h2 {
-	margin: 0;
-	padding: 10px 12px 7px;
-	color: var(--muted-foreground);
-	font-family: var(--font-sans);
-	font-size: var(--text-xs);
-	font-weight: 600;
-	letter-spacing: 0.02em;
-	text-transform: uppercase;
-}
-
-.run-board-group.needs-attention > h2 {
-	color: var(--destructive);
-}
-
-.run-board-group.active > h2 {
-	color: var(--primary);
-}
-
-.run-board-group-items {
-	display: flex;
-	flex-direction: column;
-}
-
-.run-board-group-empty {
-	margin: 0;
-	padding: 0 12px 10px;
-	color: var(--muted-foreground);
-	font-size: var(--text-xs);
 }
 
 .run-board-delegation {
@@ -3607,7 +3533,7 @@ pre {
 	min-width: 0;
 	flex-direction: column;
 	border-top: 1px solid color-mix(in oklch, var(--border) 72%, transparent);
-	padding: 10px 12px 8px;
+	padding: 9px 12px 7px;
 }
 
 .run-board-delegation:first-child {
@@ -3617,24 +3543,9 @@ pre {
 .run-board-delegation-head {
 	display: grid;
 	grid-template-columns: 18px minmax(0, 1fr) auto;
-	align-items: start;
+	align-items: center;
 	gap: 7px;
 	min-width: 0;
-}
-
-.run-board-delegation-summary {
-	display: flex;
-	min-width: 0;
-	flex-direction: column;
-	gap: 3px;
-}
-
-.run-board-delegation-title-row {
-	display: flex;
-	min-width: 0;
-	align-items: baseline;
-	flex-wrap: wrap;
-	gap: 3px 7px;
 }
 
 .run-board-delegation-title {
@@ -3646,35 +3557,7 @@ pre {
 	white-space: nowrap;
 }
 
-.run-board-delegation-kind {
-	color: var(--muted-foreground);
-	font-size: var(--text-xs);
-}
-
-.run-board-delegation-meta {
-	display: flex;
-	min-width: 0;
-	align-items: baseline;
-	flex-wrap: wrap;
-	gap: 2px 5px;
-	color: var(--muted-foreground);
-	font-size: var(--text-xs);
-	line-height: 1.35;
-}
-
-.run-board-status-text {
-	color: var(--foreground);
-	font-weight: 600;
-	text-transform: capitalize;
-}
-
-.run-board-progress {
-	min-width: 0;
-	overflow-wrap: anywhere;
-	font-variant-numeric: tabular-nums;
-}
-
-/* Agent status icons supplement adjacent text; they never carry status alone. */
+/* Shape and accessible text carry status; color is only supplementary. */
 .run-board-status-icon {
 	flex: 0 0 auto;
 	display: inline-flex;
@@ -3689,8 +3572,7 @@ pre {
 	color: var(--primary);
 }
 
-.run-board-status-icon.done,
-.run-board-status-icon.idle {
+.run-board-status-icon.done {
 	color: var(--success);
 }
 
@@ -3709,32 +3591,47 @@ pre {
 
 .run-board-delegation-controls {
 	display: flex;
-	flex-wrap: wrap;
 	justify-content: flex-end;
-	gap: 6px;
 }
 
 .run-board-blocked-reason {
 	grid-column: 2 / -1;
 	justify-self: end;
-	margin-top: 3px;
 }
 
 .run-board-cancel {
-	border-color: color-mix(in oklch, var(--destructive) 44%, var(--border));
+	display: inline-flex;
+	width: 28px;
+	height: 28px;
+	align-items: center;
+	justify-content: center;
+	border: 0;
+	border-radius: var(--radius-sm);
+	background: transparent;
 	color: var(--destructive);
+	cursor: pointer;
 }
 
-.run-board-delegation-outcome,
+.run-board-cancel:hover,
+.run-board-cancel:focus-visible {
+	background: color-mix(in oklch, var(--destructive) 10%, transparent);
+}
+
+.run-board-cancel:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
+}
+
+.run-board-cancel:disabled {
+	cursor: not-allowed;
+	opacity: 0.55;
+}
+
 .run-board-action-error {
 	margin: 6px 0 0 25px;
 	font-size: var(--text-xs);
 	line-height: 1.4;
 	overflow-wrap: anywhere;
-}
-
-.run-board-delegation-outcome {
-	color: var(--foreground);
 }
 
 .run-board-action-error {
@@ -3749,39 +3646,31 @@ pre {
 	margin-top: 2px;
 }
 
-.chip-button {
-	display: inline-flex;
-	align-items: center;
-	gap: 4px;
-	border: 1px solid var(--border);
-	border-radius: var(--radius-sm);
+.run-board-toggle {
+	align-self: flex-start;
+	margin: 7px 12px 10px;
+	border: 0;
 	background: transparent;
-	padding: 2px 8px;
-	font-size: var(--text-xs);
-	color: var(--foreground);
+	padding: 4px 0;
+	color: var(--primary);
+	font-size: var(--text-sm);
 	cursor: pointer;
 }
 
-.chip-button:hover,
-.chip-button:focus-visible {
-	border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
-	color: var(--primary);
+.run-board-toggle:hover,
+.run-board-toggle:focus-visible {
+	text-decoration: underline;
 }
 
-.chip-button:focus-visible {
+.run-board-toggle:focus-visible {
 	outline: 2px solid var(--ring);
 	outline-offset: 2px;
-}
-
-.run-board-toggle {
-	align-self: flex-start;
-	margin: 10px 12px 12px;
 }
 
 .run-board-subagents {
 	display: flex;
 	flex-direction: column;
-	margin: 8px 0 0 25px;
+	margin: 5px 0 0 25px;
 	border-left: 1px solid var(--border);
 }
 
@@ -3801,7 +3690,7 @@ pre {
 	border: 0;
 	border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 	background: transparent;
-	padding: 7px 7px 7px 9px;
+	padding: 6px 7px 6px 9px;
 	color: inherit;
 	text-align: left;
 	cursor: pointer;
@@ -3826,7 +3715,7 @@ pre {
 	display: flex;
 	width: 100%;
 	min-width: 0;
-	align-items: center;
+	align-items: flex-start;
 	gap: 6px;
 }
 
@@ -3838,22 +3727,23 @@ pre {
 	gap: 1px;
 }
 
+.run-board-subagent-name,
 .run-board-subagent-role {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.run-board-subagent-name {
 	font-size: var(--text-md);
 	font-weight: 500;
-	overflow-wrap: anywhere;
 }
 
-.run-board-subagent-status,
-.run-board-subagent-outcome {
+.run-board-subagent-role {
 	color: var(--muted-foreground);
 	font-size: var(--text-xs);
-	line-height: 1.35;
-	overflow-wrap: anywhere;
-}
-
-.run-board-subagent-status {
-	text-transform: capitalize;
+	font-weight: 400;
 }
 
 .run-board-load-error {
@@ -3878,29 +3768,22 @@ pre {
 
 @container (max-width: 380px) {
 	.run-board-delegation-head {
-		grid-template-columns: 18px minmax(0, 1fr);
-	}
-
-	.run-board-delegation-controls,
-	.run-board-blocked-reason {
-		grid-column: 2;
-		justify-self: start;
-	}
-
-	.run-board-delegation-controls {
-		justify-content: flex-start;
-		margin-top: 3px;
+		grid-template-columns: 18px minmax(0, 1fr) auto;
 	}
 }
 
 @media (pointer: coarse) {
-	.run-board-delegation-controls .chip-button,
+	.run-board-cancel,
 	.run-board-toggle,
 	.run-board-subagent-button,
 	.cancel-delegation-dialog .primary-button,
 	.cancel-delegation-dialog .secondary-button,
 	.cancel-delegation-dialog .plain-close-button {
 		min-height: 44px;
+	}
+
+	.run-board-cancel {
+		width: 44px;
 	}
 
 	.cancel-delegation-dialog .plain-close-button {

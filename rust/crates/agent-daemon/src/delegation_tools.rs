@@ -1254,11 +1254,11 @@ fn resolve_handoff_file_path(
     Ok(path)
 }
 
-/// Read one handoff file for the run board. The web client cannot read host
-/// files directly; this is the only path through which it reaches the handoff
-/// subtree, and it is scoped to the parent (the delegation must belong to it,
-/// exactly like `delegation.status`) and traversal-safe (every segment is
-/// validated).
+/// Read one handoff file for product inspection. The web client cannot read
+/// host files directly; this is the only path through which it reaches the
+/// handoff subtree, and it is scoped to the parent (the delegation must belong
+/// to it, exactly like `delegation.status`) and traversal-safe (every segment
+/// is validated).
 pub(crate) async fn read_handoff_file_core(
     state: &AppState,
     parent_session_id: &str,
@@ -1514,8 +1514,8 @@ fn list_subagent_status(
     }
 }
 
-/// Per-parent delegation list for the run board: a bounded newest-first page
-/// with compact subagent rows. (The model-facing tool surface has no list.)
+/// Per-parent delegation list for the product Agents outline: a bounded
+/// newest-first page with compact subagent rows. (The model tool surface has no list.)
 pub(crate) async fn rpc_list(
     state: &AppState,
     params: Value,

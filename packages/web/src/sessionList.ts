@@ -2,11 +2,10 @@ import type { Activity, Project, SessionSummary } from "./types.ts";
 
 export type SessionListItem = SessionSummary;
 export type SessionDisplayInfo = Pick<SessionSummary, "session_id" | "project_id" | "activity" | "active_leaf_id" | "provider" | "metadata">;
-export type SessionDisplayActivity = "idle" | "running";
 
-export function sessionTitle(session: SessionDisplayInfo): string {
+export function sessionTitle(session: SessionDisplayInfo, fallback = "Untitled session"): string {
 	const title = session.metadata?.title;
-	return typeof title === "string" && title.trim() ? title : session.session_id.slice(0, 13);
+	return typeof title === "string" && title.trim() ? title : fallback;
 }
 
 export function isArchivedSession(session: SessionDisplayInfo): boolean {
@@ -41,40 +40,17 @@ function sortableLastUserMessageTimestamp(session: SessionListItem): number {
 	return typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : -Infinity;
 }
 
-export function sessionDisplayActivity(session: SessionDisplayInfo): SessionDisplayActivity {
-	return displayActivity(session.activity);
-}
-
-export function displayActivity(activity: Activity): SessionDisplayActivity {
-	return activity === "idle" ? "idle" : "running";
-}
-
 export type SessionStatus = "idle" | "running" | "delegating";
 
 /** Three-state status for a session whose running-delegation signal is known
  * (currently only the selected session). `delegating` = parent parked but
- * subagents in flight.
- *
- * The sidebar rows / activity-count tally still use the binary
- * `displayActivity`/`tallyActivities` above, because they only have
- * `SessionSummary` (no delegation data). A sidebar-wide three-state version
- * awaits a `SessionSummary.has_running_delegations` backend field. */
+ * subagents in flight. */
 export function sessionStatusWithDelegations(activity: Activity, hasRunningDelegations: boolean): SessionStatus {
 	if (activity !== "idle") return "running"; // parent itself running (or queued)
 	return hasRunningDelegations ? "delegating" : "idle";
 }
 
-export function tallyActivities(sessions: SessionListItem[]): Record<SessionDisplayActivity, number> {
-	return sessions.reduce<Record<SessionDisplayActivity, number>>(
-		(counts, session) => {
-			counts[sessionDisplayActivity(session)] += 1;
-			return counts;
-		},
-		{ idle: 0, running: 0 }
-	);
-}
-
 export function projectTitle(project: Project): string {
 	const name = project.name.trim();
-	return name || project.project_id.slice(0, 8);
+	return name || "Untitled project";
 }

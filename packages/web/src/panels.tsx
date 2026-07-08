@@ -2,17 +2,22 @@ import {
 	Archive,
 	ArchiveRestore,
 	ArrowUp,
+	Ban,
 	Bot,
+	CircleCheck,
 	CircleAlert,
+	CircleDashed,
+	CircleHelp,
+	CircleX,
+	Clock3,
 	Folder,
 	Loader2,
-	Network,
 	PanelRightOpen,
 	Plus,
-	RotateCcw,
 	Search,
 	Square,
 	SquarePen,
+	TriangleAlert,
 	Trash2,
 	X
 } from "lucide-react";
@@ -36,22 +41,17 @@ import {
 	projectTitle,
 	sessionStatusWithDelegations,
 	sessionTitle,
-	type SessionDisplayActivity,
 	type SessionStatus,
 	type SessionListItem
 } from "./sessionList.ts";
 import { truncate } from "./text.ts";
 import {
-	canReRunDelegation,
-	delegationKindLabel,
-	delegationOutcomeText,
-	formatDelegationProgress,
+	agentStatusIconKey,
 	groupDelegations,
 	isDelegationRunning,
-	delegationStatusLabel,
 	remainingDelegationWorkCount,
-	statusRailClass,
-	subagentOutcomeText,
+	statusIconClass,
+	type AgentStatusIconKey,
 } from "./delegationBoard.ts";
 import type {
 	Notice,
@@ -62,16 +62,6 @@ import type {
 	DelegationSubagent,
 	ToolListing,
 } from "./types.ts";
-
-function projectWorkspaceSummary(project: Project): string {
-	return project.workspaces
-		.map((workspace) =>
-			(workspace.kind ?? "git") === "local"
-				? `${workspace.workspace_dir}: local ${workspace.source_path ?? ""}`
-				: `${workspace.workspace_dir}: git ${workspace.remote_url ?? ""}#${workspace.remote_branch ?? ""}`,
-		)
-		.join("\n");
-}
 
 export function SidebarHeader({
 	connection,
@@ -98,12 +88,12 @@ export function SidebarHeader({
 export interface RunBoardCallbacks {
 	onSelectSession?: (sessionId: string) => void;
 	onCancelDelegation: (parentSessionId: string, delegationId: string) => void | Promise<void>;
-	onReRunDelegation: (parentSessionId: string, delegation: Delegation) => void | Promise<void>;
 }
 
 interface RunBoardProps extends RunBoardCallbacks {
 	parentSessionId: string | null;
 	delegations: Delegation[];
+	subagentNames: ReadonlyMap<string, string>;
 	hasMoreDelegations: boolean;
 	loading: boolean;
 	error: string | null;
@@ -120,6 +110,7 @@ interface RunBoardProps extends RunBoardCallbacks {
 
 const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
 const RUN_BOARD_EXPANDED_DELEGATION_COUNT = 100;
+const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
 
 export function subagentStatusLabel(subagent: DelegationSubagent): string {
 	const status = typeof subagent.status === "string" ? subagent.status : "idle";
@@ -127,24 +118,48 @@ export function subagentStatusLabel(subagent: DelegationSubagent): string {
 	return status.replaceAll("_", " ");
 }
 
+function AgentStatusIcon({ status }: { status: string }) {
+	const label = status === "done_with_failures" ? "done with failures" : status.replaceAll("_", " ");
+	const iconKey = agentStatusIconKey(status);
+	const icons = {
+		running: Loader2,
+		done: CircleCheck,
+		"done-with-failures": TriangleAlert,
+		failed: CircleX,
+		cancelled: Ban,
+		queued: Clock3,
+		idle: CircleDashed,
+		unknown: CircleHelp,
+	} satisfies Record<AgentStatusIconKey, typeof Loader2>;
+	const Icon = icons[iconKey];
+	return (
+		<span
+			className={`run-board-status-icon ${statusIconClass(status)}`}
+			data-status-icon={iconKey}
+			role="img"
+			aria-label={`${label} status`}
+			title={label}
+		>
+			<Icon size={16} aria-hidden />
+		</span>
+	);
+}
+
 function SubagentRow({
 	subagent,
+	displayName,
 	selected,
 	onSelectSession,
 }: {
 	subagent: DelegationSubagent;
+	displayName: string;
 	selected: boolean;
 	onSelectSession?: (sessionId: string) => void;
 }) {
 	const status = typeof subagent.status === "string" ? subagent.status : "idle";
 	const statusLabel = subagentStatusLabel(subagent);
-	const activityLabel =
-		typeof subagent.activity === "string" && subagent.activity !== status
-			? ` · activity ${subagent.activity.replaceAll("_", " ")}`
-			: "";
-	const outcome = subagentOutcomeText(subagent);
-	const role = subagent.role?.trim() || subagent.id.slice(0, 13);
-	const accessibleOutcome = outcome ? `, ${outcome}` : "";
+	const role = subagent.role?.trim() || null;
+	const accessibleRole = role ? `, ${role}` : "";
 	return (
 		<div className="run-board-subagent" role="listitem">
 			<button
@@ -152,23 +167,13 @@ function SubagentRow({
 				type="button"
 				onClick={() => onSelectSession?.(subagent.id)}
 				aria-current={selected ? "page" : undefined}
-				aria-label={`Open agent ${role}, ${statusLabel}${activityLabel}${accessibleOutcome}`}
-				title={`open ${subagent.id}`}
+				aria-label={`Open agent ${displayName}${accessibleRole}, ${statusLabel}`}
 			>
 				<span className="run-board-subagent-main">
-					<span
-						className={`run-board-status-icon ${statusRailClass(status)}`}
-						title={statusLabel}
-						aria-hidden="true"
-					>
-						<Bot size={16} aria-hidden />
-					</span>
+					<AgentStatusIcon status={status} />
 					<span className="run-board-subagent-copy">
-						<span className="run-board-subagent-role">{role}</span>
-						<span className="run-board-subagent-status">
-							{statusLabel}{activityLabel}
-						</span>
-						{outcome ? <span className="run-board-subagent-outcome">{outcome}</span> : null}
+						<span className="run-board-subagent-name">{displayName}</span>
+						{role ? <span className="run-board-subagent-role">{role}</span> : null}
 					</span>
 				</span>
 			</button>
@@ -176,10 +181,8 @@ function SubagentRow({
 	);
 }
 
-type DelegationPendingAction = "cancel" | "rerun";
-
 interface DelegationActionState {
-	pending: DelegationPendingAction | null;
+	pending: boolean;
 	error: string | null;
 }
 
@@ -189,82 +192,49 @@ function actionErrorMessage(error: unknown): string {
 
 function DelegationCard({
 	delegation,
-	canReRun,
+	subagentNames,
 	selectedSessionId,
 	actionState,
 	onSelectSession,
 	onRequestCancel,
-	onRequestReRun,
 	mutationBlockedReason,
 }: {
 	delegation: Delegation;
-	canReRun: boolean;
+	subagentNames: ReadonlyMap<string, string>;
 	selectedSessionId?: string | null;
 	actionState?: DelegationActionState;
 	onRequestCancel: (delegation: Delegation) => void;
-	onRequestReRun: (delegation: Delegation) => void;
 	mutationBlockedReason?: string | null;
 } & Pick<RunBoardCallbacks, "onSelectSession">) {
 	const running = isDelegationRunning(delegation);
-	const title = delegation.label ?? delegation.workflow ?? delegation.delegation_id.slice(0, 13);
-	const statusLabel = delegationStatusLabel(delegation.status);
-	const kindLabel = delegationKindLabel(delegation.kind);
-	const KindIcon = delegation.kind === "full" ? SquarePen : Network;
-	const outcome = delegationOutcomeText(delegation);
-	const pending = actionState?.pending ?? null;
-	const actionDisabled = pending !== null || !!mutationBlockedReason;
+	const title = delegation.label?.trim() || "Agent task";
+	const statusLabel = delegation.status === "done_with_failures"
+		? "done with failures"
+		: delegation.status.replaceAll("_", " ");
+	const pending = actionState?.pending ?? false;
+	const actionDisabled = pending || !!mutationBlockedReason;
 	return (
-		<article className="run-board-delegation" aria-label={`${title}, ${kindLabel}, ${statusLabel}`}>
+		<article className="run-board-delegation" aria-label={`${title}, ${statusLabel}`}>
 			<div className="run-board-delegation-head">
-				<span
-					className={`run-board-status-icon ${statusRailClass(delegation.status)}`}
-					title={statusLabel}
-					aria-hidden="true"
-				>
-					<KindIcon size={16} aria-hidden />
-				</span>
-				<div className="run-board-delegation-summary">
-					<div className="run-board-delegation-title-row">
-						<strong className="run-board-delegation-title">{title}</strong>
-						<span className="run-board-delegation-kind">{kindLabel}</span>
-					</div>
-					<div className="run-board-delegation-meta">
-						<span className="run-board-status-text">{statusLabel}</span>
-						<span aria-hidden="true">·</span>
-						<span className="run-board-progress">{formatDelegationProgress(delegation)}</span>
-					</div>
-				</div>
+				<AgentStatusIcon status={delegation.status} />
+				<strong className="run-board-delegation-title">{title}</strong>
 				<div className="run-board-delegation-controls">
 					{running ? (
 						<button
-							className="chip-button run-board-cancel"
+							className="run-board-cancel"
 							type="button"
 							disabled={actionDisabled}
-							aria-busy={pending === "cancel"}
+							aria-busy={pending}
+							aria-label={pending ? "Cancelling…" : "Cancel"}
 							onClick={() => onRequestCancel(delegation)}
 							title="Cancel this delegated work"
 						>
-							{pending === "cancel" ? <Loader2 className="spin" size={12} aria-hidden /> : <Square size={11} aria-hidden />}
-							{pending === "cancel" ? "Cancelling…" : "Cancel"}
-						</button>
-					) : null}
-					{canReRun ? (
-						<button
-							className="chip-button"
-							type="button"
-							disabled={actionDisabled}
-							aria-busy={pending === "rerun"}
-							onClick={() => onRequestReRun(delegation)}
-							title="Re-run this delegated work"
-						>
-							{pending === "rerun" ? <Loader2 className="spin" size={12} aria-hidden /> : <RotateCcw size={11} aria-hidden />}
-							{pending === "rerun" ? "Starting…" : "Re-run"}
+							{pending ? <Loader2 className="spin" size={15} aria-hidden /> : <Square size={13} aria-hidden />}
 						</button>
 					) : null}
 				</div>
-				<ConnectionBlockedReason reason={mutationBlockedReason} className="run-board-blocked-reason" />
+				{running ? <ConnectionBlockedReason reason={mutationBlockedReason} className="run-board-blocked-reason" /> : null}
 			</div>
-			{outcome ? <p className="run-board-delegation-outcome">{outcome}</p> : null}
 			{actionState?.error ? (
 				<p className="run-board-action-error" role="alert">
 					<CircleAlert size={13} aria-hidden />
@@ -276,6 +246,7 @@ function DelegationCard({
 					<SubagentRow
 						key={subagent.id}
 						subagent={subagent}
+						displayName={subagentNames.get(subagent.id) ?? "Agent"}
 						selected={subagent.id === selectedSessionId}
 						onSelectSession={onSelectSession}
 					/>
@@ -299,7 +270,7 @@ function CancelDelegationDialog({
 	onConfirm: () => void;
 }) {
 	const cancelRef = useRef<HTMLButtonElement>(null);
-	const title = delegation.label ?? delegation.workflow ?? delegation.delegation_id.slice(0, 13);
+	const title = delegation.label?.trim() || "Agent task";
 	const remaining = remainingDelegationWorkCount(delegation);
 	return (
 		<AppAlertDialog
@@ -344,13 +315,13 @@ function CancelDelegationDialog({
 export function RunBoardDelegationList({
 	parentSessionId,
 	delegations,
+	subagentNames = EMPTY_SUBAGENT_NAMES,
 	hasMoreDelegations = false,
 	showAllDelegations,
 	onToggleShowAllDelegations,
 	selectedSessionId,
 	onSelectSession,
 	onCancelDelegation,
-	onReRunDelegation,
 	mutationBlockedReason,
 	remoteReadBlockedReason,
 	expandedDelegationsAvailable = false,
@@ -358,6 +329,7 @@ export function RunBoardDelegationList({
 }: {
 	parentSessionId: string;
 	delegations: Delegation[];
+	subagentNames?: ReadonlyMap<string, string>;
 	hasMoreDelegations?: boolean;
 	showAllDelegations: boolean;
 	onToggleShowAllDelegations: () => void;
@@ -366,21 +338,24 @@ export function RunBoardDelegationList({
 	remoteReadBlockedReason?: string | null;
 	expandedDelegationsAvailable?: boolean;
 	boundedExpansionHasMore?: boolean;
-} & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onReRunDelegation">) {
+} & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation">) {
 	const [cancelDialogIntent, setCancelDialogIntent] = useState<{
 		parentSessionId: string;
 		delegation: Delegation;
 	} | null>(null);
 	const [actionStates, setActionStates] = useState<Record<string, DelegationActionState>>({});
 	const actionLocks = useRef(new Set<string>());
-	// The daemon returns a bounded newest-first page for the board. Keep a local
-	// cap as a defensive fallback when tests or cached data include extra rows.
+	// The daemon returns a bounded newest-first page for the Agents outline. Keep
+	// a local cap as a defensive fallback when tests or cached data include extras.
 	const hiddenLocalCount = Math.max(0, delegations.length - RUN_BOARD_DEFAULT_DELEGATION_COUNT);
 	const visibleDelegations =
 		showAllDelegations || hiddenLocalCount === 0
 			? delegations
 			: delegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT);
-	const sections = useMemo(() => groupDelegations(visibleDelegations), [visibleDelegations]);
+	const orderedDelegations = useMemo(
+		() => groupDelegations(visibleDelegations).flatMap((section) => section.delegations),
+		[visibleDelegations],
+	);
 	const showToggle = hasMoreDelegations || hiddenLocalCount > 0 || showAllDelegations;
 	const toggleBlockedReason =
 		!showAllDelegations &&
@@ -397,20 +372,19 @@ export function RunBoardDelegationList({
 	const runAction = async (
 		intentParentSessionId: string,
 		delegation: Delegation,
-		action: DelegationPendingAction,
 		callback: () => void | Promise<void>,
 	) => {
 		const delegationId = delegation.delegation_id;
 		const key = actionKey(intentParentSessionId, delegationId);
 		if (actionLocks.current.has(key)) return null;
 		actionLocks.current.add(key);
-		setActionState(key, { pending: action, error: null });
+		setActionState(key, { pending: true, error: null });
 		try {
 			await callback();
-			setActionState(key, { pending: null, error: null });
+			setActionState(key, { pending: false, error: null });
 			return true;
 		} catch (error) {
-			setActionState(key, { pending: null, error: actionErrorMessage(error) });
+			setActionState(key, { pending: false, error: actionErrorMessage(error) });
 			return false;
 		} finally {
 			actionLocks.current.delete(key);
@@ -422,68 +396,49 @@ export function RunBoardDelegationList({
 		void runAction(
 			intent.parentSessionId,
 			intent.delegation,
-			"cancel",
 			() => onCancelDelegation(intent.parentSessionId, intent.delegation.delegation_id),
 		).then((settled) => {
 			if (settled !== null) setCancelDialogIntent(null);
 		});
 	};
-	const requestReRun = (delegation: Delegation) => {
-		void runAction(
-			parentSessionId,
-			delegation,
-			"rerun",
-			() => onReRunDelegation(parentSessionId, delegation),
-		);
-	};
 	return (
 		<div className="run-board">
 			{parentSessionId && delegations.length > 0 ? (
 				<>
-					{sections.map((section) => (
-						<section className={`run-board-group ${section.id}`} key={section.id} aria-labelledby={`run-board-group-${section.id}`}>
-							<h2 id={`run-board-group-${section.id}`}>{section.label}</h2>
-							{section.delegations.length > 0 ? (
-								<div className="run-board-group-items">
-									{section.delegations.map((delegation) => (
-										<DelegationCard
-											key={delegation.delegation_id}
-											delegation={delegation}
-											canReRun={canReRunDelegation(delegation)}
-											selectedSessionId={selectedSessionId}
-											actionState={actionStates[actionKey(parentSessionId, delegation.delegation_id)]}
-											onSelectSession={onSelectSession}
-											onRequestCancel={(selectedDelegation) =>
-												setCancelDialogIntent({
-													parentSessionId,
-													delegation: selectedDelegation,
-												})}
-											onRequestReRun={requestReRun}
-											mutationBlockedReason={mutationBlockedReason}
-										/>
-									))}
-								</div>
-							) : (
-								<p className="run-board-group-empty">None</p>
-							)}
-						</section>
-					))}
+					<div className="run-board-outline">
+						{orderedDelegations.map((delegation) => (
+							<DelegationCard
+								key={delegation.delegation_id}
+								delegation={delegation}
+								subagentNames={subagentNames}
+								selectedSessionId={selectedSessionId}
+								actionState={actionStates[actionKey(parentSessionId, delegation.delegation_id)]}
+								onSelectSession={onSelectSession}
+								onRequestCancel={(selectedDelegation) =>
+									setCancelDialogIntent({
+										parentSessionId,
+										delegation: selectedDelegation,
+									})}
+								mutationBlockedReason={mutationBlockedReason}
+							/>
+						))}
+					</div>
 					{showToggle ? (
 						<>
 							<button
-								className="chip-button run-board-toggle"
+								className="run-board-toggle"
 								type="button"
 								disabled={!!toggleBlockedReason}
 								onClick={onToggleShowAllDelegations}
 							>
-								{showAllDelegations ? "show fewer" : `see more${hiddenLocalCount > 0 ? ` (${hiddenLocalCount})` : ""}`}
+								{showAllDelegations ? "Show fewer" : `See more${hiddenLocalCount > 0 ? ` (${hiddenLocalCount})` : ""}`}
 							</button>
 							<ConnectionBlockedReason reason={toggleBlockedReason} />
 						</>
 					) : null}
 					{showAllDelegations && boundedExpansionHasMore ? (
 						<p className="run-board-page-limit" role="status">
-							Latest {RUN_BOARD_EXPANDED_DELEGATION_COUNT} shown. Older delegated work remains unloaded; this view has no older-page cursor.
+							Latest {RUN_BOARD_EXPANDED_DELEGATION_COUNT} shown.
 						</p>
 					) : null}
 				</>
@@ -497,7 +452,7 @@ export function RunBoardDelegationList({
 								cancelDialogIntent.parentSessionId,
 								cancelDialogIntent.delegation.delegation_id,
 							)
-						]?.pending === "cancel"
+						]?.pending === true
 					}
 					blockedReason={mutationBlockedReason}
 					onClose={() => setCancelDialogIntent(null)}
@@ -511,6 +466,7 @@ export function RunBoardDelegationList({
 function RunBoard({
 	parentSessionId,
 	delegations,
+	subagentNames,
 	hasMoreDelegations,
 	loading,
 	error,
@@ -522,7 +478,6 @@ function RunBoard({
 	boundedExpansionHasMore = false,
 	onSelectSession,
 	onCancelDelegation,
-	onReRunDelegation,
 	mutationBlockedReason,
 	remoteReadBlockedReason,
 	expandedDelegationsAvailable,
@@ -531,11 +486,7 @@ function RunBoard({
 		<section className="inspect-section run-board-section">
 			{parentSessionId && loading ? (
 				<p className="muted run-board-inline-status" role="status">
-					{delegations.length > 0
-						? showAllDelegations
-							? `Loading up to ${RUN_BOARD_EXPANDED_DELEGATION_COUNT} delegated tasks…`
-							: "Refreshing agents…"
-						: "Loading agents…"}
+					{delegations.length > 0 ? "Refreshing agents…" : "Loading agents…"}
 				</p>
 			) : null}
 			{parentSessionId && error ? (
@@ -564,13 +515,13 @@ function RunBoard({
 			<RunBoardDelegationList
 				parentSessionId={parentSessionId ?? ""}
 				delegations={delegations}
+				subagentNames={subagentNames}
 				hasMoreDelegations={hasMoreDelegations}
 				showAllDelegations={showAllDelegations}
 				onToggleShowAllDelegations={onToggleShowAllDelegations}
 				selectedSessionId={selectedSessionId}
 				onSelectSession={onSelectSession}
 				onCancelDelegation={onCancelDelegation}
-				onReRunDelegation={onReRunDelegation}
 				mutationBlockedReason={mutationBlockedReason}
 				remoteReadBlockedReason={remoteReadBlockedReason}
 				expandedDelegationsAvailable={expandedDelegationsAvailable}
@@ -588,9 +539,6 @@ const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
 ];
 
 export interface SidebarProps {
-	counts: Record<SessionDisplayActivity, number>;
-	total: number;
-	archived: number;
 	connection: string;
 	projects: Project[];
 	selectedProjectId: string | null;
@@ -621,9 +569,6 @@ export interface SidebarProps {
 }
 
 export const Sidebar = memo(function Sidebar({
-	counts,
-	total,
-	archived,
 	connection,
 	projects,
 	selectedProjectId,
@@ -664,7 +609,6 @@ export const Sidebar = memo(function Sidebar({
 			/>
 			<div className="session-section-head">
 				<span>Sessions</span>
-				<ActivityCounts counts={counts} archived={archived} />
 			</div>
 			<SidebarToolbar
 				disabled={false}
@@ -759,10 +703,7 @@ export function ProjectList({
 							aria-current={selectedProjectId === null ? "page" : undefined}
 						>
 							<Folder size={14} aria-hidden />
-							<span className="project-main">
-								<span className="project-title">Host</span>
-								<span className="project-cwd">Ephemeral sessions</span>
-							</span>
+							<span className="project-title">Host</span>
 						</button>
 					</li>
 					{projects.map((project) => {
@@ -774,14 +715,18 @@ export function ProjectList({
 									className="project-row-primary"
 									type="button"
 									onClick={() => onSelectProject(project.project_id)}
-									title={projectWorkspaceSummary(project)}
 									aria-current={selected ? "page" : undefined}
 								>
-									<Folder size={14} aria-hidden />
-									<span className="project-main">
-										<span className="project-title">{title}</span>
-										<span className="project-cwd">{project.workspaces.length} workspaces</span>
+									<span
+										className="project-folder-count"
+										role="img"
+										aria-label={`${project.workspaces.length} ${project.workspaces.length === 1 ? "workspace" : "workspaces"}`}
+										title={`${project.workspaces.length} ${project.workspaces.length === 1 ? "workspace" : "workspaces"}`}
+									>
+										<Folder size={18} aria-hidden />
+										<span aria-hidden>{project.workspaces.length}</span>
 									</span>
+									<span className="project-title">{title}</span>
 								</button>
 								<ActionMenu
 									triggerLabel={`Open project actions for ${title}`}
@@ -931,23 +876,6 @@ export function SidebarToolbar({
 	);
 }
 
-function ActivityCounts({ counts, archived }: { counts: Record<SessionDisplayActivity, number>; archived: number }) {
-	return (
-		<div className="activity-counts">
-			{(["running", "idle"] as SessionDisplayActivity[]).map((activity) => (
-				<span className={`activity-chip ${activity}`} key={activity}>
-					{activity}
-					<span className="count">{counts[activity] ?? 0}</span>
-				</span>
-			))}
-			<span className="activity-chip archived">
-				archived
-				<span className="count">{archived}</span>
-			</span>
-		</div>
-	);
-}
-
 export function SessionRow({
 	session,
 	selected,
@@ -988,12 +916,7 @@ export function SessionRow({
 				/>
 				<span className="session-main">
 					<span className="session-title">{title}</span>
-					<span className="session-sub">
-						{archived ? "archived - " : ""}{session.provider.model}
-					</span>
-					<span className="session-leaf">
-						{session.active_leaf_id ? session.active_leaf_id.slice(0, 6) : "root"}
-					</span>
+					<span className="session-sub">{session.provider.model}</span>
 				</span>
 			</button>
 			<ActionMenu
@@ -1065,7 +988,7 @@ export function LogHeader({
 	modelOptions,
 	modelValue,
 	modelDisabled,
-	modelDisabledTitle,
+	modelLocked = false,
 	reasoningDisabled = false,
 	controlsBlockedReason,
 	reasoningEfforts,
@@ -1083,7 +1006,7 @@ export function LogHeader({
 	modelOptions: { id: string; label: string; description?: string }[];
 	modelValue: string;
 	modelDisabled: boolean;
-	modelDisabledTitle: string;
+	modelLocked?: boolean;
 	reasoningDisabled?: boolean;
 	controlsBlockedReason?: string | null;
 	reasoningEfforts: ReasoningEffort[];
@@ -1126,13 +1049,13 @@ export function LogHeader({
 				</span>
 			) : null}
 			<div className="log-controls">
-				<label className="header-select" title={modelDisabledTitle}>
+				<label className="header-select" title={modelLocked ? "Model, locked" : "Model"}>
 					<span className="sr-only">Model</span>
 					<select
 						value={modelValue}
 						disabled={modelDisabled}
-						title={modelDisabledTitle}
-						aria-label="Model"
+						title={modelLocked ? "Model, locked" : "Model"}
+						aria-label={modelLocked ? "Model, locked" : "Model"}
 						onChange={(event) => onModelChange(event.target.value)}
 					>
 						{modelOptions.map((option) => (
@@ -1188,6 +1111,7 @@ export function Inspector({
 	snapshot,
 	runBoardParentSessionId = snapshot?.session_id ?? null,
 	delegations,
+	subagentNames = EMPTY_SUBAGENT_NAMES,
 	hasMoreDelegations = false,
 	delegationsLoading,
 	delegationsError,
@@ -1208,6 +1132,7 @@ export function Inspector({
 	snapshot: SessionSnapshot | null;
 	runBoardParentSessionId?: string | null;
 	delegations: Delegation[];
+	subagentNames?: ReadonlyMap<string, string>;
 	hasMoreDelegations?: boolean;
 	delegationsLoading: boolean;
 	delegationsError: string | null;
@@ -1257,6 +1182,7 @@ export function Inspector({
 					<RunBoard
 						parentSessionId={runBoardParentSessionId}
 						delegations={delegations}
+						subagentNames={subagentNames}
 						hasMoreDelegations={hasMoreDelegations}
 						loading={delegationsLoading}
 						error={delegationsError}
@@ -1269,7 +1195,6 @@ export function Inspector({
 						boundedExpansionHasMore={boundedExpansionHasMore}
 						onSelectSession={onSelectSession}
 						onCancelDelegation={runBoard.onCancelDelegation}
-						onReRunDelegation={runBoard.onReRunDelegation}
 						mutationBlockedReason={mutationBlockedReason}
 						remoteReadBlockedReason={remoteReadBlockedReason}
 					/>
