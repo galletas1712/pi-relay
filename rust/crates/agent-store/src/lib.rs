@@ -924,6 +924,7 @@ impl TokenUsageEstimate {
 pub struct OutputBatch<'a> {
     pub(crate) entries: &'a [TranscriptStorageNode],
     pub(crate) active_leaf_id: Option<&'a str>,
+    pub(crate) active_leaf_unchanged: bool,
     pub(crate) session_events: &'a [SessionEvent],
     pub(crate) actions: &'a [SessionAction],
     pub(crate) action_update: Option<ActionUpdate>,
@@ -942,6 +943,7 @@ impl<'a> OutputBatch<'a> {
         Self {
             entries,
             active_leaf_id,
+            active_leaf_unchanged: false,
             session_events,
             actions,
             action_update: None,
@@ -949,6 +951,11 @@ impl<'a> OutputBatch<'a> {
             accepted_input: None,
             control_interrupt_input_id: None,
         }
+    }
+
+    pub fn with_unchanged_active_leaf(mut self) -> Self {
+        self.active_leaf_unchanged = true;
+        self
     }
 
     pub fn with_action_update(mut self, action_update: Option<ActionUpdate>) -> Self {
@@ -969,6 +976,19 @@ impl<'a> OutputBatch<'a> {
     pub fn with_control_interrupt(mut self, input_id: &'a str) -> Self {
         self.control_interrupt_input_id = Some(input_id);
         self
+    }
+
+    /// Carrier metadata (including provider replay and a future provider-route
+    /// snapshot) is durable only with its transcript entry, not on its own.
+    pub fn has_durable_obligations(&self) -> bool {
+        !self.entries.is_empty()
+            || !self.active_leaf_unchanged
+            || !self.session_events.is_empty()
+            || !self.actions.is_empty()
+            || self.action_update.is_some()
+            || self.consumed_input.is_some()
+            || self.accepted_input.is_some()
+            || self.control_interrupt_input_id.is_some()
     }
 }
 
