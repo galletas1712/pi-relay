@@ -721,9 +721,8 @@ pre {
 	overflow: hidden;
 }
 
-/* `.status-rail` is the sidebar session-row activity bar. The run board no longer
- * uses it (status there is carried by `.run-board-status-icon`), so only the
- * sidebar's modifiers remain: `running`/`idle` here and `archived` below. */
+/* `.status-rail` is the sidebar session-row activity bar. Agent rows use an icon
+ * plus visible status copy, so only the sidebar modifiers remain here. */
 .status-rail {
 	width: 3px;
 	align-self: stretch;
@@ -3206,6 +3205,7 @@ pre {
 	grid-column: 2;
 	grid-row: 1 / span 3;
 	min-height: 0;
+	container-type: inline-size;
 	padding-right: env(safe-area-inset-right, 0px);
 	border-left: 1px solid var(--border);
 	background: var(--card);
@@ -3394,6 +3394,12 @@ pre {
 
 .run-board-section {
 	border-bottom: 0;
+	padding: 0;
+}
+
+.run-board-section > .muted {
+	margin: 0;
+	padding: 12px;
 }
 
 .inspect-section h2 {
@@ -3442,30 +3448,87 @@ pre {
 .run-board {
 	display: flex;
 	flex-direction: column;
-	gap: 10px;
+	gap: 0;
+}
+
+.run-board-group {
+	display: flex;
+	flex-direction: column;
+	gap: 0;
+}
+
+.run-board-group + .run-board-group {
+	border-top: 1px solid var(--border);
+}
+
+.run-board-group > h2 {
+	margin: 0;
+	padding: 10px 12px 7px;
+	color: var(--muted-foreground);
+	font-family: var(--font-sans);
+	font-size: var(--text-xs);
+	font-weight: 600;
+	letter-spacing: 0.02em;
+	text-transform: uppercase;
+}
+
+.run-board-group.needs-attention > h2 {
+	color: var(--destructive);
+}
+
+.run-board-group.active > h2 {
+	color: var(--primary);
+}
+
+.run-board-group-items {
+	display: flex;
+	flex-direction: column;
+}
+
+.run-board-group-empty {
+	margin: 0;
+	padding: 0 12px 10px;
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
 }
 
 .run-board-delegation {
 	display: flex;
+	min-width: 0;
 	flex-direction: column;
-	gap: 6px;
-	border: 1px solid var(--border);
-	border-radius: var(--radius);
-	padding: 8px;
+	border-top: 1px solid color-mix(in oklch, var(--border) 72%, transparent);
+	padding: 10px 12px 8px;
+}
+
+.run-board-delegation:first-child {
+	border-top: 0;
 }
 
 .run-board-delegation-head {
+	display: grid;
+	grid-template-columns: 18px minmax(0, 1fr) auto;
+	align-items: start;
+	gap: 7px;
+	min-width: 0;
+}
+
+.run-board-delegation-summary {
 	display: flex;
-	align-items: center;
-	gap: 8px;
+	min-width: 0;
+	flex-direction: column;
+	gap: 3px;
+}
+
+.run-board-delegation-title-row {
+	display: flex;
+	min-width: 0;
+	align-items: baseline;
+	flex-wrap: wrap;
+	gap: 3px 7px;
 }
 
 .run-board-delegation-title {
-	flex: 1 1 auto;
 	min-width: 0;
-	display: flex;
-	align-items: center;
-	gap: 6px;
 	font-size: var(--text-md);
 	font-weight: 600;
 	overflow: hidden;
@@ -3473,10 +3536,35 @@ pre {
 	white-space: nowrap;
 }
 
-/* Run-board status icons: the delegation kind icon and the subagent `Bot` are
- * tinted by status (mirrors the old `.status-rail` palette, but as `color` so it
- * also tints the lucide stroke + the running glow's `currentColor`). idle reads as
- * "done" green like the rail did. */
+.run-board-delegation-kind {
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+}
+
+.run-board-delegation-meta {
+	display: flex;
+	min-width: 0;
+	align-items: baseline;
+	flex-wrap: wrap;
+	gap: 2px 5px;
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+	line-height: 1.35;
+}
+
+.run-board-status-text {
+	color: var(--foreground);
+	font-weight: 600;
+	text-transform: capitalize;
+}
+
+.run-board-progress {
+	min-width: 0;
+	overflow-wrap: anywhere;
+	font-variant-numeric: tabular-nums;
+}
+
+/* Agent status icons supplement adjacent text; they never carry status alone. */
 .run-board-status-icon {
 	flex: 0 0 auto;
 	display: inline-flex;
@@ -3509,34 +3597,46 @@ pre {
 	color: var(--muted-foreground);
 }
 
-/* The one live state gets motion: a subtle opacity breathe in the icon's own
- * color (the app's "alive" pulse, like `.working-indicator-dot`). Auto-gated by
- * the global `prefers-reduced-motion` block. Kept gentle since several subagents
- * can run at once. */
-.run-board-status-icon.running {
-	animation: run-board-icon-pulse 1.6s ease-in-out infinite;
-}
-
-@keyframes run-board-icon-pulse {
-	0%,
-	100% {
-		opacity: 1;
-		filter: drop-shadow(0 0 0 transparent);
-	}
-	50% {
-		opacity: 0.6;
-		filter: drop-shadow(0 0 3px currentColor);
-	}
-}
-
 .run-board-delegation-controls {
 	display: flex;
 	flex-wrap: wrap;
+	justify-content: flex-end;
 	gap: 6px;
 }
 
 .run-board-blocked-reason {
-	flex-basis: 100%;
+	grid-column: 2 / -1;
+	justify-self: end;
+	margin-top: 3px;
+}
+
+.run-board-cancel {
+	border-color: color-mix(in oklch, var(--destructive) 44%, var(--border));
+	color: var(--destructive);
+}
+
+.run-board-delegation-outcome,
+.run-board-action-error {
+	margin: 6px 0 0 25px;
+	font-size: var(--text-xs);
+	line-height: 1.4;
+	overflow-wrap: anywhere;
+}
+
+.run-board-delegation-outcome {
+	color: var(--foreground);
+}
+
+.run-board-action-error {
+	display: flex;
+	align-items: flex-start;
+	gap: 5px;
+	color: var(--destructive);
+}
+
+.run-board-action-error svg {
+	flex: 0 0 auto;
+	margin-top: 2px;
 }
 
 .chip-button {
@@ -3547,7 +3647,7 @@ pre {
 	border-radius: var(--radius-sm);
 	background: transparent;
 	padding: 2px 8px;
-	font-size: var(--text-2xs);
+	font-size: var(--text-xs);
 	color: var(--foreground);
 	cursor: pointer;
 }
@@ -3565,35 +3665,137 @@ pre {
 
 .run-board-toggle {
 	align-self: flex-start;
+	margin: 10px 12px 12px;
 }
 
 .run-board-subagents {
 	display: flex;
 	flex-direction: column;
-	gap: 6px;
+	margin: 8px 0 0 25px;
+	border-left: 1px solid var(--border);
 }
 
 .run-board-subagent {
-	display: flex;
-	flex-direction: column;
-	gap: 4px;
-	border-left: 2px solid var(--border);
-	padding-left: 8px;
+	min-width: 0;
+	border-top: 1px solid color-mix(in oklch, var(--border) 60%, transparent);
 }
 
-.run-board-subagent-head {
-	display: flex;
-	align-items: center;
-	gap: 8px;
+.run-board-subagent:first-child {
+	border-top: 0;
 }
 
-.run-board-subagent-head .link-button {
-	flex: 1 1 auto;
-	display: inline-flex;
+.run-board-subagent-button {
+	display: flex;
+	width: 100%;
+	min-width: 0;
+	border: 0;
+	border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+	background: transparent;
+	padding: 7px 7px 7px 9px;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+.run-board-subagent-button:hover,
+.run-board-subagent-button:focus-visible {
+	background: var(--accent);
+	color: var(--accent-foreground);
+}
+
+.run-board-subagent-button:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: -2px;
+}
+
+.run-board-subagent-button[aria-current="page"] {
+	background: color-mix(in oklch, var(--primary) 10%, var(--card));
+}
+
+.run-board-subagent-main {
+	display: flex;
+	width: 100%;
+	min-width: 0;
 	align-items: center;
 	gap: 6px;
+}
+
+.run-board-subagent-copy {
+	display: flex;
+	min-width: 0;
+	flex: 1;
+	flex-direction: column;
+	gap: 1px;
+}
+
+.run-board-subagent-role {
 	font-size: var(--text-md);
-	font-weight: 600;
+	font-weight: 500;
+	overflow-wrap: anywhere;
+}
+
+.run-board-subagent-status,
+.run-board-subagent-outcome {
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+	line-height: 1.35;
+	overflow-wrap: anywhere;
+}
+
+.run-board-subagent-status {
+	text-transform: capitalize;
+}
+
+.run-board-load-error {
+	margin: 10px 12px;
+}
+
+.run-board-inline-status {
+	border-bottom: 1px solid var(--border);
+	font-size: var(--text-xs);
+}
+
+.run-board-page-limit {
+	margin: -4px 12px 12px;
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+	line-height: 1.4;
+}
+
+.cancel-delegation-dialog strong {
+	overflow-wrap: anywhere;
+}
+
+@container (max-width: 380px) {
+	.run-board-delegation-head {
+		grid-template-columns: 18px minmax(0, 1fr);
+	}
+
+	.run-board-delegation-controls,
+	.run-board-blocked-reason {
+		grid-column: 2;
+		justify-self: start;
+	}
+
+	.run-board-delegation-controls {
+		justify-content: flex-start;
+		margin-top: 3px;
+	}
+}
+
+@media (pointer: coarse) {
+	.run-board-delegation-controls .chip-button,
+	.run-board-toggle,
+	.run-board-subagent-button,
+	.cancel-delegation-dialog .primary-button,
+	.cancel-delegation-dialog .secondary-button,
+	.cancel-delegation-dialog .plain-close-button {
+		min-height: 44px;
+	}
+
+	.cancel-delegation-dialog .plain-close-button {
+		min-width: 44px;
+	}
 }
 
 .link-button {

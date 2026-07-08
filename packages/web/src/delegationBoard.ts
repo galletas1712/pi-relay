@@ -1,5 +1,180 @@
-import type { Delegation, DelegationStatus, DelegationSubagent } from "./types.ts";
+import type {
+	Delegation,
+	DelegationKind,
+	DelegationProgress,
+	DelegationStatus,
+	DelegationSubagent,
+} from "./types.ts";
 import type { StartFullDelegationParams, StartReadonlyDelegationFanoutParams } from "./agentApi.ts";
+
+export type DelegationSectionId = "needs-attention" | "active" | "recent";
+
+export interface DelegationSection {
+	id: DelegationSectionId;
+	label: string;
+	delegations: Delegation[];
+}
+
+export interface DelegationProgressSummary {
+	expected: number | null;
+	spawned: number;
+	terminal: number;
+	running: number;
+	failed: number;
+	source: "server" | "children";
+}
+
+const TERMINAL_SUBAGENT_STATUSES = new Set([
+	"done",
+	"done_with_failures",
+	"cancelled",
+	"failed",
+]);
+
+const DELEGATION_KIND_LABELS: Record<DelegationKind, string> = {
+	full: "Writing task",
+	readonly_fanout: "Parallel research",
+};
+
+export function delegationKindLabel(kind: DelegationKind): string {
+	return DELEGATION_KIND_LABELS[kind] ?? "Agent task";
+}
+
+export function humanizeDelegationValue(value: string): string {
+	const normalized = value.trim().replaceAll("_", " ").replace(/\s+/g, " ");
+	return normalized ? normalized[0].toUpperCase() + normalized.slice(1) : normalized;
+}
+
+export function delegationNeedsAttention(delegation: Delegation): boolean {
+	if (delegation.status === "failed" || delegation.status === "done_with_failures") return true;
+	if (delegation.status === "cancelled") return false;
+	if (delegation.progress && delegation.progress.failed > 0) return true;
+	if (
+		delegation.subagents.some(
+			(subagent) => subagent.status === "failed" || subagent.status === "done_with_failures",
+		)
+	) {
+		return true;
+	}
+	return false;
+}
+
+/** Split a server-ordered page into stable task-centered sections. Filtering
+ * preserves the input order inside every section, so polling cannot reshuffle
+ * peers that have not changed classification. */
+export function groupDelegations(delegations: readonly Delegation[]): DelegationSection[] {
+	const groups: Record<DelegationSectionId, Delegation[]> = {
+		"needs-attention": [],
+		active: [],
+		recent: [],
+	};
+	for (const delegation of delegations) {
+		if (delegationNeedsAttention(delegation)) groups["needs-attention"].push(delegation);
+		else if (delegation.status === "running") groups.active.push(delegation);
+		else groups.recent.push(delegation);
+	}
+	return [
+		{ id: "needs-attention", label: "Needs attention", delegations: groups["needs-attention"] },
+		{ id: "active", label: "Active", delegations: groups.active },
+		{ id: "recent", label: "Recent", delegations: groups.recent },
+	];
+}
+
+function directChildProgress(subagents: readonly DelegationSubagent[]): DelegationProgressSummary {
+	let terminal = 0;
+	let running = 0;
+	let failed = 0;
+	for (const subagent of subagents) {
+		const status = typeof subagent.status === "string" ? subagent.status : "idle";
+		if (TERMINAL_SUBAGENT_STATUSES.has(status)) {
+			terminal += 1;
+			if (status === "failed" || status === "done_with_failures") failed += 1;
+			continue;
+		}
+		if (status === "running" || subagent.activity === "running") running += 1;
+	}
+	return {
+		expected: null,
+		spawned: subagents.length,
+		terminal,
+		running,
+		failed,
+		source: "children",
+	};
+}
+
+export function delegationProgressSummary(delegation: Delegation): DelegationProgressSummary {
+	const progress: DelegationProgress | null | undefined = delegation.progress;
+	if (!progress) return directChildProgress(delegation.subagents);
+	return {
+		expected: progress.expected,
+		spawned: progress.spawned,
+		terminal: progress.terminal,
+		running: progress.running,
+		failed: progress.failed,
+		source: "server",
+	};
+}
+
+export function formatDelegationProgress(delegation: Delegation): string {
+	const progress = delegationProgressSummary(delegation);
+	const prefix =
+		progress.expected === null
+			? `${progress.spawned} agent${progress.spawned === 1 ? "" : "s"} shown`
+			: `${progress.expected} expected · ${progress.spawned} spawned`;
+	return `${prefix} · ${progress.terminal} terminal · ${progress.running} running · ${progress.failed} failed`;
+}
+
+export function remainingDelegationWorkCount(delegation: Delegation): {
+	count: number;
+	unit: "agents" | "agents/slots";
+} {
+	const progress = delegationProgressSummary(delegation);
+	if (progress.expected !== null) {
+		return {
+			count: Math.max(0, progress.expected - progress.terminal),
+			unit: "agents/slots",
+		};
+	}
+	return {
+		count: Math.max(0, progress.spawned - progress.terminal),
+		unit: "agents",
+	};
+}
+
+export function delegationOutcomeText(delegation: Delegation): string | null {
+	if (delegation.status === "running") return null;
+	const outcomes = Array.from(
+		new Set(
+			delegation.subagents.flatMap((subagent) =>
+				typeof subagent.outcome === "string" && subagent.outcome.trim()
+					? [humanizeDelegationValue(subagent.outcome)]
+					: [],
+			),
+		),
+	);
+	const label = delegation.status === "failed" ? "Failure" : outcomes.length === 1 ? "Outcome" : "Outcomes";
+	if (outcomes.length > 0) return `${label}: ${outcomes.join(", ")}`;
+	switch (delegation.status) {
+		case "done":
+			return "Completed · Outcome details are not available in this handoff";
+		case "done_with_failures":
+			return "Completed with failures · Outcome details are not available in this handoff";
+		case "cancelled":
+			return "Cancelled";
+		case "failed":
+			return "Failed";
+		default:
+			return null;
+	}
+}
+
+export function subagentOutcomeText(subagent: DelegationSubagent): string | null {
+	if (typeof subagent.outcome === "string" && subagent.outcome.trim()) {
+		return `${subagent.status === "failed" ? "Failure" : "Outcome"}: ${humanizeDelegationValue(subagent.outcome)}`;
+	}
+	return null;
+}
 
 /** A delegation is in flight (and therefore cancellable / its subagents pollable)
  * exactly while its status is `running`. Every other status is terminal. */
@@ -31,12 +206,8 @@ export function delegationStatusLabel(status: DelegationStatus): string {
 	return DELEGATION_STATUS_LABELS[status] ?? status;
 }
 
-/** Map a delegation or subagent status to a `.status-rail` modifier class.
- * In the run board, status is encoded ONLY by the rail color, so this is the
- * single source of truth for that mapping. Subagent statuses add `idle`/`queued`
- * ("waiting"), which fall back — like any unknown value — to the neutral `pending`
- * rail (grey: waiting / not started, distinct from green `done`). The class names
- * are CSS-safe (`warn` stands in for `done_with_failures`). */
+/** Map a delegation or subagent status to a CSS-safe icon modifier. Icons always
+ * sit beside visible status copy; color is supplementary, never authoritative. */
 export function statusRailClass(status: string): string {
 	switch (status) {
 		case "running":

@@ -61,7 +61,7 @@ export function AppDialog(props: AppDialogProps) {
  * Alerts require an explicit Cancel/close choice (Radix blocks outside
  * interactions). Escape remains available while idle and is blocked while busy.
  */
-export function AppAlertDialog(props: Omit<AppDialogProps, "initialFocusRef">) {
+export function AppAlertDialog(props: AppDialogProps) {
 	return <DialogRoot kind="alertdialog" {...props} />;
 }
 
@@ -118,6 +118,7 @@ function DialogRoot({
 							className={contentClassName}
 							onCloseAutoFocus={handleCloseAutoFocus}
 							onEscapeKeyDown={handleEscapeKeyDown}
+							onOpenAutoFocus={handleOpenAutoFocus}
 						>
 							{children}
 						</AlertDialogPrimitive.Content>
@@ -201,7 +202,7 @@ export function DialogFooter({ children }: { children: ReactNode }) {
 export function DialogClose({
 	children,
 	...props
-}: ComponentPropsWithoutRef<"button">) {
+}: ComponentPropsWithRef<"button">) {
 	const kind = useContext(DialogKindContext);
 	const button = <button type="button" {...props}>{children}</button>;
 	return kind === "alertdialog" ? (

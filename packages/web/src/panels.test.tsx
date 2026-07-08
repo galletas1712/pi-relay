@@ -110,6 +110,7 @@ function renderRunBoardList({
 }): string {
 	return renderToStaticMarkup(
 		<RunBoardDelegationList
+			parentSessionId="parent-1"
 			delegations={delegations}
 			hasMoreDelegations={hasMoreDelegations}
 			showAllDelegations={showAllDelegations}
@@ -233,7 +234,7 @@ describe("Inspector tabs", () => {
 		expect(html).toContain(`role="tablist"`);
 		expect(html).toContain(`aria-label="inspector tabs"`);
 		expect(html).toContain(`aria-selected="true"`);
-		expect(html).toContain("Run board");
+		expect(html).toContain("Agents");
 		expect(html).toContain("fan-out");
 		expect(html).not.toContain("Session panel");
 		expect(html).not.toContain("<h2>Session</h2>");
@@ -254,6 +255,12 @@ describe("Inspector tabs", () => {
 			/>,
 		);
 		expect(html).not.toContain("No session selected");
+	});
+
+	it("preserves the selected-session no-work empty state", () => {
+		const html = renderInspector([]);
+		expect(html).toContain("No delegated work yet.");
+		expect(html).not.toContain("Couldn’t load agents");
 	});
 });
 
@@ -533,8 +540,8 @@ describe("sidebar action menu policies", () => {
 	});
 });
 
-describe("Inspector run board status icons", () => {
-	it("encodes each delegation status as a colored, accessibly-labeled kind icon", () => {
+describe("Inspector agent status", () => {
+	it("renders every delegation status as visible text alongside its supplementary icon", () => {
 		const cases: { status: Delegation["status"]; icon: string; label: string }[] = [
 			{ status: "running", icon: "running", label: "running" },
 			{ status: "done", icon: "done", label: "done" },
@@ -543,28 +550,26 @@ describe("Inspector run board status icons", () => {
 			{ status: "cancelled", icon: "cancelled", label: "cancelled" },
 		];
 		for (const { status, icon, label } of cases) {
-			// A full delegation so the accessible name carries kind + status.
 			const html = renderRunBoardList({ delegations: [delegation({ kind: "full", status })] });
-			const expected = `full delegation — ${label}`;
 			expect(html, `${status} icon color`).toContain(`run-board-status-icon ${icon}`);
-			expect(html, `${status} icon aria-label`).toContain(`aria-label="${expected}"`);
-			expect(html, `${status} icon title`).toContain(`title="${expected}"`);
-			expect(html, `${status} icon role`).toContain('role="img"');
+			expect(html, `${status} visible text`).toContain(`<span class="run-board-status-text">${label}</span>`);
+			expect(html, `${status} kind text`).toContain("Writing task");
 		}
-		// The run board no longer renders the old vertical status rail.
 		const sample = renderRunBoardList({ delegations: [delegation({ kind: "full", status: "running" })] });
 		expect(sample).not.toContain("status-rail");
 	});
 
-	it("encodes the delegation kind in the icon's accessible name (full vs fan-out)", () => {
+	it("uses task-centered visible kind labels instead of storage vocabulary", () => {
 		const full = renderRunBoardList({ delegations: [delegation({ kind: "full", status: "done" })] });
-		expect(full).toContain(`aria-label="full delegation — done"`);
+		expect(full).toContain("Writing task");
+		expect(full).not.toContain(">full<");
 
 		const fanout = renderRunBoardList({ delegations: [delegation({ kind: "readonly_fanout", status: "done" })] });
-		expect(fanout).toContain(`aria-label="fan-out delegation — done"`);
+		expect(fanout).toContain("Parallel research");
+		expect(fanout).not.toContain(">fan-out<");
 	});
 
-	it("colors each subagent's agent icon by status with the human-readable status as its accessible name", () => {
+	it("renders each agent's role and visible status/activity in its full-row navigation name", () => {
 		const html = renderRunBoardList({
 			delegations: [
 				delegation({
@@ -582,17 +587,17 @@ describe("Inspector run board status icons", () => {
 		expect(html).toContain(`run-board-status-icon done`);
 		expect(html).toContain(`run-board-status-icon running`);
 		expect(html).toContain(`run-board-status-icon pending`);
-		expect(html).toContain(`aria-label="done"`);
-		expect(html).toContain(`aria-label="running"`);
-		expect(html).toContain(`aria-label="queued"`);
+		expect(html).toContain(`aria-label="Open agent explorer, done · activity idle"`);
+		expect(html).toContain(`aria-label="Open agent explorer, running"`);
+		expect(html).toContain(`aria-label="Open agent explorer, queued"`);
+		expect(html).toContain(`class="run-board-subagent-button"`);
 		expect(html).toContain(`title="queued"`);
-		// The vertical status rail is gone from the run board.
 		expect(html).not.toContain("status-rail");
 	});
 });
 
-describe("Inspector run board streamlined content", () => {
-	it("drops the status pills, progress counts, outcome, and handoff/artifact clutter", () => {
+describe("Inspector agent task content", () => {
+	it("shows concise progress and outcomes without handoff/artifact clutter", () => {
 		const html = renderInspector([
 			delegation({
 				status: "running",
@@ -624,19 +629,13 @@ describe("Inspector run board streamlined content", () => {
 			}),
 		]);
 
-		// Title survives; the delegation kind is now carried by the status icon's
-		// accessible name rather than a text tag.
 		expect(html).toContain("fan-out");
-		expect(html).toContain(`aria-label="fan-out delegation — running"`);
-		expect(html).not.toContain("run-board-delegation-kind");
-		// Status is carried only by the colored icon now (no vertical rail).
+		expect(html).toContain("Parallel research");
 		expect(html).toContain("run-board-status-icon running");
 		expect(html).not.toContain("status-rail");
-		// Removed: the activity/status pill, progress text, outcome, handoff path, artifact names.
-		expect(html).not.toContain("subagent-activity");
-		expect(html).not.toContain("run-board-progress");
-		expect(html).not.toContain("run-board-subagent-summary");
-		expect(html).not.toContain("1/2 terminal, 1 running, 0 failed");
+		expect(html).toContain("run-board-progress");
+		expect(html).toContain("2 expected · 2 spawned · 1 terminal · 1 running · 0 failed");
+		expect(html).toContain("Outcome: Done");
 		expect(html).not.toContain("suggested next");
 		expect(html).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
 		expect(html).not.toContain("/workspace/.pi-handoff/delegation-1");
@@ -674,7 +673,8 @@ describe("Inspector run board streamlined content", () => {
 
 		const html = renderRunBoardList({ delegations: [cancelled] });
 		expect(html).toContain("run-board-status-icon cancelled");
-		expect(html).toContain(`aria-label="cancelled"`);
+		expect(html).toContain(`<span class="run-board-status-text">cancelled</span>`);
+		expect(html).toContain("Cancelled");
 		expect(html).not.toContain("status-rail");
 		expect(html).not.toContain("cancellation transcript");
 		expect(html).not.toContain("cancelled/child-1.transcript.md");
@@ -712,13 +712,13 @@ describe("Inspector run board primary controls", () => {
 
 	it("keeps the re-run control for terminal re-runnable delegations and not while running", () => {
 		const terminal = renderInspector([delegation({ status: "done" })]);
-		expect(terminal).toContain("re-run");
-		expect(terminal).not.toContain("cancel");
+		expect(terminal).toContain("Re-run");
+		expect(terminal).not.toContain(">Cancel</button>");
 		expect(terminal).not.toContain("steer");
 
 		const running = renderInspector([delegation({ status: "running" })]);
-		expect(running).toContain("cancel");
-		expect(running).not.toContain("re-run");
+		expect(running).toContain("Cancel");
+		expect(running).not.toContain("Re-run");
 	});
 });
 
