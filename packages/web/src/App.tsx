@@ -1,6 +1,6 @@
 import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
-import { ArrowUp, Bot, Folder, FolderGit2, Menu, PanelRightOpen, X } from "lucide-react";
+import { ArrowUp, Bot, Menu, PanelRightOpen, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
@@ -11,6 +11,15 @@ import { routeComposerSubmission, type ComposerSubmission } from "./composerRout
 import { CompactHistoryPickerDialog } from "./historyPickerCompact.tsx";
 import { type HistoryTargetOption } from "./historyTargets.ts";
 import { ExportDialog } from "./exportDialog.tsx";
+import {
+	DeleteSessionDialog,
+	newWorkspaceDraft,
+	ProjectDialog,
+	projectWorkspacesFromDrafts,
+	RenameSessionDialog,
+	workspaceDraftFromProject,
+	type ProjectDialogState,
+} from "./entityDialogs.tsx";
 import { randomId } from "./ids.ts";
 import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
@@ -107,7 +116,6 @@ import type {
 	TranscriptEntry,
 	TranscriptTreeNode,
 	TranscriptTurnsResult,
-	ProjectWorkspace,
 } from "./types.ts";
 
 const MAX_NOTICES = 24;
@@ -165,35 +173,6 @@ type DeleteDialogState = {
 	deleting: boolean;
 };
 
-type WorkspaceDraft =
-	| {
-			kind: "git";
-			workspace_dir: string;
-			remote_url: string;
-			remote_branch: string;
-	  }
-	| {
-			kind: "local";
-			workspace_dir: string;
-			source_path: string;
-	  };
-
-type WorkspaceDraftPatch = {
-	kind?: "git" | "local";
-	workspace_dir?: string;
-	remote_url?: string;
-	remote_branch?: string;
-	source_path?: string;
-};
-
-type ProjectDialogState = {
-	mode: "create" | "edit";
-	projectId?: string;
-	name: string;
-	workspaces: WorkspaceDraft[];
-	saving: boolean;
-};
-
 type PromptDialogState = {
 	loading: boolean;
 	template: string;
@@ -201,68 +180,6 @@ type PromptDialogState = {
 	view: "rendered" | "template";
 	error: string | null;
 };
-
-function workspaceDraftFromProject(workspace: ProjectWorkspace): WorkspaceDraft {
-	const kind = workspace.kind ?? "git";
-	if (kind === "local") {
-		return {
-			kind,
-			workspace_dir: workspace.workspace_dir,
-			source_path: workspace.source_path ?? ""
-		};
-	}
-	return {
-		kind: "git",
-		workspace_dir: workspace.workspace_dir,
-		remote_url: workspace.remote_url ?? "",
-		remote_branch: workspace.remote_branch ?? ""
-	};
-}
-
-function newWorkspaceDraft(kind: "git" | "local" = "git"): WorkspaceDraft {
-	return kind === "local"
-		? { kind: "local", workspace_dir: "", source_path: "" }
-		: { kind: "git", workspace_dir: "", remote_url: "", remote_branch: "main" };
-}
-
-function updateWorkspaceDraft(current: WorkspaceDraft, patch: WorkspaceDraftPatch): WorkspaceDraft {
-	const nextKind = patch.kind ?? current.kind;
-	if (nextKind === "local") {
-		return {
-			kind: "local",
-			workspace_dir: patch.workspace_dir ?? current.workspace_dir,
-			source_path: patch.source_path ?? (current.kind === "local" ? current.source_path : "")
-		};
-	}
-	return {
-		kind: "git",
-		workspace_dir: patch.workspace_dir ?? current.workspace_dir,
-		remote_url: patch.remote_url ?? (current.kind === "git" ? current.remote_url : ""),
-		remote_branch: patch.remote_branch ?? (current.kind === "git" ? current.remote_branch : "main")
-	};
-}
-
-function projectWorkspacesFromDrafts(workspaces: WorkspaceDraft[]): ProjectWorkspace[] {
-	return workspaces.map((workspace, index) => {
-		if (!workspace.workspace_dir.trim()) throw new Error(`workspace ${index + 1}: name is required`);
-		if (workspace.kind === "local") {
-			if (!workspace.source_path.trim()) throw new Error(`workspace ${index + 1}: source path is required`);
-			return {
-				kind: "local",
-				workspace_dir: workspace.workspace_dir.trim(),
-				source_path: workspace.source_path.trim()
-			};
-		}
-		if (!workspace.remote_url.trim()) throw new Error(`workspace ${index + 1}: remote URL is required`);
-		if (!workspace.remote_branch.trim()) throw new Error(`workspace ${index + 1}: branch is required`);
-		return {
-			kind: "git",
-			workspace_dir: workspace.workspace_dir.trim(),
-			remote_url: workspace.remote_url.trim(),
-			remote_branch: workspace.remote_branch.trim()
-		};
-	});
-}
 
 function sessionListRefreshKey(projectId: string | null): string {
 	return projectId ?? "__host__";
@@ -379,6 +296,8 @@ export function App() {
 	const backgroundWarmUpdatedAt = useRef(new Map<string, string>());
 	const backgroundWarmInFlight = useRef(new Set<string>());
 	const composerHandleRef = useRef<ComposerHandle | null>(null);
+	const mobileSidebarToggleRef = useRef<HTMLButtonElement | null>(null);
+	const sidebarNewSessionButtonRef = useRef<HTMLButtonElement | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
 	const selectedProjectRef = useRef<string | null>(initialUiSelection.projectId);
 	const lastEventIds = useRef(new Map<string, number>());
@@ -2360,12 +2279,19 @@ export function App() {
 	const inspectorOverlayOpen = inspectorIsOverlay && rightOpen;
 	const sidebarInert = sidebarIsOverlay && !sidebarOpen;
 	const inspectorInert = inspectorIsOverlay && !rightOpen;
+	// Overlay launches close/inert the sidebar, so they return to its visible
+	// topbar toggle. Static-sidebar launches retain their opener when possible,
+	// with New session as the stable fallback if a deleted row disappears.
+	const sidebarDialogReturnFocusRef = sidebarIsOverlay
+		? mobileSidebarToggleRef
+		: sidebarNewSessionButtonRef;
 	const appClassName = `app-shell ${sidebarOpen ? "sidebar-open" : ""} ${rightOpen ? "inspector-open" : ""}`;
 
 	return (
 		<div className={appClassName}>
 			<div className="mobile-topbar">
 				<button
+					ref={mobileSidebarToggleRef}
 					className="icon-button"
 					type="button"
 					onClick={handleToggleSidebar}
@@ -2436,6 +2362,7 @@ export function App() {
 				sessionsError={sessionListRequestState.error}
 				sessionsHasCachedData={sessionsQuery.data !== undefined}
 				inert={sidebarInert}
+				newSessionButtonRef={sidebarNewSessionButtonRef}
 				onRetrySessions={retrySessions}
 				onQueryChange={setQuery}
 				onToggleArchived={handleToggleArchived}
@@ -2552,9 +2479,13 @@ export function App() {
 				<RenameSessionDialog
 					value={renameValue}
 					onChange={setRenameValue}
+					returnFocusFallbackRef={sidebarDialogReturnFocusRef}
 					onClose={closeRenameDialog}
 					onSubmit={() => {
-						void renameSession().catch((error) => pushNotice("error", errorMessage(error)));
+						return renameSession().catch((error) => {
+							pushNotice("error", errorMessage(error));
+							throw error;
+						});
 					}}
 				/>
 			) : null}
@@ -2563,9 +2494,13 @@ export function App() {
 				<DeleteSessionDialog
 					session={deleteDialog.session}
 					deleting={deleteDialog.deleting}
+					returnFocusFallbackRef={sidebarDialogReturnFocusRef}
 					onClose={closeDeleteDialog}
 					onConfirm={() => {
-						void deleteSession().catch((error) => pushNotice("error", errorMessage(error)));
+						return deleteSession().catch((error) => {
+							pushNotice("error", errorMessage(error));
+							throw error;
+						});
 					}}
 				/>
 			) : null}
@@ -2574,9 +2509,13 @@ export function App() {
 				<ProjectDialog
 					state={projectDialog}
 					onChange={(patch) => setProjectDialog((current) => (current ? { ...current, ...patch } : current))}
+					returnFocusFallbackRef={sidebarDialogReturnFocusRef}
 					onClose={closeProjectDialog}
 					onSubmit={() => {
-						void saveProjectDialog().catch((error) => pushNotice("error", errorMessage(error)));
+						return saveProjectDialog().catch((error) => {
+							pushNotice("error", errorMessage(error));
+							throw error;
+						});
 					}}
 				/>
 			) : null}
@@ -2784,262 +2723,3 @@ const MarkdownView = memo(function MarkdownView({ text }: { text: string }) {
 		</div>
 	);
 });
-
-export function RenameSessionDialog({
-	value,
-	onChange,
-	onClose,
-	onSubmit,
-}: {
-	value: string;
-	onChange: (value: string) => void;
-	onClose: () => void;
-	onSubmit: () => void;
-}) {
-	return (
-		<div className="modal-scrim" role="presentation" onMouseDown={onClose}>
-			<div
-				className="rename-dialog"
-				role="dialog"
-				aria-modal="true"
-				aria-labelledby="rename-dialog-title"
-				onMouseDown={(event) => event.stopPropagation()}
-			>
-				<div className="rename-dialog-head">
-					<div className="rename-dialog-copy">
-						<h2 id="rename-dialog-title">Rename session</h2>
-					</div>
-					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close rename dialog">
-						<X size={16} />
-					</button>
-				</div>
-				<form
-					onSubmit={(event) => {
-						event.preventDefault();
-						onSubmit();
-					}}
-				>
-					<label className="rename-field">
-						<span>Session title</span>
-						<input value={value} onChange={(event) => onChange(event.target.value)} autoFocus placeholder="Session title" required />
-					</label>
-					<div className="rename-actions">
-						<button type="button" className="secondary-button" onClick={onClose}>
-							Cancel
-						</button>
-						<button type="submit" className="primary-button">
-							Save
-						</button>
-					</div>
-				</form>
-			</div>
-		</div>
-	);
-}
-
-export function DeleteSessionDialog({
-	session,
-	deleting,
-	onClose,
-	onConfirm,
-}: {
-	session: SessionListItem;
-	deleting: boolean;
-	onClose: () => void;
-	onConfirm: () => void;
-}) {
-	const title = sessionTitle(session);
-	return (
-		<div className="modal-scrim" role="presentation" onMouseDown={deleting ? undefined : onClose}>
-			<div
-				className="rename-dialog"
-				role="dialog"
-				aria-modal="true"
-				aria-labelledby="delete-dialog-title"
-				onMouseDown={(event) => event.stopPropagation()}
-			>
-				<div className="rename-dialog-head">
-					<div className="rename-dialog-copy">
-						<h2 id="delete-dialog-title">Delete session</h2>
-					</div>
-					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close delete dialog" disabled={deleting}>
-						<X size={16} />
-					</button>
-				</div>
-				<div className="delete-dialog-body">
-					<p>
-						Delete <strong>{title}</strong> permanently?
-					</p>
-					<p className="muted">This removes the transcript, queued inputs, actions, and events for this session. This cannot be undone.</p>
-				</div>
-				<div className="rename-actions">
-					<button type="button" className="secondary-button" onClick={onClose} disabled={deleting} autoFocus>
-						Cancel
-					</button>
-					<button type="button" className="primary-button destructive" onClick={onConfirm} disabled={deleting}>
-						{deleting ? "Deleting…" : "Delete"}
-					</button>
-				</div>
-			</div>
-		</div>
-	);
-}
-
-export function ProjectDialog({
-	state,
-	onChange,
-	onClose,
-	onSubmit,
-}: {
-	state: ProjectDialogState;
-	onChange: (patch: Partial<ProjectDialogState>) => void;
-	onClose: () => void;
-	onSubmit: () => void;
-}) {
-	const title = state.mode === "create" ? "New project" : "Project settings";
-	const updateWorkspace = (index: number, patch: WorkspaceDraftPatch) => {
-		onChange({
-			workspaces: state.workspaces.map((workspace, workspaceIndex) =>
-				workspaceIndex === index ? updateWorkspaceDraft(workspace, patch) : workspace,
-			),
-		});
-	};
-	const removeWorkspace = (index: number) => {
-		onChange({ workspaces: state.workspaces.filter((_, workspaceIndex) => workspaceIndex !== index) });
-	};
-	const addWorkspace = () => {
-		onChange({ workspaces: [...state.workspaces, newWorkspaceDraft()] });
-	};
-	return (
-		<div className="modal-scrim" role="presentation" onMouseDown={state.saving ? undefined : onClose}>
-			<div
-				className="rename-dialog project-dialog"
-				role="dialog"
-				aria-modal="true"
-				aria-labelledby="project-dialog-title"
-				onMouseDown={(event) => event.stopPropagation()}
-			>
-				<div className="rename-dialog-head">
-					<div className="rename-dialog-copy">
-						<h2 id="project-dialog-title">{title}</h2>
-					</div>
-					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close project dialog" disabled={state.saving}>
-						<X size={16} />
-					</button>
-				</div>
-				<form
-					onSubmit={(event) => {
-						event.preventDefault();
-						onSubmit();
-					}}
-				>
-					<label className="rename-field">
-						<span>Project name</span>
-						<input
-							value={state.name}
-							onChange={(event) => onChange({ name: event.target.value })}
-							autoFocus
-							placeholder="Project name"
-							required
-							disabled={state.saving}
-						/>
-					</label>
-					<div className="workspace-editor">
-						<div className="workspace-editor-head">
-							<span>Workspaces</span>
-							<button type="button" className="secondary-button" onClick={addWorkspace} disabled={state.saving}>
-								Add workspace
-							</button>
-						</div>
-						<div className="workspace-editor-list">
-							{state.workspaces.map((workspace, index) => {
-								return (
-									<div className="workspace-card" key={index}>
-										<div className="workspace-card-head">
-											{workspace.kind === "git" ? <FolderGit2 size={14} /> : <Folder size={14} />}
-											<span>{workspace.kind === "git" ? "Git repo" : "Local folder"}</span>
-										</div>
-										<div className="workspace-row">
-											<label>
-												<span>Type</span>
-												<select
-													value={workspace.kind}
-													onChange={(event) => updateWorkspace(index, { kind: event.target.value as "git" | "local" })}
-													disabled={state.saving}
-												>
-													<option value="git">Git repo</option>
-													<option value="local">Local folder</option>
-												</select>
-											</label>
-											<label>
-												<span>Name</span>
-												<input
-													value={workspace.workspace_dir}
-													onChange={(event) => updateWorkspace(index, { workspace_dir: event.target.value })}
-													placeholder={workspace.kind === "local" ? "docs" : "pi-relay"}
-													required
-													disabled={state.saving}
-												/>
-											</label>
-											<button
-												type="button"
-												className="secondary-button workspace-remove"
-												onClick={() => removeWorkspace(index)}
-												disabled={state.saving || state.workspaces.length <= 1}
-											>
-												Remove
-											</button>
-										</div>
-										{workspace.kind === "local" ? (
-											<label className="workspace-full-field">
-												<span>Source path</span>
-												<input
-													value={workspace.source_path}
-													onChange={(event) => updateWorkspace(index, { source_path: event.target.value })}
-													placeholder="/Users/me/reference-docs"
-													required
-													disabled={state.saving}
-												/>
-											</label>
-										) : (
-											<div className="workspace-row git-fields">
-												<label>
-													<span>Remote URL</span>
-													<input
-														value={workspace.remote_url}
-														onChange={(event) => updateWorkspace(index, { remote_url: event.target.value })}
-														placeholder="https://github.com/me/pi-relay.git"
-														required
-														disabled={state.saving}
-													/>
-												</label>
-												<label>
-													<span>Branch</span>
-													<input
-														value={workspace.remote_branch}
-														onChange={(event) => updateWorkspace(index, { remote_branch: event.target.value })}
-														placeholder="main"
-														required
-														disabled={state.saving}
-													/>
-												</label>
-											</div>
-										)}
-									</div>
-								);
-							})}
-						</div>
-					</div>
-					<div className="rename-actions">
-						<button type="button" className="secondary-button" onClick={onClose} disabled={state.saving}>
-							Cancel
-						</button>
-						<button type="submit" className="primary-button" disabled={state.saving}>
-							{state.saving ? "Saving…" : "Save"}
-						</button>
-					</div>
-				</form>
-			</div>
-		</div>
-	);
-}
