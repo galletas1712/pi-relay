@@ -1,7 +1,7 @@
 import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import { ArrowUp, Bot, Menu, PanelRightOpen } from "lucide-react";
-import { createAgentApi } from "./agentApi.ts";
+import { createAgentApi, type AgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
 import { Composer, type ComposerHandle } from "./composer.tsx";
 import { routeComposerSubmission, type ComposerSubmission } from "./composerRouting.ts";
@@ -101,9 +101,7 @@ import {
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
 import {
 	loadUiSelection,
-	rememberSelectedSession,
 	rememberUiSelection,
-	selectedSessionForProject,
 } from "./uiResume.ts";
 import {
 	rememberWorkspaceScope,
@@ -112,6 +110,27 @@ import {
 	type WorkspaceScopeEntry,
 } from "./workspaceScope.ts";
 import { WorkspaceScopePicker } from "./workspaceScopePicker.tsx";
+import {
+	browserWorkspaceRouteHistory,
+	fallbackExecutionConversation,
+	hostRouteScope,
+	legacyWorkspaceResume,
+	messageRecipient,
+	openAgentConversation,
+	parseWorkspaceRoute,
+	projectRouteScope,
+	rootConversationRoute,
+	selectRootRun,
+	showConversation,
+	unavailableConversationRoute,
+	unavailableExecutionDetail,
+	WorkspaceRouteHistory,
+	type RouteNavigation,
+	type WorkspaceRoute,
+	type WorkspaceRouteParseResult,
+	type WorkspaceRouteUnavailable,
+	type WorkspaceRouteWarning,
+} from "./workspaceRoute.ts";
 import type {
 	Activity,
 	Delegation,
@@ -167,6 +186,10 @@ function defaultPanelState(mode: PanelMode): { sidebarOpen: boolean; rightOpen: 
 	};
 }
 
+function routeScope(projectId: string | null) {
+	return projectId === null ? hostRouteScope() : projectRouteScope(projectId);
+}
+
 type ExportDialogState = {
 	entries: TranscriptEntry[];
 	blocks?: ExportBlock[];
@@ -184,6 +207,79 @@ type DeleteDialogState = {
 	session: SessionListItem;
 	deleting: boolean;
 };
+
+export interface AppProps {
+	api?: AgentApi;
+	routeHistory?: WorkspaceRouteHistory | null;
+}
+
+type RouteValidationState =
+	| { kind: "idle" }
+	| { kind: "pending" }
+	| { kind: "valid" }
+	| {
+			kind: "unavailable";
+			state: WorkspaceRouteUnavailable;
+			retryable: boolean;
+		};
+
+function routeScopeProjectId(route: WorkspaceRoute): string | null {
+	return route.scope.kind === "project" ? route.scope.projectId : null;
+}
+
+function routeConversationSessionId(route: WorkspaceRoute): string {
+	return messageRecipient(route).sessionId;
+}
+
+function initialRouteResult(history: WorkspaceRouteHistory | null): WorkspaceRouteParseResult {
+	return history?.current() ?? { kind: "none" };
+}
+
+function routeInitialSelection(
+	result: WorkspaceRouteParseResult,
+	legacy: ReturnType<typeof loadUiSelection>,
+): { projectId: string | null; rootSessionId: string | null; conversationSessionId: string | null } {
+	if (result.kind === "route") {
+		return {
+			projectId: routeScopeProjectId(result.route),
+			rootSessionId: result.route.rootSessionId,
+			conversationSessionId: routeConversationSessionId(result.route),
+		};
+	}
+	if (result.kind === "unavailable") {
+		return { projectId: null, rootSessionId: null, conversationSessionId: null };
+	}
+	return {
+		projectId: legacy.projectId,
+		rootSessionId: null,
+		// Legacy identity is not trusted until the selected session's canonical
+		// direct parent/root has been resolved.
+		conversationSessionId: null,
+	};
+}
+
+function projectMismatchUnavailable(route: WorkspaceRoute, actualProjectId: string | null): WorkspaceRouteUnavailable {
+	const requestedProject =
+		route.scope.kind === "project" ? `project ${route.scope.projectId}` : "Host";
+	const actualProject = actualProjectId ? `project ${actualProjectId}` : "Host";
+	return {
+		kind: "unavailable",
+		issue: "project-mismatch",
+		message: `This run belongs to ${actualProject}, not ${requestedProject}.`,
+		requestedUrl: "",
+		backTo: null,
+	};
+}
+
+function routeRootUnavailable(route: WorkspaceRoute, message: string): WorkspaceRouteUnavailable {
+	return {
+		kind: "unavailable",
+		issue: "invalid-conversation",
+		message,
+		requestedUrl: "",
+		backTo: null,
+	};
+}
 
 function sessionListRefreshKey(projectId: string | null): string {
 	return projectId ?? "__host__";
@@ -251,17 +347,48 @@ function hasCanonicalCachedHistory(cache: SelectedSessionCache, sessionId: strin
 	);
 }
 
-export function App() {
-	const api = useMemo(() => createAgentApi(), []);
+export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: AppProps = {}) {
+	const api = useMemo(() => injectedApi ?? createAgentApi(), [injectedApi]);
+	const routeHistory = useMemo(
+		() => injectedRouteHistory === undefined ? browserWorkspaceRouteHistory() : injectedRouteHistory,
+		[injectedRouteHistory],
+	);
 	const queryClient = useQueryClient();
 	const initialUiSelection = useMemo(() => loadUiSelection(), []);
+	const initialWorkspaceRoute = useMemo(() => initialRouteResult(routeHistory), [routeHistory]);
+	const initialSelection = useMemo(
+		() => routeInitialSelection(initialWorkspaceRoute, initialUiSelection),
+		[initialUiSelection, initialWorkspaceRoute],
+	);
 	const [connection, setConnection] = useState<ConnectionStatus>("connecting");
 	const connectionRef = useRef<ConnectionStatus>("connecting");
 	const [hasConnected, setHasConnected] = useState(false);
 	const [retryingConnection, setRetryingConnection] = useState(false);
-	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(initialUiSelection.projectId);
-	const [selectedId, setSelectedId] = useState<string | null>(initialUiSelection.sessionId);
-	const selectedRef = useRef<string | null>(initialUiSelection.sessionId);
+	const [workspaceRouteResult, setWorkspaceRouteResult] =
+		useState<WorkspaceRouteParseResult>(initialWorkspaceRoute);
+	const [routeWarnings, setRouteWarnings] = useState<WorkspaceRouteWarning[]>(
+		initialWorkspaceRoute.kind === "route" ? initialWorkspaceRoute.warnings : [],
+	);
+	const [routeValidation, setRouteValidation] = useState<RouteValidationState>(
+		initialWorkspaceRoute.kind === "route"
+			? { kind: "pending" }
+			: initialWorkspaceRoute.kind === "unavailable"
+				? { kind: "unavailable", state: initialWorkspaceRoute, retryable: false }
+				: initialUiSelection.sessionId
+					? { kind: "pending" }
+					: { kind: "idle" },
+	);
+	const [routeRevision, setRouteRevision] = useState(0);
+	const [routeValidationRetry, setRouteValidationRetry] = useState(0);
+	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(initialSelection.projectId);
+	// `selectedId` remains as an incremental alias throughout the mature
+	// transcript/cache code. Its sole identity source is conversationSessionId.
+	const [conversationSessionId, setConversationSessionId] = useState<string | null>(
+		initialSelection.conversationSessionId,
+	);
+	const selectedId = conversationSessionId;
+	const selectedRef = useRef<string | null>(initialSelection.conversationSessionId);
+	const [rootSessionId, setRootSessionId] = useState<string | null>(initialSelection.rootSessionId);
 	const [notices, setNotices] = useState<Notice[]>([]);
 	const [query, setQuery] = useState("");
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
@@ -290,13 +417,13 @@ export function App() {
 		reset: resetSelectedCache,
 		update: updateSelectedCache,
 		warm: warmSelectedCache,
-	} = useSelectedSessionStore(initialUiSelection.sessionId);
+	} = useSelectedSessionStore(initialSelection.conversationSessionId);
 	const selectedFetchCoordinatorRef = useRef<SelectedSessionFetchCoordinator | null>(null);
 	if (!selectedFetchCoordinatorRef.current) {
 		selectedFetchCoordinatorRef.current = new SelectedSessionFetchCoordinator({
-			sessionId: initialUiSelection.sessionId,
+			sessionId: initialSelection.conversationSessionId,
 			selectionVersion: 0,
-			loading: !!initialUiSelection.sessionId,
+			loading: !!initialSelection.conversationSessionId,
 			retrying: false,
 			hadUsableCache: false,
 			error: null,
@@ -317,7 +444,17 @@ export function App() {
 	const mobileSidebarToggleRef = useRef<HTMLButtonElement | null>(null);
 	const sidebarNewSessionButtonRef = useRef<HTMLButtonElement | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
-	const selectedProjectRef = useRef<string | null>(initialUiSelection.projectId);
+	const selectedProjectRef = useRef<string | null>(initialSelection.projectId);
+	const routeValidationGenerationRef = useRef(0);
+	const workspaceRouteResultRef = useRef(workspaceRouteResult);
+	const routeValidationRef = useRef(routeValidation);
+	const legacyMigrationPendingRef = useRef(
+		initialWorkspaceRoute.kind === "none" && !!initialUiSelection.sessionId,
+	);
+	const initialCorrectionAppliedRef = useRef(false);
+	const validatedRouteRevisionRef = useRef(-1);
+	workspaceRouteResultRef.current = workspaceRouteResult;
+	routeValidationRef.current = routeValidation;
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
@@ -618,7 +755,7 @@ export function App() {
 	// can expose current navigation semantics. This intentionally follows only
 	// the canonical direct parent; it does not infer a root or traverse a graph.
 	const delegationParentSessionId =
-		loadedSnapshot?.parent_session_id ?? loadedSnapshot?.session_id ?? null;
+		rootSessionId;
 	const expandedDelegationQueryKey = queryKeys.delegations(
 		delegationParentSessionId,
 		RUN_BOARD_EXPANDED_DELEGATION_COUNT,
@@ -639,7 +776,10 @@ export function App() {
 				RUN_BOARD_DEFAULT_DELEGATION_COUNT,
 			);
 		},
-		enabled: connection === "open" && !!delegationParentSessionId,
+		enabled:
+			connection === "open" &&
+			!!delegationParentSessionId &&
+			routeValidation.kind === "valid",
 		// The parent PARKS (goes idle) while a delegation runs, so gate the poll
 		// on whether any delegation is actually running — not on the parent's
 		// activity — or the missed-event safety net would be off exactly when
@@ -660,6 +800,7 @@ export function App() {
 		enabled:
 			connection === "open" &&
 			!!delegationParentSessionId &&
+			routeValidation.kind === "valid" &&
 			showAllDelegations,
 		refetchInterval: (query) =>
 			(query.state.data?.delegations ?? []).some(isDelegationRunning) ? 2_000 : false,
@@ -782,38 +923,186 @@ export function App() {
 	const modelLocked = !!selectedId && !!loadedSnapshot && hasTranscriptEntries;
 	const modelControlsDisabled = !!selectedId && (!loadedSnapshot || loadedSnapshot.activity !== "idle");
 
-	const selectSession = useCallback((sessionId: string | null) => {
+	const applyConversationIdentity = useCallback((sessionId: string | null) => {
 		const previousSessionId = selectedRef.current;
 		if (sessionId === previousSessionId) {
 			if (sessionId === null) nextSessionTitleRef.current = null;
 			return;
 		}
 		if (sessionId === null) nextSessionTitleRef.current = null;
+		setHistoryDialog((current) => current?.sessionId === sessionId ? current : null);
 		selectedRef.current = sessionId;
-		setSelectedId(sessionId);
+		setConversationSessionId(sessionId);
 		setShowAllDelegations(false);
 		const nextCache = resetSelectedCache(sessionId);
 		selectedFetchCoordinator.select(
 			sessionId,
 			hasUsableSelectedSessionCache(nextCache, sessionId),
 		);
-		rememberSelectedSession(selectedProjectRef.current, sessionId);
 	}, [resetSelectedCache, selectedFetchCoordinator]);
 
-	const selectProjectSession = useCallback((projectId: string | null, sessionId: string | null) => {
+	const applyProjectConversationIdentity = useCallback((projectId: string | null, sessionId: string | null) => {
 		selectedProjectRef.current = projectId;
-		selectedRef.current = sessionId;
 		sessionListCoordinator.selectProject(projectId);
 		setSelectedProjectId(projectId);
-		setSelectedId(sessionId);
-		setShowAllDelegations(false);
-		const nextCache = resetSelectedCache(sessionId);
-		selectedFetchCoordinator.select(
-			sessionId,
-			hasUsableSelectedSessionCache(nextCache, sessionId),
-		);
-		rememberUiSelection(projectId, sessionId);
-	}, [resetSelectedCache, selectedFetchCoordinator, sessionListCoordinator]);
+		applyConversationIdentity(sessionId);
+	}, [applyConversationIdentity, sessionListCoordinator]);
+
+	const applyParsedWorkspaceRoute = useCallback(
+		(parsed: WorkspaceRouteParseResult, options: { correct?: boolean } = {}) => {
+			const next =
+				options.correct !== false && parsed.kind === "route" && parsed.correction
+					? routeHistory?.correct(parsed) ?? parsed
+					: parsed;
+			const unchangedValidatedRoute =
+				next.kind === "route" &&
+				workspaceRouteResultRef.current.kind === "route" &&
+				routeValidationRef.current.kind === "valid" &&
+				next.canonicalUrl === workspaceRouteResultRef.current.canonicalUrl;
+			if (unchangedValidatedRoute) {
+				setWorkspaceRouteResult(next);
+				setRouteWarnings(next.warnings);
+				return next;
+			}
+			setHistoryDialog(null);
+			routeValidationGenerationRef.current += 1;
+			validatedRouteRevisionRef.current = -1;
+			setRouteRevision((current) => current + 1);
+			setWorkspaceRouteResult(next);
+			if (next.kind === "route") {
+				const projectId = routeScopeProjectId(next.route);
+				const conversationId = routeConversationSessionId(next.route);
+				setRouteWarnings(next.warnings);
+				setRootSessionId(next.route.rootSessionId);
+				setRouteValidation({ kind: "pending" });
+				applyProjectConversationIdentity(projectId, conversationId);
+				return next;
+			}
+			setRouteWarnings([]);
+			setRootSessionId(null);
+			setRouteValidation(
+				next.kind === "unavailable"
+					? { kind: "unavailable", state: next, retryable: false }
+					: { kind: "idle" },
+			);
+			if (next.kind === "none") {
+				rememberUiSelection(selectedProjectRef.current, null);
+			}
+			applyConversationIdentity(null);
+			return next;
+		},
+		[
+			applyConversationIdentity,
+			applyProjectConversationIdentity,
+			routeHistory,
+		],
+	);
+
+	const applyNavigation = useCallback(
+		(navigation: RouteNavigation) => {
+			const parsed = routeHistory?.apply(navigation) ?? parseWorkspaceRoute(navigation.url);
+			if (parsed) applyParsedWorkspaceRoute(parsed);
+		},
+		[applyParsedWorkspaceRoute, routeHistory],
+	);
+
+	const openRootConversation = useCallback(
+		(projectId: string | null, sessionId: string) => {
+			applyNavigation(selectRootRun(routeScope(projectId), sessionId));
+		},
+		[applyNavigation],
+	);
+
+	const openConversation = useCallback(
+		(sessionId: string) => {
+			if (
+				workspaceRouteResult.kind === "route" &&
+				workspaceRouteResult.route.destination === "conversation" &&
+				routeConversationSessionId(workspaceRouteResult.route) === sessionId
+			) {
+				return;
+			}
+			const knownSession = allKnownSessions.find((session) => session.session_id === sessionId);
+			if (knownSession && !knownSession.parent_session_id) {
+				openRootConversation(knownSession.project_id, sessionId);
+				return;
+			}
+			if (
+				workspaceRouteResult.kind === "route" &&
+				(sessionId === workspaceRouteResult.route.rootSessionId ||
+					sessionId === loadedSnapshot?.parent_session_id)
+			) {
+				applyNavigation(
+					sessionId === workspaceRouteResult.route.rootSessionId
+						? selectRootRun(workspaceRouteResult.route.scope, sessionId)
+						: openAgentConversation(workspaceRouteResult.route, sessionId),
+				);
+				return;
+			}
+			if (workspaceRouteResult.kind === "route") {
+				applyNavigation(openAgentConversation(workspaceRouteResult.route, sessionId));
+				return;
+			}
+			openRootConversation(selectedProjectRef.current, sessionId);
+		},
+		[
+			allKnownSessions,
+			applyNavigation,
+			loadedSnapshot?.parent_session_id,
+			openRootConversation,
+			workspaceRouteResult,
+		],
+	);
+
+	const selectSession = useCallback(
+		(sessionId: string | null) => {
+			if (sessionId === null) {
+				routeValidationGenerationRef.current += 1;
+				const empty = routeHistory?.clear("push") ?? { kind: "none" as const };
+				setWorkspaceRouteResult(empty);
+				setRouteWarnings([]);
+				setRouteValidation({ kind: "idle" });
+				setRootSessionId(null);
+				rememberUiSelection(selectedProjectRef.current, null);
+				applyConversationIdentity(null);
+				return;
+			}
+			openConversation(sessionId);
+		},
+		[applyConversationIdentity, openConversation, routeHistory],
+	);
+
+	const selectProjectSession = useCallback(
+		(projectId: string | null, sessionId: string | null) => {
+			if (sessionId) {
+				openRootConversation(projectId, sessionId);
+				return;
+			}
+			routeValidationGenerationRef.current += 1;
+			const empty = routeHistory?.clear("push") ?? { kind: "none" as const };
+			setWorkspaceRouteResult(empty);
+			setRouteWarnings([]);
+			setRouteValidation({ kind: "idle" });
+			setRootSessionId(null);
+			rememberUiSelection(projectId, null);
+			applyProjectConversationIdentity(projectId, null);
+		},
+		[applyProjectConversationIdentity, openRootConversation, routeHistory],
+	);
+
+	useEffect(() => {
+		if (
+			!initialCorrectionAppliedRef.current &&
+			initialWorkspaceRoute.kind === "route" &&
+			initialWorkspaceRoute.correction
+		) {
+			initialCorrectionAppliedRef.current = true;
+			applyParsedWorkspaceRoute(initialWorkspaceRoute);
+		}
+		return routeHistory?.subscribe((parsed) => {
+			applyParsedWorkspaceRoute(parsed);
+		});
+	}, [applyParsedWorkspaceRoute, initialWorkspaceRoute, routeHistory]);
 
 	const invalidateSessionList = useCallback(
 		(projectId = selectedProjectRef.current) => {
@@ -860,6 +1149,242 @@ export function App() {
 		},
 		[api, assertServerReadAllowed],
 	);
+
+	useEffect(() => {
+		if (connection !== "open") return;
+		if (
+			workspaceRouteResult.kind === "route" &&
+			routeValidationRef.current.kind === "valid" &&
+			validatedRouteRevisionRef.current === routeRevision
+		) {
+			return;
+		}
+		const generation = ++routeValidationGenerationRef.current;
+		const stillCurrent = () => routeValidationGenerationRef.current === generation;
+		const validateProject = (route: WorkspaceRoute, snapshot: SessionSnapshot) =>
+			routeScopeProjectId(route) === snapshot.project_id;
+		const run = async () => {
+			if (workspaceRouteResult.kind === "none") {
+				if (!legacyMigrationPendingRef.current || !initialUiSelection.sessionId) return;
+				setRouteValidation({ kind: "pending" });
+				try {
+					const selected = await fetchSessionSnapshot(initialUiSelection.sessionId, "legacy-route");
+					if (!stillCurrent()) return;
+					const root = selected.parent_session_id
+						? await fetchSessionSnapshot(selected.parent_session_id, "legacy-route-parent")
+						: selected;
+					if (!stillCurrent()) return;
+					if (root.parent_session_id) {
+						setRouteValidation({
+							kind: "unavailable",
+							state: routeRootUnavailable(
+								rootConversationRoute(routeScope(initialUiSelection.projectId), root.session_id),
+								"Nested agent conversations are not available because the backend currently exposes direct parents only.",
+							),
+							retryable: false,
+						});
+						return;
+					}
+					if (
+						selected.project_id !== initialUiSelection.projectId ||
+						root.project_id !== initialUiSelection.projectId
+					) {
+						setRouteValidation({
+							kind: "unavailable",
+							state: projectMismatchUnavailable(
+								rootConversationRoute(routeScope(initialUiSelection.projectId), root.session_id),
+								root.project_id,
+							),
+							retryable: false,
+						});
+						return;
+					}
+					legacyMigrationPendingRef.current = false;
+					rememberUiSelection(initialUiSelection.projectId, null);
+					const resume = legacyWorkspaceResume(workspaceRouteResult, initialUiSelection, {
+						kind: "known",
+						rootSessionId: root.session_id,
+					});
+					if (resume.kind === "legacy-route") applyNavigation(resume.navigation);
+				} catch (error) {
+					if (!stillCurrent()) return;
+					setRouteValidation({
+						kind: "unavailable",
+						state: {
+							kind: "unavailable",
+							issue: "invalid-conversation",
+							message: `Couldn’t restore the previous Conversation: ${errorMessage(error)}`,
+							requestedUrl: "",
+							backTo: null,
+						},
+						retryable: true,
+					});
+				}
+				return;
+			}
+			if (workspaceRouteResult.kind !== "route") return;
+			const route = workspaceRouteResult.route;
+			setRouteValidation({ kind: "pending" });
+			try {
+				const root = await fetchSessionSnapshot(route.rootSessionId, "route-root");
+				if (!stillCurrent()) return;
+				if (!validateProject(route, root)) {
+					setRouteValidation({
+						kind: "unavailable",
+						state: projectMismatchUnavailable(route, root.project_id),
+						retryable: false,
+					});
+					return;
+				}
+				if (root.parent_session_id) {
+					setRouteValidation({
+						kind: "unavailable",
+						state: routeRootUnavailable(route, "The requested root run is an agent session, not a root session."),
+						retryable: false,
+					});
+					return;
+				}
+
+				const conversationId = routeConversationSessionId(route);
+				let conversation = root;
+				if (conversationId !== route.rootSessionId) {
+					try {
+						conversation = await fetchSessionSnapshot(conversationId, "route-conversation");
+					} catch (error) {
+						if (!stillCurrent()) return;
+						if (route.destination === "execution") {
+							applyParsedWorkspaceRoute(
+								fallbackExecutionConversation(route, "unavailable"),
+							);
+							return;
+						}
+						throw error;
+					}
+					if (!stillCurrent()) return;
+					const projectMatches = validateProject(route, conversation);
+					const validMembership =
+						projectMatches &&
+						conversation.parent_session_id === route.rootSessionId;
+					if (!validMembership) {
+						if (route.destination === "execution") {
+							const fallback = fallbackExecutionConversation(
+								route,
+								projectMatches
+									? "wrong-root-membership"
+									: "unavailable",
+							);
+							applyParsedWorkspaceRoute(fallback);
+						} else if (!projectMatches) {
+							setRouteValidation({
+								kind: "unavailable",
+								state: projectMismatchUnavailable(route, conversation.project_id),
+								retryable: false,
+							});
+						} else {
+							setRouteValidation({
+								kind: "unavailable",
+								state: unavailableConversationRoute(
+									route,
+									"The requested Conversation is not a direct agent of this root run.",
+								),
+								retryable: false,
+							});
+						}
+						return;
+					}
+				}
+
+				if (
+					route.destination === "execution" &&
+					route.focus.kind === "agent" &&
+					route.focus.sessionId !== conversation.session_id
+				) {
+					let focused: SessionSnapshot;
+					try {
+						focused = await fetchSessionSnapshot(route.focus.sessionId, "route-focus");
+					} catch {
+						if (!stillCurrent()) return;
+						setRouteValidation({
+							kind: "unavailable",
+							state: unavailableExecutionDetail(route, "focus"),
+							retryable: false,
+						});
+						return;
+					}
+					if (!stillCurrent()) return;
+					if (
+						!validateProject(route, focused) ||
+						focused.parent_session_id !== route.rootSessionId
+					) {
+						setRouteValidation({
+							kind: "unavailable",
+							state: unavailableExecutionDetail(route, "focus"),
+							retryable: false,
+						});
+						return;
+					}
+				}
+				if (route.destination === "execution" && route.focus.kind === "delegation") {
+					setRouteValidation({
+						kind: "unavailable",
+						state: unavailableExecutionDetail(
+							route,
+							"focus",
+							"Delegation focus is not available because the backend does not expose an unbounded canonical delegation lookup.",
+						),
+						retryable: false,
+					});
+					return;
+				}
+				if (route.destination === "execution" && route.handoff) {
+					setRouteValidation({
+						kind: "unavailable",
+						state: unavailableExecutionDetail(
+							route,
+							"handoff",
+							"The requested handoff cannot be validated by the current backend.",
+						),
+						retryable: false,
+					});
+					return;
+				}
+				rememberUiSelection(routeScopeProjectId(route), null);
+				validatedRouteRevisionRef.current = routeRevision;
+				setRouteValidation({ kind: "valid" });
+			} catch (error) {
+				if (!stillCurrent()) return;
+				setRouteValidation({
+					kind: "unavailable",
+					state:
+						route.destination === "conversation"
+							? unavailableConversationRoute(
+								route,
+								`Couldn’t validate the requested Conversation: ${errorMessage(error)}`,
+							)
+							: routeRootUnavailable(
+								route,
+								`Couldn’t validate the requested Execution route: ${errorMessage(error)}`,
+							),
+					retryable: true,
+				});
+			}
+		};
+		void run();
+		return () => {
+			if (routeValidationGenerationRef.current === generation) {
+				routeValidationGenerationRef.current += 1;
+			}
+		};
+	}, [
+		applyNavigation,
+		applyParsedWorkspaceRoute,
+		connection,
+		fetchSessionSnapshot,
+		initialUiSelection,
+		routeRevision,
+		routeValidationRetry,
+		workspaceRouteResult,
+	]);
 
 	const commitSelectedSnapshot = useCallback(
 		(snapshot: SessionSnapshot) => {
@@ -1013,10 +1538,8 @@ export function App() {
 				selectedFetchCoordinator.isCurrent(sessionId, selectionVersion) &&
 				snapshot.project_id !== selectedProjectRef.current
 			) {
-				selectedProjectRef.current = snapshot.project_id;
-				sessionListCoordinator.selectProject(snapshot.project_id);
-				setSelectedProjectId(snapshot.project_id);
-				rememberUiSelection(snapshot.project_id, sessionId);
+				// Route validation owns project identity. A route/project mismatch
+				// is rendered explicitly rather than silently changing scope here.
 			}
 			if (!selectedFetchCoordinator.isCurrent(sessionId, selectionVersion)) return null;
 			const cache = selectedCacheRef.current;
@@ -1107,10 +1630,7 @@ export function App() {
 					lastEventIds.current.set(sessionId, Math.max(observedEventId, committedSnapshot.last_event_id));
 					mergeSnapshotIntoKnownSessionLists(committedSnapshot);
 					if (committedSnapshot.project_id !== selectedProjectRef.current) {
-						selectedProjectRef.current = committedSnapshot.project_id;
-						sessionListCoordinator.selectProject(committedSnapshot.project_id);
-						setSelectedProjectId(committedSnapshot.project_id);
-						rememberUiSelection(committedSnapshot.project_id, sessionId);
+						// Route validation owns project identity.
 					}
 					result = {
 						snapshot: committedSnapshot,
@@ -1510,26 +2030,24 @@ export function App() {
 		if (projectsQuery.status !== "success") return;
 		const currentProjectId = selectedProjectRef.current;
 		if (currentProjectId === null || projects.some((project) => project.project_id === currentProjectId)) return;
+		if (workspaceRouteResult.kind === "route") {
+			if (routeValidation.kind !== "valid") return;
+			setRouteValidation({
+				kind: "unavailable",
+				state: projectMismatchUnavailable(workspaceRouteResult.route, null),
+				retryable: false,
+			});
+			return;
+		}
 		selectProjectSession(null, null);
 		setQuery("");
 		composerHandleRef.current?.setValue("");
-	}, [projects, projectsQuery.status, selectProjectSession]);
-
-	useEffect(() => {
-		if (!selectedId) return;
-		if (sessionItems.some((session) => session.session_id === selectedId)) return;
-		if (selectedFetchState.sessionId === selectedId && selectedFetchState.loading) return;
-		if (selectedFetchState.sessionId === selectedId && selectedFetchState.error) return;
-		if (loadedSnapshot?.session_id === selectedId) return;
-		selectSession(null);
 	}, [
-		loadedSnapshot?.session_id,
-		selectSession,
-		selectedFetchState.loading,
-		selectedFetchState.error,
-		selectedFetchState.sessionId,
-		selectedId,
-		sessionItems,
+		projects,
+		projectsQuery.status,
+		routeValidation.kind,
+		selectProjectSession,
+		workspaceRouteResult,
 	]);
 
 	useEffect(() => {
@@ -1659,16 +2177,17 @@ export function App() {
 				setNewSessionProvider(provider);
 				return;
 			}
+			const projectId = selectedProjectRef.current;
 			assertServerMutationAllowed();
 			const result = await api.configureSession({ sessionId, provider });
-			patchSessionListProvider(queryClient, selectedProjectRef.current, sessionId, provider);
+			patchSessionListProvider(queryClient, projectId, sessionId, provider);
 			patchSelectedSnapshot(sessionId, (snapshot) => ({
 				...snapshot,
 				provider,
 				metadata: result.metadata ?? snapshot.metadata,
 				activity: result.activity,
 			}));
-			invalidateSessionList();
+			invalidateSessionList(projectId);
 		},
 		[api, assertServerMutationAllowed, invalidateSessionList, patchSelectedSnapshot, queryClient],
 	);
@@ -1718,16 +2237,17 @@ export function App() {
 	const renameSession = useCallback(async () => {
 		if (!renameSessionId) return;
 		assertServerMutationAllowed();
+		const projectId = selectedProjectRef.current;
 		const title = renameValue.trim();
 		if (!title) throw new Error("session title is required");
 		const result = await api.renameSession(renameSessionId, title);
-		patchSessionListMetadata(queryClient, selectedProjectRef.current, renameSessionId, { title });
+		patchSessionListMetadata(queryClient, projectId, renameSessionId, { title });
 		patchSelectedSnapshot(renameSessionId, (snapshot) => ({
 			...snapshot,
 			metadata: result.metadata ?? { ...snapshot.metadata, title },
 			activity: result.activity,
 		}));
-		invalidateSessionList();
+		invalidateSessionList(projectId);
 		pushNotice("success", `renamed session to “${truncate(title, 80)}”`);
 		closeRenameDialog();
 	}, [api, assertServerMutationAllowed, closeRenameDialog, invalidateSessionList, patchSelectedSnapshot, pushNotice, queryClient, renameSessionId, renameValue]);
@@ -1736,6 +2256,7 @@ export function App() {
 		async (session: SessionListItem, archived: boolean) => {
 			assertServerMutationAllowed();
 			const sessionId = session.session_id;
+			const projectId = session.project_id;
 			const currentSnapshot = loadedSnapshot?.session_id === sessionId ? loadedSnapshot : null;
 			const activity = currentSnapshot?.activity ?? session.activity;
 			if (activity !== "idle") throw new Error("only idle sessions can be archived");
@@ -1750,7 +2271,7 @@ export function App() {
 			});
 			patchSessionListMetadata(
 				queryClient,
-				selectedProjectRef.current,
+				projectId,
 				sessionId,
 				archived ? { archived: true } : {},
 				archived ? [] : ["archived"],
@@ -1760,7 +2281,7 @@ export function App() {
 				metadata: result.metadata ?? metadata,
 				activity: result.activity,
 			}));
-			invalidateSessionList();
+			invalidateSessionList(projectId);
 			pushNotice(
 				"success",
 				archived ? `archived “${truncate(sessionTitle(session), 80)}”` : `unarchived “${truncate(sessionTitle(session), 80)}”`,
@@ -1804,7 +2325,7 @@ export function App() {
 			}
 
 			closeDeleteDialog();
-			invalidateSessionList();
+			invalidateSessionList(session.project_id);
 			pushNotice("success", `deleted “${truncate(title, 80)}”`);
 		} catch (error) {
 			setDeleteDialog((current) => (current?.session.session_id === sessionId ? { ...current, deleting: false } : current));
@@ -1837,6 +2358,12 @@ export function App() {
 			clientInputId: string,
 		) => {
 			assertServerMutationAllowed();
+			const projectId = snapshot.project_id;
+			const baseLeafId = selectedBaseLeafId(
+				selectedCacheRef.current,
+				sessionId,
+				snapshot.active_leaf_id ?? null,
+			);
 			if (isArchivedSession(snapshot)) {
 				const current = snapshot;
 				if (current.activity !== "idle") {
@@ -1849,31 +2376,31 @@ export function App() {
 					provider: current.provider,
 					metadata,
 				});
-				patchSessionListMetadata(queryClient, selectedProjectRef.current, sessionId, {}, ["archived"]);
+				patchSessionListMetadata(queryClient, projectId, sessionId, {}, ["archived"]);
 				patchSelectedSnapshot(sessionId, (snapshot) => ({
 					...snapshot,
 					metadata: result.metadata ?? metadata,
 					activity: result.activity,
 				}));
-				invalidateSessionList();
+				invalidateSessionList(projectId);
 			}
 			const content = textContent(text);
 			const result = await api.queueFollowUp({
 				sessionId,
 				clientInputId,
 				expectedActiveLeafId: snapshot.activity === "idle" ? (snapshot.active_leaf_id ?? null) : undefined,
-				baseLeafId: selectedBaseLeafId(selectedCacheRef.current, sessionId, snapshot.active_leaf_id ?? null),
+				baseLeafId,
 				content,
 			});
 			if (selectedRef.current !== sessionId) {
-				invalidateSessionList();
+				invalidateSessionList(projectId);
 				return;
 			}
 			if (result.queue) {
 				updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue!));
 			}
 			if (result.queued) {
-				invalidateSessionList();
+				invalidateSessionList(projectId);
 			} else {
 				if (result.active_branch_sync) {
 					const overview = {
@@ -1934,23 +2461,30 @@ export function App() {
 			await queryClient.invalidateQueries({
 				queryKey: queryKeys.sessions(projectId),
 			});
-			selectSession(result.session_id);
+			openRootConversation(projectId, result.session_id);
 			return result.session_id;
 		},
-		[api, assertServerMutationAllowed, newSessionProvider, queryClient, selectSession],
+		[api, assertServerMutationAllowed, newSessionProvider, openRootConversation, queryClient],
 	);
 
 	const switchToTarget = useCallback(
-		async (target: HistoryTargetOption) => {
+		async (
+			sessionId: string,
+			projectId: string | null,
+			snapshot: SessionSnapshot,
+			targetCache: SelectedSessionCache,
+			target: HistoryTargetOption,
+		) => {
 			assertServerMutationAllowed();
-			const sessionId = requireSelected();
-			if (!loadedSnapshot || loadedSnapshot.session_id !== sessionId) {
+			const expectedTranscriptRevision =
+				targetCache.treeTranscriptRevision ?? snapshot.transcript_revision ?? null;
+			if (targetCache.sessionId !== sessionId || targetCache.snapshot?.session_id !== sessionId) {
 				throw new Error("session is still loading");
 			}
-			if (loadedSnapshot.activity !== "idle") {
+			if (snapshot.activity !== "idle") {
 				throw new Error("stop the active turn before switching history");
 			}
-			const targetBranchIds = branchFromTree(selectedCacheRef.current, target.actionLeafId).map((node) => node.id);
+			const targetBranchIds = branchFromTree(targetCache, target.actionLeafId).map((node) => node.id);
 			if (target.actionLeafId && !targetBranchIds.includes(target.actionLeafId)) {
 				throw new Error("history index is still loading; please wait for the switch list to finish");
 			}
@@ -1958,6 +2492,7 @@ export function App() {
 				api,
 				sessionId,
 				target,
+				targetCache,
 				selectedCacheRef,
 				updateSelectedCache,
 				assertServerReadAllowed,
@@ -1967,8 +2502,8 @@ export function App() {
 				result = await api.switchHistory({
 					sessionId,
 					leafId: target.actionLeafId,
-					expectedActiveLeafId: target.expectedActiveLeafId ?? loadedSnapshot.active_leaf_id ?? null,
-					expectedTranscriptRevision: selectedCacheRef.current.treeTranscriptRevision ?? loadedSnapshot.transcript_revision ?? null,
+					expectedActiveLeafId: target.expectedActiveLeafId ?? snapshot.active_leaf_id ?? null,
+					expectedTranscriptRevision,
 					activeBranchEntryIds: targetBranchIds,
 					missingBodyIds: [],
 				});
@@ -1979,11 +2514,19 @@ export function App() {
 				}
 				throw error;
 			}
+			if (selectedRef.current !== sessionId) {
+				invalidateSessionList(projectId);
+				return;
+			}
 			if (restoreText !== null) composerHandleRef.current?.setValue(restoreText);
-			updateSelectedCache((current) => applySwitchResultToCache(current.sessionId === sessionId ? current : selectedCacheRef.current, result));
+			updateSelectedCache((current) =>
+				current.sessionId === sessionId
+					? applySwitchResultToCache(current, result)
+					: current,
+			);
 			await refreshSelectedSessionState(sessionId);
 			if (result.last_event_id !== undefined) lastEventIds.current.set(sessionId, result.last_event_id);
-			invalidateSessionList();
+			invalidateSessionList(projectId);
 			pushNotice("success", restoreText !== null ? "message restored for editing" : "switched to selected history point");
 		},
 		[
@@ -1992,47 +2535,54 @@ export function App() {
 			assertServerReadAllowed,
 			ensureTreeIndex,
 			invalidateSessionList,
-			loadedSnapshot,
 			pushNotice,
 			refreshSelectedSessionState,
-			requireSelected,
 			updateSelectedCache,
 		],
 	);
 
 	const handleSwitchHistoryTarget = useCallback(
 		(target: HistoryTargetOption) => {
+			const dialog = historyDialog;
+			if (!dialog) return;
 			try {
 				assertServerMutationAllowed();
 			} catch (error) {
 				pushNotice("error", errorMessage(error));
 				return;
 			}
-			const sessionId = selectedRef.current;
+			const sessionId = dialog.sessionId;
+			const targetCache = getSelectedCache(sessionId);
+			const snapshot = targetCache?.snapshot;
+			if (!targetCache || !snapshot || snapshot.session_id !== sessionId) {
+				setHistoryDialog(null);
+				pushNotice("error", "session is still loading");
+				return;
+			}
+			const projectId = snapshot.project_id;
 			setHistoryDialog(null);
-			if (sessionId) setHistorySwitchingSessionId(sessionId);
-			void switchToTarget(target)
+			setHistorySwitchingSessionId(sessionId);
+			void switchToTarget(sessionId, projectId, snapshot, targetCache, target)
 				.catch((error) => {
 					if (!isSelectedSessionFetchError(error)) pushNotice("error", errorMessage(error));
 				})
 				.finally(() => {
-					if (sessionId) {
-						setHistorySwitchingSessionId((current) => (current === sessionId ? null : current));
-					}
+					setHistorySwitchingSessionId((current) => (current === sessionId ? null : current));
 				});
 		},
-		[assertServerMutationAllowed, pushNotice, switchToTarget],
+		[assertServerMutationAllowed, getSelectedCache, historyDialog, pushNotice, switchToTarget],
 	);
 
 	const promoteQueuedInput = useCallback(
 		async (inputId: string) => {
 			assertServerMutationAllowed();
 			const sessionId = requireSelected();
+			const projectId = selectedProjectRef.current;
 			const result = await api.promoteQueuedInput(sessionId, inputId);
 			if (result.queue) {
 				updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue!));
 			}
-			await queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) });
+			await queryClient.invalidateQueries({ queryKey: queryKeys.sessions(projectId) });
 			if (!result.promoted && result.status !== "queued") {
 				pushNotice("info", "message is already being processed");
 			}
@@ -2044,12 +2594,13 @@ export function App() {
 		async (inputId: string, text: string) => {
 			assertServerMutationAllowed();
 			const sessionId = requireSelected();
+			const projectId = selectedProjectRef.current;
 			const queueRevision = selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current.snapshot?.queue_revision : undefined;
 			const result = await api.updateQueuedInput(sessionId, inputId, textContent(text), queueRevision);
 			updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue));
 			if (!result.updated && result.reason === "queue_changed") pushNotice("info", "queue changed; refreshed");
 			if (!result.updated && result.reason === "not_editable") pushNotice("info", "message is no longer editable");
-			invalidateSessionList();
+			invalidateSessionList(projectId);
 		},
 		[api, assertServerMutationAllowed, invalidateSessionList, pushNotice, requireSelected, updateSelectedCache],
 	);
@@ -2072,6 +2623,7 @@ export function App() {
 		async (inputId: string, direction: "up" | "down") => {
 			assertServerMutationAllowed();
 			const sessionId = requireSelected();
+			const projectId = selectedProjectRef.current;
 			const cache = selectedCacheRef.current;
 			const followUps = (cache.sessionId === sessionId ? cache.snapshot?.queued_inputs : loadedSnapshot?.queued_inputs ?? [])
 				?.filter((input) => input.priority === "follow_up" && input.status === "queued") ?? [];
@@ -2093,13 +2645,14 @@ export function App() {
 		try {
 			assertServerMutationAllowed();
 			const sessionId = requireSelected();
+			const projectId = selectedProjectRef.current;
 			setStopping(true);
 			await stopSession(sessionId, {
 				interrupt: (targetSessionId) => api.interrupt(targetSessionId),
 				refresh: (targetSessionId) => syncActiveBranchNow(targetSessionId),
 				invalidateSessions: () =>
 					queryClient.invalidateQueries({
-						queryKey: queryKeys.sessions(selectedProjectRef.current),
+						queryKey: queryKeys.sessions(projectId),
 					}),
 			});
 		} catch (error) {
@@ -2160,6 +2713,7 @@ export function App() {
 		async (leafId?: string | null) => {
 			assertServerMutationAllowed();
 			const sessionId = requireSelected();
+			const projectId = selectedProjectRef.current;
 			const current = await refreshSelected(sessionId);
 			const activeLeafId = leafId ?? current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null;
 			if (!activeLeafId) throw new Error("no terminal turn to resume");
@@ -2175,7 +2729,7 @@ export function App() {
 				});
 				await Promise.all([
 					syncActiveBranchNow(sessionId),
-					queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) }),
+					queryClient.invalidateQueries({ queryKey: queryKeys.sessions(projectId) }),
 				]);
 				pushNotice("success", result.outcome === "Interrupted" ? "continued turn" : "retry started");
 			} finally {
@@ -2392,10 +2946,9 @@ export function App() {
 	const handleSelectProject = useCallback(
 		(projectId: string | null) => {
 			if (projectId === selectedProjectRef.current) return;
-			const nextSessionId = selectedSessionForProject(projectId);
-			selectProjectSession(projectId, nextSessionId);
+			selectProjectSession(projectId, null);
 			setQuery("");
-			if (!nextSessionId) composerHandleRef.current?.setValue("");
+			composerHandleRef.current?.setValue("");
 		},
 		[selectProjectSession],
 	);
@@ -2564,6 +3117,53 @@ export function App() {
 		},
 		[pushNotice, reorderQueuedInput],
 	);
+	const validatedRoute =
+		workspaceRouteResult.kind === "route" && routeValidation.kind === "valid"
+			? workspaceRouteResult.route
+			: null;
+	const conversationVisible =
+		(validatedRoute?.destination === "conversation") ||
+		(workspaceRouteResult.kind === "none" && routeValidation.kind === "idle");
+	const executionRoute =
+		validatedRoute?.destination === "execution" ? validatedRoute : null;
+	const unavailableState =
+		routeValidation.kind === "unavailable"
+			? routeValidation.state
+			: workspaceRouteResult.kind === "unavailable"
+				? workspaceRouteResult
+				: null;
+	const routePending =
+		routeValidation.kind === "pending" &&
+		(workspaceRouteResult.kind === "route" || legacyMigrationPendingRef.current);
+	const retryRouteValidation = useCallback(() => {
+		setRouteValidationRetry((current) => current + 1);
+	}, []);
+	const openRouteRecovery = useCallback(
+		(url: string) => {
+			const parsed = parseWorkspaceRoute(url);
+			if (parsed.kind !== "route") return;
+			applyNavigation({
+				kind: "route",
+				history: "push",
+				route: parsed.route,
+				url: parsed.canonicalUrl,
+				action: "destination",
+			});
+		},
+		[applyNavigation],
+	);
+	const persistentRouteWarnings = routeWarnings.filter((warning) => warning.persistent);
+	const recipientLabel =
+		validatedRoute?.conversation.kind === "agent"
+			? sessionTitle(selectedChatSession ?? {
+				session_id: validatedRoute.conversation.sessionId,
+				project_id: selectedProjectId,
+				activity: "idle",
+				active_leaf_id: null,
+				provider: newSessionProvider,
+				metadata: {},
+			})
+			: null;
 	const mobileTitle = selectedChatSession
 		? sessionTitle(selectedChatSession)
 		: selectedProject
@@ -2709,41 +3309,128 @@ export function App() {
 				remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 			/>
 
-			<ChatPane
-				session={selectedChatSession}
-				snapshot={loadedSnapshot}
-				entries={loadedEntries}
-				turnCards={turnCardViews}
-				transcriptLoading={transcriptLoading}
-				transcriptError={selectedError}
-				transcriptErrorHasUsableCache={selectedErrorHasUsableCache}
-				transcriptRetrying={selectedRetrying}
-				hasRunningDelegations={hasRunningDelegations}
-				modelOptions={MODEL_OPTIONS}
-				modelValue={providerModelKey(activeProvider)}
-				modelLocked={modelLocked}
-				modelControlsDisabled={modelControlsDisabled}
-				mutationBlockedReason={selectedId ? connectionRemoteActionBlockedReason : null}
-				remoteReadBlockedReason={selectedId ? connectionRemoteActionBlockedReason : null}
-				reasoningEfforts={reasoningEfforts}
-				reasoningEffort={providerReasoningEffort(activeProvider)}
-				rightOpen={rightOpen}
-				selectedId={selectedId}
-				resumingTurnId={resumingTurnId}
-				onModelChange={handleModelChange}
-				onReasoningEffortChange={handleReasoningEffortChange}
-				onSelectSession={selectSession}
-				onToggleRight={handleToggleRight}
-				onNewSession={handleSidebarNew}
-				onResumeTurn={handleResumeTurn}
-				onExpandTurn={expandTurn}
-				onCollapseTurn={collapseTurn}
-				loadingTurnId={loadingTurnId ?? autoLoadingTurnId}
-				hasOlderTurns={selectedCache.sessionId === selectedId && selectedCache.turnHasMoreBefore}
-				loadingOlderTurns={loadingOlderTurns}
-				onLoadOlderTurns={loadOlderTranscriptTurns}
-				onRetryTranscript={retrySelected}
-			/>
+			{conversationVisible ? (
+				<ChatPane
+						session={selectedChatSession}
+						snapshot={loadedSnapshot}
+						entries={loadedEntries}
+						turnCards={turnCardViews}
+						transcriptLoading={transcriptLoading}
+						transcriptError={selectedError}
+						transcriptErrorHasUsableCache={selectedErrorHasUsableCache}
+						transcriptRetrying={selectedRetrying}
+						hasRunningDelegations={hasRunningDelegations}
+						modelOptions={MODEL_OPTIONS}
+						modelValue={providerModelKey(activeProvider)}
+						modelLocked={modelLocked}
+						modelControlsDisabled={modelControlsDisabled}
+						mutationBlockedReason={selectedId ? connectionRemoteActionBlockedReason : null}
+						remoteReadBlockedReason={selectedId ? connectionRemoteActionBlockedReason : null}
+						reasoningEfforts={reasoningEfforts}
+						reasoningEffort={providerReasoningEffort(activeProvider)}
+						rightOpen={rightOpen}
+						selectedId={selectedId}
+						resumingTurnId={resumingTurnId}
+						onModelChange={handleModelChange}
+						onReasoningEffortChange={handleReasoningEffortChange}
+						onSelectSession={openConversation}
+						onToggleRight={handleToggleRight}
+						onNewSession={handleSidebarNew}
+						onResumeTurn={handleResumeTurn}
+						onExpandTurn={expandTurn}
+						onCollapseTurn={collapseTurn}
+						loadingTurnId={loadingTurnId ?? autoLoadingTurnId}
+						hasOlderTurns={selectedCache.sessionId === selectedId && selectedCache.turnHasMoreBefore}
+						loadingOlderTurns={loadingOlderTurns}
+						onLoadOlderTurns={loadOlderTranscriptTurns}
+						onRetryTranscript={retrySelected}
+						routeNotice={
+							persistentRouteWarnings.length > 0 || recipientLabel ? (
+								<div className="workspace-conversation-notices">
+									{persistentRouteWarnings.length > 0 ? (
+										<div className="workspace-route-warning" role="alert">
+											{persistentRouteWarnings.map((warning) => (
+												<span key={`${warning.kind}:${warning.message}`}>{warning.message}</span>
+											))}
+										</div>
+									) : null}
+									{recipientLabel ? (
+										<div className="workspace-recipient-label" role="status">
+											Conversation recipient: <strong>{recipientLabel}</strong>
+											<code>{selectedId}</code>
+										</div>
+									) : null}
+								</div>
+							) : null
+						}
+					/>
+			) : executionRoute ? (
+				<main className="workspace-route-state execution-route-state" data-slot="execution-placeholder">
+					<p className="workspace-route-eyebrow">Execution · {executionRoute.view}</p>
+					{persistentRouteWarnings.length > 0 ? (
+						<div className="workspace-route-warning" role="alert">
+							{persistentRouteWarnings.map((warning) => (
+								<span key={`${warning.kind}:${warning.message}`}>{warning.message}</span>
+							))}
+						</div>
+					) : null}
+					<h1>Execution workspace is not available in this step</h1>
+					<p>
+						This URL retains root <code>{executionRoute.rootSessionId}</code> and Conversation{" "}
+						<code>{routeConversationSessionId(executionRoute)}</code>. The visual Execution
+						overview, activity, and handoffs workspace comes next.
+					</p>
+					<button
+						type="button"
+						className="primary-button workspace-route-action"
+						onClick={() => applyNavigation(showConversation(executionRoute))}
+					>
+						Open effective Conversation
+					</button>
+				</main>
+			) : unavailableState ? (
+				<main className="workspace-route-state unavailable-route-state" data-slot="route-unavailable">
+					<p className="workspace-route-eyebrow">Workspace route unavailable</p>
+					<h1>
+						{unavailableState.issue === "invalid-conversation"
+							? "Couldn’t load session"
+							: "Couldn’t open this workspace route"}
+					</h1>
+					<p role="alert">{unavailableState.message}</p>
+					<div className="workspace-route-actions">
+						{unavailableState.backTo ? (
+							<button
+								type="button"
+								className="primary-button workspace-route-action"
+								onClick={() => openRouteRecovery(unavailableState.backTo!.url)}
+							>
+								{unavailableState.backTo.label === "root-conversation"
+									? "Open root Conversation"
+									: "Back to root Outline"}
+							</button>
+						) : null}
+						{routeValidation.kind === "unavailable" && routeValidation.retryable ? (
+							<>
+								<button
+									type="button"
+									className="secondary-button workspace-route-action"
+									disabled={!!connectionRemoteActionBlockedReason}
+									onClick={retryRouteValidation}
+								>
+									Retry
+								</button>
+								<span>{connectionRemoteActionBlockedReason}</span>
+							</>
+						) : null}
+					</div>
+				</main>
+			) : routePending ? (
+				<main className="workspace-route-state" data-slot="route-loading" role="status">
+					<p className="workspace-route-eyebrow">Opening workspace route</p>
+					<h1>Validating Conversation…</h1>
+					<p>Checking the requested project, root run, and direct agent membership.</p>
+				</main>
+			) : null}
 
 			<footer className="chat-dock" data-slot="chat-box">
 				<ConnectionRecoveryBanner
@@ -2752,31 +3439,42 @@ export function App() {
 					retrying={retryingConnection}
 					onRetry={retryConnection}
 				/>
-				{!selectedId && selectedProject && workspaceScope.length ? (
+				{conversationVisible && !selectedId && selectedProject && workspaceScope.length ? (
 					<WorkspaceScopePicker scope={workspaceScope} onChange={handleWorkspaceScopeChange} disabled={sending} />
 				) : null}
-				<Composer
-					selectedId={selectedId}
-					selectedIsSubagent={
-						loadedSnapshot?.session_id === selectedId && !!loadedSnapshot.parent_session_id
-					}
-					composerHandleRef={composerHandleRef}
-					sending={sending}
-					canStop={canStop}
-					stopping={stopping}
-					queuedInputs={queuedInputs}
-					mutationBlockedReason={connectionRemoteActionBlockedReason}
-					cachedHistoryAvailable={cachedHistoryAvailable}
-					onSubmit={submitComposer}
-					onStop={handleStop}
-					onPromoteQueued={handlePromoteQueued}
-					onUpdateQueued={handleUpdateQueued}
-					onCancelQueued={handleCancelQueued}
-					onMoveQueued={handleMoveQueued}
-				/>
+				{conversationVisible ? (
+					<Composer
+						selectedId={selectedId}
+						selectedIsSubagent={
+							loadedSnapshot?.session_id === selectedId && !!loadedSnapshot.parent_session_id
+						}
+						composerHandleRef={composerHandleRef}
+						sending={sending}
+						canStop={canStop}
+						stopping={stopping}
+						queuedInputs={queuedInputs}
+						mutationBlockedReason={connectionRemoteActionBlockedReason}
+						cachedHistoryAvailable={cachedHistoryAvailable}
+						onSubmit={submitComposer}
+						onStop={handleStop}
+						onPromoteQueued={handlePromoteQueued}
+						onUpdateQueued={handleUpdateQueued}
+						onCancelQueued={handleCancelQueued}
+						onMoveQueued={handleMoveQueued}
+					/>
+				) : null}
 			</footer>
 
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
+				{executionRoute || unavailableState ? (
+					<div className="workspace-inspector-placeholder">
+						<p>
+							{executionRoute
+								? "Execution details are intentionally deferred."
+								: "Conversation details are unavailable for this route."}
+						</p>
+					</div>
+				) : (
 				<Inspector
 					snapshot={loadedSnapshot}
 					runBoardParentSessionId={delegationParentSessionId}
@@ -2802,11 +3500,12 @@ export function App() {
 					remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 					tools={tools}
 					onSelectSession={(sessionId) => {
-						selectSession(sessionId);
+						openConversation(sessionId);
 						if (inspectorIsOverlay) setRightOpen(false);
 					}}
 					onClose={() => setRightOpen(false)}
 				/>
+				)}
 			</aside>
 
 			{renameSessionId ? (
@@ -2994,16 +3693,23 @@ async function restoreTextForTarget(
 	api: ReturnType<typeof createAgentApi>,
 	sessionId: string,
 	target: HistoryTargetOption,
+	targetCache: SelectedSessionCache,
 	selectedCacheRef: RefObject<SelectedSessionCache>,
 	updateSelectedCache: (updater: (current: SelectedSessionCache) => SelectedSessionCache) => SelectedSessionCache,
 	assertServerReadAllowed: () => void,
 ): Promise<string | null> {
 	if (!target.restoreEntryId) return target.restoreText ?? null;
-	const cached = selectedCacheRef.current.entriesById.get(target.restoreEntryId);
+	const cached = targetCache.entriesById.get(target.restoreEntryId);
 	if (cached?.item.type === "user_message") return contentBlocksToText(cached.item.content);
 	assertServerReadAllowed();
 	const result = await api.getTranscriptEntries(sessionId, [target.restoreEntryId]);
-	updateSelectedCache((current) => applyEntryBodies(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.entries));
+	if (selectedCacheRef.current.sessionId === sessionId) {
+		updateSelectedCache((current) =>
+			current.sessionId === sessionId
+				? applyEntryBodies(current, sessionId, result.entries)
+				: current,
+		);
+	}
 	const entry = result.entries.find((candidate) => candidate.id === target.restoreEntryId);
 	if (entry?.item.type === "user_message") return contentBlocksToText(entry.item.content);
 	throw new Error("could not load the full user message for editing");

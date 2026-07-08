@@ -123,6 +123,7 @@ export type WorkspaceRouteUnavailableIssue =
 	| "invalid-path-encoding"
 	| "invalid-query-encoding"
 	| "invalid-conversation"
+	| "project-mismatch"
 	| "invalid-focus"
 	| "invalid-handoff"
 	| "unsupported-overview";
@@ -684,6 +685,19 @@ export class WorkspaceRouteHistory {
 		if (result.kind !== "route" || !result.correction) return result;
 		this.dependencies.history.replaceState(this.dependencies.history.state ?? null, "", result.correction.url);
 		return { ...result, correction: null };
+	}
+
+	/**
+	 * New-session drafts intentionally have no run route. Clearing the owned
+	 * namespace keeps refresh URL-first without inventing an unstarted run.
+	 */
+	clear(history: "push" | "replace" = "push"): NoWorkspaceRoute {
+		if (history === "push") {
+			this.dependencies.history.pushState(this.dependencies.history.state ?? null, "", "/");
+		} else {
+			this.dependencies.history.replaceState(this.dependencies.history.state ?? null, "", "/");
+		}
+		return { kind: "none" };
 	}
 
 	/**

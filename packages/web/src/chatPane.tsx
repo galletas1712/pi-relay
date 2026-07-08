@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, type ReactNode } from "react";
 import { LogHeader } from "./panels.tsx";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { isArchivedSession, sessionStatusWithDelegations, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
@@ -40,6 +40,7 @@ export interface ChatPaneProps {
 	loadingOlderTurns?: boolean;
 	onLoadOlderTurns?: () => void;
 	onRetryTranscript: () => void;
+	routeNotice?: ReactNode;
 }
 
 export const ChatPane = memo(function ChatPane({
@@ -75,12 +76,14 @@ export const ChatPane = memo(function ChatPane({
 	hasOlderTurns,
 	loadingOlderTurns,
 	onLoadOlderTurns,
-	onRetryTranscript
+	onRetryTranscript,
+	routeNotice,
 }: ChatPaneProps) {
 	const loadedLeafId = activeLeafIdFromEntries(entries);
 	const visibleActiveLeafId = loadedLeafId ?? snapshot?.active_leaf_id ?? null;
 	return (
 		<main className="log-pane" data-slot="agent-log">
+			{routeNotice}
 			<ChatHeader
 				session={session}
 				snapshot={snapshot}
