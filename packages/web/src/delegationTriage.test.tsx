@@ -40,22 +40,8 @@ function delegation(overrides: Partial<Delegation> = {}): Delegation {
 		label: "Review release",
 		progress: { expected: 2, spawned: 2, terminal: 0, running: 2, failed: 0 },
 		subagents: [
-			{
-				id: "child-1",
-				status: "running",
-				activity: "running",
-				role: "reviewer",
-				subagent_type: "read_only",
-				task_prompt_file: "child-1/task_prompt.md",
-			},
-			{
-				id: "child-2",
-				status: "running",
-				activity: "running",
-				role: "tester",
-				subagent_type: "read_only",
-				task_prompt_file: "child-2/task_prompt.md",
-			},
+			{ id: "child-1", status: "running", activity: "running", role: "reviewer", subagent_type: "read_only" },
+			{ id: "child-2", status: "queued", activity: "queued", role: null, subagent_type: "read_only" },
 		],
 		...overrides,
 	};
@@ -82,17 +68,17 @@ function renderList({
 	parentSessionId = "parent-1",
 	delegations = [delegation()],
 	selectedSessionId = null,
+	subagentNames = new Map(),
 	onSelectSession = vi.fn(),
 	onCancelDelegation = vi.fn(async () => undefined),
-	onReRunDelegation = vi.fn(async () => undefined),
 	mutationBlockedReason = null,
 }: {
 	parentSessionId?: string;
 	delegations?: Delegation[];
 	selectedSessionId?: string | null;
+	subagentNames?: ReadonlyMap<string, string>;
 	onSelectSession?: (sessionId: string) => void;
 	onCancelDelegation?: (parentSessionId: string, delegationId: string) => void | Promise<void>;
-	onReRunDelegation?: (parentSessionId: string, delegation: Delegation) => void | Promise<void>;
 	mutationBlockedReason?: string | null;
 } = {}) {
 	return render(
@@ -102,144 +88,274 @@ function renderList({
 			showAllDelegations
 			onToggleShowAllDelegations={() => undefined}
 			selectedSessionId={selectedSessionId}
+			subagentNames={subagentNames}
 			onSelectSession={onSelectSession}
 			onCancelDelegation={onCancelDelegation}
-			onReRunDelegation={onReRunDelegation}
 			mutationBlockedReason={mutationBlockedReason}
 		/>,
 	);
 }
 
-describe("delegated agent navigation", () => {
-	it("makes the full child row a stable selected navigation target with visible status and outcome", async () => {
+describe("minimal delegated agent outline", () => {
+	it("uses the canonical short name as primary text and updates it while keeping role secondary", () => {
+		const item = delegation({
+			subagents: [{
+				id: "child-1",
+				status: "running",
+				activity: "running",
+				role: "reviewer",
+				subagent_type: "read_only",
+			}],
+		});
+		const view = renderList({
+			delegations: [item],
+			subagentNames: new Map([["child-1", "Review checkout"]]),
+		});
+
+		let row = screen.getByRole("button", {
+			name: "Open agent Review checkout, reviewer, running",
+		});
+		expect(within(row).getByText("Review checkout").className).toBe("run-board-subagent-name");
+		expect(within(row).getByText("reviewer").className).toBe("run-board-subagent-role");
+		expect(row.textContent).toBe("Review checkoutreviewer");
+
+		view.rerender(
+			<RunBoardDelegationList
+				parentSessionId="parent-1"
+				delegations={[item]}
+				subagentNames={new Map([["child-1", "Review payments"]])}
+				showAllDelegations
+				onToggleShowAllDelegations={() => undefined}
+				onCancelDelegation={() => undefined}
+			/>,
+		);
+
+		row = screen.getByRole("button", {
+			name: "Open agent Review payments, reviewer, running",
+		});
+		expect(within(row).getByText("Review payments")).toBeTruthy();
+		expect(screen.queryByText("Review checkout")).toBeNull();
+	});
+
+	it("shows only task and role labels while accessible names convey shape-distinct status", async () => {
 		const onSelectSession = vi.fn();
 		const user = userEvent.setup();
-		renderList({
-			selectedSessionId: "child-1",
-			onSelectSession,
-			delegations: [
-				delegation({
-					status: "done_with_failures",
-					progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 1 },
-					subagents: [{
-						id: "child-1",
-						status: "failed",
-						activity: "idle",
-						role: "reviewer",
-						outcome: "changes_requested",
-						task_prompt_file: "child-1/task_prompt.md",
-					}],
-				}),
-			],
-		});
+		renderList({ selectedSessionId: "child-1", onSelectSession });
 
-		const row = screen.getByRole("button", {
-			name: "Open agent reviewer, failed · activity idle, Failure: Changes requested",
-		});
-		expect(row.getAttribute("aria-current")).toBe("page");
-		expect(within(row).getByText("failed · activity idle")).toBeTruthy();
-		expect(within(row).getByText("Failure: Changes requested")).toBeTruthy();
+		const outline = document.querySelector(".run-board-outline");
+		expect(outline?.textContent).toContain("Review release");
+		expect(outline?.textContent).toContain("reviewer");
+		expect(outline?.textContent).toContain("Agent");
+		for (const forbidden of [
+			"Writing task",
+			"Parallel research",
+			"Completed",
+			"Done",
+			"Activity idle",
+			"expected",
+			"spawned",
+			"terminal",
+			"running",
+			"failed",
+			"Outcome",
+			"Needs attention",
+			"Active",
+			"Recent",
+			"child-2",
+		]) {
+			expect(outline?.textContent).not.toContain(forbidden);
+		}
 
-		await user.click(within(row).getByText("Failure: Changes requested"));
-		expect(onSelectSession).toHaveBeenCalledTimes(1);
+		expect(screen.getAllByRole("img", { name: "running status" })).toHaveLength(2);
+		expect(screen.getByRole("img", { name: "queued status" }).querySelector("svg")).toBeTruthy();
+		const reviewer = screen.getByRole("button", { name: "Open agent Agent, reviewer, running" });
+		expect(reviewer.getAttribute("aria-current")).toBe("page");
+		await user.click(reviewer);
 		expect(onSelectSession).toHaveBeenCalledWith("child-1");
 	});
 
-	it("does not announce outcome text when the list contract supplies null", () => {
+	it("renders the status icon key and actual Lucide glyph for every supported state and fallback", () => {
+		const cases = [
+			{ status: "running", label: "running", key: "running", glyph: "lucide-loader-circle" },
+			{ status: "done", label: "done", key: "done", glyph: "lucide-circle-check" },
+			{
+				status: "done_with_failures",
+				label: "done with failures",
+				key: "done-with-failures",
+				glyph: "lucide-triangle-alert",
+			},
+			{ status: "failed", label: "failed", key: "failed", glyph: "lucide-circle-x" },
+			{ status: "cancelled", label: "cancelled", key: "cancelled", glyph: "lucide-ban" },
+			{ status: "queued", label: "queued", key: "queued", glyph: "lucide-clock3" },
+			{ status: "idle", label: "idle", key: "idle", glyph: "lucide-circle-dashed" },
+			{
+				status: "future_status",
+				label: "future status",
+				key: "unknown",
+				glyph: "lucide-circle-question-mark",
+			},
+		] as const;
 		renderList({
-			selectedSessionId: "child-1",
 			delegations: [
 				delegation({
-					status: "done",
-					progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 0 },
-					subagents: [{
-						id: "child-1",
-						status: "done",
-						activity: "idle",
-						role: "reviewer",
-						task_prompt_file: "child-1/task_prompt.md",
-						final_message_file: null,
-						transcript_file: null,
-						outcome: null,
-					}],
+					subagents: cases.map(({ status }, index) => ({
+						id: `child-${index}`,
+						status: status as Delegation["subagents"][number]["status"],
+						role: `role-${index}`,
+						subagent_type: "read_only",
+					})),
 				}),
 			],
 		});
 
-		const row = screen.getByRole("button", {
-			name: "Open agent reviewer, done · activity idle",
+		for (const [index, { label, key, glyph }] of cases.entries()) {
+			const row = screen.getByRole("button", { name: `Open agent Agent, role-${index}, ${label}` });
+			const icon = within(row).getByRole("img", { name: `${label} status` });
+			expect(icon.getAttribute("data-status-icon"), label).toBe(key);
+			expect(icon.querySelector("svg")?.classList.contains(glyph), label).toBe(true);
+		}
+	});
+
+	it("renders each supported delegation status with its keyed Lucide glyph", () => {
+		const cases: {
+			status: Delegation["status"];
+			label: string;
+			key: string;
+			glyph: string;
+		}[] = [
+			{ status: "running", label: "running", key: "running", glyph: "lucide-loader-circle" },
+			{ status: "done", label: "done", key: "done", glyph: "lucide-circle-check" },
+			{
+				status: "done_with_failures",
+				label: "done with failures",
+				key: "done-with-failures",
+				glyph: "lucide-triangle-alert",
+			},
+			{ status: "failed", label: "failed", key: "failed", glyph: "lucide-circle-x" },
+			{ status: "cancelled", label: "cancelled", key: "cancelled", glyph: "lucide-ban" },
+		];
+		renderList({
+			delegations: cases.map(({ status }, index) =>
+				delegation({
+					delegation_id: `delegation-${index}`,
+					label: `Task ${index}`,
+					status,
+					subagents: [],
+				}),
+			),
 		});
-		expect(row.getAttribute("aria-current")).toBe("page");
-		expect(row.getAttribute("aria-label")).not.toMatch(/outcome|success/i);
+
+		for (const [index, { label, key, glyph }] of cases.entries()) {
+			const task = screen.getByRole("article", { name: `Task ${index}, ${label}` });
+			const icon = within(task).getByRole("img", { name: `${label} status` });
+			expect(icon.getAttribute("data-status-icon"), label).toBe(key);
+			expect(icon.querySelector("svg")?.classList.contains(glyph), label).toBe(true);
+		}
+	});
+
+	it("uses Agent instead of a sliced technical id when role is unavailable", () => {
+		renderList({
+			delegations: [delegation({
+				subagents: [{ id: "session_technical_123456789", status: "failed", activity: "idle", role: null }],
+			})],
+		});
+
+		const row = screen.getByRole("button", { name: "Open agent Agent, failed" });
+		expect(within(row).queryByText("reviewer")).toBeNull();
+		expect(document.querySelector(".run-board-outline")?.textContent).not.toContain("session_technic");
+	});
+
+	it("keeps failed and completed work minimal with status available only through semantics", () => {
+		renderList({
+			delegations: [
+				delegation({ delegation_id: "failed", label: "Fix release", status: "failed", subagents: [] }),
+				delegation({ delegation_id: "done", label: "Review docs", status: "done", subagents: [] }),
+			],
+		});
+
+		const visible = document.querySelector(".run-board-outline")?.textContent ?? "";
+		expect(visible).toBe("Fix releaseReview docs");
+		expect(screen.getByRole("article", { name: "Fix release, failed" })).toBeTruthy();
+		expect(screen.getByRole("article", { name: "Review docs, done" })).toBeTruthy();
+		expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
 	});
 });
 
 describe("cancel delegated work", () => {
-	it("names affected work/count, focuses the safe action, confirms once, and exposes scoped pending", async () => {
+	it("captures the parent target and confirms once even when the rendered parent changes", async () => {
+		const pending = deferred<void>();
+		const onCancel = vi.fn(() => pending.promise);
+		const user = userEvent.setup();
+		const view = renderList({
+			parentSessionId: "parent-at-intent",
+			delegations: [
+				delegation(),
+				delegation({ delegation_id: "delegation-2", label: "Other work" }),
+			],
+			onCancelDelegation: onCancel,
+		});
+
+		const work = screen.getByRole("article", { name: /Review release/ });
+		await user.click(within(work).getByRole("button", { name: "Cancel" }));
+		const dialog = screen.getByRole("alertdialog", { name: "Cancel delegated work?" });
+		expect(within(dialog).getByText("Review release")).toBeTruthy();
+		expect(within(dialog).getByText(/remaining work affecting 2 agents\/slots/)).toBeTruthy();
+		expect(within(dialog).getByText(/cannot roll back external tool or network side effects/i)).toBeTruthy();
+		await waitFor(() =>
+			expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Cancel" })),
+		);
+
+		view.rerender(
+			<RunBoardDelegationList
+				parentSessionId="parent-now-rendered"
+				delegations={[delegation(), delegation({ delegation_id: "delegation-2", label: "Other work" })]}
+				showAllDelegations
+				onToggleShowAllDelegations={() => undefined}
+				onCancelDelegation={onCancel}
+			/>,
+		);
+		const confirm = screen.getByRole("button", { name: "Cancel work" });
+		fireEvent.click(confirm);
+		fireEvent.click(confirm);
+		expect(onCancel).toHaveBeenCalledTimes(1);
+		expect(onCancel).toHaveBeenCalledWith("parent-at-intent", "delegation-1");
+		pending.resolve();
+		await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+	});
+
+	it("scopes the spinner and duplicate lock to the selected task", async () => {
 		const pending = deferred<void>();
 		const onCancel = vi.fn(() => pending.promise);
 		const user = userEvent.setup();
 		renderList({
 			delegations: [
 				delegation(),
-				delegation({
-					delegation_id: "delegation-2",
-					label: "Other work",
-				}),
+				delegation({ delegation_id: "delegation-2", label: "Other work" }),
 			],
 			onCancelDelegation: onCancel,
 		});
 
 		const work = screen.getByRole("article", { name: /Review release/ });
-		const otherWork = screen.getByRole("article", { name: /Other work/ });
+		const other = screen.getByRole("article", { name: /Other work/ });
 		await user.click(within(work).getByRole("button", { name: "Cancel" }));
-
-		const dialog = screen.getByRole("alertdialog", { name: "Cancel delegated work?" });
-		expect(within(dialog).getByText(/Review release/)).toBeTruthy();
-		expect(within(dialog).getByText(/remaining work affecting 2 agents\/slots/)).toBeTruthy();
-		expect(within(dialog).getByText(/cannot roll back external tool or network side effects/i)).toBeTruthy();
-		await waitFor(() => expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Cancel" })));
-
-		const confirm = within(dialog).getByRole("button", { name: "Cancel work" });
+		const confirm = screen.getByRole("button", { name: "Cancel work" });
 		fireEvent.click(confirm);
 		fireEvent.click(confirm);
+
 		expect(onCancel).toHaveBeenCalledTimes(1);
-		expect(onCancel).toHaveBeenCalledWith("parent-1", "delegation-1");
-		expect(within(dialog).getByRole("button", { name: "Cancelling…" }).getAttribute("aria-busy")).toBe("true");
-		expect(within(work).getByRole("button", { name: "Cancelling…", hidden: true })).toBeTruthy();
-		expect((within(otherWork).getByRole("button", { name: "Cancel", hidden: true }) as HTMLButtonElement).disabled).toBe(false);
+		expect(within(work).getByRole("button", { name: "Cancelling…", hidden: true }).getAttribute("aria-busy")).toBe("true");
+		expect((within(other).getByRole("button", { name: "Cancel", hidden: true }) as HTMLButtonElement).disabled).toBe(false);
 
 		pending.resolve();
 		await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
 	});
 
-	it("keeps the parent captured at intent when the rendered parent changes", async () => {
-		const onCancel = vi.fn(async () => undefined);
-		const user = userEvent.setup();
-		const view = renderList({ parentSessionId: "parent-at-intent", onCancelDelegation: onCancel });
-
-		await user.click(screen.getByRole("button", { name: "Cancel" }));
-		view.rerender(
-			<RunBoardDelegationList
-				parentSessionId="parent-now-rendered"
-				delegations={[delegation()]}
-				showAllDelegations
-				onToggleShowAllDelegations={() => undefined}
-				onCancelDelegation={onCancel}
-				onReRunDelegation={async () => undefined}
-			/>,
-		);
-		await user.click(screen.getByRole("button", { name: "Cancel work" }));
-
-		expect(onCancel).toHaveBeenCalledWith("parent-at-intent", "delegation-1");
-	});
-
-	it("keeps an open intent while offline, prevents RPC, and re-enables confirm after open", async () => {
+	it("keeps an open intent offline and re-enables confirmation after reconnect", async () => {
 		const onCancel = vi.fn(async () => undefined);
 		const user = userEvent.setup();
 		const view = renderList({ onCancelDelegation: onCancel });
-
 		await user.click(screen.getByRole("button", { name: "Cancel" }));
+
 		view.rerender(
 			<RunBoardDelegationList
 				parentSessionId="parent-1"
@@ -247,17 +363,12 @@ describe("cancel delegated work", () => {
 				showAllDelegations
 				onToggleShowAllDelegations={() => undefined}
 				onCancelDelegation={onCancel}
-				onReRunDelegation={async () => undefined}
 				mutationBlockedReason="Waiting for connection"
 			/>,
 		);
-
-		const dialog = screen.getByRole("alertdialog");
-		const blockedConfirm = within(dialog).getByRole("button", { name: "Cancel work" }) as HTMLButtonElement;
-		expect(blockedConfirm.disabled).toBe(true);
-		expect(within(dialog).getByText("Waiting for connection")).toBeTruthy();
-		fireEvent.click(blockedConfirm);
-		expect(onCancel).not.toHaveBeenCalled();
+		const blocked = screen.getByRole("button", { name: "Cancel work" }) as HTMLButtonElement;
+		expect(blocked.disabled).toBe(true);
+		expect(screen.getByRole("alertdialog").textContent).toContain("Waiting for connection");
 
 		view.rerender(
 			<RunBoardDelegationList
@@ -266,135 +377,42 @@ describe("cancel delegated work", () => {
 				showAllDelegations
 				onToggleShowAllDelegations={() => undefined}
 				onCancelDelegation={onCancel}
-				onReRunDelegation={async () => undefined}
 			/>,
 		);
-		expect(screen.getByRole("alertdialog")).toBeTruthy();
-		const enabledConfirm = screen.getByRole("button", { name: "Cancel work" }) as HTMLButtonElement;
-		expect(enabledConfirm.disabled).toBe(false);
-		await user.click(enabledConfirm);
+		await user.click(screen.getByRole("button", { name: "Cancel work" }));
 		expect(onCancel).toHaveBeenCalledTimes(1);
 	});
 
-	it("closes after failure but keeps an owned error and restores controls for retry", async () => {
-		const pending = deferred<void>();
-		const onCancel = vi.fn(() => pending.promise);
+	it("owns a persistent error and restores the compact action after failure", async () => {
+		const onCancel = vi.fn(async () => {
+			throw new Error("cancel request failed");
+		});
 		const user = userEvent.setup();
 		renderList({ onCancelDelegation: onCancel });
 
 		const work = screen.getByRole("article", { name: /Review release/ });
 		await user.click(within(work).getByRole("button", { name: "Cancel" }));
 		await user.click(screen.getByRole("button", { name: "Cancel work" }));
-		pending.reject(new Error("cancel request failed"));
-
-		await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
-		expect(within(work).getByRole("alert").textContent).toContain("cancel request failed");
+		await waitFor(() => expect(within(work).getByRole("alert").textContent).toContain("cancel request failed"));
 		expect((within(work).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
 	});
 });
 
-describe("re-run delegated work", () => {
-	it("targets the explicit parent/delegation once and keeps pending scoped to the item", async () => {
-		const pending = deferred<void>();
-		const onReRun = vi.fn(() => pending.promise);
-		const first = delegation({
-			delegation_id: "finished-1",
-			label: "Finished one",
-			status: "done",
-			progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 0 },
-			subagents: [{
-				id: "finished-child-1",
-				status: "done",
-				activity: "idle",
-				role: "reviewer",
-				task_prompt_file: "finished-child-1/task_prompt.md",
-				outcome: "approved",
-			}],
-		});
-		const second = delegation({
-			delegation_id: "finished-2",
-			label: "Finished two",
-			status: "done",
-			progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 0 },
-			subagents: [{
-				id: "finished-child-2",
-				status: "done",
-				activity: "idle",
-				role: "tester",
-				task_prompt_file: "finished-child-2/task_prompt.md",
-				outcome: "pass",
-			}],
-		});
-		renderList({ delegations: [first, second], onReRunDelegation: onReRun });
-
-		const firstWork = screen.getByRole("article", { name: /Finished one/ });
-		const secondWork = screen.getByRole("article", { name: /Finished two/ });
-		const reRun = within(firstWork).getByRole("button", { name: "Re-run" });
-		fireEvent.click(reRun);
-		fireEvent.click(reRun);
-
-		expect(onReRun).toHaveBeenCalledTimes(1);
-		expect(onReRun).toHaveBeenCalledWith("parent-1", first);
-		expect((within(firstWork).getByRole("button", { name: "Starting…" }) as HTMLButtonElement).disabled).toBe(true);
-		expect((within(secondWork).getByRole("button", { name: "Re-run" }) as HTMLButtonElement).disabled).toBe(false);
-
-		pending.resolve();
-		await waitFor(() => expect(within(firstWork).getByRole("button", { name: "Re-run" })).toBeTruthy());
-	});
-
-	it("restores Re-run and keeps a persistent error after a failed start", async () => {
-		const onReRun = vi.fn(async () => {
-			throw new Error("start request failed");
-		});
-		const terminal = delegation({
-			status: "failed",
-			progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 1 },
-			subagents: [{
-				id: "failed-child",
-				status: "failed",
-				activity: "idle",
-				role: "tester",
-				task_prompt_file: "failed-child/task_prompt.md",
-			}],
-		});
+describe("agent list errors", () => {
+	it("keeps Retry actionable only for the query failure", async () => {
+		const onRetry = vi.fn();
 		const user = userEvent.setup();
-		renderList({ delegations: [terminal], onReRunDelegation: onReRun });
-
-		const work = screen.getByRole("article", { name: /Review release/ });
-		await user.click(within(work).getByRole("button", { name: "Re-run" }));
-		await waitFor(() => expect(within(work).getByRole("alert").textContent).toContain("start request failed"));
-		expect((within(work).getByRole("button", { name: "Re-run" }) as HTMLButtonElement).disabled).toBe(false);
-	});
-});
-
-describe("agent list fetch errors", () => {
-	function renderInspector(overrides: {
-		delegations?: Delegation[];
-		error: string;
-		retrying?: boolean;
-		onRetry?: () => void;
-	}) {
-		return render(
+		const { rerender } = render(
 			<Inspector
 				snapshot={snapshot()}
-				delegations={overrides.delegations ?? []}
+				delegations={[]}
 				delegationsLoading={false}
-				delegationsError={overrides.error}
-				delegationsRetrying={overrides.retrying}
-				onRetryDelegations={overrides.onRetry}
-				runBoard={{
-					onCancelDelegation: async () => undefined,
-					onReRunDelegation: async () => undefined,
-				}}
+				delegationsError="list failed"
+				onRetryDelegations={onRetry}
+				runBoard={{ onCancelDelegation: async () => undefined }}
 				tools={[]}
 			/>,
 		);
-	}
-
-	it("offers an actionable canonical Retry when there is no data and reports busy state", async () => {
-		const onRetry = vi.fn();
-		const user = userEvent.setup();
-		const { rerender } = renderInspector({ error: "list failed", onRetry });
 
 		expect(screen.getByRole("alert").textContent).toContain("Couldn’t load agents");
 		await user.click(screen.getByRole("button", { name: "Retry" }));
@@ -408,26 +426,10 @@ describe("agent list fetch errors", () => {
 				delegationsError="list failed"
 				delegationsRetrying
 				onRetryDelegations={onRetry}
-				runBoard={{
-					onCancelDelegation: async () => undefined,
-					onReRunDelegation: async () => undefined,
-				}}
+				runBoard={{ onCancelDelegation: async () => undefined }}
 				tools={[]}
 			/>,
 		);
-		const retrying = screen.getByRole("button", { name: "Retrying…" }) as HTMLButtonElement;
-		expect(retrying.disabled).toBe(true);
-		expect(retrying.getAttribute("aria-busy")).toBe("true");
-	});
-
-	it("keeps cached work visible under a refresh warning", () => {
-		renderInspector({
-			delegations: [delegation()],
-			error: "refresh failed",
-			onRetry: vi.fn(),
-		});
-
-		expect(screen.getByRole("alert").textContent).toContain("Agent refresh failed");
-		expect(screen.getByRole("article", { name: /Review release/ })).toBeTruthy();
+		expect((screen.getByRole("button", { name: "Retrying…" }) as HTMLButtonElement).disabled).toBe(true);
 	});
 });

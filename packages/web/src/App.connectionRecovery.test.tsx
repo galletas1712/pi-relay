@@ -330,7 +330,7 @@ describe("App connection recovery integration", () => {
 		expect(api.eventListenerCount()).toBe(0);
 	});
 
-	it("targets delegation actions to the rendered parent and recovers the exact re-run prompt", async () => {
+	it("targets delegation cancellation to the rendered parent and keeps terminal work inert", async () => {
 		const api = createControllableApi();
 		const running = appDelegation({
 			delegation_id: "cancel-target",
@@ -347,8 +347,8 @@ describe("App connection recovery integration", () => {
 			}],
 		});
 		const finished = appDelegation({
-			delegation_id: "rerun-target",
-			label: "Re-run target",
+			delegation_id: "finished-target",
+			label: "Finished target",
 			status: "failed",
 			progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 1 },
 			subagents: [{
@@ -371,23 +371,13 @@ describe("App connection recovery integration", () => {
 				...sessionSnapshot(),
 				session_id: sessionId,
 				parent_session_id: SESSION_ID,
-				delegation_id: sessionId === "running-child" ? "cancel-target" : "rerun-target",
+				delegation_id: sessionId === "running-child" ? "cancel-target" : "finished-target",
 				activity: sessionId === "running-child" ? "running" : "idle",
 				active_leaf_id: null,
 				has_transcript_entries: false,
 			};
 		});
 		api.cancelDelegation.mockResolvedValue({ cancelled: true });
-		api.readHandoffFile.mockResolvedValue({
-			delegation_id: "rerun-target",
-			subagent_id: "finished-child",
-			file: "task_prompt.md",
-			content: "repeat the exact implementation",
-		});
-		api.startFullDelegation.mockResolvedValue({
-			delegation_id: "new-delegation",
-			subagent_session_id: "new-child",
-		});
 		const { client, unmount } = renderApp(api);
 		const user = userEvent.setup();
 		await openAndLoad(api);
@@ -409,26 +399,13 @@ describe("App connection recovery integration", () => {
 			expect(api.cancelDelegation).toHaveBeenCalledWith(SESSION_ID, "cancel-target");
 		});
 
-		const rerunTarget = screen.getByRole("article", { name: /Re-run target/ });
-		await user.click(within(rerunTarget).getByRole("button", { name: "Re-run" }));
-		await waitFor(() => {
-			expect(api.readHandoffFile).toHaveBeenCalledWith({
-				parentSessionId: SESSION_ID,
-				delegationId: "rerun-target",
-				subagentId: "finished-child",
-				file: "task_prompt.md",
-			});
-			expect(api.startFullDelegation).toHaveBeenCalledWith({
-				parentSessionId: SESSION_ID,
-				role: "implementer",
-				prompt: "repeat the exact implementation",
-				workflow: "workflow-implement-review",
-				label: "Re-run target",
-			});
-		});
+		const finishedTarget = screen.getByRole("article", { name: /Finished target/ });
+		expect(within(finishedTarget).queryByRole("button", { name: "Cancel" })).toBeNull();
+		expect(api.readHandoffFile).not.toHaveBeenCalled();
+		expect(api.startFullDelegation).not.toHaveBeenCalled();
 
 		const childRow = screen.getByRole("button", {
-			name: /Open agent implementer, running/,
+			name: /Open agent Cached session, implementer, running/,
 		});
 		await user.click(childRow);
 		await waitFor(() => expect(childRow.getAttribute("aria-current")).toBe("page"));
@@ -493,7 +470,7 @@ describe("App connection recovery integration", () => {
 		await user.click(screen.getByRole("button", { name: /see more/i }));
 		expect(screen.getByRole("article", { name: /Recent 1/ })).toBeTruthy();
 		expect(screen.getByRole("button", { name: /show fewer/i })).toBeTruthy();
-		expect(await screen.findByText("Loading up to 100 delegated tasks…")).toBeTruthy();
+		expect(await screen.findByText("Refreshing agents…")).toBeTruthy();
 		expect(api.listDelegations).toHaveBeenCalledWith(SESSION_ID, 100);
 
 		firstExpansion.reject(new Error("100-row load failed"));
@@ -513,7 +490,7 @@ describe("App connection recovery integration", () => {
 		retryExpansion.resolve(expandedPage);
 		expect(await screen.findByRole("article", { name: /Expanded 100/ })).toBeTruthy();
 		expect(screen.queryByRole("article", { name: /Recent 1/ })).toBeNull();
-		expect(screen.getByText(/Latest 100 shown.*Older delegated work remains unloaded/)).toBeTruthy();
+		expect(screen.getByText("Latest 100 shown.")).toBeTruthy();
 
 		await user.click(screen.getByRole("button", { name: /show fewer/i }));
 		expect(screen.getByRole("article", { name: /Recent 1/ })).toBeTruthy();
@@ -591,7 +568,7 @@ describe("App connection recovery integration", () => {
 		expect(await screen.findByRole("article", { name: /First parent row/ })).toBeTruthy();
 
 		await user.click(screen.getByRole("button", { name: /see more/i }));
-		expect(await screen.findByText("Loading up to 100 delegated tasks…")).toBeTruthy();
+		expect(await screen.findByText("Refreshing agents…")).toBeTruthy();
 		const secondParentButtons = screen.getAllByRole("button", { name: /Second parent/ });
 		const secondParentNavigation = secondParentButtons.find(
 			(button) => !button.hasAttribute("aria-haspopup"),

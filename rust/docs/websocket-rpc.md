@@ -374,7 +374,7 @@ than one are preserved and the positive-count constraint is enforced before
 the completion fence is used.
 
 Child sessions link back through `sessions.delegation_id`. The
-`delegations_parent_created_idx` index supports the per-parent run-board feed.
+`delegations_parent_created_idx` index supports the per-parent delegation feed.
 The completion runner uses `attempt_id` as an idempotency fence and queues a
 deterministic parent daemon wakeup observation keyed as
 `delegation-steer:<delegation_id>:<attempt_id>` (the key name is retained for
@@ -1289,6 +1289,12 @@ tool-rerun semantics exist.
 
 ## Delegation RPC
 
+There is no dedicated delegation rerun/restart RPC. The `delegation.start_full`
+and `delegation.start_readonly_fanout` methods launch explicitly supplied new
+work; they do not restart a prior delegation. Task-prompt handoff metadata is
+retained for Handoffs/inspection only. This is separate from terminal-turn
+`turn.resume`.
+
 Delegations are the frontend-facing unit for bounded parent/child subagent work.
 A delegation is either one full (writing) subagent or a read-only fan-out. The
 websocket API only accepts the canonical `delegation.*` methods below.
@@ -1544,8 +1550,8 @@ occurred before interruption remain non-transactional and are not rolled back.
 ### `delegation.list`
 
 Lists a bounded newest-first page of delegations for a parent session. This is
-the lightweight run-board feed used by the web UI; use `delegation.status` or
-`delegation.read_handoff_file` for detail artifacts and outcomes.
+the lightweight Agents-outline feed used by the web UI; use `delegation.status`
+for structured detail or `delegation.read_handoff_file` for Handoff content.
 
 ```json
 { "parent_session_id": "parent-session", "limit": 3 }

@@ -690,6 +690,14 @@ at /home/schwinns/pi-relay-wf/rust). Postgres tests SKIP (not fail) when env uns
 
 ## 1.11 web-ui
 
+> **Superseded UI prescription:** this section records the pre-delegation build
+> map and its old stage/run-board names. Current product policy is the flat
+> icon-led Agents outline in `packages/web/docs/ui-improvement-plan.md`: task/
+> role labels plus shape-distinct accessible status icons, with no visible
+> grouping headings, status/outcome phrases, progress/counts, or ambient Handoff
+> links. The implementation uses canonical `delegation.*`, not the proposed
+> `stage.*` names below.
+
 Single React app (`packages/web/src/App.tsx`) over one WebSocket via `AgentRpcClient` (rpc.ts) wrapped by
 `AgentApiClient` (agentApi.ts). All RPCs `request<T>(method,params)`; all live updates arrive as
 `EventFrame{event_id,event,session_id,data}` through one `onEvent`. Today subagents are a flat read-only list:
@@ -717,7 +725,8 @@ the per-session inspector.
 | rust/crates/agent-daemon/src/types.rs | RpcMethod::parse | 82-121 | NO stage.* method today (only subagent.list). |
 
 ### build_seams
-Add the run board as a section inside Inspector (panels.tsx:624) or a new sibling, reusing subagent data-flow.
+Historical proposal (superseded): add a stage-grouped run board inside
+Inspector. The replacement is the flat Agents policy stated above.
 **1. Types** (types.ts after 125): StageKind=`"full"|"readonly_fanout"`, StageStatus=`"running"|"done"|
 "done_with_failures"|"cancelled"|"failed"`, SubagentType=`"full"|"read_only"`, StageSubagent
 {id,role?,status,outcome?,final_message_file?,transcript_file?,activity?}, Stage
@@ -732,9 +741,10 @@ queryKeys.stages/stage.
 **4. Event refresh** (sessionEvents.ts + App.tsx): add new stage event names to SESSION_LIST_REFRESH_EVENTS +
 KNOWN_SESSION_EVENTS; in handleSessionEvent invalidate queryKeys.stages. **Completion is a typed daemon observation in
 the parent transcript** — existing transcript pipeline renders it; board just flips the stage row via the query refresh.
-**5. Render+controls** (panels.tsx): RunBoard modeled on SubagentsSection; per subagent row link to child session; cancel
-stage → api.cancelStage; steer running subagent → parent-scoped `delegation.steer_subagent`; re-run → startFull/
-fanout (confirm with backend whether re-run is a fresh stage-start RPC or turn.resume).
+**5. Render+controls (superseded presentation):** retain full-row child
+navigation and scoped cancellation, but replace the proposed grouped/status/
+handoff board with the flat icon-led Agents policy above. Delegated work is not
+restartable; generic start methods remain for explicitly launching fresh work.
 **6. Inspector wiring** (App.tsx:2040-2054 + panels.tsx:624): thread stages + callbacks; board subagent session_ids must
 feed desiredSessionIds (App.tsx:1062-1064).
 
@@ -808,7 +818,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 - `PI.md` — rewrite lines 40-64 with Appendix B (ONLY after Phases 1-3).
 - Tests: index visibility + LoadSkill.
 
-**Phase 5 — web run board**
+**Phase 5 — web Agents outline (supersedes the run-board presentation above)**
 - `packages/web/src/types.ts` — Stage types + stage_id/subagent_type on SessionSummary/Snapshot.
 - `packages/web/src/agentApi.ts` — stage facade methods.
 - `packages/web/src/queryKeys.ts` — stages/stage keys.

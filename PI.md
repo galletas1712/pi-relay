@@ -97,7 +97,7 @@ Rules:
 - To run a known pattern (e.g. implement → review → test), `LoadSkill` the matching
   workflow skill and follow its delegation state machine, branching on the typed
   outcomes in the delivered snapshot (or a refreshed `inspect_delegation`
-  snapshot), with your own judgment (skip, re-run, escalate, stop).
+  snapshot), with your own judgment (skip, launch fresh work, escalate, stop).
 
 {% if subagent_roles.catalog %}
 ### Packaged subagent roles

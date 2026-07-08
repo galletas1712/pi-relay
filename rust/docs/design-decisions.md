@@ -88,7 +88,7 @@ under the captured draft instead of being retargeted.
 Stop is exact-session control: selecting a root stops that root only, and
 selecting a child stops that child only. It does not cascade between
 parent/children or cancel a delegation. Whole-delegation cancellation is a
-separate run-board/model operation. Parent models can also steer one child
+separate Agents-outline/model operation. Parent models can also steer one child
 without interruption (the backward-compatible default), atomically request an
 interrupt-and-steer, or call `interrupt_subagent` for exact-child
 interrupt-only control. Both interrupting forms use a durable

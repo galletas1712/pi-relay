@@ -13,7 +13,7 @@ and transcript-first interaction.
 | Sidebar        | Chat pane                        | Inspector    |
 | projects +     | header (model/effort/title)      | global cfg   |
 | session list   | transcript (turn cards)          | session head |
-| activity counts| ----------------------------------| pending      |
+|                | ----------------------------------| pending      |
 |                | composer + queue pane + slash    | actions/tools|
 +----------------+----------------------------------+--------------+
 ```
@@ -273,7 +273,7 @@ Steer and interrupt have three deliberately separate forms:
 The selected transcript's Stop button calls `input.interrupt` with the captured
 selected session id. Stopping a parent interrupts only that parent; stopping a
 child interrupts only that exact child, not its parent, siblings, or delegation.
-Whole-delegation cancellation remains the separate run-board
+Whole-delegation cancellation remains the separate Agents-outline
 `delegation.cancel`/model `cancel_delegation` operation. Its status transition
 atomically cancels active child mailbox rows (including pending combined
 controls), then exact-child runtime cancellation interrupts remaining child

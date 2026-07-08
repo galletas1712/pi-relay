@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { sessionStatusWithDelegations } from "./sessionList.ts";
+import { projectTitle, sessionStatusWithDelegations, sessionTitle } from "./sessionList.ts";
+import type { Project, SessionSummary } from "./types.ts";
 
 describe("sessionStatusWithDelegations", () => {
 	it("is idle when the parent is idle and no delegations run", () => {
@@ -17,5 +18,22 @@ describe("sessionStatusWithDelegations", () => {
 
 	it("treats a queued parent as running even with delegations in flight", () => {
 		expect(sessionStatusWithDelegations("queued", true)).toBe("running");
+	});
+});
+
+describe("primary identity fallbacks", () => {
+	it("never promotes technical ids into default product labels", () => {
+		const session = {
+			session_id: "session_technical_123",
+			metadata: {},
+		} as SessionSummary;
+		const project = {
+			project_id: "project_technical_123",
+			name: "",
+		} as Project;
+
+		expect(sessionTitle(session)).toBe("Untitled session");
+		expect(sessionTitle(session, "Agent")).toBe("Agent");
+		expect(projectTitle(project)).toBe("Untitled project");
 	});
 });

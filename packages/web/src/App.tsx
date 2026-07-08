@@ -30,7 +30,7 @@ import { randomId } from "./ids.ts";
 import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
-import { isDelegationRunning, reRunParamsForDelegation, subagentHasNonEmptyPromptFile } from "./delegationBoard.ts";
+import { isDelegationRunning } from "./delegationBoard.ts";
 import { DelegationListRetryController } from "./delegationListRetryController.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, type ParsedSlash } from "./slash.ts";
@@ -95,7 +95,6 @@ import {
 	isArchivedSession,
 	sessionStatusWithDelegations,
 	sortSessionsByLastUserMessage,
-	tallyActivities,
 	type SessionListItem,
 } from "./sessionList.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
@@ -401,6 +400,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [panelMode, setPanelMode] = useState<PanelMode>(() => panelModeForViewport());
 	const [showArchived, setShowArchived] = useState(false);
 	const [showAllDelegations, setShowAllDelegations] = useState(false);
+	const [backgroundWarmRevision, setBackgroundWarmRevision] = useState(0);
 	const [historyDialog, setHistoryDialog] = useState<HistoryDialogState | null>(null);
 	const [exportDialog, setExportDialog] = useState<ExportDialogState | null>(null);
 	const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
@@ -898,22 +898,40 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		() => delegations.flatMap((delegation) => delegation.subagents.map((subagent) => subagent.id)),
 		[delegations],
 	);
+	const delegationSubagentNames = useMemo(() => {
+		const names = new Map<string, string>();
+		const knownSessions = new Map(allKnownSessions.map((session) => [session.session_id, session]));
+		for (const sessionId of delegationSubagentIds) {
+			const session =
+				(loadedSnapshot?.session_id === sessionId ? loadedSnapshot : null) ??
+				knownSessions.get(sessionId) ??
+				getSelectedCache(sessionId)?.snapshot;
+			if (session) names.set(sessionId, sessionTitle(session, "Agent"));
+		}
+		return names;
+	}, [
+		allKnownSessions,
+		backgroundWarmRevision,
+		delegationSubagentIds,
+		getSelectedCache,
+		loadedSnapshot,
+	]);
 	const backgroundSubagentWarmCandidates = useMemo(
 		() =>
 			delegations.flatMap((delegation) =>
 				delegation.subagents
 					.filter((subagent) => subagent.id !== selectedId)
 					.filter((subagent) => {
+						if (backgroundWarmUpdatedAt.current.has(subagent.id)) return false;
 						const cache = getSelectedCache(subagent.id);
 						if (!cache?.snapshot) return true;
 						if (cache.snapshot.activity !== subagent.activity && subagent.activity) return true;
 						if (cache.snapshot.has_transcript_entries && cache.turnOrder.length === 0) return true;
-						return subagentStatusNeedsWarm(subagent.status, subagent.activity) &&
-							!backgroundWarmUpdatedAt.current.has(subagent.id);
+						return subagentStatusNeedsWarm(subagent.status, subagent.activity);
 					})
 					.map((subagent) => subagent.id),
 			),
-		[delegations, getSelectedCache, selectedId],
+		[backgroundWarmRevision, delegations, getSelectedCache, selectedId],
 	);
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
 	const hasTranscriptEntries =
@@ -1481,6 +1499,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					if (!warmed) return;
 					if (candidate.updatedAt) backgroundWarmUpdatedAt.current.set(candidate.id, candidate.updatedAt);
 					else backgroundWarmUpdatedAt.current.set(candidate.id, "subagent");
+					if (candidate.label === "subagent") {
+						setBackgroundWarmRevision((current) => current + 1);
+					}
 				})
 				.catch((error) => {
 					console.warn(`background ${candidate.label} warm failed`, candidate.id, error);
@@ -1914,10 +1935,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					scheduleSessionListRefresh(projectId);
 				}
 				if (delegationParentSessionId) {
-					// The run board reads the delegation.* surface; the backend emits no
-					// dedicated delegation events, so the subagent lifecycle events (and
-					// the typed completion observation landing in the parent transcript) are the
-					// signal to refresh the board. The 2s poll covers any missed event.
+					// The Agents outline reads delegation.*; because there is no dedicated
+					// delegation event, subagent lifecycle events and the typed completion
+					// observation refresh it. The 2s poll covers any missed event.
 					void queryClient.invalidateQueries({ queryKey: delegationQueryPrefix(delegationParentSessionId) });
 				}
 			}
@@ -2158,13 +2178,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 
 	const changeModel = useCallback(
 		async (modelKey: string) => {
-			if (modelLocked) {
-				pushNotice("info", "model is locked after the first transcript entry");
-				return;
-			}
+			if (modelLocked) return;
 			await configureProvider(providerFromModelKey(modelKey, activeProvider));
 		},
-		[activeProvider, configureProvider, modelLocked, pushNotice],
+		[activeProvider, configureProvider, modelLocked],
 	);
 
 	const changeReasoningEffort = useCallback(
@@ -2183,10 +2200,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			return title.includes(q) || session.session_id.toLowerCase().includes(q);
 		});
 	}, [query, sessionItems, showArchived]);
-
-	const activeSessionItems = useMemo(() => sessionItems.filter((session) => !isArchivedSession(session)), [sessionItems]);
-	const counts = useMemo(() => tallyActivities(activeSessionItems), [activeSessionItems]);
-	const archivedCount = sessionItems.length - activeSessionItems.length;
 
 	const openRenameDialog = useCallback((session: SessionListItem) => {
 		setRenameSessionId(session.session_id);
@@ -2639,38 +2652,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			await invalidateDelegations(parentSessionId);
 		},
 		[api, assertServerMutationAllowed, invalidateDelegations],
-	);
-
-	const reRunDelegation = useCallback(
-		async (parentSessionId: string, delegation: Delegation) => {
-			assertServerMutationAllowed();
-			const promptPairs = await Promise.all(
-				delegation.subagents.map(async (subagent): Promise<[string, string | null]> => {
-					if (!subagentHasNonEmptyPromptFile(subagent)) return [subagent.id, null];
-					assertServerReadAllowed();
-					const result = await api.readHandoffFile({
-						parentSessionId,
-						delegationId: delegation.delegation_id,
-						subagentId: subagent.id,
-						file: "task_prompt.md",
-					});
-					return [subagent.id, result.content];
-				}),
-			);
-			const resolvedPrompts = new Map<string, string>();
-			for (const [subagentId, prompt] of promptPairs) {
-				if (typeof prompt === "string") resolvedPrompts.set(subagentId, prompt);
-			}
-			const reRun = reRunParamsForDelegation(delegation, parentSessionId, resolvedPrompts);
-			if (!reRun) throw new Error("Cannot re-run: original prompts are unavailable");
-			const start =
-				reRun.kind === "full"
-					? api.startFullDelegation(reRun.params)
-					: api.startReadonlyDelegationFanout(reRun.params);
-			await start;
-			await invalidateDelegations(parentSessionId);
-		},
-		[api, assertServerMutationAllowed, assertServerReadAllowed, invalidateDelegations],
 	);
 
 	const resumeTerminalTurn = useCallback(
@@ -3222,9 +3203,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			) : null}
 
 			<Sidebar
-				counts={counts}
-				total={activeSessionItems.length}
-				archived={archivedCount}
 				connection={connection}
 				projects={projects}
 				selectedProjectId={selectedProjectId}
@@ -3443,6 +3421,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					snapshot={loadedSnapshot}
 					runBoardParentSessionId={delegationParentSessionId}
 					delegations={delegations}
+					subagentNames={delegationSubagentNames}
 					hasMoreDelegations={hasMoreDelegations}
 					delegationsLoading={delegationsLoading}
 					delegationsError={delegationsError}
@@ -3458,7 +3437,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					}
 					runBoard={{
 						onCancelDelegation: cancelDelegation,
-						onReRunDelegation: reRunDelegation,
 					}}
 					mutationBlockedReason={connectionRemoteActionBlockedReason}
 					remoteReadBlockedReason={connectionRemoteActionBlockedReason}
@@ -3599,10 +3577,7 @@ function compactionErrorNotice(data: Record<string, unknown>): string {
 }
 
 function subagentLabel(data: Record<string, unknown>): string {
-	const label =
-		typeof data.role === "string" && data.role.trim() ? data.role.trim() : "subagent";
-	const child = typeof data.child_session_id === "string" ? data.child_session_id.slice(0, 13) : "";
-	return child ? `${label} ${child}` : label;
+	return typeof data.role === "string" && data.role.trim() ? data.role.trim() : "Agent";
 }
 
 function subagentRunningNotice(data: Record<string, unknown>): string {

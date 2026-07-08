@@ -7596,7 +7596,7 @@ async fn completion_loser_after_cancellation_does_not_write_normal_handoff() {
 }
 
 #[tokio::test]
-async fn missing_task_metadata_omits_task_prompt_artifacts_and_rerun_metadata() {
+async fn missing_task_metadata_omits_task_prompt_handoff_metadata() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;

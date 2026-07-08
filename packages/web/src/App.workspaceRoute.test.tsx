@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentApi } from "./agentApi.ts";
@@ -180,7 +180,7 @@ describe("App workspace route identity integration", () => {
 		const user = userEvent.setup();
 
 		await open(api);
-		const child = await screen.findByRole("button", { name: /Open agent implementer/ });
+		const child = await screen.findByRole("button", { name: /Open agent Child one, implementer/ });
 		await user.click(child);
 		await waitFor(() => expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1"));
 		expect(await screen.findByText("Conversation recipient:")).toBeTruthy();
@@ -201,6 +201,35 @@ describe("App workspace route identity integration", () => {
 		expect(mutationCallCount(api)).toBe(mutationsBeforePop);
 		expect(browser.pushCalls).toHaveLength(pushesBeforePop);
 		expect(browser.replaceCalls).toHaveLength(replacesBeforePop);
+
+		await mounted.dispose();
+	});
+
+	it("updates an Agent fallback from the existing warmed child snapshot without changing route identity", async () => {
+		const warmedChild = deferred<SessionSnapshot>();
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const api = createRouteApi({
+			deferredSessions: new Map([["child-1", warmedChild.promise]]),
+		});
+		const mounted = renderRouteApp(api, browser);
+
+		await open(api);
+		const fallback = await screen.findByRole("button", {
+			name: "Open agent Agent, implementer, running",
+		});
+		expect(within(fallback).getByText("Agent").className).toBe("run-board-subagent-name");
+		expect(within(fallback).getByText("implementer").className).toBe("run-board-subagent-role");
+		expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1");
+		expect(api.getSession.mock.calls.filter(([sessionId]) => sessionId === "child-1")).toHaveLength(1);
+
+		warmedChild.resolve(snapshot("child-1", "root-1", null, "Review checkout"));
+		const named = await screen.findByRole("button", {
+			name: "Open agent Review checkout, implementer, running",
+		});
+		expect(within(named).getByText("Review checkout")).toBeTruthy();
+		expect(screen.queryByRole("button", { name: "Open agent Agent, implementer, running" })).toBeNull();
+		expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1");
+		expect(api.getSession.mock.calls.filter(([sessionId]) => sessionId === "child-1")).toHaveLength(1);
 
 		await mounted.dispose();
 	});
