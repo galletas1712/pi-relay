@@ -10,7 +10,10 @@ import {
 	applyTranscriptTurns,
 	applyTurnDetail,
 	branchFromTree,
+	captureSelectedSessionRefresh,
+	commitSelectedSessionRefresh,
 	emptySelectedSessionCache,
+	hasUsableSelectedSessionCache,
 	mergeSessionActivityEvent,
 	selectedEntries,
 	snapshotWithTranscriptTurnsMetadata,
@@ -32,6 +35,150 @@ const sessionId = "session_1";
 const provider: ProviderConfig = { kind: "openai", model: "gpt-5.1" };
 
 describe("selected session cache", () => {
+	it("discards a staged refresh when a websocket event advances the visible cache", async () => {
+		const original = entry("entry_1", null, "original", 1);
+		const appended = entry("entry_2", original.id, "new event", 2);
+		let visibleCache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([original], {
+				sessionRevision: 1,
+				transcriptRevision: 1,
+				lastEventId: 1,
+			}),
+		);
+		visibleCache = applyTranscriptTurns(visibleCache, turnsResult(original, 1));
+		const fence = captureSelectedSessionRefresh(visibleCache);
+		const pendingTurns = deferred<TranscriptTurnsResult>();
+		const refresh = (async () => {
+			let staged = applySelectedSnapshot(
+				visibleCache,
+				overview([], {
+					sessionRevision: 1,
+					transcriptRevision: 1,
+					lastEventId: 1,
+					activeLeafId: original.id,
+				}),
+			);
+			staged = applyTranscriptTurns(staged, await pendingTurns.promise);
+			const commit = commitSelectedSessionRefresh(fence, visibleCache, staged);
+			if (commit.committed) visibleCache = commit.cache;
+			return commit;
+		})();
+
+		visibleCache = applyTranscriptAppendedEvent(
+			visibleCache,
+			transcriptAppendedEvent(appended, 2, 2),
+		).cache;
+		pendingTurns.resolve(turnsResult(original, 1));
+		const commit = await refresh;
+
+		expect(commit.committed).toBe(false);
+		expect(visibleCache.snapshot?.session_revision).toBe(2);
+		expect(visibleCache.snapshot?.transcript_revision).toBe(2);
+		expect(visibleCache.snapshot?.last_event_id).toBe(2);
+		expect(selectedEntries(visibleCache).map((candidate) => candidate.id)).toEqual([
+			original.id,
+			appended.id,
+		]);
+	});
+
+	it("commits a staged refresh when the visible cache has not advanced", async () => {
+		const original = entry("entry_1", null, "original", 1);
+		const canonical = entry("entry_2", original.id, "canonical", 2);
+		let visibleCache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([original], {
+				sessionRevision: 1,
+				transcriptRevision: 1,
+				lastEventId: 1,
+			}),
+		);
+		visibleCache = applyTranscriptTurns(visibleCache, turnsResult(original, 1));
+		const fence = captureSelectedSessionRefresh(visibleCache);
+		const pendingTurns = deferred<TranscriptTurnsResult>();
+		const refresh = (async () => {
+			let staged = applySelectedSnapshot(
+				visibleCache,
+				overview([], {
+					sessionRevision: 2,
+					transcriptRevision: 2,
+					lastEventId: 2,
+					activeLeafId: canonical.id,
+				}),
+			);
+			staged = applyTranscriptTurns(staged, await pendingTurns.promise);
+			const commit = commitSelectedSessionRefresh(fence, visibleCache, staged);
+			if (commit.committed) visibleCache = commit.cache;
+			return commit;
+		})();
+
+		pendingTurns.resolve(turnsResult(canonical, 2));
+		const commit = await refresh;
+
+		expect(commit.committed).toBe(true);
+		expect(visibleCache.snapshot?.session_revision).toBe(2);
+		expect(visibleCache.snapshot?.transcript_revision).toBe(2);
+		expect(visibleCache.snapshot?.last_event_id).toBe(2);
+		expect(selectedEntries(visibleCache).map((candidate) => candidate.id)).toEqual([
+			canonical.id,
+		]);
+	});
+
+	it("requires a completed matching transcript-turn load, including for empty transcripts", () => {
+		let cache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([], { activeLeafId: null, transcriptRevision: 0 }),
+		);
+
+		expect(hasUsableSelectedSessionCache(cache, sessionId)).toBe(false);
+
+		cache = applyTranscriptTurns(cache, {
+			session_id: sessionId,
+			active_leaf_id: null,
+			session_revision: 1,
+			transcript_revision: 0,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
+			cards: [],
+		});
+
+		expect(hasUsableSelectedSessionCache(cache, sessionId)).toBe(true);
+	});
+
+	it("supports staging a newer snapshot without replacing the last usable cache on turn failure", () => {
+		const oldEntry = entry("entry_old", null, "old content", 1);
+		let visibleCache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([oldEntry], { activeLeafId: oldEntry.id, transcriptRevision: 1 }),
+		);
+		visibleCache = applyTranscriptTurns(visibleCache, {
+			session_id: sessionId,
+			active_leaf_id: oldEntry.id,
+			session_revision: 1,
+			transcript_revision: 1,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
+			cards: [turnCard(oldEntry.id, 1)],
+		});
+		const staged = applySelectedSnapshot(
+			visibleCache,
+			overview([], {
+				activeLeafId: "entry_new",
+				sessionRevision: 2,
+				transcriptRevision: 2,
+			}),
+		);
+
+		expect(hasUsableSelectedSessionCache(visibleCache, sessionId)).toBe(true);
+		expect(selectedEntries(visibleCache).map((entry) => entry.id)).toEqual([oldEntry.id]);
+		expect(hasUsableSelectedSessionCache(staged, sessionId)).toBe(false);
+		expect(staged.snapshot?.active_leaf_id).toBe("entry_new");
+	});
+
 	it("normalizes selected snapshots into active branch bodies", () => {
 		const root = entry("entry_1", null, "first", 1);
 		const child = entry("entry_2", "entry_1", "second", 2);
@@ -980,6 +1127,40 @@ describe("selected session cache", () => {
 		expect(cache.snapshot?.entries?.map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
 	});
 });
+
+interface Deferred<T> {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+	reject: (reason: unknown) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	let reject!: (reason: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
+
+function turnsResult(activeEntry: TranscriptEntry, revision: number): TranscriptTurnsResult {
+	return {
+		session_id: sessionId,
+		active_leaf_id: activeEntry.id,
+		session_revision: revision,
+		transcript_revision: revision,
+		before_entry_id: null,
+		next_before_entry_id: null,
+		has_more_before: false,
+		limit: 50,
+		cards: [{
+			...turnCard(activeEntry.id, 1),
+			active_leaf_id: activeEntry.id,
+			user_messages: [activeEntry],
+		}],
+	};
+}
 
 function snapshot(
 	entries: TranscriptEntry[],

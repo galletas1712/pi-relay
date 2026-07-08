@@ -46,11 +46,61 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		turnCardsById: new Map(),
 		turnOrder: [],
 		turnDetailsById: new Map(),
+		transcriptTurnsLoaded: false,
 		turnTranscriptRevision: null,
 		turnActiveLeafId: null,
 		turnHasMoreBefore: false,
 		turnBeforeEntryId: null,
 	};
+}
+
+export function hasUsableSelectedSessionCache(
+	cache: SelectedSessionCache,
+	sessionId: string | null = cache.sessionId,
+): boolean {
+	if (!sessionId || cache.sessionId !== sessionId || !cache.snapshot || !cache.transcriptTurnsLoaded) return false;
+	return (
+		cache.turnTranscriptRevision === (cache.snapshot.transcript_revision ?? null) &&
+		cache.turnActiveLeafId === (cache.snapshot.active_leaf_id ?? null)
+	);
+}
+
+export interface SelectedSessionRefreshFence {
+	cache: SelectedSessionCache;
+	sessionId: string | null;
+	sessionRevision: number | null;
+	queueRevision: number | null;
+	transcriptRevision: number | null;
+	lastEventId: number | null;
+}
+
+export function captureSelectedSessionRefresh(cache: SelectedSessionCache): SelectedSessionRefreshFence {
+	return {
+		cache,
+		sessionId: cache.sessionId,
+		sessionRevision: cache.snapshot?.session_revision ?? null,
+		queueRevision: cache.snapshot?.queue_revision ?? null,
+		transcriptRevision: cache.snapshot?.transcript_revision ?? null,
+		lastEventId: cache.snapshot?.last_event_id ?? null,
+	};
+}
+
+export function commitSelectedSessionRefresh(
+	fence: SelectedSessionRefreshFence,
+	current: SelectedSessionCache,
+	staged: SelectedSessionCache,
+): { cache: SelectedSessionCache; committed: boolean } {
+	const currentMatchesStart =
+		current === fence.cache &&
+		current.sessionId === fence.sessionId &&
+		(current.snapshot?.session_revision ?? null) === fence.sessionRevision &&
+		(current.snapshot?.queue_revision ?? null) === fence.queueRevision &&
+		(current.snapshot?.transcript_revision ?? null) === fence.transcriptRevision &&
+		(current.snapshot?.last_event_id ?? null) === fence.lastEventId;
+	if (!currentMatchesStart || staged.sessionId !== fence.sessionId) {
+		return { cache: current, committed: false };
+	}
+	return { cache: staged, committed: true };
 }
 
 export function selectedEntries(cache: SelectedSessionCache): TranscriptEntry[] {

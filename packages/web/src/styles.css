@@ -825,6 +825,39 @@ pre {
 	padding: 12px 8px;
 }
 
+.load-error-banner {
+	display: flex;
+	align-items: flex-start;
+	gap: var(--space-3);
+	border: 1px solid color-mix(in oklch, var(--destructive) 38%, var(--border));
+	border-radius: var(--radius);
+	background: color-mix(in oklch, var(--destructive) 7%, var(--card));
+	color: var(--destructive);
+	padding: var(--space-3);
+	font-size: var(--text-sm);
+}
+
+.load-error-banner > div {
+	display: flex;
+	min-width: 0;
+	flex: 1;
+	flex-direction: column;
+	gap: var(--space-1);
+}
+
+.load-error-banner span {
+	overflow-wrap: anywhere;
+	color: var(--foreground);
+}
+
+.sidebar-load-error {
+	margin: var(--space-2) var(--space-2) 0;
+}
+
+.load-error-retry {
+	flex: 0 0 auto;
+}
+
 .log-pane {
 	grid-column: 1;
 	grid-row: 2;
@@ -1049,6 +1082,11 @@ pre {
 	position: relative;
 }
 
+.transcript-load-error {
+	width: min(calc(100% - 48px), 852px);
+	margin: 0 auto var(--space-4);
+}
+
 .turn-jump-target {
 	display: block;
 }
@@ -1114,6 +1152,15 @@ pre {
 	font-size: var(--text-sm);
 	font-weight: 400;
 	color: var(--muted-foreground);
+}
+
+.load-error-state {
+	color: var(--destructive);
+}
+
+.load-error-state .empty-state-sub {
+	overflow-wrap: anywhere;
+	color: var(--foreground);
 }
 
 /* The empty-state CTA reuses .primary-button, but that base style is built for

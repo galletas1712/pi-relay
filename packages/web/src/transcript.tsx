@@ -199,6 +199,10 @@ export const MessageList = memo(function MessageList({
 	sessionId,
 	entriesSessionId,
 	loadingSession = false,
+	sessionError = null,
+	sessionErrorHasUsableCache = false,
+	retryingSession = false,
+	onRetrySession,
 	onNewSession,
 	onResumeTurn,
 	resumingTurnId,
@@ -219,6 +223,10 @@ export const MessageList = memo(function MessageList({
 	sessionId?: string | null;
 	entriesSessionId?: string | null;
 	loadingSession?: boolean;
+	sessionError?: string | null;
+	sessionErrorHasUsableCache?: boolean;
+	retryingSession?: boolean;
+	onRetrySession?: () => void;
 	onNewSession?: () => void;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
@@ -463,6 +471,31 @@ export const MessageList = memo(function MessageList({
 		);
 	}
 
+	if ((sessionError || retryingSession) && !sessionErrorHasUsableCache) {
+		return (
+			<div className="message-list-shell">
+				<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
+					<div className="empty-state load-error-state" role={sessionError ? "alert" : "status"}>
+						{sessionError ? <AlertTriangle size={30} aria-hidden /> : <Loader2 className="spin" size={28} aria-hidden />}
+						<div className="empty-state-title">{sessionError ? "Couldn’t load session" : "Retrying session"}</div>
+						<div className="empty-state-sub">{sessionError ?? "Trying to load the selected session again…"}</div>
+						{onRetrySession ? (
+							<button
+								type="button"
+								className="secondary-button load-error-retry"
+								disabled={retryingSession}
+								aria-busy={retryingSession}
+								onClick={onRetrySession}
+							>
+								{retryingSession ? "Retrying…" : "Retry"}
+							</button>
+						) : null}
+					</div>
+				</div>
+			</div>
+		);
+	}
+
 	if (loadingSession || !entriesBelongToSelectedSession) {
 		return (
 			<div className="message-list-shell">
@@ -480,6 +513,26 @@ export const MessageList = memo(function MessageList({
 		<div className={`message-list-shell ${showTurnJumpControls ? "with-turn-jump-controls" : ""}`}>
 			<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 				<div className="message-scroll-content" ref={contentRef}>
+					{sessionError || retryingSession ? (
+						<div className="load-error-banner transcript-load-error" role={sessionError ? "alert" : "status"}>
+							{sessionError ? <AlertTriangle size={18} aria-hidden /> : <Loader2 className="spin" size={18} aria-hidden />}
+							<div>
+								<strong>{sessionError ? "Session refresh failed" : "Refreshing session"}</strong>
+								<span>{sessionError ?? "Trying to refresh the selected session again…"}</span>
+							</div>
+							{onRetrySession ? (
+								<button
+									type="button"
+									className="secondary-button load-error-retry"
+									disabled={retryingSession}
+									aria-busy={retryingSession}
+									onClick={onRetrySession}
+								>
+									{retryingSession ? "Retrying…" : "Retry"}
+								</button>
+							) : null}
+						</div>
+					) : null}
 					{shouldUseTurnCards
 						? (
 								<>

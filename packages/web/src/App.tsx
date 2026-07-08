@@ -1,5 +1,5 @@
 import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
 import { ArrowUp, Bot, Folder, FolderGit2, Menu, PanelRightOpen, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
@@ -39,8 +39,11 @@ import {
 	applyTurnDetail,
 	branchFromTree,
 	emptySelectedSessionCache,
+	hasUsableSelectedSessionCache,
 	mergeSessionActivityEvent,
 	queueProjectionFromEvent,
+	captureSelectedSessionRefresh,
+	commitSelectedSessionRefresh,
 	selectedEntries,
 	snapshotWithTranscriptTurnsMetadata,
 	treeNodesInOrder,
@@ -48,6 +51,7 @@ import {
 	turnDetailEntries,
 	type SelectedSessionCache,
 } from "./selectedSessionCache.ts";
+import { SessionListRequestCoordinator } from "./sessionListRequestCoordinator.ts";
 import { useSelectedSessionStore } from "./selectedSessionStore.ts";
 import {
 	DEFAULT_PROVIDER,
@@ -60,6 +64,11 @@ import {
 	textContent,
 	withReasoningEffort,
 } from "./sessionDefaults.ts";
+import {
+	isSelectedSessionFetchError,
+	SelectedSessionFetchCoordinator,
+	shouldReportActionError,
+} from "./selectedSessionFetchState.ts";
 import {
 	projectTitle,
 	sessionTitle,
@@ -347,10 +356,23 @@ export function App() {
 		update: updateSelectedCache,
 		warm: warmSelectedCache,
 	} = useSelectedSessionStore(initialUiSelection.sessionId);
-	const [selectedFetchState, setSelectedFetchState] = useState<{ sessionId: string | null; loading: boolean }>({
-		sessionId: initialUiSelection.sessionId,
-		loading: !!initialUiSelection.sessionId,
-	});
+	const selectedFetchCoordinatorRef = useRef<SelectedSessionFetchCoordinator | null>(null);
+	if (!selectedFetchCoordinatorRef.current) {
+		selectedFetchCoordinatorRef.current = new SelectedSessionFetchCoordinator({
+			sessionId: initialUiSelection.sessionId,
+			selectionVersion: 0,
+			loading: !!initialUiSelection.sessionId,
+			retrying: false,
+			hadUsableCache: false,
+			error: null,
+		});
+	}
+	const selectedFetchCoordinator = selectedFetchCoordinatorRef.current;
+	const selectedFetchState = useSyncExternalStore(
+		selectedFetchCoordinator.subscribe,
+		selectedFetchCoordinator.getSnapshot,
+		selectedFetchCoordinator.getSnapshot,
+	);
 
 	const selectedSyncTimer = useRef<number | null>(null);
 	const sessionListRefreshTimers = useRef(new Map<string, number>());
@@ -363,8 +385,6 @@ export function App() {
 	const subscribedEventSessionIds = useRef(new Set<string>());
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
 	const sidebarSelectTimer = useRef<number | null>(null);
-	const selectedLoadVersion = useRef(0);
-	const selectedRefreshInFlight = useRef(new Map<string, Promise<{ snapshot: SessionSnapshot; entries: TranscriptEntry[] } | null>>());
 	const autoLoadedTurnDetailRef = useRef<string | null>(null);
 	const lastForegroundReconcileAt = useRef(Date.now());
 	const lastAwakeAt = useRef(Date.now());
@@ -410,19 +430,49 @@ export function App() {
 		[knownProjectIds, selectedProjectId],
 	);
 
+	const sessionListCoordinatorRef = useRef<SessionListRequestCoordinator<SessionSummary[]> | null>(null);
+	if (!sessionListCoordinatorRef.current) {
+		sessionListCoordinatorRef.current = new SessionListRequestCoordinator<SessionSummary[]>(selectedProjectId);
+	}
+	const sessionListCoordinator = sessionListCoordinatorRef.current;
+	const sessionListRequestState = useSyncExternalStore(
+		sessionListCoordinator.subscribe,
+		sessionListCoordinator.getSnapshot,
+		sessionListCoordinator.getSnapshot,
+	);
+	useEffect(() => {
+		sessionListCoordinator.selectProject(selectedProjectId);
+	}, [selectedProjectId, sessionListCoordinator]);
 	const sessionsQuery = useQuery({
 		queryKey: queryKeys.sessions(selectedProjectId),
-		queryFn: () => api.listSessions(100, selectedProjectId),
+		queryFn: () =>
+			sessionListCoordinator.run(
+				selectedProjectId,
+				() => api.listSessions(100, selectedProjectId),
+			),
 		enabled: connection === "open",
 		refetchInterval: SESSION_LIST_REFETCH_MS,
 		refetchIntervalInBackground: true,
 		refetchOnReconnect: true,
 		refetchOnWindowFocus: true,
 	});
+	useEffect(() => {
+		sessionListCoordinator.setQueryFetching(
+			selectedProjectId,
+			sessionsQuery.fetchStatus === "fetching",
+		);
+	}, [selectedProjectId, sessionListCoordinator, sessionsQuery.fetchStatus]);
+	const retrySessions = useCallback(() => {
+		void sessionListCoordinator.retry(selectedProjectId, sessionsQuery.refetch);
+	}, [selectedProjectId, sessionListCoordinator, sessionsQuery.refetch]);
 	const backgroundSessionsQueries = useQueries({
 		queries: backgroundSessionProjectIds.map((projectId) => ({
 			queryKey: queryKeys.sessions(projectId),
-			queryFn: () => api.listSessions(100, projectId),
+			queryFn: () =>
+				sessionListCoordinator.run(
+					projectId,
+					() => api.listSessions(100, projectId),
+				),
 			enabled: connection === "open",
 			refetchInterval: SESSION_LIST_REFETCH_MS,
 			refetchIntervalInBackground: true,
@@ -430,6 +480,14 @@ export function App() {
 			refetchOnWindowFocus: true,
 		})),
 	});
+	useEffect(() => {
+		for (const [index, projectId] of backgroundSessionProjectIds.entries()) {
+			sessionListCoordinator.setQueryFetching(
+				projectId,
+				backgroundSessionsQueries[index]?.fetchStatus === "fetching",
+			);
+		}
+	}, [backgroundSessionProjectIds, backgroundSessionsQueries, sessionListCoordinator]);
 	const sessions = sessionsQuery.data ?? [];
 	const backgroundSessions = backgroundSessionsQueries.flatMap((query) => query.data ?? []);
 	const allKnownSessions = useMemo(
@@ -517,7 +575,11 @@ export function App() {
 	const loadedSnapshot = selectedCache.sessionId === selectedId ? selectedCache.snapshot : null;
 	const historySwitchingSelectedSession = !!selectedId && historySwitchingSessionId === selectedId;
 	const selectedLoading = selectedFetchState.sessionId === selectedId && selectedFetchState.loading;
-	const transcriptLoading = !!selectedId && ((!loadedSnapshot && selectedLoading) || historySwitchingSelectedSession);
+	const selectedRetrying = selectedFetchState.sessionId === selectedId && selectedFetchState.retrying;
+	const selectedError = selectedFetchState.sessionId === selectedId ? selectedFetchState.error : null;
+	const selectedErrorHasUsableCache =
+		selectedFetchState.sessionId === selectedId && selectedFetchState.hadUsableCache;
+	const transcriptLoading = !!selectedId && (selectedLoading || historySwitchingSelectedSession);
 	const loadedEntries = useMemo(
 		() => (selectedCache.sessionId === selectedId ? selectedEntries(selectedCache) : []),
 		[selectedCache.activeBranchEntryIds, selectedCache.entriesById, selectedCache.sessionId, selectedId],
@@ -645,29 +707,28 @@ export function App() {
 		selectedRef.current = sessionId;
 		setSelectedId(sessionId);
 		setShowAllDelegations(false);
-		selectedLoadVersion.current += 1;
 		const nextCache = resetSelectedCache(sessionId);
-		setSelectedFetchState({
+		selectedFetchCoordinator.select(
 			sessionId,
-			loading: !!sessionId && !nextCache.snapshot,
-		});
+			hasUsableSelectedSessionCache(nextCache, sessionId),
+		);
 		rememberSelectedSession(selectedProjectRef.current, sessionId);
-	}, [resetSelectedCache]);
+	}, [resetSelectedCache, selectedFetchCoordinator]);
 
 	const selectProjectSession = useCallback((projectId: string | null, sessionId: string | null) => {
 		selectedProjectRef.current = projectId;
 		selectedRef.current = sessionId;
+		sessionListCoordinator.selectProject(projectId);
 		setSelectedProjectId(projectId);
 		setSelectedId(sessionId);
 		setShowAllDelegations(false);
-		selectedLoadVersion.current += 1;
 		const nextCache = resetSelectedCache(sessionId);
-		setSelectedFetchState({
+		selectedFetchCoordinator.select(
 			sessionId,
-			loading: !!sessionId && !nextCache.snapshot,
-		});
+			hasUsableSelectedSessionCache(nextCache, sessionId),
+		);
 		rememberUiSelection(projectId, sessionId);
-	}, [resetSelectedCache]);
+	}, [resetSelectedCache, selectedFetchCoordinator, sessionListCoordinator]);
 
 	const invalidateSessionList = useCallback(
 		(projectId = selectedProjectRef.current) => {
@@ -728,14 +789,25 @@ export function App() {
 		[mergeSnapshotIntoKnownSessionLists],
 	);
 
+	const fetchTranscriptTurns = useCallback(
+		(sessionId: string) => api.getTranscriptTurns(sessionId, { limit: TRANSCRIPT_TURN_PAGE_SIZE }),
+		[api],
+	);
+
 	const refreshTranscriptTurns = useCallback(
-		async (sessionId: string) => {
-			const result = await api.getTranscriptTurns(sessionId, { limit: TRANSCRIPT_TURN_PAGE_SIZE });
+		async (sessionId: string, selectionVersion?: number) => {
+			const result = await fetchTranscriptTurns(sessionId);
 			if (selectedRef.current !== sessionId) return null;
+			if (
+				selectionVersion !== undefined &&
+				!selectedFetchCoordinator.isCurrent(sessionId, selectionVersion)
+			) {
+				return null;
+			}
 			updateSelectedCache((current) => applyTranscriptTurns(current.sessionId === sessionId ? current : selectedCacheRef.current, result));
 			return result;
 		},
-		[api, updateSelectedCache],
+		[fetchTranscriptTurns, selectedFetchCoordinator, updateSelectedCache],
 	);
 
 	const warmBackgroundSession = useCallback(
@@ -832,29 +904,47 @@ export function App() {
 	);
 
 	const getFreshSession = useCallback(
-		async (sessionId: string) => {
+		async (sessionId: string, selectionVersion: number) => {
 			const snapshot = await fetchSessionSnapshot(sessionId, "fetch");
+			if (!selectedFetchCoordinator.isCurrent(sessionId, selectionVersion)) return null;
 			commitSelectedSnapshot(snapshot);
 			let turns: TranscriptTurnsResult | null = null;
 			try {
-				turns = await refreshTranscriptTurns(sessionId);
+				turns = await refreshTranscriptTurns(sessionId, selectionVersion);
 			} finally {
-				if (selectedRef.current === sessionId && selectedCacheRef.current.snapshot?.session_id !== sessionId) {
+				if (
+					selectedFetchCoordinator.isCurrent(sessionId, selectionVersion) &&
+					selectedCacheRef.current.snapshot?.session_id !== sessionId
+				) {
 					commitSelectedSnapshot(turns ? snapshotWithTranscriptTurnsMetadata(snapshot, turns) : snapshot);
 				}
 			}
-			if (selectedRef.current === sessionId && snapshot.project_id !== selectedProjectRef.current) {
+			if (
+				selectedFetchCoordinator.isCurrent(sessionId, selectionVersion) &&
+				snapshot.project_id !== selectedProjectRef.current
+			) {
 				selectedProjectRef.current = snapshot.project_id;
+				sessionListCoordinator.selectProject(snapshot.project_id);
 				setSelectedProjectId(snapshot.project_id);
 				rememberUiSelection(snapshot.project_id, sessionId);
 			}
+			if (!selectedFetchCoordinator.isCurrent(sessionId, selectionVersion)) return null;
 			const cache = selectedCacheRef.current;
+			if (!hasUsableSelectedSessionCache(cache, sessionId)) {
+				throw new Error("selected session transcript did not finish loading");
+			}
 			return {
 				snapshot: cache.sessionId === sessionId && cache.snapshot ? cache.snapshot : snapshot,
 				entries: cache.sessionId === sessionId ? selectedEntries(cache) : [],
 			};
 		},
-		[commitSelectedSnapshot, fetchSessionSnapshot, refreshTranscriptTurns],
+		[
+			commitSelectedSnapshot,
+			fetchSessionSnapshot,
+			refreshTranscriptTurns,
+			selectedFetchCoordinator,
+			sessionListCoordinator,
+		],
 	);
 
 	const patchSelectedSnapshot = useCallback(
@@ -878,64 +968,76 @@ export function App() {
 	const refreshSelectedSessionState = useCallback(
 		async (sessionId: string) => {
 			if (sessionId !== selectedRef.current) return null;
-			const inFlight = selectedRefreshInFlight.current.get(sessionId);
-			if (inFlight) return inFlight;
-			const currentSnapshot = selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current.snapshot : null;
-			setSelectedFetchState({
-				sessionId,
-				loading: !currentSnapshot,
-			});
-			const request = (async () => {
-				let result: { snapshot: SessionSnapshot; entries: TranscriptEntry[] } | null;
-				if (!currentSnapshot) {
-					result = await getFreshSession(sessionId);
-				} else {
-					const snapshot = await fetchSessionSnapshot(sessionId, "refresh");
-					if (selectedRef.current !== sessionId) return null;
-					commitSelectedSnapshot(snapshot);
-					if (selectedRef.current === sessionId && snapshot.project_id !== selectedProjectRef.current) {
-						selectedProjectRef.current = snapshot.project_id;
-						setSelectedProjectId(snapshot.project_id);
-						rememberUiSelection(snapshot.project_id, sessionId);
+			const cacheBeforeRequest = selectedCacheRef.current;
+			const hasUsableCache = hasUsableSelectedSessionCache(cacheBeforeRequest, sessionId);
+			return selectedFetchCoordinator.run(sessionId, hasUsableCache, async (selectionVersion) => {
+				for (;;) {
+					const cacheAtRefreshStart = selectedCacheRef.current;
+					const currentSnapshot =
+						cacheAtRefreshStart.sessionId === sessionId
+							? cacheAtRefreshStart.snapshot
+							: null;
+					let result: { snapshot: SessionSnapshot; entries: TranscriptEntry[] } | null;
+					if (!currentSnapshot) {
+						result = await getFreshSession(sessionId, selectionVersion);
+						return result;
 					}
-					const cacheAfterSnapshot = selectedCacheRef.current;
+					const refreshFence = captureSelectedSessionRefresh(cacheAtRefreshStart);
+					const snapshot = await fetchSessionSnapshot(sessionId, "refresh");
+					if (!selectedFetchCoordinator.isCurrent(sessionId, selectionVersion)) return null;
+					let nextCache = applySelectedSnapshot(
+						cacheAtRefreshStart,
+						snapshot,
+					);
 					const needsTurns =
-						cacheAfterSnapshot.sessionId !== sessionId ||
-						cacheAfterSnapshot.turnTranscriptRevision !== (snapshot.transcript_revision ?? null) ||
-						cacheAfterSnapshot.turnActiveLeafId !== (snapshot.active_leaf_id ?? null) ||
-						(snapshot.has_transcript_entries && cacheAfterSnapshot.turnOrder.length === 0);
-					if (needsTurns) await refreshTranscriptTurns(sessionId);
-					if (selectedRef.current !== sessionId) return null;
-					const cache = selectedCacheRef.current;
+						!cacheAtRefreshStart.transcriptTurnsLoaded ||
+						cacheAtRefreshStart.turnTranscriptRevision !== (snapshot.transcript_revision ?? null) ||
+						cacheAtRefreshStart.turnActiveLeafId !== (snapshot.active_leaf_id ?? null) ||
+						(snapshot.has_transcript_entries && cacheAtRefreshStart.turnOrder.length === 0);
+					if (needsTurns) {
+						const turns = await fetchTranscriptTurns(sessionId);
+						if (!selectedFetchCoordinator.isCurrent(sessionId, selectionVersion)) return null;
+						nextCache = applyTranscriptTurns(nextCache, turns);
+					}
+					if (!selectedFetchCoordinator.isCurrent(sessionId, selectionVersion)) return null;
+					if (!hasUsableSelectedSessionCache(nextCache, sessionId)) {
+						throw new Error("selected session transcript did not finish loading");
+					}
+					const commit = commitSelectedSessionRefresh(
+						refreshFence,
+						selectedCacheRef.current,
+						nextCache,
+					);
+					if (!commit.committed) continue;
+					replaceSelectedCache(commit.cache);
+					const committedSnapshot = nextCache.snapshot ?? snapshot;
+					const observedEventId = lastEventIds.current.get(sessionId) ?? 0;
+					lastEventIds.current.set(sessionId, Math.max(observedEventId, committedSnapshot.last_event_id));
+					mergeSnapshotIntoKnownSessionLists(committedSnapshot);
+					if (committedSnapshot.project_id !== selectedProjectRef.current) {
+						selectedProjectRef.current = committedSnapshot.project_id;
+						sessionListCoordinator.selectProject(committedSnapshot.project_id);
+						setSelectedProjectId(committedSnapshot.project_id);
+						rememberUiSelection(committedSnapshot.project_id, sessionId);
+					}
 					result = {
-						snapshot: cache.sessionId === sessionId && cache.snapshot ? cache.snapshot : snapshot,
-						entries: cache.sessionId === sessionId ? selectedEntries(cache) : [],
+						snapshot: committedSnapshot,
+						entries: selectedEntries(nextCache),
 					};
-				}
-				if (selectedRef.current === sessionId) {
-					setSelectedFetchState({
-						sessionId,
-						loading: false,
-					});
-				}
-				return result;
-			})().catch((error) => {
-				if (selectedRef.current === sessionId) {
-					setSelectedFetchState({
-						sessionId,
-						loading: false,
-					});
-				}
-				throw error;
-			}).finally(() => {
-				if (selectedRefreshInFlight.current.get(sessionId) === request) {
-					selectedRefreshInFlight.current.delete(sessionId);
+					return result;
 				}
 			});
-			selectedRefreshInFlight.current.set(sessionId, request);
-			return request;
 		},
-		[commitSelectedSnapshot, fetchSessionSnapshot, getFreshSession, refreshTranscriptTurns],
+		[
+			commitSelectedSnapshot,
+			fetchTranscriptTurns,
+			fetchSessionSnapshot,
+			getFreshSession,
+			mergeSnapshotIntoKnownSessionLists,
+			replaceSelectedCache,
+			selectedFetchCoordinator,
+			sessionListCoordinator,
+		],
 	);
 
 	const syncActiveBranchNow = useCallback(
@@ -948,6 +1050,11 @@ export function App() {
 		},
 		[refreshSelectedSessionState],
 	);
+	const retrySelected = useCallback(() => {
+		const sessionId = selectedRef.current;
+		if (!sessionId) return;
+		void refreshSelectedSessionState(sessionId).catch(() => undefined);
+	}, [refreshSelectedSessionState]);
 
 	const loadTurnDetail = useCallback(
 		async (cardId: string, options: { mode: "manual" | "auto" }) => {
@@ -1062,7 +1169,7 @@ export function App() {
 			const reconcile = () => {
 				void invalidateKnownSessionLists();
 				if (!sessionId) return;
-				void syncActiveBranchNow(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
+				void syncActiveBranchNow(sessionId).catch(() => undefined);
 			};
 			if (!options.forceReconnect) {
 				reconcile();
@@ -1116,10 +1223,10 @@ export function App() {
 			if (selectedSyncTimer.current !== null) window.clearTimeout(selectedSyncTimer.current);
 			selectedSyncTimer.current = window.setTimeout(() => {
 				selectedSyncTimer.current = null;
-				void refreshSelectedSessionState(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
+				void refreshSelectedSessionState(sessionId).catch(() => undefined);
 			}, delayMs);
 		},
-		[pushNotice, refreshSelectedSessionState],
+		[refreshSelectedSessionState],
 	);
 
 	const refreshSelected = useCallback(
@@ -1134,32 +1241,22 @@ export function App() {
 		if (connection !== "open") return;
 		if (!selectedId) {
 			resetSelectedCache(null);
-			setSelectedFetchState({ sessionId: null, loading: false });
+			if (selectedFetchCoordinator.getSnapshot().sessionId !== null) {
+				selectedFetchCoordinator.select(null, false);
+			}
 			return;
 		}
-		const version = ++selectedLoadVersion.current;
-		const currentSnapshot = selectedCacheRef.current.sessionId === selectedId ? selectedCacheRef.current.snapshot : null;
-		setSelectedFetchState({
-			sessionId: selectedId,
-			loading: !currentSnapshot,
-		});
-		void refreshSelectedSessionState(selectedId)
-			.then(() => {
-				if (selectedLoadVersion.current !== version || selectedRef.current !== selectedId) return;
-				setSelectedFetchState({
-					sessionId: selectedId,
-					loading: false,
-				});
-			})
-			.catch((error) => {
-				if (selectedLoadVersion.current !== version || selectedRef.current !== selectedId) return;
-				setSelectedFetchState({
-					sessionId: selectedId,
-					loading: false,
-				});
-				pushNotice("error", errorMessage(error));
-			});
-	}, [connection, pushNotice, refreshSelectedSessionState, resetSelectedCache, selectedId]);
+		selectedFetchCoordinator.restart(
+			hasUsableSelectedSessionCache(selectedCacheRef.current, selectedId),
+		);
+		void refreshSelectedSessionState(selectedId).catch(() => undefined);
+	}, [
+		connection,
+		refreshSelectedSessionState,
+		resetSelectedCache,
+		selectedFetchCoordinator,
+		selectedId,
+	]);
 
 	const handleSessionEvent = useCallback(
 		(event: EventFrame) => {
@@ -1205,6 +1302,13 @@ export function App() {
 				if (activity) {
 					replaceSelectedCache(mergeSessionActivityEvent(selectedCacheRef.current, event.session_id, event.event_id, activity));
 				}
+				replaceSelectedCache(
+					applyEventHighWater(
+						selectedCacheRef.current,
+						event.session_id,
+						event.event_id,
+					),
+				);
 			}
 			if (shouldSyncSelected) scheduleActiveBranchSync(event.session_id);
 			const activity = activityFromEvent(event);
@@ -1284,9 +1388,6 @@ export function App() {
 		if (projectsQuery.error) pushNotice("error", errorMessage(projectsQuery.error));
 	}, [projectsQuery.error, pushNotice]);
 	useEffect(() => {
-		if (sessionsQuery.error) pushNotice("error", errorMessage(sessionsQuery.error));
-	}, [sessionsQuery.error, pushNotice]);
-	useEffect(() => {
 		if (toolsQuery.error) pushNotice("error", errorMessage(toolsQuery.error));
 	}, [toolsQuery.error, pushNotice]);
 
@@ -1303,12 +1404,14 @@ export function App() {
 		if (!selectedId) return;
 		if (sessionItems.some((session) => session.session_id === selectedId)) return;
 		if (selectedFetchState.sessionId === selectedId && selectedFetchState.loading) return;
+		if (selectedFetchState.sessionId === selectedId && selectedFetchState.error) return;
 		if (loadedSnapshot?.session_id === selectedId) return;
 		selectSession(null);
 	}, [
 		loadedSnapshot?.session_id,
 		selectSession,
 		selectedFetchState.loading,
+		selectedFetchState.error,
 		selectedFetchState.sessionId,
 		selectedId,
 		sessionItems,
@@ -1585,6 +1688,7 @@ export function App() {
 			pushNotice("success", `deleted “${truncate(title, 80)}”`);
 		} catch (error) {
 			setDeleteDialog((current) => (current?.session.session_id === sessionId ? { ...current, deleting: false } : current));
+			if (isSelectedSessionFetchError(error)) return;
 			throw error;
 		}
 	}, [api, closeDeleteDialog, deleteDialog, dropSelectedCache, invalidateSessionList, pushNotice, refreshSelected, removeSessionFromKnownSessionLists, selectSession]);
@@ -1667,23 +1771,18 @@ export function App() {
 					if (result.active_branch.last_event_id !== undefined) {
 						lastEventIds.current.set(sessionId, result.active_branch.last_event_id);
 					}
-				} else {
-					try {
-						await syncActiveBranchNow(sessionId);
-					} catch (error) {
-						pushNotice("error", errorMessage(error));
-					}
 				}
 			}
-			void refreshTranscriptTurns(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
+			if (selectedRef.current === sessionId) {
+				await refreshSelectedSessionState(sessionId);
+			}
 		},
 		[
 			api,
 			commitSelectedSnapshot,
 			invalidateSessionList,
 			patchSelectedSnapshot,
-			pushNotice,
-			refreshTranscriptTurns,
+			refreshSelectedSessionState,
 			updateSelectedCache,
 		],
 	);
@@ -1751,7 +1850,7 @@ export function App() {
 			}
 			if (restoreText !== null) composerHandleRef.current?.setValue(restoreText);
 			updateSelectedCache((current) => applySwitchResultToCache(current.sessionId === sessionId ? current : selectedCacheRef.current, result));
-			await refreshTranscriptTurns(sessionId);
+			await refreshSelectedSessionState(sessionId);
 			if (result.last_event_id !== undefined) lastEventIds.current.set(sessionId, result.last_event_id);
 			invalidateSessionList();
 			pushNotice("success", restoreText !== null ? "message restored for editing" : "switched to selected history point");
@@ -1762,7 +1861,7 @@ export function App() {
 			invalidateSessionList,
 			loadedSnapshot,
 			pushNotice,
-			refreshTranscriptTurns,
+			refreshSelectedSessionState,
 			requireSelected,
 			updateSelectedCache,
 		],
@@ -1774,7 +1873,9 @@ export function App() {
 			setHistoryDialog(null);
 			if (sessionId) setHistorySwitchingSessionId(sessionId);
 			void switchToTarget(target)
-				.catch((error) => pushNotice("error", errorMessage(error)))
+				.catch((error) => {
+					if (!isSelectedSessionFetchError(error)) pushNotice("error", errorMessage(error));
+				})
 				.finally(() => {
 					if (sessionId) {
 						setHistorySwitchingSessionId((current) => (current === sessionId ? null : current));
@@ -1858,7 +1959,7 @@ export function App() {
 					}),
 			});
 		} catch (error) {
-			pushNotice("error", errorMessage(error));
+			if (!isSelectedSessionFetchError(error)) pushNotice("error", errorMessage(error));
 		} finally {
 			setStopping(false);
 		}
@@ -2085,7 +2186,9 @@ export function App() {
 					queueFollowUp: queueUserInput,
 					steerSubagent: (params) => api.steerSubagent(params),
 					startNewSession,
-					reportError: (error) => pushNotice("error", errorMessage(error)),
+					reportError: (error) => {
+						if (shouldReportActionError(error)) pushNotice("error", errorMessage(error));
+					},
 				});
 			} finally {
 				setSending(false);
@@ -2242,7 +2345,9 @@ export function App() {
 	}, []);
 	const handleResumeTurn = useCallback(
 		(entryId: string) => {
-			void resumeTerminalTurn(entryId).catch((error) => pushNotice("error", errorMessage(error)));
+			void resumeTerminalTurn(entryId).catch((error) => {
+				if (!isSelectedSessionFetchError(error)) pushNotice("error", errorMessage(error));
+			});
 		},
 		[pushNotice, resumeTerminalTurn],
 	);
@@ -2363,8 +2468,11 @@ export function App() {
 				filteredSessions={filteredSessions}
 				selectedId={selectedId}
 				sessionsLoading={sessionsQuery.isLoading}
-				sessionsFetching={sessionsQuery.isFetching}
+				sessionsFetching={sessionListRequestState.busy}
+				sessionsError={sessionListRequestState.error}
+				sessionsHasCachedData={sessionsQuery.data !== undefined}
 				inert={sidebarInert}
+				onRetrySessions={retrySessions}
 				onQueryChange={setQuery}
 				onToggleArchived={handleToggleArchived}
 				onNew={handleSidebarNew}
@@ -2403,6 +2511,9 @@ export function App() {
 				entries={loadedEntries}
 				turnCards={turnCardViews}
 				transcriptLoading={transcriptLoading}
+				transcriptError={selectedError}
+				transcriptErrorHasUsableCache={selectedErrorHasUsableCache}
+				transcriptRetrying={selectedRetrying}
 				hasRunningDelegations={hasRunningDelegations}
 				modelOptions={MODEL_OPTIONS}
 				modelValue={providerModelKey(activeProvider)}
@@ -2425,6 +2536,7 @@ export function App() {
 				hasOlderTurns={selectedCache.sessionId === selectedId && selectedCache.turnHasMoreBefore}
 				loadingOlderTurns={loadingOlderTurns}
 				onLoadOlderTurns={loadOlderTranscriptTurns}
+				onRetryTranscript={retrySelected}
 			/>
 
 			<footer className="chat-dock" data-slot="chat-box">

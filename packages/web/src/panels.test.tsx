@@ -293,6 +293,70 @@ describe("Sidebar session list loading states", () => {
 		expect(html).toContain(`aria-busy="true"`);
 
 	});
+
+	it("shows a no-data error with Retry and not the valid empty-list copy", () => {
+		const html = renderSidebar({
+			sessionsError: "request failed",
+			onRetrySessions: () => {},
+		});
+
+		expect(html).toContain(`role="alert"`);
+		expect(html).toContain("Couldn’t load sessions");
+		expect(html).toContain("request failed");
+		expect(html).toContain(">Retry</button>");
+		expect(html).not.toContain("No sessions");
+	});
+
+	it("keeps cached rows visible when their refresh fails", () => {
+		const cachedSession: SessionSummary = {
+			session_id: "cached-session",
+			project_id: null,
+			outer_cwd: "/workspace",
+			workspaces: [],
+			activity: "idle",
+			active_leaf_id: null,
+			provider: { kind: "openai", model: "gpt-test" },
+			metadata: { title: "Cached session" },
+			created_at: "2024-01-01T00:00:00Z",
+			updated_at: "2024-01-01T00:00:00Z",
+		};
+		const html = renderSidebar({
+			filteredSessions: [cachedSession],
+			sessionsHasCachedData: true,
+			sessionsError: "refresh failed",
+			onRetrySessions: () => {},
+		});
+
+		expect(html).toContain("Cached session");
+		expect(html).toContain("Session refresh failed");
+		expect(html).toContain("refresh failed");
+	});
+
+	it("uses unfiltered cache presence for refresh wording when filters hide every row", () => {
+		const html = renderSidebar({
+			filteredSessions: [],
+			sessionsHasCachedData: true,
+			sessionsError: "refresh failed",
+			onRetrySessions: () => {},
+		});
+
+		expect(html).toContain("Session refresh failed");
+		expect(html).not.toContain("Couldn’t load sessions");
+		expect(html).not.toContain("No sessions");
+	});
+
+	it("disables the list Retry and reports refreshing copy while fetching", () => {
+		const html = renderSidebar({
+			sessionsError: "request failed",
+			sessionsFetching: true,
+			onRetrySessions: () => {},
+		});
+
+		expect(html).toContain(`disabled=""`);
+		expect(html).toContain(`aria-busy="true"`);
+		expect(html).toContain("Retrying…");
+		expect(html).not.toContain(">Retry</button>");
+	});
 });
 
 describe("Inspector run board status icons", () => {

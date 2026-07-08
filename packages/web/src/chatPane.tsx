@@ -12,6 +12,9 @@ export interface ChatPaneProps {
 	entries: TranscriptEntry[];
 	turnCards?: TurnCardView[] | null;
 	transcriptLoading: boolean;
+	transcriptError: string | null;
+	transcriptErrorHasUsableCache: boolean;
+	transcriptRetrying: boolean;
 	hasRunningDelegations: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
@@ -34,6 +37,7 @@ export interface ChatPaneProps {
 	hasOlderTurns?: boolean;
 	loadingOlderTurns?: boolean;
 	onLoadOlderTurns?: () => void;
+	onRetryTranscript: () => void;
 }
 
 export const ChatPane = memo(function ChatPane({
@@ -42,6 +46,9 @@ export const ChatPane = memo(function ChatPane({
 	entries,
 	turnCards,
 	transcriptLoading,
+	transcriptError,
+	transcriptErrorHasUsableCache,
+	transcriptRetrying,
 	hasRunningDelegations,
 	modelOptions,
 	modelValue,
@@ -63,7 +70,8 @@ export const ChatPane = memo(function ChatPane({
 	loadingTurnId,
 	hasOlderTurns,
 	loadingOlderTurns,
-	onLoadOlderTurns
+	onLoadOlderTurns,
+	onRetryTranscript
 }: ChatPaneProps) {
 	const loadedLeafId = activeLeafIdFromEntries(entries);
 	const visibleActiveLeafId = loadedLeafId ?? snapshot?.active_leaf_id ?? null;
@@ -96,6 +104,10 @@ export const ChatPane = memo(function ChatPane({
 				sessionId={selectedId}
 				entriesSessionId={snapshot?.session_id ?? null}
 				loadingSession={transcriptLoading}
+				sessionError={transcriptError}
+				sessionErrorHasUsableCache={transcriptErrorHasUsableCache}
+				retryingSession={transcriptRetrying}
+				onRetrySession={onRetryTranscript}
 				onNewSession={onNewSession}
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}
