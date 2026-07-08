@@ -14,7 +14,7 @@
 	--foreground: #3c3836; /* fg1 */
 	--card: #f9f5d7; /* light0_hard — slightly lifted surface */
 	--muted: #ebdbb2; /* light1 / bg1 */
-	--muted-foreground: #7c6f64; /* light4 */
+	--muted-foreground: #665c54; /* dark3 — AA text on light surfaces */
 	--border: #d5c4a1; /* light2 / bg2 */
 	--border-strong: #bdae93; /* light3 / bg3 */
 	--primary: #af3a03; /* orange (dark variant for light bg) */
@@ -22,8 +22,8 @@
 	--accent: #ebdbb2; /* light1 / bg1 */
 	--accent-foreground: #3c3836;
 	--destructive: #9d0006; /* red (dark) */
-	--success: #79740e; /* green (dark) */
-	--warning: #b57614; /* yellow (dark) */
+	--success: #5f5a00; /* deep olive — AA text on light surfaces */
+	--warning: #8f4f00; /* warm amber — AA text on light surfaces */
 	--sidebar: #f2e5bc; /* light0_soft */
 	--sidebar-accent: #ebdbb2;
 	--ring: rgb(175 58 3 / 0.45);
