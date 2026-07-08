@@ -32,8 +32,9 @@ export function buildExportBlocks(entries: TranscriptEntry[]): ExportBlock[] {
 	const turns = buildTurnViews(entries);
 
 	for (const turn of turns) {
-		const priorUserEntryIds = turn.userInputs.map((input) => input.id);
-		for (const input of turn.userInputs) {
+		const visibleUserInputs = turn.userInputs.filter((input) => !input.item.replayed_after_compaction);
+		const priorUserEntryIds = visibleUserInputs.map((input) => input.id);
+		for (const input of visibleUserInputs) {
 			const text = userMessageExportText(input);
 			if (text) blocks.push({ type: "user", entryId: input.id, text });
 		}

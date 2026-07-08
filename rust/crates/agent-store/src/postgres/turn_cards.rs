@@ -197,6 +197,97 @@ fn parse_turn_outcome(value: &str) -> Option<agent_vocab::TurnOutcome> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_vocab::{TranscriptItem, UserMessage};
+
+    fn card() -> MutableTurnCard {
+        MutableTurnCard {
+            turn_id: Some(agent_vocab::TurnId(1)),
+            start_entry_id: Some("start".to_string()),
+            boundary_entry_id: None,
+            active_leaf_id: "start".to_string(),
+            start_sequence: 1,
+            end_sequence: 1,
+            start_timestamp_ms: 1,
+            timestamp_ms: 1,
+            user_messages: Vec::new(),
+            daemon_observations: Vec::new(),
+            assistant_message: None,
+            summary: None,
+            status: TurnCardStatus::Open,
+            outcome: None,
+        }
+    }
+
+    fn user_row(id: &str, sequence: i64, message: UserMessage) -> TurnCardRow {
+        TurnCardRow {
+            id: id.to_string(),
+            parent_id: None,
+            compaction_source_leaf_id: None,
+            timestamp_ms: sequence as u64,
+            sequence,
+            entry: Some(TranscriptEntryRecord {
+                id: id.to_string(),
+                parent_id: None,
+                timestamp_ms: sequence as u64,
+                sequence,
+                item: TranscriptItem::UserMessage(message),
+                provider_replay: Vec::new(),
+            }),
+            item_type: "user_message".to_string(),
+            turn_id: None,
+            compaction_turn_started_at_ms: None,
+            outcome: None,
+        }
+    }
+
+    #[test]
+    fn compaction_replayed_users_advance_card_without_adding_visible_messages() {
+        let mut card = card();
+        let original = UserMessage::text("same instruction");
+        append_entry_to_turn_card(&mut card, &user_row("original", 2, original.clone()));
+
+        let mut replay = original;
+        replay.replayed_after_compaction = true;
+        append_entry_to_turn_card(&mut card, &user_row("replay", 3, replay.clone()));
+        append_entry_to_turn_card(&mut card, &user_row("replay-again", 4, replay));
+
+        assert_eq!(
+            card.user_messages
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["original"]
+        );
+        assert_eq!(card.active_leaf_id, "replay-again");
+        assert_eq!(card.end_sequence, 4);
+        assert_eq!(card.timestamp_ms, 4);
+    }
+
+    #[test]
+    fn genuine_identical_user_messages_remain_visible() {
+        let mut card = card();
+        append_entry_to_turn_card(
+            &mut card,
+            &user_row("first", 2, UserMessage::text("identical")),
+        );
+        append_entry_to_turn_card(
+            &mut card,
+            &user_row("second", 3, UserMessage::text("identical")),
+        );
+
+        assert_eq!(
+            card.user_messages
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+}
+
 #[derive(Debug)]
 struct TurnCardRow {
     id: String,
@@ -332,7 +423,13 @@ fn append_entry_to_turn_card(card: &mut MutableTurnCard, row: &TurnCardRow) {
     match row.item_type.as_str() {
         "user_message" => {
             if let Some(entry) = row.entry_record() {
-                card.user_messages.push(entry);
+                if matches!(
+                    &entry.item,
+                    agent_vocab::TranscriptItem::UserMessage(message)
+                        if !message.replayed_after_compaction
+                ) {
+                    card.user_messages.push(entry);
+                }
             }
         }
         "assistant_message" => {

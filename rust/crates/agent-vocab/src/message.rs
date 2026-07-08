@@ -8,17 +8,27 @@ use crate::ids::ToolCallId;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMessage {
     pub content: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub replayed_after_compaction: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl UserMessage {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![ContentBlock::text(text)],
+            replayed_after_compaction: false,
         }
     }
 
     pub fn from_parts(content: Vec<ContentBlock>) -> Self {
-        Self { content }
+        Self {
+            content,
+            replayed_after_compaction: false,
+        }
     }
 
     pub fn as_text(&self) -> Option<&str> {
@@ -296,6 +306,29 @@ impl ToolResultMessage {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn user_message_compaction_replay_marker_is_backward_compatible() {
+        let ordinary: UserMessage = serde_json::from_value(json!({
+            "content": [{ "type": "text", "text": "hello" }]
+        }))
+        .expect("old user message deserializes");
+        assert!(!ordinary.replayed_after_compaction);
+        assert_eq!(
+            serde_json::to_value(&ordinary).expect("ordinary user message serializes"),
+            json!({ "content": [{ "type": "text", "text": "hello" }] })
+        );
+
+        let mut replayed = ordinary;
+        replayed.replayed_after_compaction = true;
+        assert_eq!(
+            serde_json::to_value(&replayed).expect("replayed user message serializes"),
+            json!({
+                "content": [{ "type": "text", "text": "hello" }],
+                "replayed_after_compaction": true
+            })
+        );
+    }
 
     #[test]
     fn assistant_item_serializes_as_tagged_objects() {

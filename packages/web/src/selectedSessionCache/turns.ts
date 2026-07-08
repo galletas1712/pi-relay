@@ -311,7 +311,7 @@ function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
 			start_entry_id: next.start_entry_id ?? entry.id,
 			start_sequence: next.start_entry_id ? next.start_sequence : entry.sequence ?? next.start_sequence,
 		};
-	} else if (item.type === "user_message") {
+	} else if (item.type === "user_message" && !item.replayed_after_compaction) {
 		next = {
 			...next,
 			user_messages: appendUniqueEntry(next.user_messages, entry),

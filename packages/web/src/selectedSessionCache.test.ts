@@ -281,6 +281,45 @@ describe("selected session cache", () => {
 		expect(cache.turnDetailsById.has("entry_start")).toBe(false);
 	});
 
+	it("omits compaction-replayed users from live turn cards while advancing metadata", () => {
+		const started = turnStartedEntry("entry_start", null, 1, 1);
+		const original = entry("entry_user", "entry_start", "same instruction", 2);
+		const replayed = {
+			...entry("entry_replayed", "entry_user", "same instruction", 3),
+			item: {
+				type: "user_message" as const,
+				content: [{ type: "text" as const, text: "same instruction" }],
+				replayed_after_compaction: true,
+			},
+		};
+		const genuineSteer = entry("entry_steer", "entry_replayed", "same instruction", 4);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([started], { transcriptRevision: 1 }));
+		cache = {
+			...cache,
+			turnOrder: ["entry_start"],
+			turnCardsById: new Map([["entry_start", turnCard("entry_start", 1)]]),
+			turnTranscriptRevision: 1,
+			turnActiveLeafId: "entry_start",
+		};
+
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(original, 5, 2)).cache;
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(replayed, 6, 3)).cache;
+
+		const afterReplay = cache.turnCardsById.get("entry_start");
+		expect(afterReplay?.user_messages.map((message) => message.id)).toEqual(["entry_user"]);
+		expect(afterReplay).toMatchObject({
+			active_leaf_id: "entry_replayed",
+			end_sequence: 3,
+			timestamp_ms: replayed.timestamp_ms,
+		});
+
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(genuineSteer, 7, 4)).cache;
+		expect(cache.turnCardsById.get("entry_start")?.user_messages.map((message) => message.id)).toEqual([
+			"entry_user",
+			"entry_steer",
+		]);
+	});
+
 	it("keeps completed turn detail attached when a new turn card is appended", () => {
 		const started = turnStartedEntry("entry_start_2", "entry_finish_1", 2, 6);
 		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([entry("entry_finish_1", null, "done", 5)], { transcriptRevision: 1 }));

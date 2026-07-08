@@ -173,9 +173,7 @@ mod tests {
                 &[],
                 &[],
                 crate::InputPriority::FollowUp,
-                &agent_vocab::UserMessage {
-                    content: Vec::new(),
-                },
+                &agent_vocab::UserMessage::from_parts(Vec::new()),
                 None,
             )
             .await
@@ -189,9 +187,7 @@ mod tests {
                 &[],
                 &[],
                 crate::InputPriority::FollowUp,
-                &agent_vocab::UserMessage {
-                    content: Vec::new(),
-                },
+                &agent_vocab::UserMessage::from_parts(Vec::new()),
                 None,
             )
             .await
@@ -258,9 +254,7 @@ mod tests {
                 &[],
                 &[],
                 crate::InputPriority::FollowUp,
-                &agent_vocab::UserMessage {
-                    content: Vec::new(),
-                },
+                &agent_vocab::UserMessage::from_parts(Vec::new()),
                 None,
             )
             .await
@@ -274,9 +268,7 @@ mod tests {
                 &[],
                 &[],
                 crate::InputPriority::FollowUp,
-                &agent_vocab::UserMessage {
-                    content: Vec::new(),
-                },
+                &agent_vocab::UserMessage::from_parts(Vec::new()),
                 None,
             )
             .await

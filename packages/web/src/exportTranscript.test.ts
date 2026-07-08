@@ -38,6 +38,31 @@ describe("export transcript", () => {
 
 		expect([...selected]).toEqual(["assistant-final"]);
 	});
+
+	it("omits compaction replay rows while preserving genuine identical user inputs", () => {
+		const entries = [
+			entry("start", { type: "turn_started", turn_id: 3 }),
+			entry("original", user("same request")),
+			entry("replayed", {
+				type: "user_message",
+				content: [{ type: "text", text: "same request" }],
+				replayed_after_compaction: true,
+			}),
+			entry("genuine", user("same request")),
+			entry("assistant-final", { type: "assistant_message", items: [text("Done.")] }),
+			entry("finish", { type: "turn_finished", turn_id: 3, outcome: "Graceful" }),
+		];
+
+		const blocks = buildExportBlocks(entries);
+
+		expect(blocks.filter((block) => block.type === "user").map((block) => block.entryId)).toEqual([
+			"original",
+			"genuine",
+		]);
+		expect(blocks.find((block) => block.type === "assistant")).toMatchObject({
+			priorUserEntryIds: ["original", "genuine"],
+		});
+	});
 });
 
 function user(text: string): TranscriptItem {
