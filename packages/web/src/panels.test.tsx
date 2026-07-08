@@ -1,8 +1,17 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import type { ComponentProps } from "react";
-import { describe, expect, it } from "vitest";
-import { Inspector, LogHeader, RunBoardDelegationList, Sidebar, SessionRow, type RunBoardCallbacks } from "./panels.tsx";
-import type { SessionSnapshot, SessionSummary, Delegation, ToolListing } from "./types.ts";
+import { describe, expect, it, vi } from "vitest";
+import {
+	Inspector,
+	LogHeader,
+	projectMenuItems,
+	RunBoardDelegationList,
+	sessionMenuItems,
+	Sidebar,
+	SessionRow,
+	type RunBoardCallbacks,
+} from "./panels.tsx";
+import type { SessionSnapshot, SessionSummary, Delegation, Project, ToolListing } from "./types.ts";
 
 function delegation(overrides: Partial<Delegation> = {}): Delegation {
 	return {
@@ -357,6 +366,171 @@ describe("Sidebar session list loading states", () => {
 		expect(html).toContain("Retrying…");
 		expect(html).not.toContain(">Retry</button>");
 	});
+
+	it("renders project and session navigation as semantic lists with sibling selection and menu buttons", () => {
+		const project: Project = {
+			project_id: "project-1",
+			name: "Menu project",
+			workspaces: [],
+			metadata: {},
+			created_at: "2024-01-01T00:00:00Z",
+			updated_at: "2024-01-01T00:00:00Z",
+		};
+		const session: SessionSummary = {
+			session_id: "session-1",
+			project_id: project.project_id,
+			outer_cwd: "/workspace",
+			workspaces: [],
+			activity: "idle",
+			active_leaf_id: "leaf-123",
+			provider: { kind: "openai", model: "gpt-test" },
+			metadata: { title: "Menu session" },
+			created_at: "2024-01-01T00:00:00Z",
+			updated_at: "2024-01-01T00:00:00Z",
+		};
+
+		const html = renderSidebar({
+			projects: [project],
+			selectedProjectId: project.project_id,
+			filteredSessions: [session],
+			selectedId: session.session_id,
+		});
+
+		expect(html).toContain('<nav aria-label="Projects">');
+		expect(html).toContain('<ul class="project-list">');
+		expect(html).toContain('<li class="project-row selected">');
+		expect(html).toContain('<nav class="session-list" aria-label="Sessions"');
+		expect(html).toContain('<ul class="session-list-items">');
+		expect(html).toContain('<li class="session-row selected ');
+		expect(html).toContain('class="project-row-primary"');
+		expect(html).toContain('class="session-row-primary"');
+		expect(html.match(/aria-current="page"/g)).toHaveLength(2);
+		expect(html).toContain('aria-label="Open project actions for Menu project"');
+		expect(html).toContain('aria-label="Open session actions for Menu session"');
+		expect(html.match(/aria-haspopup="menu"/g)).toHaveLength(2);
+		expect(html).toMatch(
+			/<li class="project-row selected"><button class="project-row-primary"[\s\S]*?<\/button><button class="action-menu-trigger"/,
+		);
+		expect(html).toMatch(
+			/<li class="session-row selected [^"]*"><button class="session-row-primary"[\s\S]*?<\/button><button class="action-menu-trigger"/,
+		);
+		expect(html).not.toContain('role="listbox"');
+		expect(html).not.toContain('role="button"');
+		expect(html).toContain('aria-label="idle session"');
+		expect(html).toContain("gpt-test");
+		expect(html).toContain("leaf-1");
+	});
+});
+
+describe("sidebar action menu policies", () => {
+	it("maps project settings to the captured project without selecting the row", () => {
+		const project: Project = {
+			project_id: "project-1",
+			name: "Menu project",
+			workspaces: [],
+			metadata: {},
+			created_at: "2024-01-01T00:00:00Z",
+			updated_at: "2024-01-01T00:00:00Z",
+		};
+		const onEditProject = vi.fn();
+		const items = projectMenuItems(project, onEditProject);
+
+		expect(items.map(({ id, label }) => ({ id, label }))).toEqual([
+			{ id: "settings", label: "Project settings…" },
+		]);
+		expect(items[0]).toMatchObject({ focusDestination: "dialog" });
+		items[0].onSelect();
+		expect(onEditProject).toHaveBeenCalledTimes(1);
+		expect(onEditProject).toHaveBeenCalledWith(project);
+	});
+
+	it("maps idle session actions, separating and styling destructive Delete", () => {
+		const onRename = vi.fn();
+		const onArchiveToggle = vi.fn();
+		const onDelete = vi.fn();
+		const items = sessionMenuItems({
+			archived: false,
+			canArchive: true,
+			canDelete: true,
+			onRename,
+			onArchiveToggle,
+			onDelete,
+		});
+
+		expect(items.map(({ id, label }) => ({ id, label }))).toEqual([
+			{ id: "rename", label: "Rename…" },
+			{ id: "archive", label: "Archive" },
+			{ id: "delete", label: "Delete…" },
+		]);
+		expect(items[0]).toMatchObject({ focusDestination: "dialog" });
+		expect(items[0].disabled).toBeUndefined();
+		expect(items[1]).toMatchObject({ disabled: false });
+		expect(items[1].destructive).toBeUndefined();
+		expect(items[2]).toMatchObject({
+			disabled: false,
+			destructive: true,
+			separatorBefore: true,
+			focusDestination: "dialog",
+		});
+
+		items[0].onSelect();
+		expect(onRename).toHaveBeenCalledTimes(1);
+		expect(onArchiveToggle).not.toHaveBeenCalled();
+		expect(onDelete).not.toHaveBeenCalled();
+
+		items[1].onSelect();
+		expect(onArchiveToggle).toHaveBeenCalledTimes(1);
+		expect(onDelete).not.toHaveBeenCalled();
+
+		items[2].onSelect();
+		expect(onDelete).toHaveBeenCalledTimes(1);
+	});
+
+	it("uses Unarchive for archived sessions without adding a confirmation policy", () => {
+		const onArchiveToggle = vi.fn();
+		const items = sessionMenuItems({
+			archived: true,
+			canArchive: true,
+			canDelete: true,
+			onRename: vi.fn(),
+			onArchiveToggle,
+			onDelete: vi.fn(),
+		});
+
+		expect(items[1]).toMatchObject({
+			id: "unarchive",
+			label: "Unarchive",
+			disabled: false,
+		});
+		expect(items[1].focusDestination).toBeUndefined();
+		items[1].onSelect();
+		expect(onArchiveToggle).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps Rename available and exposes visible reasons for running-session restrictions", () => {
+		const items = sessionMenuItems({
+			archived: false,
+			canArchive: false,
+			canDelete: false,
+			onRename: vi.fn(),
+			onArchiveToggle: vi.fn(),
+			onDelete: vi.fn(),
+		});
+
+		expect(items[0].disabled).toBeUndefined();
+		expect(items[1]).toMatchObject({
+			label: "Archive",
+			disabled: true,
+			disabledReason: "Available when the session and its subagents are idle.",
+		});
+		expect(items[2]).toMatchObject({
+			label: "Delete…",
+			disabled: true,
+			disabledReason: "Available when the session and its subagents are idle.",
+			destructive: true,
+			separatorBefore: true,
+		});
+	});
 });
 
 describe("Inspector run board status icons", () => {
@@ -583,19 +757,18 @@ describe("SessionRow sidebar delegating state", () => {
 		// Third state: idle parent parked behind a running delegation.
 		expect(html).toContain("status-rail delegating");
 		expect(html).not.toContain("status-rail idle");
-		// Archive and delete are gated off while subagents run.
-		expect(html).toContain('aria-disabled="true"');
-		expect(html).toContain("only idle sessions with no running subagents can be archived");
-		expect(html).toContain("only idle sessions with no running subagents can be deleted");
+		expect(html).toContain('aria-label="delegating session"');
+		// Closed Radix portals do not SSR their item content. The session menu
+		// policy tests above cover disabled archive/delete and their visible reason.
+		expect(html).toContain('aria-label="Open session actions for parent-1"');
 	});
 
 	it("keeps the idle rail and enables archive/delete when no delegations run", () => {
 		const html = renderRow(summary({ activity: "idle", has_running_delegations: false }));
 		expect(html).toContain("status-rail idle");
 		expect(html).not.toContain("status-rail delegating");
-		expect(html).toContain("archive session");
-		expect(html).toContain("delete session");
-		expect(html).not.toContain("no running subagents");
+		expect(html).toContain('aria-label="idle session"');
+		expect(html).toContain('aria-label="Open session actions for parent-1"');
 	});
 
 	it("shows the running rail when the parent itself is active", () => {
