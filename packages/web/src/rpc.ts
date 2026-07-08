@@ -102,6 +102,9 @@ export class AgentRpcClient implements RpcClient {
 	}
 
 	reconnect(): Promise<void> {
+		// Join an automatic or user-initiated connection attempt instead of
+		// replacing its socket and creating a competing reconnect loop.
+		if (this.openPromise) return this.openPromise;
 		this.closedByUser = false;
 		if (this.reconnectTimer !== null) {
 			globalThis.clearTimeout(this.reconnectTimer);

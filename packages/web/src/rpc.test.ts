@@ -138,4 +138,18 @@ describe("AgentRpcClient reconnect hardening", () => {
 		expect(client.isOpen()).toBe(true);
 		client.close();
 	});
+
+	it("joins an in-progress canonical connection instead of opening a duplicate retry socket", async () => {
+		const client = new AgentRpcClient("ws://agent.test/ws");
+		const connect = client.connect();
+		const retry = client.reconnect();
+
+		expect(retry).toBe(connect);
+		expect(FakeWebSocket.instances).toHaveLength(1);
+
+		FakeWebSocket.instances[0].open();
+		await Promise.all([connect, retry]);
+		expect(client.isOpen()).toBe(true);
+		client.close();
+	});
 });

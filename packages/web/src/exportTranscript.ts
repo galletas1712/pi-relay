@@ -5,6 +5,13 @@ import {
 	modelStepPhaseLabel,
 	userMessageExportText
 } from "./turnView.ts";
+import {
+	activeBranchEntriesForExport,
+	hasUsableSelectedSessionCache,
+	turnCardsInOrder,
+	turnDetailEntries,
+	type SelectedSessionCache,
+} from "./selectedSessionCache.ts";
 import type { ModelStepPhase } from "./turnView.ts";
 import type { TranscriptEntry } from "./types.ts";
 
@@ -52,6 +59,56 @@ export function buildExportBlocks(entries: TranscriptEntry[]): ExportBlock[] {
 	}
 
 	return blocks;
+}
+
+export function buildCachedExportBlocks(cache: SelectedSessionCache): ExportBlock[] {
+	const entries = activeBranchEntriesForExport(cache);
+	if (!hasUsableSelectedSessionCache(cache)) return buildExportBlocks(entries);
+
+	const selectedIds = new Set(entries.map((entry) => entry.id));
+	const blocks: ExportBlock[] = [];
+	const representedIds = new Set<string>();
+	const add = (block: ExportBlock) => {
+		if (!selectedIds.has(block.entryId) || representedIds.has(block.entryId)) return;
+		representedIds.add(block.entryId);
+		blocks.push(block);
+	};
+
+	for (const card of turnCardsInOrder(cache)) {
+		const detail = turnDetailEntries(cache, card.id);
+		if (detail) {
+			for (const block of buildExportBlocks(detail)) add(block);
+			continue;
+		}
+		const summaryBlocks = buildExportBlocks([
+			...card.user_messages,
+			...(card.assistant_message ? [card.assistant_message] : []),
+		]);
+		for (const block of summaryBlocks) {
+			add(block.type === "assistant"
+				? {
+						...block,
+						phase: card.status === "open"
+							? "running"
+							: card.outcome === "Graceful"
+								? "final_answer"
+								: card.outcome === "Interrupted" || card.outcome === "Crashed"
+									? "aborted"
+									: "unknown",
+						turnLabel: card.turn_id ? `turn ${card.turn_id}` : "session",
+					}
+				: block);
+		}
+	}
+
+	const remainingEntries = entries.filter((entry) => !representedIds.has(entry.id));
+	for (const block of buildExportBlocks(remainingEntries)) add(block);
+	const orderById = new Map(entries.map((entry, index) => [entry.id, index]));
+	return blocks.sort(
+		(left, right) =>
+			(orderById.get(left.entryId) ?? Number.MAX_SAFE_INTEGER) -
+			(orderById.get(right.entryId) ?? Number.MAX_SAFE_INTEGER),
+	);
 }
 
 export function assistantExportBlocks(blocks: ExportBlock[]): AssistantExportBlock[] {

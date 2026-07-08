@@ -9,6 +9,7 @@ import {
 	applyTreeIndex,
 	applyTranscriptTurns,
 	applyTurnDetail,
+	activeBranchEntriesForExport,
 	branchFromTree,
 	captureSelectedSessionRefresh,
 	commitSelectedSessionRefresh,
@@ -19,6 +20,12 @@ import {
 	snapshotWithTranscriptTurnsMetadata,
 	treeNodesInOrder,
 } from "./selectedSessionCache.ts";
+import {
+	buildCachedExportBlocks,
+	buildExportBlocks,
+	defaultSelectedAssistantIds,
+	formatExportMarkdown,
+} from "./exportTranscript.ts";
 import type {
 	EventFrame,
 	ProviderConfig,
@@ -79,6 +86,76 @@ describe("selected session cache", () => {
 		expect(selectedEntries(visibleCache).map((candidate) => candidate.id)).toEqual([
 			original.id,
 			appended.id,
+		]);
+	});
+
+	it("preserves cached turn-card grouping and final-answer selection without inventing boundary entries", () => {
+		const firstUser = entry("entry_user_1", "entry_start_1", "first question", 2);
+		const firstAssistant = assistantEntry("entry_assistant_1", firstUser.id, "first answer", 3);
+		const secondUser = entry("entry_user_2", "entry_start_2", "second question", 6);
+		const secondAssistant = assistantEntry("entry_assistant_2", secondUser.id, "second answer", 7);
+		const finished = turnFinishedEntry("entry_finish_2", secondAssistant.id, 2, "Graceful", 8);
+		let cache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([finished], { activeLeafId: finished.id, transcriptRevision: 2 }),
+		);
+		cache = applyTranscriptTurns(cache, {
+			session_id: sessionId,
+			active_leaf_id: finished.id,
+			session_revision: 2,
+			transcript_revision: 2,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
+			cards: [
+				{
+					...turnCard("entry_finish_1", 1),
+					status: "completed",
+					outcome: "Graceful",
+					boundary_entry_id: "entry_finish_1",
+					active_leaf_id: "entry_finish_1",
+					start_sequence: 1,
+					end_sequence: 4,
+					user_messages: [firstUser],
+					assistant_message: firstAssistant,
+				},
+				{
+					...turnCard(finished.id, 2),
+					status: "completed",
+					outcome: "Graceful",
+					boundary_entry_id: finished.id,
+					active_leaf_id: finished.id,
+					start_sequence: 5,
+					end_sequence: 8,
+					user_messages: [secondUser],
+					assistant_message: secondAssistant,
+				},
+			],
+		});
+
+		const blocks = buildCachedExportBlocks(cache);
+		expect(blocks).toMatchObject([
+			{ type: "user", entryId: firstUser.id },
+			{
+				type: "assistant",
+				entryId: firstAssistant.id,
+				priorUserEntryIds: [firstUser.id],
+				phase: "final_answer",
+				turnLabel: "turn 1",
+			},
+			{ type: "user", entryId: secondUser.id },
+			{
+				type: "assistant",
+				entryId: secondAssistant.id,
+				priorUserEntryIds: [secondUser.id],
+				phase: "final_answer",
+				turnLabel: "turn 2",
+			},
+		]);
+		expect([...defaultSelectedAssistantIds(blocks)]).toEqual([
+			firstAssistant.id,
+			secondAssistant.id,
 		]);
 	});
 
@@ -523,6 +600,134 @@ describe("selected session cache", () => {
 		expect(card?.assistant_message).toBe(cache.entriesById.get("entry_assistant_final"));
 		expect(cache.entriesById.get("entry_user")).toBe(user);
 		expect(cache.entriesById.get("entry_assistant_final")).toBe(finalAssistant);
+	});
+
+	it("exports readable canonical turn-card bodies when the active branch only names the terminal leaf", () => {
+		const finished = turnFinishedEntry("entry_finish", "entry_assistant", 1, "Graceful", 4);
+		const user = entry("entry_user", "entry_start", "cached question", 2);
+		const assistant = assistantEntry("entry_assistant", "entry_user", "cached answer", 3);
+		let cache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([finished], { activeLeafId: finished.id, transcriptRevision: 2 }),
+		);
+
+		cache = applyTranscriptTurns(cache, {
+			session_id: sessionId,
+			active_leaf_id: finished.id,
+			session_revision: 2,
+			transcript_revision: 2,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
+			cards: [{
+				...turnCard(finished.id, 1),
+				status: "completed",
+				outcome: "Graceful",
+				start_entry_id: "entry_start",
+				boundary_entry_id: finished.id,
+				active_leaf_id: finished.id,
+				start_sequence: 1,
+				end_sequence: 4,
+				user_messages: [user],
+				assistant_message: assistant,
+			}],
+		});
+
+		expect(cache.activeBranchEntryIds).toEqual([finished.id]);
+		const exportEntries = activeBranchEntriesForExport(cache);
+		expect(exportEntries.map((candidate) => candidate.id)).toEqual([
+			user.id,
+			assistant.id,
+			finished.id,
+		]);
+		const blocks = buildExportBlocks(exportEntries);
+		expect(formatExportMarkdown(blocks, defaultSelectedAssistantIds(blocks))).toContain(
+			"## Assistant\n\ncached answer",
+		);
+	});
+
+	it("deduplicates loaded export bodies and orders them by canonical transcript sequence", () => {
+		const started = turnStartedEntry("entry_start", null, 1, 1);
+		const user = entry("entry_user", started.id, "question", 2);
+		const assistant = assistantEntry("entry_assistant", user.id, "answer", 3);
+		const finished = turnFinishedEntry("entry_finish", assistant.id, 1, "Graceful", 4);
+		let cache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([finished], { activeLeafId: finished.id, transcriptRevision: 2 }),
+		);
+		cache = applyTranscriptTurns(cache, {
+			session_id: sessionId,
+			active_leaf_id: finished.id,
+			session_revision: 2,
+			transcript_revision: 2,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
+			cards: [{
+				...turnCard(finished.id, 1),
+				status: "completed",
+				outcome: "Graceful",
+				start_entry_id: started.id,
+				boundary_entry_id: finished.id,
+				active_leaf_id: finished.id,
+				start_sequence: 1,
+				end_sequence: 4,
+				user_messages: [user],
+				assistant_message: assistant,
+			}],
+		});
+		cache = applyTurnDetail(
+			cache,
+			sessionId,
+			finished.id,
+			[started, user, assistant, finished],
+		).cache;
+
+		expect(activeBranchEntriesForExport(cache).map((candidate) => candidate.id)).toEqual([
+			started.id,
+			user.id,
+			assistant.id,
+			finished.id,
+		]);
+	});
+
+	it("returns canonical empty exports and ignores unloaded turn-card bodies", () => {
+		expect(activeBranchEntriesForExport(emptySelectedSessionCache())).toEqual([]);
+
+		const selected = entry("entry_selected", null, "loaded selected body", 1);
+		const staleAssistant = assistantEntry("entry_stale", selected.id, "stale turn body", 2);
+		let unloaded = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([selected], { transcriptRevision: 2 }),
+		);
+		unloaded = {
+			...unloaded,
+			turnOrder: [selected.id],
+			turnCardsById: new Map([[
+				selected.id,
+				{ ...turnCard(selected.id, 1), assistant_message: staleAssistant },
+			]]),
+		};
+		expect(activeBranchEntriesForExport(unloaded)).toEqual([selected]);
+
+		let empty = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([], { activeLeafId: null, transcriptRevision: 0 }),
+		);
+		empty = applyTranscriptTurns(empty, {
+			session_id: sessionId,
+			active_leaf_id: null,
+			session_revision: 1,
+			transcript_revision: 0,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
+			cards: [],
+		});
+		expect(activeBranchEntriesForExport(empty)).toEqual([]);
 	});
 
 	it("drops stale expanded turn details when canonical turn cards advance", () => {

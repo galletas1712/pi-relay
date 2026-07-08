@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { memo, useEffect, useRef, useState, type RefObject } from "react";
 import { ActionMenu, type ActionMenuItem } from "./actionMenu.tsx";
+import { ConnectionBlockedReason, firstDisabledReason } from "./connectionRecovery.tsx";
 import { COMMANDS } from "./slash.ts";
 import {
 	isArchivedSession,
@@ -88,7 +89,10 @@ interface RunBoardProps extends RunBoardCallbacks {
 	loading: boolean;
 	error: string | null;
 	showAllDelegations: boolean;
+	expandedDelegationsAvailable: boolean;
 	onToggleShowAllDelegations: () => void;
+	mutationBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 }
 
 const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
@@ -138,9 +142,11 @@ function DelegationCard({
 	onSelectSession,
 	onCancelDelegation,
 	onReRunDelegation,
+	mutationBlockedReason,
 }: {
 	delegation: Delegation;
 	canReRun: boolean;
+	mutationBlockedReason?: string | null;
 } & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onReRunDelegation">) {
 	const running = isDelegationRunning(delegation);
 	const title = delegation.label ?? delegation.workflow ?? delegation.delegation_id.slice(0, 13);
@@ -163,15 +169,16 @@ function DelegationCard({
 			</div>
 			<div className="run-board-delegation-controls">
 				{running ? (
-					<button className="chip-button" type="button" onClick={() => onCancelDelegation(delegation.delegation_id)} title="cancel this delegation">
+					<button className="chip-button" type="button" disabled={!!mutationBlockedReason} onClick={() => onCancelDelegation(delegation.delegation_id)} title="cancel this delegation">
 						<Square size={11} /> cancel
 					</button>
 				) : null}
 				{canReRun ? (
-					<button className="chip-button" type="button" onClick={() => onReRunDelegation(delegation)} title="re-run this delegation">
+					<button className="chip-button" type="button" disabled={!!mutationBlockedReason} onClick={() => onReRunDelegation(delegation)} title="re-run this delegation">
 						<RotateCcw size={11} /> re-run
 					</button>
 				) : null}
+				<ConnectionBlockedReason reason={mutationBlockedReason} className="run-board-blocked-reason" />
 			</div>
 			<div className="run-board-subagents" role="list">
 				{delegation.subagents.map((subagent) => (
@@ -194,11 +201,17 @@ export function RunBoardDelegationList({
 	onSelectSession,
 	onCancelDelegation,
 	onReRunDelegation,
+	mutationBlockedReason,
+	remoteReadBlockedReason,
+	expandedDelegationsAvailable = false,
 }: {
 	delegations: Delegation[];
 	hasMoreDelegations?: boolean;
 	showAllDelegations: boolean;
 	onToggleShowAllDelegations: () => void;
+	mutationBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
+	expandedDelegationsAvailable?: boolean;
 } & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onReRunDelegation">) {
 	// The daemon returns a bounded newest-first page for the board. Keep a local
 	// cap as a defensive fallback when tests or cached data include extra rows.
@@ -208,6 +221,13 @@ export function RunBoardDelegationList({
 			? delegations
 			: delegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT);
 	const showToggle = hasMoreDelegations || hiddenLocalCount > 0 || showAllDelegations;
+	const toggleBlockedReason =
+		!showAllDelegations &&
+		hiddenLocalCount === 0 &&
+		hasMoreDelegations &&
+		!expandedDelegationsAvailable
+			? remoteReadBlockedReason
+			: null;
 	return (
 		<div className="run-board">
 			{visibleDelegations.map((delegation) => (
@@ -218,12 +238,21 @@ export function RunBoardDelegationList({
 					onSelectSession={onSelectSession}
 					onCancelDelegation={onCancelDelegation}
 					onReRunDelegation={onReRunDelegation}
+					mutationBlockedReason={mutationBlockedReason}
 				/>
 			))}
 			{showToggle ? (
-				<button className="chip-button run-board-toggle" type="button" onClick={onToggleShowAllDelegations}>
-					{showAllDelegations ? "show fewer" : `see more${hiddenLocalCount > 0 ? ` (${hiddenLocalCount})` : ""}`}
-				</button>
+				<>
+					<button
+						className="chip-button run-board-toggle"
+						type="button"
+						disabled={!!toggleBlockedReason}
+						onClick={onToggleShowAllDelegations}
+					>
+						{showAllDelegations ? "show fewer" : `see more${hiddenLocalCount > 0 ? ` (${hiddenLocalCount})` : ""}`}
+					</button>
+					<ConnectionBlockedReason reason={toggleBlockedReason} />
+				</>
 			) : null}
 		</div>
 	);
@@ -240,6 +269,9 @@ function RunBoard({
 	onSelectSession,
 	onCancelDelegation,
 	onReRunDelegation,
+	mutationBlockedReason,
+	remoteReadBlockedReason,
+	expandedDelegationsAvailable,
 }: RunBoardProps) {
 	return (
 		<section className="inspect-section run-board-section">
@@ -255,6 +287,9 @@ function RunBoard({
 					onSelectSession={onSelectSession}
 					onCancelDelegation={onCancelDelegation}
 					onReRunDelegation={onReRunDelegation}
+					mutationBlockedReason={mutationBlockedReason}
+					remoteReadBlockedReason={remoteReadBlockedReason}
+					expandedDelegationsAvailable={expandedDelegationsAvailable}
 				/>
 			) : null}
 		</section>
@@ -297,6 +332,8 @@ export interface SidebarProps {
 	onRename: (session: SessionListItem) => void;
 	onArchiveToggle: (session: SessionListItem) => void;
 	onDelete: (session: SessionListItem) => void;
+	mutationBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 }
 
 export const Sidebar = memo(function Sidebar({
@@ -327,7 +364,9 @@ export const Sidebar = memo(function Sidebar({
 	onSelectSession,
 	onRename,
 	onArchiveToggle,
-	onDelete
+	onDelete,
+	mutationBlockedReason,
+	remoteReadBlockedReason,
 }: SidebarProps) {
 	return (
 		<aside className="sidebar" data-slot="sidebar" inert={inert}>
@@ -359,15 +398,18 @@ export const Sidebar = memo(function Sidebar({
 						<span>{sessionsError}</span>
 					</div>
 					{onRetrySessions ? (
-						<button
-							type="button"
-							className="secondary-button load-error-retry"
-							disabled={sessionsFetching}
-							aria-busy={sessionsFetching}
-							onClick={onRetrySessions}
-						>
-							{sessionsFetching ? "Retrying…" : "Retry"}
-						</button>
+						<>
+							<button
+								type="button"
+								className="secondary-button load-error-retry"
+								disabled={sessionsFetching || !!remoteReadBlockedReason}
+								aria-busy={sessionsFetching}
+								onClick={onRetrySessions}
+							>
+								{sessionsFetching ? "Retrying…" : "Retry"}
+							</button>
+							<ConnectionBlockedReason reason={remoteReadBlockedReason} />
+						</>
 					) : null}
 				</div>
 			) : null}
@@ -382,6 +424,7 @@ export const Sidebar = memo(function Sidebar({
 							onRename={() => onRename(session)}
 							onArchiveToggle={() => onArchiveToggle(session)}
 							onDelete={() => onDelete(session)}
+							mutationBlockedReason={mutationBlockedReason}
 						/>
 					))}
 					{filteredSessions.length === 0 && !sessionsError ? (
@@ -627,7 +670,8 @@ export function SessionRow({
 	onSelect,
 	onRename,
 	onArchiveToggle,
-	onDelete
+	onDelete,
+	mutationBlockedReason,
 }: {
 	session: SessionListItem;
 	selected: boolean;
@@ -635,6 +679,7 @@ export function SessionRow({
 	onRename: () => void;
 	onArchiveToggle: () => void;
 	onDelete: () => void;
+	mutationBlockedReason?: string | null;
 }) {
 	const archived = isArchivedSession(session);
 	const status = sessionStatusWithDelegations(session.activity, session.has_running_delegations ?? false);
@@ -669,7 +714,7 @@ export function SessionRow({
 			</button>
 			<ActionMenu
 				triggerLabel={`Open session actions for ${title}`}
-				items={sessionMenuItems({ archived, canArchive, canDelete, onRename, onArchiveToggle, onDelete })}
+				items={sessionMenuItems({ archived, canArchive, canDelete, onRename, onArchiveToggle, onDelete, mutationBlockedReason })}
 			/>
 		</li>
 	);
@@ -684,6 +729,7 @@ export function sessionMenuItems({
 	onRename,
 	onArchiveToggle,
 	onDelete,
+	mutationBlockedReason,
 }: {
 	archived: boolean;
 	canArchive: boolean;
@@ -691,6 +737,7 @@ export function sessionMenuItems({
 	onRename: () => void;
 	onArchiveToggle: () => void;
 	onDelete: () => void;
+	mutationBlockedReason?: string | null;
 }): ActionMenuItem[] {
 	const ArchiveIcon = archived ? ArchiveRestore : Archive;
 	return [
@@ -705,8 +752,11 @@ export function sessionMenuItems({
 			id: archived ? "unarchive" : "archive",
 			label: archived ? "Unarchive" : "Archive",
 			icon: <ArchiveIcon size={15} aria-hidden />,
-			disabled: !canArchive,
-			disabledReason: !canArchive ? IDLE_SESSION_ACTION_REASON : undefined,
+			disabled: !canArchive || !!mutationBlockedReason,
+			disabledReason: firstDisabledReason(
+				mutationBlockedReason,
+				!canArchive && IDLE_SESSION_ACTION_REASON,
+			) ?? undefined,
 			onSelect: onArchiveToggle,
 		},
 		{
@@ -732,6 +782,8 @@ export function LogHeader({
 	modelValue,
 	modelDisabled,
 	modelDisabledTitle,
+	reasoningDisabled = false,
+	controlsBlockedReason,
 	reasoningEfforts,
 	reasoningEffort,
 	onModelChange,
@@ -748,6 +800,8 @@ export function LogHeader({
 	modelValue: string;
 	modelDisabled: boolean;
 	modelDisabledTitle: string;
+	reasoningDisabled?: boolean;
+	controlsBlockedReason?: string | null;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	onModelChange: (value: string) => void;
@@ -806,6 +860,7 @@ export function LogHeader({
 					<span className="sr-only">Reasoning effort</span>
 					<select
 						value={reasoningEffort}
+						disabled={reasoningDisabled}
 						title="Reasoning effort"
 						aria-label="Reasoning effort"
 						onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
@@ -815,6 +870,7 @@ export function LogHeader({
 						))}
 					</select>
 				</label>
+				<ConnectionBlockedReason reason={controlsBlockedReason} className="header-blocked-reason" />
 			</div>
 			{rightOpen ? null : (
 				<button
@@ -851,8 +907,11 @@ export function Inspector({
 	delegationsLoading,
 	delegationsError,
 	showAllDelegations = false,
+	expandedDelegationsAvailable = false,
 	onToggleShowAllDelegations = () => {},
 	runBoard,
+	mutationBlockedReason,
+	remoteReadBlockedReason,
 	tools,
 	onSelectSession,
 	onClose
@@ -863,8 +922,11 @@ export function Inspector({
 	delegationsLoading: boolean;
 	delegationsError: string | null;
 	showAllDelegations?: boolean;
+	expandedDelegationsAvailable?: boolean;
 	onToggleShowAllDelegations?: () => void;
 	runBoard: Omit<RunBoardCallbacks, "onSelectSession">;
+	mutationBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 	tools: ToolListing[];
 	onSelectSession?: (sessionId: string) => void;
 	onClose?: () => void;
@@ -905,10 +967,13 @@ export function Inspector({
 						loading={delegationsLoading}
 						error={delegationsError}
 						showAllDelegations={showAllDelegations}
+						expandedDelegationsAvailable={expandedDelegationsAvailable}
 						onToggleShowAllDelegations={onToggleShowAllDelegations}
 						onSelectSession={onSelectSession}
 						onCancelDelegation={runBoard.onCancelDelegation}
 						onReRunDelegation={runBoard.onReRunDelegation}
+						mutationBlockedReason={mutationBlockedReason}
+						remoteReadBlockedReason={remoteReadBlockedReason}
 					/>
 				</div>
 			) : (

@@ -12,6 +12,7 @@ import {
 	DialogHeading,
 	DialogTitle,
 } from "./dialog.tsx";
+import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { sessionTitle, type SessionListItem } from "./sessionList.ts";
 import type { ProjectWorkspace } from "./types.ts";
 
@@ -148,12 +149,14 @@ export function RenameSessionDialog({
 	onChange,
 	onClose,
 	onSubmit,
+	mutationBlockedReason,
 	returnFocusFallbackRef,
 }: {
 	value: string;
 	onChange: (value: string) => void;
 	onClose: () => void;
 	onSubmit: () => void | Promise<void>;
+	mutationBlockedReason?: string | null;
 	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
 	const inputRef = useRef<HTMLInputElement>(null);
@@ -180,6 +183,7 @@ export function RenameSessionDialog({
 			<form
 				onSubmit={(event) => {
 					event.preventDefault();
+					if (mutationBlockedReason) return;
 					submit();
 				}}
 			>
@@ -198,8 +202,9 @@ export function RenameSessionDialog({
 					</label>
 				</DialogBody>
 				<DialogFooter>
+					<ConnectionBlockedReason reason={mutationBlockedReason} className="dialog-blocked-reason" />
 					<DialogClose className="secondary-button" disabled={busy}>Cancel</DialogClose>
-					<button ref={submitRef} type="submit" className="primary-button" disabled={busy}>
+					<button ref={submitRef} type="submit" className="primary-button" disabled={busy || !!mutationBlockedReason} aria-busy={busy}>
 						{busy ? "Saving…" : "Save"}
 					</button>
 				</DialogFooter>
@@ -213,12 +218,14 @@ export function DeleteSessionDialog({
 	deleting,
 	onClose,
 	onConfirm,
+	mutationBlockedReason,
 	returnFocusFallbackRef,
 }: {
 	session: SessionListItem;
 	deleting: boolean;
 	onClose: () => void;
 	onConfirm: () => void | Promise<void>;
+	mutationBlockedReason?: string | null;
 	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
 	const confirmRef = useRef<HTMLButtonElement>(null);
@@ -246,13 +253,17 @@ export function DeleteSessionDialog({
 				</DialogDescription>
 			</DialogBody>
 			<DialogFooter>
+				<ConnectionBlockedReason reason={mutationBlockedReason} className="dialog-blocked-reason" />
 				<DialogClose className="secondary-button" disabled={busy}>Cancel</DialogClose>
 				<button
 					ref={confirmRef}
 					type="button"
 					className="primary-button destructive"
-					onClick={confirm}
-					disabled={busy}
+					onClick={() => {
+						if (!mutationBlockedReason) confirm();
+					}}
+					disabled={busy || !!mutationBlockedReason}
+					aria-busy={busy}
 				>
 					{busy ? "Deleting…" : "Delete"}
 				</button>
@@ -266,12 +277,14 @@ export function ProjectDialog({
 	onChange,
 	onClose,
 	onSubmit,
+	mutationBlockedReason,
 	returnFocusFallbackRef,
 }: {
 	state: ProjectDialogState;
 	onChange: (patch: Partial<ProjectDialogState>) => void;
 	onClose: () => void;
 	onSubmit: () => void | Promise<void>;
+	mutationBlockedReason?: string | null;
 	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
 	const inputRef = useRef<HTMLInputElement>(null);
@@ -311,6 +324,7 @@ export function ProjectDialog({
 			<form
 				onSubmit={(event) => {
 					event.preventDefault();
+					if (mutationBlockedReason) return;
 					submit();
 				}}
 			>
@@ -412,8 +426,9 @@ export function ProjectDialog({
 					</div>
 				</DialogBody>
 				<DialogFooter>
+					<ConnectionBlockedReason reason={mutationBlockedReason} className="dialog-blocked-reason" />
 					<DialogClose className="secondary-button" disabled={busy}>Cancel</DialogClose>
-					<button ref={submitRef} type="submit" className="primary-button" disabled={busy}>
+					<button ref={submitRef} type="submit" className="primary-button" disabled={busy || !!mutationBlockedReason} aria-busy={busy}>
 						{busy ? "Saving…" : "Save"}
 					</button>
 				</DialogFooter>

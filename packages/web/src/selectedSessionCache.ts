@@ -1,5 +1,4 @@
 import { displayParentIdForEntry, displayParentIdForNode } from "./displayParent.ts";
-import { branchEntriesFor } from "./historyTargets.ts";
 import {
 	activeBranchIdsForSnapshot,
 	appendActiveBranchEntries,
@@ -441,8 +440,50 @@ export function fullTreeEntriesFromKnownBodies(cache: SelectedSessionCache): Tra
 }
 
 export function activeBranchEntriesForExport(cache: SelectedSessionCache): TranscriptEntry[] {
-	const known = fullTreeEntriesFromKnownBodies(cache);
-	return known.length > 0 ? branchEntriesFor(known, cache.snapshot?.active_leaf_id ?? null) : selectedEntries(cache);
+	const snapshot = cache.snapshot;
+	if (!cache.sessionId || !snapshot || snapshot.session_id !== cache.sessionId) return [];
+
+	const loaded: { entry: TranscriptEntry; order: number }[] = [];
+	const seen = new Set<string>();
+	const add = (entry: TranscriptEntry | undefined) => {
+		if (!entry || seen.has(entry.id)) return;
+		seen.add(entry.id);
+		loaded.push({ entry, order: loaded.length });
+	};
+
+	if (hasUsableSelectedSessionCache(cache)) {
+		for (const cardId of cache.turnOrder) {
+			for (const entryId of cache.turnDetailsById.get(cardId) ?? []) {
+				add(cache.entriesById.get(entryId));
+			}
+			const card = cache.turnCardsById.get(cardId);
+			if (!card) continue;
+			for (const entry of card.user_messages) add(entry);
+			add(card.assistant_message ?? undefined);
+		}
+	}
+
+	for (const entry of selectedEntries(cache)) add(entry);
+	const treeMatchesSelectedBranch =
+		cache.treeComplete &&
+		cache.treeActiveLeafId === (snapshot.active_leaf_id ?? null) &&
+		cache.treeTranscriptRevision === (snapshot.transcript_revision ?? null);
+	if (treeMatchesSelectedBranch) {
+		for (const entry of activeBranchFromTreeBodies(cache)) add(entry);
+	}
+
+	const allHaveSequence = loaded.every(({ entry }) => typeof entry.sequence === "number");
+	return loaded
+		.sort((left, right) => {
+			if (allHaveSequence && left.entry.sequence !== right.entry.sequence) {
+				return left.entry.sequence! - right.entry.sequence!;
+			}
+			if (left.entry.timestamp_ms !== right.entry.timestamp_ms) {
+				return left.entry.timestamp_ms - right.entry.timestamp_ms;
+			}
+			return left.order - right.order;
+		})
+		.map(({ entry }) => entry);
 }
 
 function buildTreeChildren(order: string[], byId: Map<string, TranscriptTreeNode>): Map<string | null, string[]> {

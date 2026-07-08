@@ -14,12 +14,14 @@ import {
 	downloadMarkdown,
 	exportPreview,
 	exportTitle,
-	formatExportMarkdown
+	formatExportMarkdown,
+	type ExportBlock,
 } from "./exportTranscript.ts";
 import type { TranscriptEntry } from "./types.ts";
 
 export function ExportDialog({
 	entries,
+	blocks: providedBlocks,
 	onClose,
 	onCopied,
 	onDownloaded,
@@ -27,6 +29,7 @@ export function ExportDialog({
 	returnFocusFallbackRef,
 }: {
 	entries: TranscriptEntry[];
+	blocks?: ExportBlock[];
 	onClose: () => void;
 	onCopied: () => void;
 	onDownloaded: () => void;
@@ -35,7 +38,10 @@ export function ExportDialog({
 }) {
 	const titleRef = useRef<HTMLHeadingElement>(null);
 	const copyRunningRef = useRef(false);
-	const blocks = useMemo(() => buildExportBlocks(entries), [entries]);
+	const blocks = useMemo(
+		() => providedBlocks ?? buildExportBlocks(entries),
+		[entries, providedBlocks],
+	);
 	const assistants = useMemo(() => assistantExportBlocks(blocks), [blocks]);
 	const [selectedIds, setSelectedIds] = useState<Set<string>>(() => defaultSelectedAssistantIds(blocks));
 	const [copying, setCopying] = useState(false);

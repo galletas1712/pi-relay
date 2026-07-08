@@ -1,0 +1,806 @@
+// @vitest-environment jsdom
+
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import type { AgentApi } from "./agentApi.ts";
+import type { ConnectionStatus } from "./rpc.ts";
+import type {
+	EventFrame,
+	SessionSnapshot,
+	SessionSummary,
+	TranscriptEntry,
+	TranscriptTreeNode,
+	TranscriptTurnsResult,
+} from "./types.ts";
+import { UI_RESUME_STORAGE_KEY } from "./uiResume.ts";
+
+const mockedApi = vi.hoisted(() => ({ current: null as AgentApi | null }));
+
+vi.mock("./agentApi.ts", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./agentApi.ts")>();
+	return {
+		...actual,
+		createAgentApi: () => {
+			if (!mockedApi.current) throw new Error("App test API was not installed");
+			return mockedApi.current;
+		},
+	};
+});
+
+import { App } from "./App.tsx";
+
+beforeAll(() => {
+	class ResizeObserver {
+		observe() {}
+		unobserve() {}
+		disconnect() {}
+	}
+	vi.stubGlobal("ResizeObserver", ResizeObserver);
+	HTMLElement.prototype.scrollIntoView ??= () => {};
+	HTMLElement.prototype.hasPointerCapture ??= () => false;
+	HTMLElement.prototype.setPointerCapture ??= () => {};
+	HTMLElement.prototype.releasePointerCapture ??= () => {};
+	vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) =>
+		window.setTimeout(() => callback(performance.now()), 0));
+	vi.stubGlobal("cancelAnimationFrame", (handle: number) => window.clearTimeout(handle));
+	vi.stubGlobal("matchMedia", (query: string) => ({
+		matches: query === "(min-width: 1280px)",
+		media: query,
+		onchange: null,
+		addEventListener: vi.fn(),
+		removeEventListener: vi.fn(),
+		addListener: vi.fn(),
+		removeListener: vi.fn(),
+		dispatchEvent: vi.fn(() => true),
+	}));
+});
+
+afterEach(() => {
+	cleanup();
+	window.localStorage.clear();
+	mockedApi.current = null;
+});
+
+describe("App connection recovery integration", () => {
+	it("preserves the mounted draft/dialog, gates mutations, deduplicates Retry, and reconciles a later open", async () => {
+		const api = createControllableApi();
+		const retry = deferred<void>();
+		api.setReconnectResult(retry.promise);
+		const { client, unmount } = renderApp(api);
+		const user = userEvent.setup();
+
+		expect(screen.getByText("Connecting…")).toBeTruthy();
+		expect(api.connect).toHaveBeenCalledTimes(1);
+		expect(api.listProjects).not.toHaveBeenCalled();
+		expect(api.listSessions).not.toHaveBeenCalled();
+
+		await openAndLoad(api);
+		expect(screen.getByText("cached question")).toBeTruthy();
+		expect(screen.getByText("cached answer")).toBeTruthy();
+		expect(api.listProjects).toHaveBeenCalled();
+		expect(api.listSessions).toHaveBeenCalled();
+		expect(api.getSession).toHaveBeenCalledWith(SESSION_ID, { includeEntries: false });
+		expect(api.getTranscriptTurns).toHaveBeenCalledWith(SESSION_ID, { limit: 50 });
+
+		const composer = screen.getByRole("textbox", {
+			name: "Enter for newline. Cmd+Enter to send.",
+		}) as HTMLTextAreaElement;
+		await user.type(composer, "keep this session draft");
+		const send = screen.getByRole("button", { name: "send message" }) as HTMLButtonElement;
+		const cachedNavigation = sessionNavigationButton();
+
+		await user.click(screen.getByRole("button", { name: "new project" }));
+		const projectInput = await screen.findByRole<HTMLInputElement>("textbox", { name: "Project name" });
+		await user.type(projectInput, "Offline project draft");
+
+		await emitStatus(api, "closed");
+		await waitFor(() => expect(document.querySelector(".connection-recovery-banner")?.textContent).toContain("Connection closed"));
+		const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
+		expect(composer.value).toBe("keep this session draft");
+		expect(projectInput.value).toBe("Offline project draft");
+		expect(document.activeElement).toBe(projectInput);
+		expect(save.disabled).toBe(true);
+		expect(send.disabled).toBe(true);
+		expect(cachedNavigation.disabled).toBe(false);
+
+		await act(async () => {
+			projectInput.closest("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+			send.click();
+		});
+		expect(api.createProject).not.toHaveBeenCalled();
+		expect(api.queueFollowUp).not.toHaveBeenCalled();
+		expect(api.startSession).not.toHaveBeenCalled();
+		expect(totalMutationCalls(api)).toBe(0);
+
+		const initialProjectLists = api.listProjects.mock.calls.length;
+		const initialSessionLists = api.listSessions.mock.calls.length;
+		const initialSelectedSyncs = api.getSession.mock.calls.length;
+		const retryButton = document.querySelector<HTMLButtonElement>(".connection-retry-button");
+		expect(retryButton?.textContent).toContain("Retry connection");
+		retryButton!.click();
+		retryButton!.click();
+
+		expect(api.reconnect).toHaveBeenCalledTimes(1);
+		await waitFor(() => {
+			const pending = document.querySelector<HTMLButtonElement>(".connection-retry-button");
+			expect(pending?.disabled).toBe(true);
+			expect(pending?.getAttribute("aria-busy")).toBe("true");
+			expect(pending?.textContent).toContain("Retrying…");
+		});
+
+		await emitStatus(api, "open");
+		await waitFor(() => {
+			expect(document.querySelector(".connection-recovery-banner")).toBeNull();
+			expect(save.disabled).toBe(false);
+			expect(send.disabled).toBe(false);
+		});
+		expect(screen.getByRole("textbox", { name: "Project name" })).toBe(projectInput);
+		expect(projectInput.value).toBe("Offline project draft");
+		expect(composer.value).toBe("keep this session draft");
+		expect(document.activeElement).toBe(projectInput);
+		await waitFor(() => {
+			expect(api.listProjects.mock.calls.length).toBeGreaterThan(initialProjectLists);
+			expect(api.listSessions.mock.calls.length).toBeGreaterThan(initialSessionLists);
+			expect(api.getSession.mock.calls.length).toBeGreaterThan(initialSelectedSyncs);
+		});
+
+		await act(async () => {
+			retry.reject(new Error("stale retry failure"));
+			await retry.promise.catch(() => undefined);
+		});
+		expect(document.querySelector(".connection-recovery-banner")).toBeNull();
+		expect(document.body.textContent).not.toContain("connection retry failed");
+		expect(save.disabled).toBe(false);
+		expect(document.activeElement).toBe(projectInput);
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+		expect(api.statusListenerCount()).toBe(0);
+		expect(api.eventListenerCount()).toBe(0);
+		expect(api.close).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps loaded Help, Export, and navigation local while blocking a new-session send", async () => {
+		const api = createControllableApi();
+		const { client, unmount } = renderApp(api);
+		const user = userEvent.setup();
+		await openAndLoad(api);
+
+		const cachedNavigation = sessionNavigationButton();
+		await emitStatus(api, "error");
+		await waitFor(() => expect(screen.getByText("Connection error")).toBeTruthy());
+		expect(cachedNavigation.disabled).toBe(false);
+
+		const composer = screen.getByRole("textbox") as HTMLTextAreaElement;
+		await user.type(composer, "/help");
+		const send = screen.getByRole("button", { name: "send message" }) as HTMLButtonElement;
+		expect(send.disabled).toBe(false);
+		await user.click(send);
+		expect(await screen.findByText(/commands:.*\/help.*\/export/)).toBeTruthy();
+
+		await user.type(composer, "/export");
+		const sessionFetchesBeforeExport = api.getSession.mock.calls.length;
+		await user.click(send);
+		const exportDialog = (await screen.findByRole("heading", { name: "Export messages" })).closest('[role="dialog"]');
+		if (!(exportDialog instanceof HTMLElement)) throw new Error("missing export dialog");
+		expect(within(exportDialog).getByText("cached answer")).toBeTruthy();
+		expect(within(exportDialog).getByText("2 of 2 selected")).toBeTruthy();
+		expect(api.getSession.mock.calls.length).toBe(sessionFetchesBeforeExport);
+		await user.click(screen.getByRole("button", { name: "Cancel" }));
+		await waitFor(() => expect(screen.queryByRole("heading", { name: "Export messages" })).toBeNull());
+
+		await user.click(cachedNavigation);
+		expect(screen.getByText("cached answer")).toBeTruthy();
+		await user.click(screen.getByRole("button", { name: "New session" }));
+		const newSessionComposer = screen.getByRole("textbox") as HTMLTextAreaElement;
+		await user.type(newSessionComposer, "new session stays a draft");
+		const blockedSend = screen.getByRole("button", { name: "send message" }) as HTMLButtonElement;
+		expect(blockedSend.disabled).toBe(true);
+		await act(async () => {
+			blockedSend.click();
+			newSessionComposer.dispatchEvent(
+				new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
+			);
+		});
+
+		expect(newSessionComposer.value).toBe("new session stays a draft");
+		expect(api.startSession).not.toHaveBeenCalled();
+		expect(totalMutationCalls(api)).toBe(0);
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+		expect(api.statusListenerCount()).toBe(0);
+		expect(api.eventListenerCount()).toBe(0);
+	});
+
+	it("keeps cached transcript controls local and never reconnects through remote reads", async () => {
+		const api = createControllableApi();
+		const { client, unmount } = renderApp(api);
+		const user = userEvent.setup();
+		await openAndLoad(api);
+
+		const cachedTurn = turnCardContaining("older cached question");
+		await user.click(within(cachedTurn).getByRole("button", { name: "Show details" }));
+		expect(await within(cachedTurn).findByText("cached detail evidence")).toBeTruthy();
+		expect(api.getTranscriptTurnDetail).toHaveBeenCalledTimes(1);
+
+		api.getSession.mockRejectedValueOnce(new Error("refresh failed"));
+		await emitEvent(api, {
+			event_id: 5,
+			event: "session.recovered",
+			session_id: SESSION_ID,
+			data: { activity: "idle" },
+		});
+		expect(await screen.findByText("Session refresh failed")).toBeTruthy();
+
+		await emitStatus(api, "closed");
+		await waitFor(() => expect(screen.getByText("Connection closed")).toBeTruthy());
+
+		const getSessionCalls = api.getSession.mock.calls.length;
+		const getTurnsCalls = api.getTranscriptTurns.mock.calls.length;
+		const getDetailCalls = api.getTranscriptTurnDetail.mock.calls.length;
+		const retry = screen.getByRole("button", { name: "Retry" }) as HTMLButtonElement;
+		const loadOlder = screen.getByRole("button", { name: "Load older turns" }) as HTMLButtonElement;
+		const uncachedTurn = turnCardContaining("cached question");
+		const uncachedShow = within(uncachedTurn).getByRole("button", { name: "Show details" }) as HTMLButtonElement;
+
+		expect(retry.disabled).toBe(true);
+		expect(loadOlder.disabled).toBe(true);
+		expect(uncachedShow.disabled).toBe(true);
+		expect(within(uncachedTurn).getByText("Waiting for connection").getAttribute("tabindex")).toBe("0");
+		expect(loadOlder.parentElement?.textContent).toContain("Waiting for connection");
+		expect(retry.parentElement?.textContent).toContain("Waiting for connection");
+
+		retry.click();
+		loadOlder.click();
+		uncachedShow.click();
+		expect(api.getSession).toHaveBeenCalledTimes(getSessionCalls);
+		expect(api.getTranscriptTurns).toHaveBeenCalledTimes(getTurnsCalls);
+		expect(api.getTranscriptTurnDetail).toHaveBeenCalledTimes(getDetailCalls);
+		expect(api.reconnect).not.toHaveBeenCalled();
+
+		const hideCached = within(cachedTurn).getByRole("button", { name: "Hide details" }) as HTMLButtonElement;
+		expect(hideCached.disabled).toBe(false);
+		await user.click(hideCached);
+		expect(within(cachedTurn).queryByText("cached detail evidence")).toBeNull();
+		const reopenCached = within(cachedTurn).getByRole("button", { name: "Show details" }) as HTMLButtonElement;
+		expect(reopenCached.disabled).toBe(false);
+		expect(reopenCached.parentElement?.textContent).not.toContain("Waiting for connection");
+		await user.click(reopenCached);
+		expect(await within(cachedTurn).findByText("cached detail evidence")).toBeTruthy();
+		expect(api.getTranscriptTurnDetail).toHaveBeenCalledTimes(getDetailCalls);
+
+		await emitStatus(api, "open");
+		await waitFor(() => expect(api.getSession).toHaveBeenCalledTimes(getSessionCalls + 1));
+		await waitFor(() => {
+			expect((within(uncachedTurn).getByRole("button", { name: "Show details" }) as HTMLButtonElement).disabled).toBe(false);
+			expect((screen.getByRole("button", { name: "Load older turns" }) as HTMLButtonElement).disabled).toBe(false);
+		});
+		expect(api.getTranscriptTurns).toHaveBeenCalledTimes(getTurnsCalls);
+
+		await user.click(within(uncachedTurn).getByRole("button", { name: "Show details" }));
+		expect(await within(uncachedTurn).findByText("uncached detail evidence")).toBeTruthy();
+		expect(api.getTranscriptTurnDetail).toHaveBeenCalledTimes(getDetailCalls + 1);
+
+		await user.click(screen.getByRole("button", { name: "Load older turns" }));
+		await waitFor(() => expect(api.getTranscriptTurns).toHaveBeenCalledTimes(getTurnsCalls + 1));
+		expect(api.reconnect).not.toHaveBeenCalled();
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+		expect(api.statusListenerCount()).toBe(0);
+		expect(api.eventListenerCount()).toBe(0);
+	});
+
+	it("blocks initial-load Retry on connection error and loads canonically after open", async () => {
+		const api = createControllableApi();
+		api.getSession.mockRejectedValueOnce(new Error("initial load failed"));
+		const { client, unmount } = renderApp(api);
+
+		await emitStatus(api, "open");
+		expect(await screen.findByText("Couldn’t load session")).toBeTruthy();
+		await emitStatus(api, "error");
+
+		const sessionCalls = api.getSession.mock.calls.length;
+		const turnsCalls = api.getTranscriptTurns.mock.calls.length;
+		const retry = screen.getByRole("button", { name: "Retry" }) as HTMLButtonElement;
+		expect(retry.disabled).toBe(true);
+		expect(retry.parentElement?.textContent).toContain("Waiting for connection");
+		retry.click();
+		expect(api.getSession).toHaveBeenCalledTimes(sessionCalls);
+		expect(api.getTranscriptTurns).toHaveBeenCalledTimes(turnsCalls);
+		expect(api.reconnect).not.toHaveBeenCalled();
+
+		await emitStatus(api, "open");
+		await waitFor(() => expect(api.getSession).toHaveBeenCalledTimes(sessionCalls + 1));
+		await waitFor(() => expect(api.getTranscriptTurns).toHaveBeenCalledTimes(turnsCalls + 1));
+		expect(await screen.findByText("cached answer")).toBeTruthy();
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+		expect(api.statusListenerCount()).toBe(0);
+		expect(api.eventListenerCount()).toBe(0);
+	});
+});
+
+const SESSION_ID = "session-1";
+const SESSION_TITLE = "Cached session";
+
+type ApiSpy = ReturnType<typeof vi.fn>;
+
+type ControllableApi = AgentApi & {
+	connect: ApiSpy;
+	reconnect: ApiSpy;
+	close: ApiSpy;
+	listProjects: ApiSpy;
+	listSessions: ApiSpy;
+	getSession: ApiSpy;
+	getTranscriptTurns: ApiSpy;
+	getTranscriptTurnDetail: ApiSpy;
+	startSession: ApiSpy;
+	queueFollowUp: ApiSpy;
+	renameSession: ApiSpy;
+	createProject: ApiSpy;
+	updateProject: ApiSpy;
+	deleteProject: ApiSpy;
+	configureSession: ApiSpy;
+	deleteSession: ApiSpy;
+	interrupt: ApiSpy;
+	resumeTurn: ApiSpy;
+	switchHistory: ApiSpy;
+	promoteQueuedInput: ApiSpy;
+	updateQueuedInput: ApiSpy;
+	cancelQueuedInput: ApiSpy;
+	reorderQueuedFollowUps: ApiSpy;
+	requestCompaction: ApiSpy;
+	startFullDelegation: ApiSpy;
+	startReadonlyDelegationFanout: ApiSpy;
+	cancelDelegation: ApiSpy;
+	steerSubagent: ApiSpy;
+	emitStatus(status: ConnectionStatus): void;
+	emitEvent(event: EventFrame): void;
+	setReconnectResult(result: Promise<void>): void;
+	statusListenerCount(): number;
+	eventListenerCount(): number;
+};
+
+function renderApp(api: ControllableApi) {
+	window.localStorage.setItem(
+		UI_RESUME_STORAGE_KEY,
+		JSON.stringify({
+			selectedProjectId: null,
+			selectedSessionIdByProject: { __host__: SESSION_ID },
+			updatedAt: 1,
+		}),
+	);
+	mockedApi.current = api;
+	const client = new QueryClient({
+		defaultOptions: {
+			queries: {
+				retry: false,
+				gcTime: Infinity,
+				refetchOnWindowFocus: false,
+			},
+			mutations: { retry: false },
+		},
+	});
+	const result = render(
+		<QueryClientProvider client={client}>
+			<App />
+		</QueryClientProvider>,
+	);
+	return { ...result, client };
+}
+
+async function openAndLoad(api: ControllableApi) {
+	await emitStatus(api, "open");
+	await waitFor(() => {
+		expect(screen.queryByText("Connecting…")).toBeNull();
+		expect(screen.getByText("cached answer")).toBeTruthy();
+	});
+}
+
+async function emitEvent(api: ControllableApi, event: EventFrame) {
+	await act(async () => {
+		api.emitEvent(event);
+		await new Promise((resolve) => window.setTimeout(resolve, 100));
+	});
+}
+
+function turnCardContaining(text: string): HTMLElement {
+	const card = screen.getByText(text).closest(".turn-summary");
+	if (!(card instanceof HTMLElement)) throw new Error(`missing turn card containing ${text}`);
+	return card;
+}
+
+async function emitStatus(api: ControllableApi, status: ConnectionStatus) {
+	await act(async () => {
+		api.emitStatus(status);
+		await new Promise((resolve) => window.setTimeout(resolve, 0));
+	});
+}
+
+function sessionNavigationButton(): HTMLButtonElement {
+	const candidates = screen.getAllByRole("button", { name: new RegExp(SESSION_TITLE) });
+	const navigation = candidates.find((button) => !button.hasAttribute("aria-haspopup"));
+	if (!(navigation instanceof HTMLButtonElement)) throw new Error("missing cached session navigation");
+	return navigation;
+}
+
+function totalMutationCalls(api: ControllableApi): number {
+	return [
+		api.startSession,
+		api.queueFollowUp,
+		api.renameSession,
+		api.createProject,
+		api.updateProject,
+		api.deleteProject,
+		api.configureSession,
+		api.deleteSession,
+		api.interrupt,
+		api.resumeTurn,
+		api.switchHistory,
+		api.promoteQueuedInput,
+		api.updateQueuedInput,
+		api.cancelQueuedInput,
+		api.reorderQueuedFollowUps,
+		api.requestCompaction,
+		api.startFullDelegation,
+		api.startReadonlyDelegationFanout,
+		api.cancelDelegation,
+		api.steerSubagent,
+	].reduce((total, spy) => total + spy.mock.calls.length, 0);
+}
+
+function createControllableApi(): ControllableApi {
+	let status: ConnectionStatus = "connecting";
+	let reconnectResult = Promise.resolve();
+	const statusListeners = new Set<(next: ConnectionStatus) => void>();
+	const eventListeners = new Set<(event: EventFrame) => void>();
+	const mutation = () => vi.fn(async () => {
+		throw new Error("unexpected mutation");
+	});
+	const api = {
+		connect: vi.fn(async () => undefined),
+		reconnect: vi.fn(() => reconnectResult),
+		close: vi.fn(),
+		isOpen: vi.fn(() => status === "open"),
+		onStatus: vi.fn((listener: (next: ConnectionStatus) => void) => {
+			statusListeners.add(listener);
+			return () => statusListeners.delete(listener);
+		}),
+		onEvent: vi.fn((listener: (event: EventFrame) => void) => {
+			eventListeners.add(listener);
+			return () => eventListeners.delete(listener);
+		}),
+		listProjects: vi.fn(async () => []),
+		listSessions: vi.fn(async () => [sessionSummary()]),
+		listDelegations: vi.fn(async () => ({
+			parent_session_id: SESSION_ID,
+			has_more: false,
+			delegations: [],
+		})),
+		listTools: vi.fn(async () => []),
+		getSession: vi.fn(async () => sessionSnapshot()),
+		getTranscriptTurns: vi.fn(async (_sessionId: string, options: { beforeEntryId?: string } = {}) =>
+			options.beforeEntryId ? olderTranscriptTurns(options.beforeEntryId) : transcriptTurns()),
+		getTranscriptTurnDetail: vi.fn(async (_sessionId: string, options: { cardId: string }) => ({
+			session_id: SESSION_ID,
+			active_leaf_id: "entry-finish",
+			session_revision: 2,
+			transcript_revision: 2,
+			card_id: options.cardId,
+			entries: options.cardId === "entry-finish-1" ? firstTurnDetail() : secondTurnDetail(),
+		})),
+		getTranscriptIndex: vi.fn(async () => transcriptIndex()),
+		getTranscriptEntries: vi.fn(async () => ({
+			session_id: SESSION_ID,
+			session_revision: 2,
+			transcript_revision: 2,
+			entries: [],
+		})),
+		getHistoryTree: vi.fn(async () => ({
+			session_id: SESSION_ID,
+			active_leaf_id: "entry-finish",
+			entries: [],
+		})),
+		getHistoryContext: vi.fn(async () => []),
+		getSystemPrompt: vi.fn(async () => ({ template: "", rendered: null })),
+		syncActiveBranch: vi.fn(async () => ({
+			session_id: SESSION_ID,
+			base_leaf_id: "entry-finish",
+			active_leaf_id: "entry-finish",
+			status: "unchanged" as const,
+			entries: [],
+			overview: sessionSnapshot(),
+		})),
+		subscribeEvents: vi.fn(async () => []),
+		unsubscribeEvents: vi.fn(async () => undefined),
+		readHandoffFile: vi.fn(async () => ({
+			delegation_id: "delegation-1",
+			subagent_id: null,
+			file: "task_prompt.md" as const,
+			content: "",
+		})),
+		startSession: mutation(),
+		queueFollowUp: mutation(),
+		interrupt: mutation(),
+		resumeTurn: mutation(),
+		switchHistory: mutation(),
+		renameSession: mutation(),
+		deleteSession: mutation(),
+		configureSession: mutation(),
+		createProject: mutation(),
+		updateProject: mutation(),
+		deleteProject: mutation(),
+		promoteQueuedInput: mutation(),
+		updateQueuedInput: mutation(),
+		cancelQueuedInput: mutation(),
+		reorderQueuedFollowUps: mutation(),
+		requestCompaction: mutation(),
+		startFullDelegation: mutation(),
+		startReadonlyDelegationFanout: mutation(),
+		cancelDelegation: mutation(),
+		steerSubagent: mutation(),
+		emitStatus(next: ConnectionStatus) {
+			status = next;
+			for (const listener of statusListeners) listener(next);
+		},
+		emitEvent(event: EventFrame) {
+			for (const listener of eventListeners) listener(event);
+		},
+		setReconnectResult(result: Promise<void>) {
+			reconnectResult = result;
+		},
+		statusListenerCount: () => statusListeners.size,
+		eventListenerCount: () => eventListeners.size,
+	} as unknown as ControllableApi;
+	return api;
+}
+
+function sessionSummary(): SessionSummary {
+	return {
+		session_id: SESSION_ID,
+		project_id: null,
+		outer_cwd: "/workspace",
+		workspaces: [],
+		activity: "idle",
+		active_leaf_id: "entry-finish",
+		provider: { kind: "openai", model: "gpt-5.1" },
+		metadata: { title: SESSION_TITLE },
+		created_at: "2026-01-01T00:00:00Z",
+		updated_at: "2026-01-01T00:00:01Z",
+		has_transcript_entries: true,
+	};
+}
+
+function sessionSnapshot(): SessionSnapshot {
+	return {
+		...sessionSummary(),
+		pending_actions: [],
+		queued_inputs: [],
+		session_revision: 2,
+		queue_revision: 1,
+		transcript_revision: 2,
+		last_event_id: 4,
+		server_time_ms: 1_700_000_000_004,
+	};
+}
+
+function transcriptTurns(): TranscriptTurnsResult {
+	return {
+		session_id: SESSION_ID,
+		active_leaf_id: "entry-finish",
+		session_revision: 2,
+		transcript_revision: 2,
+		before_entry_id: null,
+		next_before_entry_id: "entry-start-1",
+		has_more_before: true,
+		limit: 50,
+		cards: [
+			{
+				id: "entry-finish-1",
+				turn_id: 1,
+				status: "completed",
+				outcome: "Graceful",
+				start_entry_id: "entry-start-1",
+				boundary_entry_id: "entry-finish-1",
+				active_leaf_id: "entry-finish-1",
+				start_sequence: 1,
+				end_sequence: 4,
+				start_timestamp_ms: 1_700_000_000_001,
+				timestamp_ms: 1_700_000_000_004,
+				user_messages: [firstUserEntry()],
+				assistant_message: firstAssistantEntry(),
+				summary: null,
+				can_resume: false,
+			},
+			{
+				id: "entry-finish",
+				turn_id: 2,
+				status: "completed",
+				outcome: "Graceful",
+				start_entry_id: "entry-start-2",
+				boundary_entry_id: "entry-finish",
+				active_leaf_id: "entry-finish",
+				start_sequence: 5,
+				end_sequence: 8,
+				start_timestamp_ms: 1_700_000_000_005,
+				timestamp_ms: 1_700_000_000_008,
+				user_messages: [userEntry()],
+				assistant_message: assistantEntry(),
+				summary: null,
+				can_resume: false,
+			},
+		],
+	};
+}
+
+function olderTranscriptTurns(beforeEntryId: string): TranscriptTurnsResult {
+	return {
+		session_id: SESSION_ID,
+		active_leaf_id: "entry-finish",
+		session_revision: 2,
+		transcript_revision: 2,
+		before_entry_id: beforeEntryId,
+		next_before_entry_id: null,
+		has_more_before: false,
+		limit: 50,
+		cards: [],
+	};
+}
+
+function firstTurnDetail(): TranscriptEntry[] {
+	return [
+		{
+			id: "entry-start-1",
+			parent_id: null,
+			sequence: 1,
+			timestamp_ms: 1_700_000_000_001,
+			item: { type: "turn_started", turn_id: 1 },
+		},
+		firstUserEntry(),
+		{
+			id: "entry-progress-1",
+			parent_id: "entry-user-1",
+			sequence: 3,
+			timestamp_ms: 1_700_000_000_003,
+			item: {
+				type: "assistant_message",
+				items: [{ type: "text", text: "cached detail evidence" }],
+			},
+		},
+		{
+			id: "entry-finish-1",
+			parent_id: "entry-progress-1",
+			sequence: 4,
+			timestamp_ms: 1_700_000_000_004,
+			item: { type: "turn_finished", turn_id: 1, outcome: "Graceful" },
+		},
+	];
+}
+
+function secondTurnDetail(): TranscriptEntry[] {
+	return [
+		{
+			id: "entry-start-2",
+			parent_id: "entry-finish-1",
+			sequence: 5,
+			timestamp_ms: 1_700_000_000_005,
+			item: { type: "turn_started", turn_id: 2 },
+		},
+		userEntry(),
+		{
+			id: "entry-progress-2",
+			parent_id: "entry-user",
+			sequence: 7,
+			timestamp_ms: 1_700_000_000_007,
+			item: {
+				type: "assistant_message",
+				items: [{ type: "text", text: "uncached detail evidence" }],
+			},
+		},
+		{
+			id: "entry-finish",
+			parent_id: "entry-progress-2",
+			sequence: 8,
+			timestamp_ms: 1_700_000_000_008,
+			item: { type: "turn_finished", turn_id: 2, outcome: "Graceful" },
+		},
+	];
+}
+
+function firstUserEntry(): TranscriptEntry {
+	return {
+		id: "entry-user-1",
+		parent_id: "entry-start-1",
+		sequence: 2,
+		timestamp_ms: 1_700_000_000_002,
+		item: {
+			type: "user_message",
+			content: [{ type: "text", text: "older cached question" }],
+		},
+	};
+}
+
+function firstAssistantEntry(): TranscriptEntry {
+	return {
+		id: "entry-assistant-1",
+		parent_id: "entry-user-1",
+		sequence: 3,
+		timestamp_ms: 1_700_000_000_003,
+		item: {
+			type: "assistant_message",
+			items: [{ type: "text", text: "older cached answer" }],
+		},
+	};
+}
+
+function userEntry(): TranscriptEntry {
+	return {
+		id: "entry-user",
+		parent_id: "entry-start-2",
+		sequence: 6,
+		timestamp_ms: 1_700_000_000_006,
+		item: {
+			type: "user_message",
+			content: [{ type: "text", text: "cached question" }],
+		},
+	};
+}
+
+function assistantEntry(): TranscriptEntry {
+	return {
+		id: "entry-assistant",
+		parent_id: "entry-user",
+		sequence: 7,
+		timestamp_ms: 1_700_000_000_007,
+		item: {
+			type: "assistant_message",
+			items: [{ type: "text", text: "cached answer" }],
+		},
+	};
+}
+
+function transcriptIndex() {
+	const nodes: TranscriptTreeNode[] = [
+		{
+			id: "entry-finish",
+			parent_id: "entry-assistant",
+			timestamp_ms: 1_700_000_000_004,
+			sequence: 4,
+			item_type: "turn_finished",
+			turn_id: 1,
+			outcome: "Graceful",
+			can_switch_to: true,
+			edit_target_leaf_id: null,
+			display_hint: "cached answer",
+		},
+	];
+	return {
+		session_id: SESSION_ID,
+		active_leaf_id: "entry-finish",
+		session_revision: 2,
+		transcript_revision: 2,
+		after_sequence: 0,
+		max_sequence: 4,
+		complete: true,
+		nodes,
+	};
+}
+
+function deferred<T>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}

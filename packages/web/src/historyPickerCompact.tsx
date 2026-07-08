@@ -6,6 +6,7 @@ import {
 	DialogDescription,
 	DialogTitle,
 } from "./dialog.tsx";
+import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { displayParentIdForNode } from "./displayParent.ts";
 import {
 	historySwitchOptionsFromNodes,
@@ -29,6 +30,7 @@ interface VisibleHistoryNodeRow {
 interface HistoryPickerContentParams {
 	loading: boolean;
 	error: string | null;
+	mutationBlockedReason?: string | null;
 	renderedRows: VisibleHistoryNodeRow[];
 	hiddenBranchIds: Set<string>;
 	onSwitch: (target: HistoryTargetOption) => void;
@@ -42,6 +44,7 @@ export function CompactHistoryPickerDialog({
 	error = null,
 	onClose,
 	onSwitch,
+	mutationBlockedReason,
 	returnFocusFallbackRef,
 }: {
 	nodes: TranscriptTreeNode[];
@@ -50,6 +53,7 @@ export function CompactHistoryPickerDialog({
 	error?: string | null;
 	onClose: () => void;
 	onSwitch: (target: HistoryTargetOption) => void;
+	mutationBlockedReason?: string | null;
 	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
 	const titleRef = useRef<HTMLHeadingElement>(null);
@@ -124,9 +128,11 @@ export function CompactHistoryPickerDialog({
 			</div>
 
 			<div className="history-options tree" role="tree" aria-label="switch targets">
+				<ConnectionBlockedReason reason={mutationBlockedReason} className="history-blocked-reason" />
 				{historyPickerContent({
 					loading,
 					error,
+					mutationBlockedReason,
 					renderedRows,
 					hiddenBranchIds,
 					onSwitch,
@@ -145,6 +151,7 @@ export function CompactHistoryPickerDialog({
 function historyPickerContent({
 	loading,
 	error,
+	mutationBlockedReason,
 	renderedRows,
 	hiddenBranchIds,
 	onSwitch,
@@ -189,6 +196,7 @@ function historyPickerContent({
 							type="button"
 							role="treeitem"
 							aria-selected={row.isActive}
+							disabled={!!mutationBlockedReason}
 							onClick={() => onSwitch(row.option)}
 						>
 							<span className="tree-guides" aria-hidden="true" />
