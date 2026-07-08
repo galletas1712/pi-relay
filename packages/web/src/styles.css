@@ -953,6 +953,111 @@ pre {
 	overflow: hidden;
 }
 
+.workspace-conversation-notices {
+	flex: 0 0 auto;
+	border-bottom: 1px solid var(--border);
+	background: var(--background);
+}
+
+.workspace-route-warning,
+.workspace-recipient-label {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--space-2);
+	padding: 7px 12px;
+	font-size: var(--text-xs);
+}
+
+.workspace-route-warning {
+	border-bottom: 1px solid color-mix(in oklch, var(--warning) 30%, var(--border));
+	background: color-mix(in oklch, var(--warning) 8%, var(--background));
+	color: var(--warning);
+}
+
+.workspace-recipient-label {
+	color: var(--muted-foreground);
+}
+
+.workspace-recipient-label strong {
+	color: var(--foreground);
+}
+
+.workspace-recipient-label code {
+	overflow: hidden;
+	max-width: min(42ch, 100%);
+	color: var(--muted-foreground);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.workspace-route-state {
+	grid-column: 1;
+	grid-row: 2;
+	display: flex;
+	min-height: 0;
+	flex-direction: column;
+	align-items: flex-start;
+	justify-content: center;
+	gap: var(--space-3);
+	overflow: auto;
+	padding: clamp(28px, 8vw, 96px);
+}
+
+.workspace-route-state h1 {
+	margin: 0;
+	font-family: var(--font-display);
+	font-size: clamp(var(--text-2xl), 4vw, var(--text-3xl));
+	color: var(--foreground);
+}
+
+.workspace-route-state > p {
+	max-width: 64ch;
+	margin: 0;
+	color: var(--muted-foreground);
+	line-height: 1.6;
+}
+
+.workspace-route-state code {
+	overflow-wrap: anywhere;
+	color: var(--foreground);
+}
+
+.workspace-route-eyebrow {
+	font-size: var(--text-xs);
+	font-weight: 700;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+}
+
+.unavailable-route-state > p[role="alert"] {
+	color: var(--destructive);
+}
+
+.workspace-route-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-2);
+}
+
+.workspace-route-action {
+	flex: 0 0 auto;
+	justify-content: center;
+	width: auto;
+	padding: 0 var(--space-4);
+}
+
+.workspace-inspector-placeholder {
+	display: flex;
+	min-height: 100%;
+	align-items: center;
+	justify-content: center;
+	padding: var(--space-5);
+	color: var(--muted-foreground);
+	font-size: var(--text-sm);
+	text-align: center;
+}
+
 .log-header {
 	border-bottom: 1px solid var(--border);
 	background: var(--background);
@@ -3285,6 +3390,11 @@ pre {
 	}
 
 	.log-pane {
+		grid-column: 2;
+		grid-row: 1 / span 2;
+	}
+
+	.workspace-route-state {
 		grid-column: 2;
 		grid-row: 1 / span 2;
 	}

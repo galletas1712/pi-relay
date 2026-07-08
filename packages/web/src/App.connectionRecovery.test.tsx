@@ -60,6 +60,7 @@ beforeAll(() => {
 
 afterEach(() => {
 	cleanup();
+	window.history.replaceState(null, "", "/");
 	window.localStorage.clear();
 	mockedApi.current = null;
 });
@@ -318,8 +319,8 @@ describe("App connection recovery integration", () => {
 		expect(api.reconnect).not.toHaveBeenCalled();
 
 		await emitStatus(api, "open");
-		await waitFor(() => expect(api.getSession).toHaveBeenCalledTimes(sessionCalls + 1));
-		await waitFor(() => expect(api.getTranscriptTurns).toHaveBeenCalledTimes(turnsCalls + 1));
+		await waitFor(() => expect(api.getSession).toHaveBeenCalledTimes(sessionCalls + 3));
+		expect(api.getTranscriptTurns).toHaveBeenCalledTimes(turnsCalls);
 		expect(await screen.findByText("cached answer")).toBeTruthy();
 
 		unmount();
