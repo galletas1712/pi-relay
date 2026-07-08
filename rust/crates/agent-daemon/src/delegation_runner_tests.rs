@@ -334,6 +334,24 @@ async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
         .expect("create parent");
 }
 
+#[tokio::test]
+async fn empty_dispatch_stops_after_the_pending_query() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let driver = SessionDriver::acquire(&env.state, "missing-empty-dispatch").await;
+
+    let dispatched = driver
+        .dispatch_ready_actions()
+        .await
+        .expect("missing session has no pending actions");
+
+    assert!(dispatched.is_empty());
+    drop(driver);
+    env.cleanup().await;
+}
+
 fn successful_compaction(summary: &str) -> CompactionCompletion {
     CompactionCompletion {
         summary: summary.to_string(),
