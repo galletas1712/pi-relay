@@ -120,6 +120,7 @@ export function HistoryPickerDialog({
 							const display = row.option;
 							const isCollapsedBranch = hiddenBranchIds.has(row.entry.id);
 							const canCollapse = row.isBranchRoot && !row.isOnActivePath;
+							const branchToggleLabel = `${isCollapsedBranch ? "Expand" : "Collapse"} branch for ${display.title}: ${display.preview}${isCollapsedBranch ? `, ${row.descendantCount} hidden descendant${row.descendantCount === 1 ? "" : "s"}` : ""}`;
 							const outcomeClass = nonGracefulOutcomeClass(display.outcome);
 							return (
 								<div
@@ -132,7 +133,7 @@ export function HistoryPickerDialog({
 											className="branch-toggle"
 											type="button"
 											onClick={() => toggleBranch(row.entry.id)}
-											aria-label={isCollapsedBranch ? "expand branch" : "collapse branch"}
+											aria-label={branchToggleLabel}
 											aria-expanded={!isCollapsedBranch}
 										>
 											<ChevronRight size={13} />

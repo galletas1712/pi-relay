@@ -3859,9 +3859,35 @@ pre {
 		padding-left: calc(9px + var(--tree-depth, 0) * 10px);
 	}
 
-	.tree-guides,
-	.branch-toggle {
+	.tree-guides {
 		display: none;
+	}
+
+	.history-tree-item {
+		display: grid;
+		grid-template-columns: 44px minmax(0, 1fr);
+		align-items: center;
+		gap: 6px;
+	}
+
+	.history-tree-item .history-option.tree-row {
+		grid-column: 2;
+	}
+
+	.branch-toggle {
+		position: static;
+		grid-column: 1;
+		grid-row: 1;
+		display: inline-flex;
+		width: 44px;
+		height: 44px;
+		align-self: center;
+		justify-self: start;
+		transform: rotate(90deg);
+	}
+
+	.branch-toggle[aria-expanded="false"] {
+		transform: none;
 	}
 
 	.history-option-icon {
