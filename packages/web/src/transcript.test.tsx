@@ -334,6 +334,72 @@ describe("MessageList session loading guard", () => {
 		expect(html).toContain("Loading session");
 		expect(html).not.toContain("stale transcript text");
 	});
+
+	it("replaces an initial load failure with a persistent Retry action", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				activeLeafId={null}
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_b"
+				entriesSessionId={null}
+				sessionError="daemon unavailable"
+				onRetrySession={() => {}}
+			/>,
+		);
+
+		expect(html).toContain(`role="alert"`);
+		expect(html).toContain("Couldn’t load session");
+		expect(html).toContain("daemon unavailable");
+		expect(html).toContain(">Retry</button>");
+		expect(html).not.toContain("Loading session");
+	});
+
+	it("keeps matching cached content visible with a refresh warning and Retry", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[userEntry("entry_1", "cached transcript text")]}
+				activeLeafId="entry_1"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				sessionError="refresh timed out"
+				sessionErrorHasUsableCache
+				onRetrySession={() => {}}
+			/>,
+		);
+
+		expect(html).toContain("cached transcript text");
+		expect(html).toContain("Session refresh failed");
+		expect(html).toContain("refresh timed out");
+		expect(html).toContain(">Retry</button>");
+	});
+
+	it("disables the selected-session action and reports busy copy while retrying", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				activeLeafId={null}
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_b"
+				entriesSessionId={null}
+				sessionError="daemon unavailable"
+				retryingSession
+				onRetrySession={() => {}}
+			/>,
+		);
+
+		expect(html).toContain(`disabled=""`);
+		expect(html).toContain(`aria-busy="true"`);
+		expect(html).toContain("Retrying…");
+		expect(html).toContain("daemon unavailable");
+	});
 });
 
 describe("MessageList markdown code rendering", () => {

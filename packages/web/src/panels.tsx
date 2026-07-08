@@ -281,7 +281,10 @@ export interface SidebarProps {
 	selectedId: string | null;
 	sessionsLoading?: boolean;
 	sessionsFetching?: boolean;
+	sessionsError?: string | null;
+	sessionsHasCachedData?: boolean;
 	inert?: boolean;
+	onRetrySessions?: () => void;
 	onQueryChange: (query: string) => void;
 	onToggleArchived: () => void;
 	onNew: () => void;
@@ -308,7 +311,10 @@ export const Sidebar = memo(function Sidebar({
 	selectedId,
 	sessionsLoading = false,
 	sessionsFetching = false,
+	sessionsError = null,
+	sessionsHasCachedData = false,
 	inert,
+	onRetrySessions,
 	onQueryChange,
 	onToggleArchived,
 	onNew,
@@ -343,6 +349,25 @@ export const Sidebar = memo(function Sidebar({
 				onToggleArchived={onToggleArchived}
 				onNew={onNew}
 			/>
+			{sessionsError ? (
+				<div className="load-error-banner sidebar-load-error" role="alert">
+					<div>
+						<strong>{sessionsHasCachedData ? "Session refresh failed" : "Couldn’t load sessions"}</strong>
+						<span>{sessionsError}</span>
+					</div>
+					{onRetrySessions ? (
+						<button
+							type="button"
+							className="secondary-button load-error-retry"
+							disabled={sessionsFetching}
+							aria-busy={sessionsFetching}
+							onClick={onRetrySessions}
+						>
+							{sessionsFetching ? "Retrying…" : "Retry"}
+						</button>
+					) : null}
+				</div>
+			) : null}
 			<div className="session-list" role="listbox" aria-label="sessions" aria-busy={sessionsLoading || sessionsFetching}>
 				{filteredSessions.map((session) => (
 					<SessionRow
@@ -355,7 +380,7 @@ export const Sidebar = memo(function Sidebar({
 						onDelete={() => onDelete(session)}
 					/>
 				))}
-				{filteredSessions.length === 0 ? (
+				{filteredSessions.length === 0 && !sessionsError ? (
 					<div className="empty-list">
 						{sessionsLoading ? "Loading sessions…" : sessionsFetching ? "Refreshing sessions…" : "No sessions"}
 					</div>

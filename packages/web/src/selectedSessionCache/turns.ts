@@ -66,6 +66,7 @@ export function applyTranscriptTurns(
 		turnCardsById,
 		turnOrder: orderedIds,
 		turnDetailsById,
+		transcriptTurnsLoaded: true,
 		turnTranscriptRevision: result.transcript_revision,
 		turnActiveLeafId: result.active_leaf_id,
 		turnHasMoreBefore: result.has_more_before,
