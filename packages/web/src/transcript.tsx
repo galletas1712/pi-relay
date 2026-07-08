@@ -835,14 +835,17 @@ const TurnCardRow = memo(function TurnCardRow({
 	const canToggleDetails = card.status !== "compacted" && (!!onExpandTurn || !!onCollapseTurn) && !(turn.isCurrent && isExpanded);
 	const canResume = card.can_resume && card.active_leaf_id === activeLeafId && !isRunning && !!onResumeTurn;
 	const resumableOutcome = card.outcome === "Interrupted" || card.outcome === "Crashed" ? card.outcome : null;
-	const firstUserMessageId = card.user_messages.at(0)?.id ?? null;
+	const visibleUserMessages = card.user_messages.filter(
+		(entry) => entry.item.type !== "user_message" || !entry.item.replayed_after_compaction,
+	);
+	const firstUserMessageId = visibleUserMessages.at(0)?.id ?? null;
 	const rootTurnJumpTargetId = isExpanded || !firstUserMessageId ? turnJumpTargetId : undefined;
 	const detailLabel = isExpanded ? "Hide details" : isLoading ? "Loading…" : "Show details";
 	const onToggleDetails = () => {
 		if (isExpanded) onCollapseTurn?.(card.id);
 		else onExpandTurn?.(card.id);
 	};
-	const summaryUserMessages = isExpanded ? [] : card.user_messages;
+	const summaryUserMessages = isExpanded ? [] : visibleUserMessages;
 	const summaryDaemonObservations = isExpanded ? [] : card.daemon_observations ?? [];
 	let detailRows: ReactNode = null;
 	if (detailEntries) {
@@ -1039,6 +1042,7 @@ class TranscriptDisplayBuilder {
 			return;
 		}
 		if (item.type === "user_message") {
+			if (item.replayed_after_compaction) return;
 			this.flushGroup();
 			this.nodes.push({ type: "user", key: entry.id, entry: entry as Extract<TranscriptDisplayNode, { type: "user" }>["entry"] });
 			return;

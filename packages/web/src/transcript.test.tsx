@@ -104,6 +104,101 @@ describe("MessageList compaction display", () => {
 		expect(html).toContain("Hide prior");
 		expect(html).not.toContain("prior entries hidden");
 	});
+
+	it("does not render marked replay messages in the fallback transcript", () => {
+		const original = userEntryWithParent("original", "start", "exact compaction instruction");
+		const replayed: TranscriptEntry = {
+			...userEntryWithParent("replayed", "compact", "exact compaction instruction"),
+			item: {
+				type: "user_message",
+				content: [{ type: "text", text: "exact compaction instruction" }],
+				replayed_after_compaction: true,
+			},
+		};
+		const replayedAgain: TranscriptEntry = {
+			...userEntryWithParent("replayed-again", "compact-again", "exact compaction instruction"),
+			item: {
+				type: "user_message",
+				content: [{ type: "text", text: "exact compaction instruction" }],
+				replayed_after_compaction: true,
+			},
+		};
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[
+					turnStartedEntry("start", 1, 1),
+					original,
+					compactionSummaryEntry("compact", null, 1, 2, 1, "original"),
+					replayed,
+					compactionSummaryEntry("compact-again", null, 1, 3, 1, "replayed"),
+					replayedAgain,
+				]}
+				activeLeafId="replayed-again"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html.match(/exact compaction instruction/g)).toHaveLength(1);
+	});
+
+	it("defensively filters marked replay messages from collapsed and expanded turn cards", () => {
+		const start = turnStartedEntry("start", 1, 1);
+		const original = userEntryWithParent("original", "start", "only once");
+		const replayed: TranscriptEntry = {
+			...userEntryWithParent("replayed", "original", "only once"),
+			item: {
+				type: "user_message",
+				content: [{ type: "text", text: "only once" }],
+				replayed_after_compaction: true,
+			},
+		};
+		const genuineSameText = userEntryWithParent("genuine", "replayed", "only once");
+		const card: TurnCard = {
+			id: "turn_1",
+			turn_id: 1,
+			status: "open",
+			outcome: null,
+			start_entry_id: "start",
+			boundary_entry_id: null,
+			active_leaf_id: "genuine",
+			start_sequence: 1,
+			end_sequence: 4,
+			start_timestamp_ms: 1,
+			timestamp_ms: 4,
+			user_messages: [original, replayed, genuineSameText],
+			assistant_message: null,
+			summary: null,
+			can_resume: false,
+		};
+
+		for (const expanded of [false, true]) {
+			const html = renderToStaticMarkup(
+				<MessageList
+					entries={[]}
+					turnCards={[
+						{
+							card,
+							entries: expanded ? [start, original, replayed, genuineSameText] : null,
+							expanded,
+							isCurrent: true,
+						},
+					]}
+					activeLeafId="genuine"
+					isRunning={false}
+					serverTimeMs={null}
+					hasSession
+					sessionId="session_a"
+					entriesSessionId="session_a"
+				/>
+			);
+
+			expect(html.match(/only once/g)).toHaveLength(2);
+		}
+	});
 });
 
 describe("MessageList daemon observations", () => {

@@ -534,8 +534,10 @@ fn continuation_suffix_for_scope(
                     let TranscriptItem::UserMessage(message) = item else {
                         return None;
                     };
+                    let mut message = message.clone();
+                    message.replayed_after_compaction = true;
                     Some(ModelContextEntry {
-                        item: TranscriptItem::UserMessage(message.clone()),
+                        item: TranscriptItem::UserMessage(message),
                         provider_replay: provider_replay.to_vec(),
                     })
                 })
@@ -730,7 +732,11 @@ mod tests {
         let suffix = continuation_suffix_for_scope(&job).expect("suffix builds");
 
         assert_eq!(suffix.len(), 1);
-        assert_eq!(suffix[0].item, TranscriptItem::UserMessage(user));
+        let TranscriptItem::UserMessage(replayed) = &suffix[0].item else {
+            panic!("expected user message");
+        };
+        assert_eq!(replayed.content, user.content);
+        assert!(replayed.replayed_after_compaction);
         assert!(suffix[0].provider_replay.is_empty());
     }
 
@@ -774,19 +780,26 @@ mod tests {
         assert_eq!(
             suffix
                 .iter()
-                .map(|node| node.item.clone())
+                .map(|node| {
+                    let TranscriptItem::UserMessage(message) = &node.item else {
+                        panic!("expected user message");
+                    };
+                    message.as_text()
+                })
                 .collect::<Vec<_>>(),
-            vec![
-                TranscriptItem::UserMessage(initial),
-                TranscriptItem::UserMessage(steering),
-            ]
+            vec![initial.as_text(), steering.as_text()]
         );
+        assert!(suffix.iter().all(|entry| matches!(
+            &entry.item,
+            TranscriptItem::UserMessage(message) if message.replayed_after_compaction
+        )));
         assert!(suffix.iter().all(|entry| entry.provider_replay.is_empty()));
     }
 
     #[test]
     fn repeated_compaction_reads_users_from_summary_rooted_open_turn() {
-        let user = UserMessage::text("instruction retained by the first compaction");
+        let mut user = UserMessage::text("instruction retained by the first compaction");
+        user.replayed_after_compaction = true;
         let job = compaction_job(
             ModelContext::from_transcript_items(vec![
                 TranscriptItem::CompactionSummary(CompactionSummary::new(
