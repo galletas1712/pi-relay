@@ -204,9 +204,14 @@ impl SessionDriver {
             .repo
             .load_stored_session(&self.session_id)
             .await?;
+        let persisted_active_leaf_id = stored.active_leaf_id.clone();
         let session = AgentSession::from_stored_session_interrupted(stored)
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
-        let active = Arc::new(Mutex::new(RuntimeSession { session, config }));
+        let active = Arc::new(Mutex::new(RuntimeSession {
+            session,
+            config,
+            persisted_active_leaf_id,
+        }));
         self.state
             .active
             .lock()
@@ -296,11 +301,16 @@ impl SessionDriver {
             .repo
             .load_stored_session(&self.session_id)
             .await?;
+        let persisted_active_leaf_id = stored.active_leaf_id.clone();
         let session = AgentSession::from_stored_session_preserving_open_turn(stored)
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         self.state.active.lock().await.insert(
             self.session_id.clone(),
-            Arc::new(Mutex::new(RuntimeSession { session, config })),
+            Arc::new(Mutex::new(RuntimeSession {
+                session,
+                config,
+                persisted_active_leaf_id,
+            })),
         );
         Ok(())
     }
@@ -466,6 +476,7 @@ impl SessionDriver {
             .repo
             .load_stored_session(&self.session_id)
             .await?;
+        let persisted_active_leaf_id = stored.active_leaf_id.clone();
         let config = self
             .state
             .repo
@@ -491,6 +502,7 @@ impl SessionDriver {
             Arc::new(Mutex::new(RuntimeSession {
                 session,
                 config: config.clone(),
+                persisted_active_leaf_id,
             })),
         );
         Ok(config)
@@ -676,11 +688,16 @@ impl SessionDriver {
             .repo
             .load_stored_session(&self.session_id)
             .await?;
+        let persisted_active_leaf_id = stored.active_leaf_id.clone();
         let session = AgentSession::from_stored_session(stored)
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         self.state.active.lock().await.insert(
             self.session_id.clone(),
-            Arc::new(Mutex::new(RuntimeSession { session, config })),
+            Arc::new(Mutex::new(RuntimeSession {
+                session,
+                config,
+                persisted_active_leaf_id,
+            })),
         );
         Ok(())
     }
@@ -1109,13 +1126,18 @@ impl SessionDriver {
             .repo
             .load_stored_session(&self.session_id)
             .await?;
+        let persisted_active_leaf_id = stored.active_leaf_id.clone();
         let mut session = AgentSession::from_stored_session(stored)
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         session
             .resume_model_turn(checkpoint_leaf_id, turn_id, action_id)
             .map_err(history_error_to_rpc)?;
 
-        let active = Arc::new(Mutex::new(RuntimeSession { session, config }));
+        let active = Arc::new(Mutex::new(RuntimeSession {
+            session,
+            config,
+            persisted_active_leaf_id,
+        }));
         self.state
             .active
             .lock()
@@ -1153,17 +1175,20 @@ impl SessionDriver {
         provider_replay: Vec<ProviderReplayItem>,
         control_interrupt_input_id: Option<&str>,
     ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
-        let (mut entries, events, actions, active_leaf_id, config) = {
+        let (mut entries, events, actions, active_leaf_id, active_leaf_changed, config) = {
             let mut runtime = active.lock().await;
             let (entries, events, actions, active_leaf_id) = collect_runtime_outputs(&mut runtime);
+            let active_leaf_changed = runtime.persisted_active_leaf_id != active_leaf_id;
             (
                 entries,
                 events,
                 actions,
                 active_leaf_id,
+                active_leaf_changed,
                 runtime.config.clone(),
             )
         };
+        let provider_replay_attached = !provider_replay.is_empty();
         attach_provider_replay(&mut entries, provider_replay)?;
         let consumed_client_input_id = consumed_input
             .as_ref()
@@ -1172,8 +1197,17 @@ impl SessionDriver {
             .with_action_update(action_update)
             .with_consumed_input(consumed_input)
             .with_accepted_input(accepted_input);
+        if !active_leaf_changed {
+            batch = batch.with_unchanged_active_leaf();
+        }
+        if provider_replay_attached {
+            batch = batch.with_provider_replay_attachment();
+        }
         if let Some(input_id) = control_interrupt_input_id {
             batch = batch.with_control_interrupt(input_id);
+        }
+        if !batch.has_durable_obligations() {
+            return Ok(Vec::new());
         }
         let persisted = self
             .state
@@ -1181,7 +1215,14 @@ impl SessionDriver {
             .persist_outputs(&self.session_id, batch)
             .await;
         let (frames, persisted_actions) = match persisted {
-            Ok(persisted) => persisted,
+            Ok(persisted) => {
+                active
+                    .lock()
+                    .await
+                    .persisted_active_leaf_id
+                    .clone_from(&active_leaf_id);
+                persisted
+            }
             Err(error) => {
                 self.state.active.lock().await.remove(&self.session_id);
                 return Err(error.into());

@@ -27,6 +27,9 @@ impl PostgresAgentStore {
         session_id: &str,
         batch: OutputBatch<'_>,
     ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
+        if !batch.has_durable_obligations() {
+            return Ok((Vec::new(), Vec::new()));
+        }
         let mut tx = self.pool.begin().await?;
         let (frames, dispatch) = persist_outputs_tx(&mut tx, session_id, batch).await?;
         tx.commit().await?;
@@ -42,11 +45,13 @@ pub(super) async fn persist_outputs_tx(
     let OutputBatch {
         entries,
         active_leaf_id,
+        active_leaf_unchanged: _,
         session_events,
         actions,
         action_update,
         consumed_input,
         accepted_input,
+        provider_replay_attached: _,
         control_interrupt_input_id,
     } = batch;
     let had_action_update = action_update.is_some();
@@ -608,3 +613,7 @@ async fn complete_action_tx(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "outputs_tests.rs"]
+mod tests;

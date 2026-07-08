@@ -73,7 +73,7 @@ use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart,
 };
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
-use crate::types::DispatchAction;
+use crate::types::{DispatchAction, RuntimeSession};
 use crate::workspaces::WorkspaceManager;
 
 use super::{
@@ -332,6 +332,37 @@ async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
         )
         .await
         .expect("create parent");
+}
+
+#[tokio::test]
+async fn true_empty_active_output_pass_opens_no_transaction_or_events() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let session_id = "empty-active-output";
+    let project_id = Uuid::new_v4();
+    let active = Arc::new(Mutex::new(RuntimeSession {
+        session: AgentSession::new(),
+        config: session_config(&env, project_id, json!({})),
+        persisted_active_leaf_id: None,
+    }));
+    let mut events = env.state.events.subscribe();
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    env.state.repo.close().await;
+
+    let dispatched = driver
+        .persist_active_outputs(active, None, None, None, Vec::new())
+        .await
+        .expect("empty output does not touch the closed pool");
+
+    assert!(dispatched.is_empty());
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    drop(driver);
+    env.cleanup().await;
 }
 
 fn successful_compaction(summary: &str) -> CompactionCompletion {
