@@ -419,7 +419,24 @@ describe("representative connection gates", () => {
 	it("gates delegation Cancel/Re-run and history switching while local navigation remains present", () => {
 		render(
 			<RunBoardDelegationList
-				delegations={[delegation]}
+				parentSessionId="parent-1"
+				delegations={[
+					delegation,
+					{
+						...delegation,
+						delegation_id: "delegation-2",
+						label: "finished work",
+						status: "done",
+						progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 0 },
+						subagents: delegation.subagents.map((subagent) => ({
+							...subagent,
+							id: "child-2",
+							status: "done",
+							activity: "idle",
+							task_prompt_file: "child-2/task_prompt.md",
+						})),
+					},
+				]}
 				showAllDelegations
 				onToggleShowAllDelegations={() => undefined}
 				onCancelDelegation={() => undefined}
@@ -428,6 +445,8 @@ describe("representative connection gates", () => {
 			/>,
 		);
 		expect((screen.getByRole("button", { name: /cancel/i }) as HTMLButtonElement).disabled).toBe(true);
+		expect((screen.getByRole("button", { name: /re-run/i }) as HTMLButtonElement).disabled).toBe(true);
+		expect(screen.getAllByText(WAITING_FOR_CONNECTION).length).toBeGreaterThanOrEqual(2);
 		cleanup();
 
 		render(
@@ -446,6 +465,7 @@ describe("representative connection gates", () => {
 	it("gates an uncached delegation page but keeps locally cached expansion available", () => {
 		const { rerender } = render(
 			<RunBoardDelegationList
+				parentSessionId="parent-1"
 				delegations={[delegation]}
 				hasMoreDelegations
 				showAllDelegations={false}
@@ -460,6 +480,7 @@ describe("representative connection gates", () => {
 
 		rerender(
 			<RunBoardDelegationList
+				parentSessionId="parent-1"
 				delegations={[delegation]}
 				hasMoreDelegations
 				showAllDelegations={false}

@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
 	canReRunDelegation,
+	delegationKindLabel,
+	delegationNeedsAttention,
+	delegationOutcomeText,
+	delegationProgressSummary,
+	formatDelegationProgress,
+	groupDelegations,
 	isDelegationRunning,
 	reRunParamsForDelegation,
 	delegationHasHandoff,
 	delegationStatusLabel,
+	remainingDelegationWorkCount,
 } from "./delegationBoard.ts";
 import type { Delegation } from "./types.ts";
 
@@ -22,6 +29,9 @@ function fullDelegation(overrides: Partial<Delegation> = {}): Delegation {
 				role: "implement",
 				subagent_type: "full",
 				task_prompt_file: "child-1/task_prompt.md",
+				final_message_file: null,
+				transcript_file: null,
+				outcome: null,
 			},
 		],
 		...overrides,
@@ -42,6 +52,9 @@ function fanoutDelegation(overrides: Partial<Delegation> = {}): Delegation {
 				role: "explore",
 				subagent_type: "read_only",
 				task_prompt_file: "child-a/task_prompt.md",
+				final_message_file: null,
+				transcript_file: null,
+				outcome: null,
 			},
 			{
 				id: "child-b",
@@ -49,6 +62,9 @@ function fanoutDelegation(overrides: Partial<Delegation> = {}): Delegation {
 				role: "explore",
 				subagent_type: "read_only",
 				task_prompt_file: "child-b/task_prompt.md",
+				final_message_file: null,
+				transcript_file: null,
+				outcome: null,
 			},
 		],
 		...overrides,
@@ -62,6 +78,159 @@ describe("isDelegationRunning", () => {
 			expect(isDelegationRunning(fullDelegation({ status }))).toBe(false);
 		}
 	});
+
+describe("delegation triage model", () => {
+	it("groups attention, active, and recent work while preserving server order inside each section", () => {
+		const delegations = [
+			fullDelegation({ delegation_id: "recent-new", status: "done" }),
+			fullDelegation({ delegation_id: "attention-new", status: "failed" }),
+			fullDelegation({ delegation_id: "active-new", status: "running" }),
+			fullDelegation({
+				delegation_id: "partial-failure",
+				status: "running",
+				progress: { expected: 3, spawned: 2, terminal: 1, running: 1, failed: 1 },
+			}),
+			fullDelegation({ delegation_id: "attention-old", status: "done_with_failures" }),
+			fullDelegation({ delegation_id: "active-old", status: "running" }),
+			fullDelegation({ delegation_id: "recent-old", status: "cancelled" }),
+		];
+
+		expect(
+			groupDelegations(delegations).map((section) => ({
+				label: section.label,
+				ids: section.delegations.map((delegation) => delegation.delegation_id),
+			})),
+		).toEqual([
+			{ label: "Needs attention", ids: ["attention-new", "partial-failure", "attention-old"] },
+			{ label: "Active", ids: ["active-new", "active-old"] },
+			{ label: "Recent", ids: ["recent-new", "recent-old"] },
+		]);
+	});
+
+	it("uses available technical failure status/progress, including partial running failures", () => {
+		expect(delegationNeedsAttention(fullDelegation({ status: "failed" }))).toBe(true);
+		expect(
+			delegationNeedsAttention(
+				fullDelegation({
+					status: "running",
+					progress: { expected: 3, spawned: 2, terminal: 1, running: 1, failed: 1 },
+				}),
+			),
+		).toBe(true);
+		expect(
+			delegationNeedsAttention(
+				fullDelegation({
+					subagents: [{
+						id: "review",
+						status: "done",
+						role: "reviewer",
+						task_prompt_file: "review/task_prompt.md",
+						outcome: "changes_requested",
+					}],
+				}),
+			),
+		).toBe(false);
+		expect(
+			delegationNeedsAttention(
+				fullDelegation({
+					subagents: [{
+						id: "review",
+						status: "done",
+						role: "reviewer",
+						task_prompt_file: "review/task_prompt.md",
+						outcome: "approved",
+					}],
+				}),
+			),
+		).toBe(false);
+		expect(
+			delegationNeedsAttention(
+				fullDelegation({
+					status: "cancelled",
+					progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 1 },
+				}),
+			),
+		).toBe(false);
+	});
+
+	it("uses task-centered labels and never infers a product outcome from the list contract's null", () => {
+		expect(delegationKindLabel("full")).toBe("Writing task");
+		expect(delegationKindLabel("readonly_fanout")).toBe("Parallel research");
+		const listContractDone = fullDelegation();
+		expect(delegationOutcomeText(listContractDone)).toBe(
+			"Completed · Outcome details are not available in this handoff",
+		);
+		expect(delegationOutcomeText(listContractDone)).not.toContain("success");
+		expect(delegationOutcomeText(fullDelegation({ status: "failed", subagents: [] }))).toBe(
+			"Failed",
+		);
+	});
+
+	it("renders a known outcome only when a caller actually supplies one", () => {
+		expect(
+			delegationOutcomeText(
+				fullDelegation({
+					subagents: [{
+						id: "review",
+						status: "done",
+						role: "reviewer",
+						task_prompt_file: "review/task_prompt.md",
+						outcome: "changes_requested",
+					}],
+				}),
+			),
+		).toBe("Outcome: Changes requested");
+	});
+});
+
+describe("delegation progress", () => {
+	it("formats every server progress field", () => {
+		const delegation = fanoutDelegation({
+			status: "running",
+			progress: { expected: 4, spawned: 3, terminal: 1, running: 2, failed: 1 },
+		});
+		expect(delegationProgressSummary(delegation)).toEqual({
+			expected: 4,
+			spawned: 3,
+			terminal: 1,
+			running: 2,
+			failed: 1,
+			source: "server",
+		});
+		expect(formatDelegationProgress(delegation)).toBe(
+			"4 expected · 3 spawned · 1 terminal · 2 running · 1 failed",
+		);
+		expect(remainingDelegationWorkCount(delegation)).toEqual({
+			count: 3,
+			unit: "agents/slots",
+		});
+	});
+
+	it("derives only observed child counts when server progress is absent", () => {
+		const delegation = fanoutDelegation({
+			status: "running",
+			progress: null,
+			subagents: [
+				{ id: "done", status: "done", activity: "running", role: "explore" },
+				{ id: "running", status: "running", activity: "running", role: "explore" },
+				{ id: "failed", status: "failed", activity: "idle", role: "explore" },
+				{ id: "queued", status: "queued", activity: "queued", role: "explore" },
+			],
+		});
+		expect(delegationProgressSummary(delegation)).toEqual({
+			expected: null,
+			spawned: 4,
+			terminal: 2,
+			running: 1,
+			failed: 1,
+			source: "children",
+		});
+		expect(formatDelegationProgress(delegation)).toBe(
+			"4 agents shown · 2 terminal · 1 running · 1 failed",
+		);
+		expect(formatDelegationProgress(delegation)).not.toContain("expected");
+	});
+});
 });
 
 describe("delegationStatusLabel", () => {

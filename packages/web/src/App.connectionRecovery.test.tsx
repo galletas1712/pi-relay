@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentApi } from "./agentApi.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import type {
+	Delegation,
 	EventFrame,
 	SessionSnapshot,
 	SessionSummary,
@@ -327,6 +328,292 @@ describe("App connection recovery integration", () => {
 		expect(api.statusListenerCount()).toBe(0);
 		expect(api.eventListenerCount()).toBe(0);
 	});
+
+	it("targets delegation actions to the rendered parent and recovers the exact re-run prompt", async () => {
+		const api = createControllableApi();
+		const running = appDelegation({
+			delegation_id: "cancel-target",
+			label: "Cancel target",
+			status: "running",
+			progress: { expected: 1, spawned: 1, terminal: 0, running: 1, failed: 0 },
+			subagents: [{
+				id: "running-child",
+				status: "running",
+				activity: "running",
+				role: "implementer",
+				subagent_type: "full",
+				task_prompt_file: "running-child/task_prompt.md",
+			}],
+		});
+		const finished = appDelegation({
+			delegation_id: "rerun-target",
+			label: "Re-run target",
+			status: "failed",
+			progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 1 },
+			subagents: [{
+				id: "finished-child",
+				status: "failed",
+				activity: "idle",
+				role: "implementer",
+				subagent_type: "full",
+				task_prompt_file: "finished-child/task_prompt.md",
+			}],
+		});
+		api.listDelegations.mockResolvedValue({
+			parent_session_id: SESSION_ID,
+			has_more: false,
+			delegations: [running, finished],
+		});
+		api.getSession.mockImplementation(async (sessionId: string) => {
+			if (sessionId === SESSION_ID) return sessionSnapshot();
+			return {
+				...sessionSnapshot(),
+				session_id: sessionId,
+				parent_session_id: SESSION_ID,
+				delegation_id: sessionId === "running-child" ? "cancel-target" : "rerun-target",
+				activity: sessionId === "running-child" ? "running" : "idle",
+				active_leaf_id: null,
+				has_transcript_entries: false,
+			};
+		});
+		api.cancelDelegation.mockResolvedValue({ cancelled: true });
+		api.readHandoffFile.mockResolvedValue({
+			delegation_id: "rerun-target",
+			subagent_id: "finished-child",
+			file: "task_prompt.md",
+			content: "repeat the exact implementation",
+		});
+		api.startFullDelegation.mockResolvedValue({
+			delegation_id: "new-delegation",
+			subagent_session_id: "new-child",
+		});
+		const { client, unmount } = renderApp(api);
+		const user = userEvent.setup();
+		await openAndLoad(api);
+
+		const cancelTarget = screen.getByRole("article", { name: /Cancel target/ });
+		await user.click(within(cancelTarget).getByRole("button", { name: "Cancel" }));
+		await emitStatus(api, "closed");
+		const blockedCancel = screen.getByRole("button", { name: "Cancel work" }) as HTMLButtonElement;
+		expect(blockedCancel.disabled).toBe(true);
+		expect(screen.getByRole("alertdialog").textContent).toContain("Waiting for connection");
+		fireEvent.click(blockedCancel);
+		expect(api.cancelDelegation).not.toHaveBeenCalled();
+
+		await emitStatus(api, "open");
+		const enabledCancel = screen.getByRole("button", { name: "Cancel work" }) as HTMLButtonElement;
+		await waitFor(() => expect(enabledCancel.disabled).toBe(false));
+		await user.click(enabledCancel);
+		await waitFor(() => {
+			expect(api.cancelDelegation).toHaveBeenCalledWith(SESSION_ID, "cancel-target");
+		});
+
+		const rerunTarget = screen.getByRole("article", { name: /Re-run target/ });
+		await user.click(within(rerunTarget).getByRole("button", { name: "Re-run" }));
+		await waitFor(() => {
+			expect(api.readHandoffFile).toHaveBeenCalledWith({
+				parentSessionId: SESSION_ID,
+				delegationId: "rerun-target",
+				subagentId: "finished-child",
+				file: "task_prompt.md",
+			});
+			expect(api.startFullDelegation).toHaveBeenCalledWith({
+				parentSessionId: SESSION_ID,
+				role: "implementer",
+				prompt: "repeat the exact implementation",
+				workflow: "workflow-implement-review",
+				label: "Re-run target",
+			});
+		});
+
+		const childRow = screen.getByRole("button", {
+			name: /Open agent implementer, running/,
+		});
+		await user.click(childRow);
+		await waitFor(() => expect(childRow.getAttribute("aria-current")).toBe("page"));
+		expect(api.listDelegations.mock.calls.some(([parent]) => parent === SESSION_ID)).toBe(true);
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
+	it("retries an initial Agents list failure through the canonical query", async () => {
+		const api = createControllableApi();
+		api.listDelegations
+			.mockRejectedValueOnce(new Error("delegation list failed"))
+			.mockResolvedValue({
+				parent_session_id: SESSION_ID,
+				has_more: false,
+				delegations: [],
+			});
+		const { client, unmount } = renderApp(api);
+		const user = userEvent.setup();
+		await openAndLoad(api);
+
+		expect(await screen.findByText("Couldn’t load agents")).toBeTruthy();
+		const callsBeforeRetry = api.listDelegations.mock.calls.length;
+		await user.click(screen.getByRole("button", { name: "Retry" }));
+		await waitFor(() => expect(api.listDelegations).toHaveBeenCalledTimes(callsBeforeRetry + 1));
+		expect(await screen.findByText("No delegated work yet.")).toBeTruthy();
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
+	it("keeps the cached 3-row page through 100-row pending, failure, Retry, success, and offline reopen", async () => {
+		const api = createControllableApi();
+		const firstExpansion = deferred<ReturnType<typeof delegationPage>>();
+		const retryExpansion = deferred<ReturnType<typeof delegationPage>>();
+		const defaultPage = delegationPage(
+			["Recent 1", "Recent 2", "Recent 3"],
+			{ hasMore: true, limit: 3 },
+		);
+		const expandedPage = delegationPage(
+			Array.from({ length: 100 }, (_, index) => `Expanded ${index + 1}`),
+			{ hasMore: true, limit: 100 },
+		);
+		let expansionCalls = 0;
+		api.listDelegations.mockImplementation(async (parentSessionId: string, limit?: number) => {
+			if (parentSessionId !== SESSION_ID) throw new Error("unexpected parent");
+			if (limit === 3) return defaultPage;
+			if (limit === 100) {
+				expansionCalls += 1;
+				return expansionCalls === 1 ? firstExpansion.promise : retryExpansion.promise;
+			}
+			throw new Error(`unexpected delegation limit ${String(limit)}`);
+		});
+		const { client, unmount } = renderApp(api);
+		const user = userEvent.setup();
+		await openAndLoad(api);
+		expect(await screen.findByRole("article", { name: /Recent 1/ })).toBeTruthy();
+
+		await user.click(screen.getByRole("button", { name: /see more/i }));
+		expect(screen.getByRole("article", { name: /Recent 1/ })).toBeTruthy();
+		expect(screen.getByRole("button", { name: /show fewer/i })).toBeTruthy();
+		expect(await screen.findByText("Loading up to 100 delegated tasks…")).toBeTruthy();
+		expect(api.listDelegations).toHaveBeenCalledWith(SESSION_ID, 100);
+
+		firstExpansion.reject(new Error("100-row load failed"));
+		expect(await screen.findByText("Agent refresh failed")).toBeTruthy();
+		expect(screen.getByRole("article", { name: /Recent 1/ })).toBeTruthy();
+		expect(screen.getByRole("button", { name: /show fewer/i })).toBeTruthy();
+
+		const callsBeforeRetry = api.listDelegations.mock.calls.length;
+		const retry = screen.getByRole("button", { name: "Retry" });
+		fireEvent.click(retry);
+		fireEvent.click(retry);
+		await waitFor(() =>
+			expect(api.listDelegations).toHaveBeenCalledTimes(callsBeforeRetry + 1));
+		expect(screen.getByRole("button", { name: "Retrying…" })).toBeTruthy();
+		expect(screen.getByRole("article", { name: /Recent 1/ })).toBeTruthy();
+
+		retryExpansion.resolve(expandedPage);
+		expect(await screen.findByRole("article", { name: /Expanded 100/ })).toBeTruthy();
+		expect(screen.queryByRole("article", { name: /Recent 1/ })).toBeNull();
+		expect(screen.getByText(/Latest 100 shown.*Older delegated work remains unloaded/)).toBeTruthy();
+
+		await user.click(screen.getByRole("button", { name: /show fewer/i }));
+		expect(screen.getByRole("article", { name: /Recent 1/ })).toBeTruthy();
+		expect(screen.queryByRole("article", { name: /Expanded 100/ })).toBeNull();
+		const callsBeforeOfflineReopen = api.listDelegations.mock.calls.length;
+		await emitStatus(api, "closed");
+		const cachedSeeMore = screen.getByRole("button", { name: /see more/i }) as HTMLButtonElement;
+		expect(cachedSeeMore.disabled).toBe(false);
+		await user.click(cachedSeeMore);
+		expect(screen.getByRole("article", { name: /Expanded 100/ })).toBeTruthy();
+		expect(api.listDelegations).toHaveBeenCalledTimes(callsBeforeOfflineReopen);
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
+	it("blocks an uncached expanded page offline and never issues its RPC", async () => {
+		const api = createControllableApi();
+		api.listDelegations.mockResolvedValue(
+			delegationPage(["Recent 1", "Recent 2", "Recent 3"], { hasMore: true, limit: 3 }),
+		);
+		const { client, unmount } = renderApp(api);
+		await openAndLoad(api);
+		expect(await screen.findByRole("article", { name: /Recent 1/ })).toBeTruthy();
+
+		await emitStatus(api, "closed");
+		const callsBeforeClick = api.listDelegations.mock.calls.length;
+		const seeMore = screen.getByRole("button", { name: /see more/i }) as HTMLButtonElement;
+		expect(seeMore.disabled).toBe(true);
+		expect(seeMore.parentElement?.textContent).toContain("Waiting for connection");
+		fireEvent.click(seeMore);
+		expect(api.listDelegations).toHaveBeenCalledTimes(callsBeforeClick);
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
+	it("fences a pending 100-row result when the selected parent changes", async () => {
+		const api = createControllableApi();
+		const staleExpansion = deferred<ReturnType<typeof delegationPage>>();
+		const secondSessionId = "session-2";
+		api.listSessions.mockResolvedValue([
+			sessionSummary(),
+			{
+				...sessionSummary(),
+				session_id: secondSessionId,
+				metadata: { title: "Second parent" },
+			},
+		]);
+		api.getSession.mockImplementation(async (sessionId: string) => ({
+			...sessionSnapshot(),
+			session_id: sessionId,
+			metadata: {
+				title: sessionId === secondSessionId ? "Second parent" : SESSION_TITLE,
+			},
+		}));
+		api.listDelegations.mockImplementation(async (parentSessionId: string, limit?: number) => {
+			if (parentSessionId === SESSION_ID && limit === 3) {
+				return delegationPage(["First parent row"], { hasMore: true, limit: 3 });
+			}
+			if (parentSessionId === SESSION_ID && limit === 100) return staleExpansion.promise;
+			if (parentSessionId === secondSessionId && limit === 3) {
+				return {
+					...delegationPage(["Second parent row"], { hasMore: false, limit: 3 }),
+					parent_session_id: secondSessionId,
+				};
+			}
+			throw new Error(`unexpected delegation request ${parentSessionId}:${String(limit)}`);
+		});
+		const { client, unmount } = renderApp(api);
+		const user = userEvent.setup();
+		await openAndLoad(api);
+		expect(await screen.findByRole("article", { name: /First parent row/ })).toBeTruthy();
+
+		await user.click(screen.getByRole("button", { name: /see more/i }));
+		expect(await screen.findByText("Loading up to 100 delegated tasks…")).toBeTruthy();
+		const secondParentButtons = screen.getAllByRole("button", { name: /Second parent/ });
+		const secondParentNavigation = secondParentButtons.find(
+			(button) => !button.hasAttribute("aria-haspopup"),
+		);
+		if (!secondParentNavigation) throw new Error("missing second parent navigation");
+		await user.click(secondParentNavigation);
+
+		expect(await screen.findByRole("article", { name: /Second parent row/ })).toBeTruthy();
+		expect(screen.queryByRole("article", { name: /First parent row/ })).toBeNull();
+		staleExpansion.resolve(
+			delegationPage(["Stale expanded parent row"], { hasMore: false, limit: 100 }),
+		);
+		await act(async () => {
+			await staleExpansion.promise;
+			await Promise.resolve();
+		});
+		expect(screen.queryByRole("article", { name: /Stale expanded parent row/ })).toBeNull();
+		expect(screen.getByRole("article", { name: /Second parent row/ })).toBeTruthy();
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
 });
 
 const SESSION_ID = "session-1";
@@ -340,6 +627,7 @@ type ControllableApi = AgentApi & {
 	close: ApiSpy;
 	listProjects: ApiSpy;
 	listSessions: ApiSpy;
+	listDelegations: ApiSpy;
 	getSession: ApiSpy;
 	getTranscriptTurns: ApiSpy;
 	getTranscriptTurnDetail: ApiSpy;
@@ -359,6 +647,7 @@ type ControllableApi = AgentApi & {
 	cancelQueuedInput: ApiSpy;
 	reorderQueuedFollowUps: ApiSpy;
 	requestCompaction: ApiSpy;
+	readHandoffFile: ApiSpy;
 	startFullDelegation: ApiSpy;
 	startReadonlyDelegationFanout: ApiSpy;
 	cancelDelegation: ApiSpy;
@@ -577,6 +866,36 @@ function sessionSummary(): SessionSummary {
 		created_at: "2026-01-01T00:00:00Z",
 		updated_at: "2026-01-01T00:00:01Z",
 		has_transcript_entries: true,
+	};
+}
+
+function delegationPage(
+	labels: string[],
+	{ hasMore, limit }: { hasMore: boolean; limit: number },
+) {
+	return {
+		parent_session_id: SESSION_ID,
+		limit,
+		has_more: hasMore,
+		delegations: labels.map((label, index) =>
+			appDelegation({
+				delegation_id: `delegation-${limit}-${index + 1}`,
+				label,
+				subagents: [],
+			})),
+	};
+}
+
+function appDelegation(overrides: Partial<Delegation> = {}): Delegation {
+	return {
+		delegation_id: "delegation-1",
+		kind: "full",
+		status: "done",
+		workflow: "workflow-implement-review",
+		label: "Delegated work",
+		progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 0 },
+		subagents: [],
+		...overrides,
 	};
 }
 

@@ -31,6 +31,7 @@ import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
 import { isDelegationRunning, reRunParamsForDelegation, subagentHasNonEmptyPromptFile } from "./delegationBoard.ts";
+import { DelegationListRetryController } from "./delegationListRetryController.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
@@ -326,6 +327,7 @@ export function App() {
 	const lastAwakeAt = useRef(Date.now());
 	const foregroundReconnectInFlight = useRef<Promise<void> | null>(null);
 	const connectionRetryController = useRef(new ConnectionRetryController());
+	const delegationListRetryController = useRef(new DelegationListRetryController());
 	const handleSessionEventRef = useRef<(event: EventFrame) => void>(() => undefined);
 	const connectionRemoteActionBlockedReason = remoteActionBlockedReason(connection);
 	const cachedHistoryAvailable = hasCanonicalCachedHistory(selectedCache, selectedId);
@@ -612,26 +614,32 @@ export function App() {
 		enabled: connection === "open",
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
+	// A selected child keeps its direct parent's board visible so the child row
+	// can expose current navigation semantics. This intentionally follows only
+	// the canonical direct parent; it does not infer a root or traverse a graph.
+	const delegationParentSessionId =
+		loadedSnapshot?.parent_session_id ?? loadedSnapshot?.session_id ?? null;
 	const expandedDelegationQueryKey = queryKeys.delegations(
-		loadedSnapshot?.session_id ?? null,
+		delegationParentSessionId,
 		RUN_BOARD_EXPANDED_DELEGATION_COUNT,
 	);
 	const expandedDelegationsAvailable =
-		!!loadedSnapshot &&
+		!!delegationParentSessionId &&
 		queryClient.getQueryData(expandedDelegationQueryKey) !== undefined;
-	const useExpandedDelegations =
-		showAllDelegations ||
-		(connectionRemoteActionBlockedReason !== null && expandedDelegationsAvailable);
-	const delegationListLimit =
-		useExpandedDelegations ? RUN_BOARD_EXPANDED_DELEGATION_COUNT : RUN_BOARD_DEFAULT_DELEGATION_COUNT;
-	const delegationsQuery = useQuery({
-		queryKey: queryKeys.delegations(loadedSnapshot?.session_id ?? null, delegationListLimit),
+	const defaultDelegationsQuery = useQuery({
+		queryKey: queryKeys.delegations(
+			delegationParentSessionId,
+			RUN_BOARD_DEFAULT_DELEGATION_COUNT,
+		),
 		queryFn: () => {
-			if (!loadedSnapshot) throw new Error("select a session first");
+			if (!delegationParentSessionId) throw new Error("select a session first");
 			assertServerReadAllowed();
-			return api.listDelegations(loadedSnapshot.session_id, delegationListLimit);
+			return api.listDelegations(
+				delegationParentSessionId,
+				RUN_BOARD_DEFAULT_DELEGATION_COUNT,
+			);
 		},
-		enabled: connection === "open" && !!loadedSnapshot,
+		enabled: connection === "open" && !!delegationParentSessionId,
 		// The parent PARKS (goes idle) while a delegation runs, so gate the poll
 		// on whether any delegation is actually running — not on the parent's
 		// activity — or the missed-event safety net would be off exactly when
@@ -639,12 +647,112 @@ export function App() {
 		refetchInterval: (query) =>
 			(query.state.data?.delegations ?? []).some(isDelegationRunning) ? 2_000 : false,
 	});
-	const delegations = delegationsQuery.data?.delegations ?? [];
-	const hasMoreDelegations = delegationsQuery.data?.has_more ?? false;
+	const expandedDelegationsQuery = useQuery({
+		queryKey: expandedDelegationQueryKey,
+		queryFn: () => {
+			if (!delegationParentSessionId) throw new Error("select a session first");
+			assertServerReadAllowed();
+			return api.listDelegations(
+				delegationParentSessionId,
+				RUN_BOARD_EXPANDED_DELEGATION_COUNT,
+			);
+		},
+		enabled:
+			connection === "open" &&
+			!!delegationParentSessionId &&
+			showAllDelegations,
+		refetchInterval: (query) =>
+			(query.state.data?.delegations ?? []).some(isDelegationRunning) ? 2_000 : false,
+	});
+	const displayedDelegationsQuery =
+		showAllDelegations && expandedDelegationsQuery.data
+			? expandedDelegationsQuery
+			: defaultDelegationsQuery;
+	const delegationListRetryScope = useMemo(
+		() => ({
+			parentSessionId: delegationParentSessionId,
+			limit: showAllDelegations
+				? RUN_BOARD_EXPANDED_DELEGATION_COUNT
+				: RUN_BOARD_DEFAULT_DELEGATION_COUNT,
+		}),
+		[delegationParentSessionId, showAllDelegations],
+	);
+	const retryDelegations = useCallback(() => {
+		try {
+			assertServerReadAllowed();
+		} catch (error) {
+			pushNotice("error", errorMessage(error));
+			return;
+		}
+		const refetch = showAllDelegations
+			? expandedDelegationsQuery.refetch
+			: defaultDelegationsQuery.refetch;
+		void delegationListRetryController.current.retry(
+			delegationListRetryScope,
+			refetch,
+		);
+	}, [
+		assertServerReadAllowed,
+		defaultDelegationsQuery.refetch,
+		delegationListRetryScope,
+		expandedDelegationsQuery.refetch,
+		pushNotice,
+		showAllDelegations,
+	]);
+	const delegations = displayedDelegationsQuery.data?.delegations ?? [];
+	const hasMoreDelegations =
+		(showAllDelegations
+			? expandedDelegationsQuery.data?.has_more
+			: defaultDelegationsQuery.data?.has_more) ??
+		defaultDelegationsQuery.data?.has_more ??
+		false;
+	const delegationsLoading = showAllDelegations
+		? expandedDelegationsQuery.isFetching
+		: defaultDelegationsQuery.isLoading;
+	const delegationErrorScope = `${delegationParentSessionId ?? ""}:${
+		showAllDelegations
+			? RUN_BOARD_EXPANDED_DELEGATION_COUNT
+			: RUN_BOARD_DEFAULT_DELEGATION_COUNT
+	}`;
+	const retainedDelegationErrorRef = useRef<{
+		scope: string;
+		error: unknown;
+	}>({ scope: delegationErrorScope, error: null });
+	if (retainedDelegationErrorRef.current.scope !== delegationErrorScope) {
+		retainedDelegationErrorRef.current = {
+			scope: delegationErrorScope,
+			error: null,
+		};
+	}
+	const currentDelegationError = showAllDelegations
+		? expandedDelegationsQuery.error ?? (
+			expandedDelegationsQuery.data ? null : defaultDelegationsQuery.error
+		)
+		: defaultDelegationsQuery.error;
+	if (currentDelegationError) {
+		retainedDelegationErrorRef.current.error = currentDelegationError;
+	} else if (
+		(showAllDelegations
+			? expandedDelegationsQuery.data
+			: defaultDelegationsQuery.data) !== undefined &&
+		!(showAllDelegations
+			? expandedDelegationsQuery.isFetching
+			: defaultDelegationsQuery.isFetching)
+	) {
+		retainedDelegationErrorRef.current.error = null;
+	}
+	const delegationsError = errorMessageOrNull(
+		currentDelegationError ?? retainedDelegationErrorRef.current.error,
+	);
+	const delegationsRetrying = showAllDelegations
+		? expandedDelegationsQuery.isFetching
+		: defaultDelegationsQuery.isFetching;
 	// `delegating` status for the selected session: the parent reports idle while
 	// its subagents are still in flight. Only known for the selected session,
 	// whose delegations are fetched above.
-	const hasRunningDelegations = delegations.some(isDelegationRunning);
+	const hasRunningDelegations =
+		loadedSnapshot?.session_id === delegationParentSessionId &&
+		delegations.some(isDelegationRunning);
 	const delegationSubagentIds = useMemo(
 		() => delegations.flatMap((delegation) => delegation.subagents.map((subagent) => subagent.id)),
 		[delegations],
@@ -1321,12 +1429,12 @@ export function App() {
 				for (const projectId of sessionListProjectTargets(eventProjectId)) {
 					scheduleSessionListRefresh(projectId);
 				}
-				if (loadedSnapshot?.session_id) {
+				if (delegationParentSessionId) {
 					// The run board reads the delegation.* surface; the backend emits no
 					// dedicated delegation events, so the subagent lifecycle events (and
 					// the typed completion observation landing in the parent transcript) are the
 					// signal to refresh the board. The 2s poll covers any missed event.
-					void queryClient.invalidateQueries({ queryKey: delegationQueryPrefix(loadedSnapshot.session_id) });
+					void queryClient.invalidateQueries({ queryKey: delegationQueryPrefix(delegationParentSessionId) });
 				}
 			}
 
@@ -1354,6 +1462,7 @@ export function App() {
 			replaceSelectedCache,
 			scheduleActiveBranchSync,
 			scheduleSessionListRefresh,
+			delegationParentSessionId,
 			loadedSnapshot?.session_id,
 			loadedSnapshot?.project_id,
 		],
@@ -2000,71 +2109,51 @@ export function App() {
 		}
 	}, [api, assertServerMutationAllowed, pushNotice, queryClient, requireSelected, syncActiveBranchNow]);
 
-	const invalidateDelegations = useCallback(() => {
-		if (loadedSnapshot?.session_id) {
-			void queryClient.invalidateQueries({ queryKey: delegationQueryPrefix(loadedSnapshot.session_id) });
-		}
-	}, [loadedSnapshot?.session_id, queryClient]);
+	const invalidateDelegations = useCallback(
+		(parentSessionId: string) =>
+			queryClient.invalidateQueries({ queryKey: delegationQueryPrefix(parentSessionId) }),
+		[queryClient],
+	);
 
 	const cancelDelegation = useCallback(
-		(delegationId: string) => {
-			try {
-				assertServerMutationAllowed();
-			} catch (error) {
-				pushNotice("error", errorMessage(error));
-				return;
-			}
-			const parentSessionId = loadedSnapshot?.session_id;
-			if (!parentSessionId) return;
-			void api
-				.cancelDelegation(parentSessionId, delegationId)
-				.then(() => invalidateDelegations())
-				.catch((error) => pushNotice("error", errorMessage(error)));
+		async (parentSessionId: string, delegationId: string) => {
+			assertServerMutationAllowed();
+			await api.cancelDelegation(parentSessionId, delegationId);
+			await invalidateDelegations(parentSessionId);
 		},
-		[api, assertServerMutationAllowed, invalidateDelegations, loadedSnapshot?.session_id, pushNotice],
+		[api, assertServerMutationAllowed, invalidateDelegations],
 	);
 
 	const reRunDelegation = useCallback(
-		(delegation: Delegation) => {
-			try {
-				assertServerMutationAllowed();
-			} catch (error) {
-				pushNotice("error", errorMessage(error));
-				return;
+		async (parentSessionId: string, delegation: Delegation) => {
+			assertServerMutationAllowed();
+			const promptPairs = await Promise.all(
+				delegation.subagents.map(async (subagent): Promise<[string, string | null]> => {
+					if (!subagentHasNonEmptyPromptFile(subagent)) return [subagent.id, null];
+					assertServerReadAllowed();
+					const result = await api.readHandoffFile({
+						parentSessionId,
+						delegationId: delegation.delegation_id,
+						subagentId: subagent.id,
+						file: "task_prompt.md",
+					});
+					return [subagent.id, result.content];
+				}),
+			);
+			const resolvedPrompts = new Map<string, string>();
+			for (const [subagentId, prompt] of promptPairs) {
+				if (typeof prompt === "string") resolvedPrompts.set(subagentId, prompt);
 			}
-			const parentSessionId = loadedSnapshot?.session_id;
-			if (!parentSessionId) return;
-			void (async () => {
-				const promptPairs = await Promise.all(
-					delegation.subagents.map(async (subagent): Promise<[string, string | null]> => {
-						if (!subagentHasNonEmptyPromptFile(subagent)) return [subagent.id, null];
-						assertServerReadAllowed();
-						const result = await api.readHandoffFile({
-							parentSessionId,
-							delegationId: delegation.delegation_id,
-							subagentId: subagent.id,
-							file: "task_prompt.md",
-						});
-						return [subagent.id, result.content];
-					}),
-				);
-				const resolvedPrompts = new Map<string, string>();
-				for (const [subagentId, prompt] of promptPairs) {
-					if (typeof prompt === "string") resolvedPrompts.set(subagentId, prompt);
-				}
-				const reRun = reRunParamsForDelegation(delegation, parentSessionId, resolvedPrompts);
-				if (!reRun) {
-					pushNotice("error", "cannot re-run: original prompts are unavailable");
-					return;
-				}
-				const start =
-					reRun.kind === "full" ? api.startFullDelegation(reRun.params) : api.startReadonlyDelegationFanout(reRun.params);
-				await start;
-				invalidateDelegations();
-			})()
-				.catch((error) => pushNotice("error", errorMessage(error)));
+			const reRun = reRunParamsForDelegation(delegation, parentSessionId, resolvedPrompts);
+			if (!reRun) throw new Error("Cannot re-run: original prompts are unavailable");
+			const start =
+				reRun.kind === "full"
+					? api.startFullDelegation(reRun.params)
+					: api.startReadonlyDelegationFanout(reRun.params);
+			await start;
+			await invalidateDelegations(parentSessionId);
 		},
-		[api, assertServerMutationAllowed, assertServerReadAllowed, invalidateDelegations, loadedSnapshot?.session_id, pushNotice],
+		[api, assertServerMutationAllowed, assertServerReadAllowed, invalidateDelegations],
 	);
 
 	const resumeTerminalTurn = useCallback(
@@ -2690,13 +2779,21 @@ export function App() {
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
 				<Inspector
 					snapshot={loadedSnapshot}
+					runBoardParentSessionId={delegationParentSessionId}
 					delegations={delegations}
 					hasMoreDelegations={hasMoreDelegations}
-					delegationsLoading={delegationsQuery.isLoading}
-					delegationsError={errorMessageOrNull(delegationsQuery.error)}
+					delegationsLoading={delegationsLoading}
+					delegationsError={delegationsError}
 					showAllDelegations={showAllDelegations}
 					expandedDelegationsAvailable={expandedDelegationsAvailable}
 					onToggleShowAllDelegations={() => setShowAllDelegations((current) => !current)}
+					onRetryDelegations={retryDelegations}
+					delegationsRetrying={delegationsRetrying}
+					selectedSessionId={selectedId}
+					boundedExpansionHasMore={
+						showAllDelegations &&
+						!!expandedDelegationsQuery.data?.has_more
+					}
 					runBoard={{
 						onCancelDelegation: cancelDelegation,
 						onReRunDelegation: reRunDelegation,
