@@ -6,6 +6,7 @@ import {
 	useContext,
 	useRef,
 	type ComponentPropsWithoutRef,
+	type ComponentPropsWithRef,
 	type ReactNode,
 	type RefObject,
 } from "react";
@@ -162,7 +163,7 @@ export function DialogHeading({ children }: { children: ReactNode }) {
 export function DialogTitle({
 	children,
 	...props
-}: ComponentPropsWithoutRef<typeof DialogPrimitive.Title>) {
+}: ComponentPropsWithRef<typeof DialogPrimitive.Title>) {
 	const kind = useContext(DialogKindContext);
 	return kind === "alertdialog" ? (
 		<AlertDialogPrimitive.Title {...props}>{children}</AlertDialogPrimitive.Title>

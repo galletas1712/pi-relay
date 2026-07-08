@@ -63,6 +63,7 @@ export function submissionIdsForDraft(
 
 export interface ComposerHandle {
 	focus(): void;
+	focusTarget(): HTMLElement | null;
 	getValue(): string;
 	setValue(value: string): void;
 	clearSession(sessionId: string | null): void;
@@ -202,6 +203,7 @@ export const Composer = memo(function Composer({
 	useEffect(() => {
 		composerHandleRef.current = {
 			focus: () => textAreaRef.current?.focus(),
+			focusTarget: () => textAreaRef.current,
 			getValue: () => draftRef.current,
 			setValue: (value) => setDraftValue(value),
 			restoreSubmittedDraft: (sessionId, value) => restoreSubmittedDraft(sessionId, value),
@@ -260,7 +262,11 @@ export const Composer = memo(function Composer({
 		});
 		draftRef.current = "";
 		setDraft("");
-		requestAnimationFrame(() => textAreaRef.current?.focus());
+		requestAnimationFrame(() => {
+			// A slash command can mount a modal before this callback runs.
+			// Never pull focus back behind that modal.
+			if (!document.querySelector('[role="dialog"], [role="alertdialog"]')) textAreaRef.current?.focus();
+		});
 		const accepted = await onSubmit({
 			sessionId: submittedSessionId,
 			text,
