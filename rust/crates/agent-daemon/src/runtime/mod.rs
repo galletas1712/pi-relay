@@ -1222,6 +1222,9 @@ impl SessionDriver {
             .repo
             .pending_actions_for_dispatch(&self.session_id)
             .await?;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
         let config = self
             .state
             .repo
