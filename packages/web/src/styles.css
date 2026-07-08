@@ -95,6 +95,16 @@
 	--elev-pop: 0 12px 40px color-mix(in oklch, var(--foreground) 14%, transparent);
 }
 
+.chip-button:disabled {
+	cursor: not-allowed;
+	opacity: 0.55;
+}
+
+.queue-blocked-reason,
+.history-blocked-reason {
+	margin: 7px 10px 0;
+}
+
 .project-dialog {
 	width: min(760px, calc(100vw - 48px));
 }
@@ -508,6 +518,17 @@ pre {
 	color: inherit;
 	text-align: left;
 	cursor: pointer;
+}
+
+.slash-row:disabled {
+	cursor: not-allowed;
+	opacity: 0.68;
+}
+
+.slash-disabled-reason {
+	grid-column: 2;
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
 }
 
 .project-main {
@@ -1295,7 +1316,10 @@ pre {
 
 .turn-card-load-older {
 	display: flex;
+	flex-wrap: wrap;
 	justify-content: center;
+	align-items: center;
+	gap: 8px;
 	margin: 2px 0 8px;
 }
 
@@ -2544,6 +2568,14 @@ pre {
 	padding: 12px 16px 14px;
 }
 
+.dialog-blocked-reason {
+	margin-right: auto;
+}
+
+.header-blocked-reason {
+	max-width: 140px;
+}
+
 .rename-actions .primary-button,
 .rename-actions .secondary-button,
 .dialog-footer .primary-button,
@@ -2883,6 +2915,66 @@ pre {
 	padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
 }
 
+.connection-recovery-banner {
+	display: flex;
+	width: min(920px, 100%);
+	min-height: 36px;
+	align-items: center;
+	gap: 9px;
+	margin: 0 auto 8px;
+	border: 1px solid color-mix(in oklch, var(--warning) 42%, var(--border));
+	border-radius: var(--radius);
+	background: color-mix(in oklch, var(--warning) 8%, var(--card));
+	padding: 6px 8px 6px 10px;
+	color: var(--warning);
+}
+
+.connection-recovery-banner.unavailable {
+	border-color: color-mix(in oklch, var(--destructive) 36%, var(--border));
+	background: color-mix(in oklch, var(--destructive) 7%, var(--card));
+	color: var(--destructive);
+}
+
+.connection-recovery-copy {
+	display: flex;
+	min-width: 0;
+	flex: 1;
+	align-items: baseline;
+	gap: 8px;
+}
+
+.connection-recovery-copy strong {
+	flex: 0 0 auto;
+	font-size: var(--text-sm);
+}
+
+.connection-recovery-copy span {
+	overflow: hidden;
+	color: var(--foreground);
+	font-size: var(--text-xs);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.connection-retry-button {
+	flex: 0 0 auto;
+	gap: 5px;
+}
+
+.connection-blocked-reason {
+	display: inline-flex;
+	align-items: center;
+	border-radius: var(--radius-sm);
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+	line-height: 1.35;
+}
+
+.connection-blocked-reason:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
+}
+
 .composer-wrap {
 	position: relative;
 	display: grid;
@@ -2890,6 +2982,12 @@ pre {
 	gap: 8px;
 	max-width: 920px;
 	margin: 0 auto;
+}
+
+.composer-blocked-reason {
+	grid-column: 1 / -1;
+	grid-row: 2;
+	justify-self: end;
 }
 
 .composer {
@@ -3437,6 +3535,10 @@ pre {
 	gap: 6px;
 }
 
+.run-board-blocked-reason {
+	flex-basis: 100%;
+}
+
 .chip-button {
 	display: inline-flex;
 	align-items: center;
@@ -3856,6 +3958,27 @@ pre {
 
 	.chat-dock {
 		padding: 8px max(10px, env(safe-area-inset-right, 0px)) calc(8px + env(safe-area-inset-bottom, 0px)) max(10px, env(safe-area-inset-left, 0px));
+	}
+
+	.connection-recovery-banner {
+		align-items: flex-start;
+		flex-wrap: wrap;
+		padding: 8px 9px;
+	}
+
+	.connection-recovery-copy {
+		align-items: flex-start;
+		flex-direction: column;
+		gap: 1px;
+	}
+
+	.connection-recovery-copy span {
+		overflow: visible;
+		white-space: normal;
+	}
+
+	.connection-retry-button {
+		width: 100%;
 	}
 
 	.composer-wrap {

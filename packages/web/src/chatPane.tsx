@@ -20,6 +20,8 @@ export interface ChatPaneProps {
 	modelValue: string;
 	modelLocked: boolean;
 	modelControlsDisabled: boolean;
+	mutationBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	rightOpen: boolean;
@@ -54,6 +56,8 @@ export const ChatPane = memo(function ChatPane({
 	modelValue,
 	modelLocked,
 	modelControlsDisabled,
+	mutationBlockedReason,
+	remoteReadBlockedReason,
 	reasoningEfforts,
 	reasoningEffort,
 	rightOpen,
@@ -85,6 +89,7 @@ export const ChatPane = memo(function ChatPane({
 				modelValue={modelValue}
 				modelLocked={modelLocked}
 				modelControlsDisabled={modelControlsDisabled}
+				mutationBlockedReason={mutationBlockedReason}
 				reasoningEfforts={reasoningEfforts}
 				reasoningEffort={reasoningEffort}
 				rightOpen={rightOpen}
@@ -111,6 +116,8 @@ export const ChatPane = memo(function ChatPane({
 				onNewSession={onNewSession}
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}
+				resumeBlockedReason={mutationBlockedReason}
+				remoteReadBlockedReason={remoteReadBlockedReason}
 				onExpandTurn={onExpandTurn}
 				onCollapseTurn={onCollapseTurn}
 				loadingTurnId={loadingTurnId}
@@ -134,6 +141,7 @@ interface ChatHeaderProps {
 	modelValue: string;
 	modelLocked: boolean;
 	modelControlsDisabled: boolean;
+	mutationBlockedReason?: string | null;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	rightOpen: boolean;
@@ -151,6 +159,7 @@ const ChatHeader = memo(function ChatHeader({
 	modelValue,
 	modelLocked,
 	modelControlsDisabled,
+	mutationBlockedReason,
 	reasoningEfforts,
 	reasoningEffort,
 	rightOpen,
@@ -160,7 +169,14 @@ const ChatHeader = memo(function ChatHeader({
 	onToggleRight
 }: ChatHeaderProps) {
 	const archived = session ? isArchivedSession(session) : false;
-	const modelDisabled = modelLocked || modelControlsDisabled;
+	const modelDisabled = modelLocked || modelControlsDisabled || !!mutationBlockedReason;
+	const configurationBlockedReason =
+		mutationBlockedReason ??
+		(modelControlsDisabled
+			? "Available when the session is idle."
+			: modelLocked
+				? "Model is locked after the first transcript entry."
+				: null);
 	const displayedModelOptions = modelOptions.some((option) => option.id === modelValue)
 		? modelOptions
 		: [{ id: modelValue, label: modelValue }, ...modelOptions];
@@ -176,7 +192,9 @@ const ChatHeader = memo(function ChatHeader({
 			modelOptions={displayedModelOptions}
 			modelValue={modelValue}
 			modelDisabled={modelDisabled}
-			modelDisabledTitle={modelLocked ? "Model is locked after the first transcript entry" : "Model"}
+			modelDisabledTitle={modelLocked ? "Model is locked after the first transcript entry" : configurationBlockedReason ?? "Model"}
+			reasoningDisabled={modelControlsDisabled || !!mutationBlockedReason}
+			controlsBlockedReason={configurationBlockedReason}
 			reasoningEfforts={displayedEfforts}
 			reasoningEffort={reasoningEffort}
 			rightOpen={rightOpen}

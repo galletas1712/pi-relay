@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
 import { ArrowDown, ArrowUp, Check, Edit3, Loader2, Send, ShipWheel, Square, Trash2, X } from "lucide-react";
 import type { ComposerSubmission } from "./composerRouting.ts";
+import { composerTextNeedsConnection, ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { randomId } from "./ids.ts";
 import { COMMANDS, filterCommands, matchSlashPrefix, type SlashCommandInfo } from "./slash.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
@@ -80,6 +81,8 @@ export const Composer = memo(function Composer({
 	canStop,
 	stopping,
 	queuedInputs,
+	mutationBlockedReason,
+	cachedHistoryAvailable = false,
 	onSubmit,
 	onStop,
 	onPromoteQueued,
@@ -94,6 +97,8 @@ export const Composer = memo(function Composer({
 	canStop: boolean;
 	stopping: boolean;
 	queuedInputs: QueuedInput[];
+	mutationBlockedReason?: string | null;
+	cachedHistoryAvailable?: boolean;
 	onSubmit: (submission: ComposerSubmission) => Promise<boolean> | boolean;
 	onStop: () => void;
 	onPromoteQueued: (inputId: string) => void;
@@ -248,7 +253,13 @@ export const Composer = memo(function Composer({
 
 	const sendDraft = useCallback(async () => {
 		const text = draftRef.current.trim();
-		if (!text || sending) return;
+		if (
+			!text ||
+			sending ||
+			(mutationBlockedReason && composerTextNeedsConnection(text, { cachedHistoryAvailable }))
+		) {
+			return;
+		}
 		const submittedSessionId = selectedIdRef.current;
 		const key = composerDraftKey(submittedSessionId);
 		const previous = pendingSubmittedDraftsRef.current.get(key);
@@ -278,7 +289,7 @@ export const Composer = memo(function Composer({
 		} else {
 			restoreSubmittedDraft(submittedSessionId, text, submittedVersion);
 		}
-	}, [clearSubmittedDraft, onSubmit, restoreSubmittedDraft, sending, storeDraft]);
+	}, [cachedHistoryAvailable, clearSubmittedDraft, mutationBlockedReason, onSubmit, restoreSubmittedDraft, sending, storeDraft]);
 
 	const onKeyDown = useCallback(
 		(event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -322,12 +333,15 @@ export const Composer = memo(function Composer({
 				commands={slashState.commands}
 				visible={slashState.visible}
 				selectedIndex={slashIndex}
+				mutationBlockedReason={mutationBlockedReason}
+				cachedHistoryAvailable={cachedHistoryAvailable}
 				onSetIndex={setSlashIndex}
 				onSelect={(command) => setDraftValue(`/${command.name} `)}
 			/>
 			<QueuedInputPane
 				inputs={queuedInputs}
 				visible={queuedInputs.length > 0 && !slashState.visible}
+				mutationBlockedReason={mutationBlockedReason}
 				onPromote={onPromoteQueued}
 				onUpdate={onUpdateQueued}
 				onCancel={onCancelQueued}
@@ -354,7 +368,8 @@ export const Composer = memo(function Composer({
 				className="stop-button"
 				type="button"
 				onClick={onStop}
-				disabled={!canStop || stopping}
+				disabled={!canStop || stopping || !!mutationBlockedReason}
+				aria-busy={stopping}
 				title="stop active turn"
 				aria-label="stop active turn"
 			>
@@ -364,12 +379,18 @@ export const Composer = memo(function Composer({
 				className="send-button"
 				type="button"
 				onClick={() => void sendDraft()}
-				disabled={sending || !draft.trim()}
+				disabled={
+					sending ||
+					!draft.trim() ||
+					(!!mutationBlockedReason && composerTextNeedsConnection(draft, { cachedHistoryAvailable }))
+				}
+				aria-busy={sending}
 				title="send (Cmd+Enter)"
 				aria-label="send message"
 			>
 				{sending ? <Loader2 className="spin" size={16} /> : <Send size={16} />}
 			</button>
+			<ConnectionBlockedReason reason={mutationBlockedReason} className="composer-blocked-reason" />
 		</div>
 	);
 });
@@ -377,6 +398,7 @@ export const Composer = memo(function Composer({
 export function QueuedInputPane({
 	inputs,
 	visible,
+	mutationBlockedReason,
 	onPromote,
 	onUpdate,
 	onCancel,
@@ -384,6 +406,7 @@ export function QueuedInputPane({
 }: {
 	inputs: QueuedInput[];
 	visible: boolean;
+	mutationBlockedReason?: string | null;
 	onPromote: (inputId: string) => void;
 	onUpdate: (inputId: string, text: string) => void;
 	onCancel: (inputId: string) => void;
@@ -411,6 +434,7 @@ export function QueuedInputPane({
 				<span>Queued messages</span>
 				<code>{inputs.length}</code>
 			</div>
+			<ConnectionBlockedReason reason={mutationBlockedReason} className="queue-blocked-reason" />
 			<div className="queue-list">
 				{inputs.map((input) => {
 					const canPromote = input.priority === "follow_up" && input.status === "queued";
@@ -442,7 +466,7 @@ export function QueuedInputPane({
 											onUpdate(input.input_id, nextText);
 											setEditingId(null);
 										}}
-										disabled={!editingText.trim()}
+										disabled={!editingText.trim() || !!mutationBlockedReason}
 										title="save queued message"
 										aria-label="save queued message"
 									>
@@ -467,7 +491,7 @@ export function QueuedInputPane({
 										className="queue-icon-button"
 										type="button"
 										onClick={() => onMove(input.input_id, "up")}
-										disabled={!canMutate || followUpIndex <= 0}
+										disabled={!canMutate || followUpIndex <= 0 || !!mutationBlockedReason}
 										title="move queued follow-up up"
 										aria-label="move queued follow-up up"
 									>
@@ -477,7 +501,7 @@ export function QueuedInputPane({
 										className="queue-icon-button"
 										type="button"
 										onClick={() => onMove(input.input_id, "down")}
-										disabled={!canMutate || followUpIndex < 0 || followUpIndex >= followUpIds.length - 1}
+										disabled={!canMutate || followUpIndex < 0 || followUpIndex >= followUpIds.length - 1 || !!mutationBlockedReason}
 										title="move queued follow-up down"
 										aria-label="move queued follow-up down"
 									>
@@ -500,7 +524,7 @@ export function QueuedInputPane({
 										className="queue-icon-button destructive"
 										type="button"
 										onClick={() => onCancel(input.input_id)}
-										disabled={!canMutate}
+										disabled={!canMutate || !!mutationBlockedReason}
 										title={canMutate ? "delete queued follow-up" : "steering messages cannot be deleted here"}
 										aria-label="delete queued follow-up"
 									>
@@ -512,7 +536,7 @@ export function QueuedInputPane({
 								className="queue-steer-button"
 								type="button"
 								onClick={() => onPromote(input.input_id)}
-								disabled={!canPromote}
+								disabled={!canPromote || !!mutationBlockedReason}
 								title={canPromote ? "promote to steer" : "already steering"}
 								aria-label={canPromote ? "promote to steer" : "already steering"}
 							>
@@ -588,25 +612,35 @@ export function SlashMenu({
 	commands,
 	visible,
 	selectedIndex,
+	mutationBlockedReason,
+	cachedHistoryAvailable = false,
 	onSetIndex,
 	onSelect
 }: {
 	commands: typeof COMMANDS;
 	visible: boolean;
 	selectedIndex: number;
+	mutationBlockedReason?: string | null;
+	cachedHistoryAvailable?: boolean;
 	onSetIndex: (index: number) => void;
 	onSelect: (command: SlashCommandInfo) => void;
 }) {
 	if (!visible || commands.length === 0) return null;
 	return (
 		<div className="slash-menu" role="listbox" aria-label="slash commands">
-			{commands.map((command, index) => (
+			{commands.map((command, index) => {
+				const connectionRequired = composerTextNeedsConnection(
+					`/${command.name}`,
+					{ cachedHistoryAvailable },
+				);
+				return (
 				<button
 					type="button"
 					key={command.name}
 					className={`slash-row ${index === selectedIndex ? "selected" : ""}`}
 					role="option"
 					aria-selected={index === selectedIndex}
+					disabled={!!mutationBlockedReason && connectionRequired}
 					onMouseEnter={() => onSetIndex(index)}
 					onMouseDown={(event) => {
 						event.preventDefault();
@@ -618,8 +652,12 @@ export function SlashMenu({
 						{command.argumentHint ? <small>{command.argumentHint}</small> : null}
 					</span>
 					<span className="slash-description">{command.description}</span>
+					{mutationBlockedReason && connectionRequired ? (
+						<span className="slash-disabled-reason">{mutationBlockedReason}</span>
+					) : null}
 				</button>
-			))}
+				);
+			})}
 		</div>
 	);
 }

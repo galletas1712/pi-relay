@@ -6,6 +6,7 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { branchEntriesFor } from "./historyTargets.ts";
+import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { MermaidBlock } from "./mermaidBlock.tsx";
 import { contentBlocksToText, firstLine } from "./text.ts";
 import { assistantMessageText, buildTurnViews } from "./turnView.ts";
@@ -53,6 +54,7 @@ type TranscriptDisplayNode =
 export interface TurnCardView {
 	card: TurnCard;
 	entries: TranscriptEntry[] | null;
+	detailCached?: boolean;
 	expanded: boolean;
 	isCurrent: boolean;
 }
@@ -206,6 +208,8 @@ export const MessageList = memo(function MessageList({
 	onNewSession,
 	onResumeTurn,
 	resumingTurnId,
+	resumeBlockedReason,
+	remoteReadBlockedReason,
 	turnCards,
 	onExpandTurn,
 	onCollapseTurn,
@@ -230,6 +234,8 @@ export const MessageList = memo(function MessageList({
 	onNewSession?: () => void;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
+	resumeBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 	turnCards?: TurnCardView[] | null;
 	onExpandTurn?: (turnId: string) => void;
 	onCollapseTurn?: (turnId: string) => void;
@@ -480,15 +486,18 @@ export const MessageList = memo(function MessageList({
 						<div className="empty-state-title">{sessionError ? "Couldn’t load session" : "Retrying session"}</div>
 						<div className="empty-state-sub">{sessionError ?? "Trying to load the selected session again…"}</div>
 						{onRetrySession ? (
-							<button
-								type="button"
-								className="secondary-button load-error-retry"
-								disabled={retryingSession}
-								aria-busy={retryingSession}
-								onClick={onRetrySession}
-							>
-								{retryingSession ? "Retrying…" : "Retry"}
-							</button>
+							<>
+								<button
+									type="button"
+									className="secondary-button load-error-retry"
+									disabled={retryingSession || !!remoteReadBlockedReason}
+									aria-busy={retryingSession}
+									onClick={onRetrySession}
+								>
+									{retryingSession ? "Retrying…" : "Retry"}
+								</button>
+								<ConnectionBlockedReason reason={remoteReadBlockedReason} />
+							</>
 						) : null}
 					</div>
 				</div>
@@ -521,15 +530,18 @@ export const MessageList = memo(function MessageList({
 								<span>{sessionError ?? "Trying to refresh the selected session again…"}</span>
 							</div>
 							{onRetrySession ? (
-								<button
-									type="button"
-									className="secondary-button load-error-retry"
-									disabled={retryingSession}
-									aria-busy={retryingSession}
-									onClick={onRetrySession}
-								>
-									{retryingSession ? "Retrying…" : "Retry"}
-								</button>
+								<>
+									<button
+										type="button"
+										className="secondary-button load-error-retry"
+										disabled={retryingSession || !!remoteReadBlockedReason}
+										aria-busy={retryingSession}
+										onClick={onRetrySession}
+									>
+										{retryingSession ? "Retrying…" : "Retry"}
+									</button>
+									<ConnectionBlockedReason reason={remoteReadBlockedReason} />
+								</>
 							) : null}
 						</div>
 					) : null}
@@ -538,9 +550,15 @@ export const MessageList = memo(function MessageList({
 								<>
 									{hasOlderTurns ? (
 										<div className="turn-card-load-older">
-											<button type="button" className="turn-card-expand" disabled={loadingOlderTurns} onClick={onLoadOlderTurns}>
+											<button
+												type="button"
+												className="turn-card-expand"
+												disabled={loadingOlderTurns || !!remoteReadBlockedReason}
+												onClick={onLoadOlderTurns}
+											>
 												{loadingOlderTurns ? "Loading older…" : "Load older turns"}
 											</button>
+											<ConnectionBlockedReason reason={remoteReadBlockedReason} />
 										</div>
 									) : null}
 									{turnCards!.map((turn) => (
@@ -552,6 +570,8 @@ export const MessageList = memo(function MessageList({
 											isRunning={isRunning}
 											onResumeTurn={onResumeTurn}
 											resumingTurnId={resumingTurnId}
+											resumeBlockedReason={resumeBlockedReason}
+											remoteReadBlockedReason={remoteReadBlockedReason}
 											onExpandTurn={onExpandTurn}
 											onCollapseTurn={onCollapseTurn}
 											loadingTurnId={loadingTurnId}
@@ -572,6 +592,7 @@ export const MessageList = memo(function MessageList({
 										onResumeTurn={onResumeTurn}
 										resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
 										resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
+										resumeBlockedReason={resumeBlockedReason}
 										compactionHiddenCount={compactionHiddenCounts.get(node.key) ?? 0}
 										compactionExpanded={!collapsedCompactions.has(node.key)}
 										onToggleCompaction={toggleCompaction}
@@ -740,6 +761,7 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	onResumeTurn,
 	resumeEntryId,
 	resuming,
+	resumeBlockedReason,
 	compactionHiddenCount,
 	compactionExpanded,
 	onToggleCompaction
@@ -751,6 +773,7 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumeEntryId: string;
 	resuming: boolean;
+	resumeBlockedReason?: string | null;
 	compactionHiddenCount: number;
 	compactionExpanded: boolean;
 	onToggleCompaction: (key: string) => void;
@@ -778,7 +801,8 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 					canResume
 						? {
 								label: resuming ? "Starting…" : actionLabel,
-								disabled: resuming,
+								disabled: resuming || !!resumeBlockedReason,
+								disabledReason: resumeBlockedReason,
 								onClick: () => onResumeTurn?.(resumeEntryId, resumableOutcome)
 							}
 						: undefined
@@ -865,6 +889,8 @@ const TurnCardRow = memo(function TurnCardRow({
 	isRunning,
 	onResumeTurn,
 	resumingTurnId,
+	resumeBlockedReason,
+	remoteReadBlockedReason,
 	onExpandTurn,
 	onCollapseTurn,
 	loadingTurnId,
@@ -876,6 +902,8 @@ const TurnCardRow = memo(function TurnCardRow({
 	isRunning: boolean;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
+	resumeBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 	onExpandTurn?: (turnId: string) => void;
 	onCollapseTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
@@ -885,6 +913,8 @@ const TurnCardRow = memo(function TurnCardRow({
 	const isLoading = loadingTurnId === card.id;
 	const detailEntries = turn.expanded ? turn.entries : null;
 	const isExpanded = !!detailEntries;
+	const detailLoadBlockedReason =
+		!isExpanded && !turn.detailCached ? remoteReadBlockedReason : null;
 	const canToggleDetails = card.status !== "compacted" && (!!onExpandTurn || !!onCollapseTurn) && !(turn.isCurrent && isExpanded);
 	const canResume = card.can_resume && card.active_leaf_id === activeLeafId && !isRunning && !!onResumeTurn;
 	const resumableOutcome = card.outcome === "Interrupted" || card.outcome === "Crashed" ? card.outcome : null;
@@ -949,15 +979,24 @@ const TurnCardRow = memo(function TurnCardRow({
 			{canToggleDetails || canResume ? (
 				<div className="turn-detail-toggle-row">
 					{canToggleDetails ? (
-						<button type="button" className="turn-card-expand" disabled={isLoading && !isExpanded} onClick={onToggleDetails}>
-							{detailLabel}
-						</button>
+						<>
+							<button
+								type="button"
+								className="turn-card-expand"
+								disabled={(isLoading && !isExpanded) || !!detailLoadBlockedReason}
+								onClick={onToggleDetails}
+							>
+								{detailLabel}
+							</button>
+							<ConnectionBlockedReason reason={detailLoadBlockedReason} />
+						</>
 					) : null}
+					{canResume ? <ConnectionBlockedReason reason={resumeBlockedReason} /> : null}
 					{canResume && !turn.isCurrent && resumableOutcome ? (
 						<button
 							type="button"
 							className="turn-card-expand"
-							disabled={resumingTurnId === card.active_leaf_id}
+							disabled={resumingTurnId === card.active_leaf_id || !!resumeBlockedReason}
 							onClick={() => onResumeTurn?.(card.active_leaf_id, resumableOutcome)}
 						>
 							{resumingTurnId === card.active_leaf_id ? "Starting…" : resumableOutcome === "Interrupted" ? "Continue" : "Retry"}
@@ -1808,7 +1847,7 @@ function SystemMessage({
 	tone: NoticeTone;
 	text: string;
 	entryId?: string;
-	action?: { label: string; disabled?: boolean; onClick: () => void };
+	action?: { label: string; disabled?: boolean; disabledReason?: string | null; onClick: () => void };
 	loading?: boolean;
 }) {
 	return (
@@ -1817,10 +1856,13 @@ function SystemMessage({
 			{loading ? <Loader2 className="spin" size={12} /> : null}
 			<span>{text}</span>
 			{action ? (
-				<button type="button" className="system-message-action" onClick={action.onClick} disabled={action.disabled}>
-					<RotateCcw size={12} />
-					{action.label}
-				</button>
+				<>
+					<button type="button" className="system-message-action" onClick={action.onClick} disabled={action.disabled}>
+						<RotateCcw size={12} />
+						{action.label}
+					</button>
+					<ConnectionBlockedReason reason={action.disabledReason} />
+				</>
 			) : null}
 		</div>
 	);
