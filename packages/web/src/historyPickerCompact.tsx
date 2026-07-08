@@ -1,5 +1,11 @@
-import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
-import { ChevronRight, Loader2, RotateCcw, X } from "lucide-react";
+import { useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
+import { ChevronRight, Loader2, RotateCcw } from "lucide-react";
+import {
+	AppDialog,
+	DialogCloseButton,
+	DialogDescription,
+	DialogTitle,
+} from "./dialog.tsx";
 import { displayParentIdForNode } from "./displayParent.ts";
 import {
 	historySwitchOptionsFromNodes,
@@ -35,7 +41,8 @@ export function CompactHistoryPickerDialog({
 	loading = false,
 	error = null,
 	onClose,
-	onSwitch
+	onSwitch,
+	returnFocusFallbackRef,
 }: {
 	nodes: TranscriptTreeNode[];
 	activeLeafId: string | null;
@@ -43,7 +50,9 @@ export function CompactHistoryPickerDialog({
 	error?: string | null;
 	onClose: () => void;
 	onSwitch: (target: HistoryTargetOption) => void;
+	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
+	const titleRef = useRef<HTMLHeadingElement>(null);
 	const [expandedBranches, setExpandedBranches] = useState<Set<string>>(() => new Set());
 	const options = useMemo(
 		() => historySwitchOptionsFromNodes(nodes, activeLeafId),
@@ -95,44 +104,41 @@ export function CompactHistoryPickerDialog({
 	const targetCount = visibleRows.length;
 
 	return (
-		<div className="modal-scrim" role="presentation" onMouseDown={onClose}>
-			<div
-				className="history-dialog"
-				role="dialog"
-				aria-modal="true"
-				aria-labelledby="history-dialog-title"
-				onMouseDown={(event) => event.stopPropagation()}
-			>
-				<div className="history-dialog-head">
-					<span className="history-dialog-icon">
-						<RotateCcw size={15} />
-					</span>
-					<div className="history-dialog-copy">
-						<h2 id="history-dialog-title">Switch branch</h2>
-						<p>Pick a user message to edit, or a completed turn or compaction root to make active.</p>
-					</div>
-					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close picker">
-						<X size={14} />
-					</button>
+		<AppDialog
+			className="history-dialog"
+			initialFocusRef={titleRef}
+			returnFocusFallbackRef={returnFocusFallbackRef}
+			onDismiss={onClose}
+		>
+			<div className="history-dialog-head">
+				<span className="history-dialog-icon" aria-hidden="true">
+					<RotateCcw size={15} />
+				</span>
+				<div className="history-dialog-copy">
+					<DialogTitle ref={titleRef} tabIndex={-1}>Switch branch</DialogTitle>
+					<DialogDescription>
+						Pick a user message to edit, or a completed turn or compaction root to make active.
+					</DialogDescription>
 				</div>
-
-				<div className="history-options tree" role="tree" aria-label="switch targets">
-					{historyPickerContent({
-						loading,
-						error,
-						renderedRows,
-						hiddenBranchIds,
-						onSwitch,
-						onToggleBranch: toggleBranch,
-					})}
-					{!loading && !error && targetCount === 0 ? (
-						<div className="history-empty">
-							No editable messages, completed turns, or compaction roots yet.
-						</div>
-					) : null}
-				</div>
+				<DialogCloseButton label="close picker" />
 			</div>
-		</div>
+
+			<div className="history-options tree" role="tree" aria-label="switch targets">
+				{historyPickerContent({
+					loading,
+					error,
+					renderedRows,
+					hiddenBranchIds,
+					onSwitch,
+					onToggleBranch: toggleBranch,
+				})}
+				{!loading && !error && targetCount === 0 ? (
+					<div className="history-empty">
+						No editable messages, completed turns, or compaction roots yet.
+					</div>
+				) : null}
+			</div>
+		</AppDialog>
 	);
 }
 

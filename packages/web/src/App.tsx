@@ -1,9 +1,6 @@
 import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
-import { ArrowUp, Bot, Menu, PanelRightOpen, X } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import rehypeRaw from "rehype-raw";
-import remarkGfm from "remark-gfm";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
+import { ArrowUp, Bot, Menu, PanelRightOpen } from "lucide-react";
 import { createAgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
 import { Composer, type ComposerHandle } from "./composer.tsx";
@@ -29,7 +26,10 @@ import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
 import { stopSession } from "./stopSession.ts";
-import { markdownComponents } from "./transcript.tsx";
+import {
+	SystemPromptDialog,
+	type SystemPromptDialogState,
+} from "./systemPromptDialog.tsx";
 import {
 	mergeSnapshotIntoSessionList,
 	patchSessionListEventSummary,
@@ -173,14 +173,6 @@ type DeleteDialogState = {
 	deleting: boolean;
 };
 
-type PromptDialogState = {
-	loading: boolean;
-	template: string;
-	rendered: string | null;
-	view: "rendered" | "template";
-	error: string | null;
-};
-
 function sessionListRefreshKey(projectId: string | null): string {
 	return projectId ?? "__host__";
 }
@@ -262,7 +254,7 @@ export function App() {
 	const [renameValue, setRenameValue] = useState("");
 	const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
 	const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
-	const [promptDialog, setPromptDialog] = useState<PromptDialogState | null>(null);
+	const [promptDialog, setPromptDialog] = useState<SystemPromptDialogState | null>(null);
 	const {
 		cache: selectedCache,
 		cacheRef: selectedCacheRef,
@@ -2059,9 +2051,21 @@ export function App() {
 						queryFn: () => api.getSystemPrompt(submittedSessionId),
 						staleTime: 0,
 					});
-					setPromptDialog({ loading: false, template: next.template, rendered: next.rendered, view: next.rendered ? "rendered" : "template", error: null });
+					setPromptDialog((current) => current ? {
+						loading: false,
+						template: next.template,
+						rendered: next.rendered,
+						view: next.rendered ? "rendered" : "template",
+						error: null,
+					} : current);
 				} catch (error) {
-					setPromptDialog({ loading: false, template: "", rendered: null, view: "template", error: errorMessage(error) });
+					setPromptDialog((current) => current ? {
+						loading: false,
+						template: "",
+						rendered: null,
+						view: "template",
+						error: errorMessage(error),
+					} : current);
 				}
 				return;
 			}
@@ -2321,6 +2325,14 @@ export function App() {
 	const sidebarDialogReturnFocusRef = sidebarIsOverlay
 		? mobileSidebarToggleRef
 		: sidebarNewSessionButtonRef;
+	const composerDialogReturnFocusRef = useMemo<RefObject<HTMLElement | null>>(
+		() => ({
+			get current() {
+				return composerHandleRef.current?.focusTarget() ?? null;
+			},
+		}),
+		[],
+	);
 	const appClassName = `app-shell ${sidebarOpen ? "sidebar-open" : ""} ${rightOpen ? "inspector-open" : ""}`;
 
 	return (
@@ -2557,7 +2569,12 @@ export function App() {
 			) : null}
 
 			{promptDialog ? (
-				<SystemPromptDialog state={promptDialog} onChangeView={(view) => setPromptDialog((current) => (current ? { ...current, view } : current))} onClose={() => setPromptDialog(null)} />
+				<SystemPromptDialog
+					state={promptDialog}
+					onChangeView={(view) => setPromptDialog((current) => (current ? { ...current, view } : current))}
+					onClose={() => setPromptDialog(null)}
+					returnFocusFallbackRef={composerDialogReturnFocusRef}
+				/>
 			) : null}
 
 			{historyDialog ? (
@@ -2568,6 +2585,7 @@ export function App() {
 					error={historyDialog.error}
 					onClose={() => setHistoryDialog(null)}
 					onSwitch={handleSwitchHistoryTarget}
+					returnFocusFallbackRef={composerDialogReturnFocusRef}
 				/>
 			) : null}
 			{exportDialog ? (
@@ -2577,6 +2595,7 @@ export function App() {
 					onCopied={() => pushNotice("success", "export copied to clipboard")}
 					onDownloaded={() => pushNotice("success", "export downloaded")}
 					onError={(error) => pushNotice("error", errorMessage(error))}
+					returnFocusFallbackRef={composerDialogReturnFocusRef}
 				/>
 			) : null}
 			<NoticeStack notices={notices} rightOpen={rightOpen} />
@@ -2696,66 +2715,3 @@ async function restoreTextForTarget(
 	if (entry?.item.type === "user_message") return contentBlocksToText(entry.item.content);
 	throw new Error("could not load the full user message for editing");
 }
-
-function SystemPromptDialog({
-	state,
-	onChangeView,
-	onClose,
-}: {
-	state: PromptDialogState;
-	onChangeView: (view: "rendered" | "template") => void;
-	onClose: () => void;
-}) {
-	const text = state.view === "rendered" ? (state.rendered ?? "") : state.template;
-	return (
-		<div className="modal-scrim" role="presentation" onMouseDown={onClose}>
-			<div
-				className="rename-dialog system-prompt-dialog"
-				role="dialog"
-				aria-modal="true"
-				aria-labelledby="system-prompt-dialog-title"
-				onMouseDown={(event) => event.stopPropagation()}
-			>
-				<div className="rename-dialog-head">
-					<div className="rename-dialog-copy">
-						<h2 id="system-prompt-dialog-title">PI.md</h2>
-						<p>Rendered prompt and source template.</p>
-					</div>
-					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close system prompt dialog">
-						<X size={16} />
-					</button>
-				</div>
-				<div className="system-prompt-tabs" role="tablist" aria-label="PI.md view">
-					<button type="button" className={state.view === "rendered" ? "selected" : ""} onClick={() => onChangeView("rendered")} disabled={!state.rendered}>
-						Rendered
-					</button>
-					<button type="button" className={state.view === "template" ? "selected" : ""} onClick={() => onChangeView("template")}>
-						Template
-					</button>
-				</div>
-				<div className="system-prompt-body">
-					{state.loading ? <p className="muted">Loading PI.md…</p> : null}
-					{state.error ? <p className="error-text">{state.error}</p> : null}
-					{!state.loading && !state.error ? (
-						state.view === "rendered" ? <MarkdownView text={text} /> : <pre>{text}</pre>
-					) : null}
-				</div>
-			</div>
-		</div>
-	);
-}
-
-
-const MarkdownView = memo(function MarkdownView({ text }: { text: string }) {
-	return (
-		<div className="assistant-markdown system-prompt-markdown">
-			<ReactMarkdown
-				rehypePlugins={[rehypeRaw]}
-				remarkPlugins={[remarkGfm]}
-				components={markdownComponents}
-			>
-				{text}
-			</ReactMarkdown>
-		</div>
-	);
-});
