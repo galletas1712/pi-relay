@@ -28,10 +28,11 @@ export function ActionMenu({
 	onOpenChange?: (open: boolean) => void;
 }) {
 	const pendingDialogAction = useRef<(() => void) | null>(null);
+	const triggerRef = useRef<HTMLButtonElement>(null);
 	return (
 		<DropdownMenu.Root open={open} defaultOpen={defaultOpen} onOpenChange={onOpenChange}>
 			<DropdownMenu.Trigger asChild>
-				<button className="action-menu-trigger" type="button" aria-label={triggerLabel}>
+				<button ref={triggerRef} className="action-menu-trigger" type="button" aria-label={triggerLabel}>
 					<MoreHorizontal size={17} aria-hidden />
 				</button>
 			</DropdownMenu.Trigger>
@@ -47,9 +48,12 @@ export function ActionMenu({
 						if (!action) return;
 						pendingDialogAction.current = null;
 						event.preventDefault();
-						// Radix removes the closing focus scope after this handler returns.
-						// Mount the dialog in the following microtask so its autofocus wins.
-						queueMicrotask(action);
+						// Radix removes the closing menu focus scope after this handler.
+						// Re-focus the opener before mounting so the dialog can restore it.
+						queueMicrotask(() => {
+							triggerRef.current?.focus();
+							action();
+						});
 					}}
 				>
 					{items.map((item) => (

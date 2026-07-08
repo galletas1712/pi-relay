@@ -2168,7 +2168,8 @@ pre {
 	overflow-wrap: anywhere;
 }
 
-.modal-scrim {
+.modal-scrim,
+.dialog-overlay {
 	position: fixed;
 	inset: 0;
 	z-index: 50;
@@ -2178,6 +2179,14 @@ pre {
 	background: color-mix(in oklch, var(--background) 70%, transparent);
 	backdrop-filter: blur(3px);
 	padding: 24px;
+}
+
+.dialog-content {
+	position: fixed;
+	z-index: 51;
+	top: 50%;
+	left: 50%;
+	transform: translate(-50%, -50%);
 }
 
 .plain-close-button {
@@ -2369,7 +2378,8 @@ pre {
 	color: var(--destructive);
 }
 
-.rename-dialog-head {
+.rename-dialog-head,
+.dialog-header {
 	display: flex;
 	align-items: center;
 	gap: 10px;
@@ -2377,12 +2387,14 @@ pre {
 	padding: 14px 16px;
 }
 
-.rename-dialog-copy {
+.rename-dialog-copy,
+.dialog-heading {
 	min-width: 0;
 	flex: 1;
 }
 
-.rename-dialog-copy h2 {
+.rename-dialog-copy h2,
+.dialog-heading h2 {
 	margin: 0;
 	font-family: var(--font-display);
 	font-size: var(--text-xl);
@@ -2523,7 +2535,8 @@ pre {
 	overflow-wrap: anywhere;
 }
 
-.rename-actions {
+.rename-actions,
+.dialog-footer {
 	display: flex;
 	justify-content: flex-end;
 	gap: 8px;
@@ -2532,7 +2545,9 @@ pre {
 }
 
 .rename-actions .primary-button,
-.rename-actions .secondary-button {
+.rename-actions .secondary-button,
+.dialog-footer .primary-button,
+.dialog-footer .secondary-button {
 	flex: 0 0 auto;
 	min-width: 82px;
 	justify-content: center;
@@ -3894,10 +3909,19 @@ pre {
 		padding: 10px;
 	}
 
-	.modal-scrim {
+	.modal-scrim,
+	.dialog-overlay {
 		align-items: flex-end;
 		padding: 10px;
 		padding-bottom: max(10px, env(safe-area-inset-bottom, 0px));
+	}
+
+	.dialog-content {
+		top: auto;
+		right: 10px;
+		bottom: max(10px, env(safe-area-inset-bottom, 0px));
+		left: 10px;
+		transform: none;
 	}
 
 	.history-dialog,
@@ -3908,9 +3932,14 @@ pre {
 		border-radius: 14px;
 	}
 
+	.dialog-content.rename-dialog {
+		width: auto;
+	}
+
 	.history-dialog-head,
 	.export-dialog-head,
-	.rename-dialog-head {
+	.rename-dialog-head,
+	.dialog-header {
 		align-items: flex-start;
 		padding: 12px;
 	}
@@ -4001,7 +4030,8 @@ pre {
 
 	.history-actions,
 	.export-actions,
-	.rename-actions {
+	.rename-actions,
+	.dialog-footer {
 		flex-wrap: wrap-reverse;
 	}
 
@@ -4010,7 +4040,9 @@ pre {
 	.export-actions .primary-button,
 	.export-actions .secondary-button,
 	.rename-actions .primary-button,
-	.rename-actions .secondary-button {
+	.rename-actions .secondary-button,
+	.dialog-footer .primary-button,
+	.dialog-footer .secondary-button {
 		flex: 1 1 140px;
 	}
 

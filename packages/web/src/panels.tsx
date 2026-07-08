@@ -14,7 +14,7 @@ import {
 	Trash2,
 	X
 } from "lucide-react";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState, type RefObject } from "react";
 import { ActionMenu, type ActionMenuItem } from "./actionMenu.tsx";
 import { COMMANDS } from "./slash.ts";
 import {
@@ -284,6 +284,7 @@ export interface SidebarProps {
 	sessionsError?: string | null;
 	sessionsHasCachedData?: boolean;
 	inert?: boolean;
+	newSessionButtonRef?: RefObject<HTMLButtonElement | null>;
 	onRetrySessions?: () => void;
 	onQueryChange: (query: string) => void;
 	onToggleArchived: () => void;
@@ -314,6 +315,7 @@ export const Sidebar = memo(function Sidebar({
 	sessionsError = null,
 	sessionsHasCachedData = false,
 	inert,
+	newSessionButtonRef,
 	onRetrySessions,
 	onQueryChange,
 	onToggleArchived,
@@ -348,6 +350,7 @@ export const Sidebar = memo(function Sidebar({
 				showArchived={showArchived}
 				onToggleArchived={onToggleArchived}
 				onNew={onNew}
+				newSessionButtonRef={newSessionButtonRef}
 			/>
 			{sessionsError ? (
 				<div className="load-error-banner sidebar-load-error" role="alert">
@@ -484,7 +487,8 @@ export function SidebarToolbar({
 	onQueryChange,
 	showArchived,
 	onToggleArchived,
-	onNew
+	onNew,
+	newSessionButtonRef,
 }: {
 	disabled: boolean;
 	query: string;
@@ -492,6 +496,7 @@ export function SidebarToolbar({
 	showArchived: boolean;
 	onToggleArchived: () => void;
 	onNew: () => void;
+	newSessionButtonRef?: RefObject<HTMLButtonElement | null>;
 }) {
 	const [searchOpen, setSearchOpen] = useState(false);
 	const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -526,7 +531,7 @@ export function SidebarToolbar({
 	return (
 		<div className="sidebar-toolbar">
 			<div className="toolbar-actions">
-				<button className="primary-button" type="button" onClick={onNew} disabled={disabled}>
+				<button ref={newSessionButtonRef} className="primary-button" type="button" onClick={onNew} disabled={disabled}>
 					<Plus size={14} />
 					New session
 				</button>
