@@ -1237,8 +1237,6 @@ function prettyToolName(toolName: string): string {
 			return "Edit";
 		case "Bash":
 			return "Bash";
-		case "Grep":
-			return "Grep";
 		case "web_search":
 			return "Web search";
 		case "web_fetch":
@@ -1257,7 +1255,6 @@ function inputSummaryFromInput(toolName: string, input: Record<string, unknown> 
 		if (typeof command === "string") return firstLine(command);
 		if (Array.isArray(command)) return firstLine(command.filter((part): part is string => typeof part === "string").join(" "));
 	}
-	if (toolName === "Grep") return [stringValue(input.pattern), stringValue(input.path)].filter(Boolean).join(" ") || null;
 	if (toolName === "Edit" && typeof input.command === "string") return [stringValue(input.command), stringValue(input.path)].filter(Boolean).join(" ") || null;
 	return null;
 }

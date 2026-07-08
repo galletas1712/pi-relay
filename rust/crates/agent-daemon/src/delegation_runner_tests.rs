@@ -3117,8 +3117,8 @@ async fn combined_control_interrupts_complete_parallel_tool_generation_once() {
     };
     let second_call = ToolCall {
         id: ToolCallId::from_u64(102),
-        tool_name: "Grep".to_string(),
-        args_json: r#"{"pattern":"needle"}"#.to_string(),
+        tool_name: "web_fetch".to_string(),
+        args_json: r#"{"url":"https://example.com"}"#.to_string(),
     };
     let entries = vec![
         TranscriptStorageNode {

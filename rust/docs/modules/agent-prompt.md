@@ -48,10 +48,10 @@ Input types the caller fills in:
 `tools.aliases` lets the template name a tool by its role rather than its concrete name, which differs per provider. The template uses minijinja `default(...)` so it still renders when an alias is absent, e.g.:
 
 ```jinja
-Use `{{ tools.aliases.workspace_search | default(value="Grep") }}` instead of calling `grep` directly.
+Use `{{ tools.aliases.edit | default(value="Edit") }}` instead of editing files through the shell.
 ```
 
-The registered builtin tools and their aliases are owned by the daemon tool registry, not this crate. Current tools: `edit` (rendered as `apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `grep` (uniform JSON `Grep`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). See [agent-tools](./agent-tools.md) and [websocket-rpc](../websocket-rpc.md) (`tools.list`).
+The registered builtin tools and their aliases are owned by the daemon tool registry, not this crate. Current tools: `edit` (rendered as `apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). See [agent-tools](./agent-tools.md) and [websocket-rpc](../websocket-rpc.md) (`tools.list`).
 
 ## How it works
 

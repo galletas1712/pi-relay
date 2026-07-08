@@ -36,7 +36,8 @@ impl AgentTool for BashTool {
             "Bash",
             "Run a shell command in the session current working directory and return stdout/stderr. \
                 Each call runs in a fresh shell rooted at that cwd; chain commands with `&&` \
-                (or call `cd` inside the command) when you need to scope work to a subdirectory."
+                (or call `cd` inside the command) when you need to scope work to a subdirectory. \
+                For file and text searches, prefer `rg` over `grep`."
                 .to_string(),
             json!({
                 "type": "object",

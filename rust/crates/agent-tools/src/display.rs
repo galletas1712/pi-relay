@@ -21,7 +21,6 @@ struct ToolDisplaySpec {
 enum ToolSummary {
     Field(&'static str),
     ShellCommand,
-    Grep,
     TextEditor,
     SkillName,
     WebSearchQuery,
@@ -45,12 +44,6 @@ const TOOL_DISPLAY_SPECS: &[ToolDisplaySpec] = &[
         kind: ToolDisplayInput::LocalTool,
         display_name: "Bash",
         summary: ToolSummary::ShellCommand,
-    },
-    ToolDisplaySpec {
-        name: "Grep",
-        kind: ToolDisplayInput::LocalTool,
-        display_name: "Grep",
-        summary: ToolSummary::Grep,
     },
     ToolDisplaySpec {
         name: "WebFetch",
@@ -111,7 +104,6 @@ fn tool_summary(summary: ToolSummary, input: Option<&serde_json::Value>) -> Opti
     let text = match summary {
         ToolSummary::Field(key) => string_field(input, key),
         ToolSummary::ShellCommand => shell_command_summary(input),
-        ToolSummary::Grep => joined_fields(input, &["pattern", "path"]),
         ToolSummary::TextEditor => joined_fields(input, &["command", "path"]),
         ToolSummary::SkillName => string_field(input, "name"),
         ToolSummary::WebSearchQuery => web_search_query(input),

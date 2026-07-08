@@ -144,7 +144,7 @@ Consecutive assistant tool activity is grouped into a `ToolRunGroup`. Each group
 The default tracks liveness (working → `recent`, done → `collapsed`); once the user toggles a group, an override is
 stashed so later status churn or streaming items do not blow away their selection. A single tool renders as a stand-alone
 row. Tool results fold into their matching call row rather than appearing as separate raw events. Edit-shaped calls
-render an "Edit …" header with a diff-style preview. Display names map the builtin tools (`Edit`, `Bash`, `Grep`,
+render an "Edit …" header with a diff-style preview. Display names map the builtin tools (`Edit`, `Bash`,
 `Web search`, `Web fetch`); see [agent-tools](../../../rust/docs/modules/agent-tools.md).
 
 ## Events and reconciliation

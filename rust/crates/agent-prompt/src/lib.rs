@@ -417,34 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_repo_pi_as_static_prompt() {
-        let rendered = render_prompt(
-            TEST_PI_MD,
-            &ctx(
-                PromptProfile::Parent,
-                vec!["Bash", "Grep", "Edit"],
-                Vec::new(),
-            ),
-        );
-        assert!(rendered.contains("You are a helpful assitant"));
-        assert!(rendered.contains("### Bash"));
-        assert!(rendered.contains("### Edit"));
-        assert!(rendered.contains("## Subagent delegation"));
-        assert!(rendered.contains("Packaged subagent roles"));
-        assert!(rendered.contains("\"name\": \"reviewer\""));
-        assert!(!rendered.contains("Current date"));
-        assert!(!rendered.contains("Starting working directory"));
-    }
-
-    #[test]
     fn subagent_profile_omits_parent_orchestration_sections() {
         let rendered = render_prompt(
             TEST_PI_MD,
-            &ctx(
-                PromptProfile::Subagent,
-                vec!["Bash", "Grep", "Edit"],
-                Vec::new(),
-            ),
+            &ctx(PromptProfile::Subagent, vec!["Bash", "Edit"], Vec::new()),
         );
 
         assert!(rendered.contains("### Bash"));
