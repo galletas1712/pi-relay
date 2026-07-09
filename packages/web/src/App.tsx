@@ -3416,8 +3416,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					<Menu size={17} />
 				</button>
 				<div className="mobile-topbar-title">
-					<span>{mobileTitle}</span>
-					<div className="mobile-topbar-status">
+					<div className="mobile-topbar-title-main">
 						{mobileSessionStatus ? (
 							<span
 								className={`session-status-icon ${mobileSessionStatus}`}
@@ -3428,7 +3427,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 								<Bot size={12} aria-hidden />
 							</span>
 						) : null}
-						{mobileParentSessionId ? (
+						<span>{mobileTitle}</span>
+					</div>
+					{mobileParentSessionId ? (
+						<div className="mobile-topbar-status">
 							<button
 								className="parent-session-link"
 								type="button"
@@ -3438,8 +3440,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 								<ArrowUp size={12} aria-hidden />
 								parent
 							</button>
-						) : null}
-					</div>
+						</div>
+					) : null}
 				</div>
 				{inspectorIsOverlay && !rightOpen ? (
 					<button
