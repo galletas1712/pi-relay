@@ -654,15 +654,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			sessionsQuery.fetchStatus === "fetching",
 		);
 	}, [selectedProjectId, sessionListCoordinator, sessionsQuery.fetchStatus]);
-	const retrySessions = useCallback(() => {
-		try {
-			assertServerReadAllowed();
-		} catch (error) {
-			reportActionError(error);
-			return;
-		}
-		void sessionListCoordinator.retry(selectedProjectId, sessionsQuery.refetch);
-	}, [assertServerReadAllowed, reportActionError, selectedProjectId, sessionListCoordinator, sessionsQuery.refetch]);
 	const backgroundSessionsQueries = useQueries({
 		queries: backgroundSessionProjectIds.map((projectId) => ({
 			queryKey: queryKeys.sessions(projectId),
@@ -3357,17 +3348,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		workspaceRouteResult.kind === "route"
 			? workspaceRouteResult.warnings.filter((warning) => warning.persistent)
 			: [];
-	const recipientLabel =
-		validatedRoute?.conversation.kind === "agent"
-			? sessionTitle(selectedChatSession ?? {
-				session_id: validatedRoute.conversation.sessionId,
-				project_id: selectedProjectId,
-				activity: "idle",
-				active_leaf_id: null,
-				provider: newSessionProvider,
-				metadata: {},
-			})
-			: null;
 	const mobileTitle = selectedChatSession
 		? sessionTitle(selectedChatSession)
 		: selectedProject
@@ -3427,21 +3407,19 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 								<Bot size={12} aria-hidden />
 							</span>
 						) : null}
-						<span>{mobileTitle}</span>
-					</div>
-					{mobileParentSessionId ? (
-						<div className="mobile-topbar-status">
+						<span className="mobile-topbar-title-text">{mobileTitle}</span>
+						{mobileParentSessionId ? (
 							<button
 								className="parent-session-link"
 								type="button"
 								onClick={() => selectSession(mobileParentSessionId)}
 								title="Open parent conversation"
+								aria-label="Open parent conversation"
 							>
-								<ArrowUp size={12} aria-hidden />
-								parent
+								<ArrowUp size={13} aria-hidden />
 							</button>
-						</div>
-					) : null}
+						) : null}
+					</div>
 				</div>
 				{inspectorIsOverlay && !rightOpen ? (
 					<button
@@ -3473,11 +3451,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				selectedId={selectedId}
 				sessionsLoading={sessionsQuery.isLoading}
 				sessionsFetching={sessionListRequestState.busy}
-				sessionsError={sessionListRequestState.error}
-				sessionsHasCachedData={sessionsQuery.data !== undefined}
 				inert={sidebarInert}
 				newSessionButtonRef={sidebarNewSessionButtonRef}
-				onRetrySessions={retrySessions}
 				onRetryProjects={retryProjects}
 				onQueryChange={setQuery}
 				onToggleArchived={handleToggleArchived}
@@ -3553,20 +3528,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						onAcknowledgeTranscriptDestination={acknowledgeTranscriptDestination}
 						onRetryTranscript={retrySelected}
 						routeNotice={
-							persistentRouteWarnings.length > 0 || recipientLabel ? (
-								<div className="workspace-conversation-notices">
-									{persistentRouteWarnings.length > 0 ? (
-										<div className="workspace-route-warning" role="alert">
-											{persistentRouteWarnings.map((warning) => (
-												<span key={`${warning.kind}:${warning.message}`}>{warning.message}</span>
-											))}
-										</div>
-									) : null}
-									{recipientLabel ? (
-										<div className="workspace-recipient-label" role="status">
-											Conversation recipient: <strong>{recipientLabel}</strong>
-										</div>
-									) : null}
+							persistentRouteWarnings.length > 0 ? (
+								<div className="workspace-route-warning" role="alert">
+									{persistentRouteWarnings.map((warning) => (
+										<span key={`${warning.kind}:${warning.message}`}>{warning.message}</span>
+									))}
 								</div>
 							) : null
 						}

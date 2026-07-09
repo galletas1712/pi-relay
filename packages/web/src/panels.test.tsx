@@ -239,31 +239,6 @@ describe("Sidebar session list loading states", () => {
 		);
 	}
 
-	it("keeps cached rows visible when their refresh fails", () => {
-		const cachedSession: SessionSummary = {
-			session_id: "cached-session",
-			project_id: null,
-			outer_cwd: "/workspace",
-			workspaces: [],
-			activity: "idle",
-			active_leaf_id: null,
-			provider: { kind: "openai", model: "gpt-test" },
-			metadata: { title: "Cached session" },
-			created_at: "2024-01-01T00:00:00Z",
-			updated_at: "2024-01-01T00:00:00Z",
-		};
-		const html = renderSidebar({
-			filteredSessions: [cachedSession],
-			sessionsHasCachedData: true,
-			sessionsError: "refresh failed",
-			onRetrySessions: () => {},
-		});
-
-		expect(html).toContain("Cached session");
-		expect(html).toContain("Session refresh failed");
-		expect(html).toContain("refresh failed");
-	});
-
 	it("renders project and session navigation as semantic lists with sibling selection and menu buttons", () => {
 		const project: Project = {
 			project_id: "project-1",

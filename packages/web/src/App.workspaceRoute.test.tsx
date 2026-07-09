@@ -189,7 +189,7 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
-	it("lets a direct child URL beat localStorage, pins Agents to root, and loads the child recipient", async () => {
+	it("lets a direct child URL beat localStorage, pins Agents to root, and loads the child conversation", async () => {
 		rememberLegacy("legacy-root");
 		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/child-1");
 		const api = createRouteApi();
@@ -199,13 +199,12 @@ describe("App workspace route identity integration", () => {
 		await waitFor(() =>
 			expect(screen.queryByText("Loading conversation")).toBeNull(),
 		);
-		const recipient = await screen.findByRole("status");
-		expect(recipient.textContent).toContain("Conversation recipient: Child one");
-		expect(recipient.textContent).not.toContain("child-1");
+		await waitFor(() =>
+			expect(document.querySelector(".log-session")?.textContent).toBe("Child one"),
+		);
 		const normalChildChrome = [
 			document.querySelector(".topbar"),
 			document.querySelector(".log-header"),
-			document.querySelector(".workspace-recipient-label"),
 		].filter((element): element is Element => element !== null);
 		for (const element of normalChildChrome) {
 			expect(element.textContent).not.toContain("child-1");
@@ -215,7 +214,7 @@ describe("App workspace route identity integration", () => {
 				expect(labelledElement.getAttribute("title") ?? "").not.toMatch(/child-1|root-1/);
 			}
 		}
-		const parentLinks = screen.getAllByRole("button", { name: "parent" });
+		const parentLinks = screen.getAllByRole("button", { name: "Open parent conversation" });
 		expect(parentLinks).toHaveLength(2);
 		for (const parentLink of parentLinks) {
 			expect(parentLink.getAttribute("title")).toBe("Open parent conversation");
@@ -267,13 +266,13 @@ describe("App workspace route identity integration", () => {
 		const child = await screen.findByRole("button", { name: /Open agent (Child one|Agent), implementer/ });
 		await user.click(child);
 		await waitFor(() => expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1"));
-		expect(await screen.findByText("Conversation recipient:")).toBeTruthy();
+		await waitFor(() => expect(document.querySelector(".log-session")?.textContent).toBe("Child one"));
 		expect(document.querySelector<HTMLDivElement>(".message-scroll")?.scrollTop).toBe(900);
 		expect(api.listDelegations.mock.calls.at(-1)?.[0]).toBe("root-1");
 
 		document.querySelector<HTMLDivElement>(".message-scroll")!.scrollTop = 211;
 		fireEvent.scroll(document.querySelector<HTMLDivElement>(".message-scroll")!);
-		const parentLinks = screen.getAllByRole("button", { name: "parent" });
+		const parentLinks = screen.getAllByRole("button", { name: "Open parent conversation" });
 		await user.click(parentLinks[0]);
 		await waitFor(() => expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1"));
 		expect(document.querySelector<HTMLDivElement>(".message-scroll")?.scrollTop).toBe(900);
@@ -284,7 +283,7 @@ describe("App workspace route identity integration", () => {
 		document.querySelector<HTMLDivElement>(".message-scroll")!.scrollTop = 315;
 		fireEvent.scroll(document.querySelector<HTMLDivElement>(".message-scroll")!);
 		await act(async () => browser.back());
-		expect(await screen.findByText("Conversation recipient:")).toBeTruthy();
+		await waitFor(() => expect(document.querySelector(".log-session")?.textContent).toBe("Child one"));
 		expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1");
 		expect(document.querySelector<HTMLDivElement>(".message-scroll")?.scrollTop).toBe(900);
 		document.querySelector<HTMLDivElement>(".message-scroll")!.scrollTop = 417;
@@ -408,14 +407,14 @@ describe("App workspace route identity integration", () => {
 		await openStatusOnly(api);
 
 		await act(async () => browser.navigate("/w/host/run/root-1/conversation/child-1"));
-		expect((await screen.findByRole("status")).textContent).toContain("Child one");
+		await waitFor(() => expect(document.querySelector(".log-session")?.textContent).toBe("Child one"));
 		stale.resolve(snapshot("child-a", "root-1", null, "Stale child"));
 		await act(async () => {
 			await stale.promise;
 			await Promise.resolve();
 		});
 		expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1");
-		expect(screen.getByRole("status").textContent).toContain("Child one");
+		expect(document.querySelector(".log-session")?.textContent).toBe("Child one");
 
 		const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
 		await userEvent.type(composer, "captured child message");

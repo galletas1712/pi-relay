@@ -424,11 +424,8 @@ export interface SidebarProps {
 	selectedId: string | null;
 	sessionsLoading?: boolean;
 	sessionsFetching?: boolean;
-	sessionsError?: string | null;
-	sessionsHasCachedData?: boolean;
 	inert?: boolean;
 	newSessionButtonRef?: RefObject<HTMLButtonElement | null>;
-	onRetrySessions?: () => void;
 	onRetryProjects?: () => void;
 	onQueryChange: (query: string) => void;
 	onToggleArchived: () => void;
@@ -458,11 +455,8 @@ export const Sidebar = memo(function Sidebar({
 	selectedId,
 	sessionsLoading = false,
 	sessionsFetching = false,
-	sessionsError = null,
-	sessionsHasCachedData = false,
 	inert,
 	newSessionButtonRef,
-	onRetrySessions,
 	onRetryProjects,
 	onQueryChange,
 	onToggleArchived,
@@ -503,28 +497,6 @@ export const Sidebar = memo(function Sidebar({
 				onNew={onNew}
 				newSessionButtonRef={newSessionButtonRef}
 			/>
-			{sessionsError ? (
-				<div className="load-error-banner sidebar-load-error" role="alert">
-					<div>
-						<strong>{sessionsHasCachedData ? "Session refresh failed" : "Couldn’t load sessions"}</strong>
-						<span>{sessionsError}</span>
-					</div>
-					{onRetrySessions ? (
-						<>
-							<button
-								type="button"
-								className="secondary-button load-error-retry"
-								disabled={sessionsFetching || !!remoteReadBlockedReason}
-								aria-busy={sessionsFetching}
-								onClick={onRetrySessions}
-							>
-								{sessionsFetching ? "Retrying…" : "Retry"}
-							</button>
-							<ConnectionBlockedReason reason={remoteReadBlockedReason} />
-						</>
-					) : null}
-				</div>
-			) : null}
 			<nav className="session-list" aria-label="Sessions" aria-busy={sessionsLoading || sessionsFetching}>
 				<ul className="session-list-items">
 					{filteredSessions.map((session) => (
@@ -539,7 +511,7 @@ export const Sidebar = memo(function Sidebar({
 							mutationBlockedReason={mutationBlockedReason}
 						/>
 					))}
-					{filteredSessions.length === 0 && !sessionsError ? (
+					{filteredSessions.length === 0 ? (
 						<li className="empty-list">
 							{sessionsLoading ? "Loading sessions…" : sessionsFetching ? "Refreshing sessions…" : "No sessions"}
 						</li>
@@ -971,9 +943,9 @@ export function LogHeader({
 							type="button"
 							onClick={() => onSelectSession?.(parentSessionId)}
 							title="Open parent conversation"
+							aria-label="Open parent conversation"
 						>
-							<ArrowUp size={12} aria-hidden />
-							parent
+							<ArrowUp size={14} aria-hidden />
 						</button>
 					) : null}
 				</span>

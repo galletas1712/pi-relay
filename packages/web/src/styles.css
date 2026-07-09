@@ -295,7 +295,7 @@ pre {
 	gap: 6px;
 }
 
-.mobile-topbar-title-main > span:last-child {
+.mobile-topbar-title-text {
 	min-width: 0;
 	max-width: 100%;
 	overflow: hidden;
@@ -313,19 +313,9 @@ pre {
 	height: 20px;
 }
 
-.mobile-topbar-status {
-	display: flex;
-	flex-wrap: wrap;
-	justify-content: center;
-	align-items: center;
-	gap: 4px;
-	max-width: 100%;
-}
-
-.mobile-topbar-status .parent-session-link {
-	height: 22px;
-	padding: 0 6px;
-	font-size: var(--text-2xs);
+.mobile-topbar-title-main .parent-session-link {
+	width: 24px;
+	height: 24px;
 }
 
 .drawer-scrim {
@@ -859,10 +849,6 @@ pre {
 	color: var(--foreground);
 }
 
-.sidebar-load-error {
-	margin: var(--space-2) var(--space-2) 0;
-}
-
 .project-load-error {
 	margin-bottom: var(--space-2);
 }
@@ -880,14 +866,7 @@ pre {
 	overflow: hidden;
 }
 
-.workspace-conversation-notices {
-	flex: 0 0 auto;
-	border-bottom: 1px solid var(--border);
-	background: var(--background);
-}
-
-.workspace-route-warning,
-.workspace-recipient-label {
+.workspace-route-warning {
 	display: flex;
 	flex-wrap: wrap;
 	align-items: center;
@@ -900,22 +879,6 @@ pre {
 	border-bottom: 1px solid color-mix(in oklch, var(--warning) 30%, var(--border));
 	background: color-mix(in oklch, var(--warning) 8%, var(--background));
 	color: var(--warning);
-}
-
-.workspace-recipient-label {
-	color: var(--muted-foreground);
-}
-
-.workspace-recipient-label strong {
-	color: var(--foreground);
-}
-
-.workspace-recipient-label code {
-	overflow: hidden;
-	max-width: min(42ch, 100%);
-	color: var(--muted-foreground);
-	text-overflow: ellipsis;
-	white-space: nowrap;
 }
 
 .workspace-route-state {
@@ -1060,22 +1023,20 @@ pre {
 	display: inline-flex;
 	flex: 0 0 auto;
 	align-items: center;
-	gap: 4px;
+	justify-content: center;
+	width: 26px;
 	height: 26px;
-	border: 1px solid var(--border);
-	border-radius: 999px;
-	background: color-mix(in oklch, var(--muted) 36%, transparent);
-	padding: 0 8px;
+	border: 0;
+	border-radius: var(--radius-sm);
+	background: transparent;
+	padding: 0;
 	color: var(--muted-foreground);
-	font-size: var(--text-xs);
-	font-weight: 500;
 	cursor: pointer;
-	transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+	transition: background 120ms ease, color 120ms ease;
 }
 
 .parent-session-link:hover,
 .parent-session-link:focus-visible {
-	border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
 	background: color-mix(in oklch, var(--primary) 10%, transparent);
 	color: var(--primary);
 }
