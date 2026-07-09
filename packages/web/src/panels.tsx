@@ -164,22 +164,17 @@ function DelegationCard({
 				<div className="run-board-delegation-controls">
 					{running ? (
 						<button
-							className="run-board-stop"
+							className="stop-button run-board-stop"
 							type="button"
 							disabled={actionDisabled}
 							aria-busy={pending}
-							aria-label={pending ? "Stop delegated work" : undefined}
+							aria-label="stop delegated work"
 							onClick={() => onStop(delegation)}
-							title="Stop this delegated work"
+							title="stop delegated work"
 						>
-							{pending ? (
-								<Loader2 className="spin" size={15} aria-hidden />
-							) : (
-								<>
-									<Square size={13} aria-hidden />
-									<span>Stop</span>
-								</>
-							)}
+							{pending
+								? <Loader2 className="spin" size={15} aria-hidden />
+								: <Square size={14} aria-hidden />}
 						</button>
 					) : null}
 				</div>

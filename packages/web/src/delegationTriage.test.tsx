@@ -203,7 +203,7 @@ describe("stop delegated work", () => {
 		});
 
 		const work = screen.getByRole("article", { name: /Review release/ });
-		await user.click(within(work).getByRole("button", { name: "Stop" }));
+		await user.click(within(work).getByRole("button", { name: "stop delegated work" }));
 		expect(onCancel).toHaveBeenCalledTimes(1);
 		expect(onCancel).toHaveBeenCalledWith("parent-at-intent", "delegation-1");
 
@@ -220,7 +220,7 @@ describe("stop delegated work", () => {
 		expect(onCancel).toHaveBeenCalledWith("parent-at-intent", "delegation-1");
 		pending.resolve();
 		await waitFor(() =>
-			expect(within(screen.getByRole("article", { name: /Review release/ })).getByRole("button", { name: "Stop" })).toBeTruthy(),
+			expect(within(screen.getByRole("article", { name: /Review release/ })).getByRole("button", { name: "stop delegated work" })).toBeTruthy(),
 		);
 	});
 
@@ -238,16 +238,16 @@ describe("stop delegated work", () => {
 
 		const work = screen.getByRole("article", { name: /Review release/ });
 		const other = screen.getByRole("article", { name: /Other work/ });
-		const stop = within(work).getByRole("button", { name: "Stop" });
+		const stop = within(work).getByRole("button", { name: "stop delegated work" });
 		fireEvent.click(stop);
 		fireEvent.click(stop);
 
 		expect(onCancel).toHaveBeenCalledTimes(1);
-		expect(within(work).getByRole("button", { name: "Stop delegated work", hidden: true }).getAttribute("aria-busy")).toBe("true");
-		expect((within(other).getByRole("button", { name: "Stop", hidden: true }) as HTMLButtonElement).disabled).toBe(false);
+		expect(within(work).getByRole("button", { name: "stop delegated work", hidden: true }).getAttribute("aria-busy")).toBe("true");
+		expect((within(other).getByRole("button", { name: "stop delegated work", hidden: true }) as HTMLButtonElement).disabled).toBe(false);
 
 		pending.resolve();
-		await waitFor(() => expect(within(work).getByRole("button", { name: "Stop" })).toBeTruthy());
+		await waitFor(() => expect(within(work).getByRole("button", { name: "stop delegated work" })).toBeTruthy());
 	});
 
 	it("blocks the direct action offline and re-enables it after reconnect", async () => {
@@ -257,7 +257,7 @@ describe("stop delegated work", () => {
 			onCancelDelegation: onCancel,
 			mutationBlockedReason: "Waiting for connection",
 		});
-		const blocked = screen.getByRole("button", { name: "Stop" }) as HTMLButtonElement;
+		const blocked = screen.getByRole("button", { name: "stop delegated work" }) as HTMLButtonElement;
 		expect(blocked.disabled).toBe(true);
 		expect(screen.getByText("Waiting for connection")).toBeTruthy();
 		fireEvent.click(blocked);
@@ -272,7 +272,7 @@ describe("stop delegated work", () => {
 				onCancelDelegation={onCancel}
 			/>,
 		);
-		await user.click(screen.getByRole("button", { name: "Stop" }));
+		await user.click(screen.getByRole("button", { name: "stop delegated work" }));
 		expect(onCancel).toHaveBeenCalledTimes(1);
 	});
 
@@ -284,9 +284,9 @@ describe("stop delegated work", () => {
 		renderList({ onCancelDelegation: onCancel });
 
 		const work = screen.getByRole("article", { name: /Review release/ });
-		await user.click(within(work).getByRole("button", { name: "Stop" }));
+		await user.click(within(work).getByRole("button", { name: "stop delegated work" }));
 		await waitFor(() => expect(within(work).getByRole("alert").textContent).toContain("cancel request failed"));
-		expect((within(work).getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
+		expect((within(work).getByRole("button", { name: "stop delegated work" }) as HTMLButtonElement).disabled).toBe(false);
 	});
 });
 
