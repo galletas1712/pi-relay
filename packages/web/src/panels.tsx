@@ -801,7 +801,7 @@ export function SidebarToolbar({
 				target?.isContentEditable;
 			if (isTypingTarget) return;
 			if (!activeElement?.closest('[data-slot="sidebar"]')) return;
-			if (event.key === "/" || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f")) {
+			if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
 				event.preventDefault();
 				setSearchOpen(true);
 			}
