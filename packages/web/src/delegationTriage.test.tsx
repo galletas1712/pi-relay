@@ -243,7 +243,7 @@ describe("stop delegated work", () => {
 		fireEvent.click(stop);
 
 		expect(onCancel).toHaveBeenCalledTimes(1);
-		expect(within(work).getByRole("button", { name: "Stopping…", hidden: true }).getAttribute("aria-busy")).toBe("true");
+		expect(within(work).getByRole("button", { name: "Stop delegated work", hidden: true }).getAttribute("aria-busy")).toBe("true");
 		expect((within(other).getByRole("button", { name: "Stop", hidden: true }) as HTMLButtonElement).disabled).toBe(false);
 
 		pending.resolve();

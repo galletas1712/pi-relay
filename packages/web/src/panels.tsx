@@ -168,11 +168,18 @@ function DelegationCard({
 							type="button"
 							disabled={actionDisabled}
 							aria-busy={pending}
+							aria-label={pending ? "Stop delegated work" : undefined}
 							onClick={() => onStop(delegation)}
 							title="Stop this delegated work"
 						>
-							{pending ? <Loader2 className="spin" size={15} aria-hidden /> : <Square size={13} aria-hidden />}
-							<span>{pending ? "Stopping…" : "Stop"}</span>
+							{pending ? (
+								<Loader2 className="spin" size={15} aria-hidden />
+							) : (
+								<>
+									<Square size={13} aria-hidden />
+									<span>Stop</span>
+								</>
+							)}
 						</button>
 					) : null}
 				</div>

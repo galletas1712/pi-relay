@@ -3466,6 +3466,7 @@ pre {
 
 .run-board-stop {
 	display: inline-flex;
+	min-width: 60px;
 	height: 28px;
 	align-items: center;
 	justify-content: center;
