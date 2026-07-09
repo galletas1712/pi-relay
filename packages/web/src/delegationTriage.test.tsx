@@ -188,7 +188,7 @@ describe("minimal delegated agent outline", () => {
 
 });
 
-describe("cancel delegated work", () => {
+describe("stop delegated work", () => {
 	it("captures the parent target and confirms once even when the rendered parent changes", async () => {
 		const pending = deferred<void>();
 		const onCancel = vi.fn(() => pending.promise);
@@ -203,13 +203,13 @@ describe("cancel delegated work", () => {
 		});
 
 		const work = screen.getByRole("article", { name: /Review release/ });
-		await user.click(within(work).getByRole("button", { name: "Cancel" }));
-		const dialog = screen.getByRole("alertdialog", { name: "Cancel delegated work?" });
+		await user.click(within(work).getByRole("button", { name: "Stop" }));
+		const dialog = screen.getByRole("alertdialog", { name: "Stop delegated work?" });
 		expect(within(dialog).getByText("Review release")).toBeTruthy();
 		expect(within(dialog).getByText(/remaining work affecting 2 agents\/slots/)).toBeTruthy();
 		expect(within(dialog).getByText(/cannot roll back external tool or network side effects/i)).toBeTruthy();
 		await waitFor(() =>
-			expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Cancel" })),
+			expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Keep running" })),
 		);
 
 		view.rerender(
@@ -221,7 +221,7 @@ describe("cancel delegated work", () => {
 				onCancelDelegation={onCancel}
 			/>,
 		);
-		const confirm = screen.getByRole("button", { name: "Cancel work" });
+		const confirm = screen.getByRole("button", { name: "Stop work" });
 		fireEvent.click(confirm);
 		fireEvent.click(confirm);
 		expect(onCancel).toHaveBeenCalledTimes(1);
@@ -244,14 +244,14 @@ describe("cancel delegated work", () => {
 
 		const work = screen.getByRole("article", { name: /Review release/ });
 		const other = screen.getByRole("article", { name: /Other work/ });
-		await user.click(within(work).getByRole("button", { name: "Cancel" }));
-		const confirm = screen.getByRole("button", { name: "Cancel work" });
+		await user.click(within(work).getByRole("button", { name: "Stop" }));
+		const confirm = screen.getByRole("button", { name: "Stop work" });
 		fireEvent.click(confirm);
 		fireEvent.click(confirm);
 
 		expect(onCancel).toHaveBeenCalledTimes(1);
-		expect(within(work).getByRole("button", { name: "Cancelling…", hidden: true }).getAttribute("aria-busy")).toBe("true");
-		expect((within(other).getByRole("button", { name: "Cancel", hidden: true }) as HTMLButtonElement).disabled).toBe(false);
+		expect(within(work).getByRole("button", { name: "Stopping…", hidden: true }).getAttribute("aria-busy")).toBe("true");
+		expect((within(other).getByRole("button", { name: "Stop", hidden: true }) as HTMLButtonElement).disabled).toBe(false);
 
 		pending.resolve();
 		await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
@@ -261,7 +261,7 @@ describe("cancel delegated work", () => {
 		const onCancel = vi.fn(async () => undefined);
 		const user = userEvent.setup();
 		const view = renderList({ onCancelDelegation: onCancel });
-		await user.click(screen.getByRole("button", { name: "Cancel" }));
+		await user.click(screen.getByRole("button", { name: "Stop" }));
 
 		view.rerender(
 			<RunBoardDelegationList
@@ -273,7 +273,7 @@ describe("cancel delegated work", () => {
 				mutationBlockedReason="Waiting for connection"
 			/>,
 		);
-		const blocked = screen.getByRole("button", { name: "Cancel work" }) as HTMLButtonElement;
+		const blocked = screen.getByRole("button", { name: "Stop work" }) as HTMLButtonElement;
 		expect(blocked.disabled).toBe(true);
 		expect(screen.getByRole("alertdialog").textContent).toContain("Waiting for connection");
 
@@ -286,7 +286,7 @@ describe("cancel delegated work", () => {
 				onCancelDelegation={onCancel}
 			/>,
 		);
-		await user.click(screen.getByRole("button", { name: "Cancel work" }));
+		await user.click(screen.getByRole("button", { name: "Stop work" }));
 		expect(onCancel).toHaveBeenCalledTimes(1);
 	});
 
@@ -298,10 +298,10 @@ describe("cancel delegated work", () => {
 		renderList({ onCancelDelegation: onCancel });
 
 		const work = screen.getByRole("article", { name: /Review release/ });
-		await user.click(within(work).getByRole("button", { name: "Cancel" }));
-		await user.click(screen.getByRole("button", { name: "Cancel work" }));
+		await user.click(within(work).getByRole("button", { name: "Stop" }));
+		await user.click(screen.getByRole("button", { name: "Stop work" }));
 		await waitFor(() => expect(within(work).getByRole("alert").textContent).toContain("cancel request failed"));
-		expect((within(work).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+		expect((within(work).getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
 	});
 });
 

@@ -406,16 +406,16 @@ describe("App connection recovery integration", () => {
 		await openAndLoad(api);
 
 		const cancelTarget = screen.getByRole("article", { name: /Cancel target/ });
-		await user.click(within(cancelTarget).getByRole("button", { name: "Cancel" }));
+		await user.click(within(cancelTarget).getByRole("button", { name: "Stop" }));
 		await emitStatus(api, "closed");
-		const blockedCancel = screen.getByRole("button", { name: "Cancel work" }) as HTMLButtonElement;
+		const blockedCancel = screen.getByRole("button", { name: "Stop work" }) as HTMLButtonElement;
 		expect(blockedCancel.disabled).toBe(true);
 		expect(screen.getByRole("alertdialog").textContent).toContain("Waiting for connection");
 		fireEvent.click(blockedCancel);
 		expect(api.cancelDelegation).not.toHaveBeenCalled();
 
 		await emitStatus(api, "open");
-		const enabledCancel = screen.getByRole("button", { name: "Cancel work" }) as HTMLButtonElement;
+		const enabledCancel = screen.getByRole("button", { name: "Stop work" }) as HTMLButtonElement;
 		await waitFor(() => expect(enabledCancel.disabled).toBe(false));
 		await user.click(enabledCancel);
 		await waitFor(() => {
@@ -423,7 +423,7 @@ describe("App connection recovery integration", () => {
 		});
 
 		const finishedTarget = screen.getByRole("article", { name: /Finished target/ });
-		expect(within(finishedTarget).queryByRole("button", { name: "Cancel" })).toBeNull();
+		expect(within(finishedTarget).queryByRole("button", { name: "Stop" })).toBeNull();
 		expect(api.readHandoffFile).not.toHaveBeenCalled();
 		expect(api.startFullDelegation).not.toHaveBeenCalled();
 

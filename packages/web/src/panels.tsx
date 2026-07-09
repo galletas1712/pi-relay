@@ -176,15 +176,15 @@ function DelegationCard({
 				<div className="run-board-delegation-controls">
 					{running ? (
 						<button
-							className="run-board-cancel"
+							className="run-board-stop"
 							type="button"
 							disabled={actionDisabled}
 							aria-busy={pending}
-							aria-label={pending ? "Cancelling…" : "Cancel"}
 							onClick={() => onRequestCancel(delegation)}
-							title="Cancel this delegated work"
+							title="Stop this delegated work"
 						>
 							{pending ? <Loader2 className="spin" size={15} aria-hidden /> : <Square size={13} aria-hidden />}
+							<span>{pending ? "Stopping…" : "Stop"}</span>
 						</button>
 					) : null}
 				</div>
@@ -211,7 +211,7 @@ function DelegationCard({
 	);
 }
 
-function CancelDelegationDialog({
+function StopDelegationDialog({
 	delegation,
 	busy,
 	blockedReason,
@@ -224,25 +224,25 @@ function CancelDelegationDialog({
 	onClose: () => void;
 	onConfirm: () => void;
 }) {
-	const cancelRef = useRef<HTMLButtonElement>(null);
+	const keepRunningRef = useRef<HTMLButtonElement>(null);
 	const title = delegation.label?.trim() || "Agent task";
 	const remaining = remainingDelegationWorkCount(delegation);
 	return (
 		<AppAlertDialog
 			className="rename-dialog cancel-delegation-dialog"
 			busy={busy}
-			initialFocusRef={cancelRef}
+			initialFocusRef={keepRunningRef}
 			onDismiss={onClose}
 		>
 			<DialogHeader>
 				<DialogHeading>
-					<DialogTitle>Cancel delegated work?</DialogTitle>
+					<DialogTitle>Stop delegated work?</DialogTitle>
 				</DialogHeading>
-				<DialogCloseButton label="close cancel delegated work dialog" disabled={busy} />
+				<DialogCloseButton label="close stop delegated work dialog" disabled={busy} />
 			</DialogHeader>
 			<DialogBody className="delete-dialog-body">
 				<p>
-					Cancel <strong>{title}</strong> and stop remaining work affecting {remaining.count} {remaining.unit}?
+					Stop <strong>{title}</strong> and its remaining work affecting {remaining.count} {remaining.unit}?
 				</p>
 				<DialogDescription className="muted">
 					This stops remaining delegated work. It cannot roll back external tool or network side effects that already happened.
@@ -250,8 +250,8 @@ function CancelDelegationDialog({
 				<ConnectionBlockedReason reason={blockedReason} />
 			</DialogBody>
 			<DialogFooter>
-				<DialogClose ref={cancelRef} className="secondary-button" disabled={busy}>
-					Cancel
+				<DialogClose ref={keepRunningRef} className="secondary-button" disabled={busy}>
+					Keep running
 				</DialogClose>
 				<button
 					type="button"
@@ -260,7 +260,7 @@ function CancelDelegationDialog({
 					aria-busy={busy}
 					onClick={onConfirm}
 				>
-					{busy ? "Cancelling…" : "Cancel work"}
+					{busy ? "Stopping…" : "Stop work"}
 				</button>
 			</DialogFooter>
 		</AppAlertDialog>
@@ -401,7 +401,7 @@ export function RunBoardDelegationList({
 				</>
 			) : null}
 			{cancelDialogIntent ? (
-				<CancelDelegationDialog
+				<StopDelegationDialog
 					delegation={cancelDialogIntent.delegation}
 					busy={
 						actionStates[
