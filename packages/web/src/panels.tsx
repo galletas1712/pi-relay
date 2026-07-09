@@ -584,9 +584,6 @@ export const Sidebar = memo(function Sidebar({
 				onEditProject={onEditProject}
 				onClose={onClose}
 			/>
-			<div className="session-section-head">
-				<span>Sessions</span>
-			</div>
 			<SidebarToolbar
 				disabled={false}
 				query={query}
@@ -679,7 +676,7 @@ export function ProjectList({
 		<div className="project-section">
 			<div className="project-section-head">
 				<span>Projects</span>
-				<span className="project-section-actions">
+				<span className="sidebar-section-actions">
 					<button className="icon-button tiny" type="button" onClick={onNewProject} title="new project" aria-label="new project">
 						<Plus size={13} />
 					</button>
@@ -815,38 +812,50 @@ export function SidebarToolbar({
 
 	return (
 		<div className="sidebar-toolbar">
-			<div className="toolbar-actions">
-				<button ref={newSessionButtonRef} className="primary-button" type="button" onClick={onNew} disabled={disabled}>
-					<Plus size={14} />
-					New session
-				</button>
-				<button
-					className={`icon-button ${searchVisible ? "pressed" : ""}`}
-					type="button"
-					onClick={() => {
-						if (searchVisible) {
-							onQueryChange("");
-							setSearchOpen(false);
-						} else {
-							setSearchOpen(true);
-						}
-					}}
-					disabled={disabled}
-					aria-label={searchVisible ? "Close Filter Sessions" : "Filter Sessions"}
-					title={searchVisible ? "Close Filter Sessions" : "Filter Sessions"}
-				>
-					<Search size={14} />
-				</button>
-				<button
-					className={`icon-button ${showArchived ? "pressed" : ""}`}
-					type="button"
-					onClick={onToggleArchived}
-					disabled={disabled}
-					aria-label={showArchived ? "hide archived sessions" : "show archived sessions"}
-					title={showArchived ? "hide archived sessions" : "show archived sessions"}
-				>
-					<Archive size={14} />
-				</button>
+			<div className="session-section-head">
+				<span>Sessions</span>
+				<span className="sidebar-section-actions">
+					<button
+						ref={newSessionButtonRef}
+						className="icon-button"
+						type="button"
+						onClick={onNew}
+						disabled={disabled}
+						aria-label="new session"
+						title="New session"
+					>
+						<Plus size={14} />
+					</button>
+					<button
+						className={`icon-button ${searchVisible ? "pressed" : ""}`}
+						type="button"
+						onClick={() => {
+							if (searchVisible) {
+								onQueryChange("");
+								setSearchOpen(false);
+							} else {
+								setSearchOpen(true);
+							}
+						}}
+						disabled={disabled}
+						aria-label={searchVisible ? "Close Filter Sessions" : "Filter Sessions"}
+						aria-pressed={searchVisible}
+						title={searchVisible ? "Close Filter Sessions" : "Filter Sessions"}
+					>
+						<Search size={14} />
+					</button>
+					<button
+						className={`icon-button ${showArchived ? "pressed" : ""}`}
+						type="button"
+						onClick={onToggleArchived}
+						disabled={disabled}
+						aria-label={showArchived ? "hide archived sessions" : "show archived sessions"}
+						aria-pressed={showArchived}
+						title={showArchived ? "hide archived sessions" : "show archived sessions"}
+					>
+						<Archive size={14} />
+					</button>
+				</span>
 			</div>
 			{searchVisible ? (
 				<label

@@ -360,8 +360,8 @@ pre {
 .sidebar-toolbar {
 	display: flex;
 	flex-direction: column;
-	gap: 8px;
-	padding: 10px 12px;
+	gap: 6px;
+	padding: 10px 8px 6px;
 }
 
 .project-section {
@@ -377,16 +377,14 @@ pre {
 	gap: 8px;
 	padding: 0 4px 6px;
 	font-family: var(--font-sans);
-	font-size: var(--text-xs);
+	font-size: var(--text-sm);
 	font-weight: 600;
 	letter-spacing: 0;
 	color: var(--muted-foreground);
 }
 
 .session-section-head {
-	justify-content: flex-start;
-	gap: 8px;
-	padding: 10px 12px 8px;
+	padding-bottom: 0;
 }
 
 .session-section-head > span:first-child {
@@ -460,20 +458,15 @@ pre {
 	font-weight: 600;
 }
 
-.project-section-actions {
+.sidebar-section-actions {
 	display: inline-flex;
 	align-items: center;
 	gap: 2px;
 }
 
-.project-section-actions .plain-close-button {
+.sidebar-section-actions .plain-close-button {
 	align-self: center;
 	margin: 0;
-}
-
-.toolbar-actions {
-	display: flex;
-	gap: 6px;
 }
 
 .primary-button,
