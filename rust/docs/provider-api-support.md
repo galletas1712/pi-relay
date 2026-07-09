@@ -95,7 +95,7 @@ replay.
 
 | Capability | OpenAI private Codex adapter | Anthropic Messages adapter | Evidence and limitations |
 | --- | --- | --- | --- |
-| Model discovery and capability metadata | **Supported.** Authenticated `GET /models?client_version=0.142.3` installs one bounded account-scoped catalog. Model lookup is exact by slug; every ordinary and compact request resolves the selected model before request shaping. There is no static catalog, alias, prefix match, substitution, public `/v1/models` fallback, disk cache, or stale-success fallback. | **Supported.** `GET /models/{id}` is cached and merged over conservative static fallback metadata for input/output limits, effort, and adaptive thinking. | OpenAI discovery/request/cache behavior is source/mock-tested from the sanitized probe schema and its retrieval/resolution path was observed live. Anthropic discovery is source/mock-tested. `[source, unit, live, pinned]` |
+| Model discovery and capability metadata | **Supported.** Authenticated `GET /models?client_version=0.144.0` installs one bounded account-scoped catalog. Model lookup is exact by slug; every ordinary and compact request resolves the selected model before request shaping. There is no static catalog, alias, prefix match, substitution, public `/v1/models` fallback, disk cache, or stale-success fallback. | **Supported.** `GET /models/{id}` is cached and merged over conservative static fallback metadata for input/output limits, effort, and adaptive thinking. | OpenAI discovery/request/cache behavior is source/mock-tested from the sanitized probe schema and its retrieval/resolution path was observed live. Anthropic discovery is source/mock-tested. `[source, unit, live, pinned]` |
 | Context windows and automatic compaction thresholds | **Supported.** The adapter resolves `context_window` before `max_context_window` and recommends `min(auto_compact_token_limit, 90% of resolved context)`, deriving 90% when the explicit limit is null/missing. The daemon has no OpenAI static rows: without fresh authoritative metadata it has no proactive threshold, while reactive overflow recovery remains available. | **Supported.** Discovered/static windows drive policy; verified 1M windows default to a 500k threshold and other known windows use the generic policy. | The sanitized probe fixture yields 334,800 for a 372k GPT-5.6 window. GPT-5.4 uses its 272k current/default window (244,800), not 90% of its advertised 1M maximum. `[source, unit, live]` |
 | Instructions / system prompt | **Supported.** Stable prompt is Responses `instructions`; dynamic context is a final user item. | **Supported.** Claude Code attribution plus a stable cacheable `system` block; dynamic context is a final uncached user message. | Request-shape tests cover both. `[source, unit]` |
 | Maximum output | **Supported.** `max_output_tokens` is emitted only when configured; otherwise omitted. The private catalog advertises no output ceiling, so discovery does not invent or clamp one. | **Supported.** Messages requires `max_tokens`; pi-relay defaults to `min(64k, model ceiling)` and clamps explicit values to the resolved ceiling. | `[source, unit]` |
@@ -114,10 +114,11 @@ replay.
 
 ### Account- and client-version-sensitive Codex catalog
 
-The private catalog is not a universal static model list. The sanitized
-2026-07-04 probe returned ten models for client version `0.142.3`; GPT-5.6 did
-not appear below `0.142.2`. The adapter therefore uses one
-`CODEX_CLIENT_VERSION = "0.142.3"` constant for both the query and
+The private catalog is not a universal static model list; the backend filters
+it by the advertised `client_version`. The GPT-5.6 family now carries
+`minimal_client_version=0.144.0`, so it only appears when the request advertises
+`client_version >= 0.144.0`. The adapter therefore uses one
+`CODEX_CLIENT_VERSION = "0.144.0"` constant for both the query and
 Codex-shaped User-Agent. It caches the whole catalog in memory for five minutes,
 scoped by Codex base URL plus account id (or a nonlogged token fingerprint when
 the account id is absent). Concurrent cold callers share one detached refresh.

@@ -59,7 +59,7 @@ const HEADER_REASONING_INCLUDED: &str = "x-reasoning-included";
 // and rate-limit accounting (see `is_first_party_originator` in the Codex
 // source). Diverging from this label is what causes throttling.
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-pub const CODEX_CLIENT_VERSION: &str = "0.142.3";
+pub const CODEX_CLIENT_VERSION: &str = "0.144.0";
 const CODEX_RESIDENCY_US: &str = "us";
 const CODEX_REQUEST_COMPRESSION_LEVEL: i32 = 3;
 const CODEX_COMPACT_REQUEST_TIMEOUT_SECS: u64 = 20 * 60;
@@ -1003,11 +1003,11 @@ mod catalog_tests {
         let request = String::from_utf8(raw).expect("request is utf-8");
         let request_lower = request.to_ascii_lowercase();
         let first_line = request.lines().next().expect("request line");
-        assert_eq!(first_line, "GET /models?client_version=0.142.3 HTTP/1.1");
+        assert_eq!(first_line, "GET /models?client_version=0.144.0 HTTP/1.1");
         assert!(request_lower.contains("authorization: bearer access-token\r\n"));
         assert!(request_lower.contains("chatgpt-account-id: account-id\r\n"));
         assert!(request_lower.contains("originator: codex_cli_rs\r\n"));
-        assert!(request_lower.contains("user-agent: codex_cli_rs/0.142.3"));
+        assert!(request_lower.contains("user-agent: codex_cli_rs/0.144.0"));
         assert!(request_lower.contains("x-codex-installation-id: installation-id\r\n"));
         assert!(request_lower.contains("x-openai-internal-codex-residency: us\r\n"));
         for forbidden in [

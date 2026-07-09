@@ -104,7 +104,7 @@ Requests go to `https://chatgpt.com/backend-api/codex/responses`, streamed (`Acc
 
 Before rendering an ordinary or compact body, the adapter exact-resolves the
 configured slug from authenticated
-`GET /models?client_version=0.142.3`. The GET uses the same bearer/account,
+`GET /models?client_version=0.144.0`. The GET uses the same bearer/account,
 originator, Codex-shaped User-Agent, installation-id, and residency identity as
 generation, but no session/window/turn routing headers and no request body.
 `CODEX_CLIENT_VERSION` is also the User-Agent version, preventing query/identity
