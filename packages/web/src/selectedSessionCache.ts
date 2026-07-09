@@ -439,13 +439,6 @@ export function activeBranchFromTreeBodies(cache: SelectedSessionCache): Transcr
 	});
 }
 
-export function fullTreeEntriesFromKnownBodies(cache: SelectedSessionCache): TranscriptEntry[] {
-	return cache.treeOrder.flatMap((id) => {
-		const entry = cache.entriesById.get(id);
-		return entry ? [entry] : [];
-	});
-}
-
 export function activeBranchEntriesForExport(cache: SelectedSessionCache): TranscriptEntry[] {
 	const snapshot = cache.snapshot;
 	if (!cache.sessionId || !snapshot || snapshot.session_id !== cache.sessionId) return [];

@@ -44,7 +44,6 @@ import {
 	type SessionStatus,
 	type SessionListItem
 } from "./sessionList.ts";
-import { truncate } from "./text.ts";
 import {
 	agentStatusIconKey,
 	groupDelegations,

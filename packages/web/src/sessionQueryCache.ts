@@ -1,8 +1,7 @@
 import type { QueryClient } from "@tanstack/react-query";
-import { queryKeys, type EntryScope } from "./queryKeys.ts";
-import { displayParentIdForEntry } from "./displayParent.ts";
+import { queryKeys } from "./queryKeys.ts";
 import { sortSessionsByLastUserMessage } from "./sessionList.ts";
-import type { ActiveBranchSyncResponse, EventFrame, SessionSnapshot, SessionSummary } from "./types.ts";
+import type { EventFrame, SessionSnapshot, SessionSummary } from "./types.ts";
 
 export function patchSessionList(
 	queryClient: QueryClient,
@@ -53,18 +52,6 @@ export function patchSessionListProvider(queryClient: QueryClient, projectId: st
 	}));
 }
 
-export function patchSessionListActivity(
-	queryClient: QueryClient,
-	projectId: string | null,
-	sessionId: string,
-	activity: SessionSummary["activity"],
-) {
-	patchSessionList(queryClient, projectId, sessionId, (session) => ({
-		...session,
-		activity,
-	}));
-}
-
 export function patchSessionListEventSummary(
 	queryClient: QueryClient,
 	projectId: string | null,
@@ -90,18 +77,6 @@ export function patchSessionListEventSummary(
 		has_transcript_entries:
 			activeLeafId === undefined ? session.has_transcript_entries : activeLeafId !== null || session.has_transcript_entries,
 	}));
-}
-
-export function patchSessionSnapshot(
-	queryClient: QueryClient,
-	sessionId: string,
-	scope: EntryScope,
-	patcher: (snapshot: SessionSnapshot) => SessionSnapshot,
-) {
-	queryClient.setQueryData<SessionSnapshot>(queryKeys.session(sessionId, scope), (current) => {
-		if (!current || current.session_id !== sessionId) return current;
-		return patcher(current);
-	});
 }
 
 export function mergeSnapshotIntoSessionList(
@@ -160,29 +135,4 @@ function lastUserMessageTimestampFromEvent(event: EventFrame): number | undefine
 	const timestamp = entry?.timestamp_ms;
 	if (item?.type !== "user_message" || typeof timestamp !== "number" || !Number.isFinite(timestamp)) return undefined;
 	return timestamp;
-}
-
-export type ActiveBranchSyncApplyResult = "applied" | "reload";
-
-export function applyActiveBranchSync(snapshot: SessionSnapshot | undefined, sync: ActiveBranchSyncResponse): ActiveBranchSyncApplyResult {
-	if (!snapshot || snapshot.session_id !== sync.session_id) return "reload";
-	if (sync.status === "branch_changed") return "reload";
-	const overview = sync.overview;
-	const nextEntries = [...(snapshot.entries ?? [])];
-	if (sync.status === "extended") {
-		for (const entry of sync.entries) {
-			if (nextEntries.some((candidate) => candidate.id === entry.id)) continue;
-			const currentLeafId = nextEntries.at(-1)?.id ?? null;
-			if (displayParentIdForEntry(entry) !== currentLeafId) return "reload";
-			nextEntries.push(entry);
-		}
-	}
-	if ((nextEntries.at(-1)?.id ?? null) !== sync.active_leaf_id) return "reload";
-	Object.assign(snapshot, {
-		...snapshot,
-		...overview,
-		active_leaf_id: sync.active_leaf_id,
-		entries: nextEntries,
-	});
-	return "applied";
 }

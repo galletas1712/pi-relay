@@ -1433,7 +1433,7 @@ class TranscriptDisplayBuilder {
 
 	constructor(
 		private readonly entries: TranscriptEntry[],
-		private readonly turns: TurnView[],
+		turns: TurnView[],
 		private readonly toolResults: Map<string, ToolResultItem>,
 		private readonly pendingActions: PendingAction[]
 	) {

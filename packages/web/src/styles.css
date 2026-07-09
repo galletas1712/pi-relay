@@ -346,8 +346,7 @@ pre {
 }
 
 .connection-row,
-.log-header,
-.inspector-head {
+.log-header {
 	display: flex;
 	align-items: center;
 	gap: 8px;
@@ -369,8 +368,7 @@ pre {
 	border-bottom: 1px solid var(--border);
 }
 
-.connection-pill,
-.session-state {
+.connection-pill {
 	border: 1px solid var(--border);
 	border-radius: 999px;
 	background: color-mix(in oklch, var(--muted) 55%, transparent);
@@ -702,8 +700,7 @@ pre {
 	background: var(--success);
 }
 
-/* `delegating` = idle parent parked behind >=1 running subagent. A 3px bar can't
-   render the dashed border the `.session-state.delegating` pill uses, so echo
+/* `delegating` = idle parent parked behind >=1 running subagent. Echo
    "running but delegated" with a static segmented primary fill (distinct from
    the solid `.running` primary and the solid `.idle` success). No pulse: many
    rows render this at once. */
@@ -1057,34 +1054,6 @@ pre {
 .session-status-icon.pending {
 	color: var(--muted-foreground);
 	background: color-mix(in oklch, var(--muted) 38%, transparent);
-}
-
-.session-state {
-	font-size: var(--text-2xs);
-	font-weight: 500;
-}
-
-.session-state.running {
-	border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
-	color: var(--primary);
-}
-
-/* `delegating` = parent parked (reports idle) while its subagents run. Same
-   primary color family as `.running`, but a dashed border marks it as
-   "running, but the work is delegated" — without needing an icon. */
-.session-state.delegating {
-	border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
-	color: var(--primary);
-	border-style: dashed;
-}
-
-.session-state.idle {
-	border-color: color-mix(in oklch, var(--success) 40%, var(--border));
-	color: var(--success);
-}
-
-.session-state.archived {
-	color: var(--muted-foreground);
 }
 
 .log-title-group {
@@ -1894,26 +1863,22 @@ pre {
 }
 
 .tool-run-group.success .tool-run-status-icon,
-.tool-run-item.success .tool-run-item-icon,
-.tool-card.ok .tool-status-icon {
+.tool-run-item.success .tool-run-item-icon {
 	color: var(--success);
 }
 
 .tool-run-group.error .tool-run-status-icon,
 .tool-run-item.error .tool-run-item-icon,
-.tool-card.error .tool-status-icon,
 .tool-output-error {
 	color: var(--destructive);
 }
 
 .tool-run-group.running .tool-run-status-icon,
-.tool-run-item.running .tool-run-item-icon,
-.tool-card.running .tool-status-icon {
+.tool-run-item.running .tool-run-item-icon {
 	color: var(--muted-foreground);
 }
 
-.tool-run-group-head,
-.tool-card-toggle {
+.tool-run-group-head {
 	display: flex;
 	align-items: center;
 	gap: 8px;
@@ -1933,14 +1898,11 @@ pre {
 	padding: 10px 10px;
 }
 
-.tool-run-group-head:hover,
-.tool-card-toggle:hover {
+.tool-run-group-head:hover {
 	background: color-mix(in oklch, var(--muted) 45%, transparent);
 }
 
 .tool-run-status-icon,
-.tool-status-icon,
-.tool-wrench,
 .tool-chevron {
 	flex: 0 0 auto;
 	color: var(--muted-foreground);
@@ -1962,18 +1924,13 @@ pre {
 	max-width: 100%;
 }
 
-.tool-run-title,
-.tool-title {
+.tool-run-title {
 	min-width: 0;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
 	font-family: var(--font-sans);
 	font-weight: 500;
-}
-
-.tool-title {
-	flex: 1 1 auto;
 }
 
 .tool-run-summary {
@@ -2000,13 +1957,6 @@ pre {
 	font-variant-numeric: tabular-nums;
 }
 
-.tool-run-head-status,
-.tool-status {
-	flex: 0 0 auto;
-	font-size: var(--text-2xs);
-	color: var(--muted-foreground);
-}
-
 .tool-chevron {
 	transform: rotate(90deg);
 	transition: transform 140ms ease;
@@ -2016,24 +1966,13 @@ pre {
 	transform: rotate(0deg);
 }
 
-.tool-run-detail,
-.tool-card-body {
+.tool-run-detail {
 	border-top: 1px solid var(--border);
 	background: color-mix(in oklch, var(--background) 75%, transparent);
 }
 
 .tool-run-detail {
 	padding: 6px 0;
-}
-
-.tool-run-detail-line {
-	display: grid;
-	grid-template-columns: 24px minmax(0, 1fr) auto;
-	gap: 8px;
-	align-items: center;
-	padding: 6px 10px;
-	font-size: var(--text-xs);
-	color: var(--muted-foreground);
 }
 
 .tool-run-detail-icon {
@@ -2328,8 +2267,7 @@ pre {
 	opacity: 0.45;
 }
 
-.connection-row .plain-close-button,
-.inspector-head .plain-close-button {
+.connection-row .plain-close-button {
 	margin-top: 0;
 }
 
@@ -2381,45 +2319,6 @@ pre {
 	margin: 2px 0 0;
 	color: var(--muted-foreground);
 	font-size: var(--text-sm);
-}
-
-.history-title-field {
-	display: grid;
-	grid-template-columns: 94px minmax(0, 1fr);
-	align-items: center;
-	gap: 10px;
-	border-bottom: 1px solid var(--border);
-	padding: 10px 12px;
-}
-
-.history-title-field span {
-	font-family: var(--font-sans);
-	font-size: var(--text-xs);
-	font-weight: 600;
-	color: var(--muted-foreground);
-}
-
-.history-title-field input {
-	min-width: 0;
-	height: 32px;
-	border: 1px solid var(--border);
-	border-radius: var(--radius);
-	background: var(--background);
-	color: var(--foreground);
-	outline: 0;
-	padding: 0 9px;
-}
-
-.history-title-field input:focus {
-	border-color: var(--ring);
-	box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 35%, transparent);
-}
-
-.history-actions {
-	display: flex;
-	justify-content: flex-end;
-	gap: 8px;
-	padding: 12px;
 }
 
 .rename-dialog {
@@ -2641,7 +2540,6 @@ pre {
 	overflow-wrap: anywhere;
 }
 
-.rename-actions,
 .dialog-footer {
 	display: flex;
 	justify-content: flex-end;
@@ -2658,8 +2556,6 @@ pre {
 	max-width: 140px;
 }
 
-.rename-actions .primary-button,
-.rename-actions .secondary-button,
 .dialog-footer .primary-button,
 .dialog-footer .secondary-button {
 	flex: 0 0 auto;
@@ -3410,10 +3306,6 @@ pre {
 	}
 }
 
-.inspector-head {
-	border-bottom: 1px solid var(--border);
-}
-
 .inspector-inner {
 	display: flex;
 	min-height: 0;
@@ -4140,17 +4032,10 @@ pre {
 		display: none;
 	}
 
-	.tool-run-group-head,
-	.tool-card-toggle {
+	.tool-run-group-head {
 		padding: 9px 10px;
 	}
 
-	.tool-run-head-status,
-	.tool-status {
-		display: none;
-	}
-
-	.tool-run-detail-line,
 	.tool-run-show-link,
 	.tool-run-item-toggle {
 		gap: 7px;
@@ -4280,12 +4165,6 @@ pre {
 		padding: 12px;
 	}
 
-	.history-title-field {
-		grid-template-columns: 1fr;
-		gap: 6px;
-	}
-
-	.history-title-field input,
 	.rename-field input {
 		height: 38px;
 	}
@@ -4364,19 +4243,13 @@ pre {
 		font-size: var(--text-2xs);
 	}
 
-	.history-actions,
 	.export-actions,
-	.rename-actions,
 	.dialog-footer {
 		flex-wrap: wrap-reverse;
 	}
 
-	.history-actions .primary-button,
-	.history-actions .secondary-button,
 	.export-actions .primary-button,
 	.export-actions .secondary-button,
-	.rename-actions .primary-button,
-	.rename-actions .secondary-button,
 	.dialog-footer .primary-button,
 	.dialog-footer .secondary-button {
 		flex: 1 1 140px;

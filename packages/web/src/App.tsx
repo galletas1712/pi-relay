@@ -144,7 +144,6 @@ import {
 } from "./workspaceRoute.ts";
 import type {
 	Activity,
-	Delegation,
 	DelegationSubagent,
 	EventFrame,
 	Notice,
@@ -282,7 +281,7 @@ function projectMismatchUnavailable(route: WorkspaceRoute, actualProjectId: stri
 	};
 }
 
-function routeRootUnavailable(route: WorkspaceRoute, message: string): WorkspaceRouteUnavailable {
+function routeRootUnavailable(message: string): WorkspaceRouteUnavailable {
 	return {
 		kind: "unavailable",
 		issue: "invalid-conversation",
@@ -1246,7 +1245,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						setRouteValidation({
 							kind: "unavailable",
 							state: routeRootUnavailable(
-								rootConversationRoute(routeScope(initialUiSelection.projectId), root.session_id),
 								"Nested agent conversations are not available because the backend currently exposes direct parents only.",
 							),
 							retryable: false,
@@ -1307,7 +1305,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				if (root.parent_session_id) {
 					setRouteValidation({
 						kind: "unavailable",
-						state: routeRootUnavailable(route, "The requested root run is an agent session, not a root session."),
+						state: routeRootUnavailable("The requested root run is an agent session, not a root session."),
 						retryable: false,
 					});
 					return;
@@ -1430,7 +1428,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 								`Couldn’t validate the requested Conversation: ${errorMessage(error)}`,
 							)
 							: routeRootUnavailable(
-								route,
 								`Couldn’t validate the requested Execution route: ${errorMessage(error)}`,
 							),
 					retryable: true,
@@ -1992,7 +1989,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (event.session_id === selectedRef.current) {
 				const queue = queueProjectionFromEvent(event);
 				if (queue) {
-					const next = replaceSelectedCache(
+					replaceSelectedCache(
 						applyEventHighWater(
 							applyQueueProjection(selectedCacheRef.current, event.session_id, queue),
 							event.session_id,
@@ -2765,7 +2762,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		async (inputId: string, direction: "up" | "down") => {
 			assertServerMutationAllowed();
 			const sessionId = requireSelected();
-			const projectId = selectedProjectRef.current;
 			const cache = selectedCacheRef.current;
 			const followUps = (cache.sessionId === sessionId ? cache.snapshot?.queued_inputs : loadedSnapshot?.queued_inputs ?? [])
 				?.filter((input) => input.priority === "follow_up" && input.status === "queued") ?? [];

@@ -9,7 +9,6 @@ import {
 	messageAgent,
 	openAgentConversation,
 	openHandoff,
-	parseWorkspaceRoute,
 	projectRouteScope,
 	rootConversationRoute,
 	selectRootRun,
