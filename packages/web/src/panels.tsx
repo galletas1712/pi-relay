@@ -526,6 +526,10 @@ const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
 export interface SidebarProps {
 	connection: string;
 	projects: Project[];
+	projectsLoading?: boolean;
+	projectsFetching?: boolean;
+	projectsError?: string | null;
+	projectsHasCachedData?: boolean;
 	selectedProjectId: string | null;
 	query: string;
 	showArchived: boolean;
@@ -538,6 +542,7 @@ export interface SidebarProps {
 	inert?: boolean;
 	newSessionButtonRef?: RefObject<HTMLButtonElement | null>;
 	onRetrySessions?: () => void;
+	onRetryProjects?: () => void;
 	onQueryChange: (query: string) => void;
 	onToggleArchived: () => void;
 	onNew: () => void;
@@ -556,6 +561,10 @@ export interface SidebarProps {
 export const Sidebar = memo(function Sidebar({
 	connection,
 	projects,
+	projectsLoading = false,
+	projectsFetching = false,
+	projectsError = null,
+	projectsHasCachedData = false,
 	selectedProjectId,
 	query,
 	showArchived,
@@ -568,6 +577,7 @@ export const Sidebar = memo(function Sidebar({
 	inert,
 	newSessionButtonRef,
 	onRetrySessions,
+	onRetryProjects,
 	onQueryChange,
 	onToggleArchived,
 	onNew,
@@ -587,7 +597,13 @@ export const Sidebar = memo(function Sidebar({
 			<SidebarHeader connection={connection} onClose={onClose} />
 			<ProjectList
 				projects={projects}
+				loading={projectsLoading}
+				fetching={projectsFetching}
+				error={projectsError}
+				hasCachedData={projectsHasCachedData}
+				remoteReadBlockedReason={remoteReadBlockedReason}
 				selectedProjectId={selectedProjectId}
+				onRetry={onRetryProjects}
 				onSelectProject={onSelectProject}
 				onNewProject={onNewProject}
 				onEditProject={onEditProject}
@@ -658,13 +674,25 @@ function pendingActionLabel(action: SessionSnapshot["pending_actions"][number]):
 
 export function ProjectList({
 	projects,
+	loading = false,
+	fetching = false,
+	error = null,
+	hasCachedData = false,
+	remoteReadBlockedReason,
 	selectedProjectId,
+	onRetry,
 	onSelectProject,
 	onNewProject,
 	onEditProject
 }: {
 	projects: Project[];
+	loading?: boolean;
+	fetching?: boolean;
+	error?: string | null;
+	hasCachedData?: boolean;
+	remoteReadBlockedReason?: string | null;
 	selectedProjectId: string | null;
+	onRetry?: () => void;
 	onSelectProject: (projectId: string | null) => void;
 	onNewProject: () => void;
 	onEditProject: (project: Project) => void;
@@ -677,7 +705,29 @@ export function ProjectList({
 					<Plus size={13} />
 				</button>
 			</div>
-			<nav aria-label="Projects">
+			{error ? (
+				<div className="load-error-banner project-load-error" role="alert">
+					<div>
+						<strong>{hasCachedData ? "Project refresh failed" : "Couldn’t load projects"}</strong>
+						<span>{error}</span>
+					</div>
+					{onRetry ? (
+						<>
+							<button
+								type="button"
+								className="secondary-button load-error-retry"
+								disabled={fetching || !!remoteReadBlockedReason}
+								aria-busy={fetching}
+								onClick={onRetry}
+							>
+								{fetching ? "Retrying…" : "Retry"}
+							</button>
+							<ConnectionBlockedReason reason={remoteReadBlockedReason} />
+						</>
+					) : null}
+				</div>
+			) : null}
+			<nav aria-label="Projects" aria-busy={loading || fetching}>
 				<ul className="project-list">
 					<li className={`project-row ${selectedProjectId === null ? "selected" : ""}`}>
 						<button
@@ -720,6 +770,7 @@ export function ProjectList({
 							</li>
 						);
 					})}
+					{loading && !error ? <li className="empty-list compact">Loading projects…</li> : null}
 				</ul>
 			</nav>
 		</div>

@@ -899,6 +899,10 @@ pre {
 	margin: var(--space-2) var(--space-2) 0;
 }
 
+.project-load-error {
+	margin-bottom: var(--space-2);
+}
+
 .load-error-retry {
 	flex: 0 0 auto;
 }

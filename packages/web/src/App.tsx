@@ -228,7 +228,13 @@ export interface AppProps {
 type RouteValidationState =
 	| { kind: "idle" }
 	| { kind: "pending" }
-	| { kind: "valid" }
+	| {
+			kind: "valid";
+			revision: number;
+			canonicalUrl: string;
+			projectId: string | null;
+			conversationSessionId: string;
+		}
 	| {
 			kind: "unavailable";
 			state: WorkspaceRouteUnavailable;
@@ -241,6 +247,21 @@ function routeScopeProjectId(route: WorkspaceRoute): string | null {
 
 function routeConversationSessionId(route: WorkspaceRoute): string {
 	return messageRecipient(route).sessionId;
+}
+
+function routeReadsEnabled(
+	result: WorkspaceRouteParseResult,
+	validation: RouteValidationState,
+	revision: number,
+): boolean {
+	if (result.kind === "none") return validation.kind === "idle";
+	if (result.kind !== "route" || validation.kind !== "valid") return false;
+	return (
+		validation.revision === revision &&
+		validation.canonicalUrl === result.canonicalUrl &&
+		validation.projectId === routeScopeProjectId(result.route) &&
+		validation.conversationSessionId === routeConversationSessionId(result.route)
+	);
 }
 
 function initialRouteResult(history: WorkspaceRouteHistory | null): WorkspaceRouteParseResult {
@@ -462,9 +483,15 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		initialWorkspaceRoute.kind === "none" && !!initialUiSelection.sessionId,
 	);
 	const initialCorrectionAppliedRef = useRef(false);
-	const validatedRouteRevisionRef = useRef(-1);
 	workspaceRouteResultRef.current = workspaceRouteResult;
 	routeValidationRef.current = routeValidation;
+	const routeRemoteReadsEnabled = routeReadsEnabled(
+		workspaceRouteResult,
+		routeValidation,
+		routeRevision,
+	);
+	const routeRemoteReadsEnabledRef = useRef(routeRemoteReadsEnabled);
+	routeRemoteReadsEnabledRef.current = routeRemoteReadsEnabled;
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
@@ -482,8 +509,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const assertServerMutationAllowed = useCallback(() => {
 		assertRemoteActionAllowed(remoteActionBlockedReason(connectionRef.current));
 	}, []);
+	const assertConnectionReadAllowed = useCallback(() => {
+		assertRemoteActionAllowed(remoteActionBlockedReason(connectionRef.current));
+	}, []);
 	const assertServerReadAllowed = useCallback(() => {
 		assertRemoteActionAllowed(remoteActionBlockedReason(connectionRef.current));
+		if (!routeRemoteReadsEnabledRef.current) {
+			throw new Error("workspace route is still being validated");
+		}
 	}, []);
 
 	const pushNotice = useCallback((tone: Notice["tone"], text: string, persistent = false) => {
@@ -513,12 +546,36 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const projectsQuery = useQuery({
 		queryKey: queryKeys.projects,
 		queryFn: () => {
-			assertServerReadAllowed();
+			assertConnectionReadAllowed();
 			return api.listProjects();
 		},
 		enabled: connection === "open",
 	});
 	const projects = projectsQuery.data ?? [];
+	const retainedProjectsErrorRef = useRef<unknown>(null);
+	if (projectsQuery.error) {
+		retainedProjectsErrorRef.current = projectsQuery.error;
+	} else if (projectsQuery.data !== undefined && !projectsQuery.isFetching) {
+		retainedProjectsErrorRef.current = null;
+	}
+	const projectsError = errorMessageOrNull(
+		projectsQuery.error ?? retainedProjectsErrorRef.current,
+	);
+	const projectsRetryRef = useRef<Promise<unknown> | null>(null);
+	const retryProjects = useCallback(() => {
+		if (connectionRef.current !== "open" || projectsRetryRef.current) return;
+		let request: Promise<unknown>;
+		try {
+			request = projectsQuery.refetch();
+		} catch (error) {
+			request = Promise.reject(error);
+		}
+		const pending = request.finally(() => {
+			if (projectsRetryRef.current === pending) projectsRetryRef.current = null;
+		});
+		projectsRetryRef.current = pending;
+		void pending.catch(() => undefined);
+	}, [projectsQuery.refetch]);
 	const knownProjectIds = useMemo(
 		() => [null, ...projects.map((project) => project.project_id)],
 		[projects],
@@ -555,7 +612,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					return api.listSessions(100, selectedProjectId);
 				},
 			),
-		enabled: connection === "open",
+		enabled: connection === "open" && routeRemoteReadsEnabled,
 		refetchInterval: SESSION_LIST_REFETCH_MS,
 		refetchIntervalInBackground: true,
 		refetchOnReconnect: true,
@@ -587,7 +644,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						return api.listSessions(100, projectId);
 					},
 				),
-			enabled: connection === "open",
+			enabled: connection === "open" && routeRemoteReadsEnabled,
 			refetchInterval: SESSION_LIST_REFETCH_MS,
 			refetchIntervalInBackground: true,
 			refetchOnReconnect: true,
@@ -646,7 +703,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 
 	useEffect(() => {
-		if (connection !== "open") return;
+		if (connection !== "open" || !routeRemoteReadsEnabled) return;
 		const key = sessionListRefreshKey(selectedProjectId);
 		const timer = sessionListRefreshTimers.current.get(key);
 		if (timer !== undefined) {
@@ -654,7 +711,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			sessionListRefreshTimers.current.delete(key);
 		}
 		void invalidateKnownSessionLists();
-	}, [connection, invalidateKnownSessionLists, selectedProjectId]);
+	}, [connection, invalidateKnownSessionLists, routeRemoteReadsEnabled, selectedProjectId]);
 
 	const sessionItems = useMemo(() => sortSessionsByLastUserMessage(sessions), [sessions]);
 	const selectedProject = useMemo(
@@ -783,7 +840,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			assertServerReadAllowed();
 			return api.listTools(activeProviderKind, activeToolsSessionId);
 		},
-		enabled: connection === "open",
+		enabled: connection === "open" && routeRemoteReadsEnabled,
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
 	// A selected child keeps its direct parent's board visible so the child row
@@ -814,7 +871,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		enabled:
 			connection === "open" &&
 			!!delegationParentSessionId &&
-			routeValidation.kind === "valid",
+			routeRemoteReadsEnabled,
 		// The parent PARKS (goes idle) while a delegation runs, so gate the poll
 		// on whether any delegation is actually running — not on the parent's
 		// activity — or the missed-event safety net would be off exactly when
@@ -835,7 +892,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		enabled:
 			connection === "open" &&
 			!!delegationParentSessionId &&
-			routeValidation.kind === "valid" &&
+			routeRemoteReadsEnabled &&
 			showAllDelegations,
 		refetchInterval: (query) =>
 			(query.state.data?.delegations ?? []).some(isDelegationRunning) ? 2_000 : false,
@@ -1028,7 +1085,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			setHistoryDialog(null);
 			routeValidationGenerationRef.current += 1;
-			validatedRouteRevisionRef.current = -1;
+			routeRemoteReadsEnabledRef.current = false;
+			selectedFetchCoordinator.restart(
+				hasUsableSelectedSessionCache(selectedCacheRef.current, selectedRef.current),
+			);
 			setRouteRevision((current) => current + 1);
 			setWorkspaceRouteResult(next);
 			if (next.kind === "route") {
@@ -1053,6 +1113,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			applyConversationIdentity,
 			applyProjectConversationIdentity,
 			routeHistory,
+			selectedFetchCoordinator,
 		],
 	);
 
@@ -1181,8 +1242,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 
 	const fetchSessionSnapshot = useCallback(
-		async (sessionId: string, source: string) => {
-			assertServerReadAllowed();
+		async (sessionId: string, source: string, validationRead = false) => {
+			if (validationRead) assertConnectionReadAllowed();
+			else assertServerReadAllowed();
 			const shouldLogPerf = perfEnabled();
 			const startedAt = perfNow();
 			if (shouldLogPerf) perfLog("session.get start", { sessionId, source });
@@ -1201,7 +1263,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			return nextSnapshot;
 		},
-		[api, assertServerReadAllowed],
+		[api, assertConnectionReadAllowed, assertServerReadAllowed],
 	);
 
 	useEffect(() => {
@@ -1209,7 +1271,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		if (
 			workspaceRouteResult.kind === "route" &&
 			routeValidationRef.current.kind === "valid" &&
-			validatedRouteRevisionRef.current === routeRevision
+			routeValidationRef.current.revision === routeRevision &&
+			routeValidationRef.current.canonicalUrl === workspaceRouteResult.canonicalUrl
 		) {
 			return;
 		}
@@ -1222,10 +1285,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				if (!legacyMigrationPendingRef.current || !initialUiSelection.sessionId) return;
 				setRouteValidation({ kind: "pending" });
 				try {
-					const selected = await fetchSessionSnapshot(initialUiSelection.sessionId, "legacy-route");
+					const selected = await fetchSessionSnapshot(initialUiSelection.sessionId, "legacy-route", true);
 					if (!stillCurrent()) return;
 					const root = selected.parent_session_id
-						? await fetchSessionSnapshot(selected.parent_session_id, "legacy-route-parent")
+						? await fetchSessionSnapshot(selected.parent_session_id, "legacy-route-parent", true)
 						: selected;
 					if (!stillCurrent()) return;
 					if (root.parent_session_id) {
@@ -1279,7 +1342,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const route = workspaceRouteResult.route;
 			setRouteValidation({ kind: "pending" });
 			try {
-				const root = await fetchSessionSnapshot(route.rootSessionId, "route-root");
+				const root = await fetchSessionSnapshot(route.rootSessionId, "route-root", true);
 				if (!stillCurrent()) return;
 				if (!validateProject(route, root)) {
 					setRouteValidation({
@@ -1302,7 +1365,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				let conversation = root;
 				if (conversationId !== route.rootSessionId) {
 					try {
-						conversation = await fetchSessionSnapshot(conversationId, "route-conversation");
+						conversation = await fetchSessionSnapshot(conversationId, "route-conversation", true);
 					} catch (error) {
 						if (!stillCurrent()) return;
 						if (route.destination === "execution") {
@@ -1354,7 +1417,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				) {
 					let focused: SessionSnapshot;
 					try {
-						focused = await fetchSessionSnapshot(route.focus.sessionId, "route-focus");
+						focused = await fetchSessionSnapshot(route.focus.sessionId, "route-focus", true);
 					} catch {
 						if (!stillCurrent()) return;
 						setRouteValidation({
@@ -1402,8 +1465,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					return;
 				}
 				rememberUiSelection(routeScopeProjectId(route), null);
-				validatedRouteRevisionRef.current = routeRevision;
-				setRouteValidation({ kind: "valid" });
+				setRouteValidation({
+					kind: "valid",
+					revision: routeRevision,
+					canonicalUrl: workspaceRouteResult.canonicalUrl,
+					projectId: routeScopeProjectId(route),
+					conversationSessionId: routeConversationSessionId(route),
+				});
 			} catch (error) {
 				if (!stillCurrent()) return;
 				setRouteValidation({
@@ -1499,7 +1567,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 
 	useEffect(() => {
-		if (connection !== "open") return;
+		if (connection !== "open" || !routeRemoteReadsEnabled) return;
 		const sessionCandidates = allKnownSessions
 			.filter((session) => session.session_id !== selectedRef.current)
 			.filter(canWarmBackgroundSession)
@@ -1544,7 +1612,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					backgroundWarmInFlight.current.delete(candidate.id);
 				});
 		}
-	}, [allKnownSessions, backgroundSubagentWarmCandidates, connection, getSelectedCache, warmBackgroundSession]);
+	}, [
+		allKnownSessions,
+		backgroundSubagentWarmCandidates,
+		connection,
+		getSelectedCache,
+		routeRemoteReadsEnabled,
+		warmBackgroundSession,
+	]);
 
 	const loadOlderTranscriptTurns = useCallback(
 		async (request: OlderTurnsLoadRequest): Promise<OlderTurnsLoadResult> => {
@@ -1934,7 +2009,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 
 	useEffect(() => {
-		if (connection !== "open") return;
+		if (connection !== "open" || !routeRemoteReadsEnabled) return;
 		if (!selectedId) {
 			resetSelectedCache(null);
 			if (selectedFetchCoordinator.getSnapshot().sessionId !== null) {
@@ -1950,6 +2025,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		connection,
 		refreshSelectedSessionState,
 		resetSelectedCache,
+		routeRemoteReadsEnabled,
 		selectedFetchCoordinator,
 		selectedId,
 	]);
@@ -2085,9 +2161,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	}, [api, invalidateKnownSessionLists, pushNotice, queryClient]);
 
 	useEffect(() => {
-		if (projectsQuery.error) pushNotice("error", errorMessage(projectsQuery.error));
-	}, [projectsQuery.error, pushNotice]);
-	useEffect(() => {
 		if (toolsQuery.error) pushNotice("error", errorMessage(toolsQuery.error));
 	}, [toolsQuery.error, pushNotice]);
 
@@ -2192,13 +2265,15 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		const selectedHasEventCursor =
 			!!selectedId && (lastEventIds.current.has(selectedId) || loadedSnapshot?.session_id === selectedId);
 		const desiredSessionIds = new Set<string>();
-		for (const session of sessions) {
-			desiredSessionIds.add(session.session_id);
+		if (routeRemoteReadsEnabled) {
+			for (const session of sessions) {
+				desiredSessionIds.add(session.session_id);
+			}
+			for (const delegationSubagentId of delegationSubagentIds) {
+				desiredSessionIds.add(delegationSubagentId);
+			}
+			if (selectedId && selectedHasEventCursor) desiredSessionIds.add(selectedId);
 		}
-		for (const delegationSubagentId of delegationSubagentIds) {
-			desiredSessionIds.add(delegationSubagentId);
-		}
-		if (selectedId && selectedHasEventCursor) desiredSessionIds.add(selectedId);
 		for (const sessionId of Array.from(subscribedEventSessionIds.current)) {
 			if (desiredSessionIds.has(sessionId)) continue;
 			subscribedEventSessionIds.current.delete(sessionId);
@@ -2230,6 +2305,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		loadedSnapshot?.last_event_id,
 		loadedSnapshot?.session_id,
 		pushNotice,
+		routeRemoteReadsEnabled,
 		selectedId,
 		sessions,
 		delegationSubagentIds,
@@ -3218,7 +3294,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		[pushNotice, reorderQueuedInput],
 	);
 	const validatedRoute =
-		workspaceRouteResult.kind === "route" && routeValidation.kind === "valid"
+		workspaceRouteResult.kind === "route" && routeRemoteReadsEnabled
 			? workspaceRouteResult.route
 			: null;
 	const conversationVisible =
@@ -3362,6 +3438,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			<Sidebar
 				connection={connection}
 				projects={projects}
+				projectsLoading={projectsQuery.isLoading}
+				projectsFetching={projectsQuery.isFetching}
+				projectsError={projectsError}
+				projectsHasCachedData={projectsQuery.data !== undefined}
 				selectedProjectId={selectedProjectId}
 				query={query}
 				showArchived={showArchived}
@@ -3374,6 +3454,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				inert={sidebarInert}
 				newSessionButtonRef={sidebarNewSessionButtonRef}
 				onRetrySessions={retrySessions}
+				onRetryProjects={retryProjects}
 				onQueryChange={setQuery}
 				onToggleArchived={handleToggleArchived}
 				onNew={handleSidebarNew}
