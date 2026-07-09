@@ -62,28 +62,6 @@ import type {
 	ToolListing,
 } from "./types.ts";
 
-export function SidebarHeader({
-	connection,
-	onClose
-}: {
-	connection: string;
-	onClose?: () => void;
-}) {
-	const connected = connection === "open";
-	return (
-		<div className="sidebar-header">
-			<div className="connection-row">
-				<span className={`connection-pill ${connected ? "online" : "offline"}`}>
-					{connected ? "connected" : connection}
-				</span>
-				<button className="plain-close-button sidebar-close" type="button" onClick={onClose} aria-label="close sidebar">
-					<X size={14} />
-				</button>
-			</div>
-		</div>
-	);
-}
-
 export const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
 export const RUN_BOARD_EXPANDED_DELEGATION_COUNT = 100;
 const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
@@ -469,9 +447,9 @@ function RunBoard({
 }) {
 	return (
 		<section className="inspect-section run-board-section">
-			{parentSessionId && loading ? (
+			{parentSessionId && loading && delegations.length === 0 ? (
 				<p className="muted run-board-inline-status" role="status">
-					{delegations.length > 0 ? "Refreshing agents…" : "Loading agents…"}
+					Loading agents…
 				</p>
 			) : null}
 			{parentSessionId && error ? (
@@ -524,7 +502,6 @@ const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
 ];
 
 export interface SidebarProps {
-	connection: string;
 	projects: Project[];
 	projectsLoading?: boolean;
 	projectsFetching?: boolean;
@@ -559,7 +536,6 @@ export interface SidebarProps {
 }
 
 export const Sidebar = memo(function Sidebar({
-	connection,
 	projects,
 	projectsLoading = false,
 	projectsFetching = false,
@@ -594,7 +570,6 @@ export const Sidebar = memo(function Sidebar({
 }: SidebarProps) {
 	return (
 		<aside className="sidebar" data-slot="sidebar" inert={inert}>
-			<SidebarHeader connection={connection} onClose={onClose} />
 			<ProjectList
 				projects={projects}
 				loading={projectsLoading}
@@ -607,6 +582,7 @@ export const Sidebar = memo(function Sidebar({
 				onSelectProject={onSelectProject}
 				onNewProject={onNewProject}
 				onEditProject={onEditProject}
+				onClose={onClose}
 			/>
 			<div className="session-section-head">
 				<span>Sessions</span>
@@ -683,7 +659,8 @@ export function ProjectList({
 	onRetry,
 	onSelectProject,
 	onNewProject,
-	onEditProject
+	onEditProject,
+	onClose,
 }: {
 	projects: Project[];
 	loading?: boolean;
@@ -696,14 +673,22 @@ export function ProjectList({
 	onSelectProject: (projectId: string | null) => void;
 	onNewProject: () => void;
 	onEditProject: (project: Project) => void;
+	onClose?: () => void;
 }) {
 	return (
 		<div className="project-section">
 			<div className="project-section-head">
 				<span>Projects</span>
-				<button className="icon-button tiny" type="button" onClick={onNewProject} title="new project" aria-label="new project">
-					<Plus size={13} />
-				</button>
+				<span className="project-section-actions">
+					<button className="icon-button tiny" type="button" onClick={onNewProject} title="new project" aria-label="new project">
+						<Plus size={13} />
+					</button>
+					{onClose ? (
+						<button className="plain-close-button sidebar-close" type="button" onClick={onClose} aria-label="close sidebar">
+							<X size={14} />
+						</button>
+					) : null}
+				</span>
 			</div>
 			{error ? (
 				<div className="load-error-banner project-load-error" role="alert">
@@ -752,15 +737,7 @@ export function ProjectList({
 									onClick={() => onSelectProject(project.project_id)}
 									aria-current={selected ? "page" : undefined}
 								>
-									<span
-										className="project-folder-count"
-										role="img"
-										aria-label={`${project.workspaces.length} ${project.workspaces.length === 1 ? "workspace" : "workspaces"}`}
-										title={`${project.workspaces.length} ${project.workspaces.length === 1 ? "workspace" : "workspaces"}`}
-									>
-										<Folder size={18} aria-hidden />
-										<span aria-hidden>{project.workspaces.length}</span>
-									</span>
+									<Folder size={14} aria-hidden />
 									<span className="project-title">{title}</span>
 								</button>
 								<ActionMenu
@@ -1026,7 +1003,6 @@ export function LogHeader({
 	modelDisabled,
 	modelLocked = false,
 	reasoningDisabled = false,
-	controlsBlockedReason,
 	reasoningEfforts,
 	reasoningEffort,
 	onModelChange,
@@ -1044,7 +1020,6 @@ export function LogHeader({
 	modelDisabled: boolean;
 	modelLocked?: boolean;
 	reasoningDisabled?: boolean;
-	controlsBlockedReason?: string | null;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	onModelChange: (value: string) => void;
@@ -1113,7 +1088,6 @@ export function LogHeader({
 						))}
 					</select>
 				</label>
-				<ConnectionBlockedReason reason={controlsBlockedReason} className="header-blocked-reason" />
 			</div>
 			{rightOpen ? null : (
 				<button

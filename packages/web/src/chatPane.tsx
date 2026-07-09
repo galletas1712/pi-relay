@@ -210,7 +210,6 @@ const ChatHeader = memo(function ChatHeader({
 			modelDisabled={modelDisabled}
 			modelLocked={modelLocked}
 			reasoningDisabled={reasoningControlsDisabled || !!mutationBlockedReason}
-			controlsBlockedReason={mutationBlockedReason}
 			reasoningEfforts={displayedEfforts}
 			reasoningEffort={reasoningEffort}
 			rightOpen={rightOpen}

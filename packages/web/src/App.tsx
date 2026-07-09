@@ -419,7 +419,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 	const [connection, setConnection] = useState<ConnectionStatus>("connecting");
 	const connectionRef = useRef<ConnectionStatus>("connecting");
-	const [hasConnected, setHasConnected] = useState(false);
+	const [disconnected, setDisconnected] = useState(false);
 	const [retryingConnection, setRetryingConnection] = useState(false);
 	const [workspaceRouteResult, setWorkspaceRouteResult] =
 		useState<WorkspaceRouteParseResult>(initialWorkspaceRoute);
@@ -2163,10 +2163,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		const offStatus = api.onStatus((status) => {
 			connectionRef.current = status;
 			setConnection(status);
+			if (status === "open") setDisconnected(false);
+			else if (status !== "connecting") setDisconnected(true);
 			subscribedEventSessionIds.current.clear();
 			if (status !== "open") return;
 			connectionRetryController.current.opened();
-			setHasConnected(true);
 			setRetryingConnection(false);
 			void Promise.all([
 				queryClient.invalidateQueries({ queryKey: queryKeys.projects }),
@@ -3418,9 +3419,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				<div className="mobile-topbar-title">
 					<span>{mobileTitle}</span>
 					<div className="mobile-topbar-status">
-						<span className={`connection-pill ${connection === "open" ? "online" : "offline"}`}>
-							{connection === "open" ? "connected" : connection}
-						</span>
 						{mobileSessionStatus ? (
 							<span
 								className={`session-status-icon ${mobileSessionStatus}`}
@@ -3462,7 +3460,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			) : null}
 
 			<Sidebar
-				connection={connection}
 				projects={projects}
 				projectsLoading={projectsQuery.isLoading}
 				projectsFetching={projectsQuery.isFetching}
@@ -3637,8 +3634,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 
 			<footer className="chat-dock" data-slot="chat-box">
 				<ConnectionRecoveryBanner
-					status={connection}
-					hasConnected={hasConnected}
+					disconnected={disconnected}
 					retrying={retryingConnection}
 					onRetry={retryConnection}
 				/>

@@ -218,7 +218,6 @@ describe("Sidebar session list loading states", () => {
 	function renderSidebar(overrides: Partial<ComponentProps<typeof Sidebar>> = {}): string {
 		return renderToStaticMarkup(
 			<Sidebar
-				connection="open"
 				projects={[]}
 				selectedProjectId={null}
 				query=""
@@ -325,8 +324,10 @@ describe("Sidebar session list loading states", () => {
 		expect(html).not.toContain("activity-counts");
 		expect(html).not.toContain("activity-chip");
 		expect(html).not.toContain("1 workspace</");
-		expect(html).toContain('class="project-folder-count" role="img" aria-label="1 workspace"');
-		expect(html).toContain(">1</span>");
+		expect(html).not.toContain("project-folder-count");
+		expect(html).not.toContain("1 workspace");
+		expect(html).not.toContain("connection-pill");
+		expect(html).not.toContain(">connected<");
 	});
 
 });

@@ -60,24 +60,23 @@ describe("connection recovery primitives", () => {
 	it("renders unavailable and pending Retry states, then hides when open", () => {
 		const { rerender } = render(
 			<ConnectionRecoveryBanner
-				status="closed"
-				hasConnected
+				disconnected
 				retrying={false}
 				onRetry={() => undefined}
 			/>,
 		);
-		expect(screen.getByText("Connection closed")).toBeTruthy();
+		expect(screen.getByText("Disconnected")).toBeTruthy();
 		expect(screen.getByRole("button", { name: "Retry connection" })).toBeTruthy();
 
 		rerender(
-			<ConnectionRecoveryBanner status="closed" hasConnected retrying onRetry={() => undefined} />,
+			<ConnectionRecoveryBanner disconnected retrying onRetry={() => undefined} />,
 		);
 		const pending = screen.getByRole("button", { name: "Retrying…" }) as HTMLButtonElement;
 		expect(pending.disabled).toBe(true);
 		expect(pending.getAttribute("aria-busy")).toBe("true");
 
 		rerender(
-			<ConnectionRecoveryBanner status="open" hasConnected retrying={false} onRetry={() => undefined} />,
+			<ConnectionRecoveryBanner disconnected={false} retrying={false} onRetry={() => undefined} />,
 		);
 		expect(screen.queryByRole("status")).toBeNull();
 	});
