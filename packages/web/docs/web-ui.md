@@ -386,9 +386,11 @@ offers `gpt-5.6-sol` (default), `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude offe
 Sonnet 5 is the normal Claude default at `high` effort. Fable 5 is listed last as an explicit opt-in, and its option text
 and tooltip state Anthropic's required 30-day retention and lack of Zero Data Retention. The provider/model is locked
 once the session has any transcript history, because both providers carry provider-shaped replay state across turns.
-Reasoning effort is a per-request knob and can change during or between turns
-(applying to subsequently created requests). The picker remains a static seeded
-convenience: its existing hosted GPT-5.6 choices remain `none`,
+The model control keeps its `Model, locked` accessible name after that point and
+retains the existing running-state lock. Reasoning effort is independently
+editable while a response is running whenever the selected session is loaded,
+the client is connected, and the selected provider/model supports the value.
+The picker remains a static seeded convenience: its existing hosted GPT-5.6 choices remain `none`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, while the Claude
 entries expose `low…max`. `max` is the highest public wire effort; catalog-only
 values such as `ultra` are not exposed. The private catalog reports `ultra` for
@@ -397,9 +399,27 @@ and uses it to select proactive MultiAgent V2 behavior. pi-relay implements no
 equivalent orchestration mode, and live literal-Ultra requests were rejected,
 so it neither exposes nor aliases the value. Some seeded OpenAI choices can be
 rejected when the active account's catalog does not advertise them. Changing
-model/effort calls
-`session.configure` and patches the cached list/snapshot. Runtime validation is
-authoritative:
+model/effort calls `session.configure`; an effort-only update is accepted while
+the session is active and persists immediately as that session's default for
+future work. The daemon snapshots the complete provider route on each queued
+input at acceptance and on each durable action at turn creation. Therefore an
+open turn—including provider retries, tool continuations, compaction/recovery,
+and steering consumed into that turn—keeps its captured effort. A follow-up
+queued before an edit keeps its old route, while one queued after the accepted
+edit captures the new route. Steering an already open turn keeps that turn's
+route rather than retargeting it; future work created at a turn boundary uses
+the queued item's snapshot.
+
+The web client's focused provider-configuration controller serializes complete
+provider writes independently per session. Rapid model/effort edits on an empty
+session compose without dropping unrelated provider fields and coalesce to the
+latest desired value. Successful responses rebase later edits on the canonical
+provider response and patch the captured session's list and warm snapshot cache
+even after navigation. A final failure clears the optimistic value, shows a
+persistent dismissible notice, and refetches canonical state. Connection
+recovery and ordinary snapshot/list refetches remain authoritative and converge
+on the daemon's persisted default.
+No persistent “applies next turn” copy is added to the header. Runtime validation is authoritative:
 OpenAI exact-resolves the model and configured effort from its account-scoped
 private Codex catalog before every ordinary and compact request, while
 Anthropic uses discovered/static adapter capabilities. No transient catalog

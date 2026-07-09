@@ -1836,6 +1836,10 @@ pre {
 }
 
 .notice-toast {
+	display: flex;
+	align-items: start;
+	justify-content: space-between;
+	gap: 8px;
 	border: 1px solid var(--border);
 	border-radius: var(--radius);
 	background: color-mix(in oklch, var(--card) 96%, transparent);
@@ -1843,6 +1847,18 @@ pre {
 	box-shadow: var(--elev-pop);
 	font-size: var(--text-sm);
 	color: var(--foreground);
+}
+
+.notice-dismiss {
+	display: inline-grid;
+	flex: 0 0 auto;
+	place-items: center;
+	border: 0;
+	background: transparent;
+	padding: 1px;
+	color: currentColor;
+	cursor: pointer;
+	pointer-events: auto;
 }
 
 .notice-toast.info {

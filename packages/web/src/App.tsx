@@ -39,6 +39,10 @@ import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
 import { isDelegationRunning } from "./delegationBoard.ts";
 import { DelegationListRetryController } from "./delegationListRetryController.ts";
+import {
+	ProviderConfigurationController,
+	type ProviderConfigurationTarget,
+} from "./providerConfigurationController.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
@@ -399,6 +403,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [notices, setNotices] = useState<Notice[]>([]);
 	const [query, setQuery] = useState("");
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
+	const [, setProviderConfigurationRevision] = useState(0);
+	const providerConfigurationControllerRef = useRef<ProviderConfigurationController | null>(null);
+	const providerConfigurationMountGenerationRef = useRef(0);
 	const [sending, setSending] = useState(false);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
@@ -484,8 +491,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		assertRemoteActionAllowed(remoteActionBlockedReason(connectionRef.current));
 	}, []);
 
-	const pushNotice = useCallback((tone: Notice["tone"], text: string) => {
-		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_NOTICES + 1)), { id: randomId("notice"), tone, text }]);
+	const pushNotice = useCallback((tone: Notice["tone"], text: string, persistent = false) => {
+		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_NOTICES + 1)), { id: randomId("notice"), tone, text, persistent }]);
+	}, []);
+	const dismissNotice = useCallback((noticeId: string) => {
+		setNotices((current) => current.filter((notice) => notice.id !== noticeId));
 	}, []);
 
 	useEffect(() => {
@@ -497,12 +507,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	}, [selectedProjectId]);
 
 	useEffect(() => {
-		if (notices.length === 0) return;
+		const expiringNotice = notices.find((notice) => !notice.persistent);
+		if (!expiringNotice) return;
 		const timer = window.setTimeout(() => {
-			setNotices((current) => current.slice(1));
+			setNotices((current) => current.filter((notice) => notice.id !== expiringNotice.id));
 		}, NOTICE_TTL_MS);
 		return () => window.clearTimeout(timer);
-	}, [notices.length]);
+	}, [notices]);
 
 	const projectsQuery = useQuery({
 		queryKey: queryKeys.projects,
@@ -764,7 +775,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	}, [loadedSnapshot?.project_id, newSessionProvider, selectedId, selectedProjectId, selectedSession]);
 	const selectedChatSession = snapshotChatSession ?? selectedListChatSession;
 
-	const activeProvider = loadedSnapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
+	const storedProvider = loadedSnapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
+	const activeProvider =
+		(selectedId
+			? providerConfigurationControllerRef.current?.desired(selectedId)
+			: null) ?? storedProvider;
 	const activeProviderKind = activeProvider.kind;
 	const activeToolsSessionId = loadedSnapshot?.session_id ?? selectedChatSession?.session_id ?? null;
 	const toolsQuery = useQuery({
@@ -965,6 +980,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		(loadedSnapshot ? loadedEntries.length > 0 || loadedSnapshot.active_leaf_id !== null : false);
 	const modelLocked = !!selectedId && !!loadedSnapshot && hasTranscriptEntries;
 	const modelControlsDisabled = !!selectedId && (!loadedSnapshot || loadedSnapshot.activity !== "idle");
+	const reasoningControlsDisabled = !!selectedId && !loadedSnapshot;
 
 	const applyConversationIdentity = useCallback((sessionId: string | null) => {
 		const previousSessionId = selectedRef.current;
@@ -2236,41 +2252,91 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		delegationSubagentIds,
 	]);
 
-	const configureProvider = useCallback(
-		async (provider: ProviderConfig) => {
-			const sessionId = selectedRef.current;
-			if (!sessionId) {
-				setNewSessionProvider(provider);
-				return;
-			}
-			const projectId = selectedProjectRef.current;
-			assertServerMutationAllowed();
-			const result = await api.configureSession({ sessionId, provider });
-			patchSessionListProvider(queryClient, projectId, sessionId, provider);
-			patchSelectedSnapshot(sessionId, (snapshot) => ({
-				...snapshot,
-				provider,
-				metadata: result.metadata ?? snapshot.metadata,
-				activity: result.activity,
-			}));
-			invalidateSessionList(projectId);
+	const commitConfiguredProvider = useCallback(
+		(
+			target: ProviderConfigurationTarget,
+			provider: ProviderConfig,
+			result: Awaited<ReturnType<AgentApi["configureSession"]>>,
+		) => {
+			patchSessionListProvider(queryClient, target.projectId, target.sessionId, provider);
+			warmSelectedCache(target.sessionId, (current) => {
+				if (!current.snapshot) return current;
+				return applySelectedSnapshot(current, {
+					...current.snapshot,
+					entries: selectedEntries(current),
+					provider,
+					metadata: result.metadata ?? current.snapshot.metadata,
+					activity: result.activity,
+				});
+			});
+			invalidateSessionList(target.projectId);
 		},
-		[api, assertServerMutationAllowed, invalidateSessionList, patchSelectedSnapshot, queryClient],
+		[invalidateSessionList, queryClient, warmSelectedCache],
 	);
+	if (!providerConfigurationControllerRef.current) {
+		providerConfigurationControllerRef.current = new ProviderConfigurationController({
+			configure: (target, provider) => {
+				assertServerMutationAllowed();
+				return api.configureSession({ sessionId: target.sessionId, provider });
+			},
+			commit: commitConfiguredProvider,
+			fail: (target, edit, error) => {
+				pushNotice("error", `Could not update ${edit}: ${errorMessage(error)}. Try again.`, true);
+				invalidateSessionList(target.projectId);
+				if (selectedRef.current === target.sessionId) {
+					void refreshSelectedSessionState(target.sessionId).catch(() => undefined);
+				}
+			},
+			change: () => setProviderConfigurationRevision((revision) => revision + 1),
+		});
+	}
+	const providerConfigurationController = providerConfigurationControllerRef.current;
+	useEffect(() => {
+		const generation = ++providerConfigurationMountGenerationRef.current;
+		return () => {
+			queueMicrotask(() => {
+				if (providerConfigurationMountGenerationRef.current === generation) {
+					providerConfigurationController.dispose();
+				}
+			});
+		};
+	}, [providerConfigurationController]);
 
 	const changeModel = useCallback(
-		async (modelKey: string) => {
+		(modelKey: string) => {
 			if (modelLocked) return;
-			await configureProvider(providerFromModelKey(modelKey, activeProvider));
+			const sessionId = selectedRef.current;
+			if (!sessionId) {
+				setNewSessionProvider(providerFromModelKey(modelKey, activeProvider));
+				return;
+			}
+			assertServerMutationAllowed();
+			providerConfigurationController.update(
+				{ sessionId, projectId: selectedProjectRef.current },
+				activeProvider,
+				(provider) => providerFromModelKey(modelKey, provider),
+				"model",
+			);
 		},
-		[activeProvider, configureProvider, modelLocked],
+		[activeProvider, assertServerMutationAllowed, modelLocked, providerConfigurationController],
 	);
 
 	const changeReasoningEffort = useCallback(
-		async (effort: ReasoningEffort) => {
-			await configureProvider(withReasoningEffort(activeProvider, effort));
+		(effort: ReasoningEffort) => {
+			const sessionId = selectedRef.current;
+			if (!sessionId) {
+				setNewSessionProvider(withReasoningEffort(activeProvider, effort));
+				return;
+			}
+			assertServerMutationAllowed();
+			providerConfigurationController.update(
+				{ sessionId, projectId: selectedProjectRef.current },
+				activeProvider,
+				(provider) => withReasoningEffort(provider, effort),
+				"reasoning effort",
+			);
 		},
-		[activeProvider, configureProvider],
+		[activeProvider, assertServerMutationAllowed, providerConfigurationController],
 	);
 
 	const filteredSessions = useMemo(() => {
@@ -3061,13 +3127,21 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	}, []);
 	const handleModelChange = useCallback(
 		(value: string) => {
-			void changeModel(value).catch((error) => pushNotice("error", errorMessage(error)));
+			try {
+				changeModel(value);
+			} catch (error) {
+				pushNotice("error", errorMessage(error));
+			}
 		},
 		[changeModel, pushNotice],
 	);
 	const handleReasoningEffortChange = useCallback(
 		(value: ReasoningEffort) => {
-			void changeReasoningEffort(value).catch((error) => pushNotice("error", errorMessage(error)));
+			try {
+				changeReasoningEffort(value);
+			} catch (error) {
+				pushNotice("error", errorMessage(error));
+			}
 		},
 		[changeReasoningEffort, pushNotice],
 	);
@@ -3365,6 +3439,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						modelValue={providerModelKey(activeProvider)}
 						modelLocked={modelLocked}
 						modelControlsDisabled={modelControlsDisabled}
+						reasoningControlsDisabled={reasoningControlsDisabled}
 						mutationBlockedReason={selectedId ? connectionRemoteActionBlockedReason : null}
 						remoteReadBlockedReason={selectedId ? connectionRemoteActionBlockedReason : null}
 						reasoningEfforts={reasoningEfforts}
@@ -3632,7 +3707,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					returnFocusFallbackRef={composerDialogReturnFocusRef}
 				/>
 			) : null}
-			<NoticeStack notices={notices} rightOpen={rightOpen} />
+			<NoticeStack notices={notices} rightOpen={rightOpen} onDismiss={dismissNotice} />
 		</div>
 	);
 }

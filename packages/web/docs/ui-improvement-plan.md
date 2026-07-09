@@ -546,6 +546,18 @@ Implementation slices:
 - Summary trigger should show the current model and reasoning in concise text.
 - Explain locking after the first transcript entry and running-state restrictions in visible copy, not only a disabled-title tooltip.
 - For an existing session, say “Applies to this session.” For new-session setup, say “Applies to the new session.”
+- **Implemented (PR13) — effort default during active work:** the existing
+  Effort selector remains enabled while a response runs (subject to loaded,
+  connected, supported-provider constraints) without changing model locking or
+  adding persistent helper copy. Effort-only `session.configure` writes are
+  serialized as complete provider writes per immutable session target and
+  persist the future-work default. Model/effort edits on an empty session
+  compose without losing unrelated fields.
+  Queued inputs snapshot the route at acceptance, durable actions snapshot the
+  open-turn route, and retries, tool continuation, compaction/recovery, and
+  steering consumed into that open turn preserve it. Thus pre-change queued
+  work keeps the old effort, post-change queued/idle work uses the new effort,
+  and navigation/reconnect converges on the daemon's canonical config.
 
 **Project settings**
 
@@ -1407,6 +1419,7 @@ These are bounded decisions, not reasons to defer the architecture:
 | R55 | No duplicate authoritative run surfaces | 3 | Feature-flag/product-path audit |
 | R56 | No wholesale rebrand or premature graph/durable timeline claims | All | Design/content review |
 | R57 | **Implemented in PR12.** Destination chat entry starts at latest/bottom for root/subagent navigation, direct-link refresh, Back/Forward, and branch switch after matching canonical session/leaf/page hydration; App owns ID-keyed acknowledgement across transcript remounts. Switch opens once per opening at active/current or bottom. Older-page loads restore request-time pinned readers after committed/no-op/stale/failed/rejected outcomes, preserve measured unpinned anchors for matching committed hydration, and cancel both behaviors on deliberate scroll intent. Per-session mid-transcript restoration was removed. | 5 | Route/remount/refresh/Back/Forward/branch-switch coordinator-race tests, metadata-rerender and streaming tests, plus Switch and pinned/unpinned prepend outcome matrices |
+| R58 | **Implemented in PR13.** Effort remains editable during active work without unlocking model selection. The persisted session value is the future-work default; queued inputs capture it at acceptance and durable actions capture the open-turn route, so in-flight/retry/tool/compaction/steering continuation work cannot be relabeled or retargeted. Per-session serialized UI writes, rollback/refetch on failure, and ID-keyed cache patches make rapid edits and navigation races converge on daemon truth without noisy header copy. | 4 | Active-control/model-lock UI test, serialized rapid-edit/failure/navigation tests, and store-level queued/action/steering route snapshot tests |
 
 ## 20. Overall Definition of Done
 

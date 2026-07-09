@@ -26,6 +26,7 @@ export interface ChatPaneProps {
 	modelValue: string;
 	modelLocked: boolean;
 	modelControlsDisabled: boolean;
+	reasoningControlsDisabled: boolean;
 	mutationBlockedReason?: string | null;
 	remoteReadBlockedReason?: string | null;
 	reasoningEfforts: ReasoningEffort[];
@@ -66,6 +67,7 @@ export const ChatPane = memo(function ChatPane({
 	modelValue,
 	modelLocked,
 	modelControlsDisabled,
+	reasoningControlsDisabled,
 	mutationBlockedReason,
 	remoteReadBlockedReason,
 	reasoningEfforts,
@@ -104,6 +106,7 @@ export const ChatPane = memo(function ChatPane({
 				modelValue={modelValue}
 				modelLocked={modelLocked}
 				modelControlsDisabled={modelControlsDisabled}
+				reasoningControlsDisabled={reasoningControlsDisabled}
 				mutationBlockedReason={mutationBlockedReason}
 				reasoningEfforts={reasoningEfforts}
 				reasoningEffort={reasoningEffort}
@@ -159,6 +162,7 @@ interface ChatHeaderProps {
 	modelValue: string;
 	modelLocked: boolean;
 	modelControlsDisabled: boolean;
+	reasoningControlsDisabled: boolean;
 	mutationBlockedReason?: string | null;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
@@ -177,6 +181,7 @@ const ChatHeader = memo(function ChatHeader({
 	modelValue,
 	modelLocked,
 	modelControlsDisabled,
+	reasoningControlsDisabled,
 	mutationBlockedReason,
 	reasoningEfforts,
 	reasoningEffort,
@@ -204,7 +209,7 @@ const ChatHeader = memo(function ChatHeader({
 			modelValue={modelValue}
 			modelDisabled={modelDisabled}
 			modelLocked={modelLocked}
-			reasoningDisabled={modelControlsDisabled || !!mutationBlockedReason}
+			reasoningDisabled={reasoningControlsDisabled || !!mutationBlockedReason}
 			controlsBlockedReason={mutationBlockedReason}
 			reasoningEfforts={displayedEfforts}
 			reasoningEffort={reasoningEffort}
