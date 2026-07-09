@@ -349,7 +349,195 @@ async fn empty_dispatch_stops_after_the_pending_query() {
         .expect("missing session has no pending actions");
 
     assert!(dispatched.is_empty());
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn nonempty_dispatch_uses_session_fallback_for_legacy_null_route() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    let session_id = "legacy-null-dispatch";
+    env.state
+        .repo
+        .create_project(project_id, "legacy null dispatch", &[], json!({}))
+        .await
+        .expect("create project");
+    let entries = vec![
+        TranscriptStorageNode {
+            id: "legacy-turn".to_string(),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "legacy-user".to_string(),
+            parent_id: Some("legacy-turn".to_string()),
+            timestamp_ms: 2,
+            item: TranscriptItem::UserMessage(UserMessage::text("hello")),
+            provider_replay: Vec::new(),
+        },
+    ];
+    let action = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::new(),
+        context_leaf_id: Some("legacy-user".to_string()),
+    };
+    let mut config = session_config(&env, project_id, json!({ "harness": true }));
+    config.provider.reasoning_effort = ReasoningEffort::High;
+    let (_, persisted) = env
+        .state
+        .repo
+        .start_session_outputs(
+            session_id,
+            &config,
+            &entries,
+            Some("legacy-user"),
+            &[],
+            &[action],
+            InputPriority::FollowUp,
+            &UserMessage::text("hello"),
+            None,
+        )
+        .await
+        .expect("create pending action");
+    let database_url = database_url_with_name(&env.admin_url, &env.name);
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect route mutation pool");
+    sqlx::query("update actions set provider_config=null where id=$1")
+        .bind(&persisted[0].row_id)
+        .execute(&pool)
+        .await
+        .expect("simulate old daemon action insert");
+    pool.close().await;
+
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    let dispatched = driver
+        .dispatch_ready_actions()
+        .await
+        .expect("legacy pending action dispatches");
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(
+        dispatched[0].config.provider.reasoning_effort,
+        ReasoningEffort::High
+    );
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_retry_keeps_recovered_route_after_default_changes() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    let session_id = "retry-route";
+    env.state
+        .repo
+        .create_project(project_id, "retry route", &[], json!({}))
+        .await
+        .expect("create project");
+    let entries = vec![
+        TranscriptStorageNode {
+            id: "retry-turn".to_string(),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "retry-user".to_string(),
+            parent_id: Some("retry-turn".to_string()),
+            timestamp_ms: 2,
+            item: TranscriptItem::UserMessage(UserMessage::text("retry")),
+            provider_replay: Vec::new(),
+        },
+    ];
+    let action = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::from_transcript_items(
+            entries.iter().map(|entry| entry.item.clone()).collect(),
+        ),
+        context_leaf_id: Some("retry-user".to_string()),
+    };
+    let mut original = session_config(
+        &env,
+        project_id,
+        json!({
+            "harness": true,
+            "fault_injection": {
+                "force_harness_model_dispatch": true,
+                "model_result": "retry_once_then_complete",
+                "model_provider_max_attempts": 2
+            }
+        }),
+    );
+    original.provider.reasoning_effort = ReasoningEffort::Medium;
+    env.state
+        .repo
+        .start_session_outputs(
+            session_id,
+            &original,
+            &entries,
+            Some("retry-user"),
+            &[],
+            &[action],
+            InputPriority::FollowUp,
+            &UserMessage::text("retry"),
+            None,
+        )
+        .await
+        .expect("create retryable action");
+    let mut future_default = original;
+    future_default.provider.reasoning_effort = ReasoningEffort::High;
+    env.state
+        .repo
+        .configure_session(session_id, &future_default)
+        .await
+        .expect("change future default");
+
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    driver
+        .ensure_active_loaded_preserving_open_turn()
+        .await
+        .expect("load retry runtime");
+    let dispatched = driver
+        .dispatch_ready_actions()
+        .await
+        .expect("dispatch recovered action");
+    assert_eq!(
+        dispatched[0].config.provider.reasoning_effort,
+        ReasoningEffort::Medium
+    );
     drop(driver);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if crate::provider_runtime::injected_provider_start_count(session_id) == 2
+                && !env
+                    .state
+                    .repo
+                    .has_unfinished_actions(session_id)
+                    .await
+                    .expect("read retry action state")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the same captured dispatch route survives its provider retry");
+    assert_eq!(
+        crate::provider_runtime::injected_provider_start_efforts(session_id),
+        vec![ReasoningEffort::Medium, ReasoningEffort::Medium],
+        "both provider attempts receive the recovered route, not the new default"
+    );
     env.cleanup().await;
 }
 
@@ -552,7 +740,7 @@ async fn commit_post_compaction_dispatch(
     env: &TestEnv,
     project_id: Uuid,
     session_id: &str,
-) -> (agent_store::PersistedAction, String) {
+) -> (agent_store::PendingDispatchAction, String) {
     commit_post_compaction_dispatch_with_faults(env, project_id, session_id, json!({})).await
 }
 
@@ -561,7 +749,7 @@ async fn commit_post_compaction_dispatch_with_faults(
     project_id: Uuid,
     session_id: &str,
     faults: serde_json::Value,
-) -> (agent_store::PersistedAction, String) {
+) -> (agent_store::PendingDispatchAction, String) {
     let mut faults = faults.as_object().cloned().unwrap_or_default();
     faults
         .entry("pause_model_dispatch_before_provider".to_string())
@@ -649,6 +837,27 @@ async fn commit_post_compaction_dispatch_with_faults(
         )
         .await
         .expect("overflow blocks model");
+    let route_pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+        .await
+        .expect("connect route assertion pool");
+    let compaction_route: Option<serde_json::Value> =
+        sqlx::query_scalar("select provider_config from actions where id=$1")
+            .bind(&compaction.job.action_row_id)
+            .fetch_one(&route_pool)
+            .await
+            .expect("read compaction route");
+    assert!(
+        compaction_route.is_none(),
+        "non-recoverable compaction jobs do not duplicate the blocked model route"
+    );
+    route_pool.close().await;
+    let mut future_default = config.clone();
+    future_default.provider.reasoning_effort = ReasoningEffort::High;
+    env.state
+        .repo
+        .configure_session(session_id, &future_default)
+        .await
+        .expect("change future-work default while model is blocked");
     let completed = env
         .state
         .repo
@@ -661,6 +870,11 @@ async fn commit_post_compaction_dispatch_with_faults(
     let resumed = completed
         .resumed_model_action
         .expect("success transaction persists resumed model");
+    assert_eq!(
+        resumed.route.provider().reasoning_effort,
+        ReasoningEffort::Medium,
+        "compaction resume retains the blocked model route"
+    );
     let compacted_leaf = completed
         .active_leaf_id
         .expect("success transaction installs compacted leaf");
@@ -1227,6 +1441,23 @@ async fn heartbeat_loss_after_terminal_commit_still_registers_persisted_successo
     .await
     .expect("count markers");
     assert_eq!(marker_count, 0, "terminal commit clears the exact marker");
+    let tool_effort: String = sqlx::query_scalar(
+        r#"
+        select provider_config->>'reasoning_effort'
+        from actions
+        where session_id=$1 and kind='tool'
+        order by created_at desc
+        limit 1
+        "#,
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read persisted tool continuation route");
+    assert_eq!(
+        tool_effort, "medium",
+        "tool continuation from recovered model retains the blocked generation route"
+    );
     assert!(
         crate::runtime::runner_start_count(session_id, "tool") >= 1,
         "successor crosses a tracked start barrier"
@@ -3219,6 +3450,19 @@ async fn restart_from_interrupt_applied_phase_does_not_repeat_interrupt() {
         "the crash phase remains mailbox-blocking"
     );
 
+    let mut future_default = env
+        .state
+        .repo
+        .load_session_config("crash_phase_child")
+        .await
+        .expect("load future default");
+    future_default.provider.reasoning_effort = ReasoningEffort::High;
+    env.state
+        .repo
+        .configure_session("crash_phase_child", &future_default)
+        .await
+        .expect("change default after the control captured its route");
+
     // Simulate process loss: no volatile session or task ownership survives.
     env.state.active.lock().await.remove("crash_phase_child");
     crate::spawn_drive_until_blocked(
@@ -3246,6 +3490,21 @@ async fn restart_from_interrupt_applied_phase_does_not_repeat_interrupt() {
     })
     .await
     .expect("fresh child driver settles applied phase");
+    assert_eq!(
+        env.state
+            .active
+            .lock()
+            .await
+            .get("crash_phase_child")
+            .expect("recovered active runtime")
+            .lock()
+            .await
+            .config
+            .provider
+            .reasoning_effort,
+        ReasoningEffort::Medium,
+        "recovered ready steer restores its captured route over the new default"
+    );
 
     let history = env
         .state
@@ -3495,10 +3754,36 @@ async fn combined_control_interrupts_complete_parallel_tool_generation_once() {
         .reconcile_pending_subagent_controls()
         .await
         .expect("interrupt complete captured generation");
+    env.state
+        .active
+        .lock()
+        .await
+        .get("parallel_child")
+        .expect("live parallel runtime")
+        .lock()
+        .await
+        .config
+        .provider
+        .reasoning_effort = ReasoningEffort::High;
     driver
         .drive_until_blocked()
         .await
         .expect("consume ready steer once");
+    assert_eq!(
+        env.state
+            .active
+            .lock()
+            .await
+            .get("parallel_child")
+            .expect("continued live runtime")
+            .lock()
+            .await
+            .config
+            .provider
+            .reasoning_effort,
+        ReasoningEffort::Medium,
+        "live ready steer restores the captured generation route"
+    );
     drop(driver);
 
     for attempt in &attempts {
@@ -4406,6 +4691,74 @@ async fn parent_model_context_does_not_inject_current_delegations() {
     assert!(parent_tool_names.contains(&"cancel_delegation"));
     assert!(parent_tool_names.contains(&"steer_subagent"));
 
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn configure_and_rename_refresh_non_provider_state_without_retargeting_active_work() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    let session_id = "active-route-refresh";
+    env.state
+        .repo
+        .create_project(project_id, "active route refresh", &[], json!({}))
+        .await
+        .expect("create project");
+    let original = session_config(&env, project_id, json!({ "title": "Before" }));
+    env.state
+        .repo
+        .create_session(session_id, &original)
+        .await
+        .expect("create session");
+    let active = Arc::new(Mutex::new(RuntimeSession {
+        session: AgentSession::new(),
+        config: original.clone(),
+        persisted_active_leaf_id: None,
+    }));
+    env.state
+        .active
+        .lock()
+        .await
+        .insert(session_id.to_string(), active.clone());
+
+    let response = crate::session_configure(
+        &env.state,
+        json!({
+            "session_id": session_id,
+            "provider": {
+                "kind": "openai",
+                "model": original.provider.model,
+                "reasoning_effort": "high"
+            }
+        }),
+    )
+    .await
+    .expect("configure future default");
+    assert_eq!(response["provider"]["reasoning_effort"], "high");
+    assert_eq!(
+        active.lock().await.config.provider.reasoning_effort,
+        ReasoningEffort::Medium,
+        "active work retains its captured route"
+    );
+
+    crate::session_rename(
+        &env.state,
+        json!({ "session_id": session_id, "title": "After" }),
+    )
+    .await
+    .expect("rename active session");
+    let active = active.lock().await;
+    assert_eq!(active.config.metadata["title"], "After");
+    assert_eq!(
+        active.config.provider.reasoning_effort,
+        ReasoningEffort::Medium,
+        "rename refresh also preserves the active route"
+    );
+
+    drop(active);
     env.cleanup().await;
 }
 

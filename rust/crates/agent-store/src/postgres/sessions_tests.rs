@@ -317,6 +317,102 @@ async fn migration_creates_exact_queued_input_indexes_idempotently() -> Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn provider_route_migration_is_nullable_idempotent_and_rollback_compatible() -> Result<()> {
+    let db = test_store_without_schema()
+        .await
+        .expect("PI_RELAY_TEST_DATABASE_URL is required for provider route tests")?;
+    let work = async {
+        db.store.migrate().await?;
+        let project_id = Uuid::new_v4();
+        db.store
+            .create_project(project_id, "route migration", &[], json!({}))
+            .await?;
+        let config = session_config(project_id);
+        db.store.create_session("legacy-route", &config).await?;
+
+        // Simulate a populated database created by the prior release.
+        sqlx::raw_sql(
+            r#"
+            alter table queued_inputs drop column provider_config;
+            alter table actions drop column provider_config;
+            insert into queued_inputs (
+                id, session_id, priority, content, status, client_input_id
+            ) values (
+                'legacy-input', 'legacy-route', 'follow_up',
+                '{"type":"user_message","content":{"content":[{"type":"text","text":"legacy"}]}}',
+                'queued', 'legacy-input'
+            );
+            insert into actions (
+                id, session_id, turn_id, action_id, attempt_id, kind, status, payload
+            ) values (
+                'legacy-action', 'legacy-route', 1, 1, 'legacy-attempt', 'model',
+                'pending', '{"context_leaf_id":"legacy-leaf"}'
+            );
+            "#,
+        )
+        .execute(&db.store.pool)
+        .await?;
+        db.store.migrate().await?;
+        db.store.migrate().await?;
+
+        let columns: Vec<(String, String)> = sqlx::query_as(
+            r#"
+            select table_name, is_nullable
+            from information_schema.columns
+            where table_schema='public'
+              and table_name in ('queued_inputs','actions')
+              and column_name='provider_config'
+            order by table_name
+            "#,
+        )
+        .fetch_all(&db.store.pool)
+        .await?;
+        assert_eq!(
+            columns,
+            vec![
+                ("actions".to_string(), "YES".to_string()),
+                ("queued_inputs".to_string(), "YES".to_string()),
+            ]
+        );
+        let legacy_nulls: (bool, bool) = sqlx::query_as(
+            r#"
+            select
+                (select provider_config is null from queued_inputs where id='legacy-input'),
+                (select provider_config is null from actions where id='legacy-action')
+            "#,
+        )
+        .fetch_one(&db.store.pool)
+        .await?;
+        assert_eq!(legacy_nulls, (true, true));
+
+        // An old daemon can still omit the new columns during rollback.
+        sqlx::raw_sql(
+            r#"
+            insert into queued_inputs (
+                id, session_id, priority, content, status, client_input_id
+            ) values (
+                'rollback-input', 'legacy-route', 'follow_up',
+                '{"type":"user_message","content":{"content":[{"type":"text","text":"rollback"}]}}',
+                'queued', 'rollback-input'
+            );
+            insert into actions (
+                id, session_id, turn_id, action_id, attempt_id, kind, status, payload
+            ) values (
+                'rollback-action', 'legacy-route', 2, 2, 'rollback-attempt', 'tool',
+                'pending', '{}'
+            );
+            "#,
+        )
+        .execute(&db.store.pool)
+        .await?;
+        db.store.migrate().await?;
+        Ok(())
+    }
+    .await;
+    finish_with_cleanup(work, db.cleanup().await)
+}
+
 #[test]
 fn work_and_cleanup_errors_are_both_reported() {
     let error = finish_with_cleanup::<()>(

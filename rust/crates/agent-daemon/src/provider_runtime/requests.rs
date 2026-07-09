@@ -48,7 +48,7 @@ fn injected_model_result(
         .metadata
         .pointer("/fault_injection/model_result")
         .and_then(serde_json::Value::as_str)?;
-    record_injected_provider_start(session_id);
+    let attempt = record_injected_provider_start(session_id, config.provider.reasoning_effort);
     Some(match result {
         "complete" => Ok(ModelResponse {
             assistant: AssistantMessage {
@@ -59,6 +59,20 @@ fn injected_model_result(
             stop_reason: ModelStopReason::Complete,
             stop_details: None,
         }),
+        "retry_once_then_complete" if attempt > 1 => Ok(ModelResponse {
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::Text("injected completion".to_string())],
+            },
+            provider_replay: Vec::new(),
+            usage: None,
+            stop_reason: ModelStopReason::Complete,
+            stop_details: None,
+        }),
+        "retry_once_then_complete" => Err(ProviderError::Status {
+            status: 503,
+            message: "injected retryable provider failure".to_string(),
+        }
+        .into()),
         "tool" => Ok(ModelResponse {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::ToolCall(ToolCall {
@@ -90,12 +104,19 @@ fn injected_provider_starts() -> &'static std::sync::Mutex<std::collections::Has
 }
 
 #[cfg(test)]
-fn record_injected_provider_start(session_id: &str) {
-    *injected_provider_starts()
+fn record_injected_provider_start(session_id: &str, effort: agent_vocab::ReasoningEffort) -> usize {
+    injected_provider_efforts()
         .lock()
-        .expect("injected provider counter lock poisoned")
+        .expect("injected provider effort lock poisoned")
         .entry(session_id.to_string())
-        .or_default() += 1;
+        .or_default()
+        .push(effort);
+    let mut starts = injected_provider_starts()
+        .lock()
+        .expect("injected provider counter lock poisoned");
+    let count = starts.entry(session_id.to_string()).or_default();
+    *count += 1;
+    *count
 }
 
 #[cfg(test)]
@@ -105,6 +126,28 @@ pub(crate) fn injected_provider_start_count(session_id: &str) -> usize {
         .expect("injected provider counter lock poisoned")
         .get(session_id)
         .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn injected_provider_efforts(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<agent_vocab::ReasoningEffort>>>
+{
+    static EFFORTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Vec<agent_vocab::ReasoningEffort>>>,
+    > = std::sync::OnceLock::new();
+    EFFORTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn injected_provider_start_efforts(
+    session_id: &str,
+) -> Vec<agent_vocab::ReasoningEffort> {
+    injected_provider_efforts()
+        .lock()
+        .expect("injected provider effort lock poisoned")
+        .get(session_id)
+        .cloned()
         .unwrap_or_default()
 }
 

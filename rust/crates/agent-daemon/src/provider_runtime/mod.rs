@@ -27,9 +27,9 @@ pub(crate) use prompt::{
     current_pi_template, effective_prompt_profile, provider_tools_for_session, render_pi_prompt,
 };
 pub(crate) use provider::model_metadata_for_config;
-#[cfg(test)]
-pub(crate) use requests::injected_provider_start_count;
 pub(crate) use requests::{build_model_request, run_model};
+#[cfg(test)]
+pub(crate) use requests::{injected_provider_start_count, injected_provider_start_efforts};
 pub(crate) use session_titles::{
     schedule_session_title_refresh_for_model_turn, SessionTitleScheduler,
 };

@@ -8,7 +8,10 @@ use super::events::insert_event_tx;
 use super::queue::{
     append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
 };
-use super::sql::{action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity};
+use super::sql::{
+    action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity,
+    steering_route_tx,
+};
 use super::PostgresAgentStore;
 use crate::{
     DelegationKind, DelegationStatus, EnqueueUserInputResult, EventFrame, EventType, InputPriority,
@@ -897,6 +900,7 @@ impl PostgresAgentStore {
         let target_active_leaf_id: Option<String> = session_row.get("active_leaf_id");
         let target_turn_id: Option<i64> = session_row.get("target_turn_id");
         let target_action_attempt_ids: Value = session_row.get("target_action_attempt_ids");
+        let route = steering_route_tx(&mut tx, subagent_id).await?;
         if child_parent.as_deref() != Some(parent_session_id)
             || child_delegation.as_deref() != Some(delegation_id)
             || !matches!(subagent_type.as_deref(), Some("full") | Some("read_only"))
@@ -985,7 +989,8 @@ impl PostgresAgentStore {
         let inserted = sqlx::query(
             r#"
             insert into queued_inputs (
-                id, session_id, priority, content, status, client_input_id, origin
+                id, session_id, priority, content, status, client_input_id, origin,
+                provider_config
             )
             values (
                 $1, $2, 'steer', $3, 'queued', $4,
@@ -1001,7 +1006,8 @@ impl PostgresAgentStore {
                     'target_active_leaf_id', $8::text,
                     'target_turn_id', $9::bigint,
                     'target_action_attempt_ids', $10::jsonb
-                )
+                ),
+                $12
             )
             on conflict (session_id, client_input_id) where client_input_id is not null
             do nothing
@@ -1024,6 +1030,7 @@ impl PostgresAgentStore {
         .bind(target_turn_id)
         .bind(target_action_attempt_ids)
         .bind(control_kind.as_str())
+        .bind(serde_json::to_value(route)?)
         .fetch_optional(&mut *tx)
         .await?;
         let input_id = if let Some(inserted) = inserted {
@@ -1910,15 +1917,18 @@ async fn enqueue_steer_content_tx(
     client_input_id: &str,
 ) -> Result<bool> {
     lock_session_tx(tx, parent_session_id).await?;
+    let route = steering_route_tx(tx, parent_session_id).await?;
     let id = format!("input_{}", Uuid::new_v4());
     let inserted = sqlx::query(
         r#"
             insert into queued_inputs (
-                id, session_id, priority, content, status, client_input_id, origin
+                id, session_id, priority, content, status, client_input_id, origin,
+                provider_config
             )
             values (
                 $1, $2, 'steer', $3, 'queued', $4,
-                jsonb_build_object('promoted_at', clock_timestamp()::text)
+                jsonb_build_object('promoted_at', clock_timestamp()::text),
+                $5
             )
             on conflict (session_id, client_input_id) where client_input_id is not null
             do nothing
@@ -1929,6 +1939,7 @@ async fn enqueue_steer_content_tx(
     .bind(parent_session_id)
     .bind(serde_json::to_value(&content)?)
     .bind(client_input_id)
+    .bind(serde_json::to_value(route)?)
     .fetch_optional(&mut **tx)
     .await?;
     let Some(inserted) = inserted else {

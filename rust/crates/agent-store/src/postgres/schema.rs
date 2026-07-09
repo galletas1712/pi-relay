@@ -14,8 +14,10 @@ use sqlx::PgPool;
 /// - `transcript_entries`: append-only transcript forest. `parent_id` points
 ///   within the same session, while `sequence` preserves insertion order.
 /// - `queued_inputs`: user inputs waiting to be consumed by a session turn.
-///   Idempotency is keyed by `(session_id, client_input_id)`.
-/// - `actions`: durable model/tool/compaction/cancel work records.
+///   Idempotency is keyed by `(session_id, client_input_id)` and
+///   `provider_config` snapshots submission-time routing.
+/// - `actions`: durable model/tool/compaction/cancel work records whose
+///   `provider_config` snapshots turn routing for restart-safe dispatch.
 /// - `events`: ordered observable event stream for websocket replay.
 /// - `delegations`: bounded parent/child subagent delegation units.
 const SCHEMA_SQL: &str = r#"
@@ -85,7 +87,8 @@ create table if not exists queued_inputs (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     follow_up_position integer null,
-    client_input_id text null
+    client_input_id text null,
+    provider_config jsonb null
 );
 
 create unique index if not exists queued_inputs_client_input_idx
@@ -114,6 +117,7 @@ create table if not exists actions (
     status text not null,
     payload jsonb not null,
     result jsonb null,
+    provider_config jsonb null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -162,6 +166,9 @@ create index if not exists delegations_completed_repair_idx
 -- `sessions` and `delegations` reference each other, so this side of the cycle
 -- is added after both canonical tables exist.
 alter table sessions add column if not exists delegation_id text null references delegations(id);
+
+alter table queued_inputs add column if not exists provider_config jsonb null;
+alter table actions add column if not exists provider_config jsonb null;
 
 create index if not exists sessions_delegation_created_idx
     on sessions(delegation_id, created_at, id)
