@@ -137,14 +137,6 @@ impl ProviderRouteSnapshot {
     pub fn apply_to(&self, config: &mut SessionConfig) {
         config.provider = self.0.clone();
     }
-
-    pub fn provider(&self) -> &ProviderConfig {
-        &self.0
-    }
-
-    pub fn into_provider(self) -> ProviderConfig {
-        self.0
-    }
 }
 
 impl From<ProviderConfig> for ProviderRouteSnapshot {

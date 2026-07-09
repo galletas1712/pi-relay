@@ -870,8 +870,10 @@ async fn commit_post_compaction_dispatch_with_faults(
     let resumed = completed
         .resumed_model_action
         .expect("success transaction persists resumed model");
+    let mut resumed_config = future_default;
+    resumed.route.apply_to(&mut resumed_config);
     assert_eq!(
-        resumed.route.provider().reasoning_effort,
+        resumed_config.provider.reasoning_effort,
         ReasoningEffort::Medium,
         "compaction resume retains the blocked model route"
     );

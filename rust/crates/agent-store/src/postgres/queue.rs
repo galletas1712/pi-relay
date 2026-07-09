@@ -1290,7 +1290,9 @@ mod tests {
             .expect("recover pending model and tool actions");
         assert!(
             recovered.iter().all(|action| {
-                action.route.provider().reasoning_effort == ReasoningEffort::Medium
+                let mut restored = with_effort(&medium, ReasoningEffort::High);
+                action.route.apply_to(&mut restored);
+                restored.provider.reasoning_effort == ReasoningEffort::Medium
             }),
             "recovered model and tool dispatches retain one generation route"
         );
