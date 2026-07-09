@@ -187,11 +187,6 @@ pub(super) fn register_task(
         // the pre-#221 behavior for ordinary dispatch.
         if replaced.post_compaction_dispatch_lease.is_some() {
             replaced.handle.abort();
-        } else {
-            eprintln!(
-                "register_task: re-dispatch for {} replaced a live non-leased {:?} task; keeping it (no abort)",
-                replaced.action_row_id, replaced.kind
-            );
         }
     }
     let _ = start.send(());
