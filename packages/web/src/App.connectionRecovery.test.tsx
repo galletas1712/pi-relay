@@ -510,7 +510,6 @@ describe("App connection recovery integration", () => {
 		await user.click(screen.getByRole("button", { name: /see more/i }));
 		expect(screen.getByRole("article", { name: /Recent 1/ })).toBeTruthy();
 		expect(screen.getByRole("button", { name: /show fewer/i })).toBeTruthy();
-		expect(await screen.findByText("Refreshing agents…")).toBeTruthy();
 		expect(api.listDelegations).toHaveBeenCalledWith(SESSION_ID, 100);
 
 		firstExpansion.reject(new Error("100-row load failed"));
@@ -586,7 +585,6 @@ describe("App connection recovery integration", () => {
 		expect(await screen.findByRole("article", { name: /First parent row/ })).toBeTruthy();
 
 		await user.click(screen.getByRole("button", { name: /see more/i }));
-		expect(await screen.findByText("Refreshing agents…")).toBeTruthy();
 		const secondParentButtons = screen.getAllByRole("button", { name: /Second parent/ });
 		const secondParentNavigation = secondParentButtons.find(
 			(button) => !button.hasAttribute("aria-haspopup"),

@@ -471,9 +471,9 @@ function RunBoard({
 }) {
 	return (
 		<section className="inspect-section run-board-section">
-			{parentSessionId && loading ? (
+			{parentSessionId && loading && delegations.length === 0 ? (
 				<p className="muted run-board-inline-status" role="status">
-					{delegations.length > 0 ? "Refreshing agents…" : "Loading agents…"}
+					Loading agents…
 				</p>
 			) : null}
 			{parentSessionId && error ? (
