@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
 	agentStatusIconKey,
-	delegationHasHandoff,
 	delegationNeedsAttention,
 	delegationProgressSummary,
-	groupDelegations,
 	isDelegationRunning,
+	orderDelegations,
 	remainingDelegationWorkCount,
 	statusIconClass,
 } from "./delegationBoard.ts";
@@ -47,14 +46,15 @@ describe("delegation triage model", () => {
 		];
 
 		expect(
-			groupDelegations(delegations).map((section) => ({
-				label: section.label,
-				ids: section.delegations.map((item) => item.delegation_id),
-			})),
+			orderDelegations(delegations).map((item) => item.delegation_id),
 		).toEqual([
-			{ label: "Needs attention", ids: ["attention-new", "partial-failure", "attention-old"] },
-			{ label: "Active", ids: ["active-new", "active-old"] },
-			{ label: "Recent", ids: ["recent-new", "recent-old"] },
+			"attention-new",
+			"partial-failure",
+			"attention-old",
+			"active-new",
+			"active-old",
+			"recent-new",
+			"recent-old",
 		]);
 	});
 
@@ -117,12 +117,5 @@ describe("delegation control helpers", () => {
 			expect(agentStatusIconKey(status), status).toBe(icon);
 		}
 		expect(new Set(Object.values(cases)).size).toBe(Object.keys(cases).length);
-	});
-
-	it("exposes handoffs only for barrier-completed delegations", () => {
-		expect(delegationHasHandoff(delegation({ status: "done" }))).toBe(true);
-		expect(delegationHasHandoff(delegation({ status: "done_with_failures" }))).toBe(true);
-		expect(delegationHasHandoff(delegation({ status: "running" }))).toBe(false);
-		expect(delegationHasHandoff(delegation({ status: "cancelled" }))).toBe(false);
 	});
 });

@@ -46,10 +46,6 @@ export function assertRemoteActionAllowed(reason: string | null): void {
 	if (reason) throw new Error(reason);
 }
 
-export function assertMutationAllowed(reason: string | null): void {
-	assertRemoteActionAllowed(reason);
-}
-
 export function composerTextNeedsConnection(
 	text: string,
 	options: { cachedHistoryAvailable?: boolean } = {},
@@ -95,10 +91,6 @@ export class ConnectionRetryController {
 	opened(): void {
 		this.generation += 1;
 		this.pending = null;
-	}
-
-	isPending(): boolean {
-		return this.pending !== null;
 	}
 }
 

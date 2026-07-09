@@ -468,46 +468,16 @@ export function unavailableExecutionDetail(
 	};
 }
 
-export function agentFocus(sessionId: string): ExecutionFocus {
-	return { kind: "agent", sessionId: requireRouteId(sessionId, "agent session ID") };
-}
-
-export function delegationFocus(delegationId: string): ExecutionFocus {
-	return { kind: "delegation", delegationId: requireRouteId(delegationId, "delegation ID") };
-}
-
-export function handoffReference(ref: string): HandoffReference {
-	return { kind: "handoff", ref: requireRouteId(ref, "handoff reference") };
-}
-
 export interface RouteNavigation {
 	kind: "route";
 	history: "push" | "replace";
 	route: WorkspaceRoute;
 	url: string;
-	action:
-		| "root-selection"
-		| "destination"
-		| "execution-view"
-		| "focus"
-		| "agent-conversation"
-		| "message-agent"
-		| "handoff-detail";
-	focusComposer?: true;
-	handoffParentUrl?: string;
 }
-
-export interface CloseHandoffNavigation {
-	kind: "close-handoff";
-	route: ExecutionRoute;
-	url: string;
-}
-
-export type WorkspaceNavigation = RouteNavigation | CloseHandoffNavigation;
 
 /** Selecting a run always enters its root Conversation and pushes history. */
 export function selectRootRun(scope: WorkspaceRouteScope, rootSessionId: string): RouteNavigation {
-	return navigation("push", rootConversationRoute(scope, rootSessionId), "root-selection");
+	return navigation("push", rootConversationRoute(scope, rootSessionId));
 }
 
 /** Conversation and Execution destination links preserve the effective conversation. */
@@ -522,79 +492,11 @@ export function showConversation(route: WorkspaceRoute): RouteNavigation {
 				? rootConversation()
 				: { kind: "agent", sessionId: conversation.sessionId },
 	};
-	return navigation("push", next, "destination");
-}
-
-export function showExecution(route: WorkspaceRoute, view: ExecutionView = "overview"): RouteNavigation {
-	const next = executionRouteFor(route, view);
-	return navigation("push", next, "destination");
-}
-
-/** Execution subview links are major destinations and therefore push. */
-export function changeExecutionView(route: ExecutionRoute, view: ExecutionView): RouteNavigation {
-	const next: ExecutionRoute = {
-		...route,
-		view,
-		handoff: view === route.view ? route.handoff : null,
-	};
-	return navigation("push", next, "execution-view");
-}
-
-/** Keyboard/click focus roving changes only focus and replaces the current entry. */
-export function changeExecutionFocus(route: ExecutionRoute, focus: ExecutionFocus): RouteNavigation {
-	return navigation("replace", { ...route, focus }, "focus");
-}
-
-/**
- * Run Navigator links push when entering/changing a destination, but replace
- * when focus is the only changed route dimension.
- */
-export function navigateExecutionFocus(
-	route: WorkspaceRoute,
-	view: ExecutionView,
-	focus: ExecutionFocus,
-): RouteNavigation {
-	const base = executionRouteFor(route, view);
-	const next: ExecutionRoute = { ...base, focus };
-	if (route.destination === "execution" && route.view === view) {
-		return navigation("replace", { ...next, handoff: route.handoff }, "focus");
-	}
-	return navigation("push", next, "execution-view");
+	return navigation("push", next);
 }
 
 export function openAgentConversation(route: WorkspaceRoute, sessionId: string): RouteNavigation {
-	return agentConversationNavigation(route, sessionId, "agent-conversation");
-}
-
-export function messageAgent(route: WorkspaceRoute, sessionId: string): RouteNavigation {
-	return {
-		...agentConversationNavigation(route, sessionId, "message-agent"),
-		focusComposer: true,
-	};
-}
-
-/**
- * Durable handoff details preserve conversation/focus and push so ordinary
- * Close can use Back. If focus is subsequently replaced while the detail is
- * open, that replacement intentionally drops this entry's parent marker;
- * Close then replaces to the new focus instead of going Back to stale focus.
- */
-export function openHandoff(route: ExecutionRoute, handoff: HandoffReference): RouteNavigation {
-	const next: ExecutionRoute = { ...route, handoff };
-	const result = navigation("push", next, "handoff-detail");
-	return {
-		...result,
-		handoffParentUrl: serializeWorkspaceRoute({ ...route, handoff: null }),
-	};
-}
-
-/**
- * The history adapter uses Back for a detail opened by this adapter. A direct
- * handoff deep link has no parent marker, so Close safely replaces it in place.
- */
-export function closeHandoff(route: ExecutionRoute): CloseHandoffNavigation {
-	const next: ExecutionRoute = { ...route, handoff: null };
-	return { kind: "close-handoff", route: next, url: serializeWorkspaceRoute(next) };
+	return agentConversationNavigation(route, sessionId);
 }
 
 /**
@@ -630,7 +532,6 @@ export interface WorkspaceHistoryLike {
 	readonly state?: unknown;
 	pushState(data: unknown, unused: string, url?: string | URL | null): void;
 	replaceState(data: unknown, unused: string, url?: string | URL | null): void;
-	back?(): void;
 }
 
 export interface WorkspacePopstateSource {
@@ -644,14 +545,6 @@ export interface WorkspaceRouteHistoryDependencies {
 	events: WorkspacePopstateSource;
 }
 
-interface WorkspaceHistoryMarker {
-	piRelayWorkspaceRoute: {
-		version: 1;
-		action: RouteNavigation["action"];
-		handoffParentUrl?: string;
-	};
-}
-
 /**
  * Minimal history adapter. Dependencies are injected, and no browser global is
  * read until the optional browser factory is called.
@@ -663,19 +556,12 @@ export class WorkspaceRouteHistory {
 		return parseWorkspaceRoute(this.dependencies.location);
 	}
 
-	apply(navigation: WorkspaceNavigation): WorkspaceRouteParseResult | null {
-		if (navigation.kind === "close-handoff") return this.closeHandoff(navigation);
-		const marker: WorkspaceHistoryMarker = {
-			piRelayWorkspaceRoute: {
-				version: 1,
-				action: navigation.action,
-				handoffParentUrl: navigation.handoffParentUrl,
-			},
-		};
+	apply(navigation: RouteNavigation): WorkspaceRouteParseResult {
+		const state = this.dependencies.history.state ?? null;
 		if (navigation.history === "push") {
-			this.dependencies.history.pushState(marker, "", navigation.url);
+			this.dependencies.history.pushState(state, "", navigation.url);
 		} else {
-			this.dependencies.history.replaceState(marker, "", navigation.url);
+			this.dependencies.history.replaceState(state, "", navigation.url);
 		}
 		return parseWorkspaceRoute(navigation.url);
 	}
@@ -710,19 +596,6 @@ export class WorkspaceRouteHistory {
 		return () => this.dependencies.events.removeEventListener("popstate", onPopstate);
 	}
 
-	private closeHandoff(navigation: CloseHandoffNavigation): WorkspaceRouteParseResult | null {
-		const state = workspaceHistoryMarker(this.dependencies.history.state);
-		if (
-			state?.action === "handoff-detail" &&
-			state.handoffParentUrl === navigation.url &&
-			this.dependencies.history.back
-		) {
-			this.dependencies.history.back();
-			return null;
-		}
-		this.dependencies.history.replaceState(this.dependencies.history.state ?? null, "", navigation.url);
-		return parseWorkspaceRoute(navigation.url);
-	}
 }
 
 /** Browser convenience factory; safe to import during SSR/static rendering. */
@@ -792,7 +665,7 @@ export function legacyWorkspaceResume(
 	};
 	return {
 		kind: "legacy-route",
-		navigation: navigation("replace", route, "root-selection"),
+		navigation: navigation("replace", route),
 	};
 }
 
@@ -905,29 +778,9 @@ function rootFocus(): ExecutionFocus {
 	return { kind: "root" };
 }
 
-function executionRouteFor(route: WorkspaceRoute, view: ExecutionView): ExecutionRoute {
-	if (route.destination === "execution") {
-		return {
-			...route,
-			view,
-			handoff: view === route.view ? route.handoff : null,
-		};
-	}
-	return {
-		destination: "execution",
-		scope: route.scope,
-		rootSessionId: route.rootSessionId,
-		view,
-		conversation: route.conversation,
-		focus: rootFocus(),
-		handoff: null,
-	};
-}
-
 function agentConversationNavigation(
 	route: WorkspaceRoute,
 	sessionId: string,
-	action: "agent-conversation" | "message-agent",
 ): RouteNavigation {
 	const validatedSessionId = requireRouteId(sessionId, "agent session ID");
 	const next: ConversationRoute = {
@@ -939,20 +792,18 @@ function agentConversationNavigation(
 				? rootConversation()
 				: { kind: "agent", sessionId: validatedSessionId },
 	};
-	return navigation("push", next, action);
+	return navigation("push", next);
 }
 
 function navigation(
 	history: "push" | "replace",
 	route: WorkspaceRoute,
-	action: RouteNavigation["action"],
 ): RouteNavigation {
 	return {
 		kind: "route",
 		history,
 		route,
 		url: serializeWorkspaceRoute(route),
-		action,
 	};
 }
 
@@ -1256,13 +1107,6 @@ function unavailable(
 		requestedUrl: location.requestedUrl,
 		backTo,
 	};
-}
-
-function workspaceHistoryMarker(state: unknown): WorkspaceHistoryMarker["piRelayWorkspaceRoute"] | null {
-	if (!isRecord(state) || !isRecord(state.piRelayWorkspaceRoute)) return null;
-	const marker = state.piRelayWorkspaceRoute;
-	if (marker.version !== 1 || typeof marker.action !== "string") return null;
-	return marker as unknown as WorkspaceHistoryMarker["piRelayWorkspaceRoute"];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

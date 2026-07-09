@@ -46,8 +46,8 @@ import {
 } from "./sessionList.ts";
 import {
 	agentStatusIconKey,
-	groupDelegations,
 	isDelegationRunning,
+	orderDelegations,
 	remainingDelegationWorkCount,
 	statusIconClass,
 	type AgentStatusIconKey,
@@ -84,31 +84,8 @@ export function SidebarHeader({
 	);
 }
 
-export interface RunBoardCallbacks {
-	onSelectSession?: (sessionId: string) => void;
-	onCancelDelegation: (parentSessionId: string, delegationId: string) => void | Promise<void>;
-}
-
-interface RunBoardProps extends RunBoardCallbacks {
-	parentSessionId: string | null;
-	delegations: Delegation[];
-	subagentNames: ReadonlyMap<string, string>;
-	hasMoreDelegations: boolean;
-	loading: boolean;
-	error: string | null;
-	showAllDelegations: boolean;
-	expandedDelegationsAvailable: boolean;
-	onToggleShowAllDelegations: () => void;
-	onRetryDelegations?: () => void;
-	delegationsRetrying?: boolean;
-	selectedSessionId?: string | null;
-	boundedExpansionHasMore?: boolean;
-	mutationBlockedReason?: string | null;
-	remoteReadBlockedReason?: string | null;
-}
-
-const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
-const RUN_BOARD_EXPANDED_DELEGATION_COUNT = 100;
+export const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
+export const RUN_BOARD_EXPANDED_DELEGATION_COUNT = 100;
 const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
 
 export function subagentStatusLabel(subagent: DelegationSubagent): string {
@@ -204,7 +181,8 @@ function DelegationCard({
 	actionState?: DelegationActionState;
 	onRequestCancel: (delegation: Delegation) => void;
 	mutationBlockedReason?: string | null;
-} & Pick<RunBoardCallbacks, "onSelectSession">) {
+	onSelectSession?: (sessionId: string) => void;
+}) {
 	const running = isDelegationRunning(delegation);
 	const title = delegation.label?.trim() || "Agent task";
 	const statusLabel = delegation.status === "done_with_failures"
@@ -337,7 +315,9 @@ export function RunBoardDelegationList({
 	remoteReadBlockedReason?: string | null;
 	expandedDelegationsAvailable?: boolean;
 	boundedExpansionHasMore?: boolean;
-} & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation">) {
+	onSelectSession?: (sessionId: string) => void;
+	onCancelDelegation: (parentSessionId: string, delegationId: string) => void | Promise<void>;
+}) {
 	const [cancelDialogIntent, setCancelDialogIntent] = useState<{
 		parentSessionId: string;
 		delegation: Delegation;
@@ -352,7 +332,7 @@ export function RunBoardDelegationList({
 			? delegations
 			: delegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT);
 	const orderedDelegations = useMemo(
-		() => groupDelegations(visibleDelegations).flatMap((section) => section.delegations),
+		() => orderDelegations(visibleDelegations),
 		[visibleDelegations],
 	);
 	const showToggle = hasMoreDelegations || hiddenLocalCount > 0 || showAllDelegations;
@@ -480,7 +460,13 @@ function RunBoard({
 	mutationBlockedReason,
 	remoteReadBlockedReason,
 	expandedDelegationsAvailable,
-}: RunBoardProps) {
+}: Omit<Parameters<typeof RunBoardDelegationList>[0], "parentSessionId"> & {
+	parentSessionId: string | null;
+	loading: boolean;
+	error: string | null;
+	onRetryDelegations?: () => void;
+	delegationsRetrying?: boolean;
+}) {
 	return (
 		<section className="inspect-section run-board-section">
 			{parentSessionId && loading ? (
@@ -1139,7 +1125,7 @@ export function Inspector({
 	delegationsRetrying = false,
 	selectedSessionId = null,
 	boundedExpansionHasMore = false,
-	runBoard,
+	onCancelDelegation,
 	mutationBlockedReason,
 	remoteReadBlockedReason,
 	tools,
@@ -1160,7 +1146,7 @@ export function Inspector({
 	delegationsRetrying?: boolean;
 	selectedSessionId?: string | null;
 	boundedExpansionHasMore?: boolean;
-	runBoard: Omit<RunBoardCallbacks, "onSelectSession">;
+	onCancelDelegation: (parentSessionId: string, delegationId: string) => void | Promise<void>;
 	mutationBlockedReason?: string | null;
 	remoteReadBlockedReason?: string | null;
 	tools: ToolListing[];
@@ -1211,7 +1197,7 @@ export function Inspector({
 						selectedSessionId={selectedSessionId}
 						boundedExpansionHasMore={boundedExpansionHasMore}
 						onSelectSession={onSelectSession}
-						onCancelDelegation={runBoard.onCancelDelegation}
+						onCancelDelegation={onCancelDelegation}
 						mutationBlockedReason={mutationBlockedReason}
 						remoteReadBlockedReason={remoteReadBlockedReason}
 					/>

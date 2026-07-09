@@ -119,7 +119,9 @@ describe("ConnectionRetryController", () => {
 
 		expect(onFailure).not.toHaveBeenCalled();
 		expect(onSettled).not.toHaveBeenCalled();
-		expect(controller.isPending()).toBe(false);
+		const next = controller.retry(connect, onFailure, onSettled);
+		expect(next).not.toBe(first);
+		expect(connect).toHaveBeenCalledTimes(2);
 	});
 
 	it("does not modify composer draft storage while retrying", async () => {

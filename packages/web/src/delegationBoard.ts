@@ -6,14 +6,6 @@ import type {
 	DelegationSubagent,
 } from "./types.ts";
 
-export type DelegationSectionId = "needs-attention" | "active" | "recent";
-
-export interface DelegationSection {
-	id: DelegationSectionId;
-	label: string;
-	delegations: Delegation[];
-}
-
 export type AgentStatus = Activity | DelegationStatus;
 export type AgentStatusIconKey =
 	| "running"
@@ -71,25 +63,17 @@ export function delegationNeedsAttention(delegation: Delegation): boolean {
 	return false;
 }
 
-/** Split a server-ordered page into stable task-centered sections. Filtering
- * preserves the input order inside every section, so polling cannot reshuffle
- * peers that have not changed classification. */
-export function groupDelegations(delegations: readonly Delegation[]): DelegationSection[] {
-	const groups: Record<DelegationSectionId, Delegation[]> = {
-		"needs-attention": [],
-		active: [],
-		recent: [],
-	};
+/** Preserve server order within Needs attention, Active, then Recent. */
+export function orderDelegations(delegations: readonly Delegation[]): Delegation[] {
+	const attention: Delegation[] = [];
+	const active: Delegation[] = [];
+	const recent: Delegation[] = [];
 	for (const delegation of delegations) {
-		if (delegationNeedsAttention(delegation)) groups["needs-attention"].push(delegation);
-		else if (delegation.status === "running") groups.active.push(delegation);
-		else groups.recent.push(delegation);
+		if (delegationNeedsAttention(delegation)) attention.push(delegation);
+		else if (delegation.status === "running") active.push(delegation);
+		else recent.push(delegation);
 	}
-	return [
-		{ id: "needs-attention", label: "Needs attention", delegations: groups["needs-attention"] },
-		{ id: "active", label: "Active", delegations: groups.active },
-		{ id: "recent", label: "Recent", delegations: groups.recent },
-	];
+	return [...attention, ...active, ...recent];
 }
 
 function directChildProgress(subagents: readonly DelegationSubagent[]): DelegationProgressSummary {
@@ -149,14 +133,6 @@ export function remainingDelegationWorkCount(delegation: Delegation): {
  * exactly while its status is `running`. Every other status is terminal. */
 export function isDelegationRunning(delegation: Delegation): boolean {
 	return delegation.status === "running";
-}
-
-/** The daemon writes normal per-subagent handoff files from the delegation
- * barrier, which completes delegations as `done` or `done_with_failures`.
- * Other terminal states are real, but only completed delegations expose the
- * normal final_message/transcript handoff links. */
-export function delegationHasHandoff(delegation: Delegation): boolean {
-	return delegation.status === "done" || delegation.status === "done_with_failures";
 }
 
 /** Map a delegation or subagent status to a CSS-safe icon modifier. */

@@ -5,11 +5,9 @@ export interface SessionListRequestState {
 }
 
 interface ProjectRequestState<T> {
-	generation: number;
 	error: string | null;
 	request: Promise<T> | null;
 	retry: Promise<unknown> | null;
-	retryStarting: boolean;
 	queryFetching: boolean;
 }
 
@@ -43,7 +41,7 @@ export class SessionListRequestCoordinator<T> {
 		if (projectId === this.activeProjectId) return;
 		this.activeProjectId = projectId;
 		const next = this.project(projectId);
-		if (!next.request && !next.queryFetching && !next.retry && !next.retryStarting) {
+		if (!next.request && !next.queryFetching && !next.retry) {
 			next.error = null;
 		}
 		this.publish();
@@ -60,8 +58,6 @@ export class SessionListRequestCoordinator<T> {
 		const project = this.project(projectId);
 		if (project.request) return project.request;
 
-		const generation = project.generation;
-		project.retryStarting = false;
 		const request = Promise.resolve().then(requestCanonicalList);
 		project.request = request;
 		this.publishIfActive(projectId);
@@ -69,18 +65,18 @@ export class SessionListRequestCoordinator<T> {
 		void request
 			.then(
 				() => {
-					if (!this.matches(projectId, generation, request)) return;
+					if (project.request !== request) return;
 					project.error = null;
 				},
 				(error) => {
-					if (!this.matches(projectId, generation, request)) return;
+					if (project.request !== request) return;
 					project.error = this.messageForError(error);
 				},
 			)
 			.finally(() => {
 				if (project.request !== request) return;
 				project.request = null;
-				if (project.generation === generation) this.publishIfActive(projectId);
+				this.publishIfActive(projectId);
 			});
 		return request;
 	}
@@ -91,33 +87,28 @@ export class SessionListRequestCoordinator<T> {
 		if (project.request) return project.request;
 		if (project.retry) return project.retry;
 
-		const generation = project.generation;
-		project.retryStarting = true;
 		const retry = Promise.resolve().then(refetch);
 		project.retry = retry;
 		this.publish();
 		void retry.then(
-			() => this.finishRetry(projectId, generation, retry),
-			() => this.finishRetry(projectId, generation, retry),
+			() => this.finishRetry(projectId, retry),
+			() => this.finishRetry(projectId, retry),
 		);
 		return retry;
 	}
 
-	private finishRetry(projectId: string | null, generation: number, retry: Promise<unknown>): void {
+	private finishRetry(projectId: string | null, retry: Promise<unknown>): void {
 		const project = this.project(projectId);
-		if (project.generation !== generation || project.retry !== retry) return;
+		if (project.retry !== retry) return;
 		project.retry = null;
-		project.retryStarting = false;
 		this.publishIfActive(projectId);
 	}
 
 	private emptyProjectState(): ProjectRequestState<T> {
 		return {
-			generation: 0,
 			error: null,
 			request: null,
 			retry: null,
-			retryStarting: false,
 			queryFetching: false,
 		};
 	}
@@ -129,11 +120,6 @@ export class SessionListRequestCoordinator<T> {
 			this.projects.set(projectId, project);
 		}
 		return project;
-	}
-
-	private matches(projectId: string | null, generation: number, request: Promise<T>): boolean {
-		const project = this.project(projectId);
-		return project.generation === generation && project.request === request;
 	}
 
 	private publishIfActive(projectId: string | null): void {
@@ -148,7 +134,6 @@ export class SessionListRequestCoordinator<T> {
 			busy:
 				project.request !== null ||
 				project.retry !== null ||
-				project.retryStarting ||
 				project.queryFetching,
 		};
 		for (const listener of this.listeners) listener();

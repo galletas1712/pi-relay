@@ -13,7 +13,6 @@ import type {
 import { Composer, type ComposerHandle } from "./composer.tsx";
 import { routeComposerSubmission, type ComposerSubmission } from "./composerRouting.ts";
 import {
-	assertMutationAllowed,
 	assertRemoteActionAllowed,
 	composerTextNeedsConnection,
 	ConnectionRecoveryBanner,
@@ -34,7 +33,13 @@ import {
 	type ProjectDialogState,
 } from "./entityDialogs.tsx";
 import { randomId } from "./ids.ts";
-import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
+import {
+	Inspector,
+	NoticeStack,
+	RUN_BOARD_DEFAULT_DELEGATION_COUNT,
+	RUN_BOARD_EXPANDED_DELEGATION_COUNT,
+	Sidebar,
+} from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
 import { isDelegationRunning } from "./delegationBoard.ts";
@@ -140,7 +145,6 @@ import {
 	type WorkspaceRoute,
 	type WorkspaceRouteParseResult,
 	type WorkspaceRouteUnavailable,
-	type WorkspaceRouteWarning,
 } from "./workspaceRoute.ts";
 import type {
 	Activity,
@@ -169,8 +173,6 @@ const FOREGROUND_RECONNECT_AFTER_MS = 5000;
 const AWAKE_HEARTBEAT_MS = 1000;
 const TRANSCRIPT_INDEX_PAGE_SIZE = 5000;
 const TRANSCRIPT_TURN_PAGE_SIZE = 50;
-const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
-const RUN_BOARD_EXPANDED_DELEGATION_COUNT = 100;
 const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
 const SIDEBAR_CLOSE_BEFORE_SELECT_MS = 200;
 const MEDIUM_PANEL_QUERY = "(min-width: 900px)";
@@ -248,20 +250,18 @@ function initialRouteResult(history: WorkspaceRouteHistory | null): WorkspaceRou
 function routeInitialSelection(
 	result: WorkspaceRouteParseResult,
 	legacy: ReturnType<typeof loadUiSelection>,
-): { projectId: string | null; rootSessionId: string | null; conversationSessionId: string | null } {
+): { projectId: string | null; conversationSessionId: string | null } {
 	if (result.kind === "route") {
 		return {
 			projectId: routeScopeProjectId(result.route),
-			rootSessionId: result.route.rootSessionId,
 			conversationSessionId: routeConversationSessionId(result.route),
 		};
 	}
 	if (result.kind === "unavailable") {
-		return { projectId: null, rootSessionId: null, conversationSessionId: null };
+		return { projectId: null, conversationSessionId: null };
 	}
 	return {
 		projectId: legacy.projectId,
-		rootSessionId: null,
 		// Legacy identity is not trusted until the selected session's canonical
 		// direct parent/root has been resolved.
 		conversationSessionId: null,
@@ -376,9 +376,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [retryingConnection, setRetryingConnection] = useState(false);
 	const [workspaceRouteResult, setWorkspaceRouteResult] =
 		useState<WorkspaceRouteParseResult>(initialWorkspaceRoute);
-	const [routeWarnings, setRouteWarnings] = useState<WorkspaceRouteWarning[]>(
-		initialWorkspaceRoute.kind === "route" ? initialWorkspaceRoute.warnings : [],
-	);
 	const [routeValidation, setRouteValidation] = useState<RouteValidationState>(
 		initialWorkspaceRoute.kind === "route"
 			? { kind: "pending" }
@@ -398,7 +395,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 	const selectedId = conversationSessionId;
 	const selectedRef = useRef<string | null>(initialSelection.conversationSessionId);
-	const [rootSessionId, setRootSessionId] = useState<string | null>(initialSelection.rootSessionId);
 	const [notices, setNotices] = useState<Notice[]>([]);
 	const [query, setQuery] = useState("");
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
@@ -484,7 +480,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const connectionRemoteActionBlockedReason = remoteActionBlockedReason(connection);
 	const cachedHistoryAvailable = hasCanonicalCachedHistory(selectedCache, selectedId);
 	const assertServerMutationAllowed = useCallback(() => {
-		assertMutationAllowed(remoteActionBlockedReason(connectionRef.current));
+		assertRemoteActionAllowed(remoteActionBlockedReason(connectionRef.current));
 	}, []);
 	const assertServerReadAllowed = useCallback(() => {
 		assertRemoteActionAllowed(remoteActionBlockedReason(connectionRef.current));
@@ -794,7 +790,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	// can expose current navigation semantics. This intentionally follows only
 	// the canonical direct parent; it does not infer a root or traverse a graph.
 	const delegationParentSessionId =
-		rootSessionId;
+		workspaceRouteResult.kind === "route" ? workspaceRouteResult.route.rootSessionId : null;
 	const expandedDelegationQueryKey = queryKeys.delegations(
 		delegationParentSessionId,
 		RUN_BOARD_EXPANDED_DELEGATION_COUNT,
@@ -1028,7 +1024,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				next.canonicalUrl === workspaceRouteResultRef.current.canonicalUrl;
 			if (unchangedValidatedRoute) {
 				setWorkspaceRouteResult(next);
-				setRouteWarnings(next.warnings);
 				return next;
 			}
 			setHistoryDialog(null);
@@ -1039,14 +1034,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (next.kind === "route") {
 				const projectId = routeScopeProjectId(next.route);
 				const conversationId = routeConversationSessionId(next.route);
-				setRouteWarnings(next.warnings);
-				setRootSessionId(next.route.rootSessionId);
 				setRouteValidation({ kind: "pending" });
 				applyProjectConversationIdentity(projectId, conversationId);
 				return next;
 			}
-			setRouteWarnings([]);
-			setRootSessionId(null);
 			setRouteValidation(
 				next.kind === "unavailable"
 					? { kind: "unavailable", state: next, retryable: false }
@@ -1127,9 +1118,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				routeValidationGenerationRef.current += 1;
 				const empty = routeHistory?.clear("push") ?? { kind: "none" as const };
 				setWorkspaceRouteResult(empty);
-				setRouteWarnings([]);
 				setRouteValidation({ kind: "idle" });
-				setRootSessionId(null);
 				rememberUiSelection(selectedProjectRef.current, null);
 				applyConversationIdentity(null);
 				return;
@@ -1148,9 +1137,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			routeValidationGenerationRef.current += 1;
 			const empty = routeHistory?.clear("push") ?? { kind: "none" as const };
 			setWorkspaceRouteResult(empty);
-			setRouteWarnings([]);
 			setRouteValidation({ kind: "idle" });
-			setRootSessionId(null);
 			rememberUiSelection(projectId, null);
 			applyProjectConversationIdentity(projectId, null);
 		},
@@ -1888,7 +1875,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 
 	const retryConnection = useCallback(() => {
-		if (connectionRetryController.current.isPending()) return;
 		setRetryingConnection(true);
 		void connectionRetryController.current.retry(
 			() => api.reconnect(),
@@ -3261,12 +3247,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				history: "push",
 				route: parsed.route,
 				url: parsed.canonicalUrl,
-				action: "destination",
 			});
 		},
 		[applyNavigation],
 	);
-	const persistentRouteWarnings = routeWarnings.filter((warning) => warning.persistent);
+	const persistentRouteWarnings =
+		workspaceRouteResult.kind === "route"
+			? workspaceRouteResult.warnings.filter((warning) => warning.persistent)
+			: [];
 	const recipientLabel =
 		validatedRoute?.conversation.kind === "agent"
 			? sessionTitle(selectedChatSession ?? {
@@ -3608,9 +3596,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						showAllDelegations &&
 						!!expandedDelegationsQuery.data?.has_more
 					}
-					runBoard={{
-						onCancelDelegation: cancelDelegation,
-					}}
+					onCancelDelegation={cancelDelegation}
 					mutationBlockedReason={connectionRemoteActionBlockedReason}
 					remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 					tools={tools}

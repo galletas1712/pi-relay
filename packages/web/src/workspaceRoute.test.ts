@@ -1,27 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
-	agentFocus,
 	browserWorkspaceRouteHistory,
-	changeExecutionFocus,
-	changeExecutionView,
-	closeHandoff,
-	delegationFocus,
 	fallbackExecutionConversation,
-	handoffReference,
 	hostRouteScope,
 	legacyWorkspaceResume,
-	messageAgent,
 	messageRecipient,
-	navigateExecutionFocus,
 	openAgentConversation,
-	openHandoff,
 	parseWorkspaceRoute,
 	projectRouteScope,
 	rootConversationRoute,
 	selectRootRun,
 	serializeWorkspaceRoute,
 	showConversation,
-	showExecution,
 	unavailableConversationRoute,
 	unavailableExecutionDetail,
 	type ConversationRoute,
@@ -71,22 +61,11 @@ describe("workspace route parser and serializer", () => {
 	});
 
 	it("every helper-produced URL parses back to exactly the helper route", () => {
-		const root = rootConversationRoute(PROJECT, "root-1");
-		const execution = executionRoute(PROJECT, "overview");
 		const childExecution = agentExecutionRoute(PROJECT, "activity", "child-1");
-		const focused = expectExecution(changeExecutionFocus(childExecution, agentFocus("child-2")).route);
-		const opened = openHandoff(focused, handoffReference("detail-1"));
 		const navigations = [
 			selectRootRun(PROJECT, "root-2"),
-			showExecution(root),
 			showConversation(childExecution),
-			changeExecutionView(execution, "handoffs"),
-			changeExecutionFocus(execution, delegationFocus("work-1")),
-			navigateExecutionFocus(execution, "overview", agentFocus("child-1")),
-			openAgentConversation(execution, "child-1"),
-			messageAgent(execution, "child-1"),
-			opened,
-			closeHandoff(expectExecution(opened.route)),
+			openAgentConversation(childExecution, "child-2"),
 		];
 
 		for (const navigation of navigations) {
@@ -106,10 +85,13 @@ describe("workspace route parser and serializer", () => {
 		];
 		const focuses: ExecutionRoute["focus"][] = [
 			{ kind: "root" },
-			delegationFocus("delegation-1"),
-			agentFocus("agent-1"),
+			expectExecution(expectRoute("/w/host/run/root-1/execution/overview?focus=delegation%3Adelegation-1")).focus,
+			expectExecution(expectRoute("/w/host/run/root-1/execution/overview?focus=agent%3Aagent-1")).focus,
 		];
-		const handoffs: ExecutionRoute["handoff"][] = [null, handoffReference("handoff-1")];
+		const handoffs: ExecutionRoute["handoff"][] = [
+			null,
+			expectExecution(expectRoute("/w/host/run/root-1/execution/overview?handoff=handoff-1")).handoff,
+		];
 
 		for (const scope of scopes) {
 			for (const view of ["overview", "activity", "handoffs"] as const) {
@@ -167,11 +149,12 @@ describe("workspace route parser and serializer", () => {
 	});
 
 	it("round-trips typed conversation, focus, and handoff in deterministic parameter order", () => {
-		const route: ExecutionRoute = {
-			...agentExecutionRoute(PROJECT, "handoffs", "agent ?1"),
-			focus: agentFocus("agent ?1"),
-			handoff: handoffReference("delegation 1 final_message.md"),
-		};
+		const route = expectExecution(expectRoute(
+			"/w/project/project-1/run/root-1/execution/handoffs" +
+				"?conversation=agent%3Aagent%20%3F1" +
+				"&focus=agent%3Aagent%20%3F1" +
+				"&handoff=delegation%201%20final_message.md",
+		));
 		const url = serializeWorkspaceRoute(route);
 
 		expect(url).toBe(
@@ -404,11 +387,10 @@ describe("workspace route parser and serializer", () => {
 	});
 
 	it("preserves unavailable focus/handoff selection for owned detail rendering", () => {
-		const route: ExecutionRoute = {
-			...agentExecutionRoute(PROJECT, "handoffs", "child-1"),
-			focus: delegationFocus("delegation-1"),
-			handoff: handoffReference("missing-file"),
-		};
+		const route = expectExecution(expectRoute(
+			"/w/project/project-1/run/root-1/execution/handoffs" +
+				"?conversation=agent%3Achild-1&focus=delegation%3Adelegation-1&handoff=missing-file",
+		));
 
 		expect(unavailableExecutionDetail(route, "focus")).toMatchObject({
 			kind: "unavailable",
@@ -563,8 +545,10 @@ describe("workspace route parser and serializer", () => {
 			// @ts-expect-error Membership validation is not freely writable route identity.
 			membership: "validated",
 		};
-		const childFocus = agentFocus("child");
-		if (childFocus.kind !== "agent") throw new Error("agentFocus returned a non-agent focus");
+		const childFocus = expectExecution(
+			expectRoute("/w/host/run/root-1/execution/overview?focus=agent%3Achild"),
+		).focus;
+		if (childFocus.kind !== "agent") throw new Error("expected agent focus");
 		const writableAvailability: ExecutionRoute["focus"] = {
 			kind: "agent",
 			sessionId: childFocus.sessionId,
@@ -591,18 +575,14 @@ describe("workspace route parser and serializer", () => {
 		"bad\u0085id",
 		"bad\ud800id",
 	])(
-		"all exported builders reject malformed IDs consistently: %j",
+		"active outgoing builders reject malformed IDs consistently: %j",
 		(id) => {
 			expect(() => projectRouteScope(id)).toThrowError(/Workspace route programmer error/);
 			expect(() => rootConversationRoute(HOST, id)).toThrowError(/Workspace route programmer error/);
 			expect(() => selectRootRun(HOST, id)).toThrowError(/Workspace route programmer error/);
-			expect(() => agentFocus(id)).toThrowError(/Workspace route programmer error/);
-			expect(() => delegationFocus(id)).toThrowError(/Workspace route programmer error/);
-			expect(() => handoffReference(id)).toThrowError(/Workspace route programmer error/);
 
 			const root = rootConversationRoute(HOST, "root-1");
 			expect(() => openAgentConversation(root, id)).toThrowError(/Workspace route programmer error/);
-			expect(() => messageAgent(root, id)).toThrowError(/Workspace route programmer error/);
 		},
 	);
 
@@ -657,7 +637,6 @@ describe("workspace route transitions and recipient derivation", () => {
 		expect(selectRootRun(PROJECT, "root-2")).toMatchObject({
 			kind: "route",
 			history: "push",
-			action: "root-selection",
 			url: "/w/project/project-1/run/root-2/conversation/root-2",
 			route: {
 				destination: "conversation",
@@ -668,133 +647,23 @@ describe("workspace route transitions and recipient derivation", () => {
 		expect(selectRootRun(HOST, "root-2").url).toBe("/w/host/run/root-2/conversation/root-2");
 	});
 
-	it("switches Conversation to every Execution subview and back while preserving a non-root conversation", () => {
-		const conversation = expectConversation(
-			expectRoute("/w/project/project-1/run/root-1/conversation/child-1"),
-		);
-
-		for (const view of ["overview", "activity", "handoffs"] as const) {
-			const executionNavigation = showExecution(conversation, view);
-			expect(executionNavigation).toMatchObject({
-				history: "push",
-				action: "destination",
-				url:
-					`/w/project/project-1/run/root-1/execution/${view}` +
-					"?conversation=agent%3Achild-1",
-			});
-			expect(showConversation(executionNavigation.route).url).toBe(
-				"/w/project/project-1/run/root-1/conversation/child-1",
-			);
-		}
-	});
-
-	it("changes Execution subviews with push while preserving conversation and focus", () => {
-		const route: ExecutionRoute = {
-			...agentExecutionRoute(HOST, "overview", "child-1"),
-			focus: delegationFocus("delegation-1"),
-			handoff: handoffReference("detail-1"),
-		};
-		const changed = changeExecutionView(route, "activity");
-
-		expect(changed).toMatchObject({
-			history: "push",
-			action: "execution-view",
-			route: {
-				view: "activity",
-				conversation: { kind: "agent", sessionId: "child-1" },
-				focus: { kind: "delegation", delegationId: "delegation-1" },
-				handoff: null,
-			},
-		});
-		expect(changed.url).toBe(
-			"/w/host/run/root-1/execution/activity" +
-				"?conversation=agent%3Achild-1&focus=delegation%3Adelegation-1",
-		);
-	});
-
-	it("uses replace for focus-only changes in the same Execution destination", () => {
-		const route: ExecutionRoute = {
-			...agentExecutionRoute(PROJECT, "overview", "child-1"),
-		};
-		const changed = changeExecutionFocus(route, agentFocus("child-2"));
-
-		expect(changed).toMatchObject({
-			history: "replace",
-			action: "focus",
-			route: {
-				conversation: { kind: "agent", sessionId: "child-1" },
-				focus: { kind: "agent", sessionId: "child-2" },
-			},
-		});
-		expect(changed.url).toContain("conversation=agent%3Achild-1&focus=agent%3Achild-2");
-	});
-
-	it("pushes Run Navigator focus when entering/changing destination and replaces same-destination focus", () => {
-		const conversation = rootConversationRoute(PROJECT, "root-1");
-		expect(navigateExecutionFocus(conversation, "activity", agentFocus("child-1"))).toMatchObject({
-			history: "push",
-			action: "execution-view",
-		});
-
-		const overview = executionRoute(PROJECT, "overview");
-		expect(navigateExecutionFocus(overview, "activity", agentFocus("child-1"))).toMatchObject({
-			history: "push",
-			action: "execution-view",
-		});
-		expect(navigateExecutionFocus(overview, "overview", agentFocus("child-1"))).toMatchObject({
-			history: "replace",
-			action: "focus",
-		});
-	});
-
-	it("opens and messages an agent Conversation with the root pinned", () => {
+	it("opens an agent Conversation with the root pinned", () => {
 		const route = executionRoute(PROJECT, "activity");
 
 		expect(openAgentConversation(route, "child-1")).toMatchObject({
 			history: "push",
-			action: "agent-conversation",
 			url: "/w/project/project-1/run/root-1/conversation/child-1",
 			route: {
 				rootSessionId: "root-1",
 				conversation: { kind: "agent", sessionId: "child-1" },
 			},
 		});
-		expect(messageAgent(route, "child-1")).toMatchObject({
-			history: "push",
-			action: "message-agent",
-			focusComposer: true,
-		});
-	});
-
-	it("opens durable handoff detail with push and describes its close route", () => {
-		const route: ExecutionRoute = {
-			...agentExecutionRoute(HOST, "handoffs", "child-1"),
-			focus: agentFocus("child-1"),
-		};
-		const opened = openHandoff(route, handoffReference("final-message"));
-
-		expect(opened).toMatchObject({
-			history: "push",
-			action: "handoff-detail",
-			handoffParentUrl:
-				"/w/host/run/root-1/execution/handoffs" +
-				"?conversation=agent%3Achild-1&focus=agent%3Achild-1",
-		});
-		expect(opened.url).toContain("&handoff=final-message");
-		expect(closeHandoff(expectExecution(opened.route))).toEqual({
-			kind: "close-handoff",
-			route,
-			url:
-				"/w/host/run/root-1/execution/handoffs" +
-				"?conversation=agent%3Achild-1&focus=agent%3Achild-1",
-		});
 	});
 
 	it("derives recipient exclusively from the effective conversation, never focus", () => {
-		const rootExecution: ExecutionRoute = {
-			...executionRoute(PROJECT, "overview"),
-			focus: agentFocus("focused-child"),
-		};
+		const rootExecution = expectExecution(expectRoute(
+			"/w/project/project-1/run/root-1/execution/overview?focus=agent%3Afocused-child",
+		));
 		expect(messageRecipient(rootExecution)).toEqual({ kind: "root", sessionId: "root-1" });
 
 		const agentExecution: ExecutionRoute = {
@@ -873,7 +742,6 @@ describe("legacy route resume migration", () => {
 				navigation: expect.objectContaining({
 					kind: "route",
 					history: "replace",
-					action: "root-selection",
 					url: expectedUrl,
 					route: expect.objectContaining({
 						rootSessionId,
@@ -920,7 +788,10 @@ describe("legacy route resume migration", () => {
 });
 
 function executionRoute(scope: WorkspaceRouteScope, view: ExecutionView): ExecutionRoute {
-	return expectExecution(showExecution(rootConversationRoute(scope, "root-1"), view).route);
+	const prefix = scope.kind === "project"
+		? `/w/project/${scope.projectId}/run/root-1`
+		: "/w/host/run/root-1";
+	return expectExecution(expectRoute(`${prefix}/execution/${view}`));
 }
 
 function agentExecutionRoute(
@@ -928,10 +799,12 @@ function agentExecutionRoute(
 	view: ExecutionView,
 	sessionId: string,
 ): ExecutionRoute {
-	const conversation = expectConversation(
-		openAgentConversation(rootConversationRoute(scope, "root-1"), sessionId).route,
-	);
-	return expectExecution(showExecution(conversation, view).route);
+	const prefix = scope.kind === "project"
+		? `/w/project/${scope.projectId}/run/root-1`
+		: "/w/host/run/root-1";
+	return expectExecution(expectRoute(
+		`${prefix}/execution/${view}?conversation=agent%3A${encodeURIComponent(sessionId)}`,
+	));
 }
 
 function expectMatch(url: string): WorkspaceRouteMatch {

@@ -9,7 +9,6 @@ import {
 	sessionMenuItems,
 	Sidebar,
 	SessionRow,
-	type RunBoardCallbacks,
 } from "./panels.tsx";
 import type { SessionSnapshot, SessionSummary, Delegation, Project, ToolListing } from "./types.ts";
 
@@ -77,12 +76,6 @@ function snapshot(): SessionSnapshot {
 	};
 }
 
-function callbacks(): Omit<RunBoardCallbacks, "onSelectSession"> {
-	return {
-		onCancelDelegation: () => {},
-	};
-}
-
 function renderInspector(delegations: Delegation[]): string {
 	return renderToStaticMarkup(
 		<Inspector
@@ -91,7 +84,7 @@ function renderInspector(delegations: Delegation[]): string {
 			hasMoreDelegations={false}
 			delegationsLoading={false}
 			delegationsError={null}
-			runBoard={callbacks()}
+			onCancelDelegation={() => {}}
 			tools={[] satisfies ToolListing[]}
 		/>,
 	);
@@ -255,7 +248,7 @@ describe("Inspector tabs", () => {
 				delegations={[]}
 				delegationsLoading={false}
 				delegationsError={null}
-				runBoard={callbacks()}
+				onCancelDelegation={() => {}}
 				tools={[] satisfies ToolListing[]}
 			/>,
 		);

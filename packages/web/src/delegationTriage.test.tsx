@@ -409,7 +409,7 @@ describe("agent list errors", () => {
 				delegationsLoading={false}
 				delegationsError="list failed"
 				onRetryDelegations={onRetry}
-				runBoard={{ onCancelDelegation: async () => undefined }}
+				onCancelDelegation={async () => undefined}
 				tools={[]}
 			/>,
 		);
@@ -426,7 +426,7 @@ describe("agent list errors", () => {
 				delegationsError="list failed"
 				delegationsRetrying
 				onRetryDelegations={onRetry}
-				runBoard={{ onCancelDelegation: async () => undefined }}
+				onCancelDelegation={async () => undefined}
 				tools={[]}
 			/>,
 		);

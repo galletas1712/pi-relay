@@ -1,21 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-	agentFocus,
-	changeExecutionFocus,
-	changeExecutionView,
-	closeHandoff,
-	handoffReference,
 	hostRouteScope,
-	messageAgent,
 	openAgentConversation,
-	openHandoff,
+	parseWorkspaceRoute,
 	projectRouteScope,
 	rootConversationRoute,
 	selectRootRun,
 	showConversation,
-	showExecution,
 	WorkspaceRouteHistory,
 	type ExecutionRoute,
+	type RouteNavigation,
 	type WorkspaceHistoryLike,
 	type WorkspacePopstateSource,
 	type WorkspaceRouteHistoryDependencies,
@@ -24,7 +18,7 @@ import {
 } from "./workspaceRoute.ts";
 
 describe("WorkspaceRouteHistory", () => {
-	it("pushes destinations/conversations/details, replaces focus, and preserves browser length semantics", () => {
+	it("applies active navigation and explicit incoming routes with push/replace semantics", () => {
 		const browser = new FakeBrowser("/");
 		const adapter = new WorkspaceRouteHistory(browser.dependencies);
 
@@ -32,51 +26,45 @@ describe("WorkspaceRouteHistory", () => {
 		expect(browser.currentUrl).toBe("/w/project/project-1/run/root-1/conversation/root-1");
 		expect(browser.length).toBe(2);
 
-		const conversation = expectRoute(adapter.current()).route;
-		const executionNavigation = showExecution(conversation, "overview");
-		adapter.apply(executionNavigation);
+		adapter.apply(navigation(
+			"/w/project/project-1/run/root-1/execution/overview?focus=agent%3Achild-1",
+		));
 		expect(browser.length).toBe(3);
 
-		const execution = expectExecution(expectRoute(adapter.current()).route);
-		adapter.apply(changeExecutionFocus(execution, agentFocus("child-1")));
-		expect(browser.currentUrl).toContain("?focus=agent%3Achild-1");
+		adapter.apply(navigation(
+			"/w/project/project-1/run/root-1/execution/overview?focus=delegation%3Awork-1",
+			"replace",
+		));
+		expect(browser.currentUrl).toContain("?focus=delegation%3Awork-1");
 		expect(browser.length).toBe(3);
 
-		const focused = expectExecution(expectRoute(adapter.current()).route);
-		adapter.apply(openHandoff(focused, handoffReference("final-message")));
+		adapter.apply(navigation(
+			"/w/project/project-1/run/root-1/execution/overview" +
+				"?focus=delegation%3Awork-1&handoff=final-message",
+		));
 		expect(browser.currentUrl).toContain("&handoff=final-message");
 		expect(browser.length).toBe(4);
 
-		const detail = expectExecution(expectRoute(adapter.current()).route);
-		expect(adapter.apply(closeHandoff(detail))).toBeNull();
-		expect(browser.currentUrl).toBe(
-			"/w/project/project-1/run/root-1/execution/overview?focus=agent%3Achild-1",
-		);
-		expect(browser.length).toBe(4);
-		expect(browser.index).toBe(2);
-
 		expect(browser.pushCalls).toHaveLength(3);
 		expect(browser.replaceCalls).toHaveLength(1);
-		expect(browser.backCalls).toBe(1);
 	});
 
-	it("uses push for every explicit destination/conversation/subview/durable-detail action", () => {
+	it("uses push for active root and Conversation destinations", () => {
 		const browser = new FakeBrowser("/");
 		const adapter = new WorkspaceRouteHistory(browser.dependencies);
 		const root = rootConversationRoute(hostRouteScope(), "root-1");
+		const execution = expectExecution(expectRoute(
+			parseWorkspaceRoute("/w/host/run/root-1/execution/overview"),
+		).route);
 
 		adapter.apply(selectRootRun(hostRouteScope(), "root-1"));
-		const execution = expectExecution(showExecution(root, "overview").route);
-		adapter.apply(showExecution(root, "overview"));
-		adapter.apply(changeExecutionView(execution, "activity"));
 		adapter.apply(showConversation(execution));
 		adapter.apply(openAgentConversation(execution, "child-1"));
-		adapter.apply(messageAgent(execution, "child-2"));
-		adapter.apply(openHandoff({ ...execution, view: "handoffs" }, handoffReference("detail-1")));
+		adapter.apply(openAgentConversation(root, "child-2"));
 
-		expect(browser.pushCalls).toHaveLength(7);
+		expect(browser.pushCalls).toHaveLength(4);
 		expect(browser.replaceCalls).toHaveLength(0);
-		expect(browser.length).toBe(8);
+		expect(browser.length).toBe(5);
 	});
 
 	it("applies canonical/default/invalid-optional corrections with replace and no extra Back entry", () => {
@@ -116,12 +104,12 @@ describe("WorkspaceRouteHistory", () => {
 		const unsubscribe = adapter.subscribe(listener);
 
 		adapter.apply(selectRootRun(hostRouteScope(), "root-1"));
-		const rootConversation = expectRoute(adapter.current()).route;
-		adapter.apply(showExecution(rootConversation, "activity"));
-		const execution = expectExecution(expectRoute(adapter.current()).route);
-		adapter.apply(changeExecutionFocus(execution, agentFocus("child-1")));
-		const focused = expectExecution(expectRoute(adapter.current()).route);
-		adapter.apply(openHandoff(focused, handoffReference("detail-1")));
+		adapter.apply(navigation(
+			"/w/host/run/root-1/execution/activity?focus=agent%3Achild-1",
+		));
+		adapter.apply(navigation(
+			"/w/host/run/root-1/execution/activity?focus=agent%3Achild-1&handoff=detail-1",
+		));
 
 		const pushCount = browser.pushCalls.length;
 		const replaceCount = browser.replaceCalls.length;
@@ -158,54 +146,6 @@ describe("WorkspaceRouteHistory", () => {
 		unsubscribe();
 		browser.forward();
 		expect(listener).toHaveBeenCalledTimes(3);
-	});
-
-	it("replaces a directly loaded handoff on Close instead of leaving the workspace", () => {
-		const direct =
-			"/w/host/run/root-1/execution/handoffs" +
-			"?conversation=agent%3Achild-1&focus=agent%3Achild-1&handoff=final-message";
-		const browser = new FakeBrowser(direct);
-		const adapter = new WorkspaceRouteHistory(browser.dependencies);
-		const route = expectExecution(expectRoute(adapter.current()).route);
-		const result = adapter.apply(closeHandoff(route));
-
-		expect(result).toMatchObject({ kind: "route", route: { handoff: null } });
-		expect(browser.currentUrl).toBe(
-			"/w/host/run/root-1/execution/handoffs" +
-				"?conversation=agent%3Achild-1&focus=agent%3Achild-1",
-		);
-		expect(browser.length).toBe(1);
-		expect(browser.backCalls).toBe(0);
-		expect(browser.replaceCalls).toHaveLength(1);
-	});
-
-	it("closes to the new focus in place after focus replacement while a handoff is open", () => {
-		const browser = new FakeBrowser("/w/host/run/root-1/execution/handoffs?focus=agent%3Achild-1");
-		const adapter = new WorkspaceRouteHistory(browser.dependencies);
-		const initial = expectExecution(expectRoute(adapter.current()).route);
-
-		adapter.apply(openHandoff(initial, handoffReference("final-message")));
-		expect(browser.length).toBe(2);
-		const detail = expectExecution(expectRoute(adapter.current()).route);
-		adapter.apply(changeExecutionFocus(detail, agentFocus("child-2")));
-		expect(browser.currentUrl).toBe(
-			"/w/host/run/root-1/execution/handoffs?focus=agent%3Achild-2&handoff=final-message",
-		);
-		expect(browser.length).toBe(2);
-
-		const refocusedDetail = expectExecution(expectRoute(adapter.current()).route);
-		const result = adapter.apply(closeHandoff(refocusedDetail));
-
-		expect(result).toMatchObject({
-			kind: "route",
-			route: { focus: { kind: "agent", sessionId: "child-2" }, handoff: null },
-		});
-		expect(browser.currentUrl).toBe(
-			"/w/host/run/root-1/execution/handoffs?focus=agent%3Achild-2",
-		);
-		expect(browser.length).toBe(2);
-		expect(browser.index).toBe(1);
-		expect(browser.backCalls).toBe(0);
 	});
 
 	it("parses location lazily and does not cache a stale route", () => {
@@ -331,4 +271,14 @@ function expectRoute(result: WorkspaceRouteParseResult) {
 function expectExecution(route: ReturnType<typeof expectRoute>["route"]): ExecutionRoute {
 	expect(route.destination).toBe("execution");
 	return route as ExecutionRoute;
+}
+
+function navigation(url: string, history: "push" | "replace" = "push"): RouteNavigation {
+	const parsed = expectRoute(parseWorkspaceRoute(url));
+	return {
+		kind: "route",
+		history,
+		route: parsed.route,
+		url: parsed.canonicalUrl,
+	};
 }
