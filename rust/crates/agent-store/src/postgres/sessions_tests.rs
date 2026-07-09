@@ -5,7 +5,9 @@ use agent_vocab::{
     AssistantItem, AssistantMessage, ProviderConfig, ProviderKind, ProviderReplayItem,
     ReasoningEffort, TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
+use anyhow::{anyhow, Context, Result};
 use serde_json::json;
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{OutputBatch, SessionConfig};
@@ -21,19 +23,29 @@ struct TestDb {
 }
 
 impl TestDb {
-    async fn cleanup(self) {
+    async fn cleanup(self) -> Result<()> {
         self.store.close().await;
-        if let Ok(admin) = sqlx::PgPool::connect(&self.admin_url).await {
-            let _ = sqlx::query(&format!(r#"drop database if exists "{}""#, self.name))
-                .execute(&admin)
-                .await;
-            admin.close().await;
-        }
+        drop_test_database(&self.admin_url, &self.name).await
     }
 }
 
 async fn test_store() -> Option<TestDb> {
+    let db = test_store_without_schema()
+        .await?
+        .expect("create isolated test database");
+    db.store
+        .migrate()
+        .await
+        .expect("migrate isolated test database");
+    Some(db)
+}
+
+async fn test_store_without_schema() -> Option<Result<TestDb>> {
     let admin_url = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok()?;
+    Some(create_test_store(admin_url).await)
+}
+
+async fn create_test_store(admin_url: String) -> Result<TestDb> {
     let name = format!(
         "pi_relay_sessions_test_{}_{}",
         std::process::id(),
@@ -41,25 +53,50 @@ async fn test_store() -> Option<TestDb> {
     );
     let admin = sqlx::PgPool::connect(&admin_url)
         .await
-        .expect("connect to PI_RELAY_TEST_DATABASE_URL");
+        .context("connect to PI_RELAY_TEST_DATABASE_URL")?;
     sqlx::query(&format!(r#"create database "{name}""#))
         .execute(&admin)
         .await
-        .expect("create isolated test database");
+        .context("create isolated test database")?;
     admin.close().await;
     let database_url = database_url_with_name(&admin_url, &name);
-    let store = PostgresAgentStore::connect(&database_url)
+    let store = match PostgresAgentStore::connect(&database_url)
         .await
-        .expect("connect isolated test database");
-    store
-        .migrate()
-        .await
-        .expect("migrate isolated test database");
-    Some(TestDb {
+        .context("connect isolated test database")
+    {
+        Ok(store) => store,
+        Err(error) => {
+            return finish_with_cleanup(Err(error), drop_test_database(&admin_url, &name).await);
+        }
+    };
+    Ok(TestDb {
         store,
         admin_url,
         name,
     })
+}
+
+async fn drop_test_database(admin_url: &str, name: &str) -> Result<()> {
+    let admin = sqlx::PgPool::connect(admin_url)
+        .await
+        .context("connect to test database admin for cleanup")?;
+    sqlx::query(&format!(r#"drop database if exists "{name}""#))
+        .execute(&admin)
+        .await
+        .with_context(|| format!("drop isolated test database {name}"))?;
+    admin.close().await;
+    Ok(())
+}
+
+fn finish_with_cleanup<T>(work: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (work, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(work), Ok(())) => Err(work),
+        (Ok(_), Err(cleanup)) => Err(cleanup.context("test work succeeded but cleanup failed")),
+        (Err(work), Err(cleanup)) => Err(anyhow!(
+            "test work failed: {work:#}; cleanup also failed: {cleanup:#}"
+        )),
+    }
 }
 
 fn database_url_with_name(base: &str, name: &str) -> String {
@@ -88,6 +125,208 @@ fn session_config(project_id: Uuid) -> SessionConfig {
         },
         metadata: json!({}),
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct IndexCatalogEntry {
+    index_name: String,
+    table_schema: String,
+    table_name: String,
+    access_method: String,
+    key_columns: Vec<String>,
+    included_columns: Vec<String>,
+    has_expressions: bool,
+    is_unique: bool,
+    is_valid: bool,
+    is_ready: bool,
+    is_live: bool,
+    predicate: Option<String>,
+}
+
+async fn queued_input_index_catalog(store: &PostgresAgentStore) -> Result<Vec<IndexCatalogEntry>> {
+    let mut connection = store
+        .pool
+        .acquire()
+        .await
+        .context("acquire connection for queued input index catalog")?;
+    sqlx::query("set quote_all_identifiers = off")
+        .execute(&mut *connection)
+        .await
+        .context("set canonical quote_all_identifiers for index predicates")?;
+    sqlx::query("set search_path = pg_catalog, public")
+        .execute(&mut *connection)
+        .await
+        .context("set canonical search_path for index predicates")?;
+
+    let rows = sqlx::query(
+        r#"
+        select
+            index_relation.relname::text as index_name,
+            table_namespace.nspname::text as table_schema,
+            table_relation.relname::text as table_name,
+            access_method.amname::text as access_method,
+            array(
+                select attribute.attname::text
+                from unnest(index_catalog.indkey) with ordinality
+                    as key_attribute(attribute_number, position)
+                join pg_attribute as attribute
+                  on attribute.attrelid = index_catalog.indrelid
+                 and attribute.attnum = key_attribute.attribute_number
+                where key_attribute.position <= index_catalog.indnkeyatts
+                order by key_attribute.position
+            ) as key_columns,
+            array(
+                select attribute.attname::text
+                from unnest(index_catalog.indkey) with ordinality
+                    as included_attribute(attribute_number, position)
+                join pg_attribute as attribute
+                  on attribute.attrelid = index_catalog.indrelid
+                 and attribute.attnum = included_attribute.attribute_number
+                where included_attribute.position > index_catalog.indnkeyatts
+                order by included_attribute.position
+            ) as included_columns,
+            index_catalog.indexprs is not null as has_expressions,
+            index_catalog.indisunique as is_unique,
+            index_catalog.indisvalid as is_valid,
+            index_catalog.indisready as is_ready,
+            index_catalog.indislive as is_live,
+            pg_get_expr(index_catalog.indpred, index_catalog.indrelid, false) as predicate
+        from pg_index as index_catalog
+        join pg_class as index_relation
+          on index_relation.oid = index_catalog.indexrelid
+        join pg_class as table_relation
+          on table_relation.oid = index_catalog.indrelid
+        join pg_namespace as table_namespace
+          on table_namespace.oid = table_relation.relnamespace
+        join pg_am as access_method
+          on access_method.oid = index_relation.relam
+        where index_relation.relname in (
+              'queued_inputs_active_session_idx',
+              'queued_inputs_non_cancelled_session_idx',
+              'queued_inputs_follow_up_order_idx'
+        )
+        order by index_relation.relname
+        "#,
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .context("load queued input index catalog")?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(IndexCatalogEntry {
+                index_name: row.try_get("index_name")?,
+                table_schema: row.try_get("table_schema")?,
+                table_name: row.try_get("table_name")?,
+                access_method: row.try_get("access_method")?,
+                key_columns: row.try_get("key_columns")?,
+                included_columns: row.try_get("included_columns")?,
+                has_expressions: row.try_get("has_expressions")?,
+                is_unique: row.try_get("is_unique")?,
+                is_valid: row.try_get("is_valid")?,
+                is_ready: row.try_get("is_ready")?,
+                is_live: row.try_get("is_live")?,
+                predicate: row.try_get("predicate")?,
+            })
+        })
+        .collect()
+}
+
+async fn queued_input_index_migration_results(
+    store: &PostgresAgentStore,
+) -> Result<(Vec<IndexCatalogEntry>, Vec<IndexCatalogEntry>)> {
+    store
+        .migrate()
+        .await
+        .context("fresh startup schema initialization")?;
+    let fresh = queued_input_index_catalog(store).await?;
+    store
+        .migrate()
+        .await
+        .context("repeat startup schema initialization")?;
+    let repeated = queued_input_index_catalog(store).await?;
+    Ok((fresh, repeated))
+}
+
+#[tokio::test]
+async fn migration_creates_exact_queued_input_indexes_idempotently() -> Result<()> {
+    let Some(db) = test_store_without_schema().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return Ok(());
+    };
+    let db = db?;
+    let expected = vec![
+        IndexCatalogEntry {
+            index_name: "queued_inputs_active_session_idx".to_string(),
+            table_schema: "public".to_string(),
+            table_name: "queued_inputs".to_string(),
+            access_method: "btree".to_string(),
+            key_columns: vec!["session_id".to_string()],
+            included_columns: Vec::new(),
+            has_expressions: false,
+            is_unique: false,
+            is_valid: true,
+            is_ready: true,
+            is_live: true,
+            predicate: Some(
+                "(status = ANY (ARRAY['queued'::text, 'consuming'::text]))".to_string(),
+            ),
+        },
+        IndexCatalogEntry {
+            index_name: "queued_inputs_follow_up_order_idx".to_string(),
+            table_schema: "public".to_string(),
+            table_name: "queued_inputs".to_string(),
+            access_method: "btree".to_string(),
+            key_columns: vec![
+                "session_id".to_string(),
+                "follow_up_position".to_string(),
+                "created_at".to_string(),
+                "id".to_string(),
+            ],
+            included_columns: Vec::new(),
+            has_expressions: false,
+            is_unique: false,
+            is_valid: true,
+            is_ready: true,
+            is_live: true,
+            predicate: Some(
+                "((priority = 'follow_up'::text) AND (status = 'queued'::text))".to_string(),
+            ),
+        },
+        IndexCatalogEntry {
+            index_name: "queued_inputs_non_cancelled_session_idx".to_string(),
+            table_schema: "public".to_string(),
+            table_name: "queued_inputs".to_string(),
+            access_method: "btree".to_string(),
+            key_columns: vec!["session_id".to_string()],
+            included_columns: Vec::new(),
+            has_expressions: false,
+            is_unique: false,
+            is_valid: true,
+            is_ready: true,
+            is_live: true,
+            predicate: Some("(status <> 'cancelled'::text)".to_string()),
+        },
+    ];
+
+    let work = queued_input_index_migration_results(&db.store).await;
+    let cleanup = db.cleanup().await;
+    let (fresh, repeated) = finish_with_cleanup(work, cleanup)?;
+    assert_eq!(fresh, expected, "fresh schema index catalog");
+    assert_eq!(repeated, expected, "repeated schema index catalog");
+    Ok(())
+}
+
+#[test]
+fn work_and_cleanup_errors_are_both_reported() {
+    let error = finish_with_cleanup::<()>(
+        Err(anyhow!("intentional work failure")),
+        Err(anyhow!("intentional cleanup failure")),
+    )
+    .expect_err("combined failures return an error")
+    .to_string();
+    assert!(error.contains("intentional work failure"));
+    assert!(error.contains("intentional cleanup failure"));
 }
 
 #[test]
@@ -352,7 +591,7 @@ async fn manual_compaction_failure_terminalizes_without_installing_a_checkpoint(
     assert_eq!(error.data["trigger"], "manual");
     assert_eq!(error.data["error"], "typed provider failure");
 
-    db.cleanup().await;
+    db.cleanup().await.expect("clean up isolated test database");
 }
 
 #[tokio::test]
@@ -421,7 +660,7 @@ async fn compaction_provider_replay_round_trips_nullable_and_omitted_encrypted_c
         );
     }
 
-    db.cleanup().await;
+    db.cleanup().await.expect("clean up isolated test database");
 }
 
 #[tokio::test]
@@ -477,7 +716,7 @@ async fn subagent_type_round_trips_through_start_session_outputs() {
         None,
     );
 
-    db.cleanup().await;
+    db.cleanup().await.expect("clean up isolated test database");
 }
 
 #[tokio::test]
@@ -525,7 +764,7 @@ async fn delete_session_rejects_active_queued_input_under_session_lock() {
         1
     );
 
-    db.cleanup().await;
+    db.cleanup().await.expect("clean up isolated test database");
 }
 
 #[tokio::test]
@@ -567,5 +806,5 @@ async fn list_sessions_sorts_by_last_user_message_timestamp() {
         ]
     );
 
-    db.cleanup().await;
+    db.cleanup().await.expect("clean up isolated test database");
 }
