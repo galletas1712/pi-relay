@@ -3541,7 +3541,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 									{recipientLabel ? (
 										<div className="workspace-recipient-label" role="status">
 											Conversation recipient: <strong>{recipientLabel}</strong>
-											<code>{selectedId}</code>
 										</div>
 									) : null}
 								</div>

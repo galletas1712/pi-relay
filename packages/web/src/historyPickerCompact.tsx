@@ -31,7 +31,7 @@ interface HistoryPickerContentParams {
 	loading: boolean;
 	error: string | null;
 	mutationBlockedReason?: string | null;
-	renderedRows: VisibleHistoryNodeRow[];
+	rows: VisibleHistoryNodeRow[];
 	hiddenBranchIds: Set<string>;
 	onSwitch: (target: HistoryTargetOption) => void;
 	onToggleBranch: (entryId: string) => void;
@@ -112,7 +112,7 @@ export function CompactHistoryPickerDialog({
 		if (initializedScrollRef.current || loading || error || renderedRows.length === 0) return;
 		const list = optionsRef.current;
 		if (!list) return;
-		const active = list.querySelector<HTMLElement>('[role="treeitem"][aria-selected="true"]');
+		const active = list.querySelector<HTMLElement>('.history-option[aria-current="true"]');
 		if (active) scrollHistoryTargetIntoView(list, active);
 		else if (activeLeafId === null || nodes.some((node) => node.id === activeLeafId)) {
 			list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
@@ -142,13 +142,13 @@ export function CompactHistoryPickerDialog({
 				<DialogCloseButton label="close picker" />
 			</div>
 
-			<div ref={optionsRef} className="history-options tree" role="tree" aria-label="switch targets">
+			<div ref={optionsRef} className="history-options tree">
 				<ConnectionBlockedReason reason={mutationBlockedReason} className="history-blocked-reason" />
 				{historyPickerContent({
 					loading,
 					error,
 					mutationBlockedReason,
-					renderedRows,
+					rows: visibleRows,
 					hiddenBranchIds,
 					onSwitch,
 					onToggleBranch: toggleBranch,
@@ -177,7 +177,7 @@ function historyPickerContent({
 	loading,
 	error,
 	mutationBlockedReason,
-	renderedRows,
+	rows,
 	hiddenBranchIds,
 	onSwitch,
 	onToggleBranch,
@@ -191,66 +191,80 @@ function historyPickerContent({
 		);
 	}
 	if (error) return <div className="history-empty error">{error}</div>;
-	return (
-		<>
-			{renderedRows.map((row) => {
-				const display = row.option;
-				const isCollapsedBranch = hiddenBranchIds.has(row.node.id);
-				const canCollapse = row.isBranchRoot && !row.isOnActivePath;
-				const branchToggleLabel = `${isCollapsedBranch ? "Expand" : "Collapse"} branch for ${display.title}: ${display.preview}${isCollapsedBranch ? `, ${row.descendantCount} hidden descendant${row.descendantCount === 1 ? "" : "s"}` : ""}`;
-				const outcomeClass = nonGracefulOutcomeClass(display.outcome);
-				return (
-					<div
-						key={row.node.id}
-						className={`history-tree-item ${row.isOnActivePath ? "on-active-path" : ""} ${isCollapsedBranch ? "collapsed" : ""} ${outcomeClass}`}
-						style={{ "--tree-depth": row.depth } as CSSProperties}
-					>
-						{canCollapse ? (
-							<button
-								className="branch-toggle"
-								type="button"
-								onClick={() => onToggleBranch(row.node.id)}
-								aria-label={branchToggleLabel}
-								aria-expanded={!isCollapsedBranch}
-							>
-								<ChevronRight size={13} />
-							</button>
-						) : null}
+	const children = new Map<string | null, VisibleHistoryNodeRow[]>();
+	for (const row of rows) {
+		const siblings = children.get(row.parentId) ?? [];
+		siblings.push(row);
+		children.set(row.parentId, siblings);
+	}
+	const renderRows = (parentId: string | null): ReactNode =>
+		(children.get(parentId) ?? []).map((row) => {
+			const display = row.option;
+			const isCollapsedBranch = hiddenBranchIds.has(row.node.id);
+			const canCollapse = row.isBranchRoot && !row.isOnActivePath;
+			const branchToggleLabel = `${isCollapsedBranch ? "Expand" : "Collapse"} branch for ${display.title}: ${display.preview}${isCollapsedBranch ? `, ${row.descendantCount} hidden descendant${row.descendantCount === 1 ? "" : "s"}` : ""}`;
+			const outcomeClass = nonGracefulOutcomeClass(display.outcome);
+			const childRows = children.get(row.node.id) ?? [];
+			const branchId = `history-branch-${row.node.id.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+			return (
+				<li
+					key={row.node.id}
+					className={`history-tree-item ${row.isOnActivePath ? "on-active-path" : ""} ${isCollapsedBranch ? "collapsed" : ""} ${outcomeClass}`}
+					style={{ "--tree-depth": row.depth } as CSSProperties}
+				>
+					{canCollapse ? (
 						<button
-							className="history-option tree-row"
+							className="branch-toggle"
 							type="button"
-							role="treeitem"
-							aria-selected={row.isActive}
-							disabled={!!mutationBlockedReason}
-							onClick={() => onSwitch(row.option)}
+							onClick={() => onToggleBranch(row.node.id)}
+							aria-label={branchToggleLabel}
+							aria-expanded={!isCollapsedBranch}
+							aria-controls={branchId}
 						>
-							<span className="tree-guides" aria-hidden="true" />
-							<span className={`history-option-icon ${row.parentId ? "" : "root"}`}>
-								{display.turnLabel}
-							</span>
-							<span className="history-option-main">
-								<span className="history-option-title">
-									{display.title}
-									{row.isActive ? <span className="history-badge">current</span> : null}
-									{isCollapsedBranch ? <span className="history-badge muted">{row.descendantCount} hidden</span> : null}
-									{display.outcome && display.outcome !== "Graceful" ? (
-										<span className="history-badge danger">{display.outcome.toLowerCase()}</span>
-									) : null}
-								</span>
-								<span className="history-option-preview">{display.preview}</span>
-							</span>
-							<span className="history-option-meta">{display.meta}</span>
+							<ChevronRight size={13} />
 						</button>
-					</div>
-				);
-			})}
-			{loading ? (
-				<div className="history-loading">
-					<Loader2 className="spin" size={16} />
-					<span>Loading more history…</span>
-				</div>
-			) : null}
-		</>
+					) : null}
+					<button
+						className="history-option tree-row"
+						type="button"
+						aria-label={`Switch to ${display.title}: ${display.preview}${row.isActive ? ", current" : ""}`}
+						aria-current={row.isActive ? "true" : undefined}
+						disabled={!!mutationBlockedReason}
+						onClick={() => onSwitch(row.option)}
+					>
+						<span className="tree-guides" aria-hidden="true" />
+						<span className={`history-option-icon ${row.parentId ? "" : "root"}`}>
+							{display.turnLabel}
+						</span>
+						<span className="history-option-main">
+							<span className="history-option-title">
+								{display.title}
+								{row.isActive ? <span className="history-badge">current</span> : null}
+								{isCollapsedBranch ? <span className="history-badge muted">{row.descendantCount} hidden</span> : null}
+								{display.outcome && display.outcome !== "Graceful" ? (
+									<span className="history-badge danger">{display.outcome.toLowerCase()}</span>
+								) : null}
+							</span>
+							<span className="history-option-preview">{display.preview}</span>
+						</span>
+						<span className="history-option-meta">{display.meta}</span>
+					</button>
+					{childRows.length > 0 ? (
+						<ul
+							id={canCollapse ? branchId : undefined}
+							className="history-branch-list"
+							hidden={canCollapse && isCollapsedBranch}
+						>
+							{renderRows(row.node.id)}
+						</ul>
+					) : null}
+				</li>
+			);
+		});
+	return (
+		<ul className="history-target-list" aria-label="switch targets">
+			{renderRows(null)}
+		</ul>
 	);
 }
 
