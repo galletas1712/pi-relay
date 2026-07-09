@@ -654,15 +654,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			sessionsQuery.fetchStatus === "fetching",
 		);
 	}, [selectedProjectId, sessionListCoordinator, sessionsQuery.fetchStatus]);
-	const retrySessions = useCallback(() => {
-		try {
-			assertServerReadAllowed();
-		} catch (error) {
-			reportActionError(error);
-			return;
-		}
-		void sessionListCoordinator.retry(selectedProjectId, sessionsQuery.refetch);
-	}, [assertServerReadAllowed, reportActionError, selectedProjectId, sessionListCoordinator, sessionsQuery.refetch]);
 	const backgroundSessionsQueries = useQueries({
 		queries: backgroundSessionProjectIds.map((projectId) => ({
 			queryKey: queryKeys.sessions(projectId),
@@ -3460,11 +3451,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				selectedId={selectedId}
 				sessionsLoading={sessionsQuery.isLoading}
 				sessionsFetching={sessionListRequestState.busy}
-				sessionsError={sessionListRequestState.error}
-				sessionsHasCachedData={sessionsQuery.data !== undefined}
 				inert={sidebarInert}
 				newSessionButtonRef={sidebarNewSessionButtonRef}
-				onRetrySessions={retrySessions}
 				onRetryProjects={retryProjects}
 				onQueryChange={setQuery}
 				onToggleArchived={handleToggleArchived}

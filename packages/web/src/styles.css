@@ -849,10 +849,6 @@ pre {
 	color: var(--foreground);
 }
 
-.sidebar-load-error {
-	margin: var(--space-2) var(--space-2) 0;
-}
-
 .project-load-error {
 	margin-bottom: var(--space-2);
 }
