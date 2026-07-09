@@ -3,7 +3,13 @@ import { LogHeader } from "./panels.tsx";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { isArchivedSession, sessionStatusWithDelegations, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
 import { MessageList } from "./transcript.tsx";
-import type { TurnCardView } from "./transcript.tsx";
+import type {
+	OlderTurnsLoadRequest,
+	OlderTurnsLoadResult,
+	TranscriptDestination,
+	TranscriptTurnPageIdentity,
+	TurnCardView,
+} from "./transcript.tsx";
 import type { ReasoningEffort, SessionSnapshot, TranscriptEntry } from "./types.ts";
 
 export interface ChatPaneProps {
@@ -38,7 +44,10 @@ export interface ChatPaneProps {
 	loadingTurnId?: string | null;
 	hasOlderTurns?: boolean;
 	loadingOlderTurns?: boolean;
-	onLoadOlderTurns?: () => void;
+	onLoadOlderTurns?: (request: OlderTurnsLoadRequest) => Promise<OlderTurnsLoadResult>;
+	transcriptDestination?: TranscriptDestination | null;
+	transcriptTurnPageIdentity?: TranscriptTurnPageIdentity | null;
+	onAcknowledgeTranscriptDestination?: (destinationId: number) => void;
 	onRetryTranscript: () => void;
 	routeNotice?: ReactNode;
 }
@@ -76,6 +85,9 @@ export const ChatPane = memo(function ChatPane({
 	hasOlderTurns,
 	loadingOlderTurns,
 	onLoadOlderTurns,
+	transcriptDestination,
+	transcriptTurnPageIdentity,
+	onAcknowledgeTranscriptDestination,
 	onRetryTranscript,
 	routeNotice,
 }: ChatPaneProps) {
@@ -127,6 +139,9 @@ export const ChatPane = memo(function ChatPane({
 				hasOlderTurns={hasOlderTurns}
 				loadingOlderTurns={loadingOlderTurns}
 				onLoadOlderTurns={onLoadOlderTurns}
+				destination={transcriptDestination}
+				turnPageIdentity={transcriptTurnPageIdentity}
+				onAcknowledgeDestination={onAcknowledgeTranscriptDestination}
 			/>
 		</main>
 	);

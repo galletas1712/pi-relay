@@ -26,7 +26,13 @@ import type {
 } from "./types.ts";
 
 export type { SelectedSessionCache } from "./selectedSessionCache/types.ts";
-export { applyTranscriptTurns, applyTurnDetail, turnCardsInOrder, turnDetailEntries } from "./selectedSessionCache/turns.ts";
+export {
+	applyTranscriptTurns,
+	applyTurnDetail,
+	prependTranscriptTurns,
+	turnCardsInOrder,
+	turnDetailEntries,
+} from "./selectedSessionCache/turns.ts";
 
 export function emptySelectedSessionCache(sessionId: string | null = null): SelectedSessionCache {
 	return {
@@ -46,6 +52,7 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		turnOrder: [],
 		turnDetailsById: new Map(),
 		transcriptTurnsLoaded: false,
+		turnPageHydrationRevision: 0,
 		turnTranscriptRevision: null,
 		turnActiveLeafId: null,
 		turnHasMoreBefore: false,
