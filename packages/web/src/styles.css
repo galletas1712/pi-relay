@@ -3905,7 +3905,7 @@ pre {
 		width: 100%;
 		max-width: none;
 		height: 34px;
-		font-size: var(--text-input-mobile);
+		font-size: var(--text-xs);
 	}
 
 	.message-scroll {
