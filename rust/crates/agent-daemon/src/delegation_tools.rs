@@ -1566,6 +1566,7 @@ pub(crate) async fn rpc_list(
                 "status": status,
                 "activity": subagent.activity,
                 "role": subagent.role,
+                "title": subagent.title,
                 "type": subagent.subagent_type,
                 "subagent_type": subagent.subagent_type,
                 "task_prompt_file": task_prompt_file,

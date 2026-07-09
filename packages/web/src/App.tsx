@@ -1014,18 +1014,28 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const delegationSubagentNames = useMemo(() => {
 		const names = new Map<string, string>();
 		const knownSessions = new Map(allKnownSessions.map((session) => [session.session_id, session]));
-		for (const sessionId of delegationSubagentIds) {
-			const session =
-				(loadedSnapshot?.session_id === sessionId ? loadedSnapshot : null) ??
-				knownSessions.get(sessionId) ??
-				getSelectedCache(sessionId)?.snapshot;
-			if (session) names.set(sessionId, sessionTitle(session, "Agent"));
+		for (const delegation of delegations) {
+			for (const subagent of delegation.subagents) {
+				const session =
+					(loadedSnapshot?.session_id === subagent.id ? loadedSnapshot : null) ??
+					knownSessions.get(subagent.id) ??
+					getSelectedCache(subagent.id)?.snapshot;
+				// Prefer the title carried by `delegation.list` so a subagent's name
+				// renders immediately, without waiting on a per-child session warm.
+				// Fall back to the warmed snapshot title so a freshly-spawned child
+				// whose title hasn't generated yet still gets named once hydrated.
+				const name =
+					subagent.title?.trim() ||
+					(session ? sessionTitle(session, "").trim() : "") ||
+					"Agent";
+				names.set(subagent.id, name);
+			}
 		}
 		return names;
 	}, [
 		allKnownSessions,
 		backgroundWarmRevision,
-		delegationSubagentIds,
+		delegations,
 		getSelectedCache,
 		loadedSnapshot,
 	]);

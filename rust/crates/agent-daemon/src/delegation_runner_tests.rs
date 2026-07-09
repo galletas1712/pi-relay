@@ -4536,6 +4536,7 @@ fn assert_list_subagent_has_only_compact_fields(subagent: &serde_json::Value) {
                 "id" | "status"
                     | "activity"
                     | "role"
+                    | "title"
                     | "type"
                     | "subagent_type"
                     | "task_prompt_file"
@@ -5756,7 +5757,23 @@ async fn running_read_only_snapshot_reports_steerable_only_when_accepted() {
         "Done.",
     )
     .await;
-
+    // Give the terminal subagent a session title so we can assert `rpc_list`
+    // surfaces `metadata.title` without any per-child session warm.
+    env.state
+        .repo
+        .update_session_metadata(
+            "readonly_done",
+            &json!({
+                "created_by": "test",
+                "subagent": true,
+                "prompt_profile": "subagent",
+                "subagent_type": SubagentType::ReadOnly.as_str(),
+                "role_name": "reviewer",
+                "title": "Review the docs",
+            }),
+        )
+        .await
+        .expect("set subagent title");
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
     let snapshot_subagents = snapshot["subagents"].as_array().expect("subagents");
     let busy = snapshot_subagents
@@ -5791,6 +5808,10 @@ async fn running_read_only_snapshot_reports_steerable_only_when_accepted() {
         .expect("listed done subagent");
     assert_eq!(listed_done["status"], "done");
     assert_eq!(listed_done["steerable"], false);
+    // `rpc_list` surfaces the subagent's `metadata.title` directly, so the web
+    // Agents outline can render the name without a per-child session warm.
+    assert_eq!(listed_done["title"], "Review the docs");
+    assert_eq!(listed_busy["title"], serde_json::Value::Null);
 
     env.cleanup().await;
 }
