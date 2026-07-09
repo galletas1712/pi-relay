@@ -3418,9 +3418,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				<div className="mobile-topbar-title">
 					<span>{mobileTitle}</span>
 					<div className="mobile-topbar-status">
-						<span className={`connection-pill ${connection === "open" ? "online" : "offline"}`}>
-							{connection === "open" ? "connected" : connection}
-						</span>
 						{mobileSessionStatus ? (
 							<span
 								className={`session-status-icon ${mobileSessionStatus}`}
@@ -3462,7 +3459,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			) : null}
 
 			<Sidebar
-				connection={connection}
 				projects={projects}
 				projectsLoading={projectsQuery.isLoading}
 				projectsFetching={projectsQuery.isFetching}
@@ -3526,6 +3522,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						transcriptErrorHasUsableCache={selectedErrorHasUsableCache}
 						transcriptRetrying={selectedRetrying}
 						hasRunningDelegations={hasRunningDelegations}
+						connection={connection}
 						modelOptions={MODEL_OPTIONS}
 						modelValue={providerModelKey(activeProvider)}
 						modelLocked={modelLocked}

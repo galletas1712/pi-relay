@@ -47,6 +47,7 @@ function renderLogHeader(overrides: Partial<Parameters<typeof LogHeader>[0]> = {
 			modelOptions={[{ id: "gpt-test", label: "GPT test" }]}
 			modelValue="gpt-test"
 			modelDisabled={false}
+			connection="open"
 			reasoningEfforts={["minimal", "medium"]}
 			reasoningEffort="medium"
 			onModelChange={() => {}}
@@ -179,6 +180,9 @@ describe("LogHeader", () => {
 		expect(html).toContain("session-status-icon delegating");
 		expect(html).toContain(`aria-label="delegating session"`);
 		expect(html).toContain(`title="delegating session"`);
+		expect(html).toContain(`class="header-connection-status connected"`);
+		expect(html).toContain(`aria-label="Connected"`);
+		expect(html).not.toContain(">connected<");
 		expect(html).not.toContain("session-state delegating");
 		expect(html).not.toContain(">delegating</span>");
 	});
@@ -218,7 +222,6 @@ describe("Sidebar session list loading states", () => {
 	function renderSidebar(overrides: Partial<ComponentProps<typeof Sidebar>> = {}): string {
 		return renderToStaticMarkup(
 			<Sidebar
-				connection="open"
 				projects={[]}
 				selectedProjectId={null}
 				query=""
@@ -325,8 +328,10 @@ describe("Sidebar session list loading states", () => {
 		expect(html).not.toContain("activity-counts");
 		expect(html).not.toContain("activity-chip");
 		expect(html).not.toContain("1 workspace</");
-		expect(html).toContain('class="project-folder-count" role="img" aria-label="1 workspace"');
-		expect(html).toContain(">1</span>");
+		expect(html).not.toContain("project-folder-count");
+		expect(html).not.toContain("1 workspace");
+		expect(html).not.toContain("connection-pill");
+		expect(html).not.toContain(">connected<");
 	});
 
 });

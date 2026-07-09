@@ -1,5 +1,6 @@
 import { memo, type ReactNode } from "react";
 import { LogHeader } from "./panels.tsx";
+import type { ConnectionStatus } from "./rpc.ts";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { isArchivedSession, sessionStatusWithDelegations, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
 import { MessageList } from "./transcript.tsx";
@@ -22,6 +23,7 @@ export interface ChatPaneProps {
 	transcriptErrorHasUsableCache: boolean;
 	transcriptRetrying: boolean;
 	hasRunningDelegations: boolean;
+	connection: ConnectionStatus;
 	modelOptions: ModelOption[];
 	modelValue: string;
 	modelLocked: boolean;
@@ -63,6 +65,7 @@ export const ChatPane = memo(function ChatPane({
 	transcriptErrorHasUsableCache,
 	transcriptRetrying,
 	hasRunningDelegations,
+	connection,
 	modelOptions,
 	modelValue,
 	modelLocked,
@@ -102,6 +105,7 @@ export const ChatPane = memo(function ChatPane({
 				session={session}
 				snapshot={snapshot}
 				hasRunningDelegations={hasRunningDelegations}
+				connection={connection}
 				modelOptions={modelOptions}
 				modelValue={modelValue}
 				modelLocked={modelLocked}
@@ -158,6 +162,7 @@ interface ChatHeaderProps {
 	session: SessionDisplayInfo | null;
 	snapshot: SessionSnapshot | null;
 	hasRunningDelegations: boolean;
+	connection: ConnectionStatus;
 	modelOptions: ModelOption[];
 	modelValue: string;
 	modelLocked: boolean;
@@ -177,6 +182,7 @@ const ChatHeader = memo(function ChatHeader({
 	session,
 	snapshot,
 	hasRunningDelegations,
+	connection,
 	modelOptions,
 	modelValue,
 	modelLocked,
@@ -210,7 +216,7 @@ const ChatHeader = memo(function ChatHeader({
 			modelDisabled={modelDisabled}
 			modelLocked={modelLocked}
 			reasoningDisabled={reasoningControlsDisabled || !!mutationBlockedReason}
-			controlsBlockedReason={mutationBlockedReason}
+			connection={connection}
 			reasoningEfforts={displayedEfforts}
 			reasoningEffort={reasoningEffort}
 			rightOpen={rightOpen}
