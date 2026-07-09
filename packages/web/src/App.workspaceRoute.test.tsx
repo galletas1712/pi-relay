@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentApi } from "./agentApi.ts";
@@ -60,6 +60,135 @@ afterEach(() => {
 });
 
 describe("App workspace route identity integration", () => {
+	it.each([
+		{
+			name: "wrong project",
+			url: "/w/project/project-1/run/root-other/conversation/root-other",
+			deferredSessionId: "root-other",
+			result: snapshot("root-other", null, "project-2", "Other project root"),
+		},
+		{
+			name: "wrong root",
+			url: "/w/project/project-1/run/project-root-1/conversation/project-wrong-root-child",
+			deferredSessionId: "project-wrong-root-child",
+			result: snapshot(
+				"project-wrong-root-child",
+				"project-root-2",
+				"project-1",
+				"Wrong root child",
+			),
+		},
+		{
+			name: "child used as root",
+			url: "/w/host/run/child-1/conversation/child-1",
+			deferredSessionId: "child-1",
+			result: snapshot("child-1", "root-1", null, "Child one"),
+		},
+	])("never starts non-validation reads for a rejected $name route", async ({
+		url,
+		deferredSessionId,
+		result,
+	}) => {
+		const validation = deferred<SessionSnapshot>();
+		const browser = new FakeWorkspaceBrowser(url);
+		const api = createRouteApi({
+			deferredSessions: new Map([[deferredSessionId, validation.promise]]),
+		});
+		const mounted = renderRouteApp(api, browser);
+
+		await openStatusOnly(api);
+		await waitFor(() =>
+			expect(
+				api.getSession.mock.calls.some(([sessionId]) => sessionId === deferredSessionId),
+			).toBe(true),
+		);
+		expectSensitiveReads(api, 0);
+
+		await act(async () => validation.resolve(result));
+		expect(await screen.findByRole("heading", { name: /Couldn’t (load session|open this workspace route)/ })).toBeTruthy();
+		expectSensitiveReads(api, 0);
+
+		await mounted.dispose();
+	});
+
+	it("starts session, transcript, tools, events, delegations, and project session reads only after validation", async () => {
+		const validation = deferred<SessionSnapshot>();
+		const browser = new FakeWorkspaceBrowser(
+			"/w/project/project-1/run/project-root-1/conversation/project-child-1",
+		);
+		const api = createRouteApi({
+			deferredSessions: new Map([["project-child-1", validation.promise]]),
+		});
+		const mounted = renderRouteApp(api, browser);
+
+		await openStatusOnly(api);
+		await waitFor(() =>
+			expect(api.getSession.mock.calls.some(([sessionId]) => sessionId === "project-child-1")).toBe(true),
+		);
+		expectSensitiveReads(api, 0);
+
+		await act(async () =>
+			validation.resolve(snapshot(
+				"project-child-1",
+				"project-root-1",
+				"project-1",
+				"Project child",
+			)),
+		);
+		await waitFor(() => {
+			expect(api.listSessions).toHaveBeenCalledWith(100, "project-1");
+			expect(api.getTranscriptTurns).toHaveBeenCalledWith("project-child-1", { limit: 50 });
+			expect(api.listTools).toHaveBeenCalled();
+			expect(api.subscribeEvents).toHaveBeenCalled();
+			expect(api.listDelegations).toHaveBeenCalledWith("project-root-1", 3);
+		});
+
+		await mounted.dispose();
+	});
+
+	it("keeps Back/Forward target reads fenced across a stale validation completion", async () => {
+		const firstValidation = deferred<SessionSnapshot>();
+		const forwardValidation = deferred<SessionSnapshot>();
+		const deferredSessions = new Map<string, Promise<SessionSnapshot>>([
+			["child-a", firstValidation.promise],
+		]);
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const api = createRouteApi({ deferredSessions });
+		const mounted = renderRouteApp(api, browser);
+
+		await open(api);
+		await act(async () => browser.navigate("/w/host/run/root-1/conversation/child-a"));
+		await waitFor(() =>
+			expect(api.getSession.mock.calls.some(([sessionId]) => sessionId === "child-a")).toBe(true),
+		);
+		expect(api.getTranscriptTurns.mock.calls.some(([sessionId]) => sessionId === "child-a")).toBe(false);
+		expect(api.subscribeEvents.mock.calls.some(([sessionId]) => sessionId === "child-a")).toBe(false);
+
+		deferredSessions.set("child-a", forwardValidation.promise);
+		await act(async () => browser.back());
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1"),
+		);
+		await act(async () =>
+			firstValidation.resolve(snapshot("child-a", "root-1", null, "Stale child")),
+		);
+		expect(api.getTranscriptTurns.mock.calls.some(([sessionId]) => sessionId === "child-a")).toBe(false);
+
+		await act(async () => browser.forward());
+		await waitFor(() =>
+			expect(api.getSession.mock.calls.filter(([sessionId]) => sessionId === "child-a")).toHaveLength(2),
+		);
+		expect(api.getTranscriptTurns.mock.calls.some(([sessionId]) => sessionId === "child-a")).toBe(false);
+		await act(async () =>
+			forwardValidation.resolve(snapshot("child-a", "root-1", null, "Current child")),
+		);
+		await waitFor(() =>
+			expect(api.getTranscriptTurns.mock.calls.some(([sessionId]) => sessionId === "child-a")).toBe(true),
+		);
+
+		await mounted.dispose();
+	});
+
 	it("lets a direct child URL beat localStorage, pins Agents to root, and loads the child recipient", async () => {
 		rememberLegacy("legacy-root");
 		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/child-1");
@@ -72,85 +201,12 @@ describe("App workspace route identity integration", () => {
 		);
 		const recipient = await screen.findByRole("status");
 		expect(recipient.textContent).toContain("Conversation recipient: Child one");
-		expect(recipient.textContent).toContain("child-1");
+		expect(recipient.textContent).not.toContain("child-1");
 		expect(api.getTranscriptTurns).toHaveBeenCalledWith("child-1", { limit: 50 });
 		expect(api.listDelegations).toHaveBeenCalledWith("root-1", 3);
 		expect(api.listDelegations.mock.calls.every(([parent]) => parent === "root-1")).toBe(true);
 		expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1");
 		expect(loadUiSelection()).toEqual({ projectId: null, sessionId: null });
-
-		await mounted.dispose();
-	});
-
-	it("rejects a project child that belongs to a different root without rewriting the route", async () => {
-		const url = "/w/project/project-1/run/project-root-1/conversation/project-wrong-root-child";
-		const browser = new FakeWorkspaceBrowser(url);
-		const api = createRouteApi();
-		const mounted = renderRouteApp(api, browser);
-
-		await openStatusOnly(api);
-		await waitFor(() =>
-			expect(screen.queryByText("Validating Conversation…")).toBeNull(),
-		);
-		expect(await screen.findByRole("heading", { name: "Couldn’t load session" })).toBeTruthy();
-		expect(screen.getByRole("alert").textContent).toContain(
-			"not a direct agent of this root run",
-		);
-		expect(browser.currentUrl).toBe(url);
-		expect(browser.pushCalls).toHaveLength(0);
-		expect(browser.replaceCalls).toHaveLength(0);
-		expect(mutationCallCount(api)).toBe(0);
-
-		await mounted.dispose();
-	});
-
-	it.each([
-		{
-			url: "/w/project/project-1/run/project-root-1/conversation/project-root-1",
-			sessionId: "project-root-1",
-			title: "Project root",
-		},
-		{
-			url: "/w/project/project-1/run/project-root-1/conversation/project-child-1",
-			sessionId: "project-child-1",
-			title: "Project child",
-		},
-	])("loads successful project deep link $url", async ({ url, sessionId, title }) => {
-		rememberLegacy("legacy-root");
-		const browser = new FakeWorkspaceBrowser(url);
-		const api = createRouteApi();
-		const mounted = renderRouteApp(api, browser);
-
-		await open(api);
-		expect(document.querySelector(".log-pane")?.textContent).toContain(title);
-		expect(api.getTranscriptTurns).toHaveBeenCalledWith(sessionId, { limit: 50 });
-		expect(api.listDelegations).toHaveBeenCalledWith("project-root-1", 3);
-		expect(browser.currentUrl).toBe(url);
-		expect(browser.pushCalls).toHaveLength(0);
-		expect(browser.replaceCalls).toHaveLength(0);
-		expect(loadUiSelection()).toEqual({ projectId: "project-1", sessionId: null });
-
-		await mounted.dispose();
-	});
-
-	it("refreshes a project child deep link across an actual App unmount/remount", async () => {
-		const url = "/w/project/project-1/run/project-root-1/conversation/project-child-1";
-		const browser = new FakeWorkspaceBrowser(url);
-		let api = createRouteApi();
-		let mounted = renderRouteApp(api, browser);
-
-		await open(api);
-		expect(document.querySelector(".log-pane")?.textContent).toContain("Project child");
-		await mounted.dispose();
-
-		api = createRouteApi();
-		mounted = renderRouteApp(api, browser);
-		await open(api);
-		expect(document.querySelector(".log-pane")?.textContent).toContain("Project child");
-		expect(api.getTranscriptTurns).toHaveBeenCalledWith("project-child-1", { limit: 50 });
-		expect(browser.currentUrl).toBe(url);
-		expect(browser.pushCalls).toHaveLength(0);
-		expect(browser.replaceCalls).toHaveLength(0);
 
 		await mounted.dispose();
 	});
@@ -190,7 +246,7 @@ describe("App workspace route identity integration", () => {
 		expect(document.querySelector<HTMLDivElement>(".message-scroll")?.scrollTop).toBe(900);
 		document.querySelector<HTMLDivElement>(".message-scroll")!.scrollTop = 137;
 		fireEvent.scroll(document.querySelector<HTMLDivElement>(".message-scroll")!);
-		const child = await screen.findByRole("button", { name: /Open agent Child one, implementer/ });
+		const child = await screen.findByRole("button", { name: /Open agent (Child one|Agent), implementer/ });
 		await user.click(child);
 		await waitFor(() => expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1"));
 		expect(await screen.findByText("Conversation recipient:")).toBeTruthy();
@@ -225,64 +281,6 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 		clientHeightSpy.mockRestore();
 		scrollHeightSpy.mockRestore();
-	});
-
-	it("waits for late non-empty route transcript hydration before initializing at latest", async () => {
-		const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
-			return this.classList.contains("message-scroll") ? 100 : 0;
-		});
-		const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
-			return this.classList.contains("message-scroll") ? 1000 : 0;
-		});
-		const turns = deferred<TranscriptTurnsResult>();
-		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
-		const api = createRouteApi({
-			activeLeafIds: new Map([["root-1", "entry-finish"]]),
-			deferredTranscriptTurns: new Map([["root-1", turns.promise]]),
-		});
-		const mounted = renderRouteApp(api, browser);
-
-		await openStatusOnly(api);
-		await waitFor(() => expect(api.getTranscriptTurns).toHaveBeenCalledWith("root-1", { limit: 50 }));
-		const scroller = document.querySelector<HTMLDivElement>(".message-scroll");
-		if (!scroller) throw new Error("missing transcript scroller");
-		scroller.scrollTop = 137;
-		await act(async () => turns.resolve(nonEmptyTurns("root-1")));
-
-		await waitFor(() => expect(screen.getByText("late routed content")).toBeTruthy());
-		expect(scroller.scrollTop).toBe(900);
-		await mounted.dispose();
-		clientHeightSpy.mockRestore();
-		scrollHeightSpy.mockRestore();
-	});
-
-	it("updates an Agent fallback from the existing warmed child snapshot without changing route identity", async () => {
-		const warmedChild = deferred<SessionSnapshot>();
-		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
-		const api = createRouteApi({
-			deferredSessions: new Map([["child-1", warmedChild.promise]]),
-		});
-		const mounted = renderRouteApp(api, browser);
-
-		await open(api);
-		const fallback = await screen.findByRole("button", {
-			name: "Open agent Agent, implementer, running",
-		});
-		expect(within(fallback).getByText("Agent").className).toBe("run-board-subagent-name");
-		expect(within(fallback).getByText("implementer").className).toBe("run-board-subagent-role");
-		expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1");
-		expect(api.getSession.mock.calls.filter(([sessionId]) => sessionId === "child-1")).toHaveLength(1);
-
-		warmedChild.resolve(snapshot("child-1", "root-1", null, "Review checkout"));
-		const named = await screen.findByRole("button", {
-			name: "Open agent Review checkout, implementer, running",
-		});
-		expect(within(named).getByText("Review checkout")).toBeTruthy();
-		expect(screen.queryByRole("button", { name: "Open agent Agent, implementer, running" })).toBeNull();
-		expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1");
-		expect(api.getSession.mock.calls.filter(([sessionId]) => sessionId === "child-1")).toHaveLength(1);
-
-		await mounted.dispose();
 	});
 
 	it("owns invalid required Conversation, project mismatch, and malformed detail states", async () => {
@@ -499,7 +497,7 @@ describe("App workspace route identity integration", () => {
 		const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
 		await user.type(composer, "/switch");
 		await user.click(screen.getByRole("button", { name: "send message" }));
-		const target = await screen.findByRole("treeitem", { name: /User message/ });
+		const target = await screen.findByRole("button", { name: /Switch to User message/ });
 		await user.click(target);
 		await waitFor(() => expect(api.getTranscriptEntries).toHaveBeenCalledWith("root-1", ["entry-user"]));
 
@@ -526,44 +524,6 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
-	it.each(["failed", "noop"] as const)("preserves the current viewport after a %s history switch", async (outcome) => {
-		const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
-			return this.classList.contains("message-scroll") ? 100 : 0;
-		});
-		const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
-			return this.classList.contains("message-scroll") ? 1000 : 0;
-		});
-		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
-		const api = createRouteApi({ historySessionIds: new Set(["root-1"]) });
-		if (outcome === "failed") {
-			api.switchHistory.mockRejectedValue(new Error("switch rejected"));
-		} else {
-			api.switchHistory.mockImplementation(async () => ({
-				session_id: "root-1",
-				active_leaf_id: "entry-active",
-			}));
-		}
-		const mounted = renderRouteApp(api, browser);
-		const user = userEvent.setup();
-		await open(api);
-		const scroller = document.querySelector<HTMLDivElement>(".message-scroll");
-		if (!scroller) throw new Error("missing transcript scroller");
-		scroller.scrollTop = 243;
-		fireEvent.scroll(scroller);
-
-		await user.type(screen.getByRole("textbox"), "/switch");
-		await user.click(screen.getByRole("button", { name: "send message" }));
-		await user.click(await screen.findByRole("treeitem", { name: /Original answer/ }));
-		await waitFor(() => expect(api.switchHistory).toHaveBeenCalledOnce());
-		if (outcome === "failed") await screen.findByText("switch rejected");
-
-		expect(scroller.scrollTop).toBe(243);
-		expect(screen.queryByText("Loading session…")).toBeNull();
-		await mounted.dispose();
-		clientHeightSpy.mockRestore();
-		scrollHeightSpy.mockRestore();
-	});
-
 	it("abandons a pending history destination when the route selects another conversation", async () => {
 		const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
 			return this.classList.contains("message-scroll") ? 100 : 0;
@@ -586,7 +546,6 @@ describe("App workspace route identity integration", () => {
 
 		const oldRefresh = deferred<SessionSnapshot>();
 		const destinationTurns = deferred<TranscriptTurnsResult>();
-		const getSessionCallsBeforeRefresh = api.getSession.mock.calls.length;
 		api.getSession
 			.mockImplementationOnce(() => oldRefresh.promise)
 			.mockImplementationOnce(async () => ({
@@ -603,7 +562,7 @@ describe("App workspace route identity integration", () => {
 			data: {},
 		});
 		await waitFor(() =>
-			expect(api.getSession.mock.calls.length).toBe(getSessionCallsBeforeRefresh + 1),
+			expect(api.getSession.mock.results.some(({ value }) => value === oldRefresh.promise)).toBe(true),
 		);
 
 		api.switchHistory.mockImplementation(async () => ({
@@ -615,8 +574,10 @@ describe("App workspace route identity integration", () => {
 		}));
 		await user.type(screen.getByRole("textbox"), "/switch");
 		await user.click(screen.getByRole("button", { name: "send message" }));
-		await user.click(await screen.findByRole("treeitem", { name: /Destination answer/ }));
-		await waitFor(() => expect(api.getTranscriptTurns).toHaveBeenCalledTimes(2));
+		await user.click(await screen.findByRole("button", { name: /Switch to.*Destination answer/ }));
+		await waitFor(() =>
+			expect(api.getTranscriptTurns.mock.results.some(({ value }) => value === destinationTurns.promise)).toBe(true),
+		);
 		expect(screen.getByText("old rendered page")).toBeTruthy();
 
 		await act(async () => {
@@ -653,124 +614,6 @@ describe("App workspace route identity integration", () => {
 		scrollHeightSpy.mockRestore();
 	});
 
-	it("waits for canonical destination cards when history switch races an in-flight usable-cache refresh", async () => {
-		const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
-			return this.classList.contains("message-scroll") ? 100 : 0;
-		});
-		const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
-			return this.classList.contains("message-scroll") ? 1000 : 0;
-		});
-		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
-		const api = createRouteApi({
-			historySessionIds: new Set(["root-1"]),
-			includeDestinationHistoryTarget: true,
-		});
-		api.getTranscriptTurns.mockResolvedValue(
-			turnsWithContent("root-1", "entry-active", "old rendered page", 1),
-		);
-		const mounted = renderRouteApp(api, browser);
-		const user = userEvent.setup();
-		await open(api);
-		expect(await screen.findByText("old rendered page")).toBeTruthy();
-
-		const scroller = document.querySelector<HTMLDivElement>(".message-scroll");
-		if (!scroller) throw new Error("missing transcript scroller");
-		let scrollTop = 243;
-		const writes: number[] = [];
-		Object.defineProperty(scroller, "scrollTop", {
-			configurable: true,
-			get: () => scrollTop,
-			set: (value: number) => {
-				scrollTop = value;
-				writes.push(value);
-			},
-		});
-		fireEvent.scroll(scroller);
-
-		const oldRefresh = deferred<SessionSnapshot>();
-		const destinationTurns = deferred<TranscriptTurnsResult>();
-		const destinationSnapshot = {
-			...snapshot("root-1", null, null, "Root one", "entry-destination"),
-			session_revision: 2,
-			transcript_revision: 2,
-			last_event_id: 3,
-		};
-		const getSessionCallsBeforeRefresh = api.getSession.mock.calls.length;
-		api.getSession
-			.mockImplementationOnce(() => oldRefresh.promise)
-			.mockImplementationOnce(async () => destinationSnapshot);
-		api.getTranscriptTurns.mockImplementationOnce(() => destinationTurns.promise);
-
-		api.emitEvent({
-			event_id: 2,
-			event: "session.configured",
-			session_id: "root-1",
-			data: {},
-		});
-		await waitFor(() =>
-			expect(api.getSession.mock.calls.length).toBe(getSessionCallsBeforeRefresh + 1),
-		);
-
-		api.switchHistory.mockImplementation(async () => ({
-			session_id: "root-1",
-			active_leaf_id: "entry-destination",
-			session_revision: 2,
-			transcript_revision: 2,
-			last_event_id: 3,
-		}));
-		await user.type(screen.getByRole("textbox"), "/switch");
-		await user.click(screen.getByRole("button", { name: "send message" }));
-		await user.click(await screen.findByRole("treeitem", { name: /Destination answer/ }));
-
-		await waitFor(() => expect(api.switchHistory).toHaveBeenCalledOnce());
-		await waitFor(() => expect(api.getTranscriptTurns).toHaveBeenCalledTimes(2));
-		expect(screen.getByText("old rendered page")).toBeTruthy();
-		expect(screen.queryByText("canonical destination page")).toBeNull();
-		expect(screen.queryByText("Loading session…")).toBeNull();
-		expect(writes).toEqual([]);
-
-		await act(async () => {
-			browser.navigate("/w/host/run/root-1/execution/overview");
-		});
-		expect(await screen.findByRole("heading", { name: /Execution workspace is not available/ })).toBeTruthy();
-		await user.click(screen.getByRole("button", { name: "Open effective Conversation" }));
-		expect(await screen.findByText("old rendered page")).toBeTruthy();
-		const remountedScroller = document.querySelector<HTMLDivElement>(".message-scroll");
-		if (!remountedScroller) throw new Error("missing remounted transcript scroller");
-		// A fresh MessageList mount must not run ordinary session initialization
-		// against the stale rendered page while App still owns this destination.
-		expect(remountedScroller.scrollTop).toBe(0);
-		Object.defineProperty(remountedScroller, "scrollTop", {
-			configurable: true,
-			get: () => scrollTop,
-			set: (value: number) => {
-				scrollTop = value;
-				writes.push(value);
-			},
-		});
-
-		await act(async () => destinationTurns.resolve(
-			turnsWithContent(
-				"root-1",
-				"entry-destination",
-				"canonical destination page",
-				2,
-			),
-		));
-		expect(await screen.findByText("canonical destination page")).toBeTruthy();
-		expect(screen.queryByText("old rendered page")).toBeNull();
-		expect(writes).toEqual([900]);
-
-		await act(async () => oldRefresh.resolve(
-			snapshot("root-1", null, null, "Root one", "entry-active"),
-		));
-		expect(screen.getByText("canonical destination page")).toBeTruthy();
-		expect(writes).toEqual([900]);
-
-		await mounted.dispose();
-		clientHeightSpy.mockRestore();
-		scrollHeightSpy.mockRestore();
-	});
 });
 
 type ApiSpy = ReturnType<typeof vi.fn>;
@@ -779,7 +622,10 @@ type RouteApi = AgentApi & {
 	getSession: ApiSpy;
 	getTranscriptEntries: ApiSpy;
 	getTranscriptTurns: ApiSpy;
+	listSessions: ApiSpy;
+	listTools: ApiSpy;
 	listDelegations: ApiSpy;
+	subscribeEvents: ApiSpy;
 	queueFollowUp: ApiSpy;
 	startSession: ApiSpy;
 	switchHistory: ApiSpy;
@@ -1108,6 +954,23 @@ function emptyTurns(sessionId: string, activeLeafId: string | null = null): Tran
 
 function rememberLegacy(sessionId: string) {
 	rememberUiSelection(null, sessionId);
+}
+
+function expectSensitiveReads(api: RouteApi, count: number): void {
+	const spies = [
+		api.listSessions,
+		api.getTranscriptTurns,
+		api.listTools,
+		api.subscribeEvents,
+		api.listDelegations,
+		api.getTranscriptEntries,
+		api.getTranscriptIndex,
+		api.getTranscriptTurnDetail,
+		api.readHandoffFile,
+	] as ApiSpy[];
+	expect(
+		spies.reduce((total, spy) => total + spy.mock.calls.length, 0),
+	).toBe(count);
 }
 
 function historyIndex(

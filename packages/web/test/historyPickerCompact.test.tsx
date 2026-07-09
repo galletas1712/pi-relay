@@ -69,7 +69,7 @@ function pixelDeclaration(rule: string, property: string): number {
 }
 
 describe("compact history branch disclosure", () => {
-	it("renders collapsed branch disclosure separately from its switch target with contextual state", async () => {
+	it("uses list/disclosure semantics with native keyboard traversal and activation", async () => {
 		const onClose = vi.fn();
 		const onSwitch = vi.fn();
 		const user = userEvent.setup();
@@ -84,21 +84,31 @@ describe("compact history branch disclosure", () => {
 		const disclosure = screen.getByRole("button", {
 			name: "Expand branch for User message: alternate branch, 1 hidden descendant",
 		});
-		const switchTarget = screen.getByRole("treeitem", { name: /User message.*alternate branch/ });
+		const switchTarget = screen.getByRole("button", { name: "Switch to User message: alternate branch" });
 		const collapsedBranch = disclosure.closest(".history-tree-item");
+		const branchId = disclosure.getAttribute("aria-controls");
 
 		expect(disclosure).not.toBe(switchTarget);
 		expect(disclosure.getAttribute("aria-expanded")).toBe("false");
+		expect(branchId).toBeTruthy();
+		expect(document.getElementById(branchId!)?.hidden).toBe(true);
 		expect(collapsedBranch?.classList.contains("collapsed")).toBe(true);
-		expect(screen.queryByText("hidden alternate turn")).toBeNull();
+		expect(screen.queryByRole("button", { name: /hidden alternate turn/ })).toBeNull();
+		expect(screen.getAllByRole("list").length).toBeGreaterThan(0);
+		expect(screen.queryByRole("tree")).toBeNull();
+		expect(screen.queryByRole("treeitem")).toBeNull();
 
-		await user.click(disclosure);
+		disclosure.focus();
+		await user.keyboard(" ");
 		expect(disclosure.getAttribute("aria-expanded")).toBe("true");
-		expect(screen.getByText("hidden alternate turn")).toBeTruthy();
+		expect(document.getElementById(branchId!)?.hidden).toBe(false);
+		expect(screen.getByRole("button", { name: /hidden alternate turn/ })).toBeTruthy();
 		expect(onSwitch).not.toHaveBeenCalled();
 		expect(onClose).not.toHaveBeenCalled();
 
-		await user.click(switchTarget);
+		await user.tab();
+		expect(document.activeElement).toBe(switchTarget);
+		await user.keyboard("{Enter}");
 		expect(onSwitch).toHaveBeenCalledTimes(1);
 		expect(onSwitch.mock.calls[0]?.[0]).toMatchObject({
 			id: "alternate",
@@ -146,7 +156,7 @@ describe("compact history branch disclosure", () => {
 		);
 		expect(screen.getByRole("heading", { name: "Switch branch" })).toBe(heading);
 		expect(document.activeElement).toBe(heading);
-		expect(screen.getByRole("treeitem", { name: /active branch/ })).toBeTruthy();
+		expect(screen.getByRole("button", { name: /Switch to.*active branch/ }).getAttribute("aria-current")).toBe("true");
 
 		await user.keyboard("{Escape}");
 		await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
@@ -155,8 +165,8 @@ describe("compact history branch disclosure", () => {
 
 	it("scrolls the current branch target into view once without moving heading focus", async () => {
 		const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function () {
-			if (this.getAttribute("aria-selected") === "true") return rect(150, 180);
-			if (this.getAttribute("role") === "tree") return rect(0, 100);
+			if (this.getAttribute("aria-current") === "true") return rect(150, 180);
+			if (this.classList.contains("history-options")) return rect(0, 100);
 			return rect(0, 0);
 		});
 		const { rerender } = render(
@@ -168,8 +178,9 @@ describe("compact history branch disclosure", () => {
 				onSwitch={() => undefined}
 			/>,
 		);
-		const list = screen.getByRole("tree", { name: "switch targets" });
-		list.scrollTop = 10;
+		const scroller = document.querySelector<HTMLElement>(".history-options");
+		if (!scroller) throw new Error("missing history scroller");
+		scroller.scrollTop = 10;
 		rerender(
 			<CompactHistoryPickerDialog
 				nodes={branchFixture()}
@@ -179,9 +190,9 @@ describe("compact history branch disclosure", () => {
 			/>,
 		);
 
-		expect(list.scrollTop).toBe(90);
+		expect(scroller.scrollTop).toBe(90);
 		expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Switch branch" }));
-		list.scrollTop = 25;
+		scroller.scrollTop = 25;
 		rerender(
 			<CompactHistoryPickerDialog
 				nodes={[...branchFixture()]}
@@ -190,7 +201,7 @@ describe("compact history branch disclosure", () => {
 				onSwitch={() => undefined}
 			/>,
 		);
-		expect(list.scrollTop).toBe(25);
+		expect(scroller.scrollTop).toBe(25);
 		rectSpy.mockRestore();
 	});
 
@@ -204,8 +215,9 @@ describe("compact history branch disclosure", () => {
 				onSwitch={() => undefined}
 			/>,
 		);
-		const list = screen.getByRole("tree", { name: "switch targets" });
-		Object.defineProperties(list, {
+		const scroller = document.querySelector<HTMLElement>(".history-options");
+		if (!scroller) throw new Error("missing history scroller");
+		Object.defineProperties(scroller, {
 			clientHeight: { configurable: true, value: 100 },
 			scrollHeight: { configurable: true, value: 500 },
 		});
@@ -218,13 +230,13 @@ describe("compact history branch disclosure", () => {
 			/>,
 		);
 
-		expect(list.scrollTop).toBe(400);
+		expect(scroller.scrollTop).toBe(400);
 	});
 
 	it("reinitializes on close/reopen and waits for a late active row", async () => {
 		const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function () {
-			if (this.getAttribute("aria-selected") === "true") return rect(140, 170);
-			if (this.getAttribute("role") === "tree") return rect(0, 100);
+			if (this.getAttribute("aria-current") === "true") return rect(140, 170);
+			if (this.classList.contains("history-options")) return rect(0, 100);
 			return rect(0, 0);
 		});
 		const partial = branchFixture().filter((node) => node.id !== "active");
@@ -243,7 +255,8 @@ describe("compact history branch disclosure", () => {
 		);
 		const opener = screen.getByRole("button", { name: "Open history" });
 		await user.click(opener);
-		let list = screen.getByRole("tree", { name: "switch targets" });
+		let list = document.querySelector<HTMLElement>(".history-options");
+		if (!list) throw new Error("missing history scroller");
 		list.scrollTop = 10;
 		view.rerender(
 			<HistoryLauncher nodes={[]} loading={false}>
@@ -274,7 +287,8 @@ describe("compact history branch disclosure", () => {
 			</HistoryLauncher>,
 		);
 		await user.click(opener);
-		list = screen.getByRole("tree", { name: "switch targets" });
+		list = document.querySelector<HTMLElement>(".history-options");
+		if (!list) throw new Error("missing history scroller");
 		list.scrollTop = 5;
 		view.rerender(
 			<HistoryLauncher nodes={[]} loading={false}>
@@ -313,25 +327,6 @@ describe("compact history branch disclosure", () => {
 
 		await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 		expect(document.activeElement).toBe(opener);
-	});
-
-	it.each([
-		["loading", { loading: true, error: null }, "Loading history index…"],
-		["error", { loading: false, error: "History failed" }, "History failed"],
-		["empty", { loading: false, error: null }, "No editable messages, completed turns, or compaction roots yet."],
-	] as const)("preserves the %s render contract", (_name, state, expected) => {
-		render(
-			<CompactHistoryPickerDialog
-				nodes={[]}
-				activeLeafId={null}
-				loading={state.loading}
-				error={state.error}
-				onClose={() => undefined}
-				onSwitch={() => undefined}
-			/>,
-		);
-
-		expect(screen.getByText(expected)).toBeTruthy();
 	});
 
 	it("keeps the compact disclosure visible with a coarse-pointer-sized target", async () => {

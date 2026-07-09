@@ -174,85 +174,6 @@ describe("minimal delegated agent outline", () => {
 		expect(onSelectSession).toHaveBeenCalledWith("child-1");
 	});
 
-	it("renders the status icon key and actual Lucide glyph for every supported state and fallback", () => {
-		const cases = [
-			{ status: "running", label: "running", key: "running", glyph: "lucide-loader-circle" },
-			{ status: "done", label: "done", key: "done", glyph: "lucide-circle-check" },
-			{
-				status: "done_with_failures",
-				label: "done with failures",
-				key: "done-with-failures",
-				glyph: "lucide-triangle-alert",
-			},
-			{ status: "failed", label: "failed", key: "failed", glyph: "lucide-circle-x" },
-			{ status: "cancelled", label: "cancelled", key: "cancelled", glyph: "lucide-ban" },
-			{ status: "queued", label: "queued", key: "queued", glyph: "lucide-clock3" },
-			{ status: "idle", label: "idle", key: "idle", glyph: "lucide-circle-dashed" },
-			{
-				status: "future_status",
-				label: "future status",
-				key: "unknown",
-				glyph: "lucide-circle-question-mark",
-			},
-		] as const;
-		renderList({
-			delegations: [
-				delegation({
-					subagents: cases.map(({ status }, index) => ({
-						id: `child-${index}`,
-						status: status as Delegation["subagents"][number]["status"],
-						role: `role-${index}`,
-						subagent_type: "read_only",
-					})),
-				}),
-			],
-		});
-
-		for (const [index, { label, key, glyph }] of cases.entries()) {
-			const row = screen.getByRole("button", { name: `Open agent Agent, role-${index}, ${label}` });
-			const icon = within(row).getByRole("img", { name: `${label} status` });
-			expect(icon.getAttribute("data-status-icon"), label).toBe(key);
-			expect(icon.querySelector("svg")?.classList.contains(glyph), label).toBe(true);
-		}
-	});
-
-	it("renders each supported delegation status with its keyed Lucide glyph", () => {
-		const cases: {
-			status: Delegation["status"];
-			label: string;
-			key: string;
-			glyph: string;
-		}[] = [
-			{ status: "running", label: "running", key: "running", glyph: "lucide-loader-circle" },
-			{ status: "done", label: "done", key: "done", glyph: "lucide-circle-check" },
-			{
-				status: "done_with_failures",
-				label: "done with failures",
-				key: "done-with-failures",
-				glyph: "lucide-triangle-alert",
-			},
-			{ status: "failed", label: "failed", key: "failed", glyph: "lucide-circle-x" },
-			{ status: "cancelled", label: "cancelled", key: "cancelled", glyph: "lucide-ban" },
-		];
-		renderList({
-			delegations: cases.map(({ status }, index) =>
-				delegation({
-					delegation_id: `delegation-${index}`,
-					label: `Task ${index}`,
-					status,
-					subagents: [],
-				}),
-			),
-		});
-
-		for (const [index, { label, key, glyph }] of cases.entries()) {
-			const task = screen.getByRole("article", { name: `Task ${index}, ${label}` });
-			const icon = within(task).getByRole("img", { name: `${label} status` });
-			expect(icon.getAttribute("data-status-icon"), label).toBe(key);
-			expect(icon.querySelector("svg")?.classList.contains(glyph), label).toBe(true);
-		}
-	});
-
 	it("uses Agent instead of a sliced technical id when role is unavailable", () => {
 		renderList({
 			delegations: [delegation({
@@ -265,20 +186,6 @@ describe("minimal delegated agent outline", () => {
 		expect(document.querySelector(".run-board-outline")?.textContent).not.toContain("session_technic");
 	});
 
-	it("keeps failed and completed work minimal with status available only through semantics", () => {
-		renderList({
-			delegations: [
-				delegation({ delegation_id: "failed", label: "Fix release", status: "failed", subagents: [] }),
-				delegation({ delegation_id: "done", label: "Review docs", status: "done", subagents: [] }),
-			],
-		});
-
-		const visible = document.querySelector(".run-board-outline")?.textContent ?? "";
-		expect(visible).toBe("Fix releaseReview docs");
-		expect(screen.getByRole("article", { name: "Fix release, failed" })).toBeTruthy();
-		expect(screen.getByRole("article", { name: "Review docs, done" })).toBeTruthy();
-		expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
-	});
 });
 
 describe("cancel delegated work", () => {

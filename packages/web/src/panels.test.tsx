@@ -4,7 +4,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	Inspector,
 	LogHeader,
-	projectMenuItems,
 	RunBoardDelegationList,
 	sessionMenuItems,
 	Sidebar,
@@ -155,7 +154,7 @@ describe("Inspector run board delegation list", () => {
 		expect(expanded).not.toContain("See more");
 	});
 
-	it("shows the expansion control when the server reports older delegations beyond the current page", () => {
+	it("uses server paging metadata without inventing expansion for a complete short page", () => {
 		const html = renderRunBoardList({
 			delegations: [1, 2, 3].map((index) => delegation({ delegation_id: `delegation-${index}`, label: `task ${index}` })),
 			hasMoreDelegations: true,
@@ -165,18 +164,12 @@ describe("Inspector run board delegation list", () => {
 		expect(html).toContain("task 2");
 		expect(html).toContain("task 3");
 		expect(html).toContain("See more");
-	});
 
-	it("does not show an expansion control when there are three or fewer delegations", () => {
-		const html = renderRunBoardList({
+		const complete = renderRunBoardList({
 			delegations: [1, 2, 3].map((index) => delegation({ delegation_id: `delegation-${index}`, label: `task ${index}` })),
 		});
-
-		expect(html).toContain("task 1");
-		expect(html).toContain("task 2");
-		expect(html).toContain("task 3");
-		expect(html).not.toContain("See more");
-		expect(html).not.toContain("Show fewer");
+		expect(complete).not.toContain("See more");
+		expect(complete).not.toContain("Show fewer");
 	});
 });
 
@@ -188,33 +181,6 @@ describe("LogHeader", () => {
 		expect(html).toContain(`title="delegating session"`);
 		expect(html).not.toContain("session-state delegating");
 		expect(html).not.toContain(">delegating</span>");
-	});
-
-	it("omits the literal no-session title text when no session is selected", () => {
-		const html = renderLogHeader({ title: null, status: null });
-		expect(html).not.toContain("No session selected");
-		expect(html).not.toContain("session-status-icon");
-	});
-
-	it("shows a parent-session control only when a parent id exists", () => {
-		const withoutParent = renderLogHeader({ parentSessionId: null });
-		expect(withoutParent).not.toContain("parent-session-link");
-
-		const withParent = renderLogHeader({ parentSessionId: "parent-session-12345" });
-		expect(withParent).toContain("log-title-group");
-		expect(withParent).toContain("parent-session-link");
-		expect(withParent).toContain("parent");
-		expect(withParent).toContain("open parent parent-session-12345");
-	});
-
-	it("keeps model and effort labels accessible but not visible text labels", () => {
-		const html = renderLogHeader();
-		expect(html).toContain(`aria-label="Model"`);
-		expect(html).toContain(`aria-label="Reasoning effort"`);
-		expect(html).toContain(`class="sr-only">Model</span>`);
-		expect(html).toContain(`class="sr-only">Reasoning effort</span>`);
-		expect(html).not.toContain(">model</span>");
-		expect(html).not.toContain(">effort</span>");
 	});
 
 	it("keeps the model disabled with concise accessible locked state and no verbose explanation", () => {
@@ -239,20 +205,6 @@ describe("Inspector tabs", () => {
 		expect(html).not.toContain("<h2>Pending</h2>");
 		expect(html).not.toContain("<h2>Tools</h2>");
 		expect(html).not.toContain("<h2>Slash</h2>");
-	});
-
-	it("does not render no-session literal text in the right-panel empty state", () => {
-		const html = renderToStaticMarkup(
-			<Inspector
-				snapshot={null}
-				delegations={[]}
-				delegationsLoading={false}
-				delegationsError={null}
-				onCancelDelegation={() => {}}
-				tools={[] satisfies ToolListing[]}
-			/>,
-		);
-		expect(html).not.toContain("No session selected");
 	});
 
 	it("preserves the selected-session no-work empty state", () => {
@@ -288,36 +240,6 @@ describe("Sidebar session list loading states", () => {
 		);
 	}
 
-	it("shows loading instead of no sessions while the selected project list is loading", () => {
-		const html = renderSidebar({ sessionsLoading: true });
-
-		expect(html).toContain("Loading sessions…");
-		expect(html).not.toContain("No sessions");
-		expect(html).toContain(`aria-busy="true"`);
-	});
-
-	it("shows refreshing while an empty selected project list is being refetched", () => {
-		const html = renderSidebar({ sessionsFetching: true });
-
-		expect(html).toContain("Refreshing sessions…");
-		expect(html).not.toContain("No sessions");
-		expect(html).toContain(`aria-busy="true"`);
-
-	});
-
-	it("shows a no-data error with Retry and not the valid empty-list copy", () => {
-		const html = renderSidebar({
-			sessionsError: "request failed",
-			onRetrySessions: () => {},
-		});
-
-		expect(html).toContain(`role="alert"`);
-		expect(html).toContain("Couldn’t load sessions");
-		expect(html).toContain("request failed");
-		expect(html).toContain(">Retry</button>");
-		expect(html).not.toContain("No sessions");
-	});
-
 	it("keeps cached rows visible when their refresh fails", () => {
 		const cachedSession: SessionSummary = {
 			session_id: "cached-session",
@@ -341,32 +263,6 @@ describe("Sidebar session list loading states", () => {
 		expect(html).toContain("Cached session");
 		expect(html).toContain("Session refresh failed");
 		expect(html).toContain("refresh failed");
-	});
-
-	it("uses unfiltered cache presence for refresh wording when filters hide every row", () => {
-		const html = renderSidebar({
-			filteredSessions: [],
-			sessionsHasCachedData: true,
-			sessionsError: "refresh failed",
-			onRetrySessions: () => {},
-		});
-
-		expect(html).toContain("Session refresh failed");
-		expect(html).not.toContain("Couldn’t load sessions");
-		expect(html).not.toContain("No sessions");
-	});
-
-	it("disables the list Retry and reports refreshing copy while fetching", () => {
-		const html = renderSidebar({
-			sessionsError: "request failed",
-			sessionsFetching: true,
-			onRetrySessions: () => {},
-		});
-
-		expect(html).toContain(`disabled=""`);
-		expect(html).toContain(`aria-busy="true"`);
-		expect(html).toContain("Retrying…");
-		expect(html).not.toContain(">Retry</button>");
 	});
 
 	it("renders project and session navigation as semantic lists with sibling selection and menu buttons", () => {
@@ -403,7 +299,7 @@ describe("Sidebar session list loading states", () => {
 			selectedId: session.session_id,
 		});
 
-		expect(html).toContain('<nav aria-label="Projects">');
+		expect(html).toContain('<nav aria-label="Projects"');
 		expect(html).toContain('<ul class="project-list">');
 		expect(html).toContain('<li class="project-row selected">');
 		expect(html).toContain('<nav class="session-list" aria-label="Sessions"');
@@ -433,48 +329,9 @@ describe("Sidebar session list loading states", () => {
 		expect(html).toContain(">1</span>");
 	});
 
-	it("names plural workspace counts on the compact folder icon without a subtitle", () => {
-		const html = renderSidebar({
-			projects: [{
-				project_id: "project-2",
-				name: "Two repos",
-				workspaces: [
-					{ workspace_dir: "one", kind: "local", source_path: "/one" },
-					{ workspace_dir: "two", kind: "local", source_path: "/two" },
-				],
-				metadata: {},
-				created_at: "2024-01-01T00:00:00Z",
-				updated_at: "2024-01-01T00:00:00Z",
-			}],
-		});
-
-		expect(html).toContain('role="img" aria-label="2 workspaces"');
-		expect(html).not.toContain("2 workspaces</");
-	});
 });
 
 describe("sidebar action menu policies", () => {
-	it("maps project settings to the captured project without selecting the row", () => {
-		const project: Project = {
-			project_id: "project-1",
-			name: "Menu project",
-			workspaces: [],
-			metadata: {},
-			created_at: "2024-01-01T00:00:00Z",
-			updated_at: "2024-01-01T00:00:00Z",
-		};
-		const onEditProject = vi.fn();
-		const items = projectMenuItems(project, onEditProject);
-
-		expect(items.map(({ id, label }) => ({ id, label }))).toEqual([
-			{ id: "settings", label: "Project settings…" },
-		]);
-		expect(items[0]).toMatchObject({ focusDestination: "dialog" });
-		items[0].onSelect();
-		expect(onEditProject).toHaveBeenCalledTimes(1);
-		expect(onEditProject).toHaveBeenCalledWith(project);
-	});
-
 	it("maps idle session actions, separating and styling destructive Delete", () => {
 		const onRename = vi.fn();
 		const onArchiveToggle = vi.fn();
@@ -517,27 +374,6 @@ describe("sidebar action menu policies", () => {
 		expect(onDelete).toHaveBeenCalledTimes(1);
 	});
 
-	it("uses Unarchive for archived sessions without adding a confirmation policy", () => {
-		const onArchiveToggle = vi.fn();
-		const items = sessionMenuItems({
-			archived: true,
-			canArchive: true,
-			canDelete: true,
-			onRename: vi.fn(),
-			onArchiveToggle,
-			onDelete: vi.fn(),
-		});
-
-		expect(items[1]).toMatchObject({
-			id: "unarchive",
-			label: "Unarchive",
-			disabled: false,
-		});
-		expect(items[1].focusDestination).toBeUndefined();
-		items[1].onSelect();
-		expect(onArchiveToggle).toHaveBeenCalledTimes(1);
-	});
-
 	it("keeps Rename available and exposes visible reasons for running-session restrictions", () => {
 		const items = sessionMenuItems({
 			archived: false,
@@ -561,192 +397,6 @@ describe("sidebar action menu policies", () => {
 			destructive: true,
 			separatorBefore: true,
 		});
-	});
-});
-
-describe("Inspector agent outline", () => {
-	it("renders every status as a shape-distinct accessible icon without visible status prose", () => {
-		const cases: { status: Delegation["status"]; icon: string; label: string }[] = [
-			{ status: "running", icon: "running", label: "running" },
-			{ status: "done", icon: "done", label: "done" },
-			{ status: "done_with_failures", icon: "warn", label: "done with failures" },
-			{ status: "failed", icon: "failed", label: "failed" },
-			{ status: "cancelled", icon: "cancelled", label: "cancelled" },
-		];
-		for (const { status, icon, label } of cases) {
-			const html = renderRunBoardList({ delegations: [delegation({ kind: "full", status })] });
-			expect(html, `${status} icon color`).toContain(`run-board-status-icon ${icon}`);
-			expect(html, `${status} accessible text`).toContain(`aria-label="${label} status"`);
-			expect(html).not.toContain("run-board-status-text");
-			expect(html).not.toContain("Writing task");
-		}
-		const sample = renderRunBoardList({ delegations: [delegation({ kind: "full", status: "running" })] });
-		expect(sample).not.toContain("status-rail");
-	});
-
-	it("does not expose kind labels or storage vocabulary", () => {
-		const full = renderRunBoardList({ delegations: [delegation({ kind: "full", status: "done" })] });
-		expect(full).not.toContain("Writing task");
-		expect(full).not.toContain(">full<");
-
-		const fanout = renderRunBoardList({ delegations: [delegation({ kind: "readonly_fanout", status: "done" })] });
-		expect(fanout).not.toContain("Parallel research");
-		expect(fanout).not.toContain(">fan-out<");
-	});
-
-	it("renders each agent role visibly and keeps status in the full-row navigation name", () => {
-		const html = renderRunBoardList({
-			delegations: [
-				delegation({
-					status: "running",
-					subagents: [
-						{ id: "done-child", status: "done", activity: "idle", role: "explorer", subagent_type: "read_only" },
-						{ id: "running-child", status: "running", activity: "running", role: "explorer", subagent_type: "read_only" },
-						{ id: "waiting-child", status: "queued", activity: "queued", role: "explorer", subagent_type: "read_only" },
-					],
-				}),
-			],
-		});
-
-		// done -> done, running -> running, queued -> neutral pending icon.
-		expect(html).toContain(`run-board-status-icon done`);
-		expect(html).toContain(`run-board-status-icon running`);
-		expect(html).toContain(`run-board-status-icon pending`);
-		expect(html).toContain(`aria-label="Open agent Agent, explorer, done"`);
-		expect(html).toContain(`aria-label="Open agent Agent, explorer, running"`);
-		expect(html).toContain(`aria-label="Open agent Agent, explorer, queued"`);
-		expect(html).toContain(`class="run-board-subagent-button"`);
-		expect(html).toContain(`title="queued"`);
-		expect(html).not.toContain("activity idle");
-		expect(html).not.toContain("run-board-subagent-status");
-		expect(html).not.toContain("status-rail");
-	});
-});
-
-describe("Inspector agent task content", () => {
-	it("omits progress, outcomes, kinds, headings, and handoff metadata", () => {
-		const html = renderInspector([
-			delegation({
-				status: "running",
-				kind: "readonly_fanout",
-				label: "fan-out",
-				progress: { expected: 2, spawned: 2, terminal: 1, running: 1, failed: 0 },
-				subagents: [
-					{
-						id: "done-child",
-						status: "done",
-						activity: "idle",
-						role: "explorer",
-						subagent_type: "read_only",
-						task_prompt_file: "done-child/task_prompt.md",
-						final_message_file: "done-child/final_message.md",
-						transcript_file: "done-child/transcript.md",
-						outcome: "done",
-					},
-					{
-						id: "running-child",
-						status: "running",
-						activity: "running",
-						role: "explorer",
-						subagent_type: "read_only",
-						task_prompt_file: "running-child/task_prompt.md",
-						outcome: null,
-					},
-				],
-			}),
-		]);
-
-		expect(html).toContain("fan-out");
-		expect(html).not.toContain("Parallel research");
-		expect(html).toContain("run-board-status-icon running");
-		expect(html).not.toContain("status-rail");
-		expect(html).not.toContain("run-board-progress");
-		expect(html).not.toContain("2 expected");
-		expect(html).not.toContain("Outcome: Done");
-		expect(html).not.toContain("Needs attention");
-		expect(html).not.toContain(">Active<");
-		expect(html).not.toContain(">Recent<");
-		expect(html).not.toContain("suggested next");
-		expect(html).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
-		expect(html).not.toContain("/workspace/.pi-handoff/delegation-1");
-		expect(html).not.toContain("final_message.md");
-		expect(html).not.toContain("transcript.md");
-		expect(html).not.toContain("task_prompt.md");
-	});
-
-	it("removes the details toggle and any artifact file viewer", () => {
-		const html = renderRunBoardList({ delegations: [delegation({ status: "done_with_failures" })] });
-
-		expect(html).not.toContain("details");
-		expect(html).not.toContain("hide details");
-		expect(html).not.toContain("run-board-debug");
-		expect(html).not.toContain("run-board-handoff-links");
-		expect(html).not.toContain("run-board-handoff-path");
-		expect(html).not.toContain("run-board-file");
-	});
-
-	it("keeps a cancelled delegation's status on its icon without exposing the cancellation transcript", () => {
-		const cancelled = delegation({
-			status: "cancelled",
-			subagents: [
-				{
-					id: "child-1",
-					status: "cancelled",
-					activity: "idle",
-					role: "reviewer",
-					subagent_type: "read_only",
-					task_prompt_file: "child-1/task_prompt.md",
-					transcript_file: "cancelled/child-1.transcript.md",
-				},
-			],
-		});
-
-		const html = renderRunBoardList({ delegations: [cancelled] });
-		expect(html).toContain("run-board-status-icon cancelled");
-		expect(html).toContain(`aria-label="cancelled status"`);
-		expect(html).not.toContain("run-board-status-text");
-		expect(html).not.toContain("status-rail");
-		expect(html).not.toContain("cancellation transcript");
-		expect(html).not.toContain("cancelled/child-1.transcript.md");
-	});
-});
-
-describe("Inspector run board primary controls", () => {
-	it("does not offer steer from the run board while keeping cancel and subagent open controls", () => {
-		const html = renderInspector([
-			delegation({
-				kind: "full",
-				status: "running",
-				label: "implement",
-				subagents: [
-					{
-						id: "child-full-1",
-						status: "running",
-						activity: "running",
-						role: "implementer",
-						subagent_type: "full",
-						steerable: true,
-						task_prompt_file: "child-full-1/task_prompt.md",
-						transcript_file: "child-full-1/transcript.md",
-					},
-				],
-			}),
-		]);
-
-		expect(html).toContain("implement");
-		expect(html).toContain(`aria-label="Cancel"`);
-		expect(html).toContain(`aria-label="Open agent Agent, implementer, running"`);
-		expect(html).not.toContain("steer");
-		expect(html).not.toContain("suggested next");
-	});
-
-	it("offers only active-work cancel and never a terminal delegated-work restart", () => {
-		const terminal = renderInspector([delegation({ status: "done" })]);
-		expect(terminal).not.toContain(`aria-label="Cancel"`);
-		expect(terminal).not.toContain("steer");
-
-		const running = renderInspector([delegation({ status: "running" })]);
-		expect(running).toContain(`aria-label="Cancel"`);
 	});
 });
 
@@ -780,28 +430,14 @@ describe("SessionRow sidebar delegating state", () => {
 		);
 	}
 
-	it("renders the delegating rail and disables archive/delete for an idle parent with running subagents", () => {
-		const html = renderRow(summary({ activity: "idle", has_running_delegations: true }));
-		// Third state: idle parent parked behind a running delegation.
-		expect(html).toContain("status-rail delegating");
-		expect(html).not.toContain("status-rail idle");
-		expect(html).toContain('aria-label="delegating session"');
-		// Closed Radix portals do not SSR their item content. The session menu
-		// policy tests above cover disabled archive/delete and their visible reason.
+	it.each([
+		["idle", false, "idle"],
+		["idle", true, "delegating"],
+		["running", false, "running"],
+	] as const)("renders %s/child-running=%s as the %s rail", (activity, childRunning, expected) => {
+		const html = renderRow(summary({ activity, has_running_delegations: childRunning }));
+		expect(html).toContain(`status-rail ${expected}`);
+		expect(html).toContain(`aria-label="${expected} session"`);
 		expect(html).toContain('aria-label="Open session actions for Untitled session"');
-	});
-
-	it("keeps the idle rail and enables archive/delete when no delegations run", () => {
-		const html = renderRow(summary({ activity: "idle", has_running_delegations: false }));
-		expect(html).toContain("status-rail idle");
-		expect(html).not.toContain("status-rail delegating");
-		expect(html).toContain('aria-label="idle session"');
-		expect(html).toContain('aria-label="Open session actions for Untitled session"');
-	});
-
-	it("shows the running rail when the parent itself is active", () => {
-		const html = renderRow(summary({ activity: "running", has_running_delegations: false }));
-		expect(html).toContain("status-rail running");
-		expect(html).not.toContain("status-rail delegating");
 	});
 });

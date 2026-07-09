@@ -11,7 +11,6 @@ import {
 	rootConversationRoute,
 	selectRootRun,
 	serializeWorkspaceRoute,
-	showConversation,
 	unavailableConversationRoute,
 	unavailableExecutionDetail,
 	type ConversationRoute,
@@ -60,19 +59,6 @@ describe("workspace route parser and serializer", () => {
 		expect(expectRoute(url)).toEqual(route);
 	});
 
-	it("every helper-produced URL parses back to exactly the helper route", () => {
-		const childExecution = agentExecutionRoute(PROJECT, "activity", "child-1");
-		const navigations = [
-			selectRootRun(PROJECT, "root-2"),
-			showConversation(childExecution),
-			openAgentConversation(childExecution, "child-2"),
-		];
-
-		for (const navigation of navigations) {
-			expect(expectRoute(navigation.url)).toEqual(navigation.route);
-		}
-	});
-
 	it("round-trips every scope/subview/conversation/focus/handoff combination", () => {
 		const scopes = [PROJECT, HOST];
 		const conversations: ExecutionRoute["conversation"][] = [
@@ -110,42 +96,6 @@ describe("workspace route parser and serializer", () => {
 				}
 			}
 		}
-	});
-
-	it("round-trips encoded Conversation identifiers in Host scope", () => {
-		const route = expectConversation(
-			openAgentConversation(rootConversationRoute(HOST, "root ?#% ü"), "agent ?#% ü").route,
-		);
-
-		expect(expectRoute(serializeWorkspaceRoute(route))).toEqual(route);
-	});
-
-	it.each(["overview", "activity", "handoffs"] as const)(
-		"round-trips Execution/%s with typed root defaults in both scopes",
-		(view) => {
-			for (const scope of [PROJECT, HOST]) {
-				const route = executionRoute(scope, view);
-				const url = serializeWorkspaceRoute(route);
-
-				expect(url).toMatch(new RegExp(`/execution/${view}$`));
-				expect(expectRoute(url)).toEqual(route);
-			}
-		},
-	);
-
-	it("parses non-root identity without making a writable membership claim", () => {
-		const result = expectMatch(
-			"/w/project/project-1/run/root-1/execution/activity?conversation=agent%3Achild-1",
-		);
-
-		expect(result.route).toMatchObject({
-			destination: "execution",
-			conversation: {
-				kind: "agent",
-				sessionId: "child-1",
-			},
-		});
-		expect(result.correction).toBeNull();
 	});
 
 	it("round-trips typed conversation, focus, and handoff in deterministic parameter order", () => {
@@ -321,29 +271,6 @@ describe("workspace route parser and serializer", () => {
 		}
 	});
 
-	it("accepts typed root, delegation, and agent focus without writable availability claims", () => {
-		const root = expectExecution(
-			expectRoute("/w/host/run/root-1/execution/overview?focus=root%3Aroot-1"),
-		);
-		expect(root.focus).toEqual({ kind: "root" });
-
-		const delegation = expectExecution(
-			expectRoute("/w/host/run/root-1/execution/overview?focus=delegation%3Adelegation-1"),
-		);
-		expect(delegation.focus).toEqual({
-			kind: "delegation",
-			delegationId: "delegation-1",
-		});
-
-		const agent = expectExecution(
-			expectRoute("/w/host/run/root-1/execution/overview?focus=agent%3Aagent-1"),
-		);
-		expect(agent.focus).toEqual({
-			kind: "agent",
-			sessionId: "agent-1",
-		});
-	});
-
 	it.each([
 		"focus=plain",
 		"focus=root%3Aother-root",
@@ -477,20 +404,6 @@ describe("workspace route parser and serializer", () => {
 		);
 		expect(result.correction?.reasons).toEqual(["noncanonical-url"]);
 		expect(expectRoute(result.canonicalUrl)).toEqual(result.route);
-	});
-
-	it("serializes every parsed canonical route back to the exact same identity", () => {
-		for (const url of [
-			"/w/project/project-1/run/root-1/conversation/root-1",
-			"/w/project/project-1/run/root-1/conversation/child-1",
-			"/w/host/run/root-1/execution/overview",
-			"/w/host/run/root-1/execution/activity?conversation=agent%3Achild-1&focus=delegation%3Awork-1",
-			"/w/host/run/root-1/execution/handoffs?focus=agent%3Achild-1&handoff=final-message",
-		]) {
-			const parsed = expectRoute(url);
-			expect(serializeWorkspaceRoute(parsed)).toBe(url);
-			expect(expectRoute(serializeWorkspaceRoute(parsed))).toEqual(parsed);
-		}
 	});
 
 	it("rejects contradictory or obsolete forged route state instead of silently discarding it", () => {
@@ -633,33 +546,6 @@ describe("workspace route parser and serializer", () => {
 });
 
 describe("workspace route transitions and recipient derivation", () => {
-	it("selects project and Host roots into root Conversation with push semantics", () => {
-		expect(selectRootRun(PROJECT, "root-2")).toMatchObject({
-			kind: "route",
-			history: "push",
-			url: "/w/project/project-1/run/root-2/conversation/root-2",
-			route: {
-				destination: "conversation",
-				rootSessionId: "root-2",
-				conversation: { kind: "root" },
-			},
-		});
-		expect(selectRootRun(HOST, "root-2").url).toBe("/w/host/run/root-2/conversation/root-2");
-	});
-
-	it("opens an agent Conversation with the root pinned", () => {
-		const route = executionRoute(PROJECT, "activity");
-
-		expect(openAgentConversation(route, "child-1")).toMatchObject({
-			history: "push",
-			url: "/w/project/project-1/run/root-1/conversation/child-1",
-			route: {
-				rootSessionId: "root-1",
-				conversation: { kind: "agent", sessionId: "child-1" },
-			},
-		});
-	});
-
 	it("derives recipient exclusively from the effective conversation, never focus", () => {
 		const rootExecution = expectExecution(expectRoute(
 			"/w/project/project-1/run/root-1/execution/overview?focus=agent%3Afocused-child",

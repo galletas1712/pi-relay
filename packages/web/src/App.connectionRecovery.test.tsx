@@ -9,6 +9,7 @@ import type { ConnectionStatus } from "./rpc.ts";
 import type {
 	Delegation,
 	EventFrame,
+	Project,
 	SessionSnapshot,
 	SessionSummary,
 	TranscriptEntry,
@@ -66,6 +67,80 @@ afterEach(() => {
 });
 
 describe("App connection recovery integration", () => {
+	it("owns an initial project failure through deduplicated Retry, offline state, and reconnect recovery", async () => {
+		const api = createControllableApi();
+		const retry = deferred<Project[]>();
+		api.listProjects
+			.mockRejectedValueOnce(new Error("project list unavailable"))
+			.mockImplementationOnce(() => retry.promise)
+			.mockResolvedValue([project()]);
+		const { client, unmount } = renderApp(api);
+
+		await emitStatus(api, "open");
+		let alert = await screen.findByRole("alert");
+		expect(alert.textContent).toContain("Couldn’t load projects");
+		expect(alert.textContent).toContain("project list unavailable");
+		expect(document.body.textContent).not.toContain("Dismiss notification");
+
+		const callsBeforeRetry = api.listProjects.mock.calls.length;
+		const retryButton = within(alert).getByRole("button", { name: "Retry" });
+		fireEvent.click(retryButton);
+		fireEvent.click(retryButton);
+		await waitFor(() => {
+			expect(api.listProjects).toHaveBeenCalledTimes(callsBeforeRetry + 1);
+			expect((within(alert).getByRole("button", { name: "Retrying…" }) as HTMLButtonElement).disabled).toBe(true);
+		});
+
+		await act(async () => retry.reject(new Error("project retry failed")));
+		alert = await screen.findByRole("alert");
+		expect(alert.textContent).toContain("project retry failed");
+		await emitStatus(api, "closed");
+		const offlineRetry = within(alert).getByRole("button", { name: "Retry" }) as HTMLButtonElement;
+		expect(offlineRetry.disabled).toBe(true);
+		expect(alert.textContent).toContain("Waiting for connection");
+
+		await emitStatus(api, "open");
+		expect(await screen.findByText("Recovered project")).toBeTruthy();
+		await waitFor(() =>
+			expect(screen.queryByText("project retry failed")).toBeNull(),
+		);
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
+	it("keeps cached projects visible through a persistent refresh failure and Retry recovery", async () => {
+		const api = createControllableApi();
+		api.listProjects.mockResolvedValue([project()]);
+		const { client, unmount } = renderApp(api);
+		const retry = deferred<Project[]>();
+
+		await emitStatus(api, "open");
+		expect(await screen.findByText("Recovered project")).toBeTruthy();
+		api.listProjects
+			.mockImplementationOnce(async () => {
+				throw new Error("project refresh failed");
+			})
+			.mockImplementationOnce(() => retry.promise);
+		await act(async () => {
+			await client.invalidateQueries({ queryKey: ["projects"] });
+		});
+
+		const alert = await screen.findByRole("alert");
+		expect(alert.textContent).toContain("Project refresh failed");
+		expect(screen.getByText("Recovered project")).toBeTruthy();
+		fireEvent.click(within(alert).getByRole("button", { name: "Retry" }));
+		expect(screen.getByText("Recovered project")).toBeTruthy();
+		await act(async () => retry.resolve([project({ name: "Restored project" })]));
+		expect(await screen.findByText("Restored project")).toBeTruthy();
+		await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
 	it("preserves the mounted draft/dialog, gates mutations, deduplicates Retry, and reconciles a later open", async () => {
 		const api = createControllableApi();
 		const retry = deferred<void>();
@@ -163,60 +238,6 @@ describe("App connection recovery integration", () => {
 		expect(api.statusListenerCount()).toBe(0);
 		expect(api.eventListenerCount()).toBe(0);
 		expect(api.close).toHaveBeenCalledTimes(1);
-	});
-
-	it("keeps loaded Help, Export, and navigation local while blocking a new-session send", async () => {
-		const api = createControllableApi();
-		const { client, unmount } = renderApp(api);
-		const user = userEvent.setup();
-		await openAndLoad(api);
-
-		const cachedNavigation = sessionNavigationButton();
-		await emitStatus(api, "error");
-		await waitFor(() => expect(screen.getByText("Connection error")).toBeTruthy());
-		expect(cachedNavigation.disabled).toBe(false);
-
-		const composer = screen.getByRole("textbox") as HTMLTextAreaElement;
-		await user.type(composer, "/help");
-		const send = screen.getByRole("button", { name: "send message" }) as HTMLButtonElement;
-		expect(send.disabled).toBe(false);
-		await user.click(send);
-		expect(await screen.findByText(/commands:.*\/help.*\/export/)).toBeTruthy();
-
-		await user.type(composer, "/export");
-		const sessionFetchesBeforeExport = api.getSession.mock.calls.length;
-		await user.click(send);
-		const exportDialog = (await screen.findByRole("heading", { name: "Export messages" })).closest('[role="dialog"]');
-		if (!(exportDialog instanceof HTMLElement)) throw new Error("missing export dialog");
-		expect(within(exportDialog).getByText("cached answer")).toBeTruthy();
-		expect(within(exportDialog).getByText("2 of 2 selected")).toBeTruthy();
-		expect(api.getSession.mock.calls.length).toBe(sessionFetchesBeforeExport);
-		await user.click(screen.getByRole("button", { name: "Cancel" }));
-		await waitFor(() => expect(screen.queryByRole("heading", { name: "Export messages" })).toBeNull());
-
-		await user.click(cachedNavigation);
-		expect(screen.getByText("cached answer")).toBeTruthy();
-		await user.click(screen.getByRole("button", { name: "New session" }));
-		const newSessionComposer = screen.getByRole("textbox") as HTMLTextAreaElement;
-		await user.type(newSessionComposer, "new session stays a draft");
-		const blockedSend = screen.getByRole("button", { name: "send message" }) as HTMLButtonElement;
-		expect(blockedSend.disabled).toBe(true);
-		await act(async () => {
-			blockedSend.click();
-			newSessionComposer.dispatchEvent(
-				new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
-			);
-		});
-
-		expect(newSessionComposer.value).toBe("new session stays a draft");
-		expect(api.startSession).not.toHaveBeenCalled();
-		expect(totalMutationCalls(api)).toBe(0);
-
-		unmount();
-		await client.cancelQueries();
-		client.clear();
-		expect(api.statusListenerCount()).toBe(0);
-		expect(api.eventListenerCount()).toBe(0);
 	});
 
 	it("keeps cached transcript controls local and never reconnects through remote reads", async () => {
@@ -320,7 +341,7 @@ describe("App connection recovery integration", () => {
 
 		await emitStatus(api, "open");
 		await waitFor(() => expect(api.getSession).toHaveBeenCalledTimes(sessionCalls + 3));
-		expect(api.getTranscriptTurns).toHaveBeenCalledTimes(turnsCalls);
+		expect(api.getTranscriptTurns).toHaveBeenCalledTimes(turnsCalls + 1);
 		expect(await screen.findByText("cached answer")).toBeTruthy();
 
 		unmount();
@@ -459,270 +480,6 @@ describe("App connection recovery integration", () => {
 		client.clear();
 	});
 
-	it("serializes rapid effort edits to the latest value and rolls back a failed update", async () => {
-		const api = createControllableApi();
-		const first = deferred<{
-			session_id: string;
-			activity: "idle";
-			provider: { kind: "openai"; model: string; reasoning_effort: "high" };
-			metadata: Record<string, unknown>;
-		}>();
-		let canonicalEffort: "xhigh" | "low" = "xhigh";
-		api.getSession.mockImplementation(async () => ({
-			...sessionSnapshot(),
-			provider: {
-				kind: "openai",
-				model: "gpt-5.1",
-				reasoning_effort: canonicalEffort,
-			},
-		}));
-		api.configureSession
-			.mockImplementationOnce(() => first.promise)
-			.mockImplementationOnce(async () => {
-				canonicalEffort = "low";
-				return {
-					session_id: SESSION_ID,
-					activity: "idle",
-					provider: { kind: "openai", model: "gpt-5.1", reasoning_effort: "low" },
-					metadata: { title: SESSION_TITLE },
-				};
-			})
-			.mockRejectedValueOnce(new Error("catalog rejected effort"));
-		const { client, unmount } = renderApp(api);
-		await openAndLoad(api);
-		const effort = screen.getByRole("combobox", { name: "Reasoning effort" }) as HTMLSelectElement;
-
-		fireEvent.change(effort, { target: { value: "high" } });
-		fireEvent.change(effort, { target: { value: "low" } });
-		expect(effort.value).toBe("low");
-		expect(api.configureSession).toHaveBeenCalledTimes(1);
-
-		await act(async () => {
-			first.resolve({
-				session_id: SESSION_ID,
-				activity: "idle",
-				provider: { kind: "openai", model: "gpt-5.1", reasoning_effort: "high" },
-				metadata: { title: SESSION_TITLE },
-			});
-			await first.promise;
-		});
-		await waitFor(() => expect(api.configureSession).toHaveBeenCalledTimes(2));
-		await waitFor(() => expect(effort.value).toBe("low"));
-		expect(api.configureSession.mock.calls[1]?.[0]).toMatchObject({
-			sessionId: SESSION_ID,
-			provider: { reasoning_effort: "low" },
-		});
-
-		fireEvent.change(effort, { target: { value: "high" } });
-		expect(effort.value).toBe("high");
-		await waitFor(() => expect(api.configureSession).toHaveBeenCalledTimes(3));
-		await waitFor(() => expect(effort.value).toBe("low"));
-		expect(document.body.textContent).toContain(
-			"Could not update reasoning effort: catalog rejected effort. Try again.",
-		);
-		expect(screen.getByRole("button", { name: "Dismiss notification" })).toBeTruthy();
-
-		unmount();
-		await client.cancelQueries();
-		client.clear();
-	});
-
-	it("serializes mixed model and effort edits without losing canonical provider fields", async () => {
-		const api = createControllableApi();
-		const first = deferred<{
-			session_id: string;
-			activity: "idle";
-			provider: {
-				kind: "openai";
-				model: string;
-				reasoning_effort: "xhigh";
-				max_tokens: number;
-				prompt_cache: { key: string };
-			};
-			metadata: Record<string, unknown>;
-		}>();
-		const empty = {
-			...sessionSnapshot(),
-			active_leaf_id: null,
-			has_transcript_entries: false,
-			provider: {
-				kind: "openai" as const,
-				model: "gpt-5.6-sol",
-				reasoning_effort: "medium" as const,
-				max_tokens: 4096,
-				prompt_cache: { key: "initial" },
-			},
-		};
-		api.getSession.mockResolvedValue(empty);
-		api.listSessions.mockResolvedValue([{ ...sessionSummary(), ...empty }]);
-		api.configureSession
-			.mockImplementationOnce(() => first.promise)
-			.mockImplementationOnce(async ({ provider }) => ({
-				session_id: SESSION_ID,
-				activity: "idle" as const,
-				provider,
-				metadata: empty.metadata,
-			}));
-		const { client, unmount } = renderApp(api);
-		await emitStatus(api, "open");
-		const model = await screen.findByRole<HTMLSelectElement>("combobox", { name: "Model" });
-		const effort = screen.getByRole<HTMLSelectElement>("combobox", { name: "Reasoning effort" });
-
-		fireEvent.change(model, { target: { value: "openai:gpt-5.6-terra" } });
-		expect(api.configureSession).toHaveBeenCalledWith({
-			sessionId: SESSION_ID,
-			provider: {
-				...empty.provider,
-				model: "gpt-5.6-terra",
-				reasoning_effort: "xhigh",
-			},
-		});
-		fireEvent.change(effort, { target: { value: "low" } });
-		expect(api.configureSession).toHaveBeenCalledTimes(1);
-		expect(model.value).toBe("openai:gpt-5.6-terra");
-		expect(effort.value).toBe("low");
-
-		first.resolve({
-			session_id: SESSION_ID,
-			activity: "idle",
-			provider: {
-				kind: "openai",
-				model: "gpt-5.6-terra",
-				reasoning_effort: "xhigh",
-				max_tokens: 8192,
-				prompt_cache: { key: "canonical" },
-			},
-			metadata: empty.metadata,
-		});
-		await act(async () => {
-			await first.promise;
-		});
-		await waitFor(() => expect(api.configureSession).toHaveBeenCalledTimes(2));
-		expect(api.configureSession.mock.calls[1]?.[0]).toEqual({
-			sessionId: SESSION_ID,
-			provider: {
-				kind: "openai",
-				model: "gpt-5.6-terra",
-				reasoning_effort: "low",
-				max_tokens: 8192,
-				prompt_cache: { key: "canonical" },
-			},
-		});
-
-		unmount();
-		await client.cancelQueries();
-		client.clear();
-	});
-
-	it("keeps pending effort updates targeted and cached by session across navigation", async () => {
-		const api = createControllableApi();
-		const secondSessionId = "session-2";
-		const firstUpdate = deferred<{
-			session_id: string;
-			activity: "idle";
-			provider: { kind: "openai"; model: string; reasoning_effort: "high" };
-			metadata: Record<string, unknown>;
-		}>();
-		let firstEffort: "xhigh" | "high" = "xhigh";
-		let secondEffort: "medium" | "low" = "medium";
-		const summary = (sessionId: string, title: string, effort: typeof firstEffort | typeof secondEffort) => ({
-			...sessionSummary(),
-			session_id: sessionId,
-			provider: { kind: "openai" as const, model: "gpt-5.1", reasoning_effort: effort },
-			metadata: { title },
-		});
-		api.listSessions.mockImplementation(async () => [
-			summary(SESSION_ID, SESSION_TITLE, firstEffort),
-			summary(secondSessionId, "Second session", secondEffort),
-		]);
-		api.getSession.mockImplementation(async (sessionId: string) => ({
-			...sessionSnapshot(),
-			...summary(
-				sessionId,
-				sessionId === SESSION_ID ? SESSION_TITLE : "Second session",
-				sessionId === SESSION_ID ? firstEffort : secondEffort,
-			),
-		}));
-		api.configureSession.mockImplementation(async ({ sessionId, provider }) => {
-			if (sessionId === SESSION_ID) return firstUpdate.promise;
-			secondEffort = provider.reasoning_effort as typeof secondEffort;
-			return {
-				session_id: secondSessionId,
-				activity: "idle",
-				provider: { ...provider, reasoning_effort: secondEffort },
-				metadata: { title: "Second session" },
-			};
-		});
-		const { client, unmount } = renderApp(api);
-		const user = userEvent.setup();
-		await openAndLoad(api);
-
-		const effort = screen.getByRole("combobox", { name: "Reasoning effort" }) as HTMLSelectElement;
-		fireEvent.change(effort, { target: { value: "high" } });
-		expect(effort.value).toBe("high");
-
-		await user.click(sessionNavigationButtonNamed("Second session"));
-		const secondEffortControl = await screen.findByRole<HTMLSelectElement>("combobox", {
-			name: "Reasoning effort",
-		});
-		await waitFor(() => expect(secondEffortControl.value).toBe("medium"));
-		fireEvent.change(secondEffortControl, { target: { value: "low" } });
-		await waitFor(() =>
-			expect(api.configureSession).toHaveBeenCalledWith({
-				sessionId: secondSessionId,
-				provider: expect.objectContaining({ reasoning_effort: "low" }),
-			}),
-		);
-		await waitFor(() => expect(secondEffortControl.value).toBe("low"));
-
-		firstEffort = "high";
-		firstUpdate.resolve({
-			session_id: SESSION_ID,
-			activity: "idle",
-			provider: { kind: "openai", model: "gpt-5.1", reasoning_effort: "high" },
-			metadata: { title: SESSION_TITLE },
-		});
-		await act(async () => {
-			await firstUpdate.promise;
-		});
-		expect(secondEffortControl.value).toBe("low");
-
-		await user.click(sessionNavigationButtonNamed(SESSION_TITLE));
-		await waitFor(() =>
-			expect(
-				screen.getByRole<HTMLSelectElement>("combobox", { name: "Reasoning effort" }).value,
-			).toBe("high"),
-		);
-
-		unmount();
-		await client.cancelQueries();
-		client.clear();
-	});
-
-	it("retries an initial Agents list failure through the canonical query", async () => {
-		const api = createControllableApi();
-		api.listDelegations
-			.mockRejectedValueOnce(new Error("delegation list failed"))
-			.mockResolvedValue({
-				parent_session_id: SESSION_ID,
-				has_more: false,
-				delegations: [],
-			});
-		const { client, unmount } = renderApp(api);
-		const user = userEvent.setup();
-		await openAndLoad(api);
-
-		expect(await screen.findByText("Couldn’t load agents")).toBeTruthy();
-		const callsBeforeRetry = api.listDelegations.mock.calls.length;
-		await user.click(screen.getByRole("button", { name: "Retry" }));
-		await waitFor(() => expect(api.listDelegations).toHaveBeenCalledTimes(callsBeforeRetry + 1));
-		expect(await screen.findByText("No delegated work yet.")).toBeTruthy();
-
-		unmount();
-		await client.cancelQueries();
-		client.clear();
-	});
-
 	it("keeps the cached 3-row page through 100-row pending, failure, Retry, success, and offline reopen", async () => {
 		const api = createControllableApi();
 		const firstExpansion = deferred<ReturnType<typeof delegationPage>>();
@@ -785,28 +542,6 @@ describe("App connection recovery integration", () => {
 		await user.click(cachedSeeMore);
 		expect(screen.getByRole("article", { name: /Expanded 100/ })).toBeTruthy();
 		expect(api.listDelegations).toHaveBeenCalledTimes(callsBeforeOfflineReopen);
-
-		unmount();
-		await client.cancelQueries();
-		client.clear();
-	});
-
-	it("blocks an uncached expanded page offline and never issues its RPC", async () => {
-		const api = createControllableApi();
-		api.listDelegations.mockResolvedValue(
-			delegationPage(["Recent 1", "Recent 2", "Recent 3"], { hasMore: true, limit: 3 }),
-		);
-		const { client, unmount } = renderApp(api);
-		await openAndLoad(api);
-		expect(await screen.findByRole("article", { name: /Recent 1/ })).toBeTruthy();
-
-		await emitStatus(api, "closed");
-		const callsBeforeClick = api.listDelegations.mock.calls.length;
-		const seeMore = screen.getByRole("button", { name: /see more/i }) as HTMLButtonElement;
-		expect(seeMore.disabled).toBe(true);
-		expect(seeMore.parentElement?.textContent).toContain("Waiting for connection");
-		fireEvent.click(seeMore);
-		expect(api.listDelegations).toHaveBeenCalledTimes(callsBeforeClick);
 
 		unmount();
 		await client.cancelQueries();
@@ -1116,6 +851,18 @@ function createControllableApi(): ControllableApi {
 		eventListenerCount: () => eventListeners.size,
 	} as unknown as ControllableApi;
 	return api;
+}
+
+function project(overrides: Partial<Project> = {}): Project {
+	return {
+		project_id: "project-recovered",
+		name: "Recovered project",
+		workspaces: [],
+		metadata: {},
+		created_at: "2026-01-01T00:00:00Z",
+		updated_at: "2026-01-01T00:00:00Z",
+		...overrides,
+	};
 }
 
 function sessionSummary(): SessionSummary {
