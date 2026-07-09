@@ -3410,7 +3410,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 								className="parent-session-link"
 								type="button"
 								onClick={() => selectSession(mobileParentSessionId)}
-								title={`open parent ${mobileParentSessionId}`}
+								title="Open parent conversation"
 							>
 								<ArrowUp size={12} aria-hidden />
 								parent

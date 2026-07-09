@@ -1076,7 +1076,7 @@ export function LogHeader({
 							className="parent-session-link"
 							type="button"
 							onClick={() => onSelectSession?.(parentSessionId)}
-							title={`open parent ${parentSessionId}`}
+							title="Open parent conversation"
 						>
 							<ArrowUp size={12} aria-hidden />
 							parent

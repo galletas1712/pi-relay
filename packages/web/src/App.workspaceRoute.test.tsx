@@ -202,6 +202,24 @@ describe("App workspace route identity integration", () => {
 		const recipient = await screen.findByRole("status");
 		expect(recipient.textContent).toContain("Conversation recipient: Child one");
 		expect(recipient.textContent).not.toContain("child-1");
+		const normalChildChrome = [
+			document.querySelector(".topbar"),
+			document.querySelector(".log-header"),
+			document.querySelector(".workspace-recipient-label"),
+		].filter((element): element is Element => element !== null);
+		for (const element of normalChildChrome) {
+			expect(element.textContent).not.toContain("child-1");
+			expect(element.textContent).not.toContain("root-1");
+			for (const labelledElement of element.querySelectorAll("[aria-label], [title]")) {
+				expect(labelledElement.getAttribute("aria-label") ?? "").not.toMatch(/child-1|root-1/);
+				expect(labelledElement.getAttribute("title") ?? "").not.toMatch(/child-1|root-1/);
+			}
+		}
+		const parentLinks = screen.getAllByRole("button", { name: "parent" });
+		expect(parentLinks).toHaveLength(2);
+		for (const parentLink of parentLinks) {
+			expect(parentLink.getAttribute("title")).toBe("Open parent conversation");
+		}
 		expect(api.getTranscriptTurns).toHaveBeenCalledWith("child-1", { limit: 50 });
 		expect(api.listDelegations).toHaveBeenCalledWith("root-1", 3);
 		expect(api.listDelegations.mock.calls.every(([parent]) => parent === "root-1")).toBe(true);
