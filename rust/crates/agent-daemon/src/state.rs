@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
+use crate::pull_requests::PullRequestScheduler;
 use crate::types::RuntimeSession;
 use crate::workspaces::WorkspaceManager;
 
@@ -48,6 +49,7 @@ pub(crate) struct AppState {
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) provider_connections: ProviderConnectionRegistry,
     pub(crate) session_titles: SessionTitleScheduler,
+    pub(crate) pull_requests: PullRequestScheduler,
     pub(crate) workspaces: WorkspaceManager,
     pub(crate) prompt_root: PathBuf,
     #[cfg(test)]

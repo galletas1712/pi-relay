@@ -552,7 +552,19 @@ ephemeral host sessions.
 
 Each row includes `session_id`, nullable `project_id`, `outer_cwd`, `workspaces`,
 `activity`, `active_leaf_id`, `provider`, `metadata`, `updated_at`,
-`last_user_message_timestamp_ms`, and `has_transcript_entries`. Archived rows
+`last_user_message_timestamp_ms`, `has_transcript_entries`, and cached
+`pull_requests` metadata for checked-out session-workspace branches. Each pull
+request has `number`, `status` (`draft`, `open`, or `merged`), `url`,
+`source_repository` (the source branch repository's `owner/name`), and
+`workspace_dirs` (a sorted array of every session workspace associated with the
+canonical PR URL). Discovery only includes checked-out branches that still exist
+on a configured remote, follows explicit push destinations, and supports pull
+requests whose base repository differs from the branch's source repository.
+Remote and push configuration is read only from the repository's local Git
+config with includes and URL rewrites disabled. Discovery runs asynchronously
+and fails closed, so an initial or temporarily unavailable lookup returns an
+empty array without delaying the RPC.
+Archived rows
 remain at the end of the list. Sessions without user messages sort after
 sessions that have user messages, then by creation time. Defensive listing hides
 accidental empty web-created rows that have no transcript, queued input, or

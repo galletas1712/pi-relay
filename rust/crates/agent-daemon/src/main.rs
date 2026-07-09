@@ -9,6 +9,7 @@ mod delegation_snapshot;
 mod delegation_tools;
 mod handoff;
 mod provider_runtime;
+mod pull_requests;
 mod rpc_views;
 mod runtime;
 mod session_start;
@@ -26,6 +27,7 @@ use crate::provider_runtime::{
     current_pi_template, effective_prompt_profile, provider_tools_for_session, PromptProfile,
     ProviderConnectionRegistry, SessionTitleScheduler,
 };
+use crate::pull_requests::PullRequestScheduler;
 use crate::runtime::*;
 use crate::state::AppState;
 use crate::types::*;
@@ -79,6 +81,7 @@ async fn main() -> Result<()> {
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
+        pull_requests: PullRequestScheduler::default(),
         workspaces,
         prompt_root,
         #[cfg(test)]
@@ -569,10 +572,17 @@ async fn session_list(state: &AppState, params: Value) -> std::result::Result<Va
         })
         .transpose()?;
     let sessions = state.repo.list_sessions(project_id, limit).await?;
+    let pull_requests = state.pull_requests.cached_and_schedule(state, &sessions);
     Ok(json!({
         "sessions": sessions
             .into_iter()
-            .map(rpc_views::session_summary)
+            .map(|summary| {
+                let session_pull_requests = pull_requests
+                    .get(&summary.session_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                rpc_views::session_summary(summary, session_pull_requests)
+            })
             .collect::<Vec<_>>()
     }))
 }
@@ -724,6 +734,7 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
             .remove_session(candidate_session_id)
             .await;
     }
+    state.pull_requests.remove_sessions(&delete_order);
 
     Ok(json!({
         "session_id": session_id,

@@ -8,6 +8,8 @@ use agent_store::{
 };
 use serde_json::{json, Value};
 
+use crate::pull_requests::PullRequestSummary;
+
 pub(crate) fn project(project: Project) -> Value {
     json!({
         "project_id": project.project_id,
@@ -19,7 +21,10 @@ pub(crate) fn project(project: Project) -> Value {
     })
 }
 
-pub(crate) fn session_summary(summary: SessionSummary) -> Value {
+pub(crate) fn session_summary(
+    summary: SessionSummary,
+    pull_requests: &[PullRequestSummary],
+) -> Value {
     json!({
         "session_id": summary.session_id,
         "project_id": summary.project_id,
@@ -35,6 +40,7 @@ pub(crate) fn session_summary(summary: SessionSummary) -> Value {
         "last_user_message_timestamp_ms": summary.last_user_message_timestamp_ms,
         "has_transcript_entries": summary.has_transcript_entries,
         "has_running_delegations": summary.has_running_delegations,
+        "pull_requests": pull_requests,
     })
 }
 
@@ -253,9 +259,11 @@ fn now_ms() -> u64 {
 mod tests {
     use agent_store::{
         InputPriority, QueueState, QueuedInputContent, QueuedInputRecord, QueuedInputStatus,
-        SessionActivity,
+        SessionActivity, SessionSummary,
     };
-    use agent_vocab::UserMessage;
+    use agent_vocab::{ProviderConfig, ProviderKind, ReasoningEffort, UserMessage};
+
+    use crate::pull_requests::{PullRequestStatus, PullRequestSummary};
 
     #[test]
     fn queue_view_does_not_expose_internal_provider_routes() {
@@ -280,5 +288,83 @@ mod tests {
         assert!(queued.get("provider_config").is_none());
         assert!(queued.get("provider").is_none());
         assert!(queued.get("route").is_none());
+    }
+
+    #[test]
+    fn session_summary_serializes_pull_request_statuses() {
+        let value = super::session_summary(
+            SessionSummary {
+                session_id: "session".to_string(),
+                project_id: None,
+                parent_session_id: None,
+                outer_cwd: "/tmp/session".to_string(),
+                workspaces: Vec::new(),
+                activity: SessionActivity::Idle,
+                active_leaf_id: None,
+                provider: ProviderConfig {
+                    kind: ProviderKind::OpenAi,
+                    model: "gpt-test".to_string(),
+                    reasoning_effort: ReasoningEffort::Medium,
+                    max_tokens: None,
+                    prompt_cache: None,
+                },
+                metadata: serde_json::json!({}),
+                created_at: "created".to_string(),
+                updated_at: "updated".to_string(),
+                last_user_message_timestamp_ms: None,
+                has_transcript_entries: false,
+                has_running_delegations: false,
+            },
+            &[
+                PullRequestSummary {
+                    number: 1,
+                    status: PullRequestStatus::Draft,
+                    url: "https://example.test/pull/1".to_string(),
+                    workspace_dirs: vec!["repo-a".to_string()],
+                    source_repository: "example/repo".to_string(),
+                },
+                PullRequestSummary {
+                    number: 2,
+                    status: PullRequestStatus::Open,
+                    url: "https://example.test/pull/2".to_string(),
+                    workspace_dirs: vec!["repo-a".to_string(), "repo-b".to_string()],
+                    source_repository: "example/repo".to_string(),
+                },
+                PullRequestSummary {
+                    number: 3,
+                    status: PullRequestStatus::Merged,
+                    url: "https://example.test/pull/3".to_string(),
+                    workspace_dirs: vec!["repo-b".to_string()],
+                    source_repository: "example/repo".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            value["pull_requests"],
+            serde_json::json!([
+                {
+                    "number": 1,
+                    "status": "draft",
+                    "url": "https://example.test/pull/1",
+                    "workspace_dirs": ["repo-a"],
+                    "source_repository": "example/repo",
+                },
+                {
+                    "number": 2,
+                    "status": "open",
+                    "url": "https://example.test/pull/2",
+                    "workspace_dirs": ["repo-a", "repo-b"],
+                    "source_repository": "example/repo",
+                },
+                {
+                    "number": 3,
+                    "status": "merged",
+                    "url": "https://example.test/pull/3",
+                    "workspace_dirs": ["repo-b"],
+                    "source_repository": "example/repo",
+                },
+            ])
+        );
     }
 }

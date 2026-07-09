@@ -28,6 +28,14 @@ export interface SessionWorkspace extends ProjectWorkspace {
 	local_branch?: string;
 }
 
+export interface PullRequestSummary {
+	number: number;
+	status: "draft" | "open" | "merged";
+	url: string;
+	workspace_dirs: string[];
+	source_repository: string;
+}
+
 export interface SessionSummary {
 	session_id: string;
 	project_id: string | null;
@@ -45,6 +53,7 @@ export interface SessionSummary {
 	last_user_message_timestamp_ms?: number | null;
 	has_transcript_entries?: boolean;
 	has_running_delegations?: boolean;
+	pull_requests?: PullRequestSummary[];
 }
 
 export interface PendingAction {

@@ -1,3 +1,4 @@
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
 	Archive,
 	ArchiveRestore,
@@ -11,6 +12,9 @@ import {
 	CircleX,
 	Clock3,
 	Folder,
+	GitMerge,
+	GitPullRequest,
+	GitPullRequestDraft,
 	Loader2,
 	PanelRightOpen,
 	Plus,
@@ -55,6 +59,7 @@ import {
 import type {
 	Notice,
 	Project,
+	PullRequestSummary,
 	ReasoningEffort,
 	SessionSnapshot,
 	Delegation,
@@ -941,11 +946,154 @@ export function SessionRow({
 					<span className="session-sub">{session.provider.model}</span>
 				</span>
 			</button>
+			{session.pull_requests?.length ? (
+				<span className="session-pr-association">
+					<PullRequestAssociation pullRequests={session.pull_requests} />
+				</span>
+			) : null}
 			<ActionMenu
 				triggerLabel={`Open session actions for ${title}`}
 				items={sessionMenuItems({ archived, canArchive, canDelete, onRename, onArchiveToggle, onDelete, mutationBlockedReason })}
 			/>
 		</li>
+	);
+}
+
+function PullRequestAssociation({ pullRequests }: { pullRequests: PullRequestSummary[] }) {
+	if (pullRequests.length === 0) return null;
+	const associations = pullRequests.reduce(
+		(total, pullRequest) => total + pullRequest.workspace_dirs.length,
+		0,
+	);
+	if (pullRequests.length === 1 && associations === 1) {
+		const pullRequest = pullRequests[0];
+		const label = pullRequestLabel(pullRequest, pullRequest.workspace_dirs[0]);
+		return (
+			<a
+				className={`session-pr-pill ${pullRequest.status}`}
+				href={pullRequest.url}
+				target="_blank"
+				rel="noreferrer"
+				aria-label={label}
+				title={label}
+				onClick={(event) => event.stopPropagation()}
+			>
+				<PullRequestStatusIcon status={pullRequest.status} size={11} />
+				<span className="session-pr-workspace">{pullRequest.workspace_dirs[0]}</span>
+				<span aria-hidden="true">· #{pullRequest.number}</span>
+			</a>
+		);
+	}
+
+	const groups = groupPullRequestsByWorkspace(pullRequests);
+	const triggerLabel = `${pullRequests.length} ${pullRequests.length === 1 ? "PR" : "PRs"}`;
+	const triggerDescription = `${triggerLabel} across ${groups.length} ${groups.length === 1 ? "workspace" : "workspaces"}; show pull request details`;
+	return (
+		<DropdownMenu.Root>
+			<DropdownMenu.Trigger asChild>
+				<button
+					className="session-pr-pill session-pr-summary"
+					type="button"
+					aria-label={triggerDescription}
+					title={triggerDescription}
+					onClick={(event) => event.stopPropagation()}
+				>
+					<GitPullRequest size={11} aria-hidden />
+					<span aria-hidden="true">{triggerLabel}</span>
+				</button>
+			</DropdownMenu.Trigger>
+			<DropdownMenu.Portal>
+				<DropdownMenu.Content
+					className="session-pr-menu"
+					align="start"
+					sideOffset={4}
+					collisionPadding={8}
+					aria-label="Pull requests by workspace"
+					onEscapeKeyDown={(event) => event.stopPropagation()}
+					onClick={(event) => event.stopPropagation()}
+				>
+					{groups.map(([workspaceDir, workspacePullRequests]) => (
+						<DropdownMenu.Group key={workspaceDir}>
+							<DropdownMenu.Label className="session-pr-menu-workspace" title={workspaceDir}>
+								{workspaceDir}
+							</DropdownMenu.Label>
+							{workspacePullRequests.map((pullRequest) => {
+								const label = pullRequestLabel(pullRequest, workspaceDir);
+								return (
+									<DropdownMenu.Item key={pullRequest.url} asChild>
+										<a
+											className={`session-pr-menu-item ${pullRequest.status}`}
+											href={pullRequest.url}
+											target="_blank"
+											rel="noreferrer"
+											aria-label={label}
+											title={label}
+											onClick={(event) => event.stopPropagation()}
+										>
+											<PullRequestStatusIcon status={pullRequest.status} size={14} />
+											<span>#{pullRequest.number}</span>
+											<span className="session-pr-menu-status">{pullRequestStatusLabel(pullRequest.status)}</span>
+										</a>
+									</DropdownMenu.Item>
+								);
+							})}
+						</DropdownMenu.Group>
+					))}
+				</DropdownMenu.Content>
+			</DropdownMenu.Portal>
+		</DropdownMenu.Root>
+	);
+}
+
+function groupPullRequestsByWorkspace(
+	pullRequests: PullRequestSummary[],
+): Array<[string, PullRequestSummary[]]> {
+	const groups = new Map<string, PullRequestSummary[]>();
+	for (const pullRequest of pullRequests) {
+		for (const workspaceDir of [...pullRequest.workspace_dirs].sort()) {
+			const group = groups.get(workspaceDir) ?? [];
+			group.push(pullRequest);
+			groups.set(workspaceDir, group);
+		}
+	}
+	return [...groups.entries()]
+		.sort(([left], [right]) => compareStrings(left, right))
+		.map(([workspaceDir, group]) => [
+			workspaceDir,
+			group.sort((left, right) => left.number - right.number || compareStrings(left.url, right.url)),
+		]);
+}
+
+function compareStrings(left: string, right: string): number {
+	return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function pullRequestStatusLabel(status: PullRequestSummary["status"]): string {
+	if (status === "open") return "ready for review";
+	return status;
+}
+
+function pullRequestLabel(pullRequest: PullRequestSummary, workspaceDir: string): string {
+	return `${workspaceDir}: ${pullRequestStatusLabel(pullRequest.status)} pull request #${pullRequest.number} from ${pullRequest.source_repository}`;
+}
+
+function PullRequestStatusIcon({
+	status,
+	size,
+}: {
+	status: PullRequestSummary["status"];
+	size: number;
+}) {
+	const Icon =
+		status === "draft"
+			? GitPullRequestDraft
+			: status === "merged"
+				? GitMerge
+				: GitPullRequest;
+	return (
+		<span className={`session-pr-status-icon ${status}`} aria-hidden="true">
+			<Icon size={size} />
+		</span>
 	);
 }
 

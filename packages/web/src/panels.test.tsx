@@ -441,4 +441,66 @@ describe("SessionRow sidebar delegating state", () => {
 		expect(html).toContain(`aria-label="${expected} session"`);
 		expect(html).toContain('aria-label="Open session actions for Untitled session"');
 	});
+
+	it("keeps the model subtitle and renders one workspace-aware direct PR link", () => {
+		const html = renderRow(summary({
+			pull_requests: [
+				{
+					number: 14,
+					status: "draft",
+					url: "https://github.com/example/repo/pull/14",
+					workspace_dirs: ["extremely-long-workspace-directory"],
+					source_repository: "example/repo",
+				},
+			],
+		}));
+
+		expect(html).toContain("gpt-test");
+		expect(html).toContain('<a class="session-pr-pill draft"');
+		expect(html).toContain('href="https://github.com/example/repo/pull/14"');
+		expect(html).toContain(
+			'aria-label="extremely-long-workspace-directory: draft pull request #14 from example/repo"',
+		);
+		expect(html).toContain('title="extremely-long-workspace-directory: draft pull request #14 from example/repo"');
+		expect(html).toContain('class="lucide lucide-git-pull-request-draft"');
+		expect(html).toContain("extremely-long-workspace-directory");
+		expect(html).toContain("· #14");
+	});
+
+	it("renders one summary control for multiple PRs or duplicate workspace attribution", () => {
+		const multiple = renderRow(summary({
+			pull_requests: [
+				{
+					number: 18,
+					status: "open",
+					url: "https://github.com/example/repo/pull/18",
+					workspace_dirs: ["repo-a"],
+					source_repository: "example/repo",
+				},
+				{
+					number: 11,
+					status: "merged",
+					url: "https://github.com/example/repo/pull/11",
+					workspace_dirs: ["repo-b"],
+					source_repository: "example/repo",
+				},
+			],
+		}));
+		expect(multiple).toContain('aria-label="2 PRs across 2 workspaces; show pull request details"');
+		expect(multiple).toContain(">2 PRs<");
+		expect(multiple).not.toContain(">#18<");
+		expect(multiple).not.toContain(">#11<");
+
+		const shared = renderRow(summary({
+			pull_requests: [{
+				number: 18,
+				status: "open",
+				url: "https://github.com/example/repo/pull/18",
+				workspace_dirs: ["repo-a", "repo-b"],
+				source_repository: "example/repo",
+			}],
+		}));
+		expect(shared).toContain('aria-label="1 PR across 2 workspaces; show pull request details"');
+		expect(shared).toContain(">1 PR<");
+	});
 });
