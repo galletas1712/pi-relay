@@ -1,5 +1,4 @@
 import { displayParentIdForEntry, displayParentIdForNode } from "./displayParent.ts";
-import { branchEntriesFor } from "./historyTargets.ts";
 import {
 	activeBranchIdsForSnapshot,
 	appendActiveBranchEntries,
@@ -27,7 +26,13 @@ import type {
 } from "./types.ts";
 
 export type { SelectedSessionCache } from "./selectedSessionCache/types.ts";
-export { applyTranscriptTurns, applyTurnDetail, turnCardsInOrder, turnDetailEntries } from "./selectedSessionCache/turns.ts";
+export {
+	applyTranscriptTurns,
+	applyTurnDetail,
+	prependTranscriptTurns,
+	turnCardsInOrder,
+	turnDetailEntries,
+} from "./selectedSessionCache/turns.ts";
 
 export function emptySelectedSessionCache(sessionId: string | null = null): SelectedSessionCache {
 	return {
@@ -46,11 +51,62 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		turnCardsById: new Map(),
 		turnOrder: [],
 		turnDetailsById: new Map(),
+		transcriptTurnsLoaded: false,
+		turnPageHydrationRevision: 0,
 		turnTranscriptRevision: null,
 		turnActiveLeafId: null,
 		turnHasMoreBefore: false,
 		turnBeforeEntryId: null,
 	};
+}
+
+export function hasUsableSelectedSessionCache(
+	cache: SelectedSessionCache,
+	sessionId: string | null = cache.sessionId,
+): boolean {
+	if (!sessionId || cache.sessionId !== sessionId || !cache.snapshot || !cache.transcriptTurnsLoaded) return false;
+	return (
+		cache.turnTranscriptRevision === (cache.snapshot.transcript_revision ?? null) &&
+		cache.turnActiveLeafId === (cache.snapshot.active_leaf_id ?? null)
+	);
+}
+
+export interface SelectedSessionRefreshFence {
+	cache: SelectedSessionCache;
+	sessionId: string | null;
+	sessionRevision: number | null;
+	queueRevision: number | null;
+	transcriptRevision: number | null;
+	lastEventId: number | null;
+}
+
+export function captureSelectedSessionRefresh(cache: SelectedSessionCache): SelectedSessionRefreshFence {
+	return {
+		cache,
+		sessionId: cache.sessionId,
+		sessionRevision: cache.snapshot?.session_revision ?? null,
+		queueRevision: cache.snapshot?.queue_revision ?? null,
+		transcriptRevision: cache.snapshot?.transcript_revision ?? null,
+		lastEventId: cache.snapshot?.last_event_id ?? null,
+	};
+}
+
+export function commitSelectedSessionRefresh(
+	fence: SelectedSessionRefreshFence,
+	current: SelectedSessionCache,
+	staged: SelectedSessionCache,
+): { cache: SelectedSessionCache; committed: boolean } {
+	const currentMatchesStart =
+		current === fence.cache &&
+		current.sessionId === fence.sessionId &&
+		(current.snapshot?.session_revision ?? null) === fence.sessionRevision &&
+		(current.snapshot?.queue_revision ?? null) === fence.queueRevision &&
+		(current.snapshot?.transcript_revision ?? null) === fence.transcriptRevision &&
+		(current.snapshot?.last_event_id ?? null) === fence.lastEventId;
+	if (!currentMatchesStart || staged.sessionId !== fence.sessionId) {
+		return { cache: current, committed: false };
+	}
+	return { cache: staged, committed: true };
 }
 
 export function selectedEntries(cache: SelectedSessionCache): TranscriptEntry[] {
@@ -383,16 +439,51 @@ export function activeBranchFromTreeBodies(cache: SelectedSessionCache): Transcr
 	});
 }
 
-export function fullTreeEntriesFromKnownBodies(cache: SelectedSessionCache): TranscriptEntry[] {
-	return cache.treeOrder.flatMap((id) => {
-		const entry = cache.entriesById.get(id);
-		return entry ? [entry] : [];
-	});
-}
-
 export function activeBranchEntriesForExport(cache: SelectedSessionCache): TranscriptEntry[] {
-	const known = fullTreeEntriesFromKnownBodies(cache);
-	return known.length > 0 ? branchEntriesFor(known, cache.snapshot?.active_leaf_id ?? null) : selectedEntries(cache);
+	const snapshot = cache.snapshot;
+	if (!cache.sessionId || !snapshot || snapshot.session_id !== cache.sessionId) return [];
+
+	const loaded: { entry: TranscriptEntry; order: number }[] = [];
+	const seen = new Set<string>();
+	const add = (entry: TranscriptEntry | undefined) => {
+		if (!entry || seen.has(entry.id)) return;
+		seen.add(entry.id);
+		loaded.push({ entry, order: loaded.length });
+	};
+
+	if (hasUsableSelectedSessionCache(cache)) {
+		for (const cardId of cache.turnOrder) {
+			for (const entryId of cache.turnDetailsById.get(cardId) ?? []) {
+				add(cache.entriesById.get(entryId));
+			}
+			const card = cache.turnCardsById.get(cardId);
+			if (!card) continue;
+			for (const entry of card.user_messages) add(entry);
+			add(card.assistant_message ?? undefined);
+		}
+	}
+
+	for (const entry of selectedEntries(cache)) add(entry);
+	const treeMatchesSelectedBranch =
+		cache.treeComplete &&
+		cache.treeActiveLeafId === (snapshot.active_leaf_id ?? null) &&
+		cache.treeTranscriptRevision === (snapshot.transcript_revision ?? null);
+	if (treeMatchesSelectedBranch) {
+		for (const entry of activeBranchFromTreeBodies(cache)) add(entry);
+	}
+
+	const allHaveSequence = loaded.every(({ entry }) => typeof entry.sequence === "number");
+	return loaded
+		.sort((left, right) => {
+			if (allHaveSequence && left.entry.sequence !== right.entry.sequence) {
+				return left.entry.sequence! - right.entry.sequence!;
+			}
+			if (left.entry.timestamp_ms !== right.entry.timestamp_ms) {
+				return left.entry.timestamp_ms - right.entry.timestamp_ms;
+			}
+			return left.order - right.order;
+		})
+		.map(({ entry }) => entry);
 }
 
 function buildTreeChildren(order: string[], byId: Map<string, TranscriptTreeNode>): Map<string | null, string[]> {

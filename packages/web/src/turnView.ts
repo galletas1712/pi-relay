@@ -169,18 +169,6 @@ export function terminalModelStep(turn: TurnView): ModelStepView | null {
 	return turn.modelSteps.at(-1) ?? null;
 }
 
-export function turnForBoundaryEntry(turns: TurnView[], entryId: string): TurnView | null {
-	return turns.find((turn) => turn.boundaryEntry?.id === entryId) ?? null;
-}
-
-export function modelStepForEntry(turns: TurnView[], entryId: string): ModelStepView | null {
-	for (const turn of turns) {
-		const match = turn.modelSteps.find((step) => step.entry.id === entryId);
-		if (match) return match;
-	}
-	return null;
-}
-
 export function userMessageExportText(entry: UserTranscriptEntry): string {
 	return contentBlocksToText(entry.item.content).trim();
 }

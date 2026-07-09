@@ -130,6 +130,7 @@ pub(super) async fn run_tool_turn(
                 agent_input_from_queued_priority(queued.priority, queued.content.clone());
             let enqueue_result = {
                 let mut runtime = active.lock().await;
+                queued.route.apply_to(&mut runtime.config);
                 runtime.session.enqueue_input(agent_input)
             };
             if let Err(error) = enqueue_result {

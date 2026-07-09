@@ -72,7 +72,16 @@ pub(super) async fn spawn_model_dispatch(
     dispatch: DispatchAction,
     already_claimed: bool,
 ) -> Result<Option<TaskRegistrationId>, TaskRegistrationRejected> {
-    if session_uses_harness(&dispatch.config) {
+    let uses_harness = session_uses_harness(&dispatch.config);
+    #[cfg(test)]
+    let uses_harness = uses_harness
+        && dispatch
+            .config
+            .metadata
+            .pointer("/fault_injection/force_harness_model_dispatch")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true);
+    if uses_harness {
         return Ok(None);
     }
     if is_shutting_down(&state) {

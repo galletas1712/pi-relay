@@ -1,4 +1,16 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type UIEvent } from "react";
+import {
+	memo,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+	type KeyboardEvent as ReactKeyboardEvent,
+	type PointerEvent as ReactPointerEvent,
+	type ReactNode,
+	type UIEvent,
+} from "react";
 import { AlertTriangle, Check, ChevronDown, ChevronUp, Copy, Loader2, Plus, RotateCcw, Terminal } from "lucide-react";
 import rehypeRaw from "rehype-raw";
 import rehypeHighlight from "rehype-highlight";
@@ -6,6 +18,7 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { branchEntriesFor } from "./historyTargets.ts";
+import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { MermaidBlock } from "./mermaidBlock.tsx";
 import { contentBlocksToText, firstLine } from "./text.ts";
 import { assistantMessageText, buildTurnViews } from "./turnView.ts";
@@ -53,6 +66,7 @@ type TranscriptDisplayNode =
 export interface TurnCardView {
 	card: TurnCard;
 	entries: TranscriptEntry[] | null;
+	detailCached?: boolean;
 	expanded: boolean;
 	isCurrent: boolean;
 }
@@ -66,18 +80,11 @@ const ACTIVE_SESSION_SCROLL_KEY = "__active_session__";
 const TRANSCRIPT_SCROLL_STORAGE_KEY = "piRelayTranscriptScroll:v1";
 const RECENT_TOOL_ROW_COUNT = 3;
 
-export interface ScrollPositionSnapshot {
-	scrollTop: number;
-	sticky: boolean;
-}
-
 export interface TurnJumpTargetPosition {
 	id: string;
 	top: number;
 	bottom: number;
 }
-
-export type TranscriptScrollStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
 export function isScrolledAtBottom(node: ScrollMetrics): boolean {
 	return node.scrollHeight - node.scrollTop - node.clientHeight <= STICKY_BOTTOM_EPSILON_PX;
@@ -85,22 +92,6 @@ export function isScrolledAtBottom(node: ScrollMetrics): boolean {
 
 function bottomScrollTop(node: ScrollMetrics): number {
 	return Math.max(0, node.scrollHeight - node.clientHeight);
-}
-
-export function captureScrollPosition(node: ScrollMetrics): ScrollPositionSnapshot {
-	return {
-		scrollTop: node.scrollTop,
-		sticky: isScrolledAtBottom(node)
-	};
-}
-
-export function restoreScrollPosition(node: ScrollMetrics, position: ScrollPositionSnapshot): boolean {
-	if (position.sticky) {
-		node.scrollTop = bottomScrollTop(node);
-	} else {
-		node.scrollTop = position.scrollTop;
-	}
-	return isScrolledAtBottom(node);
 }
 
 export function adjacentTurnJumpTargetId(
@@ -133,44 +124,73 @@ function turnJumpTargetIsFullyVisible(target: TurnJumpTargetPosition, scrollTop:
 	return target.top >= scrollTop - TURN_JUMP_EPSILON_PX && target.bottom <= scrollTop + viewportHeight + TURN_JUMP_EPSILON_PX;
 }
 
-export function loadTranscriptScrollPositions(storage = browserStorage()): Map<string, ScrollPositionSnapshot> {
-	const positions = new Map<string, ScrollPositionSnapshot>();
-	if (!storage) return positions;
-	try {
-		const raw = storage.getItem(TRANSCRIPT_SCROLL_STORAGE_KEY);
-		if (!raw) return positions;
-		const parsed = JSON.parse(raw) as unknown;
-		if (!isRecord(parsed) || !isRecord(parsed.positions)) return positions;
-		for (const [key, value] of Object.entries(parsed.positions)) {
-			if (!key || !isRecord(value)) continue;
-			const scrollTop = value.scrollTop;
-			const sticky = value.sticky;
-			if (typeof scrollTop !== "number" || !Number.isFinite(scrollTop) || typeof sticky !== "boolean") continue;
-			positions.set(key, { scrollTop: Math.max(0, scrollTop), sticky });
-		}
-	} catch {
-		return new Map();
-	}
-	return positions;
+interface ActiveTranscriptScrollIdentity {
+	sessionKey: string | null;
+	leafId: string | null;
 }
 
-export function saveTranscriptScrollPositions(positions: Map<string, ScrollPositionSnapshot>, storage = browserStorage()): void {
+interface PendingOlderTurnsLoad {
+	sessionKey: string;
+	leafId: string | null;
+	requestId: number;
+	elementId: string | null;
+	viewportOffset: number | null;
+	contentHeight: number;
+	wasPinned: boolean;
+	userCancelled: boolean;
+}
+
+interface PointerScrollbarIntent {
+	pointerId: number;
+	requestId: number;
+	scroller: HTMLDivElement;
+	initialScrollTop: number;
+	removeListeners: () => void;
+}
+
+export interface TranscriptDestination {
+	id: number;
+	sessionId: string;
+	targetLeafId: string | null;
+	minimumTurnPageHydrationRevision: number;
+}
+
+export interface TranscriptTurnPageIdentity {
+	sessionId: string;
+	leafId: string | null;
+	hydrationRevision: number;
+}
+
+export interface OlderTurnsLoadRequest {
+	requestId: number;
+	sessionId: string;
+}
+
+export interface OlderTurnsLoadResult extends OlderTurnsLoadRequest {
+	status: "committed" | "noop" | "stale" | "failed";
+	turnPageHydrationRevision?: number;
+}
+
+interface OlderTurnsLoadCompletion extends OlderTurnsLoadRequest {
+	status: OlderTurnsLoadResult["status"] | "rejected";
+	turnPageHydrationRevision?: number;
+}
+
+export function clearAcknowledgedTranscriptDestination(
+	current: TranscriptDestination | null,
+	destinationId: number,
+): TranscriptDestination | null {
+	return current?.id === destinationId ? null : current;
+}
+
+type TranscriptScrollStorage = Pick<Storage, "removeItem">;
+
+export function removeLegacyTranscriptScroll(storage = browserStorage()): void {
 	if (!storage) return;
 	try {
-		const entries = Array.from(positions.entries()).filter(([key]) => key);
-		if (entries.length === 0) {
-			storage.removeItem(TRANSCRIPT_SCROLL_STORAGE_KEY);
-			return;
-		}
-		storage.setItem(
-			TRANSCRIPT_SCROLL_STORAGE_KEY,
-			JSON.stringify({
-				positions: Object.fromEntries(entries),
-				updatedAt: Date.now(),
-			}),
-		);
+		storage.removeItem(TRANSCRIPT_SCROLL_STORAGE_KEY);
 	} catch {
-		// localStorage can be unavailable or full; scroll persistence is best-effort.
+		// Storage may be unavailable or blocked. The retired value is never read.
 	}
 }
 
@@ -187,8 +207,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export { TRANSCRIPT_SCROLL_STORAGE_KEY };
-
 export const MessageList = memo(function MessageList({
 	entries,
 	pendingActions,
@@ -199,16 +217,25 @@ export const MessageList = memo(function MessageList({
 	sessionId,
 	entriesSessionId,
 	loadingSession = false,
+	sessionError = null,
+	sessionErrorHasUsableCache = false,
+	retryingSession = false,
+	onRetrySession,
 	onNewSession,
 	onResumeTurn,
 	resumingTurnId,
+	resumeBlockedReason,
+	remoteReadBlockedReason,
 	turnCards,
 	onExpandTurn,
 	onCollapseTurn,
 	loadingTurnId,
 	hasOlderTurns,
 	loadingOlderTurns,
-	onLoadOlderTurns
+	onLoadOlderTurns,
+	destination = null,
+	turnPageIdentity = null,
+	onAcknowledgeDestination,
 }: {
 	entries: TranscriptEntry[];
 	pendingActions?: PendingAction[];
@@ -219,24 +246,41 @@ export const MessageList = memo(function MessageList({
 	sessionId?: string | null;
 	entriesSessionId?: string | null;
 	loadingSession?: boolean;
+	sessionError?: string | null;
+	sessionErrorHasUsableCache?: boolean;
+	retryingSession?: boolean;
+	onRetrySession?: () => void;
 	onNewSession?: () => void;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
+	resumeBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 	turnCards?: TurnCardView[] | null;
 	onExpandTurn?: (turnId: string) => void;
 	onCollapseTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
 	hasOlderTurns?: boolean;
 	loadingOlderTurns?: boolean;
-	onLoadOlderTurns?: () => void;
+	onLoadOlderTurns?: (request: OlderTurnsLoadRequest) => Promise<OlderTurnsLoadResult>;
+	destination?: TranscriptDestination | null;
+	turnPageIdentity?: TranscriptTurnPageIdentity | null;
+	onAcknowledgeDestination?: (destinationId: number) => void;
 }) {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const contentRef = useRef<HTMLDivElement | null>(null);
 	const shouldStickToBottomRef = useRef(true);
-	const activeScrollSessionKeyRef = useRef<string | null>(null);
-	const activeScrollSessionCanSaveRef = useRef(false);
-	const pendingScrollRestoreRef = useRef<{ key: string; position: ScrollPositionSnapshot } | null>(null);
-	const scrollPositionsRef = useRef(loadTranscriptScrollPositions());
+	const activeScrollIdentityRef = useRef<ActiveTranscriptScrollIdentity>({
+		sessionKey: null,
+		leafId: null,
+	});
+	const pendingLatestSessionKeyRef = useRef<string | null>(null);
+	const consumedDestinationIdRef = useRef<number | null>(null);
+	const pendingOlderTurnsLoadRef = useRef<PendingOlderTurnsLoad | null>(null);
+	const pointerScrollbarIntentRef = useRef<PointerScrollbarIntent | null>(null);
+	const olderTurnsRequestIdRef = useRef(0);
+	const mountedRef = useRef(false);
+	const legacyStorageRemovalAttemptedRef = useRef(false);
+	const [olderTurnsLoadCompletion, setOlderTurnsLoadCompletion] = useState<OlderTurnsLoadCompletion | null>(null);
 	const scrollSessionKey = hasSession ? (sessionId ?? ACTIVE_SESSION_SCROLL_KEY) : null;
 	const entriesBelongToSelectedSession = !hasSession || !sessionId || entriesSessionId === sessionId;
 	const effectiveEntries = entriesBelongToSelectedSession ? entries : [];
@@ -244,18 +288,100 @@ export const MessageList = memo(function MessageList({
 		() => (hasSession ? branchEntriesFor(effectiveEntries, activeLeafId) : effectiveEntries),
 		[activeLeafId, effectiveEntries, hasSession]
 	);
+	const transcriptContentReady =
+		!!scrollSessionKey &&
+		entriesBelongToSelectedSession &&
+		!loadingSession &&
+		(!sessionErrorHasUsableCache ? !sessionError && !retryingSession : true);
 
 	const scrollToBottom = useCallback(() => {
 		const node = scrollRef.current;
 		if (!node) return;
 		node.scrollTop = bottomScrollTop(node);
 		shouldStickToBottomRef.current = true;
-		const key = activeScrollSessionKeyRef.current;
-		if (key && activeScrollSessionCanSaveRef.current) {
-			scrollPositionsRef.current.set(key, { scrollTop: node.scrollTop, sticky: true });
-			saveTranscriptScrollPositions(scrollPositionsRef.current);
-		}
 	}, []);
+
+	const clearPointerScrollbarIntent = useCallback((expected?: PointerScrollbarIntent) => {
+		const intent = pointerScrollbarIntentRef.current;
+		if (!intent || (expected && intent !== expected)) return;
+		pointerScrollbarIntentRef.current = null;
+		intent.removeListeners();
+	}, []);
+
+	const cancelOlderTurnsPreservationForRequest = useCallback((requestId: number | null) => {
+		const pending = pendingOlderTurnsLoadRef.current;
+		if (requestId !== null && pending?.requestId !== requestId) return;
+		if (requestId === null) clearPointerScrollbarIntent();
+		else {
+			const intent = pointerScrollbarIntentRef.current;
+			if (intent?.requestId === requestId) clearPointerScrollbarIntent(intent);
+		}
+		if (!pending) return;
+		pending.userCancelled = true;
+		if (olderTurnsLoadCompletion?.requestId === pending.requestId) {
+			pendingOlderTurnsLoadRef.current = null;
+		}
+	}, [clearPointerScrollbarIntent, olderTurnsLoadCompletion]);
+
+	const cancelOlderTurnsPreservation = useCallback(() => {
+		cancelOlderTurnsPreservationForRequest(null);
+	}, [cancelOlderTurnsPreservationForRequest]);
+
+	const finishPointerScrollbarIntent = useCallback((intent: PointerScrollbarIntent) => {
+		if (pointerScrollbarIntentRef.current !== intent) return;
+		const viewportMoved = intent.scroller.scrollTop !== intent.initialScrollTop;
+		clearPointerScrollbarIntent(intent);
+		if (viewportMoved) cancelOlderTurnsPreservationForRequest(intent.requestId);
+	}, [cancelOlderTurnsPreservationForRequest, clearPointerScrollbarIntent]);
+
+	const handlePointerScrollbarIntentEnd = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+		const intent = pointerScrollbarIntentRef.current;
+		if (intent?.pointerId === event.pointerId) finishPointerScrollbarIntent(intent);
+	}, [finishPointerScrollbarIntent]);
+
+	const handlePointerScrollbarIntentStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+		const scroller = event.currentTarget;
+		const pending = pendingOlderTurnsLoadRef.current;
+		if (
+			!pending ||
+			event.target !== scroller ||
+			event.button !== 0 ||
+			!["mouse", "pen"].includes(event.pointerType) ||
+			!isPointerInVerticalScrollbarGutter(scroller, event.clientX, event.clientY)
+		) return;
+		const ownerWindow = scroller.ownerDocument.defaultView;
+		if (!ownerWindow) return;
+		clearPointerScrollbarIntent();
+		const intent: PointerScrollbarIntent = {
+			pointerId: event.pointerId,
+			requestId: pending.requestId,
+			scroller,
+			initialScrollTop: scroller.scrollTop,
+			removeListeners: () => {},
+		};
+		const handlePointerEnd = (releaseEvent: PointerEvent) => {
+			if (
+				releaseEvent.pointerId === intent.pointerId &&
+				pointerScrollbarIntentRef.current === intent
+			) {
+				finishPointerScrollbarIntent(intent);
+			}
+		};
+		const handleWindowBlur = () => {
+			if (pointerScrollbarIntentRef.current === intent) {
+				finishPointerScrollbarIntent(intent);
+			}
+		};
+		intent.removeListeners = () => {
+			ownerWindow.removeEventListener("pointerup", handlePointerEnd, true);
+			ownerWindow.removeEventListener("pointercancel", handlePointerEnd, true);
+			ownerWindow.removeEventListener("blur", handleWindowBlur);
+		};
+		pointerScrollbarIntentRef.current = intent;
+		ownerWindow.addEventListener("pointerup", handlePointerEnd, true);
+		ownerWindow.addEventListener("pointercancel", handlePointerEnd, true);
+		ownerWindow.addEventListener("blur", handleWindowBlur);
+	}, [clearPointerScrollbarIntent, finishPointerScrollbarIntent]);
 
 	const collectTurnJumpTargetPositions = useCallback((): TurnJumpTargetPosition[] => {
 		const scroller = scrollRef.current;
@@ -282,12 +408,8 @@ export const MessageList = memo(function MessageList({
 		const targetRect = target.getBoundingClientRect();
 		scroller.scrollTop = Math.max(0, scroller.scrollTop + targetRect.top - scrollerRect.top);
 		shouldStickToBottomRef.current = false;
-		const key = activeScrollSessionKeyRef.current;
-		if (key && activeScrollSessionCanSaveRef.current) {
-			scrollPositionsRef.current.set(key, { scrollTop: scroller.scrollTop, sticky: false });
-			saveTranscriptScrollPositions(scrollPositionsRef.current);
-		}
-	}, []);
+		cancelOlderTurnsPreservation();
+	}, [cancelOlderTurnsPreservation]);
 
 	const jumpToAdjacentTurn = useCallback((direction: TurnJumpDirection) => {
 		const scroller = scrollRef.current;
@@ -297,76 +419,185 @@ export const MessageList = memo(function MessageList({
 	}, [collectTurnJumpTargetPositions, scrollToTurnJumpTarget]);
 
 	const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
-		if (pendingScrollRestoreRef.current?.key === activeScrollSessionKeyRef.current) return;
-		const position = captureScrollPosition(event.currentTarget);
-		shouldStickToBottomRef.current = position.sticky;
-		const key = activeScrollSessionKeyRef.current;
-		if (key && activeScrollSessionCanSaveRef.current) {
-			scrollPositionsRef.current.set(key, position);
-			saveTranscriptScrollPositions(scrollPositionsRef.current);
+		if (pendingLatestSessionKeyRef.current === activeScrollIdentityRef.current.sessionKey) return;
+		const pointerIntent = pointerScrollbarIntentRef.current;
+		if (
+			pointerIntent?.scroller === event.currentTarget &&
+			pointerIntent.initialScrollTop !== event.currentTarget.scrollTop
+		) {
+			finishPointerScrollbarIntent(pointerIntent);
 		}
-	}, []);
+		shouldStickToBottomRef.current = isScrolledAtBottom(event.currentTarget);
+	}, [finishPointerScrollbarIntent]);
+
+	const handleScrollKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
+		if (
+			["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(event.key) ||
+			(event.key === " " && event.target === event.currentTarget)
+		) {
+			cancelOlderTurnsPreservation();
+		}
+	}, [cancelOlderTurnsPreservation]);
+
+	useEffect(() => {
+		mountedRef.current = true;
+		if (!legacyStorageRemovalAttemptedRef.current) {
+			legacyStorageRemovalAttemptedRef.current = true;
+			removeLegacyTranscriptScroll();
+		}
+		return () => {
+			mountedRef.current = false;
+			pendingOlderTurnsLoadRef.current = null;
+			clearPointerScrollbarIntent();
+		};
+	}, [clearPointerScrollbarIntent]);
 
 	useLayoutEffect(() => {
-		if (activeScrollSessionKeyRef.current === scrollSessionKey) return;
-		const node = scrollRef.current;
-		const previousKey = activeScrollSessionKeyRef.current;
-		if (previousKey && node && activeScrollSessionCanSaveRef.current) {
-			scrollPositionsRef.current.set(previousKey, captureScrollPosition(node));
-			saveTranscriptScrollPositions(scrollPositionsRef.current);
+		const previous = activeScrollIdentityRef.current;
+		const sessionChanged = previous.sessionKey !== scrollSessionKey;
+		const leafChanged = !sessionChanged && previous.leafId !== activeLeafId;
+		if (previous.sessionKey !== scrollSessionKey) {
+			activeScrollIdentityRef.current = { sessionKey: scrollSessionKey, leafId: activeLeafId };
+			pendingLatestSessionKeyRef.current = scrollSessionKey;
+			pendingOlderTurnsLoadRef.current = null;
+			clearPointerScrollbarIntent();
+			shouldStickToBottomRef.current = false;
+		} else if (leafChanged) {
+			activeScrollIdentityRef.current = { ...previous, leafId: activeLeafId };
 		}
-		activeScrollSessionKeyRef.current = scrollSessionKey;
-		activeScrollSessionCanSaveRef.current = false;
 		if (!scrollSessionKey) {
-			pendingScrollRestoreRef.current = null;
+			pendingLatestSessionKeyRef.current = null;
 			shouldStickToBottomRef.current = true;
 			return;
 		}
-		const fallbackPosition = node ? captureScrollPosition(node) : { scrollTop: 0, sticky: true };
-		pendingScrollRestoreRef.current = {
-			key: scrollSessionKey,
-			position: scrollPositionsRef.current.get(scrollSessionKey) ?? fallbackPosition
-		};
-		shouldStickToBottomRef.current = false;
-	}, [scrollSessionKey]);
-
-	useLayoutEffect(() => {
-		const pendingRestore = pendingScrollRestoreRef.current;
-		if (pendingRestore?.key === scrollSessionKey) {
-			if (!entriesBelongToSelectedSession) return;
-			const node = scrollRef.current;
-			if (node) {
-				const sticky = restoreScrollPosition(node, pendingRestore.position);
-				shouldStickToBottomRef.current = sticky;
-				if (scrollSessionKey) {
-					scrollPositionsRef.current.set(scrollSessionKey, { scrollTop: node.scrollTop, sticky });
-					saveTranscriptScrollPositions(scrollPositionsRef.current);
-				}
+		if (!transcriptContentReady) return;
+		const destinationReady =
+			!!destination &&
+			destination.id !== consumedDestinationIdRef.current &&
+			destination.sessionId === scrollSessionKey &&
+			turnPageIdentity?.sessionId === destination.sessionId &&
+			turnPageIdentity.leafId === destination.targetLeafId &&
+			turnPageIdentity.hydrationRevision >= destination.minimumTurnPageHydrationRevision;
+		const destinationPending =
+			!!destination &&
+			destination.id !== consumedDestinationIdRef.current &&
+			destination.sessionId === scrollSessionKey;
+		if (pendingLatestSessionKeyRef.current === scrollSessionKey) {
+			if (destinationPending && !destinationReady) return;
+			pendingLatestSessionKeyRef.current = null;
+			if (destinationReady) {
+				consumedDestinationIdRef.current = destination.id;
+				onAcknowledgeDestination?.(destination.id);
 			}
-			activeScrollSessionCanSaveRef.current = true;
-			pendingScrollRestoreRef.current = null;
+			scrollToBottom();
 			return;
 		}
-		if (!entriesBelongToSelectedSession) return;
-		activeScrollSessionCanSaveRef.current = true;
-		if (!shouldStickToBottomRef.current) return;
-		scrollToBottom();
-	}, [entriesBelongToSelectedSession, isRunning, scrollSessionKey, scrollToBottom, visibleEntries]);
+		if (destinationReady) {
+			consumedDestinationIdRef.current = destination.id;
+			onAcknowledgeDestination?.(destination.id);
+			pendingOlderTurnsLoadRef.current = null;
+			clearPointerScrollbarIntent();
+			scrollToBottom();
+			return;
+		}
+		if (destinationPending) return;
+		if (leafChanged && shouldStickToBottomRef.current) scrollToBottom();
+	}, [
+		activeLeafId,
+		clearPointerScrollbarIntent,
+		destination,
+		isRunning,
+		onAcknowledgeDestination,
+		scrollSessionKey,
+		scrollToBottom,
+		transcriptContentReady,
+		turnPageIdentity,
+		visibleEntries,
+	]);
 
 	useLayoutEffect(() => {
-		if (!hasSession || typeof ResizeObserver === "undefined") return;
+		const pending = pendingOlderTurnsLoadRef.current;
+		if (!pending) return;
+		if (pending.sessionKey !== scrollSessionKey || pending.leafId !== activeLeafId) {
+			pendingOlderTurnsLoadRef.current = null;
+			const intent = pointerScrollbarIntentRef.current;
+			if (intent?.requestId === pending.requestId) clearPointerScrollbarIntent(intent);
+		}
+	}, [activeLeafId, clearPointerScrollbarIntent, scrollSessionKey]);
+
+	useLayoutEffect(() => {
+		const pending = pendingOlderTurnsLoadRef.current;
+		const completion = olderTurnsLoadCompletion;
+		if (!pending || !completion || completion.requestId !== pending.requestId) return;
+		const scroller = scrollRef.current;
+		if (!scroller) {
+			pendingOlderTurnsLoadRef.current = null;
+			const intent = pointerScrollbarIntentRef.current;
+			if (intent?.requestId === pending.requestId) clearPointerScrollbarIntent(intent);
+			return;
+		}
+		if (completion.sessionId !== pending.sessionKey || pending.userCancelled) {
+			pendingOlderTurnsLoadRef.current = null;
+			const intent = pointerScrollbarIntentRef.current;
+			if (intent?.requestId === pending.requestId) clearPointerScrollbarIntent(intent);
+			return;
+		}
+		const matchingCommittedPage =
+			completion.status === "committed" &&
+			completion.turnPageHydrationRevision !== undefined;
+		if (matchingCommittedPage) {
+			// The callback can settle before React commits the cache update. The
+			// parent-provided page identity advances with the matching card DOM.
+			if (
+				turnPageIdentity?.sessionId !== completion.sessionId ||
+				turnPageIdentity.hydrationRevision < completion.turnPageHydrationRevision!
+			) return;
+		}
+		if (pending.wasPinned) {
+			if (
+				matchingCommittedPage ||
+				scroller.scrollHeight > pending.contentHeight ||
+				!isScrolledAtBottom(scroller)
+			) {
+				scrollToBottom();
+			} else {
+				shouldStickToBottomRef.current = true;
+			}
+		} else if (
+			matchingCommittedPage &&
+			pending.elementId !== null &&
+			pending.viewportOffset !== null
+		) {
+			const current = transcriptAnchorNode(scroller, pending.elementId);
+			if (current) {
+				scroller.scrollTop += viewportOffset(scroller, current) - pending.viewportOffset;
+				shouldStickToBottomRef.current = isScrolledAtBottom(scroller);
+			}
+		}
+		pendingOlderTurnsLoadRef.current = null;
+		const intent = pointerScrollbarIntentRef.current;
+		if (intent?.requestId === pending.requestId) clearPointerScrollbarIntent(intent);
+	}, [clearPointerScrollbarIntent, olderTurnsLoadCompletion, scrollToBottom, turnCards, turnPageIdentity]);
+
+	useLayoutEffect(() => {
+		if (!hasSession || !transcriptContentReady || typeof ResizeObserver === "undefined") return;
 		const scroller = scrollRef.current;
 		const content = contentRef.current;
 		if (!scroller || !content) return;
 		const observer = new ResizeObserver(() => {
-			if (pendingScrollRestoreRef.current?.key === activeScrollSessionKeyRef.current) return;
-			if (!entriesBelongToSelectedSession) return;
+			if (pendingLatestSessionKeyRef.current === activeScrollIdentityRef.current.sessionKey) return;
+			if (
+				destination &&
+				destination.id !== consumedDestinationIdRef.current &&
+				destination.sessionId === activeScrollIdentityRef.current.sessionKey
+			) return;
+			if (pendingOlderTurnsLoadRef.current) return;
 			if (shouldStickToBottomRef.current) scrollToBottom();
 		});
 		observer.observe(scroller);
 		observer.observe(content);
 		return () => observer.disconnect();
-	}, [entriesBelongToSelectedSession, hasSession, scrollToBottom]);
+	}, [destination, hasSession, scrollToBottom, transcriptContentReady]);
 	const toolIndex = useMemo(() => indexToolEntries(visibleEntries), [visibleEntries]);
 	const turnViews = useMemo(() => buildTurnViews(visibleEntries), [visibleEntries]);
 	const displayNodes = useMemo(() => deriveTranscriptDisplayNodes(visibleEntries, turnViews, toolIndex.results, pendingActions), [pendingActions, toolIndex.results, turnViews, visibleEntries]);
@@ -442,6 +673,38 @@ export const MessageList = memo(function MessageList({
 		[fallbackTurnJumpTargets],
 	);
 	const showTurnJumpControls = turnJumpTargets.length > 1;
+	const loadOlderTurns = useCallback(() => {
+		if (!onLoadOlderTurns || !scrollSessionKey || pendingOlderTurnsLoadRef.current !== null) return;
+		const node = scrollRef.current;
+		if (!node) return;
+		clearPointerScrollbarIntent();
+		const request = {
+			requestId: ++olderTurnsRequestIdRef.current,
+			sessionId: scrollSessionKey,
+		};
+		const element = visibleTranscriptAnchor(node);
+		const elementId = element?.dataset.transcriptAnchorId ?? null;
+		const pending: PendingOlderTurnsLoad = {
+			sessionKey: scrollSessionKey,
+			leafId: activeLeafId,
+			requestId: request.requestId,
+			elementId,
+			viewportOffset: element ? viewportOffset(node, element) : null,
+			contentHeight: node.scrollHeight,
+			wasPinned: isScrolledAtBottom(node),
+			userCancelled: false,
+		};
+		pendingOlderTurnsLoadRef.current = pending;
+		void onLoadOlderTurns(request).then((result) => {
+			if (mountedRef.current && pendingOlderTurnsLoadRef.current === pending) {
+				setOlderTurnsLoadCompletion(result);
+			}
+		}, () => {
+			if (mountedRef.current && pendingOlderTurnsLoadRef.current === pending) {
+				setOlderTurnsLoadCompletion({ ...request, status: "rejected" });
+			}
+		});
+	}, [activeLeafId, clearPointerScrollbarIntent, onLoadOlderTurns, scrollSessionKey]);
 
 	if (!hasSession) {
 		return (
@@ -456,6 +719,34 @@ export const MessageList = memo(function MessageList({
 								<Plus size={14} />
 								New session
 							</button>
+						) : null}
+					</div>
+				</div>
+			</div>
+		);
+	}
+
+	if ((sessionError || retryingSession) && !sessionErrorHasUsableCache) {
+		return (
+			<div className="message-list-shell">
+				<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
+					<div className="empty-state load-error-state" role={sessionError ? "alert" : "status"}>
+						{sessionError ? <AlertTriangle size={30} aria-hidden /> : <Loader2 className="spin" size={28} aria-hidden />}
+						<div className="empty-state-title">{sessionError ? "Couldn’t load session" : "Retrying session"}</div>
+						<div className="empty-state-sub">{sessionError ?? "Trying to load the selected session again…"}</div>
+						{onRetrySession ? (
+							<>
+								<button
+									type="button"
+									className="secondary-button load-error-retry"
+									disabled={retryingSession || !!remoteReadBlockedReason}
+									aria-busy={retryingSession}
+									onClick={onRetrySession}
+								>
+									{retryingSession ? "Retrying…" : "Retry"}
+								</button>
+								<ConnectionBlockedReason reason={remoteReadBlockedReason} />
+							</>
 						) : null}
 					</div>
 				</div>
@@ -478,16 +769,59 @@ export const MessageList = memo(function MessageList({
 
 	return (
 		<div className={`message-list-shell ${showTurnJumpControls ? "with-turn-jump-controls" : ""}`}>
-			<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
+			<div
+				className="message-scroll"
+				ref={scrollRef}
+				role="region"
+				aria-label="Conversation transcript"
+				tabIndex={0}
+				onScroll={handleScroll}
+				onWheel={cancelOlderTurnsPreservation}
+				onTouchMove={cancelOlderTurnsPreservation}
+				onPointerDown={handlePointerScrollbarIntentStart}
+				onPointerUp={handlePointerScrollbarIntentEnd}
+				onPointerCancel={handlePointerScrollbarIntentEnd}
+				onLostPointerCapture={handlePointerScrollbarIntentEnd}
+				onKeyDown={handleScrollKeyDown}
+			>
 				<div className="message-scroll-content" ref={contentRef}>
+					{sessionError || retryingSession ? (
+						<div className="load-error-banner transcript-load-error" role={sessionError ? "alert" : "status"}>
+							{sessionError ? <AlertTriangle size={18} aria-hidden /> : <Loader2 className="spin" size={18} aria-hidden />}
+							<div>
+								<strong>{sessionError ? "Session refresh failed" : "Refreshing session"}</strong>
+								<span>{sessionError ?? "Trying to refresh the selected session again…"}</span>
+							</div>
+							{onRetrySession ? (
+								<>
+									<button
+										type="button"
+										className="secondary-button load-error-retry"
+										disabled={retryingSession || !!remoteReadBlockedReason}
+										aria-busy={retryingSession}
+										onClick={onRetrySession}
+									>
+										{retryingSession ? "Retrying…" : "Retry"}
+									</button>
+									<ConnectionBlockedReason reason={remoteReadBlockedReason} />
+								</>
+							) : null}
+						</div>
+					) : null}
 					{shouldUseTurnCards
 						? (
 								<>
 									{hasOlderTurns ? (
 										<div className="turn-card-load-older">
-											<button type="button" className="turn-card-expand" disabled={loadingOlderTurns} onClick={onLoadOlderTurns}>
+											<button
+												type="button"
+												className="turn-card-expand"
+												disabled={loadingOlderTurns || !!remoteReadBlockedReason}
+												onClick={loadOlderTurns}
+											>
 												{loadingOlderTurns ? "Loading older…" : "Load older turns"}
 											</button>
+											<ConnectionBlockedReason reason={remoteReadBlockedReason} />
 										</div>
 									) : null}
 									{turnCards!.map((turn) => (
@@ -499,10 +833,13 @@ export const MessageList = memo(function MessageList({
 											isRunning={isRunning}
 											onResumeTurn={onResumeTurn}
 											resumingTurnId={resumingTurnId}
+											resumeBlockedReason={resumeBlockedReason}
+											remoteReadBlockedReason={remoteReadBlockedReason}
 											onExpandTurn={onExpandTurn}
 											onCollapseTurn={onCollapseTurn}
 											loadingTurnId={loadingTurnId}
 											turnJumpTargetId={turn.card.id}
+											transcriptAnchorId={turn.card.id}
 										/>
 									))}
 								</>
@@ -519,6 +856,7 @@ export const MessageList = memo(function MessageList({
 										onResumeTurn={onResumeTurn}
 										resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
 										resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
+										resumeBlockedReason={resumeBlockedReason}
 										compactionHiddenCount={compactionHiddenCounts.get(node.key) ?? 0}
 										compactionExpanded={!collapsedCompactions.has(node.key)}
 										onToggleCompaction={toggleCompaction}
@@ -555,6 +893,68 @@ function buildFallbackTurnJumpTargets(turns: TurnView[], displayNodes: Transcrip
 function turnJumpTargetNode(scroller: HTMLDivElement, targetId: string): HTMLElement | null {
 	return Array.from(scroller.querySelectorAll<HTMLElement>("[data-turn-jump-target-id]"))
 		.find((target) => target.dataset.turnJumpTargetId === targetId) ?? null;
+}
+
+function transcriptAnchorNode(scroller: HTMLElement, anchorId: string): HTMLElement | null {
+	return Array.from(scroller.querySelectorAll<HTMLElement>("[data-transcript-anchor-id]"))
+		.find((candidate) => candidate.dataset.transcriptAnchorId === anchorId) ?? null;
+}
+
+function visibleTranscriptAnchor(scroller: HTMLElement): HTMLElement | null {
+	const scrollerRect = scroller.getBoundingClientRect();
+	const candidates = Array.from(scroller.querySelectorAll<HTMLElement>("[data-transcript-anchor-id]"));
+	return candidates.find((candidate) => {
+		const rect = candidate.getBoundingClientRect();
+		return rect.bottom > scrollerRect.top && rect.top < scrollerRect.bottom && rect.height > 0;
+	}) ?? null;
+}
+
+function viewportOffset(scroller: HTMLElement, element: HTMLElement): number {
+	return element.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+}
+
+function isPointerInVerticalScrollbarGutter(
+	scroller: HTMLElement,
+	clientX: number,
+	clientY: number,
+): boolean {
+	if (
+		scroller.scrollHeight <= scroller.clientHeight ||
+		!Number.isFinite(clientX) ||
+		!Number.isFinite(clientY)
+	) return false;
+	const rect = scroller.getBoundingClientRect();
+	if (rect.width <= 0 || rect.height <= 0 || scroller.offsetWidth <= 0) return false;
+	const style = scroller.ownerDocument.defaultView?.getComputedStyle(scroller);
+	const borderLeft = cssPixels(style?.borderLeftWidth);
+	const borderRight = cssPixels(style?.borderRightWidth);
+	const leftScrollbarWidth = Math.max(0, scroller.clientLeft - borderLeft);
+	const rightScrollbarWidth = Math.max(
+		0,
+		scroller.offsetWidth - scroller.clientWidth - scroller.clientLeft - borderRight,
+	);
+	if (leftScrollbarWidth <= 0 && rightScrollbarWidth <= 0) return false;
+	const horizontalScale = rect.width / scroller.offsetWidth;
+	const verticalScale = scroller.offsetHeight > 0 ? rect.height / scroller.offsetHeight : 1;
+	const gutterTop = rect.top + scroller.clientTop * verticalScale;
+	const gutterBottom = gutterTop + scroller.clientHeight * verticalScale;
+	const leftGutterStart = rect.left + borderLeft * horizontalScale;
+	const leftGutterEnd = leftGutterStart + leftScrollbarWidth * horizontalScale;
+	const rightGutterEnd = rect.right - borderRight * horizontalScale;
+	const rightGutterStart = rightGutterEnd - rightScrollbarWidth * horizontalScale;
+	return (
+		clientY >= gutterTop &&
+		clientY <= gutterBottom &&
+		(
+			(leftScrollbarWidth > 0 && clientX >= leftGutterStart && clientX <= leftGutterEnd) ||
+			(rightScrollbarWidth > 0 && clientX >= rightGutterStart && clientX <= rightGutterEnd)
+		)
+	);
+}
+
+function cssPixels(value: string | undefined): number {
+	const parsed = Number.parseFloat(value ?? "");
+	return Number.isFinite(parsed) ? parsed : 0;
 }
 
 const TurnJumpControls = memo(function TurnJumpControls({
@@ -687,6 +1087,7 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	onResumeTurn,
 	resumeEntryId,
 	resuming,
+	resumeBlockedReason,
 	compactionHiddenCount,
 	compactionExpanded,
 	onToggleCompaction
@@ -698,6 +1099,7 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumeEntryId: string;
 	resuming: boolean;
+	resumeBlockedReason?: string | null;
 	compactionHiddenCount: number;
 	compactionExpanded: boolean;
 	onToggleCompaction: (key: string) => void;
@@ -725,7 +1127,8 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 					canResume
 						? {
 								label: resuming ? "Starting…" : actionLabel,
-								disabled: resuming,
+								disabled: resuming || !!resumeBlockedReason,
+								disabledReason: resumeBlockedReason,
 								onClick: () => onResumeTurn?.(resumeEntryId, resumableOutcome)
 							}
 						: undefined
@@ -812,10 +1215,13 @@ const TurnCardRow = memo(function TurnCardRow({
 	isRunning,
 	onResumeTurn,
 	resumingTurnId,
+	resumeBlockedReason,
+	remoteReadBlockedReason,
 	onExpandTurn,
 	onCollapseTurn,
 	loadingTurnId,
-	turnJumpTargetId
+	turnJumpTargetId,
+	transcriptAnchorId,
 }: {
 	turn: TurnCardView;
 	pendingActions?: PendingAction[];
@@ -823,15 +1229,20 @@ const TurnCardRow = memo(function TurnCardRow({
 	isRunning: boolean;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
+	resumeBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 	onExpandTurn?: (turnId: string) => void;
 	onCollapseTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
 	turnJumpTargetId?: string;
+	transcriptAnchorId?: string;
 }) {
 	const card = turn.card;
 	const isLoading = loadingTurnId === card.id;
 	const detailEntries = turn.expanded ? turn.entries : null;
 	const isExpanded = !!detailEntries;
+	const detailLoadBlockedReason =
+		!isExpanded && !turn.detailCached ? remoteReadBlockedReason : null;
 	const canToggleDetails = card.status !== "compacted" && (!!onExpandTurn || !!onCollapseTurn) && !(turn.isCurrent && isExpanded);
 	const canResume = card.can_resume && card.active_leaf_id === activeLeafId && !isRunning && !!onResumeTurn;
 	const resumableOutcome = card.outcome === "Interrupted" || card.outcome === "Crashed" ? card.outcome : null;
@@ -873,6 +1284,7 @@ const TurnCardRow = memo(function TurnCardRow({
 		<div
 			className={["turn-summary", turn.isCurrent ? "current" : null, card.status, isExpanded ? "expanded" : null].filter(Boolean).join(" ")}
 			data-turn-jump-target-id={rootTurnJumpTargetId}
+			data-transcript-anchor-id={transcriptAnchorId}
 		>
 			{summaryUserMessages.map((entry) =>
 				entry.item.type === "user_message" ? (
@@ -896,15 +1308,24 @@ const TurnCardRow = memo(function TurnCardRow({
 			{canToggleDetails || canResume ? (
 				<div className="turn-detail-toggle-row">
 					{canToggleDetails ? (
-						<button type="button" className="turn-card-expand" disabled={isLoading && !isExpanded} onClick={onToggleDetails}>
-							{detailLabel}
-						</button>
+						<>
+							<button
+								type="button"
+								className="turn-card-expand"
+								disabled={(isLoading && !isExpanded) || !!detailLoadBlockedReason}
+								onClick={onToggleDetails}
+							>
+								{detailLabel}
+							</button>
+							<ConnectionBlockedReason reason={detailLoadBlockedReason} />
+						</>
 					) : null}
+					{canResume ? <ConnectionBlockedReason reason={resumeBlockedReason} /> : null}
 					{canResume && !turn.isCurrent && resumableOutcome ? (
 						<button
 							type="button"
 							className="turn-card-expand"
-							disabled={resumingTurnId === card.active_leaf_id}
+							disabled={resumingTurnId === card.active_leaf_id || !!resumeBlockedReason}
 							onClick={() => onResumeTurn?.(card.active_leaf_id, resumableOutcome)}
 						>
 							{resumingTurnId === card.active_leaf_id ? "Starting…" : resumableOutcome === "Interrupted" ? "Continue" : "Retry"}
@@ -1012,7 +1433,7 @@ class TranscriptDisplayBuilder {
 
 	constructor(
 		private readonly entries: TranscriptEntry[],
-		private readonly turns: TurnView[],
+		turns: TurnView[],
 		private readonly toolResults: Map<string, ToolResultItem>,
 		private readonly pendingActions: PendingAction[]
 	) {
@@ -1755,7 +2176,7 @@ function SystemMessage({
 	tone: NoticeTone;
 	text: string;
 	entryId?: string;
-	action?: { label: string; disabled?: boolean; onClick: () => void };
+	action?: { label: string; disabled?: boolean; disabledReason?: string | null; onClick: () => void };
 	loading?: boolean;
 }) {
 	return (
@@ -1764,10 +2185,13 @@ function SystemMessage({
 			{loading ? <Loader2 className="spin" size={12} /> : null}
 			<span>{text}</span>
 			{action ? (
-				<button type="button" className="system-message-action" onClick={action.onClick} disabled={action.disabled}>
-					<RotateCcw size={12} />
-					{action.label}
-				</button>
+				<>
+					<button type="button" className="system-message-action" onClick={action.onClick} disabled={action.disabled}>
+						<RotateCcw size={12} />
+						{action.label}
+					</button>
+					<ConnectionBlockedReason reason={action.disabledReason} />
+				</>
 			) : null}
 		</div>
 	);

@@ -15,6 +15,7 @@ use super::events::insert_event_tx;
 use super::rows::row_text;
 use super::sql::{
     lock_session_tx, queued_input_is_active, queued_input_is_editable, session_activity,
+    session_default_route_tx, steering_route_tx, unfinished_generation_route_tx,
     QUEUED_INPUT_DISPATCH_ORDER,
 };
 use super::PostgresAgentStore;
@@ -70,6 +71,10 @@ impl PostgresAgentStore {
             }
         }
         ensure_expected_active_leaf_tx(&mut tx, session_id, expected_active_leaf_id).await?;
+        let route = match priority {
+            InputPriority::Steer => steering_route_tx(&mut tx, session_id).await?,
+            InputPriority::FollowUp => session_default_route_tx(&mut tx, session_id).await?,
+        };
         let inserted = sqlx::query(
             r#"
                 insert into queued_inputs (
@@ -80,7 +85,8 @@ impl PostgresAgentStore {
                     status,
                     client_input_id,
                     origin,
-                    follow_up_position
+                    follow_up_position,
+                    provider_config
                 )
                 values (
                     $1,
@@ -102,7 +108,8 @@ impl PostgresAgentStore {
                                 and status='queued'
                         )
                         else null
-                    end
+                    end,
+                    $6
                 )
                 on conflict (session_id, client_input_id) where client_input_id is not null
                 do nothing
@@ -114,6 +121,7 @@ impl PostgresAgentStore {
         .bind(priority.as_str())
         .bind(serde_json::to_value(QueuedInputContent::user_message(content.clone()))?)
         .bind(client_input_id)
+        .bind(serde_json::to_value(route)?)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(inserted) = inserted else {
@@ -219,7 +227,13 @@ impl PostgresAgentStore {
         let priority_filter = priority.map(|priority| priority.as_str().to_string());
         let query = format!(
             r#"
-                select id, priority, content, client_input_id, xmin::text as row_version
+                select id, priority, content,
+                    coalesce(
+                        provider_config,
+                        (select provider_config from sessions where id=$1)
+                    ) as provider_config,
+                    client_input_id,
+                    xmin::text as row_version
                 from queued_inputs
                 where session_id=$1
                     and {editable_queue}
@@ -254,6 +268,7 @@ impl PostgresAgentStore {
             id: row.get("id"),
             priority: row_text::<InputPriority>(&row, "priority")?,
             content,
+            route: serde_json::from_value(row.get("provider_config"))?,
             client_input_id: row.get("client_input_id"),
             claim_id: String::new(),
             row_version: row.get("row_version"),
@@ -267,11 +282,13 @@ impl PostgresAgentStore {
     ) -> Result<PromoteQueuedInputResult> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
+        let generation_route = unfinished_generation_route_tx(&mut tx, session_id).await?;
         let editable_queue = queued_input_is_editable(None);
         let query = format!(
             r#"
                 update queued_inputs
                 set priority='steer',
+                    provider_config=coalesce($3, provider_config),
                     follow_up_position=null,
                     updated_at=now(),
                     origin=coalesce(origin, '{{}}'::jsonb)
@@ -286,6 +303,7 @@ impl PostgresAgentStore {
         let row = sqlx::query(&query)
             .bind(session_id)
             .bind(input_id)
+            .bind(generation_route.map(serde_json::to_value).transpose()?)
             .fetch_optional(&mut *tx)
             .await?;
         let Some(row) = row else {
@@ -1013,7 +1031,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use agent_session::StoredTranscriptEntry;
-    use agent_vocab::{ProviderConfig, ProviderKind, ReasoningEffort, UserMessage};
+    use agent_vocab::{
+        ProviderConfig, ProviderKind, ReasoningEffort, ToolCall, ToolCallId, UserMessage,
+    };
     use serde_json::json;
     use uuid::Uuid;
 
@@ -1113,6 +1133,12 @@ mod tests {
         config
     }
 
+    fn with_effort(config: &SessionConfig, effort: ReasoningEffort) -> SessionConfig {
+        let mut config = config.clone();
+        config.provider.reasoning_effort = effort;
+        config
+    }
+
     fn queued_follow_up_ids(queue: &QueueState) -> Vec<String> {
         queue
             .queued_inputs
@@ -1134,6 +1160,281 @@ mod tests {
             item,
             provider_replay: Vec::new(),
         }
+    }
+
+    async fn stored_effort(store: &PostgresAgentStore, table: &str, id: &str) -> ReasoningEffort {
+        let query = format!("select provider_config from {table} where id=$1");
+        let value: Value = sqlx::query_scalar(&query)
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("route row");
+        serde_json::from_value::<ProviderConfig>(value)
+            .expect("provider route")
+            .reasoning_effort
+    }
+
+    async fn persist_model_action(
+        store: &PostgresAgentStore,
+        session_id: &str,
+        id: &str,
+        turn_id: u64,
+        route: &ProviderConfig,
+    ) -> String {
+        let context_entry = entry(
+            id,
+            None,
+            agent_vocab::TranscriptItem::UserMessage(UserMessage::text("route context")),
+        );
+        let action = agent_session::SessionAction::RequestModel {
+            action_id: agent_vocab::ActionId(turn_id),
+            turn_id: agent_vocab::TurnId(turn_id),
+            model_context: agent_session::ModelContext::new(),
+            context_leaf_id: Some(context_entry.id.clone()),
+        };
+        let (_, persisted) = store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(
+                    std::slice::from_ref(&context_entry),
+                    Some(&context_entry.id),
+                    &[],
+                    &[action],
+                )
+                .with_provider_route(route.clone().into()),
+            )
+            .await
+            .expect("turn action persists");
+        persisted[0].row_id.clone()
+    }
+
+    #[tokio::test]
+    async fn routes_follow_acceptance_open_generation_and_promotion_boundaries() {
+        let db = test_store()
+            .await
+            .expect("PI_RELAY_TEST_DATABASE_URL is required for provider route tests");
+        let store = &db.store;
+        let session_id = "queue-provider-route";
+        let medium = create_session(store, session_id).await;
+        let before = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::FollowUp,
+                &UserMessage::text("before"),
+                Some("before-effort"),
+                None,
+            )
+            .await
+            .expect("pre-change input enqueues");
+        let low = with_effort(&medium, ReasoningEffort::Low);
+        store
+            .configure_session(session_id, &low)
+            .await
+            .expect("new default persists while work is queued");
+        let after = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::FollowUp,
+                &UserMessage::text("after"),
+                Some("after-effort"),
+                None,
+            )
+            .await
+            .expect("post-change input enqueues");
+        assert_eq!(
+            stored_effort(store, "queued_inputs", &before.input_id).await,
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            stored_effort(store, "queued_inputs", &after.input_id).await,
+            ReasoningEffort::Low
+        );
+
+        store
+            .promote_queued_input(session_id, &before.input_id)
+            .await
+            .expect("idle promotion");
+        assert_eq!(
+            stored_effort(store, "queued_inputs", &before.input_id).await,
+            ReasoningEffort::Medium,
+            "promotion without open work preserves submission route"
+        );
+
+        let action_id =
+            persist_model_action(store, session_id, "entry-route", 1, &medium.provider).await;
+        let (_, tool_actions) = store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(
+                    &[],
+                    None,
+                    &[],
+                    &[agent_session::SessionAction::RequestTool {
+                        action_id: agent_vocab::ActionId(2),
+                        turn_id: agent_vocab::TurnId(1),
+                        tool_call: ToolCall {
+                            id: ToolCallId::from_u64(1),
+                            tool_name: "Bash".to_string(),
+                            args_json: r#"{"command":"true"}"#.to_string(),
+                        },
+                    }],
+                )
+                .with_unchanged_active_leaf()
+                .with_provider_route(medium.provider.clone().into()),
+            )
+            .await
+            .expect("tool action persists with the open generation route");
+        let recovered = store
+            .pending_actions_for_dispatch(session_id)
+            .await
+            .expect("recover pending model and tool actions");
+        assert!(
+            recovered.iter().all(|action| {
+                let mut restored = with_effort(&medium, ReasoningEffort::High);
+                action.route.apply_to(&mut restored);
+                restored.provider.reasoning_effort == ReasoningEffort::Medium
+            }),
+            "recovered model and tool dispatches retain one generation route"
+        );
+        assert_eq!(
+            stored_effort(store, "actions", &tool_actions[0].row_id).await,
+            ReasoningEffort::Medium,
+            "fresh tool continuation stores its route"
+        );
+        store
+            .promote_queued_input(session_id, &after.input_id)
+            .await
+            .expect("active promotion");
+        assert_eq!(
+            stored_effort(store, "queued_inputs", &after.input_id).await,
+            ReasoningEffort::Medium,
+            "promotion into open work adopts its route"
+        );
+        let steer = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::Steer,
+                &UserMessage::text("steer current turn"),
+                Some("steer-effort"),
+                None,
+            )
+            .await
+            .expect("steer enqueues");
+        assert_eq!(
+            stored_effort(store, "queued_inputs", &steer.input_id).await,
+            ReasoningEffort::Medium
+        );
+
+        sqlx::query("update actions set status='completed' where id in ($1, $2)")
+            .bind(action_id)
+            .bind(&tool_actions[0].row_id)
+            .execute(&store.pool)
+            .await
+            .expect("complete historical generation");
+        let idle = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::Steer,
+                &UserMessage::text("idle steer"),
+                Some("idle-steer"),
+                None,
+            )
+            .await
+            .expect("idle steer enqueues");
+        assert_eq!(
+            stored_effort(store, "queued_inputs", &idle.input_id).await,
+            ReasoningEffort::Low,
+            "completed history is never an active steer route"
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn config_update_freezes_legacy_active_rows_and_rejects_mixed_open_routes() {
+        let db = test_store()
+            .await
+            .expect("PI_RELAY_TEST_DATABASE_URL is required for provider route tests");
+        let store = &db.store;
+        let session_id = "legacy-provider-route";
+        let medium = create_session(store, session_id).await;
+        let queued = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::FollowUp,
+                &UserMessage::text("legacy"),
+                Some("legacy"),
+                None,
+            )
+            .await
+            .expect("input enqueues");
+        let action_id =
+            persist_model_action(store, session_id, "entry-legacy", 1, &medium.provider).await;
+        sqlx::query("update queued_inputs set provider_config=null where id=$1")
+            .bind(&queued.input_id)
+            .execute(&store.pool)
+            .await
+            .expect("simulate rollback-era queue insert");
+        sqlx::query("update actions set provider_config=null where id=$1")
+            .bind(&action_id)
+            .execute(&store.pool)
+            .await
+            .expect("simulate rollback-era action insert");
+        let low = with_effort(&medium, ReasoningEffort::Low);
+        store
+            .configure_session(session_id, &low)
+            .await
+            .expect("configuration freezes old default");
+        assert_eq!(
+            stored_effort(store, "queued_inputs", &queued.input_id).await,
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            stored_effort(store, "actions", &action_id).await,
+            ReasoningEffort::Medium
+        );
+
+        let other = "action-mixed";
+        sqlx::query(
+            r#"
+            insert into actions (
+                id, session_id, turn_id, action_id, attempt_id, kind, status, payload,
+                provider_config
+            )
+            select $2, session_id, turn_id, action_id + 1, 'attempt-mixed', kind, status,
+                payload, $3
+            from actions
+            where id=$1
+            "#,
+        )
+        .bind(&action_id)
+        .bind(other)
+        .bind(serde_json::to_value(&low.provider).expect("serialize low route"))
+        .execute(&store.pool)
+        .await
+        .expect("inject inconsistent generation route");
+        let error = match store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::Steer,
+                &UserMessage::text("mixed"),
+                Some("mixed"),
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("mixed generation routes must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("inconsistent provider routes"));
+        sqlx::query("update actions set status='completed' where id in ($1, $2)")
+            .bind(action_id)
+            .bind(other)
+            .execute(&store.pool)
+            .await
+            .expect("complete rows");
+
+        db.cleanup().await;
     }
 
     #[tokio::test]

@@ -1,4 +1,8 @@
-use crate::SessionActivity;
+use anyhow::{anyhow, Result};
+use serde_json::Value;
+use sqlx::Row;
+
+use crate::{ProviderRouteSnapshot, SessionActivity};
 
 use super::action_records::POST_COMPACTION_DISPATCH_KEY;
 
@@ -89,6 +93,116 @@ pub(super) async fn lock_session_tx(
     if locked.is_none() {
         anyhow::bail!("session not found: {session_id}");
     }
+    Ok(())
+}
+
+/// Returns the route of the newest unfinished model/tool generation.
+///
+/// Legacy null action routes fall back to the current session default. Every
+/// unfinished model/tool action in one generation must resolve to the same
+/// route; dispatching an arbitrary first route would make recovery non-
+/// deterministic.
+pub(super) async fn unfinished_generation_route_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> Result<Option<ProviderRouteSnapshot>> {
+    let rows = sqlx::query(
+        r#"
+        with newest as (
+            select turn_id
+            from actions
+            where session_id=$1
+              and kind in ('model','tool')
+              and status in ('pending','blocked','running')
+            order by created_at desc, id desc
+            limit 1
+        )
+        select coalesce(a.provider_config, s.provider_config) as provider_config
+        from sessions s
+        join newest on true
+        join actions a
+          on a.session_id=s.id
+         and a.turn_id is not distinct from newest.turn_id
+         and a.kind in ('model','tool')
+         and a.status in ('pending','blocked','running')
+        where s.id=$1
+        order by a.created_at, a.id
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut route: Option<Value> = None;
+    for row in rows {
+        let candidate: Value = row.get("provider_config");
+        if route.as_ref().is_some_and(|route| route != &candidate) {
+            return Err(anyhow!(
+                "unfinished generation has inconsistent provider routes: {session_id}"
+            ));
+        }
+        route = Some(candidate);
+    }
+    route
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
+}
+
+pub(super) async fn session_default_route_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> Result<ProviderRouteSnapshot> {
+    let value: Value = sqlx::query_scalar("select provider_config from sessions where id=$1")
+        .bind(session_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(serde_json::from_value(value)?)
+}
+
+pub(super) async fn steering_route_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> Result<ProviderRouteSnapshot> {
+    match unfinished_generation_route_tx(tx, session_id).await? {
+        Some(route) => Ok(route),
+        None => session_default_route_tx(tx, session_id).await,
+    }
+}
+
+/// Freeze rollback-era null rows against the old default before it changes.
+pub(super) async fn freeze_legacy_routes_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        update queued_inputs q
+        set provider_config=s.provider_config
+        from sessions s
+        where q.session_id=s.id
+          and s.id=$1
+          and q.status in ('queued','consuming')
+          and q.provider_config is null
+        "#,
+    )
+    .bind(session_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        update actions a
+        set provider_config=s.provider_config
+        from sessions s
+        where a.session_id=s.id
+          and s.id=$1
+          and a.kind in ('model','tool')
+          and a.status in ('pending','blocked','running')
+          and a.provider_config is null
+        "#,
+    )
+    .bind(session_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 

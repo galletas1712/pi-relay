@@ -248,7 +248,7 @@ parent calls delegate_writing_task / delegate_readonly_tasks
      writes final_message.md + transcript.md for every subagent, then enqueues
      ONE terminal typed wakeup observation to the parent with the structured snapshot
   -> parent (woken by a terminal snapshot) branches on the outcome/status and decides
-     the next stage, a re-run, done, or whether to read artifact files for more detail
+     the next fresh stage, done, or whether to read artifact files for more detail
 ```
 
 A stage is terminal when all its subagents are terminal
@@ -288,7 +288,8 @@ A workflow is a **skill** (`SKILL.md`) discovered in the skills index and loaded
 with `LoadSkill` (the subagent roles are already skills). It documents a
 graph-shaped state machine the parent follows with judgment, driving it with
 delegation tool calls. There is **no `workflow.*` tool surface**; stages carry
-an optional `workflow` label only so the run board can group them.
+an optional `workflow` label for internal correlation/ordering, not for a
+visible product heading.
 
 **Soft control flow, hard signals.** The skill reads like a state machine, but it
 is parent-interpreted. What keeps it crisp is the **typed `outcome`
@@ -344,7 +345,7 @@ prompt.
 ```
 
 Gates are **not** hard-enforced; mitigations are the skill's termination rules,
-the human watching the run board, and the typed outcomes. If a single critical
+the human watching the Agents outline, and the typed outcomes. If a single critical
 gate ever needs enforcement (e.g. "cannot finish without a tester `pass`"), add a
 targeted check — not a graph engine.
 
@@ -585,9 +586,11 @@ busy-wait/poll loop.
 
 ### Phase 5 — UI
 
-- Run board: parent session -> stages -> subagents with status and links to their
-  handoff files; show the full subagent's in-place changes. Controls: cancel
-  stage, steer active subagents, re-run a stage.
+- Agents outline: a flat list of task/role labels led by shape-distinct,
+  accessibly named status icons. Do not render group headings, status/outcome
+  phrases, progress/counts, or handoff links in ambient rows; open Handoffs or
+  Debug Inspector explicitly for detail. Keep scoped cancellation. Delegated
+  work has no restart control.
 
 ## Testing
 
@@ -631,8 +634,8 @@ Reuse the dev harness that resolves model actions deterministically
 9. Workflows are skills (`SKILL.md` + `LoadSkill`) describing a parent-interpreted,
    possibly-cyclic stage state machine. No DSL, no daemon graph, no `workflow.*`
    tools.
-10. The daemon owns mechanism; the model owns policy (which stage next, re-run,
-    stop).
+10. The daemon owns mechanism; the model owns policy (which fresh stage next or
+    stop). There is no dedicated delegation rerun API.
 
 ## Appendix A: delegation tool schemas
 
@@ -709,8 +712,8 @@ Rules:
 - Never mix RO and full work in one stage.
 - To run a known pattern (e.g. implement → review → test), `LoadSkill` the matching
   workflow skill and follow its stage state machine, branching on the typed
-  outcomes in `inspect_delegation`, with your own judgment (skip, re-run,
-  escalate, stop).
+  outcomes in `inspect_delegation`, with your own judgment (skip, launch fresh
+  work, escalate, stop).
 - The `PythonRepl` tool remains only for ad hoc scripting, not for orchestrating
   subagents.
 ```

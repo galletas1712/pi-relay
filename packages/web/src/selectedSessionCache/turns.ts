@@ -10,14 +10,7 @@ export function applyTranscriptTurns(
 ): SelectedSessionCache {
 	if (cache.sessionId !== result.session_id) return cache;
 	const mode = options.mode ?? "replace";
-	if (
-		mode === "prepend" &&
-		(cache.turnTranscriptRevision !== result.transcript_revision ||
-			cache.turnActiveLeafId !== result.active_leaf_id ||
-			cache.turnBeforeEntryId !== (result.before_entry_id ?? null))
-	) {
-		return cache;
-	}
+	if (mode === "prepend" && !canPrependTranscriptTurns(cache, result)) return cache;
 	if (mode === "replace" && isStaleTranscriptTurnsResult(cache, result)) return cache;
 	let entriesById = cache.entriesById;
 	const incomingCardsById = new Map<string, TurnCard>();
@@ -31,7 +24,10 @@ export function applyTranscriptTurns(
 		});
 	}
 	const orderedIds = mode === "prepend"
-		? uniqueStringArray([...result.cards.map((card) => card.id), ...cache.turnOrder])
+		? uniqueStringArray([
+				...result.cards.map((card) => card.id).filter((id) => !cache.turnCardsById.has(id)),
+				...cache.turnOrder,
+			])
 		: result.cards.map((card) => card.id);
 	const turnCardsById = mode === "prepend"
 		? new Map([...cache.turnCardsById, ...incomingCardsById])
@@ -56,7 +52,7 @@ export function applyTranscriptTurns(
 				entries: selectedEntriesFromIds(activeBranchEntryIds, entriesById),
 			}
 		: cache.snapshot;
-	return {
+	const next = {
 		...cache,
 		snapshot,
 		activeBranchEntryIds: sameStringArray(cache.activeBranchEntryIds, activeBranchEntryIds)
@@ -66,11 +62,79 @@ export function applyTranscriptTurns(
 		turnCardsById,
 		turnOrder: orderedIds,
 		turnDetailsById,
+		transcriptTurnsLoaded: true,
+		turnPageHydrationRevision: cache.turnPageHydrationRevision + 1,
 		turnTranscriptRevision: result.transcript_revision,
 		turnActiveLeafId: result.active_leaf_id,
 		turnHasMoreBefore: result.has_more_before,
 		turnBeforeEntryId: result.next_before_entry_id ?? null,
 	};
+	return mode === "prepend" && samePrependProjection(cache, next) ? cache : next;
+}
+
+export interface TranscriptTurnsPrependResult {
+	cache: SelectedSessionCache;
+	status: "committed" | "noop" | "stale";
+	turnPageHydrationRevision?: number;
+}
+
+export function prependTranscriptTurns(
+	cache: SelectedSessionCache,
+	result: TranscriptTurnsResult,
+): TranscriptTurnsPrependResult {
+	if (!canPrependTranscriptTurns(cache, result)) return { cache, status: "stale" };
+	const next = applyTranscriptTurns(cache, result, { mode: "prepend" });
+	if (next === cache) return { cache, status: "noop" };
+	return {
+		cache: next,
+		status: "committed",
+		turnPageHydrationRevision: next.turnPageHydrationRevision,
+	};
+}
+
+function canPrependTranscriptTurns(cache: SelectedSessionCache, result: TranscriptTurnsResult): boolean {
+	return (
+		cache.turnTranscriptRevision === result.transcript_revision &&
+		cache.turnActiveLeafId === result.active_leaf_id &&
+		cache.turnBeforeEntryId === (result.before_entry_id ?? null)
+	);
+}
+
+function samePrependProjection(left: SelectedSessionCache, right: SelectedSessionCache): boolean {
+	return (
+		left.entriesById === right.entriesById &&
+		sameStringArray(left.activeBranchEntryIds, right.activeBranchEntryIds) &&
+		sameStringArray(left.turnOrder, right.turnOrder) &&
+		sameJsonValue(left.snapshot, right.snapshot) &&
+		sameJsonMap(left.turnCardsById, right.turnCardsById) &&
+		sameStringArrayMap(left.turnDetailsById, right.turnDetailsById) &&
+		left.transcriptTurnsLoaded === right.transcriptTurnsLoaded &&
+		left.turnTranscriptRevision === right.turnTranscriptRevision &&
+		left.turnActiveLeafId === right.turnActiveLeafId &&
+		left.turnHasMoreBefore === right.turnHasMoreBefore &&
+		left.turnBeforeEntryId === right.turnBeforeEntryId
+	);
+}
+
+function sameJsonMap<T>(left: Map<string, T>, right: Map<string, T>): boolean {
+	if (left.size !== right.size) return false;
+	for (const [key, value] of left) {
+		if (!right.has(key) || !sameJsonValue(value, right.get(key))) return false;
+	}
+	return true;
+}
+
+function sameStringArrayMap(left: Map<string, string[]>, right: Map<string, string[]>): boolean {
+	if (left.size !== right.size) return false;
+	for (const [key, value] of left) {
+		const candidate = right.get(key);
+		if (!candidate || !sameStringArray(value, candidate)) return false;
+	}
+	return true;
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+	return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function turnDetailCoversCard(entryIds: string[], card: TurnCard): boolean {

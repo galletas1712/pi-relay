@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_session::{SessionAction, SessionActionKind, SessionEvent, TranscriptStorageNode};
 use agent_vocab::{
-    AssistantItem, AssistantMessage, ProviderKind, ProviderReplayItem, TranscriptItem, UserMessage,
+    AssistantItem, AssistantMessage, ProviderConfig, ProviderKind, ProviderReplayItem,
+    ReasoningEffort, TranscriptItem, UserMessage,
 };
 use serde_json::json;
 
@@ -63,6 +64,14 @@ fn consumed_input() -> QueuedInput {
         id: "input".to_string(),
         priority: InputPriority::FollowUp,
         content: QueuedInputContent::user_message(UserMessage::text("hello")),
+        route: ProviderConfig {
+            kind: ProviderKind::OpenAi,
+            model: "test-model".to_string(),
+            reasoning_effort: ReasoningEffort::Medium,
+            max_tokens: None,
+            prompt_cache: None,
+        }
+        .into(),
         client_input_id: None,
         claim_id: "claim".to_string(),
         row_version: "1".to_string(),
@@ -140,8 +149,19 @@ async fn only_a_batch_with_no_durable_obligations_skips_the_transaction() {
             OutputBatch::new(&[], None, &events, &[]).with_unchanged_active_leaf(),
         ),
         (
-            "action",
-            OutputBatch::new(&[], None, &[], &actions).with_unchanged_active_leaf(),
+            "provider route with action",
+            OutputBatch::new(&[], None, &[], &actions)
+                .with_unchanged_active_leaf()
+                .with_provider_route(
+                    ProviderConfig {
+                        kind: ProviderKind::OpenAi,
+                        model: "test-model".to_string(),
+                        reasoning_effort: ReasoningEffort::High,
+                        max_tokens: None,
+                        prompt_cache: None,
+                    }
+                    .into(),
+                ),
         ),
         (
             "action update / compaction completion",
@@ -156,10 +176,20 @@ async fn only_a_batch_with_no_durable_obligations_skips_the_transaction() {
                 .with_consumed_input(Some(consumed_input())),
         ),
         (
-            "accepted input",
+            "provider route with accepted input",
             OutputBatch::new(&[], None, &[], &[])
                 .with_unchanged_active_leaf()
-                .with_accepted_input(Some(accepted_input())),
+                .with_accepted_input(Some(accepted_input()))
+                .with_provider_route(
+                    ProviderConfig {
+                        kind: ProviderKind::OpenAi,
+                        model: "test-model".to_string(),
+                        reasoning_effort: ReasoningEffort::High,
+                        max_tokens: None,
+                        prompt_cache: None,
+                    }
+                    .into(),
+                ),
         ),
         (
             "transcript entry with provider replay attachment",
@@ -185,6 +215,26 @@ async fn only_a_batch_with_no_durable_obligations_skips_the_transaction() {
     }
 
     store.close().await;
+    let route_only = store
+        .persist_outputs(
+            "session",
+            OutputBatch::new(&[], None, &[], &[])
+                .with_unchanged_active_leaf()
+                .with_provider_route(
+                    ProviderConfig {
+                        kind: ProviderKind::OpenAi,
+                        model: "test-model".to_string(),
+                        reasoning_effort: ReasoningEffort::High,
+                        max_tokens: None,
+                        prompt_cache: None,
+                    }
+                    .into(),
+                ),
+        )
+        .await
+        .expect("provider route alone must not touch the closed pool");
+    assert!(route_only.0.is_empty());
+    assert!(route_only.1.is_empty());
     let admin = sqlx::PgPool::connect(&admin_url)
         .await
         .expect("connect test database admin for cleanup");

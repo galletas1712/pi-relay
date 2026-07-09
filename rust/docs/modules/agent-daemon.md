@@ -316,7 +316,12 @@ The circuit breaker lives in compaction auto-state on session metadata. Each aut
 
 - `RuntimeSession` lives in `active` only while a session is working; the store is the source of truth and the in-memory session is dropped on idle, on persist failure, and when a boundary-scoped compaction starts.
 - Recovery is mandatory before the first read/input on a cold session; skipping it would surface an open turn as a finished one.
-- Source mutations require an idle session; metadata-only `session.configure` needs idle queue/actions but not full recovery. A session model cannot change once the first transcript entry exists (`provider_locked`).
+- Source mutations require an idle session; metadata-only `session.configure`
+  needs idle queue/actions but not full recovery. A session model cannot change
+  once the first transcript entry exists (`provider_locked`). Provider-adjacent
+  defaults such as reasoning effort may persist while work is active: queued
+  input and action route snapshots keep already accepted/open-turn work stable,
+  and the active runtime is not overwritten.
 - `ProviderKind` is `{ OpenAi, Claude }`. `codex` is not a provider kind — it is the auth transport OpenAI always uses.
 - `client_input_id` makes idle-accept and busy-queue sends idempotent: a replayed id returns the prior outcome without re-enqueuing.
 - The dev harness methods (`harness.model.complete` / `harness.model.fail`) let tests resolve model actions deterministically; harness sessions skip provider dispatch and auto-compaction entirely.

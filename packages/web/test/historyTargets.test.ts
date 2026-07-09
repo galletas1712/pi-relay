@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
 	branchEntriesFor,
-	historyEntryDisplay,
 	historySwitchOptions,
 	historySwitchOptionsFromNodes,
 	nodeBranchIds,
@@ -145,19 +144,6 @@ describe("nodeBranchIds", () => {
 		];
 
 		expect(nodeBranchIds(nodes, "finish2")).toEqual(["start1", "finish1", "compact1", "finish2"]);
-	});
-});
-
-describe("historyEntryDisplay", () => {
-	it("derives user-message labels from tree ancestry rather than array adjacency", () => {
-		const entries = fixtureEntries();
-		const sibling = entries.find((item) => item.id === "sibling")!;
-
-		expect(historyEntryDisplay(sibling, entries)).toMatchObject({
-			turnLabel: "user",
-			title: "User message",
-			preview: "alternate branch"
-		});
 	});
 });
 

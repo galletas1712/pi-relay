@@ -1,5 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
-import { Download, FileText, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { Download, FileText } from "lucide-react";
+import {
+	AppDialog,
+	DialogClose,
+	DialogCloseButton,
+	DialogDescription,
+	DialogTitle,
+} from "./dialog.tsx";
 import {
 	assistantExportBlocks,
 	buildExportBlocks,
@@ -7,26 +14,37 @@ import {
 	downloadMarkdown,
 	exportPreview,
 	exportTitle,
-	formatExportMarkdown
+	formatExportMarkdown,
+	type ExportBlock,
 } from "./exportTranscript.ts";
 import type { TranscriptEntry } from "./types.ts";
 
 export function ExportDialog({
 	entries,
+	blocks: providedBlocks,
 	onClose,
 	onCopied,
 	onDownloaded,
-	onError
+	onError,
+	returnFocusFallbackRef,
 }: {
 	entries: TranscriptEntry[];
+	blocks?: ExportBlock[];
 	onClose: () => void;
 	onCopied: () => void;
 	onDownloaded: () => void;
 	onError: (error: unknown) => void;
+	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
-	const blocks = useMemo(() => buildExportBlocks(entries), [entries]);
+	const titleRef = useRef<HTMLHeadingElement>(null);
+	const copyRunningRef = useRef(false);
+	const blocks = useMemo(
+		() => providedBlocks ?? buildExportBlocks(entries),
+		[entries, providedBlocks],
+	);
 	const assistants = useMemo(() => assistantExportBlocks(blocks), [blocks]);
 	const [selectedIds, setSelectedIds] = useState<Set<string>>(() => defaultSelectedAssistantIds(blocks));
+	const [copying, setCopying] = useState(false);
 
 	useEffect(() => {
 		setSelectedIds(defaultSelectedAssistantIds(blocks));
@@ -53,12 +71,18 @@ export function ExportDialog({
 	const clear = () => setSelectedIds(new Set());
 
 	const copy = async () => {
+		if (copyRunningRef.current) return;
+		copyRunningRef.current = true;
+		setCopying(true);
 		try {
 			await navigator.clipboard.writeText(markdown);
 			onCopied();
 			onClose();
 		} catch (error) {
 			onError(error);
+		} finally {
+			copyRunningRef.current = false;
+			setCopying(false);
 		}
 	};
 
@@ -73,52 +97,59 @@ export function ExportDialog({
 	};
 
 	return (
-		<div className="modal-scrim" role="presentation" onMouseDown={onClose}>
-			<div className="export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
-				<div className="export-dialog-head">
-					<span className="history-dialog-icon" aria-hidden="true"><FileText size={15} /></span>
-					<div className="history-dialog-copy">
-						<h2 id="export-dialog-title">Export messages</h2>
-						<p>Select model steps from the current branch. User inputs from the containing turn are included once.</p>
-					</div>
-					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close export dialog">
-						<X size={16} />
-					</button>
+		<AppDialog
+			className="export-dialog"
+			busy={copying}
+			initialFocusRef={titleRef}
+			returnFocusFallbackRef={returnFocusFallbackRef}
+			onDismiss={onClose}
+		>
+			<div className="export-dialog-head">
+				<span className="history-dialog-icon" aria-hidden="true"><FileText size={15} /></span>
+				<div className="history-dialog-copy">
+					<DialogTitle ref={titleRef} tabIndex={-1}>Export messages</DialogTitle>
+					<DialogDescription>
+						Select model steps from the current branch. User inputs from the containing turn are included once.
+					</DialogDescription>
 				</div>
+				<DialogCloseButton label="close export dialog" disabled={copying} />
+			</div>
 
-				<div className="export-toolbar">
-					<div className="export-count">{selectedCount} of {assistants.length} selected</div>
-					<div className="export-toolbar-actions">
-						<button type="button" className="secondary-button" onClick={selectAll} disabled={assistants.length === 0}>Select all</button>
-						<button type="button" className="secondary-button" onClick={selectLast} disabled={assistants.length === 0}>Select last</button>
-						<button type="button" className="secondary-button" onClick={clear} disabled={selectedCount === 0}>Clear</button>
-					</div>
-				</div>
-
-				<div className="export-options">
-					{assistants.length === 0 ? (
-						<div className="export-empty">No assistant messages to export.</div>
-					) : assistants.map((assistant, index) => (
-						<label className="export-option" key={assistant.entryId}>
-							<input
-								type="checkbox"
-								checked={selectedIds.has(assistant.entryId)}
-								onChange={() => toggle(assistant.entryId)}
-							/>
-							<span className="export-option-main">
-								<span className={`export-option-title phase-${assistant.phase}`}>{exportTitle(assistant, index)}</span>
-								<span className="export-option-preview">{exportPreview(assistant.text)}</span>
-							</span>
-						</label>
-					))}
-				</div>
-
-				<div className="export-actions">
-					<button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
-					<button type="button" className="secondary-button" onClick={copy} disabled={!canExport}>Copy to clipboard</button>
-					<button type="button" className="primary-button" onClick={download} disabled={!canExport}><Download size={14} />Download Markdown</button>
+			<div className="export-toolbar">
+				<div className="export-count">{selectedCount} of {assistants.length} selected</div>
+				<div className="export-toolbar-actions">
+					<button type="button" className="secondary-button" onClick={selectAll} disabled={copying || assistants.length === 0}>Select all</button>
+					<button type="button" className="secondary-button" onClick={selectLast} disabled={copying || assistants.length === 0}>Select last</button>
+					<button type="button" className="secondary-button" onClick={clear} disabled={copying || selectedCount === 0}>Clear</button>
 				</div>
 			</div>
-		</div>
+
+			<div className="export-options">
+				{assistants.length === 0 ? (
+					<div className="export-empty">No assistant messages to export.</div>
+				) : assistants.map((assistant, index) => (
+					<label className="export-option" key={assistant.entryId}>
+						<input
+							type="checkbox"
+							checked={selectedIds.has(assistant.entryId)}
+							onChange={() => toggle(assistant.entryId)}
+							disabled={copying}
+						/>
+						<span className="export-option-main">
+							<span className={`export-option-title phase-${assistant.phase}`}>{exportTitle(assistant, index)}</span>
+							<span className="export-option-preview">{exportPreview(assistant.text)}</span>
+						</span>
+					</label>
+				))}
+			</div>
+
+			<div className="export-actions">
+				<DialogClose className="secondary-button" disabled={copying}>Cancel</DialogClose>
+				<button type="button" className="secondary-button" onClick={copy} disabled={copying || !canExport}>
+					{copying ? "Copying…" : "Copy to clipboard"}
+				</button>
+				<button type="button" className="primary-button" onClick={download} disabled={copying || !canExport}><Download size={14} />Download Markdown</button>
+			</div>
+		</AppDialog>
 	);
 }

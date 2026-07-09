@@ -124,6 +124,39 @@ pub struct SessionConfig {
     pub metadata: Value,
 }
 
+/// Complete provider request-shaping state captured for accepted or recoverable work.
+///
+/// This is internal routing metadata, not a session default and not part of queue RPC
+/// views. Applying a snapshot replaces only the provider portion of a freshly loaded
+/// [`SessionConfig`], retaining current workspace, prompt, and metadata state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProviderRouteSnapshot(ProviderConfig);
+
+impl ProviderRouteSnapshot {
+    pub fn apply_to(&self, config: &mut SessionConfig) {
+        config.provider = self.0.clone();
+    }
+}
+
+impl From<ProviderConfig> for ProviderRouteSnapshot {
+    fn from(provider: ProviderConfig) -> Self {
+        Self(provider)
+    }
+}
+
+impl PartialEq for ProviderRouteSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.kind == other.0.kind
+            && self.0.model == other.0.model
+            && self.0.reasoning_effort == other.0.reasoning_effort
+            && self.0.max_tokens == other.0.max_tokens
+            && self.0.prompt_cache == other.0.prompt_cache
+    }
+}
+
+impl Eq for ProviderRouteSnapshot {}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceKind {
@@ -259,6 +292,7 @@ pub struct PendingDispatchAction {
     pub row_id: String,
     pub attempt_id: String,
     pub action: SessionAction,
+    pub route: ProviderRouteSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -604,7 +638,7 @@ pub struct CreateCompactionResult {
 pub struct CompleteCompactionResult {
     pub new_root_id: Option<String>,
     pub active_leaf_id: Option<String>,
-    pub resumed_model_action: Option<PersistedAction>,
+    pub resumed_model_action: Option<PendingDispatchAction>,
     pub events: Vec<EventFrame>,
 }
 
@@ -837,6 +871,7 @@ pub struct QueuedInput {
     pub id: String,
     pub priority: InputPriority,
     pub content: QueuedInputContent,
+    pub route: ProviderRouteSnapshot,
     pub client_input_id: Option<String>,
     pub claim_id: String,
     pub row_version: String,
@@ -931,6 +966,7 @@ pub struct OutputBatch<'a> {
     pub(crate) consumed_input: Option<QueuedInput>,
     pub(crate) accepted_input: Option<AcceptedInput>,
     pub(crate) control_interrupt_input_id: Option<&'a str>,
+    pub(crate) provider_route: Option<ProviderRouteSnapshot>,
 }
 
 impl<'a> OutputBatch<'a> {
@@ -950,6 +986,7 @@ impl<'a> OutputBatch<'a> {
             consumed_input: None,
             accepted_input: None,
             control_interrupt_input_id: None,
+            provider_route: None,
         }
     }
 
@@ -989,6 +1026,11 @@ impl<'a> OutputBatch<'a> {
             || self.consumed_input.is_some()
             || self.accepted_input.is_some()
             || self.control_interrupt_input_id.is_some()
+    }
+
+    pub fn with_provider_route(mut self, route: ProviderRouteSnapshot) -> Self {
+        self.provider_route = Some(route);
+        self
     }
 }
 

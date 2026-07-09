@@ -248,3 +248,37 @@ fn now_ms() -> u64 {
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use agent_store::{
+        InputPriority, QueueState, QueuedInputContent, QueuedInputRecord, QueuedInputStatus,
+        SessionActivity,
+    };
+    use agent_vocab::UserMessage;
+
+    #[test]
+    fn queue_view_does_not_expose_internal_provider_routes() {
+        let value = super::queue_state(QueueState {
+            session_revision: 1,
+            queue_revision: 2,
+            transcript_revision: 3,
+            activity: SessionActivity::Queued,
+            queued_inputs: vec![QueuedInputRecord {
+                input_id: "input".to_string(),
+                priority: InputPriority::FollowUp,
+                status: QueuedInputStatus::Queued,
+                content: QueuedInputContent::user_message(UserMessage::text("hello")),
+                client_input_id: Some("client".to_string()),
+                created_at: "created".to_string(),
+                updated_at: "updated".to_string(),
+                promoted_at: None,
+                follow_up_position: Some(0),
+            }],
+        });
+        let queued = &value["queued_inputs"][0];
+        assert!(queued.get("provider_config").is_none());
+        assert!(queued.get("provider").is_none());
+        assert!(queued.get("route").is_none());
+    }
+}

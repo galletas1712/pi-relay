@@ -243,10 +243,6 @@ function historyTreeRowsIndexed(index: HistoryIndex, activeLeafId: string | null
 	return rows;
 }
 
-export function historyEntryDisplay(entry: TranscriptEntry, entries: TranscriptEntry[]): HistoryEntryDisplay {
-	return historyEntryDisplayIndexed(createHistoryIndex(entries), entry);
-}
-
 function historyEntryDisplayIndexed(index: HistoryIndex, entry: TranscriptEntry): HistoryEntryDisplay {
 	const meta = index.metaById.get(entry.id);
 	const currentTurnId = meta?.turnId ?? null;

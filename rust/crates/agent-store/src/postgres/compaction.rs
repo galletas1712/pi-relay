@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     ActionKind, ActionStatus, CompactionCompletion, CompactionJob, CompactionScope,
     CompactionTrigger, CompleteCompactionResult, CreateCompactionResult, EventFrame, EventType,
-    PersistedAction,
+    PendingDispatchAction,
 };
 
 use super::action_records::{
@@ -571,9 +571,11 @@ impl PostgresAgentStore {
             if updated == 1 {
                 if let Some(row) = sqlx::query(
                     r#"
-                    select id, attempt_id, kind, action_id, turn_id, payload
-                    from actions
-                    where session_id=$1 and id=$2::text and attempt_id=$3::text
+                    select a.id, a.attempt_id, a.kind, a.action_id, a.turn_id, a.payload,
+                        coalesce(a.provider_config, s.provider_config) as provider_config
+                    from actions a
+                    join sessions s on s.id=a.session_id
+                    where a.session_id=$1 and a.id=$2::text and a.attempt_id=$3::text
                     "#,
                 )
                 .bind(&job.source_session_id)
@@ -584,10 +586,12 @@ impl PostgresAgentStore {
                 {
                     let new_model_context =
                         model_context_from_installed_entries(&installed_entries);
-                    resumed_model_action = Some(PersistedAction {
+                    let route = serde_json::from_value(row.get("provider_config"))?;
+                    resumed_model_action = Some(PendingDispatchAction {
                         row_id: row.get("id"),
                         attempt_id: row.get("attempt_id"),
                         action: session_action_from_model_row(row, new_model_context)?,
+                        route,
                     });
                 }
             } else {

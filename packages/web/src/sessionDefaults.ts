@@ -66,7 +66,7 @@ export function withReasoningEffort(provider: ProviderConfig, reasoningEffort: R
 export function providerFromModelKey(modelKey: string, current: ProviderConfig): ProviderConfig {
 	const option = MODEL_OPTIONS.find((candidate) => candidate.id === modelKey);
 	if (!option) return current;
-	return { ...option.provider };
+	return { ...current, ...option.provider };
 }
 
 export function reasoningEffortsForProvider(provider: ProviderConfig): ReasoningEffort[] {

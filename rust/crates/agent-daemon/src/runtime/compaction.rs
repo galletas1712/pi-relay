@@ -239,7 +239,7 @@ async fn compensate_resumed_action(
     state: &AppState,
     driver: &SessionDriver,
     session_id: &str,
-    resumed: &agent_store::PersistedAction,
+    resumed: &agent_store::PendingDispatchAction,
     post_compaction_dispatch_lease: Option<&agent_store::PostCompactionDispatchLease>,
     error: String,
 ) -> std::result::Result<(), RpcError> {
@@ -391,8 +391,13 @@ async fn run_compaction_job(
     }
     if let Some(resumed) = resumed {
         super::ensure_post_compaction_dispatch_recovery(&state);
-        let resumed_config = match install_runtime_compaction_checkpoint(&state, &session_id, &job)
-            .await
+        let resumed_config = match install_runtime_compaction_checkpoint(
+            &state,
+            &session_id,
+            &job,
+            &resumed.route,
+        )
+        .await
         {
             Ok(config) => config,
             Err(error) => {
@@ -550,10 +555,12 @@ async fn install_runtime_compaction_checkpoint(
     state: &AppState,
     session_id: &str,
     job: &CompactionJob,
+    route: &agent_store::ProviderRouteSnapshot,
 ) -> std::result::Result<SessionConfig, RpcError> {
     let stored = state.repo.load_stored_session(session_id).await?;
     let persisted_active_leaf_id = stored.active_leaf_id.clone();
-    let config = state.repo.load_session_config(session_id).await?;
+    let mut config = state.repo.load_session_config(session_id).await?;
+    route.apply_to(&mut config);
     state
         .workspaces
         .ensure_session(session_id, &config.outer_cwd, &config.workspaces)

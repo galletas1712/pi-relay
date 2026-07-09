@@ -1,9 +1,15 @@
-import { memo } from "react";
+import { memo, type ReactNode } from "react";
 import { LogHeader } from "./panels.tsx";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { isArchivedSession, sessionStatusWithDelegations, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
 import { MessageList } from "./transcript.tsx";
-import type { TurnCardView } from "./transcript.tsx";
+import type {
+	OlderTurnsLoadRequest,
+	OlderTurnsLoadResult,
+	TranscriptDestination,
+	TranscriptTurnPageIdentity,
+	TurnCardView,
+} from "./transcript.tsx";
 import type { ReasoningEffort, SessionSnapshot, TranscriptEntry } from "./types.ts";
 
 export interface ChatPaneProps {
@@ -12,11 +18,17 @@ export interface ChatPaneProps {
 	entries: TranscriptEntry[];
 	turnCards?: TurnCardView[] | null;
 	transcriptLoading: boolean;
+	transcriptError: string | null;
+	transcriptErrorHasUsableCache: boolean;
+	transcriptRetrying: boolean;
 	hasRunningDelegations: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
 	modelLocked: boolean;
 	modelControlsDisabled: boolean;
+	reasoningControlsDisabled: boolean;
+	mutationBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	rightOpen: boolean;
@@ -33,7 +45,12 @@ export interface ChatPaneProps {
 	loadingTurnId?: string | null;
 	hasOlderTurns?: boolean;
 	loadingOlderTurns?: boolean;
-	onLoadOlderTurns?: () => void;
+	onLoadOlderTurns?: (request: OlderTurnsLoadRequest) => Promise<OlderTurnsLoadResult>;
+	transcriptDestination?: TranscriptDestination | null;
+	transcriptTurnPageIdentity?: TranscriptTurnPageIdentity | null;
+	onAcknowledgeTranscriptDestination?: (destinationId: number) => void;
+	onRetryTranscript: () => void;
+	routeNotice?: ReactNode;
 }
 
 export const ChatPane = memo(function ChatPane({
@@ -42,11 +59,17 @@ export const ChatPane = memo(function ChatPane({
 	entries,
 	turnCards,
 	transcriptLoading,
+	transcriptError,
+	transcriptErrorHasUsableCache,
+	transcriptRetrying,
 	hasRunningDelegations,
 	modelOptions,
 	modelValue,
 	modelLocked,
 	modelControlsDisabled,
+	reasoningControlsDisabled,
+	mutationBlockedReason,
+	remoteReadBlockedReason,
 	reasoningEfforts,
 	reasoningEffort,
 	rightOpen,
@@ -63,12 +86,18 @@ export const ChatPane = memo(function ChatPane({
 	loadingTurnId,
 	hasOlderTurns,
 	loadingOlderTurns,
-	onLoadOlderTurns
+	onLoadOlderTurns,
+	transcriptDestination,
+	transcriptTurnPageIdentity,
+	onAcknowledgeTranscriptDestination,
+	onRetryTranscript,
+	routeNotice,
 }: ChatPaneProps) {
 	const loadedLeafId = activeLeafIdFromEntries(entries);
 	const visibleActiveLeafId = loadedLeafId ?? snapshot?.active_leaf_id ?? null;
 	return (
 		<main className="log-pane" data-slot="agent-log">
+			{routeNotice}
 			<ChatHeader
 				session={session}
 				snapshot={snapshot}
@@ -77,6 +106,8 @@ export const ChatPane = memo(function ChatPane({
 				modelValue={modelValue}
 				modelLocked={modelLocked}
 				modelControlsDisabled={modelControlsDisabled}
+				reasoningControlsDisabled={reasoningControlsDisabled}
+				mutationBlockedReason={mutationBlockedReason}
 				reasoningEfforts={reasoningEfforts}
 				reasoningEffort={reasoningEffort}
 				rightOpen={rightOpen}
@@ -96,15 +127,24 @@ export const ChatPane = memo(function ChatPane({
 				sessionId={selectedId}
 				entriesSessionId={snapshot?.session_id ?? null}
 				loadingSession={transcriptLoading}
+				sessionError={transcriptError}
+				sessionErrorHasUsableCache={transcriptErrorHasUsableCache}
+				retryingSession={transcriptRetrying}
+				onRetrySession={onRetryTranscript}
 				onNewSession={onNewSession}
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}
+				resumeBlockedReason={mutationBlockedReason}
+				remoteReadBlockedReason={remoteReadBlockedReason}
 				onExpandTurn={onExpandTurn}
 				onCollapseTurn={onCollapseTurn}
 				loadingTurnId={loadingTurnId}
 				hasOlderTurns={hasOlderTurns}
 				loadingOlderTurns={loadingOlderTurns}
 				onLoadOlderTurns={onLoadOlderTurns}
+				destination={transcriptDestination}
+				turnPageIdentity={transcriptTurnPageIdentity}
+				onAcknowledgeDestination={onAcknowledgeTranscriptDestination}
 			/>
 		</main>
 	);
@@ -122,6 +162,8 @@ interface ChatHeaderProps {
 	modelValue: string;
 	modelLocked: boolean;
 	modelControlsDisabled: boolean;
+	reasoningControlsDisabled: boolean;
+	mutationBlockedReason?: string | null;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	rightOpen: boolean;
@@ -139,6 +181,8 @@ const ChatHeader = memo(function ChatHeader({
 	modelValue,
 	modelLocked,
 	modelControlsDisabled,
+	reasoningControlsDisabled,
+	mutationBlockedReason,
 	reasoningEfforts,
 	reasoningEffort,
 	rightOpen,
@@ -148,7 +192,7 @@ const ChatHeader = memo(function ChatHeader({
 	onToggleRight
 }: ChatHeaderProps) {
 	const archived = session ? isArchivedSession(session) : false;
-	const modelDisabled = modelLocked || modelControlsDisabled;
+	const modelDisabled = modelLocked || modelControlsDisabled || !!mutationBlockedReason;
 	const displayedModelOptions = modelOptions.some((option) => option.id === modelValue)
 		? modelOptions
 		: [{ id: modelValue, label: modelValue }, ...modelOptions];
@@ -164,7 +208,9 @@ const ChatHeader = memo(function ChatHeader({
 			modelOptions={displayedModelOptions}
 			modelValue={modelValue}
 			modelDisabled={modelDisabled}
-			modelDisabledTitle={modelLocked ? "Model is locked after the first transcript entry" : "Model"}
+			modelLocked={modelLocked}
+			reasoningDisabled={reasoningControlsDisabled || !!mutationBlockedReason}
+			controlsBlockedReason={mutationBlockedReason}
 			reasoningEfforts={displayedEfforts}
 			reasoningEffort={reasoningEffort}
 			rightOpen={rightOpen}

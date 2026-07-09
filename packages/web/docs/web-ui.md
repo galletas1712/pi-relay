@@ -13,7 +13,7 @@ and transcript-first interaction.
 | Sidebar        | Chat pane                        | Inspector    |
 | projects +     | header (model/effort/title)      | global cfg   |
 | session list   | transcript (turn cards)          | session head |
-| activity counts| ----------------------------------| pending      |
+|                | ----------------------------------| pending      |
 |                | composer + queue pane + slash    | actions/tools|
 +----------------+----------------------------------+--------------+
 ```
@@ -130,8 +130,32 @@ entry stream.
   in its segment.
 - Crashed or interrupted terminal turns expose a Continue/Retry action inline that calls `turn.resume`.
 - Turn-start, graceful turn-finish, and tool-call-start bookkeeping entries are not rendered as messages.
-- Turn-jump controls page between turn anchors; scroll position is sticky-to-bottom and persisted per session in
-  `localStorage`.
+- Turn-jump controls page between turn anchors. Entering a root or subagent
+  conversation—through direct load, navigation, Back/Forward, or a transcript
+  branch switch—waits for the matching rendered canonical turn page and
+  initializes once at latest/bottom. A successful branch-switch destination is
+  bound to its response session/leaf and a newer turn-page hydration revision;
+  loading state alone is not treated as content readiness. App owns and clears
+  the destination by ID only after `MessageList` acknowledges matching rendered
+  content, so a temporary Conversation/Execution remount still waits and a
+  later destination cannot be cleared by an older acknowledgement. Changing
+  conversation identity abandons the old destination. There is no per-session
+  mid-transcript scroll restoration.
+  After initialization, streaming remains sticky-to-bottom only while the user
+  stays near the bottom; deliberate scroll-up is preserved, including across
+  sparse canonical refreshes. An older-page request records whether the reader
+  was pinned. Every committed update—including an in-place duplicate card or
+  cursor-only update—waits for its rendered page hydration, then either restores
+  request-time bottom or preserves a measured visible-card offset, excluding
+  unrelated growth below the viewport. No-op, stale, failed, and rejected
+  outcomes also restore bottom after concurrent growth for a reader who started
+  pinned. Wheel, touch, scrollbar-drag, or keyboard scroll intent during the
+  request cancels both restoration modes; arbitrary browser/programmatic
+  `scroll` events alone do not.
+- The `/switch` branch dialog keeps focus on its heading and, once its async
+  history rows are available, scrolls the current target into view. If there is
+  no current target it starts at the bottom/latest row. This happens once per
+  dialog opening and does not fight later manual list scrolling.
 
 ### Tool calls render as collapsible groups
 
@@ -273,7 +297,7 @@ Steer and interrupt have three deliberately separate forms:
 The selected transcript's Stop button calls `input.interrupt` with the captured
 selected session id. Stopping a parent interrupts only that parent; stopping a
 child interrupts only that exact child, not its parent, siblings, or delegation.
-Whole-delegation cancellation remains the separate run-board
+Whole-delegation cancellation remains the separate Agents-outline
 `delegation.cancel`/model `cancel_delegation` operation. Its status transition
 atomically cancels active child mailbox rows (including pending combined
 controls), then exact-child runtime cancellation interrupts remaining child
@@ -334,8 +358,9 @@ Composer text is persisted per session in `localStorage` under `piRelayComposerD
 Submission IDs are retained in memory with the pending draft for an unchanged
 retry, but are not persisted across a full page reload.
 There are no browser-local *session* drafts — only Postgres-backed sessions appear in the sidebar, and starting a new
-chat is purely composer state. UI selection (`piRelayUiResume:v1`) and transcript scroll position are the other
-`localStorage`-backed UI state.
+chat is purely composer state. Legacy UI selection migration uses
+`piRelayUiResume:v1`; transcript scroll position is not persisted, and the
+retired `piRelayTranscriptScroll:v1` key is removed defensively.
 
 ### Slash commands
 
@@ -361,9 +386,11 @@ offers `gpt-5.6-sol` (default), `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude offe
 Sonnet 5 is the normal Claude default at `high` effort. Fable 5 is listed last as an explicit opt-in, and its option text
 and tooltip state Anthropic's required 30-day retention and lack of Zero Data Retention. The provider/model is locked
 once the session has any transcript history, because both providers carry provider-shaped replay state across turns.
-Reasoning effort is a per-request knob and can change during or between turns
-(applying to subsequently created requests). The picker remains a static seeded
-convenience: its existing hosted GPT-5.6 choices remain `none`,
+The model control keeps its `Model, locked` accessible name after that point and
+retains the existing running-state lock. Reasoning effort is independently
+editable while a response is running whenever the selected session is loaded,
+the client is connected, and the selected provider/model supports the value.
+The picker remains a static seeded convenience: its existing hosted GPT-5.6 choices remain `none`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, while the Claude
 entries expose `low…max`. `max` is the highest public wire effort; catalog-only
 values such as `ultra` are not exposed. The private catalog reports `ultra` for
@@ -372,9 +399,27 @@ and uses it to select proactive MultiAgent V2 behavior. pi-relay implements no
 equivalent orchestration mode, and live literal-Ultra requests were rejected,
 so it neither exposes nor aliases the value. Some seeded OpenAI choices can be
 rejected when the active account's catalog does not advertise them. Changing
-model/effort calls
-`session.configure` and patches the cached list/snapshot. Runtime validation is
-authoritative:
+model/effort calls `session.configure`; an effort-only update is accepted while
+the session is active and persists immediately as that session's default for
+future work. The daemon snapshots the complete provider route on each queued
+input at acceptance and on each durable action at turn creation. Therefore an
+open turn—including provider retries, tool continuations, compaction/recovery,
+and steering consumed into that turn—keeps its captured effort. A follow-up
+queued before an edit keeps its old route, while one queued after the accepted
+edit captures the new route. Steering an already open turn keeps that turn's
+route rather than retargeting it; future work created at a turn boundary uses
+the queued item's snapshot.
+
+The web client's focused provider-configuration controller serializes complete
+provider writes independently per session. Rapid model/effort edits on an empty
+session compose without dropping unrelated provider fields and coalesce to the
+latest desired value. Successful responses rebase later edits on the canonical
+provider response and patch the captured session's list and warm snapshot cache
+even after navigation. A final failure clears the optimistic value, shows a
+persistent dismissible notice, and refetches canonical state. Connection
+recovery and ordinary snapshot/list refetches remain authoritative and converge
+on the daemon's persisted default.
+No persistent “applies next turn” copy is added to the header. Runtime validation is authoritative:
 OpenAI exact-resolves the model and configured effort from its account-scoped
 private Codex catalog before every ordinary and compact request, while
 Anthropic uses discovered/static adapter capabilities. No transient catalog

@@ -13,8 +13,8 @@ use super::events::insert_event_tx;
 use super::outputs::persist_outputs_tx;
 use super::queue::bump_revisions_tx;
 use super::sql::{
-    action_is_unfinished, ensure_no_active_work_tx, lock_session_tx, queued_input_is_active,
-    session_activity,
+    action_is_unfinished, ensure_no_active_work_tx, freeze_legacy_routes_tx, lock_session_tx,
+    queued_input_is_active, session_activity,
 };
 use super::PostgresAgentStore;
 
@@ -398,6 +398,7 @@ impl PostgresAgentStore {
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
+        freeze_legacy_routes_tx(&mut tx, session_id).await?;
         let row = sqlx::query(
             "update sessions set provider_config=$2, metadata=$3, updated_at=now() where id=$1 returning metadata",
         )

@@ -8,7 +8,10 @@ use super::events::insert_event_tx;
 use super::queue::{
     append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
 };
-use super::sql::{action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity};
+use super::sql::{
+    action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity,
+    steering_route_tx,
+};
 use super::PostgresAgentStore;
 use crate::{
     DelegationKind, DelegationStatus, EnqueueUserInputResult, EventFrame, EventType, InputPriority,
@@ -55,7 +58,7 @@ pub struct DelegationProgress {
     pub failed: i32,
 }
 
-/// Compact status fields for a subagent in the run-board list.
+/// Compact status fields for a subagent in `delegation.list`.
 ///
 /// Unlike `delegation.status` / inspect snapshots this deliberately avoids
 /// loading the full active branch or touching handoff files. Terminality is
@@ -128,9 +131,9 @@ impl PostgresAgentStore {
     /// Compact subagent rows for `delegation.list`.
     ///
     /// This is intentionally set-based: it avoids `active_branch` hydration,
-    /// per-subagent `activity()` calls, and handoff filesystem probes. The run
-    /// board only needs enough state to draw status dots, open a subagent, and
-    /// decide whether re-run can fetch a task prompt on demand.
+    /// per-subagent `activity()` calls, and handoff filesystem probes. The
+    /// product surface only needs enough state to draw status icons, open a
+    /// subagent, and expose task-prompt handoff availability for inspection.
     pub async fn delegation_subagent_overview(
         &self,
         delegation_id: &str,
@@ -298,7 +301,7 @@ impl PostgresAgentStore {
         rows.iter().map(row_to_delegation).collect()
     }
 
-    /// A bounded page of delegations for the run board, newest first.
+    /// A bounded page of delegations for the product Agents outline, newest first.
     ///
     /// Fetching all historical delegations made the common selected-session
     /// poll scale with the lifetime of the parent session even though the UI
@@ -897,6 +900,7 @@ impl PostgresAgentStore {
         let target_active_leaf_id: Option<String> = session_row.get("active_leaf_id");
         let target_turn_id: Option<i64> = session_row.get("target_turn_id");
         let target_action_attempt_ids: Value = session_row.get("target_action_attempt_ids");
+        let route = steering_route_tx(&mut tx, subagent_id).await?;
         if child_parent.as_deref() != Some(parent_session_id)
             || child_delegation.as_deref() != Some(delegation_id)
             || !matches!(subagent_type.as_deref(), Some("full") | Some("read_only"))
@@ -985,7 +989,8 @@ impl PostgresAgentStore {
         let inserted = sqlx::query(
             r#"
             insert into queued_inputs (
-                id, session_id, priority, content, status, client_input_id, origin
+                id, session_id, priority, content, status, client_input_id, origin,
+                provider_config
             )
             values (
                 $1, $2, 'steer', $3, 'queued', $4,
@@ -1001,7 +1006,8 @@ impl PostgresAgentStore {
                     'target_active_leaf_id', $8::text,
                     'target_turn_id', $9::bigint,
                     'target_action_attempt_ids', $10::jsonb
-                )
+                ),
+                $12
             )
             on conflict (session_id, client_input_id) where client_input_id is not null
             do nothing
@@ -1024,6 +1030,7 @@ impl PostgresAgentStore {
         .bind(target_turn_id)
         .bind(target_action_attempt_ids)
         .bind(control_kind.as_str())
+        .bind(serde_json::to_value(route)?)
         .fetch_optional(&mut *tx)
         .await?;
         let input_id = if let Some(inserted) = inserted {
@@ -1782,9 +1789,8 @@ impl PostgresAgentStore {
                 .get("role_name")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            // The subagent's task prompt, persisted at spawn — carried in
-            // delegation.list so the run board can re-run a delegation from
-            // the delegation data itself.
+            // The subagent's task prompt is persisted at spawn and carried in
+            // delegation.list so inspection can expose its handoff file.
             let task = metadata
                 .get("task")
                 .and_then(Value::as_str)
@@ -1911,15 +1917,18 @@ async fn enqueue_steer_content_tx(
     client_input_id: &str,
 ) -> Result<bool> {
     lock_session_tx(tx, parent_session_id).await?;
+    let route = steering_route_tx(tx, parent_session_id).await?;
     let id = format!("input_{}", Uuid::new_v4());
     let inserted = sqlx::query(
         r#"
             insert into queued_inputs (
-                id, session_id, priority, content, status, client_input_id, origin
+                id, session_id, priority, content, status, client_input_id, origin,
+                provider_config
             )
             values (
                 $1, $2, 'steer', $3, 'queued', $4,
-                jsonb_build_object('promoted_at', clock_timestamp()::text)
+                jsonb_build_object('promoted_at', clock_timestamp()::text),
+                $5
             )
             on conflict (session_id, client_input_id) where client_input_id is not null
             do nothing
@@ -1930,6 +1939,7 @@ async fn enqueue_steer_content_tx(
     .bind(parent_session_id)
     .bind(serde_json::to_value(&content)?)
     .bind(client_input_id)
+    .bind(serde_json::to_value(route)?)
     .fetch_optional(&mut **tx)
     .await?;
     let Some(inserted) = inserted else {

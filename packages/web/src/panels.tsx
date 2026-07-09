@@ -2,36 +2,55 @@ import {
 	Archive,
 	ArchiveRestore,
 	ArrowUp,
+	Ban,
 	Bot,
-	Edit3,
+	CircleCheck,
+	CircleAlert,
+	CircleDashed,
+	CircleHelp,
+	CircleX,
+	Clock3,
 	Folder,
-	Network,
+	Loader2,
 	PanelRightOpen,
 	Plus,
-	RotateCcw,
 	Search,
 	Square,
 	SquarePen,
+	TriangleAlert,
 	Trash2,
 	X
 } from "lucide-react";
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { ActionMenu, type ActionMenuItem } from "./actionMenu.tsx";
+import { ConnectionBlockedReason, firstDisabledReason } from "./connectionRecovery.tsx";
+import {
+	AppAlertDialog,
+	DialogBody,
+	DialogClose,
+	DialogCloseButton,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogHeading,
+	DialogTitle,
+} from "./dialog.tsx";
 import { COMMANDS } from "./slash.ts";
 import {
 	isArchivedSession,
 	projectTitle,
 	sessionStatusWithDelegations,
 	sessionTitle,
-	type SessionDisplayActivity,
 	type SessionStatus,
 	type SessionListItem
 } from "./sessionList.ts";
-import { truncate } from "./text.ts";
 import {
-	canReRunDelegation,
+	agentStatusIconKey,
 	isDelegationRunning,
-	delegationStatusLabel,
-	statusRailClass,
+	orderDelegations,
+	remainingDelegationWorkCount,
+	statusIconClass,
+	type AgentStatusIconKey,
 } from "./delegationBoard.ts";
 import type {
 	Notice,
@@ -42,16 +61,6 @@ import type {
 	DelegationSubagent,
 	ToolListing,
 } from "./types.ts";
-
-function projectWorkspaceSummary(project: Project): string {
-	return project.workspaces
-		.map((workspace) =>
-			(workspace.kind ?? "git") === "local"
-				? `${workspace.workspace_dir}: local ${workspace.source_path ?? ""}`
-				: `${workspace.workspace_dir}: git ${workspace.remote_url ?? ""}#${workspace.remote_branch ?? ""}`,
-		)
-		.join("\n");
-}
 
 export function SidebarHeader({
 	connection,
@@ -75,155 +84,359 @@ export function SidebarHeader({
 	);
 }
 
-export interface RunBoardCallbacks {
-	onSelectSession?: (sessionId: string) => void;
-	onCancelDelegation: (delegationId: string) => void;
-	onReRunDelegation: (delegation: Delegation) => void;
-}
+export const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
+export const RUN_BOARD_EXPANDED_DELEGATION_COUNT = 100;
+const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
 
-interface RunBoardProps extends RunBoardCallbacks {
-	parentSessionId: string | null;
-	delegations: Delegation[];
-	hasMoreDelegations: boolean;
-	loading: boolean;
-	error: string | null;
-	showAllDelegations: boolean;
-	onToggleShowAllDelegations: () => void;
-}
-
-const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
-
-function subagentStatusLabel(subagent: DelegationSubagent): string {
+export function subagentStatusLabel(subagent: DelegationSubagent): string {
 	const status = typeof subagent.status === "string" ? subagent.status : "idle";
 	if (status === "done_with_failures") return "done with failures";
 	return status.replaceAll("_", " ");
 }
 
+function AgentStatusIcon({ status }: { status: string }) {
+	const label = status === "done_with_failures" ? "done with failures" : status.replaceAll("_", " ");
+	const iconKey = agentStatusIconKey(status);
+	const icons = {
+		running: Loader2,
+		done: CircleCheck,
+		"done-with-failures": TriangleAlert,
+		failed: CircleX,
+		cancelled: Ban,
+		queued: Clock3,
+		idle: CircleDashed,
+		unknown: CircleHelp,
+	} satisfies Record<AgentStatusIconKey, typeof Loader2>;
+	const Icon = icons[iconKey];
+	return (
+		<span
+			className={`run-board-status-icon ${statusIconClass(status)}`}
+			data-status-icon={iconKey}
+			role="img"
+			aria-label={`${label} status`}
+			title={label}
+		>
+			<Icon size={16} aria-hidden />
+		</span>
+	);
+}
+
 function SubagentRow({
 	subagent,
+	displayName,
+	selected,
 	onSelectSession,
 }: {
 	subagent: DelegationSubagent;
+	displayName: string;
+	selected: boolean;
 	onSelectSession?: (sessionId: string) => void;
 }) {
 	const status = typeof subagent.status === "string" ? subagent.status : "idle";
 	const statusLabel = subagentStatusLabel(subagent);
+	const role = subagent.role?.trim() || null;
+	const accessibleRole = role ? `, ${role}` : "";
 	return (
 		<div className="run-board-subagent" role="listitem">
-			<div className="run-board-subagent-head">
-				<button
-					className="link-button"
-					type="button"
-					onClick={() => onSelectSession?.(subagent.id)}
-					title={`open ${subagent.id}`}
-				>
-					<span
-						className={`run-board-status-icon ${statusRailClass(status)}`}
-						role="img"
-						aria-label={statusLabel}
-						title={statusLabel}
-					>
-						<Bot size={16} aria-hidden />
-					</span>{" "}
-					{subagent.role ?? subagent.id.slice(0, 13)}
-				</button>
-			</div>
+			<button
+				className="run-board-subagent-button"
+				type="button"
+				onClick={() => onSelectSession?.(subagent.id)}
+				aria-current={selected ? "page" : undefined}
+				aria-label={`Open agent ${displayName}${accessibleRole}, ${statusLabel}`}
+			>
+				<span className="run-board-subagent-main">
+					<AgentStatusIcon status={status} />
+					<span className="run-board-subagent-copy">
+						<span className="run-board-subagent-name">{displayName}</span>
+						{role ? <span className="run-board-subagent-role">{role}</span> : null}
+					</span>
+				</span>
+			</button>
 		</div>
 	);
 }
 
+interface DelegationActionState {
+	pending: boolean;
+	error: string | null;
+}
+
+function actionErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 function DelegationCard({
 	delegation,
-	canReRun,
+	subagentNames,
+	selectedSessionId,
+	actionState,
 	onSelectSession,
-	onCancelDelegation,
-	onReRunDelegation,
+	onRequestCancel,
+	mutationBlockedReason,
 }: {
 	delegation: Delegation;
-	canReRun: boolean;
-} & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onReRunDelegation">) {
+	subagentNames: ReadonlyMap<string, string>;
+	selectedSessionId?: string | null;
+	actionState?: DelegationActionState;
+	onRequestCancel: (delegation: Delegation) => void;
+	mutationBlockedReason?: string | null;
+	onSelectSession?: (sessionId: string) => void;
+}) {
 	const running = isDelegationRunning(delegation);
-	const title = delegation.label ?? delegation.workflow ?? delegation.delegation_id.slice(0, 13);
-	const statusLabel = delegationStatusLabel(delegation.status);
-	const isFull = delegation.kind === "full";
-	const KindIcon = isFull ? SquarePen : Network;
-	const kindStatusLabel = `${isFull ? "full" : "fan-out"} delegation — ${statusLabel}`;
+	const title = delegation.label?.trim() || "Agent task";
+	const statusLabel = delegation.status === "done_with_failures"
+		? "done with failures"
+		: delegation.status.replaceAll("_", " ");
+	const pending = actionState?.pending ?? false;
+	const actionDisabled = pending || !!mutationBlockedReason;
 	return (
-		<div className="run-board-delegation">
+		<article className="run-board-delegation" aria-label={`${title}, ${statusLabel}`}>
 			<div className="run-board-delegation-head">
-				<span
-					className={`run-board-status-icon ${statusRailClass(delegation.status)}`}
-					role="img"
-					aria-label={kindStatusLabel}
-					title={kindStatusLabel}
-				>
-					<KindIcon size={16} aria-hidden />
-				</span>
-				<span className="run-board-delegation-title">{title}</span>
+				<AgentStatusIcon status={delegation.status} />
+				<strong className="run-board-delegation-title">{title}</strong>
+				<div className="run-board-delegation-controls">
+					{running ? (
+						<button
+							className="run-board-cancel"
+							type="button"
+							disabled={actionDisabled}
+							aria-busy={pending}
+							aria-label={pending ? "Cancelling…" : "Cancel"}
+							onClick={() => onRequestCancel(delegation)}
+							title="Cancel this delegated work"
+						>
+							{pending ? <Loader2 className="spin" size={15} aria-hidden /> : <Square size={13} aria-hidden />}
+						</button>
+					) : null}
+				</div>
+				{running ? <ConnectionBlockedReason reason={mutationBlockedReason} className="run-board-blocked-reason" /> : null}
 			</div>
-			<div className="run-board-delegation-controls">
-				{running ? (
-					<button className="chip-button" type="button" onClick={() => onCancelDelegation(delegation.delegation_id)} title="cancel this delegation">
-						<Square size={11} /> cancel
-					</button>
-				) : null}
-				{canReRun ? (
-					<button className="chip-button" type="button" onClick={() => onReRunDelegation(delegation)} title="re-run this delegation">
-						<RotateCcw size={11} /> re-run
-					</button>
-				) : null}
-			</div>
+			{actionState?.error ? (
+				<p className="run-board-action-error" role="alert">
+					<CircleAlert size={13} aria-hidden />
+					{actionState.error}
+				</p>
+			) : null}
 			<div className="run-board-subagents" role="list">
 				{delegation.subagents.map((subagent) => (
 					<SubagentRow
 						key={subagent.id}
 						subagent={subagent}
+						displayName={subagentNames.get(subagent.id) ?? "Agent"}
+						selected={subagent.id === selectedSessionId}
 						onSelectSession={onSelectSession}
 					/>
 				))}
 			</div>
-		</div>
+		</article>
+	);
+}
+
+function CancelDelegationDialog({
+	delegation,
+	busy,
+	blockedReason,
+	onClose,
+	onConfirm,
+}: {
+	delegation: Delegation;
+	busy: boolean;
+	blockedReason?: string | null;
+	onClose: () => void;
+	onConfirm: () => void;
+}) {
+	const cancelRef = useRef<HTMLButtonElement>(null);
+	const title = delegation.label?.trim() || "Agent task";
+	const remaining = remainingDelegationWorkCount(delegation);
+	return (
+		<AppAlertDialog
+			className="rename-dialog cancel-delegation-dialog"
+			busy={busy}
+			initialFocusRef={cancelRef}
+			onDismiss={onClose}
+		>
+			<DialogHeader>
+				<DialogHeading>
+					<DialogTitle>Cancel delegated work?</DialogTitle>
+				</DialogHeading>
+				<DialogCloseButton label="close cancel delegated work dialog" disabled={busy} />
+			</DialogHeader>
+			<DialogBody className="delete-dialog-body">
+				<p>
+					Cancel <strong>{title}</strong> and stop remaining work affecting {remaining.count} {remaining.unit}?
+				</p>
+				<DialogDescription className="muted">
+					This stops remaining delegated work. It cannot roll back external tool or network side effects that already happened.
+				</DialogDescription>
+				<ConnectionBlockedReason reason={blockedReason} />
+			</DialogBody>
+			<DialogFooter>
+				<DialogClose ref={cancelRef} className="secondary-button" disabled={busy}>
+					Cancel
+				</DialogClose>
+				<button
+					type="button"
+					className="primary-button destructive"
+					disabled={busy || !!blockedReason}
+					aria-busy={busy}
+					onClick={onConfirm}
+				>
+					{busy ? "Cancelling…" : "Cancel work"}
+				</button>
+			</DialogFooter>
+		</AppAlertDialog>
 	);
 }
 
 export function RunBoardDelegationList({
+	parentSessionId,
 	delegations,
+	subagentNames = EMPTY_SUBAGENT_NAMES,
 	hasMoreDelegations = false,
 	showAllDelegations,
 	onToggleShowAllDelegations,
+	selectedSessionId,
 	onSelectSession,
 	onCancelDelegation,
-	onReRunDelegation,
+	mutationBlockedReason,
+	remoteReadBlockedReason,
+	expandedDelegationsAvailable = false,
+	boundedExpansionHasMore = false,
 }: {
+	parentSessionId: string;
 	delegations: Delegation[];
+	subagentNames?: ReadonlyMap<string, string>;
 	hasMoreDelegations?: boolean;
 	showAllDelegations: boolean;
 	onToggleShowAllDelegations: () => void;
-} & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onReRunDelegation">) {
-	// The daemon returns a bounded newest-first page for the board. Keep a local
-	// cap as a defensive fallback when tests or cached data include extra rows.
+	selectedSessionId?: string | null;
+	mutationBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
+	expandedDelegationsAvailable?: boolean;
+	boundedExpansionHasMore?: boolean;
+	onSelectSession?: (sessionId: string) => void;
+	onCancelDelegation: (parentSessionId: string, delegationId: string) => void | Promise<void>;
+}) {
+	const [cancelDialogIntent, setCancelDialogIntent] = useState<{
+		parentSessionId: string;
+		delegation: Delegation;
+	} | null>(null);
+	const [actionStates, setActionStates] = useState<Record<string, DelegationActionState>>({});
+	const actionLocks = useRef(new Set<string>());
+	// The daemon returns a bounded newest-first page for the Agents outline. Keep
+	// a local cap as a defensive fallback when tests or cached data include extras.
 	const hiddenLocalCount = Math.max(0, delegations.length - RUN_BOARD_DEFAULT_DELEGATION_COUNT);
 	const visibleDelegations =
 		showAllDelegations || hiddenLocalCount === 0
 			? delegations
 			: delegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT);
+	const orderedDelegations = useMemo(
+		() => orderDelegations(visibleDelegations),
+		[visibleDelegations],
+	);
 	const showToggle = hasMoreDelegations || hiddenLocalCount > 0 || showAllDelegations;
+	const toggleBlockedReason =
+		!showAllDelegations &&
+		hiddenLocalCount === 0 &&
+		hasMoreDelegations &&
+		!expandedDelegationsAvailable
+			? remoteReadBlockedReason
+			: null;
+	const actionKey = (intentParentSessionId: string, delegationId: string) =>
+		`${intentParentSessionId}:${delegationId}`;
+	const setActionState = (key: string, state: DelegationActionState) => {
+		setActionStates((current) => ({ ...current, [key]: state }));
+	};
+	const runAction = async (
+		intentParentSessionId: string,
+		delegation: Delegation,
+		callback: () => void | Promise<void>,
+	) => {
+		const delegationId = delegation.delegation_id;
+		const key = actionKey(intentParentSessionId, delegationId);
+		if (actionLocks.current.has(key)) return null;
+		actionLocks.current.add(key);
+		setActionState(key, { pending: true, error: null });
+		try {
+			await callback();
+			setActionState(key, { pending: false, error: null });
+			return true;
+		} catch (error) {
+			setActionState(key, { pending: false, error: actionErrorMessage(error) });
+			return false;
+		} finally {
+			actionLocks.current.delete(key);
+		}
+	};
+	const confirmCancel = () => {
+		const intent = cancelDialogIntent;
+		if (!intent || mutationBlockedReason) return;
+		void runAction(
+			intent.parentSessionId,
+			intent.delegation,
+			() => onCancelDelegation(intent.parentSessionId, intent.delegation.delegation_id),
+		).then((settled) => {
+			if (settled !== null) setCancelDialogIntent(null);
+		});
+	};
 	return (
 		<div className="run-board">
-			{visibleDelegations.map((delegation) => (
-				<DelegationCard
-					key={delegation.delegation_id}
-					delegation={delegation}
-					canReRun={canReRunDelegation(delegation)}
-					onSelectSession={onSelectSession}
-					onCancelDelegation={onCancelDelegation}
-					onReRunDelegation={onReRunDelegation}
+			{parentSessionId && delegations.length > 0 ? (
+				<>
+					<div className="run-board-outline">
+						{orderedDelegations.map((delegation) => (
+							<DelegationCard
+								key={delegation.delegation_id}
+								delegation={delegation}
+								subagentNames={subagentNames}
+								selectedSessionId={selectedSessionId}
+								actionState={actionStates[actionKey(parentSessionId, delegation.delegation_id)]}
+								onSelectSession={onSelectSession}
+								onRequestCancel={(selectedDelegation) =>
+									setCancelDialogIntent({
+										parentSessionId,
+										delegation: selectedDelegation,
+									})}
+								mutationBlockedReason={mutationBlockedReason}
+							/>
+						))}
+					</div>
+					{showToggle ? (
+						<>
+							<button
+								className="run-board-toggle"
+								type="button"
+								disabled={!!toggleBlockedReason}
+								onClick={onToggleShowAllDelegations}
+							>
+								{showAllDelegations ? "Show fewer" : `See more${hiddenLocalCount > 0 ? ` (${hiddenLocalCount})` : ""}`}
+							</button>
+							<ConnectionBlockedReason reason={toggleBlockedReason} />
+						</>
+					) : null}
+					{showAllDelegations && boundedExpansionHasMore ? (
+						<p className="run-board-page-limit" role="status">
+							Latest {RUN_BOARD_EXPANDED_DELEGATION_COUNT} shown.
+						</p>
+					) : null}
+				</>
+			) : null}
+			{cancelDialogIntent ? (
+				<CancelDelegationDialog
+					delegation={cancelDialogIntent.delegation}
+					busy={
+						actionStates[
+							actionKey(
+								cancelDialogIntent.parentSessionId,
+								cancelDialogIntent.delegation.delegation_id,
+							)
+						]?.pending === true
+					}
+					blockedReason={mutationBlockedReason}
+					onClose={() => setCancelDialogIntent(null)}
+					onConfirm={confirmCancel}
 				/>
-			))}
-			{showToggle ? (
-				<button className="chip-button run-board-toggle" type="button" onClick={onToggleShowAllDelegations}>
-					{showAllDelegations ? "show fewer" : `see more${hiddenLocalCount > 0 ? ` (${hiddenLocalCount})` : ""}`}
-				</button>
 			) : null}
 		</div>
 	);
@@ -232,31 +445,73 @@ export function RunBoardDelegationList({
 function RunBoard({
 	parentSessionId,
 	delegations,
+	subagentNames,
 	hasMoreDelegations,
 	loading,
 	error,
 	showAllDelegations,
 	onToggleShowAllDelegations,
+	onRetryDelegations,
+	delegationsRetrying = false,
+	selectedSessionId,
+	boundedExpansionHasMore = false,
 	onSelectSession,
 	onCancelDelegation,
-	onReRunDelegation,
-}: RunBoardProps) {
+	mutationBlockedReason,
+	remoteReadBlockedReason,
+	expandedDelegationsAvailable,
+}: Omit<Parameters<typeof RunBoardDelegationList>[0], "parentSessionId"> & {
+	parentSessionId: string | null;
+	loading: boolean;
+	error: string | null;
+	onRetryDelegations?: () => void;
+	delegationsRetrying?: boolean;
+}) {
 	return (
 		<section className="inspect-section run-board-section">
-			{parentSessionId && loading ? <p className="muted">Loading delegations…</p> : null}
-			{parentSessionId && error ? <p className="error-text">{error}</p> : null}
-			{parentSessionId && !loading && !error && delegations.length === 0 ? <p className="muted">No delegations yet.</p> : null}
-			{parentSessionId && delegations.length > 0 ? (
-				<RunBoardDelegationList
-					delegations={delegations}
-					hasMoreDelegations={hasMoreDelegations}
-					showAllDelegations={showAllDelegations}
-					onToggleShowAllDelegations={onToggleShowAllDelegations}
-					onSelectSession={onSelectSession}
-					onCancelDelegation={onCancelDelegation}
-					onReRunDelegation={onReRunDelegation}
-				/>
+			{parentSessionId && loading ? (
+				<p className="muted run-board-inline-status" role="status">
+					{delegations.length > 0 ? "Refreshing agents…" : "Loading agents…"}
+				</p>
 			) : null}
+			{parentSessionId && error ? (
+				<div className="load-error-banner run-board-load-error" role="alert">
+					<div>
+						<strong>{delegations.length > 0 ? "Agent refresh failed" : "Couldn’t load agents"}</strong>
+						<span>{error}</span>
+					</div>
+					{onRetryDelegations ? (
+						<>
+							<button
+								type="button"
+								className="secondary-button load-error-retry"
+								disabled={delegationsRetrying || !!remoteReadBlockedReason}
+								aria-busy={delegationsRetrying}
+								onClick={onRetryDelegations}
+							>
+								{delegationsRetrying ? "Retrying…" : "Retry"}
+							</button>
+							<ConnectionBlockedReason reason={remoteReadBlockedReason} />
+						</>
+					) : null}
+				</div>
+			) : null}
+			{parentSessionId && !loading && !error && delegations.length === 0 ? <p className="muted">No delegated work yet.</p> : null}
+			<RunBoardDelegationList
+				parentSessionId={parentSessionId ?? ""}
+				delegations={delegations}
+				subagentNames={subagentNames}
+				hasMoreDelegations={hasMoreDelegations}
+				showAllDelegations={showAllDelegations}
+				onToggleShowAllDelegations={onToggleShowAllDelegations}
+				selectedSessionId={selectedSessionId}
+				onSelectSession={onSelectSession}
+				onCancelDelegation={onCancelDelegation}
+				mutationBlockedReason={mutationBlockedReason}
+				remoteReadBlockedReason={remoteReadBlockedReason}
+				expandedDelegationsAvailable={expandedDelegationsAvailable}
+				boundedExpansionHasMore={boundedExpansionHasMore}
+			/>
 		</section>
 	);
 }
@@ -264,16 +519,17 @@ function RunBoard({
 type InspectorTab = "run-board" | "debug";
 
 const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
-	{ id: "run-board", label: "Run board" },
+	{ id: "run-board", label: "Agents" },
 	{ id: "debug", label: "Inspector" },
 ];
 
 export interface SidebarProps {
-	counts: Record<SessionDisplayActivity, number>;
-	total: number;
-	archived: number;
 	connection: string;
 	projects: Project[];
+	projectsLoading?: boolean;
+	projectsFetching?: boolean;
+	projectsError?: string | null;
+	projectsHasCachedData?: boolean;
 	selectedProjectId: string | null;
 	query: string;
 	showArchived: boolean;
@@ -281,7 +537,12 @@ export interface SidebarProps {
 	selectedId: string | null;
 	sessionsLoading?: boolean;
 	sessionsFetching?: boolean;
+	sessionsError?: string | null;
+	sessionsHasCachedData?: boolean;
 	inert?: boolean;
+	newSessionButtonRef?: RefObject<HTMLButtonElement | null>;
+	onRetrySessions?: () => void;
+	onRetryProjects?: () => void;
 	onQueryChange: (query: string) => void;
 	onToggleArchived: () => void;
 	onNew: () => void;
@@ -293,14 +554,17 @@ export interface SidebarProps {
 	onRename: (session: SessionListItem) => void;
 	onArchiveToggle: (session: SessionListItem) => void;
 	onDelete: (session: SessionListItem) => void;
+	mutationBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 }
 
 export const Sidebar = memo(function Sidebar({
-	counts,
-	total,
-	archived,
 	connection,
 	projects,
+	projectsLoading = false,
+	projectsFetching = false,
+	projectsError = null,
+	projectsHasCachedData = false,
 	selectedProjectId,
 	query,
 	showArchived,
@@ -308,7 +572,12 @@ export const Sidebar = memo(function Sidebar({
 	selectedId,
 	sessionsLoading = false,
 	sessionsFetching = false,
+	sessionsError = null,
+	sessionsHasCachedData = false,
 	inert,
+	newSessionButtonRef,
+	onRetrySessions,
+	onRetryProjects,
 	onQueryChange,
 	onToggleArchived,
 	onNew,
@@ -319,21 +588,28 @@ export const Sidebar = memo(function Sidebar({
 	onSelectSession,
 	onRename,
 	onArchiveToggle,
-	onDelete
+	onDelete,
+	mutationBlockedReason,
+	remoteReadBlockedReason,
 }: SidebarProps) {
 	return (
 		<aside className="sidebar" data-slot="sidebar" inert={inert}>
 			<SidebarHeader connection={connection} onClose={onClose} />
 			<ProjectList
 				projects={projects}
+				loading={projectsLoading}
+				fetching={projectsFetching}
+				error={projectsError}
+				hasCachedData={projectsHasCachedData}
+				remoteReadBlockedReason={remoteReadBlockedReason}
 				selectedProjectId={selectedProjectId}
+				onRetry={onRetryProjects}
 				onSelectProject={onSelectProject}
 				onNewProject={onNewProject}
 				onEditProject={onEditProject}
 			/>
 			<div className="session-section-head">
 				<span>Sessions</span>
-				<ActivityCounts counts={counts} archived={archived} />
 			</div>
 			<SidebarToolbar
 				disabled={false}
@@ -342,25 +618,51 @@ export const Sidebar = memo(function Sidebar({
 				showArchived={showArchived}
 				onToggleArchived={onToggleArchived}
 				onNew={onNew}
+				newSessionButtonRef={newSessionButtonRef}
 			/>
-			<div className="session-list" role="listbox" aria-label="sessions" aria-busy={sessionsLoading || sessionsFetching}>
-				{filteredSessions.map((session) => (
-					<SessionRow
-						key={session.session_id}
-						session={session}
-						selected={session.session_id === selectedId}
-						onSelect={() => onSelectSession(session.session_id)}
-						onRename={() => onRename(session)}
-						onArchiveToggle={() => onArchiveToggle(session)}
-						onDelete={() => onDelete(session)}
-					/>
-				))}
-				{filteredSessions.length === 0 ? (
-					<div className="empty-list">
-						{sessionsLoading ? "Loading sessions…" : sessionsFetching ? "Refreshing sessions…" : "No sessions"}
+			{sessionsError ? (
+				<div className="load-error-banner sidebar-load-error" role="alert">
+					<div>
+						<strong>{sessionsHasCachedData ? "Session refresh failed" : "Couldn’t load sessions"}</strong>
+						<span>{sessionsError}</span>
 					</div>
-				) : null}
-			</div>
+					{onRetrySessions ? (
+						<>
+							<button
+								type="button"
+								className="secondary-button load-error-retry"
+								disabled={sessionsFetching || !!remoteReadBlockedReason}
+								aria-busy={sessionsFetching}
+								onClick={onRetrySessions}
+							>
+								{sessionsFetching ? "Retrying…" : "Retry"}
+							</button>
+							<ConnectionBlockedReason reason={remoteReadBlockedReason} />
+						</>
+					) : null}
+				</div>
+			) : null}
+			<nav className="session-list" aria-label="Sessions" aria-busy={sessionsLoading || sessionsFetching}>
+				<ul className="session-list-items">
+					{filteredSessions.map((session) => (
+						<SessionRow
+							key={session.session_id}
+							session={session}
+							selected={session.session_id === selectedId}
+							onSelect={() => onSelectSession(session.session_id)}
+							onRename={() => onRename(session)}
+							onArchiveToggle={() => onArchiveToggle(session)}
+							onDelete={() => onDelete(session)}
+							mutationBlockedReason={mutationBlockedReason}
+						/>
+					))}
+					{filteredSessions.length === 0 && !sessionsError ? (
+						<li className="empty-list">
+							{sessionsLoading ? "Loading sessions…" : sessionsFetching ? "Refreshing sessions…" : "No sessions"}
+						</li>
+					) : null}
+				</ul>
+			</nav>
 		</aside>
 	);
 });
@@ -372,13 +674,25 @@ function pendingActionLabel(action: SessionSnapshot["pending_actions"][number]):
 
 export function ProjectList({
 	projects,
+	loading = false,
+	fetching = false,
+	error = null,
+	hasCachedData = false,
+	remoteReadBlockedReason,
 	selectedProjectId,
+	onRetry,
 	onSelectProject,
 	onNewProject,
 	onEditProject
 }: {
 	projects: Project[];
+	loading?: boolean;
+	fetching?: boolean;
+	error?: string | null;
+	hasCachedData?: boolean;
+	remoteReadBlockedReason?: string | null;
 	selectedProjectId: string | null;
+	onRetry?: () => void;
 	onSelectProject: (projectId: string | null) => void;
 	onNewProject: () => void;
 	onEditProject: (project: Project) => void;
@@ -391,57 +705,88 @@ export function ProjectList({
 					<Plus size={13} />
 				</button>
 			</div>
-			<div className="project-list" role="listbox" aria-label="projects">
-				<button
-					className={`project-row ${selectedProjectId === null ? "selected" : ""}`}
-					type="button"
-					onClick={() => onSelectProject(null)}
-					title="Ephemeral host sessions start from your home directory"
-				>
-					<Folder size={14} />
-					<span className="project-main">
-						<span className="project-title">Host</span>
-						<span className="project-cwd">Ephemeral sessions</span>
-					</span>
-				</button>
-				{projects.map((project) => (
-					<button
-						className={`project-row ${project.project_id === selectedProjectId ? "selected" : ""}`}
+			{error ? (
+				<div className="load-error-banner project-load-error" role="alert">
+					<div>
+						<strong>{hasCachedData ? "Project refresh failed" : "Couldn’t load projects"}</strong>
+						<span>{error}</span>
+					</div>
+					{onRetry ? (
+						<>
+							<button
+								type="button"
+								className="secondary-button load-error-retry"
+								disabled={fetching || !!remoteReadBlockedReason}
+								aria-busy={fetching}
+								onClick={onRetry}
+							>
+								{fetching ? "Retrying…" : "Retry"}
+							</button>
+							<ConnectionBlockedReason reason={remoteReadBlockedReason} />
+						</>
+					) : null}
+				</div>
+			) : null}
+			<nav aria-label="Projects" aria-busy={loading || fetching}>
+				<ul className="project-list">
+					<li className={`project-row ${selectedProjectId === null ? "selected" : ""}`}>
+						<button
+							className="project-row-primary"
 							type="button"
-							key={project.project_id}
-							onClick={() => onSelectProject(project.project_id)}
-							title={projectWorkspaceSummary(project)}
+							onClick={() => onSelectProject(null)}
+							title="Ephemeral host sessions start from your home directory"
+							aria-current={selectedProjectId === null ? "page" : undefined}
 						>
-						<Folder size={14} />
-						<span className="project-main">
-								<span className="project-title">{projectTitle(project)}</span>
-								<span className="project-cwd">{project.workspaces.length} workspaces</span>
-						</span>
-						<span
-							className="session-row-action"
-							role="button"
-							tabIndex={0}
-							title="edit project"
-							aria-label={`edit ${projectTitle(project)}`}
-							onClick={(event) => {
-								event.stopPropagation();
-								onEditProject(project);
-							}}
-							onKeyDown={(event) => {
-								if (event.key !== "Enter" && event.key !== " ") return;
-								event.preventDefault();
-								event.stopPropagation();
-								onEditProject(project);
-							}}
-						>
-							<Edit3 size={13} />
-						</span>
-					</button>
-				))}
-
-			</div>
+							<Folder size={14} aria-hidden />
+							<span className="project-title">Host</span>
+						</button>
+					</li>
+					{projects.map((project) => {
+						const title = projectTitle(project);
+						const selected = project.project_id === selectedProjectId;
+						return (
+							<li className={`project-row ${selected ? "selected" : ""}`} key={project.project_id}>
+								<button
+									className="project-row-primary"
+									type="button"
+									onClick={() => onSelectProject(project.project_id)}
+									aria-current={selected ? "page" : undefined}
+								>
+									<span
+										className="project-folder-count"
+										role="img"
+										aria-label={`${project.workspaces.length} ${project.workspaces.length === 1 ? "workspace" : "workspaces"}`}
+										title={`${project.workspaces.length} ${project.workspaces.length === 1 ? "workspace" : "workspaces"}`}
+									>
+										<Folder size={18} aria-hidden />
+										<span aria-hidden>{project.workspaces.length}</span>
+									</span>
+									<span className="project-title">{title}</span>
+								</button>
+								<ActionMenu
+									triggerLabel={`Open project actions for ${title}`}
+									items={projectMenuItems(project, onEditProject)}
+								/>
+							</li>
+						);
+					})}
+					{loading && !error ? <li className="empty-list compact">Loading projects…</li> : null}
+				</ul>
+			</nav>
 		</div>
 	);
+}
+
+export function projectMenuItems(project: Project, onEditProject: (project: Project) => void): ActionMenuItem[] {
+	return [
+		{
+			id: "settings",
+			label: "Project settings…",
+			icon: <SquarePen size={15} aria-hidden />,
+			focusDestination: "dialog",
+			onSelect: () => onEditProject(project),
+		},
+	];
 }
 
 export function SidebarToolbar({
@@ -450,7 +795,8 @@ export function SidebarToolbar({
 	onQueryChange,
 	showArchived,
 	onToggleArchived,
-	onNew
+	onNew,
+	newSessionButtonRef,
 }: {
 	disabled: boolean;
 	query: string;
@@ -458,6 +804,7 @@ export function SidebarToolbar({
 	showArchived: boolean;
 	onToggleArchived: () => void;
 	onNew: () => void;
+	newSessionButtonRef?: RefObject<HTMLButtonElement | null>;
 }) {
 	const [searchOpen, setSearchOpen] = useState(false);
 	const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -492,7 +839,7 @@ export function SidebarToolbar({
 	return (
 		<div className="sidebar-toolbar">
 			<div className="toolbar-actions">
-				<button className="primary-button" type="button" onClick={onNew} disabled={disabled}>
+				<button ref={newSessionButtonRef} className="primary-button" type="button" onClick={onNew} disabled={disabled}>
 					<Plus size={14} />
 					New session
 				</button>
@@ -565,30 +912,14 @@ export function SidebarToolbar({
 	);
 }
 
-function ActivityCounts({ counts, archived }: { counts: Record<SessionDisplayActivity, number>; archived: number }) {
-	return (
-		<div className="activity-counts">
-			{(["running", "idle"] as SessionDisplayActivity[]).map((activity) => (
-				<span className={`activity-chip ${activity}`} key={activity}>
-					{activity}
-					<span className="count">{counts[activity] ?? 0}</span>
-				</span>
-			))}
-			<span className="activity-chip archived">
-				archived
-				<span className="count">{archived}</span>
-			</span>
-		</div>
-	);
-}
-
 export function SessionRow({
 	session,
 	selected,
 	onSelect,
 	onRename,
 	onArchiveToggle,
-	onDelete
+	onDelete,
+	mutationBlockedReason,
 }: {
 	session: SessionListItem;
 	selected: boolean;
@@ -596,88 +927,93 @@ export function SessionRow({
 	onRename: () => void;
 	onArchiveToggle: () => void;
 	onDelete: () => void;
+	mutationBlockedReason?: string | null;
 }) {
 	const archived = isArchivedSession(session);
 	const status = sessionStatusWithDelegations(session.activity, session.has_running_delegations ?? false);
 	const idleAndQuiet = session.activity === "idle" && !(session.has_running_delegations ?? false);
 	const canArchive = idleAndQuiet;
 	const canDelete = idleAndQuiet;
-	const ArchiveIcon = archived ? ArchiveRestore : Archive;
+	const title = sessionTitle(session);
+	const statusLabel = `${archived ? "archived" : status} session`;
 	return (
-		<button className={`session-row ${selected ? "selected" : ""} ${archived ? "archived" : ""}`} type="button" onClick={onSelect}>
-			<span className={`status-rail ${archived ? "archived" : status}`} />
-			<span className="session-main">
-				<span className="session-title">{sessionTitle(session)}</span>
-				<span className="session-sub">
-					{archived ? "archived - " : ""}{session.provider.model}
-				</span>
-				<span className="session-leaf">
-					{session.active_leaf_id ? session.active_leaf_id.slice(0, 6) : "root"}
-				</span>
-			</span>
-			<span className="session-row-actions" aria-label="session actions">
+		<li className={`session-row ${selected ? "selected" : ""} ${archived ? "archived" : ""}`}>
+			<button
+				className="session-row-primary"
+				type="button"
+				onClick={onSelect}
+				aria-current={selected ? "page" : undefined}
+			>
 				<span
-					className="session-row-action"
-					role="button"
-					tabIndex={0}
-					title="rename session"
-					aria-label={`rename ${sessionTitle(session)}`}
-					onClick={(event) => {
-						event.stopPropagation();
-						onRename();
-					}}
-					onKeyDown={(event) => {
-						if (event.key !== "Enter" && event.key !== " ") return;
-						event.preventDefault();
-						event.stopPropagation();
-						onRename();
-					}}
-				>
-					<Edit3 size={13} />
+					className={`status-rail ${archived ? "archived" : status}`}
+					role="img"
+					aria-label={statusLabel}
+					title={statusLabel}
+				/>
+				<span className="session-main">
+					<span className="session-title">{title}</span>
+					<span className="session-sub">{session.provider.model}</span>
 				</span>
-				<span
-					className={`session-row-action ${canArchive ? "" : "disabled"}`}
-					role="button"
-					tabIndex={canArchive ? 0 : -1}
-					title={canArchive ? (archived ? "unarchive session" : "archive session") : "only idle sessions with no running subagents can be archived"}
-					aria-label={`${archived ? "unarchive" : "archive"} ${sessionTitle(session)}`}
-					aria-disabled={!canArchive}
-					onClick={(event) => {
-						event.stopPropagation();
-						if (canArchive) onArchiveToggle();
-					}}
-					onKeyDown={(event) => {
-						if (!canArchive || (event.key !== "Enter" && event.key !== " ")) return;
-						event.preventDefault();
-						event.stopPropagation();
-						onArchiveToggle();
-					}}
-				>
-					<ArchiveIcon size={13} />
-				</span>
-				<span
-					className={`session-row-action danger ${canDelete ? "" : "disabled"}`}
-					role="button"
-					tabIndex={canDelete ? 0 : -1}
-					title={canDelete ? "delete session" : "only idle sessions with no running subagents can be deleted"}
-					aria-label={`delete ${sessionTitle(session)}`}
-					aria-disabled={!canDelete}
-					onClick={(event) => {
-						event.stopPropagation();
-						if (canDelete) onDelete();
-					}}
-					onKeyDown={(event) => {
-						if (!canDelete || (event.key !== "Enter" && event.key !== " ")) return;
-						event.preventDefault();
-						event.stopPropagation();
-						onDelete();
-					}}
-				>
-					<Trash2 size={13} />
-				</span>
-			</span>
-		</button>
+			</button>
+			<ActionMenu
+				triggerLabel={`Open session actions for ${title}`}
+				items={sessionMenuItems({ archived, canArchive, canDelete, onRename, onArchiveToggle, onDelete, mutationBlockedReason })}
+			/>
+		</li>
 	);
+}
+
+const IDLE_SESSION_ACTION_REASON = "Available when the session and its subagents are idle.";
+
+export function sessionMenuItems({
+	archived,
+	canArchive,
+	canDelete,
+	onRename,
+	onArchiveToggle,
+	onDelete,
+	mutationBlockedReason,
+}: {
+	archived: boolean;
+	canArchive: boolean;
+	canDelete: boolean;
+	onRename: () => void;
+	onArchiveToggle: () => void;
+	onDelete: () => void;
+	mutationBlockedReason?: string | null;
+}): ActionMenuItem[] {
+	const ArchiveIcon = archived ? ArchiveRestore : Archive;
+	return [
+		{
+			id: "rename",
+			label: "Rename…",
+			icon: <SquarePen size={15} aria-hidden />,
+			focusDestination: "dialog",
+			onSelect: onRename,
+		},
+		{
+			id: archived ? "unarchive" : "archive",
+			label: archived ? "Unarchive" : "Archive",
+			icon: <ArchiveIcon size={15} aria-hidden />,
+			disabled: !canArchive || !!mutationBlockedReason,
+			disabledReason: firstDisabledReason(
+				mutationBlockedReason,
+				!canArchive && IDLE_SESSION_ACTION_REASON,
+			) ?? undefined,
+			onSelect: onArchiveToggle,
+		},
+		{
+			id: "delete",
+			label: "Delete…",
+			icon: <Trash2 size={15} aria-hidden />,
+			disabled: !canDelete,
+			disabledReason: !canDelete ? IDLE_SESSION_ACTION_REASON : undefined,
+			destructive: true,
+			separatorBefore: true,
+			focusDestination: "dialog",
+			onSelect: onDelete,
+		},
+	];
 }
 
 export function LogHeader({
@@ -688,7 +1024,9 @@ export function LogHeader({
 	modelOptions,
 	modelValue,
 	modelDisabled,
-	modelDisabledTitle,
+	modelLocked = false,
+	reasoningDisabled = false,
+	controlsBlockedReason,
 	reasoningEfforts,
 	reasoningEffort,
 	onModelChange,
@@ -704,7 +1042,9 @@ export function LogHeader({
 	modelOptions: { id: string; label: string; description?: string }[];
 	modelValue: string;
 	modelDisabled: boolean;
-	modelDisabledTitle: string;
+	modelLocked?: boolean;
+	reasoningDisabled?: boolean;
+	controlsBlockedReason?: string | null;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	onModelChange: (value: string) => void;
@@ -736,7 +1076,7 @@ export function LogHeader({
 							className="parent-session-link"
 							type="button"
 							onClick={() => onSelectSession?.(parentSessionId)}
-							title={`open parent ${parentSessionId}`}
+							title="Open parent conversation"
 						>
 							<ArrowUp size={12} aria-hidden />
 							parent
@@ -745,13 +1085,13 @@ export function LogHeader({
 				</span>
 			) : null}
 			<div className="log-controls">
-				<label className="header-select" title={modelDisabledTitle}>
+				<label className="header-select" title={modelLocked ? "Model, locked" : "Model"}>
 					<span className="sr-only">Model</span>
 					<select
 						value={modelValue}
 						disabled={modelDisabled}
-						title={modelDisabledTitle}
-						aria-label="Model"
+						title={modelLocked ? "Model, locked" : "Model"}
+						aria-label={modelLocked ? "Model, locked" : "Model"}
 						onChange={(event) => onModelChange(event.target.value)}
 					>
 						{modelOptions.map((option) => (
@@ -763,6 +1103,7 @@ export function LogHeader({
 					<span className="sr-only">Reasoning effort</span>
 					<select
 						value={reasoningEffort}
+						disabled={reasoningDisabled}
 						title="Reasoning effort"
 						aria-label="Reasoning effort"
 						onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
@@ -772,6 +1113,7 @@ export function LogHeader({
 						))}
 					</select>
 				</label>
+				<ConnectionBlockedReason reason={controlsBlockedReason} className="header-blocked-reason" />
 			</div>
 			{rightOpen ? null : (
 				<button
@@ -788,13 +1130,31 @@ export function LogHeader({
 	);
 }
 
-export function NoticeStack({ notices, rightOpen }: { notices: Notice[]; rightOpen: boolean }) {
+export function NoticeStack({
+	notices,
+	rightOpen,
+	onDismiss,
+}: {
+	notices: Notice[];
+	rightOpen: boolean;
+	onDismiss?: (noticeId: string) => void;
+}) {
 	if (notices.length === 0) return null;
 	return (
 		<div className={`notice-stack ${rightOpen ? "with-inspector" : ""}`} aria-live="polite">
 			{notices.slice(-4).map((notice) => (
 				<div className={`notice-toast ${notice.tone}`} key={notice.id}>
-					{notice.text}
+					<span>{notice.text}</span>
+					{notice.persistent && onDismiss ? (
+						<button
+							type="button"
+							className="notice-dismiss"
+							aria-label="Dismiss notification"
+							onClick={() => onDismiss(notice.id)}
+						>
+							<X size={14} />
+						</button>
+					) : null}
 				</div>
 			))}
 		</div>
@@ -803,25 +1163,43 @@ export function NoticeStack({ notices, rightOpen }: { notices: Notice[]; rightOp
 
 export function Inspector({
 	snapshot,
+	runBoardParentSessionId = snapshot?.session_id ?? null,
 	delegations,
+	subagentNames = EMPTY_SUBAGENT_NAMES,
 	hasMoreDelegations = false,
 	delegationsLoading,
 	delegationsError,
 	showAllDelegations = false,
+	expandedDelegationsAvailable = false,
 	onToggleShowAllDelegations = () => {},
-	runBoard,
+	onRetryDelegations,
+	delegationsRetrying = false,
+	selectedSessionId = null,
+	boundedExpansionHasMore = false,
+	onCancelDelegation,
+	mutationBlockedReason,
+	remoteReadBlockedReason,
 	tools,
 	onSelectSession,
 	onClose
 }: {
 	snapshot: SessionSnapshot | null;
+	runBoardParentSessionId?: string | null;
 	delegations: Delegation[];
+	subagentNames?: ReadonlyMap<string, string>;
 	hasMoreDelegations?: boolean;
 	delegationsLoading: boolean;
 	delegationsError: string | null;
 	showAllDelegations?: boolean;
+	expandedDelegationsAvailable?: boolean;
 	onToggleShowAllDelegations?: () => void;
-	runBoard: Omit<RunBoardCallbacks, "onSelectSession">;
+	onRetryDelegations?: () => void;
+	delegationsRetrying?: boolean;
+	selectedSessionId?: string | null;
+	boundedExpansionHasMore?: boolean;
+	onCancelDelegation: (parentSessionId: string, delegationId: string) => void | Promise<void>;
+	mutationBlockedReason?: string | null;
+	remoteReadBlockedReason?: string | null;
 	tools: ToolListing[];
 	onSelectSession?: (sessionId: string) => void;
 	onClose?: () => void;
@@ -856,16 +1234,23 @@ export function Inspector({
 					aria-labelledby="inspector-tab-run-board"
 				>
 					<RunBoard
-						parentSessionId={snapshot?.session_id ?? null}
+						parentSessionId={runBoardParentSessionId}
 						delegations={delegations}
+						subagentNames={subagentNames}
 						hasMoreDelegations={hasMoreDelegations}
 						loading={delegationsLoading}
 						error={delegationsError}
 						showAllDelegations={showAllDelegations}
+						expandedDelegationsAvailable={expandedDelegationsAvailable}
 						onToggleShowAllDelegations={onToggleShowAllDelegations}
+						onRetryDelegations={onRetryDelegations}
+						delegationsRetrying={delegationsRetrying}
+						selectedSessionId={selectedSessionId}
+						boundedExpansionHasMore={boundedExpansionHasMore}
 						onSelectSession={onSelectSession}
-						onCancelDelegation={runBoard.onCancelDelegation}
-						onReRunDelegation={runBoard.onReRunDelegation}
+						onCancelDelegation={onCancelDelegation}
+						mutationBlockedReason={mutationBlockedReason}
+						remoteReadBlockedReason={remoteReadBlockedReason}
 					/>
 				</div>
 			) : (

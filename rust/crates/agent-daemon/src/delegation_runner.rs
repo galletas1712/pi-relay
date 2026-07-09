@@ -74,8 +74,8 @@ pub(crate) async fn complete_delegation_if_ready(
     // forward (re-establishing live work, keeping the delegation running) or advances
     // it to a genuine boundary. v1 semantics: a subagent that genuinely cannot
     // continue ends at a boundary classified Crashed -> done_with_failures,
-    // which the workflow re-runs; a resumable mid-turn subagent keeps the
-    // delegation running.
+    // after which the workflow may choose fresh work; a resumable mid-turn
+    // subagent keeps the delegation running.
     recover_subagent_tails(state, &delegation).await;
 
     let all_terminal = state

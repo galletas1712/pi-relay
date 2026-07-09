@@ -204,11 +204,6 @@ export type ContentBlock =
 			};
 	  };
 
-export interface UserMessage {
-	content: ContentBlock[];
-	replayed_after_compaction?: boolean;
-}
-
 export type AssistantItem =
 	| { type: "text"; text: string }
 	| {
@@ -224,13 +219,6 @@ export interface ToolCall {
 	args_json: string;
 }
 
-export interface ToolResultMessage {
-	tool_call_id: string;
-	tool_name: string;
-	output: string;
-	status: ToolResultStatus;
-}
-
 export interface DaemonToolObservation {
 	tool_call_id: string;
 	tool_name: string;
@@ -242,7 +230,7 @@ export interface DaemonToolObservation {
 
 export type TranscriptItem =
 	| { type: "turn_started"; turn_id: number }
-	| ({ type: "user_message" } & UserMessage)
+	| { type: "user_message"; content: ContentBlock[]; replayed_after_compaction?: boolean }
 	| { type: "assistant_message"; items: AssistantItem[] }
 	| { type: "tool_call_started"; turn_id: number; tool_call: ToolCall }
 	| { type: "tool_result"; tool_call_id: string; tool_name: string; output: string; status: ToolResultStatus }
@@ -362,4 +350,5 @@ export interface Notice {
 	id: string;
 	tone: NoticeTone;
 	text: string;
+	persistent?: boolean;
 }

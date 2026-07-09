@@ -374,7 +374,7 @@ than one are preserved and the positive-count constraint is enforced before
 the completion fence is used.
 
 Child sessions link back through `sessions.delegation_id`. The
-`delegations_parent_created_idx` index supports the per-parent run-board feed.
+`delegations_parent_created_idx` index supports the per-parent delegation feed.
 The completion runner uses `attempt_id` as an idempotency fence and queues a
 deterministic parent daemon wakeup observation keyed as
 `delegation-steer:<delegation_id>:<attempt_id>` (the key name is retained for
@@ -895,10 +895,16 @@ subscribed clients can update lists/snapshots without a transcript refresh.
 Idle-only for metadata or model/source-changing updates. Replaces provider
 config and/or metadata. Once a session has any transcript entry, `provider.kind`
 and `provider.model` are locked; clients may still change provider-adjacent
-knobs such as `reasoning_effort` during or between turns. Runtime changes apply
-to subsequently created provider requests, not to an already in-flight request.
-Responses and `session.configured` events include `provider`, `metadata`, and
-`activity` so clients can patch cached summaries and selected snapshots.
+knobs such as `reasoning_effort` during or between turns. An effort-only update
+persists immediately as the session default for future accepted work; it does
+not replace an active runtime's route. Each queued input captures the provider
+config when accepted, and each action captures its open-turn route. Existing
+queued items, provider retries, tool continuations, compaction/recovery, and
+steering consumed into an open turn therefore retain their captured config;
+newly accepted future work captures the new default. These route snapshots are
+daemon-internal and do not add fields to queue RPC views. Responses and
+`session.configured` events include `provider`, `metadata`, and `activity` so
+clients can patch cached summaries and selected snapshots.
 
 ### `session.sync_active_branch`
 
@@ -1289,6 +1295,12 @@ tool-rerun semantics exist.
 
 ## Delegation RPC
 
+There is no dedicated delegation rerun/restart RPC. The `delegation.start_full`
+and `delegation.start_readonly_fanout` methods launch explicitly supplied new
+work; they do not restart a prior delegation. Task-prompt handoff metadata is
+retained for Handoffs/inspection only. This is separate from terminal-turn
+`turn.resume`.
+
 Delegations are the frontend-facing unit for bounded parent/child subagent work.
 A delegation is either one full (writing) subagent or a read-only fan-out. The
 websocket API only accepts the canonical `delegation.*` methods below.
@@ -1544,8 +1556,8 @@ occurred before interruption remain non-transactional and are not rolled back.
 ### `delegation.list`
 
 Lists a bounded newest-first page of delegations for a parent session. This is
-the lightweight run-board feed used by the web UI; use `delegation.status` or
-`delegation.read_handoff_file` for detail artifacts and outcomes.
+the lightweight Agents-outline feed used by the web UI; use `delegation.status`
+for structured detail or `delegation.read_handoff_file` for Handoff content.
 
 ```json
 { "parent_session_id": "parent-session", "limit": 3 }
