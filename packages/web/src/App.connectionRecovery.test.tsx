@@ -148,7 +148,7 @@ describe("App connection recovery integration", () => {
 		const { client, unmount } = renderApp(api);
 		const user = userEvent.setup();
 
-		expect(screen.getByText("Connecting…")).toBeTruthy();
+		expect(screen.queryByText("Connecting…")).toBeNull();
 		expect(api.connect).toHaveBeenCalledTimes(1);
 		expect(api.listProjects).not.toHaveBeenCalled();
 		expect(api.listSessions).not.toHaveBeenCalled();
@@ -173,7 +173,9 @@ describe("App connection recovery integration", () => {
 		await user.type(projectInput, "Offline project draft");
 
 		await emitStatus(api, "closed");
-		await waitFor(() => expect(document.querySelector(".connection-recovery-banner")?.textContent).toContain("Connection closed"));
+		await waitFor(() => expect(document.querySelector(".connection-recovery-banner")?.textContent).toContain("Disconnected"));
+		await emitStatus(api, "connecting");
+		expect(screen.getByText("Disconnected")).toBeTruthy();
 		const save = screen.getByRole("button", { name: "Save" }) as HTMLButtonElement;
 		expect(composer.value).toBe("keep this session draft");
 		expect(projectInput.value).toBe("Offline project draft");
@@ -261,7 +263,7 @@ describe("App connection recovery integration", () => {
 		expect(await screen.findByText("Session refresh failed")).toBeTruthy();
 
 		await emitStatus(api, "closed");
-		await waitFor(() => expect(screen.getByText("Connection closed")).toBeTruthy());
+		await waitFor(() => expect(screen.getByText("Disconnected")).toBeTruthy());
 
 		const getSessionCalls = api.getSession.mock.calls.length;
 		const getTurnsCalls = api.getTranscriptTurns.mock.calls.length;

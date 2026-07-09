@@ -419,7 +419,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 	const [connection, setConnection] = useState<ConnectionStatus>("connecting");
 	const connectionRef = useRef<ConnectionStatus>("connecting");
-	const [hasConnected, setHasConnected] = useState(false);
+	const [disconnected, setDisconnected] = useState(false);
 	const [retryingConnection, setRetryingConnection] = useState(false);
 	const [workspaceRouteResult, setWorkspaceRouteResult] =
 		useState<WorkspaceRouteParseResult>(initialWorkspaceRoute);
@@ -2163,10 +2163,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		const offStatus = api.onStatus((status) => {
 			connectionRef.current = status;
 			setConnection(status);
+			if (status === "open") setDisconnected(false);
+			else if (status !== "connecting") setDisconnected(true);
 			subscribedEventSessionIds.current.clear();
 			if (status !== "open") return;
 			connectionRetryController.current.opened();
-			setHasConnected(true);
 			setRetryingConnection(false);
 			void Promise.all([
 				queryClient.invalidateQueries({ queryKey: queryKeys.projects }),
@@ -3522,7 +3523,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						transcriptErrorHasUsableCache={selectedErrorHasUsableCache}
 						transcriptRetrying={selectedRetrying}
 						hasRunningDelegations={hasRunningDelegations}
-						connection={connection}
 						modelOptions={MODEL_OPTIONS}
 						modelValue={providerModelKey(activeProvider)}
 						modelLocked={modelLocked}
@@ -3634,8 +3634,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 
 			<footer className="chat-dock" data-slot="chat-box">
 				<ConnectionRecoveryBanner
-					status={connection}
-					hasConnected={hasConnected}
+					disconnected={disconnected}
 					retrying={retryingConnection}
 					onRetry={retryConnection}
 				/>

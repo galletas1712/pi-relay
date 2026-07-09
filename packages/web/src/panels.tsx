@@ -19,8 +19,6 @@ import {
 	SquarePen,
 	TriangleAlert,
 	Trash2,
-	Wifi,
-	WifiOff,
 	X
 } from "lucide-react";
 import { memo, useEffect, useMemo, useRef, useState, type RefObject } from "react";
@@ -54,7 +52,6 @@ import {
 	statusIconClass,
 	type AgentStatusIconKey,
 } from "./delegationBoard.ts";
-import type { ConnectionStatus } from "./rpc.ts";
 import type {
 	Notice,
 	Project,
@@ -98,27 +95,6 @@ function AgentStatusIcon({ status }: { status: string }) {
 			title={label}
 		>
 			<Icon size={16} aria-hidden />
-		</span>
-	);
-}
-
-function ConnectionStatusIcon({ connection }: { connection: ConnectionStatus }) {
-	const presentation = connection === "open"
-		? { label: "Connected", className: "connected", Icon: Wifi }
-		: connection === "connecting"
-			? { label: "Connecting", className: "connecting", Icon: Loader2 }
-			: connection === "error"
-				? { label: "Connection error", className: "error", Icon: CircleAlert }
-				: { label: "Disconnected", className: "disconnected", Icon: WifiOff };
-	const { label, className, Icon } = presentation;
-	return (
-		<span
-			className={`header-connection-status ${className}`}
-			role="img"
-			aria-label={label}
-			title={label}
-		>
-			<Icon className={connection === "connecting" ? "spin" : undefined} size={15} aria-hidden />
 		</span>
 	);
 }
@@ -1027,7 +1003,6 @@ export function LogHeader({
 	modelDisabled,
 	modelLocked = false,
 	reasoningDisabled = false,
-	connection,
 	reasoningEfforts,
 	reasoningEffort,
 	onModelChange,
@@ -1045,7 +1020,6 @@ export function LogHeader({
 	modelDisabled: boolean;
 	modelLocked?: boolean;
 	reasoningDisabled?: boolean;
-	connection: ConnectionStatus;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	onModelChange: (value: string) => void;
@@ -1114,7 +1088,6 @@ export function LogHeader({
 						))}
 					</select>
 				</label>
-				<ConnectionStatusIcon connection={connection} />
 			</div>
 			{rightOpen ? null : (
 				<button

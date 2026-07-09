@@ -1,38 +1,8 @@
-import { AlertTriangle, Loader2, RefreshCw, WifiOff } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Loader2, RefreshCw, WifiOff } from "lucide-react";
 import { parseSlash } from "./slash.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 
 export const WAITING_FOR_CONNECTION = "Waiting for connection";
-
-export interface ConnectionDisplayState {
-	kind: "connecting" | "unavailable";
-	title: string;
-	detail: string;
-	canRetry: boolean;
-}
-
-export function connectionDisplayState(
-	status: ConnectionStatus,
-	hasConnected: boolean,
-	retrying = false,
-): ConnectionDisplayState | null {
-	if (status === "open") return null;
-	if (retrying || status === "connecting") {
-		return {
-			kind: "connecting",
-			title: retrying || hasConnected ? "Reconnecting…" : "Connecting…",
-			detail: "Drafting and Help stay available; already loaded reading, navigation, export, and history stay local.",
-			canRetry: retrying,
-		};
-	}
-	return {
-		kind: "unavailable",
-		title: status === "error" ? "Connection error" : "Connection closed",
-		detail: `${WAITING_FOR_CONNECTION}. Drafting and cached content remain available.`,
-		canRetry: true,
-	};
-}
 
 export function remoteActionBlockedReason(status: ConnectionStatus): string | null {
 	return status === "open" ? null : WAITING_FOR_CONNECTION;
@@ -110,58 +80,33 @@ export function ConnectionBlockedReason({
 }
 
 export function ConnectionRecoveryBanner({
-	status,
-	hasConnected,
+	disconnected,
 	retrying,
 	onRetry,
 }: {
-	status: ConnectionStatus;
-	hasConnected: boolean;
+	disconnected: boolean;
 	retrying: boolean;
 	onRetry: () => void;
 }) {
-	const display = connectionDisplayState(status, hasConnected, retrying);
-	const announcedFailureRef = useRef(false);
-	const [failureAnnouncement, setFailureAnnouncement] = useState("");
-
-	useEffect(() => {
-		if (!display) {
-			announcedFailureRef.current = false;
-			setFailureAnnouncement("");
-			return;
-		}
-		if (display.kind !== "unavailable" || announcedFailureRef.current) return;
-		announcedFailureRef.current = true;
-		setFailureAnnouncement(`${display.title}. ${WAITING_FOR_CONNECTION}.`);
-	}, [display]);
-
-	if (!display) return null;
-	const Icon = display.kind === "unavailable" ? (status === "error" ? AlertTriangle : WifiOff) : Loader2;
+	if (!disconnected) return null;
 	return (
 		<div
-			className={`connection-recovery-banner ${display.kind}`}
+			className="connection-recovery-banner"
 			role="status"
-			aria-live="off"
-			aria-label={`${display.title} ${display.detail}`}
+			aria-label="Disconnected"
 		>
-			<Icon className={display.kind === "connecting" ? "spin" : undefined} size={15} aria-hidden />
-			<div className="connection-recovery-copy">
-				<strong>{display.title}</strong>
-				<span>{display.detail}</span>
-			</div>
-			{display.canRetry ? (
-				<button
-					type="button"
-					className="secondary-button connection-retry-button"
-					disabled={retrying}
-					aria-busy={retrying}
-					onClick={onRetry}
-				>
-					{retrying ? <Loader2 className="spin" size={13} aria-hidden /> : <RefreshCw size={13} aria-hidden />}
-					{retrying ? "Retrying…" : "Retry connection"}
-				</button>
-			) : null}
-			{failureAnnouncement ? <span className="sr-only" role="alert">{failureAnnouncement}</span> : null}
+			<WifiOff size={15} aria-hidden />
+			<strong className="connection-recovery-label">Disconnected</strong>
+			<button
+				type="button"
+				className="secondary-button connection-retry-button"
+				disabled={retrying}
+				aria-busy={retrying}
+				onClick={onRetry}
+			>
+				{retrying ? <Loader2 className="spin" size={13} aria-hidden /> : <RefreshCw size={13} aria-hidden />}
+				{retrying ? "Retrying…" : "Retry connection"}
+			</button>
 		</div>
 	);
 }

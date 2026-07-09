@@ -47,7 +47,6 @@ function renderLogHeader(overrides: Partial<Parameters<typeof LogHeader>[0]> = {
 			modelOptions={[{ id: "gpt-test", label: "GPT test" }]}
 			modelValue="gpt-test"
 			modelDisabled={false}
-			connection="open"
 			reasoningEfforts={["minimal", "medium"]}
 			reasoningEffort="medium"
 			onModelChange={() => {}}
@@ -180,9 +179,6 @@ describe("LogHeader", () => {
 		expect(html).toContain("session-status-icon delegating");
 		expect(html).toContain(`aria-label="delegating session"`);
 		expect(html).toContain(`title="delegating session"`);
-		expect(html).toContain(`class="header-connection-status connected"`);
-		expect(html).toContain(`aria-label="Connected"`);
-		expect(html).not.toContain(">connected<");
 		expect(html).not.toContain("session-state delegating");
 		expect(html).not.toContain(">delegating</span>");
 	});

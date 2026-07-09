@@ -1080,29 +1080,6 @@ pre {
 	min-width: 0;
 }
 
-.header-connection-status {
-	display: inline-flex;
-	width: 24px;
-	height: 24px;
-	flex: 0 0 24px;
-	align-items: center;
-	justify-content: center;
-	color: var(--muted-foreground);
-}
-
-.header-connection-status.connected {
-	color: var(--success);
-}
-
-.header-connection-status.connecting {
-	color: var(--primary);
-}
-
-.header-connection-status.error,
-.header-connection-status.disconnected {
-	color: var(--warning);
-}
-
 .header-select {
 	display: inline-flex;
 	align-items: center;
@@ -2889,38 +2866,16 @@ pre {
 	align-items: center;
 	gap: 9px;
 	margin: 0 auto 8px;
-	border: 1px solid color-mix(in oklch, var(--warning) 42%, var(--border));
+	border: 1px solid color-mix(in oklch, var(--destructive) 36%, var(--border));
 	border-radius: var(--radius);
-	background: color-mix(in oklch, var(--warning) 8%, var(--card));
-	padding: 6px 8px 6px 10px;
-	color: var(--warning);
-}
-
-.connection-recovery-banner.unavailable {
-	border-color: color-mix(in oklch, var(--destructive) 36%, var(--border));
 	background: color-mix(in oklch, var(--destructive) 7%, var(--card));
+	padding: 6px 8px 6px 10px;
 	color: var(--destructive);
 }
 
-.connection-recovery-copy {
-	display: flex;
-	min-width: 0;
+.connection-recovery-label {
 	flex: 1;
-	align-items: baseline;
-	gap: 8px;
-}
-
-.connection-recovery-copy strong {
-	flex: 0 0 auto;
 	font-size: var(--text-sm);
-}
-
-.connection-recovery-copy span {
-	overflow: hidden;
-	color: var(--foreground);
-	font-size: var(--text-xs);
-	text-overflow: ellipsis;
-	white-space: nowrap;
 }
 
 .connection-retry-button {
@@ -3950,7 +3905,7 @@ pre {
 		min-width: 0;
 		margin-left: 0;
 		display: grid;
-		grid-template-columns: minmax(0, 1fr) minmax(0, 0.72fr) 24px;
+		grid-template-columns: minmax(0, 1fr) minmax(0, 0.72fr);
 	}
 
 	.header-select {
@@ -4046,24 +4001,7 @@ pre {
 	}
 
 	.connection-recovery-banner {
-		align-items: flex-start;
-		flex-wrap: wrap;
 		padding: 8px 9px;
-	}
-
-	.connection-recovery-copy {
-		align-items: flex-start;
-		flex-direction: column;
-		gap: 1px;
-	}
-
-	.connection-recovery-copy span {
-		overflow: visible;
-		white-space: normal;
-	}
-
-	.connection-retry-button {
-		width: 100%;
 	}
 
 	.composer-wrap {
