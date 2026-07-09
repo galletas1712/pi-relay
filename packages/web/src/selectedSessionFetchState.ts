@@ -14,12 +14,19 @@ export class SelectedSessionFetchError extends Error {
 	}
 }
 
+export class IntermediateUiStateError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "IntermediateUiStateError";
+	}
+}
+
 export function isSelectedSessionFetchError(error: unknown): error is SelectedSessionFetchError {
 	return error instanceof SelectedSessionFetchError;
 }
 
 export function shouldReportActionError(error: unknown): boolean {
-	return !isSelectedSessionFetchError(error);
+	return !isSelectedSessionFetchError(error) && !(error instanceof IntermediateUiStateError);
 }
 
 function errorMessage(error: unknown): string {

@@ -94,7 +94,7 @@ function AgentStatusIcon({ status }: { status: string }) {
 			aria-label={`${label} status`}
 			title={label}
 		>
-			<Icon size={16} aria-hidden />
+			<Icon className={iconKey === "running" ? "spin" : undefined} size={16} aria-hidden />
 		</span>
 	);
 }

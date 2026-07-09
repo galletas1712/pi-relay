@@ -6,6 +6,7 @@ import {
 	hasUsableSelectedSessionCache,
 } from "./selectedSessionCache.ts";
 import {
+	IntermediateUiStateError,
 	SelectedSessionFetchCoordinator,
 	shouldReportActionError,
 	type SelectedSessionFetchState,
@@ -290,6 +291,7 @@ describe("selected session request ownership", () => {
 
 		expect(coordinator.getSnapshot().error).toBe("synchronization failed");
 		expect(notices).toBe(0);
+		expect(shouldReportActionError(new IntermediateUiStateError("conversation is loading"))).toBe(false);
 		expect(shouldReportActionError(new Error("mutation failed"))).toBe(true);
 	});
 });
