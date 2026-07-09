@@ -1,9 +1,7 @@
 import type {
 	Activity,
 	Delegation,
-	DelegationProgress,
 	DelegationStatus,
-	DelegationSubagent,
 } from "./types.ts";
 
 export type AgentStatus = Activity | DelegationStatus;
@@ -33,22 +31,6 @@ export function agentStatusIconKey(status: string): AgentStatusIconKey {
 	return AGENT_STATUS_ICON_KEYS[status as AgentStatus] ?? "unknown";
 }
 
-export interface DelegationProgressSummary {
-	expected: number | null;
-	spawned: number;
-	terminal: number;
-	running: number;
-	failed: number;
-	source: "server" | "children";
-}
-
-const TERMINAL_SUBAGENT_STATUSES = new Set([
-	"done",
-	"done_with_failures",
-	"cancelled",
-	"failed",
-]);
-
 export function delegationNeedsAttention(delegation: Delegation): boolean {
 	if (delegation.status === "failed" || delegation.status === "done_with_failures") return true;
 	if (delegation.status === "cancelled") return false;
@@ -74,59 +56,6 @@ export function orderDelegations(delegations: readonly Delegation[]): Delegation
 		else recent.push(delegation);
 	}
 	return [...attention, ...active, ...recent];
-}
-
-function directChildProgress(subagents: readonly DelegationSubagent[]): DelegationProgressSummary {
-	let terminal = 0;
-	let running = 0;
-	let failed = 0;
-	for (const subagent of subagents) {
-		const status = typeof subagent.status === "string" ? subagent.status : "idle";
-		if (TERMINAL_SUBAGENT_STATUSES.has(status)) {
-			terminal += 1;
-			if (status === "failed" || status === "done_with_failures") failed += 1;
-			continue;
-		}
-		if (status === "running" || subagent.activity === "running") running += 1;
-	}
-	return {
-		expected: null,
-		spawned: subagents.length,
-		terminal,
-		running,
-		failed,
-		source: "children",
-	};
-}
-
-export function delegationProgressSummary(delegation: Delegation): DelegationProgressSummary {
-	const progress: DelegationProgress | null | undefined = delegation.progress;
-	if (!progress) return directChildProgress(delegation.subagents);
-	return {
-		expected: progress.expected,
-		spawned: progress.spawned,
-		terminal: progress.terminal,
-		running: progress.running,
-		failed: progress.failed,
-		source: "server",
-	};
-}
-
-export function remainingDelegationWorkCount(delegation: Delegation): {
-	count: number;
-	unit: "agents" | "agents/slots";
-} {
-	const progress = delegationProgressSummary(delegation);
-	if (progress.expected !== null) {
-		return {
-			count: Math.max(0, progress.expected - progress.terminal),
-			unit: "agents/slots",
-		};
-	}
-	return {
-		count: Math.max(0, progress.spawned - progress.terminal),
-		unit: "agents",
-	};
 }
 
 /** A delegation is in flight (and therefore cancellable / its subagents pollable)

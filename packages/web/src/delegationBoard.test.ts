@@ -2,10 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
 	agentStatusIconKey,
 	delegationNeedsAttention,
-	delegationProgressSummary,
 	isDelegationRunning,
 	orderDelegations,
-	remainingDelegationWorkCount,
 	statusIconClass,
 } from "./delegationBoard.ts";
 import type { Delegation } from "./types.ts";
@@ -74,22 +72,6 @@ describe("delegation control helpers", () => {
 		for (const status of ["done", "done_with_failures", "cancelled", "failed"] as const) {
 			expect(isDelegationRunning(delegation({ status }))).toBe(false);
 		}
-	});
-
-	it("retains progress underneath the UI for cancellation impact", () => {
-		const item = delegation({
-			status: "running",
-			progress: { expected: 4, spawned: 3, terminal: 1, running: 2, failed: 1 },
-		});
-		expect(delegationProgressSummary(item)).toEqual({
-			expected: 4,
-			spawned: 3,
-			terminal: 1,
-			running: 2,
-			failed: 1,
-			source: "server",
-		});
-		expect(remainingDelegationWorkCount(item)).toEqual({ count: 3, unit: "agents/slots" });
 	});
 
 	it("maps statuses to stable icon modifiers", () => {

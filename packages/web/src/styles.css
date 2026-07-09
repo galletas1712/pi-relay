@@ -3615,10 +3615,6 @@ pre {
 	line-height: 1.4;
 }
 
-.cancel-delegation-dialog strong {
-	overflow-wrap: anywhere;
-}
-
 @container (max-width: 380px) {
 	.run-board-delegation-head {
 		grid-template-columns: 18px minmax(0, 1fr) auto;
@@ -3628,19 +3624,12 @@ pre {
 @media (pointer: coarse) {
 	.run-board-stop,
 	.run-board-toggle,
-	.run-board-subagent-button,
-	.cancel-delegation-dialog .primary-button,
-	.cancel-delegation-dialog .secondary-button,
-	.cancel-delegation-dialog .plain-close-button {
+	.run-board-subagent-button {
 		min-height: 44px;
 	}
 
 	.run-board-stop {
 		padding: 0 10px;
-	}
-
-	.cancel-delegation-dialog .plain-close-button {
-		min-width: 44px;
 	}
 }
 

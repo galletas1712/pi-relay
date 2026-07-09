@@ -24,17 +24,6 @@ import {
 import { memo, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { ActionMenu, type ActionMenuItem } from "./actionMenu.tsx";
 import { ConnectionBlockedReason, firstDisabledReason } from "./connectionRecovery.tsx";
-import {
-	AppAlertDialog,
-	DialogBody,
-	DialogClose,
-	DialogCloseButton,
-	DialogDescription,
-	DialogFooter,
-	DialogHeader,
-	DialogHeading,
-	DialogTitle,
-} from "./dialog.tsx";
 import { COMMANDS } from "./slash.ts";
 import {
 	isArchivedSession,
@@ -48,7 +37,6 @@ import {
 	agentStatusIconKey,
 	isDelegationRunning,
 	orderDelegations,
-	remainingDelegationWorkCount,
 	statusIconClass,
 	type AgentStatusIconKey,
 } from "./delegationBoard.ts";
@@ -150,14 +138,14 @@ function DelegationCard({
 	selectedSessionId,
 	actionState,
 	onSelectSession,
-	onRequestCancel,
+	onStop,
 	mutationBlockedReason,
 }: {
 	delegation: Delegation;
 	subagentNames: ReadonlyMap<string, string>;
 	selectedSessionId?: string | null;
 	actionState?: DelegationActionState;
-	onRequestCancel: (delegation: Delegation) => void;
+	onStop: (delegation: Delegation) => void;
 	mutationBlockedReason?: string | null;
 	onSelectSession?: (sessionId: string) => void;
 }) {
@@ -180,7 +168,7 @@ function DelegationCard({
 							type="button"
 							disabled={actionDisabled}
 							aria-busy={pending}
-							onClick={() => onRequestCancel(delegation)}
+							onClick={() => onStop(delegation)}
 							title="Stop this delegated work"
 						>
 							{pending ? <Loader2 className="spin" size={15} aria-hidden /> : <Square size={13} aria-hidden />}
@@ -208,62 +196,6 @@ function DelegationCard({
 				))}
 			</div>
 		</article>
-	);
-}
-
-function StopDelegationDialog({
-	delegation,
-	busy,
-	blockedReason,
-	onClose,
-	onConfirm,
-}: {
-	delegation: Delegation;
-	busy: boolean;
-	blockedReason?: string | null;
-	onClose: () => void;
-	onConfirm: () => void;
-}) {
-	const keepRunningRef = useRef<HTMLButtonElement>(null);
-	const title = delegation.label?.trim() || "Agent task";
-	const remaining = remainingDelegationWorkCount(delegation);
-	return (
-		<AppAlertDialog
-			className="rename-dialog cancel-delegation-dialog"
-			busy={busy}
-			initialFocusRef={keepRunningRef}
-			onDismiss={onClose}
-		>
-			<DialogHeader>
-				<DialogHeading>
-					<DialogTitle>Stop delegated work?</DialogTitle>
-				</DialogHeading>
-				<DialogCloseButton label="close stop delegated work dialog" disabled={busy} />
-			</DialogHeader>
-			<DialogBody className="delete-dialog-body">
-				<p>
-					Stop <strong>{title}</strong> and its remaining work affecting {remaining.count} {remaining.unit}?
-				</p>
-				<DialogDescription className="muted">
-					This stops remaining delegated work. It cannot roll back external tool or network side effects that already happened.
-				</DialogDescription>
-				<ConnectionBlockedReason reason={blockedReason} />
-			</DialogBody>
-			<DialogFooter>
-				<DialogClose ref={keepRunningRef} className="secondary-button" disabled={busy}>
-					Keep running
-				</DialogClose>
-				<button
-					type="button"
-					className="primary-button destructive"
-					disabled={busy || !!blockedReason}
-					aria-busy={busy}
-					onClick={onConfirm}
-				>
-					{busy ? "Stopping…" : "Stop work"}
-				</button>
-			</DialogFooter>
-		</AppAlertDialog>
 	);
 }
 
@@ -296,10 +228,6 @@ export function RunBoardDelegationList({
 	onSelectSession?: (sessionId: string) => void;
 	onCancelDelegation: (parentSessionId: string, delegationId: string) => void | Promise<void>;
 }) {
-	const [cancelDialogIntent, setCancelDialogIntent] = useState<{
-		parentSessionId: string;
-		delegation: Delegation;
-	} | null>(null);
 	const [actionStates, setActionStates] = useState<Record<string, DelegationActionState>>({});
 	const actionLocks = useRef(new Set<string>());
 	// The daemon returns a bounded newest-first page for the Agents outline. Keep
@@ -333,30 +261,25 @@ export function RunBoardDelegationList({
 	) => {
 		const delegationId = delegation.delegation_id;
 		const key = actionKey(intentParentSessionId, delegationId);
-		if (actionLocks.current.has(key)) return null;
+		if (actionLocks.current.has(key)) return;
 		actionLocks.current.add(key);
 		setActionState(key, { pending: true, error: null });
 		try {
 			await callback();
 			setActionState(key, { pending: false, error: null });
-			return true;
 		} catch (error) {
 			setActionState(key, { pending: false, error: actionErrorMessage(error) });
-			return false;
 		} finally {
 			actionLocks.current.delete(key);
 		}
 	};
-	const confirmCancel = () => {
-		const intent = cancelDialogIntent;
-		if (!intent || mutationBlockedReason) return;
+	const stopDelegation = (delegation: Delegation) => {
+		if (mutationBlockedReason) return;
 		void runAction(
-			intent.parentSessionId,
-			intent.delegation,
-			() => onCancelDelegation(intent.parentSessionId, intent.delegation.delegation_id),
-		).then((settled) => {
-			if (settled !== null) setCancelDialogIntent(null);
-		});
+			parentSessionId,
+			delegation,
+			() => onCancelDelegation(parentSessionId, delegation.delegation_id),
+		);
 	};
 	return (
 		<div className="run-board">
@@ -371,11 +294,7 @@ export function RunBoardDelegationList({
 								selectedSessionId={selectedSessionId}
 								actionState={actionStates[actionKey(parentSessionId, delegation.delegation_id)]}
 								onSelectSession={onSelectSession}
-								onRequestCancel={(selectedDelegation) =>
-									setCancelDialogIntent({
-										parentSessionId,
-										delegation: selectedDelegation,
-									})}
+								onStop={stopDelegation}
 								mutationBlockedReason={mutationBlockedReason}
 							/>
 						))}
@@ -399,22 +318,6 @@ export function RunBoardDelegationList({
 						</p>
 					) : null}
 				</>
-			) : null}
-			{cancelDialogIntent ? (
-				<StopDelegationDialog
-					delegation={cancelDialogIntent.delegation}
-					busy={
-						actionStates[
-							actionKey(
-								cancelDialogIntent.parentSessionId,
-								cancelDialogIntent.delegation.delegation_id,
-							)
-						]?.pending === true
-					}
-					blockedReason={mutationBlockedReason}
-					onClose={() => setCancelDialogIntent(null)}
-					onConfirm={confirmCancel}
-				/>
 			) : null}
 		</div>
 	);
