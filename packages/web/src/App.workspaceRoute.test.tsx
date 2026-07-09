@@ -214,7 +214,7 @@ describe("App workspace route identity integration", () => {
 				expect(labelledElement.getAttribute("title") ?? "").not.toMatch(/child-1|root-1/);
 			}
 		}
-		const parentLinks = screen.getAllByRole("button", { name: "parent" });
+		const parentLinks = screen.getAllByRole("button", { name: "Open parent conversation" });
 		expect(parentLinks).toHaveLength(2);
 		for (const parentLink of parentLinks) {
 			expect(parentLink.getAttribute("title")).toBe("Open parent conversation");
@@ -272,7 +272,7 @@ describe("App workspace route identity integration", () => {
 
 		document.querySelector<HTMLDivElement>(".message-scroll")!.scrollTop = 211;
 		fireEvent.scroll(document.querySelector<HTMLDivElement>(".message-scroll")!);
-		const parentLinks = screen.getAllByRole("button", { name: "parent" });
+		const parentLinks = screen.getAllByRole("button", { name: "Open parent conversation" });
 		await user.click(parentLinks[0]);
 		await waitFor(() => expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1"));
 		expect(document.querySelector<HTMLDivElement>(".message-scroll")?.scrollTop).toBe(900);

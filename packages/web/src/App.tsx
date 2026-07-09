@@ -3423,9 +3423,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 								type="button"
 								onClick={() => selectSession(mobileParentSessionId)}
 								title="Open parent conversation"
+								aria-label="Open parent conversation"
 							>
-								<ArrowUp size={12} aria-hidden />
-								parent
+								<ArrowUp size={13} aria-hidden />
 							</button>
 						) : null}
 					</div>

@@ -971,9 +971,9 @@ export function LogHeader({
 							type="button"
 							onClick={() => onSelectSession?.(parentSessionId)}
 							title="Open parent conversation"
+							aria-label="Open parent conversation"
 						>
-							<ArrowUp size={12} aria-hidden />
-							parent
+							<ArrowUp size={14} aria-hidden />
 						</button>
 					) : null}
 				</span>
