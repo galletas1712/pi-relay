@@ -105,7 +105,7 @@ describe("App workspace route identity integration", () => {
 		expectSensitiveReads(api, 0);
 
 		await act(async () => validation.resolve(result));
-		expect(await screen.findByRole("heading", { name: /Couldn’t (load session|open this workspace route)/ })).toBeTruthy();
+		expect(await screen.findByRole("heading", { name: /Couldn’t (load session|open this workspace)/ })).toBeTruthy();
 		expectSensitiveReads(api, 0);
 
 		await mounted.dispose();
@@ -197,7 +197,7 @@ describe("App workspace route identity integration", () => {
 
 		await openStatusOnly(api);
 		await waitFor(() =>
-			expect(screen.queryByText("Validating Conversation…")).toBeNull(),
+			expect(screen.queryByText("Loading conversation")).toBeNull(),
 		);
 		const recipient = await screen.findByRole("status");
 		expect(recipient.textContent).toContain("Conversation recipient: Child one");
@@ -328,7 +328,7 @@ describe("App workspace route identity integration", () => {
 		const detailApi = createRouteApi();
 		mounted = renderRouteApp(detailApi, detailBrowser);
 		await open(detailApi);
-		expect(await screen.findByRole("heading", { name: "Couldn’t open this workspace route" })).toBeTruthy();
+		expect(await screen.findByRole("heading", { name: "Couldn’t open this workspace" })).toBeTruthy();
 		expect(screen.getByRole("alert").textContent).toContain("unbounded canonical delegation lookup");
 		expect(screen.getByRole("button", { name: "Back to root Outline" })).toBeTruthy();
 		expect(mutationCallCount(detailApi)).toBe(0);
@@ -903,7 +903,7 @@ function turnsWithContent(
 
 async function open(api: RouteApi) {
 	await openStatusOnly(api);
-	await waitFor(() => expect(screen.queryByText("Validating Conversation…")).toBeNull());
+	await waitFor(() => expect(screen.queryByText("Loading conversation")).toBeNull());
 }
 
 async function openStatusOnly(api: RouteApi) {

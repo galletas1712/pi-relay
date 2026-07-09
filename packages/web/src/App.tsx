@@ -378,6 +378,32 @@ function hasCanonicalCachedHistory(cache: SelectedSessionCache, sessionId: strin
 	);
 }
 
+function LoadingConversation() {
+	const [dotCount, setDotCount] = useState(1);
+
+	useEffect(() => {
+		const interval = window.setInterval(() => {
+			setDotCount((current) => current % 3 + 1);
+		}, 250);
+		return () => window.clearInterval(interval);
+	}, []);
+
+	return (
+		<main
+			className="workspace-route-state conversation-loading-state"
+			data-slot="route-loading"
+			role="status"
+		>
+			<h1>
+				Loading conversation
+				<span className="conversation-loading-dots" aria-hidden>
+					{".".repeat(dotCount)}
+				</span>
+			</h1>
+		</main>
+	);
+}
+
 export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: AppProps = {}) {
 	const api = useMemo(() => injectedApi ?? createAgentApi(), [injectedApi]);
 	const routeHistory = useMemo(
@@ -515,7 +541,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const assertServerReadAllowed = useCallback(() => {
 		assertRemoteActionAllowed(remoteActionBlockedReason(connectionRef.current));
 		if (!routeRemoteReadsEnabledRef.current) {
-			throw new Error("workspace route is still being validated");
+			throw new Error("Conversation is still loading.");
 		}
 	}, []);
 
@@ -1458,7 +1484,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						state: unavailableExecutionDetail(
 							route,
 							"handoff",
-							"The requested handoff cannot be validated by the current backend.",
+							"The requested handoff is not available.",
 						),
 						retryable: false,
 					});
@@ -1480,10 +1506,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						route.destination === "conversation"
 							? unavailableConversationRoute(
 								route,
-								`Couldn’t validate the requested Conversation: ${errorMessage(error)}`,
+								`Couldn’t load the requested conversation: ${errorMessage(error)}`,
 							)
 							: routeRootUnavailable(
-								`Couldn’t validate the requested Execution route: ${errorMessage(error)}`,
+								`Couldn’t load the requested execution: ${errorMessage(error)}`,
 							),
 					retryable: true,
 				});
@@ -3573,11 +3599,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				</main>
 			) : unavailableState ? (
 				<main className="workspace-route-state unavailable-route-state" data-slot="route-unavailable">
-					<p className="workspace-route-eyebrow">Workspace route unavailable</p>
+					<p className="workspace-route-eyebrow">Workspace unavailable</p>
 					<h1>
 						{unavailableState.issue === "invalid-conversation"
 							? "Couldn’t load session"
-							: "Couldn’t open this workspace route"}
+							: "Couldn’t open this workspace"}
 					</h1>
 					<p role="alert">{unavailableState.message}</p>
 					<div className="workspace-route-actions">
@@ -3607,13 +3633,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						) : null}
 					</div>
 				</main>
-			) : routePending ? (
-				<main className="workspace-route-state" data-slot="route-loading" role="status">
-					<p className="workspace-route-eyebrow">Opening workspace route</p>
-					<h1>Validating Conversation…</h1>
-					<p>Checking the requested project, root run, and direct agent membership.</p>
-				</main>
-			) : null}
+			) : routePending ? <LoadingConversation /> : null}
 
 			<footer className="chat-dock" data-slot="chat-box">
 				<ConnectionRecoveryBanner
@@ -3654,7 +3674,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						<p>
 							{executionRoute
 								? "Execution details are intentionally deferred."
-								: "Conversation details are unavailable for this route."}
+								: "Conversation details are unavailable."}
 						</p>
 					</div>
 				) : (

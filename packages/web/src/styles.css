@@ -974,6 +974,17 @@ pre {
 	color: var(--foreground);
 }
 
+.conversation-loading-state {
+	align-items: center;
+	text-align: center;
+}
+
+.conversation-loading-dots {
+	display: inline-block;
+	min-width: 3ch;
+	text-align: left;
+}
+
 .workspace-route-state > p {
 	max-width: 64ch;
 	margin: 0;

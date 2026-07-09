@@ -372,7 +372,7 @@ describe("workspace route parser and serializer", () => {
 			{
 				kind: "unsupported-fragment",
 				persistent: false,
-				message: "URL fragments are not supported for workspace routes and were removed.",
+				message: "URL fragments are not supported here and were removed.",
 			},
 		]);
 		expect(result.correction?.reasons).toEqual(["unsupported-query", "unsupported-fragment"]);

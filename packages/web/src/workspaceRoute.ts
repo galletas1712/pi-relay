@@ -193,7 +193,7 @@ export function parseWorkspaceRoute(input: string | WorkspaceRouteLocation): Wor
 
 	const base = parsePathBase(rawSegments, decodedSegments);
 	if (!base) {
-		return unavailable("invalid-path", "The workspace URL does not match a supported project or Host route.", location, null);
+		return unavailable("invalid-path", "The workspace URL does not match a supported project or Host.", location, null);
 	}
 
 	const rootConversationRecovery = recoveryForRootConversation(base);
@@ -839,7 +839,7 @@ function unsupportedQueryWarnings(
 		warnings.push({
 			kind: "unsupported-fragment",
 			persistent: false,
-			message: "URL fragments are not supported for workspace routes and were removed.",
+			message: "URL fragments are not supported here and were removed.",
 		});
 	}
 	return warnings;
