@@ -37,12 +37,15 @@ export function workspaceScopeForProject(
 ): WorkspaceScopeEntry[] {
 	const stored = projectId ? readProjectScope(projectId, storage) : EMPTY_STORED;
 	const excluded = new Set(stored.excluded);
+	const excludesEveryWorkspace =
+		workspaces.length > 0 &&
+		workspaces.every((workspace) => excluded.has(workspace.workspace_dir));
 	return workspaces.map((workspace) => {
 		const kind = workspace.kind ?? "git";
 		return {
 			workspaceDir: workspace.workspace_dir,
 			kind,
-			included: !excluded.has(workspace.workspace_dir),
+			included: excludesEveryWorkspace || !excluded.has(workspace.workspace_dir),
 			branch: kind === "git" ? (stored.branches[workspace.workspace_dir] ?? "") : "",
 		};
 	});
@@ -74,6 +77,9 @@ export function rememberWorkspaceScope(
  */
 export function startWorkspacesFromScope(scope: WorkspaceScopeEntry[]): StartSessionWorkspace[] | undefined {
 	const included = scope.filter((entry) => entry.included);
+	if (scope.length > 0 && included.length === 0) {
+		throw new Error("At least one project workspace must be selected");
+	}
 	const hasBranchOverride = included.some((entry) => entry.kind === "git" && entry.branch.trim());
 	if (included.length === scope.length && !hasBranchOverride) return undefined;
 	return included.map((entry) => ({

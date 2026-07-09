@@ -148,6 +148,7 @@ fn session_config_with_task(
             prompt_cache: None,
         },
         metadata,
+        mcp_manifest: None,
     }
 }
 

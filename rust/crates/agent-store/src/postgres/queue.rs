@@ -1116,6 +1116,7 @@ mod tests {
                 prompt_cache: None,
             },
             metadata: json!({}),
+            mcp_manifest: None,
         }
     }
 

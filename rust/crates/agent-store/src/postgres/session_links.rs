@@ -151,6 +151,7 @@ mod tests {
             // list_sessions' "empty web session" exclusion (which treats a null
             // created_by as an unknown under SQL three-valued logic).
             metadata: json!({ "created_by": "test" }),
+            mcp_manifest: None,
         }
     }
 

@@ -59,10 +59,63 @@ pub(crate) fn runner_start_count(session_id: &str, kind: &str) -> usize {
 }
 
 async fn spawn_dispatch(state: AppState, session_id: String, dispatch: DispatchAction) {
-    if matches!(&dispatch.action, SessionAction::RequestModel { .. }) {
-        let _ = spawn_model_dispatch(state, session_id, dispatch, false).await;
-    } else {
-        let _ = spawn_claimed_dispatch(state, session_id, dispatch);
+    match &dispatch.action {
+        SessionAction::RequestModel { .. } => {
+            let _ = spawn_model_dispatch(state, session_id, dispatch, false).await;
+        }
+        SessionAction::RequestTool { .. } => {
+            let _ = spawn_tool_dispatch(state, session_id, dispatch).await;
+        }
+        SessionAction::CancelSessionWork => {}
+    }
+}
+
+async fn spawn_tool_dispatch(
+    state: AppState,
+    session_id: String,
+    dispatch: DispatchAction,
+) -> Result<Option<TaskRegistrationId>, TaskRegistrationRejected> {
+    if is_shutting_down(&state) {
+        return Err(TaskRegistrationRejected);
+    }
+    let events = match state
+        .repo
+        .mark_action_running_and_event(
+            &session_id,
+            &dispatch.row_id,
+            &dispatch.attempt_id,
+            EventType::ToolStarted,
+        )
+        .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            eprintln!(
+                "failed to claim tool action {session_id}/{}: {error:#}",
+                dispatch.row_id
+            );
+            return Ok(None);
+        }
+    };
+    if events.is_empty() {
+        return Ok(None);
+    }
+    publish_events(&state, events);
+    match spawn_claimed_dispatch(state.clone(), session_id.clone(), dispatch.clone()) {
+        Ok(registration_id) => Ok(Some(registration_id)),
+        Err(error) => {
+            if let Err(mark_error) = state
+                .repo
+                .mark_action_stale(&session_id, &dispatch.row_id, &dispatch.attempt_id, None)
+                .await
+            {
+                eprintln!(
+                    "failed to stale unregistered tool action {session_id}/{}: {mark_error:#}",
+                    dispatch.row_id
+                );
+            }
+            Err(error)
+        }
     }
 }
 

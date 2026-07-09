@@ -463,6 +463,7 @@ mod tests {
                 prompt_cache: None,
             },
             metadata: Value::Null,
+            mcp_manifest: None,
         }
     }
 

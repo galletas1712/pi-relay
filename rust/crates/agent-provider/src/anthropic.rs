@@ -1419,14 +1419,6 @@ fn anthropic_tools(
 }
 
 fn anthropic_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
-    let mut tools = tools.to_vec();
-    tools.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.canonical_name.cmp(&right.canonical_name))
-    });
     tools.iter().map(|tool| tool.declaration.clone()).collect()
 }
 
@@ -5262,7 +5254,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_body_sorts_tools_for_cache_stability() {
+    fn messages_body_preserves_snapshot_tool_order() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
@@ -5291,8 +5283,8 @@ mod tests {
         })
         .expect("body renders");
 
-        assert_eq!(body["tools"][0]["name"], "read");
-        assert_eq!(body["tools"][1]["name"], "write");
+        assert_eq!(body["tools"][0]["name"], "write");
+        assert_eq!(body["tools"][1]["name"], "read");
         // No tools-level breakpoints regardless of how many tools there are.
         assert!(body["tools"][0].get("cache_control").is_none());
         assert!(body["tools"][1].get("cache_control").is_none());

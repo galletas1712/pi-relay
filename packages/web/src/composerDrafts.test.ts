@@ -15,6 +15,7 @@ describe("composer draft storage", () => {
 	const pending: PendingSubmittedDraft = {
 		value: "run tests",
 		version: 3,
+		newSessionSetupGeneration: 7,
 		clientControlId: "web_control_stable",
 		newSessionId: "session_stable",
 	};
@@ -29,6 +30,16 @@ describe("composer draft storage", () => {
 		saveComposerDrafts(drafts, storage);
 
 		expect(loadComposerDrafts(storage)).toEqual(drafts);
+	});
+
+	it("replaces both IDs after a deliberate new-session setup edit", () => {
+		let next = 0;
+		expect(
+			submissionIdsForDraft(pending, "run tests", 8, (prefix) => `${prefix}_${++next}`),
+		).toEqual({
+			clientControlId: "web_control_1",
+			newSessionId: "session_2",
+		});
 	});
 
 	it("drops empty drafts and removes storage when none remain", () => {
@@ -48,7 +59,7 @@ describe("composer draft storage", () => {
 	});
 
 	it("reuses both durable IDs when unchanged text is retried after an uncertain response", () => {
-		expect(submissionIdsForDraft(pending, "run tests", () => "new-id")).toEqual({
+		expect(submissionIdsForDraft(pending, "run tests", 7, () => "new-id")).toEqual({
 			clientControlId: "web_control_stable",
 			newSessionId: "session_stable",
 		});
@@ -57,7 +68,7 @@ describe("composer draft storage", () => {
 	it("replaces both IDs after a deliberate edit", () => {
 		let next = 0;
 		expect(
-			submissionIdsForDraft(pending, "run all tests", (prefix) => `${prefix}_${++next}`),
+			submissionIdsForDraft(pending, "run all tests", 7, (prefix) => `${prefix}_${++next}`),
 		).toEqual({
 			clientControlId: "web_control_1",
 			newSessionId: "session_2",
@@ -69,6 +80,7 @@ describe("submitted composer draft guards", () => {
 	const pending: PendingSubmittedDraft = {
 		value: "run tests",
 		version: 3,
+		newSessionSetupGeneration: 7,
 		clientControlId: "web_control_stable",
 		newSessionId: "session_stable",
 	};

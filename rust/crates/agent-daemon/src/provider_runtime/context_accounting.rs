@@ -1,3 +1,4 @@
+use agent_mcp::McpSessionSnapshot;
 use agent_provider::{ProviderTokenCountRequest, ProviderToolProfile};
 use agent_session::{ModelContext, ModelContextEntry, TranscriptStorageNode};
 use agent_store::SessionConfig;
@@ -8,6 +9,7 @@ use crate::auth::Credentials;
 use crate::state::AppState;
 
 use super::auth_retry::count_tokens_with_auth_retry;
+use super::mcp::provider_toolset_fingerprint;
 use super::prompt::{assemble_agent_prompt, effective_prompt_profile, provider_tools_for_session};
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
@@ -18,10 +20,18 @@ pub(crate) async fn model_input_tokens_for_gate(
     session_id: &str,
     context_leaf_id: Option<&str>,
     model_context: ModelContext,
+    snapshot: &McpSessionSnapshot,
 ) -> Result<usize> {
     match config.provider.kind {
         ProviderKind::Claude => {
-            count_claude_model_input_tokens_remotely(state, config, session_id, model_context).await
+            count_claude_model_input_tokens_remotely(
+                state,
+                config,
+                session_id,
+                model_context,
+                snapshot,
+            )
+            .await
         }
         ProviderKind::OpenAi => {
             estimate_codex_model_input_tokens_from_usage_anchor(
@@ -30,6 +40,7 @@ pub(crate) async fn model_input_tokens_for_gate(
                 session_id,
                 context_leaf_id,
                 model_context,
+                snapshot,
             )
             .await
         }
@@ -41,21 +52,19 @@ async fn count_claude_model_input_tokens_remotely(
     config: &SessionConfig,
     session_id: &str,
     model_context: ModelContext,
+    snapshot: &McpSessionSnapshot,
 ) -> Result<usize> {
     // Claude has an authoritative remote preflight backend. Count the exact
     // local tool surface sent on the next /messages call, including web
     // wrappers now that they are normal client JSON tools.
     let prompt = assemble_agent_prompt(state, config, session_id).await?;
+    let tools = request_tools(state, config, session_id, snapshot).await?;
     let request = ProviderTokenCountRequest {
         model: config.provider.model.clone(),
         prompt,
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: provider_tools_for_session(
-            state,
-            config.provider.kind,
-            effective_prompt_profile(state, config, session_id).await?,
-        ),
+        tools,
         max_tokens: config.provider.max_tokens,
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
@@ -77,6 +86,7 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
     session_id: &str,
     context_leaf_id: Option<&str>,
     model_context: ModelContext,
+    snapshot: &McpSessionSnapshot,
 ) -> Result<usize> {
     // The Codex/ChatGPT backend has no usable remote count endpoint: probing
     // /responses/input_tokens returns a Cloudflare challenge instead of a
@@ -85,9 +95,11 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
     // transcript suffixes appended after that point, and let reactive
     // compaction/retry handle rare overflow misses.
     if let Some(context_leaf_id) = context_leaf_id {
+        let tools = request_tools(state, config, session_id, snapshot).await?;
+        let toolset_fingerprint = provider_toolset_fingerprint(&tools);
         if let Some(usage) = state
             .repo
-            .latest_model_token_usage_estimate(session_id, context_leaf_id)
+            .latest_model_token_usage_estimate(session_id, context_leaf_id, &toolset_fingerprint)
             .await?
         {
             let suffix_entries =
@@ -117,7 +129,14 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
         }
     }
 
-    estimate_model_input_tokens_from_local_heuristic(state, config, session_id, model_context).await
+    estimate_model_input_tokens_from_local_heuristic(
+        state,
+        config,
+        session_id,
+        model_context,
+        snapshot,
+    )
+    .await
 }
 
 fn suffix_after_first_model_generated_item(
@@ -136,11 +155,29 @@ async fn estimate_model_input_tokens_from_local_heuristic(
     config: &SessionConfig,
     session_id: &str,
     model_context: ModelContext,
+    snapshot: &McpSessionSnapshot,
 ) -> Result<usize> {
     let prompt = assemble_agent_prompt(state, config, session_id).await?;
     let transcript = provider_transcript(model_context);
-    Ok(agent_provider::estimate_model_input_tokens(
+    let tools = request_tools(state, config, session_id, snapshot).await?;
+    Ok(agent_provider::estimate_model_input_tokens_with_tools(
         &prompt,
         &transcript,
+        &tools,
     )?)
+}
+
+async fn request_tools(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+    snapshot: &McpSessionSnapshot,
+) -> Result<Vec<agent_tools::ProviderTool>> {
+    let mut tools = provider_tools_for_session(
+        state,
+        config.provider.kind,
+        effective_prompt_profile(state, config, session_id).await?,
+    );
+    tools.extend(snapshot.provider_tools(config.provider.kind));
+    Ok(tools)
 }

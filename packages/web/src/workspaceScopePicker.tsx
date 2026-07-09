@@ -13,15 +13,24 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 	scope,
 	onChange,
 	disabled,
+	open: controlledOpen,
+	onOpenChange,
 }: {
 	scope: WorkspaceScopeEntry[];
 	onChange: (scope: WorkspaceScopeEntry[]) => void;
 	disabled?: boolean;
+	open?: boolean;
+	onOpenChange?: (open: boolean) => void;
 }) {
-	const [open, setOpen] = useState(false);
+	const [internalOpen, setInternalOpen] = useState(false);
+	const open = controlledOpen ?? internalOpen;
 	if (!scope.length) return null;
 
 	const includedCount = scope.filter((entry) => entry.included).length;
+	const setOpen = (nextOpen: boolean) => {
+		if (controlledOpen === undefined) setInternalOpen(nextOpen);
+		onOpenChange?.(nextOpen);
+	};
 	const patch = (index: number, change: Partial<WorkspaceScopeEntry>) => {
 		onChange(scope.map((entry, entryIndex) => (entryIndex === index ? { ...entry, ...change } : entry)));
 	};
@@ -31,8 +40,9 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 			<button
 				type="button"
 				className="workspace-scope-toggle"
-				onClick={() => setOpen((value) => !value)}
+				onClick={() => setOpen(!open)}
 				aria-expanded={open}
+				disabled={disabled}
 			>
 				{open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
 				<span>Workspaces</span>
@@ -42,13 +52,19 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 			</button>
 			{open ? (
 				<div className="workspace-scope-list">
+					<p className="workspace-scope-help">At least one workspace must remain selected.</p>
 					{scope.map((entry, index) => (
 						<div className="workspace-scope-item" key={entry.workspaceDir}>
 							<label className="workspace-scope-name">
 								<input
 									type="checkbox"
 									checked={entry.included}
-									disabled={disabled}
+									disabled={disabled || (entry.included && includedCount === 1)}
+									title={
+										entry.included && includedCount === 1
+											? "At least one workspace must remain selected"
+											: undefined
+									}
 									onChange={(event) => patch(index, { included: event.target.checked })}
 								/>
 								{entry.kind === "git" ? <FolderGit2 size={14} /> : <Folder size={14} />}

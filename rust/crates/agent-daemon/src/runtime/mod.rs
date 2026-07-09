@@ -410,6 +410,8 @@ impl SessionDriver {
                 attempt_id: claimed.pending.attempt_id,
                 post_compaction_dispatch_lease: Some(claimed.lease),
                 action: claimed.pending.action,
+                mcp_snapshot: crate::provider_runtime::mcp_snapshot_for_session(&config)
+                    .map_err(RpcError::from)?,
                 config,
             };
             if session_uses_harness(&dispatch.config) {
@@ -1305,6 +1307,8 @@ impl SessionDriver {
                     post_compaction_dispatch_lease: None,
                     action: action.action,
                     config: dispatch_config,
+                    mcp_snapshot: crate::provider_runtime::mcp_snapshot_for_session(&config)
+                        .expect("loaded session MCP manifest is valid"),
                 }
             })
             .collect::<Vec<_>>();
@@ -1320,8 +1324,24 @@ impl SessionDriver {
         for dispatch in dispatches {
             match &dispatch.action {
                 SessionAction::RequestModel { .. } => {
-                    if self.gate_model_dispatch(&dispatch).await? {
-                        ready.push(dispatch);
+                    match self.gate_model_dispatch(&dispatch).await {
+                        Ok(true) => ready.push(dispatch),
+                        Ok(false) => {}
+                        Err(error) => {
+                            let events = self
+                                .state
+                                .repo
+                                .fail_unfinished_model_action(
+                                    &self.session_id,
+                                    &dispatch.row_id,
+                                    &dispatch.attempt_id,
+                                    dispatch.post_compaction_dispatch_lease.as_ref(),
+                                    &error.message,
+                                )
+                                .await?;
+                            publish_events(&self.state, events);
+                            return Err(error);
+                        }
                     }
                 }
                 SessionAction::RequestTool { .. } => ready.push(dispatch),

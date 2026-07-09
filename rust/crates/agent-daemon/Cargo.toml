@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 agent-core = { workspace = true }
+agent-mcp = { workspace = true }
 agent-provider = { workspace = true }
 agent-prompt = { workspace = true }
 agent-session = { workspace = true }

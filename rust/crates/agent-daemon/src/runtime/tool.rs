@@ -2,10 +2,10 @@ use std::collections::BTreeSet;
 
 use agent_core::AgentInput;
 use agent_session::SessionAction;
-use agent_store::{ActionStatus, ActionUpdate, EventType};
-use agent_tools::ToolContext;
+use agent_store::{ActionStatus, ActionUpdate};
+use agent_tools::{limit_tool_output, ToolContext};
 use agent_vocab::{ToolResultMessage, ToolResultStatus, TranscriptItem};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::delegation_tools::{is_delegation_tool_name, run_delegation_tool};
 use crate::provider_runtime::{
@@ -14,7 +14,7 @@ use crate::provider_runtime::{
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError};
 
-use super::{agent_input_from_queued_priority, publish_events, SessionDriver};
+use super::{agent_input_from_queued_priority, SessionDriver};
 
 pub(super) async fn run_tool_turn(
     state: AppState,
@@ -30,19 +30,6 @@ pub(super) async fn run_tool_turn(
         return Ok(());
     };
 
-    let events = state
-        .repo
-        .mark_action_running_and_event(
-            &session_id,
-            &dispatch.row_id,
-            &dispatch.attempt_id,
-            EventType::ToolStarted,
-        )
-        .await?;
-    if events.is_empty() {
-        return Ok(());
-    }
-    publish_events(&state, events);
     state
         .workspaces
         .ensure_session(
@@ -54,7 +41,31 @@ pub(super) async fn run_tool_turn(
 
     let tool_context =
         ToolContext::new(std::path::PathBuf::from(dispatch.config.outer_cwd.clone()));
-    let mut result = if tool_call.tool_name == "LoadSkill" {
+    let snapshot = &dispatch.mcp_snapshot;
+    let mut result = if snapshot.manifest().tool(&tool_call.tool_name).is_some() {
+        let arguments = serde_json::from_str(&tool_call.args_json).unwrap_or(Value::Null);
+        match state
+            .mcp
+            .call(snapshot, &tool_call.tool_name, arguments)
+            .await
+        {
+            Ok(output) if output.is_error => ToolResultMessage::error(
+                tool_call.id.clone(),
+                tool_call.tool_name.clone(),
+                output.output,
+            ),
+            Ok(output) => ToolResultMessage::success(
+                tool_call.id.clone(),
+                tool_call.tool_name.clone(),
+                output.output,
+            ),
+            Err(error) => ToolResultMessage::error(
+                tool_call.id.clone(),
+                tool_call.tool_name.clone(),
+                error.to_string(),
+            ),
+        }
+    } else if tool_call.tool_name == "LoadSkill" {
         let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
         load_skill_result(
             &state.prompt_root,
@@ -89,7 +100,7 @@ pub(super) async fn run_tool_turn(
             ),
         }
     };
-    escape_nul_in_tool_result(&mut result);
+    finalize_tool_result(&mut result);
     let status = if matches!(result.status, ToolResultStatus::Success) {
         ActionStatus::Completed
     } else {
@@ -174,6 +185,11 @@ fn escape_nul_in_tool_result(result: &mut ToolResultMessage) {
     }
 }
 
+fn finalize_tool_result(result: &mut ToolResultMessage) {
+    escape_nul_in_tool_result(result);
+    result.output = limit_tool_output(std::mem::take(&mut result.output));
+}
+
 async fn loaded_skills_for_session(state: &AppState, session_id: &str) -> BTreeSet<String> {
     let Some(active) = state.active.lock().await.get(session_id).cloned() else {
         return BTreeSet::new();
@@ -233,13 +249,28 @@ mod tests {
             .await
             .expect("bash execution succeeds");
 
-        escape_nul_in_tool_result(&mut result);
+        finalize_tool_result(&mut result);
 
         assert!(result.output.contains(r"before\x00after"));
         assert!(!result.output.contains('\0'));
         assert!(!serde_json::to_string(&result)
             .expect("serialize tool result")
             .contains(r"\u0000"));
+    }
+
+    #[test]
+    fn nul_expansion_is_bounded_by_the_final_tool_output_limit() {
+        let mut result = ToolResultMessage::success(
+            ToolCallId::new("call"),
+            "mcp__fixture__nul",
+            "\0".repeat(40_000),
+        );
+
+        finalize_tool_result(&mut result);
+
+        assert!(!result.output.contains('\0'));
+        assert!(result.output.chars().count() <= 40_100);
+        assert!(result.output.contains("[tool output truncated:"));
     }
 
     #[test]

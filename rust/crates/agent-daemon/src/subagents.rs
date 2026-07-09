@@ -118,6 +118,7 @@ pub(crate) async fn spawn_subagent(
         system_prompt: String::new(),
         provider: request.provider.unwrap_or(parent_config.provider),
         metadata: child_metadata,
+        mcp_manifest: parent_config.mcp_manifest.clone(),
     };
     child_config.system_prompt = child_system_prompt(
         state,

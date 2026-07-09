@@ -10,6 +10,7 @@ use crate::{
 use agent_vocab::{ProviderConfig, UserMessage};
 
 use super::events::insert_event_tx;
+use super::mcp::install_session_manifest_tx;
 use super::outputs::persist_outputs_tx;
 use super::queue::bump_revisions_tx;
 use super::sql::{
@@ -106,10 +107,16 @@ impl PostgresAgentStore {
         config: &SessionConfig,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
+        if let Some(binding) = &config.mcp_manifest {
+            install_session_manifest_tx(&mut tx, binding).await?;
+        }
         sqlx::query(
             r#"
-            insert into sessions (id, project_id, outer_cwd, workspaces, system_prompt, provider_config, metadata)
-            values ($1, $2, $3, $4, $5, $6, $7)
+            insert into sessions (
+                id, project_id, outer_cwd, workspaces, system_prompt,
+                provider_config, metadata, mcp_manifest_fingerprint
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8::text)
             "#,
         )
         .bind(session_id)
@@ -119,6 +126,12 @@ impl PostgresAgentStore {
         .bind(&config.system_prompt)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
+        .bind(
+            config
+                .mcp_manifest
+                .as_ref()
+                .map(|binding| &binding.manifest_fingerprint),
+        )
         .execute(&mut *tx)
         .await?;
         let event = insert_event_tx(
@@ -246,10 +259,39 @@ impl PostgresAgentStore {
             ));
         }
         let mut tx = self.pool.begin().await?;
+        if let Some(parent_session_id) = parent_session_id {
+            let parent_fingerprint: Option<Option<String>> = sqlx::query_scalar(
+                "select mcp_manifest_fingerprint from sessions where id=$1::text for key share",
+            )
+            .bind(parent_session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let parent_fingerprint = parent_fingerprint
+                .ok_or_else(|| anyhow!("parent session not found: {parent_session_id}"))?;
+            let child_fingerprint = config
+                .mcp_manifest
+                .as_ref()
+                .map(|binding| binding.manifest_fingerprint.as_str());
+            if parent_fingerprint.as_deref() != child_fingerprint {
+                return Err(anyhow!(
+                    "child MCP manifest must exactly match parent session {parent_session_id}"
+                ));
+            }
+        }
+        if let Some(binding) = &config.mcp_manifest {
+            install_session_manifest_tx(&mut tx, binding).await?;
+        }
         let inserted = sqlx::query(
             r#"
-                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, system_prompt, provider_config, metadata, parent_session_id, subagent_type, delegation_id)
-                values ($1, $2, $3, $4, $5::text, $6, $7, $8, $9::text, $10::text, $11::text)
+                insert into sessions (
+                    id, project_id, outer_cwd, workspaces, active_leaf_id,
+                    system_prompt, provider_config, metadata, parent_session_id,
+                    subagent_type, delegation_id, mcp_manifest_fingerprint
+                )
+                values (
+                    $1, $2, $3, $4, $5::text, $6, $7, $8, $9::text,
+                    $10::text, $11::text, $12::text
+                )
                 on conflict (id) do nothing
                 returning id
                 "#,
@@ -265,6 +307,12 @@ impl PostgresAgentStore {
         .bind(parent_session_id)
         .bind(subagent_type.map(|subagent_type| subagent_type.as_str()))
         .bind(delegation_id)
+        .bind(
+            config
+                .mcp_manifest
+                .as_ref()
+                .map(|binding| &binding.manifest_fingerprint),
+        )
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_none() {
@@ -518,8 +566,12 @@ impl PostgresAgentStore {
                 s.workspaces,
                 s.system_prompt,
                 s.provider_config,
-                s.metadata
+                s.metadata,
+                s.mcp_manifest_fingerprint,
+                m.manifest as mcp_manifest
             from sessions s
+            left join mcp_session_manifests m
+                on m.fingerprint=s.mcp_manifest_fingerprint
             where s.id=$1
             "#,
         )
@@ -536,6 +588,14 @@ impl PostgresAgentStore {
             system_prompt: row.get("system_prompt"),
             provider: serde_json::from_value(row.get("provider_config"))?,
             metadata: row.get("metadata"),
+            mcp_manifest: row
+                .get::<Option<String>, _>("mcp_manifest_fingerprint")
+                .map(|manifest_fingerprint| crate::McpSessionManifestBinding {
+                    manifest_fingerprint,
+                    manifest: row
+                        .get::<Option<Value>, _>("mcp_manifest")
+                        .expect("MCP manifest foreign key must resolve"),
+                }),
         })
     }
 

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use agent_vocab::{ProviderKind, ToolCall, ToolDefinition, ToolResultMessage};
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::context::ToolContext;
@@ -21,7 +21,7 @@ pub trait AgentTool: Send + Sync {
 ///
 /// Provider-native details still live in `ProviderTool::declaration`; execution
 /// is always owned by pi-relay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecution {
     LocalJson,
@@ -29,7 +29,7 @@ pub enum ToolExecution {
 }
 
 /// One provider-facing form of a canonical pi-relay tool.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderTool {
     /// Stable pi-relay-internal name used for execution and transcript state.
     pub canonical_name: String,

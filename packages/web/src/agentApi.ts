@@ -17,6 +17,8 @@ import type {
 	ReadHandoffFileResult,
 	HandoffFileName,
 	ToolListing,
+	McpInventory,
+	StartSessionMcpSelection,
 	TranscriptEntriesResult,
 	TranscriptEntry,
 	TranscriptTreeIndex,
@@ -50,6 +52,7 @@ export interface AgentApi {
 	steerSubagent(params: SteerSubagentParams): Promise<SteerSubagentResult>;
 	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse>;
 	listTools(provider: string, sessionId?: string | null): Promise<ToolListing[]>;
+	getMcpInventory(provider: string): Promise<McpInventory>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
 	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse>;
 	getTranscriptIndex(sessionId: string, options?: TranscriptIndexOptions): Promise<TranscriptTreeIndex>;
@@ -129,6 +132,7 @@ export interface StartSessionParams {
 	content: ContentBlock[];
 	/** Subset of the project's workspaces to materialize, with optional per-session git branch overrides. Omit for all. */
 	workspaces?: StartSessionWorkspace[] | null;
+	mcp?: StartSessionMcpSelection;
 }
 
 export interface StartSessionResult {
@@ -318,6 +322,10 @@ class AgentApiClient implements AgentApi {
 
 	connect(): Promise<void> {
 		return this.client.connect();
+	}
+
+	getMcpInventory(provider: string): Promise<McpInventory> {
+		return this.client.request<McpInventory>("mcp.inventory", { provider });
 	}
 
 	reconnect(): Promise<void> {
@@ -514,12 +522,23 @@ class AgentApiClient implements AgentApi {
 			client_input_id: params.clientInputId,
 			priority: params.priority,
 			content: params.content,
-			workspaces: params.workspaces?.length
-				? params.workspaces.map((workspace) => ({
+			...(params.mcp?.servers.length
+				? { mcp: {
+						inventory_revision: params.mcp.inventoryRevision,
+						servers: [...params.mcp.servers].sort((left, right) =>
+							left.server < right.server ? -1 : left.server > right.server ? 1 : 0
+						).map((server) => ({
+							server: server.server,
+							tools: [...server.tools].sort(),
+						})),
+					} }
+				: {}),
+			workspaces: params.workspaces == null
+				? undefined
+				: params.workspaces.map((workspace) => ({
 						workspace_dir: workspace.workspaceDir,
 						branch: workspace.branch?.trim() || undefined
 					}))
-				: undefined
 		});
 	}
 

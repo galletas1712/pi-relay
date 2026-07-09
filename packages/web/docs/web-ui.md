@@ -40,6 +40,7 @@ TanStack Query                          SelectedSessionCache (per sessionId)
 projects        queryKeys.projects      snapshot (head/revisions/queue/metadata)
 session lists   queryKeys.sessions(pid) activeBranchEntryIds + entriesById
 tools           queryKeys.tools(kind)   tree* (compact topology for /switch)
+mcp inventory   queryKeys.mcpInventory
 system prompt   queryKeys.systemPrompt  turnCardsById/turnOrder/turnDetailsById
 ```
 
@@ -327,15 +328,54 @@ a deliberate new submission/control creates a new id, a response can still be
 lost after commit, and external tool or network side effects remain
 non-transactional and cannot be rolled back.
 
-### Workspace scope picker
+### New Session setup
 
-When composing a new session inside a project (no session selected), a collapsible `WorkspaceScopePicker`
-(`workspaceScopePicker.tsx`) sits above the composer. It scopes the next session to a subset of the project's workspaces
-and lets git workspaces start from a non-default branch, then feeds `session.start`'s optional `workspaces` array via
-`startWorkspacesFromScope`. It defaults to every workspace included at its default branch (sending no `workspaces`, i.e.
-the daemon's existing behavior), so the type-and-send flow is unchanged. Per-project choices persist in `localStorage`
-under `piRelayWorkspaceScope:v1` (`workspaceScope.ts`); stored entries for workspaces a project no longer declares are
-dropped when the picker re-derives.
+When no session is selected, `NewSessionSetup` renders compact disclosures
+above the shared composer and after connection-recovery state. Project sessions
+show **Workspaces** first and **MCP tools** second; host sessions show MCP only.
+The composition owns one disclosure state, so opening either bounded list
+closes the other instead of allowing both to consume the mobile viewport.
+
+`WorkspaceScopePicker` scopes the next project session to a subset of its
+declared workspaces and lets git workspaces start from a non-default branch. It
+feeds `session.start`'s optional `workspaces` array through
+`startWorkspacesFromScope`. It defaults to every workspace at its default
+branch, so that default remains omission/all. The final included workspace
+cannot be unchecked and has accessible explanatory copy; the UI can therefore
+never display `0 of N` and accidentally serialize it as omission/all.
+Per-project choices persist under `piRelayWorkspaceScope:v1`; stale workspace
+entries are dropped when the picker re-derives.
+
+The MCP inventory query is enabled only while the connection is open, the route
+allows remote reads, and no durable session is selected. Loading and failures
+are field-local and do not block an MCP-free session; failure offers Retry.
+Nothing is initially selected. Clicking a healthy server selects all currently
+operator-allowed tools; expanding it allows individual
+deselection/reselection. The server checkbox is accessible tri-state
+(`indeterminate` plus `aria-checked="mixed"`), and deselecting every tool omits
+that server.
+
+The collapsed and per-server summaries show selected tool counts and the
+approximate **MCP context tokens added**, computed from the exact provider
+declaration JSON. This is not total context.
+
+Pure transforms live in `mcpSelection.ts`: deterministic raw-identity payload,
+none/some/all state, all/one toggles, totals, and revision reconciliation.
+`session.start` sends only sorted raw server/tool identities plus
+`inventory_revision`; it never sends descriptions, schemas, configuration, or
+credentials. Omitted selection explicitly creates an MCP-free session. On
+`mcp_inventory_changed`, App refetches inventory and clears changed-server
+selections rather than silently selecting newly published contracts. Draft
+selection, workspace scope, and composer text survive uncertain failures.
+Nonempty selection fails closed while its provider inventory is unavailable.
+MCP selection clears after definite creation success or an explicit New
+Session reset. Changing the draft provider kind clears selection visibly;
+reasoning-effort changes within the same provider retain it.
+
+Existing-session tools use immutable `tools.list(session_id)` data and are not
+overwritten by New Session inventory refresh. Full and read-only children
+inherit the exact parent MCP set. Read-only filesystem status does not restrict
+side effects performed by remote MCP servers.
 
 ### Queue pane
 

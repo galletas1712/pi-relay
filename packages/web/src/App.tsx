@@ -137,7 +137,13 @@ import {
 	workspaceScopeForProject,
 	type WorkspaceScopeEntry,
 } from "./workspaceScope.ts";
-import { WorkspaceScopePicker } from "./workspaceScopePicker.tsx";
+import { NewSessionSetup } from "./newSessionSetup.tsx";
+import {
+	mcpSelectionForProviderChange,
+	mcpSelectionPayloadForProvider,
+	reconcileMcpSelection,
+	type McpSelectionState,
+} from "./mcpSelection.ts";
 import {
 	browserWorkspaceRouteHistory,
 	fallbackExecutionConversation,
@@ -162,6 +168,7 @@ import type {
 	Activity,
 	DelegationSubagent,
 	EventFrame,
+	McpInventory,
 	Notice,
 	Project,
 	ProviderConfig,
@@ -489,6 +496,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [, setProviderConfigurationRevision] = useState(0);
 	const providerConfigurationControllerRef = useRef<ProviderConfigurationController | null>(null);
 	const providerConfigurationMountGenerationRef = useRef(0);
+	const [mcpSelection, setMcpSelection] = useState<McpSelectionState>(new Map());
+	const mcpSelectionRef = useRef<McpSelectionState>(mcpSelection);
+	const mcpSelectionProviderRef = useRef<ProviderConfig["kind"]>(newSessionProvider.kind);
+	const previousMcpInventoryRef = useRef<McpInventory | null>(null);
+	const [reconciledMcpInventoryIdentity, setReconciledMcpInventoryIdentity] =
+		useState<string | null>(null);
+	const [newSessionSetupGeneration, setNewSessionSetupGeneration] = useState(0);
 	const [sending, setSending] = useState(false);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
@@ -799,13 +813,19 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const projectWorkspaces = selectedProject?.workspaces ?? null;
 	const projectWorkspacesRef = useRef(projectWorkspaces);
 	projectWorkspacesRef.current = projectWorkspaces;
-	const projectWorkspaceKey = projectWorkspaces?.map((workspace) => workspace.workspace_dir).join("\n") ?? "";
+	const projectWorkspaceKey = JSON.stringify(
+		projectWorkspaces?.map((workspace) => ({
+			workspaceDir: workspace.workspace_dir,
+			kind: workspace.kind ?? "git",
+		})) ?? [],
+	);
 	useEffect(() => {
 		setWorkspaceScope(workspaceScopeForProject(selectedProjectId, projectWorkspacesRef.current ?? []));
 	}, [selectedProjectId, projectWorkspaceKey]);
 	const handleWorkspaceScopeChange = useCallback((scope: WorkspaceScopeEntry[]) => {
 		setWorkspaceScope(scope);
 		rememberWorkspaceScope(selectedProjectRef.current, scope);
+		setNewSessionSetupGeneration((generation) => generation + 1);
 	}, []);
 
 	const selectedSession = useMemo(
@@ -913,6 +933,63 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		enabled: connection === "open" && routeRemoteReadsEnabled,
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
+	const mcpInventoryQuery = useQuery({
+		queryKey: queryKeys.mcpInventory(newSessionProvider.kind),
+		queryFn: async () => {
+			assertServerReadAllowed();
+			return {
+				provider: newSessionProvider.kind,
+				inventory: await api.getMcpInventory(newSessionProvider.kind),
+			};
+		},
+		enabled: connection === "open" && routeRemoteReadsEnabled && !selectedId,
+	});
+	const mcpInventoryProvider =
+		mcpInventoryQuery.data?.provider === newSessionProvider.kind
+			? mcpInventoryQuery.data.provider
+			: null;
+	const mcpInventory =
+		mcpInventoryProvider === newSessionProvider.kind
+			? mcpInventoryQuery.data?.inventory ?? null
+			: null;
+	const mcpInventoryIdentity = mcpInventory
+		? JSON.stringify({
+				provider: mcpInventoryProvider,
+				revision: mcpInventory.revision,
+			})
+		: null;
+	const mcpInventoryReady =
+		mcpInventoryProvider === newSessionProvider.kind &&
+		reconciledMcpInventoryIdentity === mcpInventoryIdentity &&
+		!mcpInventoryQuery.isFetching &&
+		!mcpInventoryQuery.error;
+	useEffect(() => {
+		if (!mcpInventory) return;
+		const next = reconcileMcpSelection(
+			previousMcpInventoryRef.current,
+			mcpInventory,
+			mcpSelectionRef.current,
+		);
+		previousMcpInventoryRef.current = mcpInventory;
+		mcpSelectionRef.current = next;
+		setMcpSelection(next);
+		setReconciledMcpInventoryIdentity(mcpInventoryIdentity);
+	}, [mcpInventory, mcpInventoryIdentity]);
+	const handleMcpSelectionChange = useCallback((selection: McpSelectionState) => {
+		mcpSelectionRef.current = selection;
+		setMcpSelection(selection);
+		setNewSessionSetupGeneration((generation) => generation + 1);
+	}, []);
+	const retryMcpInventory = useCallback(() => {
+		if (mcpInventoryQuery.isFetching) return;
+		try {
+			assertServerReadAllowed();
+		} catch (error) {
+			pushNotice("error", errorMessage(error));
+			return;
+		}
+		void mcpInventoryQuery.refetch();
+	}, [assertServerReadAllowed, mcpInventoryQuery.isFetching, mcpInventoryQuery.refetch, pushNotice]);
 	// A selected child keeps its direct parent's board visible so the child row
 	// can expose current navigation semantics. This intentionally follows only
 	// the canonical direct parent; it does not infer a root or traverse a graph.
@@ -2445,7 +2522,23 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (modelLocked) return;
 			const sessionId = selectedRef.current;
 			if (!sessionId) {
-				setNewSessionProvider(providerFromModelKey(modelKey, activeProvider));
+				const provider = providerFromModelKey(modelKey, activeProvider);
+				const providerChange = mcpSelectionForProviderChange(
+					mcpSelectionProviderRef.current,
+					provider.kind,
+					mcpSelectionRef.current,
+				);
+				if (mcpSelectionProviderRef.current !== provider.kind) {
+					mcpSelectionProviderRef.current = provider.kind;
+					previousMcpInventoryRef.current = null;
+					mcpSelectionRef.current = providerChange.selection;
+					setMcpSelection(providerChange.selection);
+					if (providerChange.reset) {
+						pushNotice("info", "MCP selection cleared because the provider changed");
+					}
+				}
+				setNewSessionProvider(provider);
+				setNewSessionSetupGeneration((generation) => generation + 1);
 				return;
 			}
 			assertServerMutationAllowed();
@@ -2456,7 +2549,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				"model",
 			);
 		},
-		[activeProvider, assertServerMutationAllowed, modelLocked, providerConfigurationController],
+		[
+			activeProvider,
+			assertServerMutationAllowed,
+			modelLocked,
+			providerConfigurationController,
+			pushNotice,
+		],
 	);
 
 	const changeReasoningEffort = useCallback(
@@ -2464,6 +2563,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const sessionId = selectedRef.current;
 			if (!sessionId) {
 				setNewSessionProvider(withReasoningEffort(activeProvider, effort));
+				setNewSessionSetupGeneration((generation) => generation + 1);
 				return;
 			}
 			assertServerMutationAllowed();
@@ -2600,6 +2700,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const createSession = useCallback(
 		(title?: string) => {
 			nextSessionTitleRef.current = title?.trim() || null;
+			mcpSelectionRef.current = new Map();
+			setMcpSelection(new Map());
 			selectSession(null);
 			composerHandleRef.current?.setValue("");
 			requestAnimationFrame(() => composerHandleRef.current?.focus());
@@ -2705,29 +2807,58 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const projectId = selectedProjectRef.current;
 			const title = nextSessionTitleRef.current || titleFromText(text);
 			nextSessionTitleRef.current = null;
-			const result = await api.startSession({
-				sessionId,
-				projectId,
-				provider: newSessionProvider,
-				metadata: {
-					title,
-					created_by: "web",
-					compaction: {
-						config: newSessionCompactionConfig(),
+			let result;
+			try {
+				result = await api.startSession({
+					sessionId,
+					projectId,
+					provider: newSessionProvider,
+					metadata: {
+						title,
+						created_by: "web",
+						compaction: {
+							config: newSessionCompactionConfig(),
+						},
 					},
-				},
-				clientInputId,
-				priority: "follow_up",
-				content: textContent(text),
-				workspaces: projectId ? startWorkspacesFromScope(workspaceScopeRef.current) : undefined,
-			});
-			await queryClient.invalidateQueries({
+					clientInputId,
+					priority: "follow_up",
+					content: textContent(text),
+					workspaces: projectId ? startWorkspacesFromScope(workspaceScopeRef.current) : undefined,
+					mcp: mcpSelectionPayloadForProvider(
+						newSessionProvider.kind,
+						mcpSelectionProviderRef.current,
+						mcpInventoryProvider,
+						mcpInventory,
+						mcpInventoryReady,
+						mcpSelectionRef.current,
+					),
+				});
+			} catch (error) {
+				if (errorMessage(error).startsWith("mcp_inventory_changed:")) {
+					await queryClient.refetchQueries({
+						queryKey: queryKeys.mcpInventory(newSessionProvider.kind),
+					});
+				}
+				throw error;
+			}
+			mcpSelectionRef.current = new Map();
+			setMcpSelection(new Map());
+			void queryClient.invalidateQueries({
 				queryKey: queryKeys.sessions(projectId),
 			});
 			openRootConversation(projectId, result.session_id);
 			return result.session_id;
 		},
-		[api, assertServerMutationAllowed, newSessionProvider, openRootConversation, queryClient],
+		[
+			api,
+			assertServerMutationAllowed,
+			mcpInventory,
+			mcpInventoryProvider,
+			mcpInventoryReady,
+			newSessionProvider,
+			openRootConversation,
+			queryClient,
+		],
 	);
 
 	const switchToTarget = useCallback(
@@ -3765,8 +3896,19 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					retrying={retryingConnection}
 					onRetry={retryConnection}
 				/>
-				{conversationVisible && !selectedId && selectedProject && workspaceScope.length ? (
-					<WorkspaceScopePicker scope={workspaceScope} onChange={handleWorkspaceScopeChange} disabled={sending} />
+				{conversationVisible && !selectedId ? (
+					<NewSessionSetup
+						workspaceScope={selectedProject ? workspaceScope : null}
+						onWorkspaceScopeChange={handleWorkspaceScopeChange}
+						mcpInventory={mcpInventory}
+						mcpSelection={mcpSelection}
+						onMcpSelectionChange={handleMcpSelectionChange}
+						mcpLoading={mcpInventoryQuery.isFetching}
+						mcpReady={mcpInventoryReady}
+						mcpError={mcpInventoryQuery.error ? errorMessage(mcpInventoryQuery.error) : null}
+						onRetryMcp={retryMcpInventory}
+						disabled={sending}
+					/>
 				) : null}
 				{conversationVisible ? (
 					<Composer
@@ -3781,6 +3923,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						queuedInputs={queuedInputs}
 						mutationBlockedReason={connectionRemoteActionBlockedReason}
 						cachedHistoryAvailable={cachedHistoryAvailable}
+						newSessionSetupGeneration={newSessionSetupGeneration}
 						onSubmit={submitComposer}
 						onStop={handleStop}
 						onPromoteQueued={handlePromoteQueued}

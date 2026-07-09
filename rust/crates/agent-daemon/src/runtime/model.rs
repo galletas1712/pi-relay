@@ -4,7 +4,10 @@ use agent_store::{ActionStatus, ActionUpdate};
 use agent_vocab::TurnId;
 use serde_json::{json, Value};
 
-use crate::provider_runtime::{run_model, schedule_session_title_refresh_for_model_turn};
+use crate::provider_runtime::{
+    build_model_request, provider_toolset_fingerprint, run_model,
+    schedule_session_title_refresh_for_model_turn,
+};
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError};
 
@@ -45,6 +48,7 @@ pub(super) async fn run_model_turn(
         &dispatch.config,
         turn_id,
         &model_context,
+        &dispatch.mcp_snapshot,
     );
 
     let result =
@@ -63,6 +67,7 @@ pub(super) async fn run_model_turn(
     {
         return Ok(());
     }
+
     let active = driver
         .active_session()
         .await
@@ -77,7 +82,8 @@ pub(super) async fn run_model_turn(
                 &dispatch,
                 action_id,
                 turn_id,
-                response,
+                response.response,
+                &response.toolset_fingerprint,
             )
             .await?
         }
@@ -155,6 +161,7 @@ pub(crate) async fn apply_model_response(
     action_id: agent_vocab::ActionId,
     turn_id: TurnId,
     response: agent_provider::ModelResponse,
+    toolset_fingerprint: &str,
 ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
     if response.usage.is_some()
         && matches!(
@@ -182,6 +189,8 @@ pub(crate) async fn apply_model_response(
         status: action_status,
         result: json!({
             "source": "provider",
+            "mcp_manifest_fingerprint": dispatch.mcp_snapshot.manifest_fingerprint(),
+            "toolset_fingerprint": toolset_fingerprint,
             "usage": response.usage,
             "stop_reason": stop_reason,
             "stop_details": response.stop_details,
@@ -277,11 +286,19 @@ async fn run_model_for_action_with_retries(
     dispatch: &DispatchAction,
     turn_id: TurnId,
     model_context: ModelContext,
-) -> std::result::Result<
-    std::result::Result<agent_provider::ModelResponse, ModelProviderFailure>,
-    RpcError,
-> {
+) -> std::result::Result<std::result::Result<CompletedModelResponse, ModelProviderFailure>, RpcError>
+{
     let max_attempts = model_provider_max_attempts_for_test(&dispatch.config);
+    let request = build_model_request(
+        state,
+        &dispatch.config,
+        session_id,
+        Some(turn_id),
+        model_context,
+        &dispatch.mcp_snapshot,
+    )
+    .await?;
+    let toolset_fingerprint = provider_toolset_fingerprint(&request.tools);
     for attempt in 1..=max_attempts {
         if attempt > 1
             && !state
@@ -299,16 +316,14 @@ async fn run_model_for_action_with_retries(
                 "action attempt is no longer running",
             ));
         }
-        let result = run_model(
-            state,
-            &dispatch.config,
-            session_id,
-            turn_id,
-            model_context.clone(),
-        )
-        .await;
+        let result = run_model(state, &dispatch.config, session_id, request.clone()).await;
         match result {
-            Ok(response) => return Ok(Ok(response)),
+            Ok(response) => {
+                return Ok(Ok(CompletedModelResponse {
+                    response,
+                    toolset_fingerprint,
+                }))
+            }
             Err(error) => {
                 let provider_error = match error.downcast::<agent_provider::ProviderError>() {
                     Ok(error) => error,
@@ -346,6 +361,11 @@ async fn run_model_for_action_with_retries(
     }
 
     unreachable!("retry loop either returns provider result or stale action")
+}
+
+struct CompletedModelResponse {
+    response: agent_provider::ModelResponse,
+    toolset_fingerprint: String,
 }
 
 struct ModelProviderFailure {

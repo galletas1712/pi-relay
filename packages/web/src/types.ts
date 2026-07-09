@@ -341,8 +341,44 @@ export interface ToolDefinition {
 	input_schema: unknown;
 }
 
-export interface ToolListing extends ToolDefinition {
+export interface LocalToolListing extends ToolDefinition {
 	kind: "local_tool" | "hosted_tool";
+}
+
+export interface McpToolListing extends ToolDefinition {
+	kind: "mcp_tool";
+	server: string;
+	raw_name: string;
+	manifest_fingerprint: string;
+	contract_fingerprint: string;
+	health: McpHealth;
+}
+
+export type ToolListing = LocalToolListing | McpToolListing;
+
+export type McpHealth = "healthy" | "unavailable" | "revoked";
+
+export interface McpInventoryTool {
+	raw_name: string;
+	description: string;
+	context_token_estimate: number;
+}
+
+export interface McpInventoryServer {
+	server: string;
+	revision: string;
+	health: McpHealth;
+	tools: McpInventoryTool[];
+}
+
+export interface McpInventory {
+	revision: string;
+	servers: McpInventoryServer[];
+}
+
+export interface StartSessionMcpSelection {
+	inventoryRevision: string;
+	servers: { server: string; tools: string[] }[];
 }
 
 export type NoticeTone = "info" | "success" | "error";

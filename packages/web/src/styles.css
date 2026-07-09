@@ -100,6 +100,13 @@
 	margin: 7px 10px 0;
 }
 
+.mcp-picker-toggle:disabled,
+.mcp-picker-expand:disabled,
+.workspace-scope-toggle:disabled {
+	cursor: default;
+	opacity: 0.5;
+}
+
 .project-dialog {
 	width: min(760px, calc(100vw - 48px));
 }
@@ -870,7 +877,20 @@ pre {
 	overflow: hidden;
 }
 
-.workspace-route-warning {
+.workspace-conversation-notices {
+	flex: 0 0 auto;
+	border-bottom: 1px solid var(--border);
+	background: var(--background);
+}
+
+.workspace-scope-help {
+	margin: 0;
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+}
+
+.workspace-route-warning,
+.workspace-recipient-label {
 	display: flex;
 	flex-wrap: wrap;
 	align-items: center;
@@ -2748,9 +2768,13 @@ pre {
 	font-weight: 500;
 }
 
-.workspace-scope {
-	max-width: 920px;
+.new-session-setup {
+	width: min(920px, 100%);
 	margin: 0 auto 8px;
+}
+
+.workspace-scope + .mcp-picker {
+	margin-top: 4px;
 }
 
 .workspace-scope-toggle {
@@ -2777,6 +2801,9 @@ pre {
 .workspace-scope-list {
 	display: flex;
 	flex-direction: column;
+	max-height: min(40dvh, 420px);
+	overflow-y: auto;
+	overscroll-behavior: contain;
 	gap: 6px;
 	margin-top: 6px;
 	padding: 8px;
@@ -2825,6 +2852,173 @@ pre {
 
 .workspace-scope-branch:disabled {
 	opacity: 0.5;
+}
+
+.mcp-picker {
+	width: 100%;
+}
+
+.mcp-picker-toggle,
+.mcp-picker-expand {
+	display: inline-flex;
+	align-items: center;
+	border: 0;
+	background: transparent;
+	color: var(--muted-foreground);
+	cursor: pointer;
+}
+
+.mcp-picker-toggle {
+	gap: 6px;
+	padding: 2px 0;
+	font-size: var(--text-sm);
+}
+
+.mcp-picker-toggle:hover,
+.mcp-picker-expand:hover {
+	color: var(--foreground);
+}
+
+.mcp-picker-count,
+.mcp-picker-meta {
+	color: var(--muted-foreground);
+	font-variant-numeric: tabular-nums;
+}
+
+.mcp-picker-warning {
+	margin: 5px 0 0 20px;
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+	line-height: 1.35;
+}
+
+.mcp-picker-list {
+	display: flex;
+	flex-direction: column;
+	max-height: min(40dvh, 420px);
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	gap: 6px;
+	margin-top: 6px;
+	padding: 8px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--background);
+}
+
+.mcp-picker-server {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.mcp-picker-server-row {
+	display: grid;
+	grid-template-columns: 24px minmax(0, 1fr) auto auto;
+	align-items: center;
+	gap: 8px;
+	font-size: var(--text-sm);
+}
+
+.mcp-picker-expand {
+	justify-content: center;
+	padding: 3px;
+}
+
+.mcp-picker-server-name,
+.mcp-picker-tool {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+}
+
+.mcp-picker-server-name span,
+.mcp-picker-tool span {
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.mcp-picker-health {
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+}
+
+.mcp-picker-health.unavailable,
+.mcp-picker-health.revoked {
+	color: var(--destructive);
+}
+
+.mcp-picker-tools {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	margin-left: 32px;
+	padding-left: 8px;
+	border-left: 1px solid var(--border);
+}
+
+.mcp-picker-tool {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr) auto;
+	padding: 3px 0;
+	font-size: var(--text-sm);
+}
+
+.mcp-picker-tool span {
+	display: flex;
+	flex-direction: column;
+}
+
+.mcp-picker-tool strong {
+	font-weight: 500;
+}
+
+.mcp-picker-tool small {
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+}
+
+.new-session-setup-status,
+.new-session-setup-error {
+	margin: 0;
+	color: var(--muted-foreground);
+	font-size: var(--text-sm);
+}
+
+.new-session-setup-error {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.new-session-setup-error button {
+	border: 0;
+	background: transparent;
+	color: var(--foreground);
+	font: inherit;
+	text-decoration: underline;
+	cursor: pointer;
+}
+
+.new-session-setup-error button:disabled {
+	cursor: default;
+	opacity: 0.5;
+}
+
+@media (max-width: 640px) {
+	.workspace-scope-list,
+	.mcp-picker-list {
+		max-height: min(32dvh, 280px);
+	}
+
+	.mcp-picker-server-row {
+		grid-template-columns: 24px minmax(0, 1fr) auto;
+	}
+
+	.mcp-picker-meta {
+		grid-column: 2 / -1;
+	}
 }
 
 .chat-dock {

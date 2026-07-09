@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use agent_mcp::McpSessionSnapshot;
 use agent_provider::ModelTranscriptEntry;
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
@@ -38,6 +39,7 @@ struct PendingTitleRefresh {
     generation: u64,
     config: SessionConfig,
     model_context: ModelContext,
+    mcp_snapshot: McpSessionSnapshot,
     title_at_submit: Option<String>,
     prompt: &'static str,
 }
@@ -48,6 +50,7 @@ pub(crate) fn schedule_session_title_refresh_for_model_turn(
     config: &SessionConfig,
     turn_id: TurnId,
     model_context: &ModelContext,
+    mcp_snapshot: &McpSessionSnapshot,
 ) {
     if session_title_disabled(config) {
         return;
@@ -61,6 +64,7 @@ pub(crate) fn schedule_session_title_refresh_for_model_turn(
     let session_id = session_id.into();
     let config = config.clone();
     let model_context = model_context.clone();
+    let mcp_snapshot = mcp_snapshot.clone();
     let should_spawn = {
         let mut pending = state
             .session_titles
@@ -77,6 +81,7 @@ pub(crate) fn schedule_session_title_refresh_for_model_turn(
                 generation,
                 config,
                 model_context,
+                mcp_snapshot,
                 title_at_submit,
                 prompt,
             },
@@ -186,6 +191,7 @@ async fn generate_session_title(
         session_id,
         None,
         request.model_context.clone(),
+        &request.mcp_snapshot,
     )
     .await?;
     let cache_prefix_len = model_request.transcript.len();

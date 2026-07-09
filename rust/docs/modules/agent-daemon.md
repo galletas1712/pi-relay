@@ -22,7 +22,8 @@ The daemon is split by responsibility, not by RPC method family (see [Daemon Mod
 ```
 main.rs            websocket accept + JSON-RPC routing + most RPC handlers
 session_start.rs   explicit session-start pipeline: workspace materialization,
-                   prompt render, atomic session/output persist, initial dispatch
+                   MCP selection validation, prompt render, atomic
+                   session/manifest/output persist, initial dispatch
 config.rs          --database-url / --bind, DATABASE_URL / PI_AGENTD_BIND
 types.rs           RpcRequest/Response/Error, RpcMethod parse table, DispatchAction, RuntimeSession
 state.rs           AppState: repo handle, active sessions, driver locks, task registry,

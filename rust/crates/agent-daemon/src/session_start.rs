@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_mcp::McpSessionSelection;
 use agent_session::AgentSession;
 use agent_store::{
-    InputPriority, QueuedInputContent, SessionActivity, SessionConfig, SubagentType,
+    InputPriority, McpSessionManifestBinding, QueuedInputContent, SessionActivity, SessionConfig,
+    SubagentType,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
@@ -12,7 +14,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::codec::{from_params, parse_user_message};
-use crate::provider_runtime::render_pi_prompt;
+use crate::provider_runtime::{first_party_toolsets, render_pi_prompt, PromptProfile};
 use crate::runtime::{
     agent_input_from_queued_priority, attach_dispatch_config, collect_runtime_outputs,
     publish_events, SessionDriver,
@@ -48,6 +50,28 @@ pub(crate) async fn session_start(
         }));
     }
 
+    let mcp_manifest = if let Some(selection) = params
+        .mcp
+        .as_ref()
+        .filter(|selection| !selection.servers.is_empty())
+    {
+        let snapshot = state
+            .mcp
+            .select(
+                selection,
+                &first_party_toolsets(state, PromptProfile::Parent),
+            )
+            .await
+            .map_err(RpcError::from)?;
+        Some(McpSessionManifestBinding {
+            manifest_fingerprint: snapshot.manifest_fingerprint().to_string(),
+            manifest: serde_json::to_value(snapshot.manifest())
+                .map_err(anyhow::Error::from)
+                .map_err(RpcError::from)?,
+        })
+    } else {
+        None
+    };
     let (outer_cwd, workspaces) = if let Some(project_id) = project_id {
         let project = state.repo.get_project(project_id).await?;
         let selection = WorkspaceSelection::from_requested(
@@ -75,6 +99,7 @@ pub(crate) async fn session_start(
         system_prompt: String::new(),
         provider: params.provider,
         metadata: parent_session_metadata(params.metadata.unwrap_or_else(|| json!({}))),
+        mcp_manifest,
     };
     config.system_prompt = render_pi_prompt(state, &config)?;
 
@@ -258,6 +283,7 @@ struct StartSessionParams {
     client_input_id: Option<String>,
     priority: Option<InputPriority>,
     content: Value,
+    mcp: Option<McpSessionSelection>,
     /// Optional subset of the project's workspaces to materialize for this session,
     /// each with an optional per-session git branch override. Omit to materialize
     /// every project workspace at its default branch. Ignored for ephemeral sessions.

@@ -125,6 +125,29 @@ create table if not exists actions (
 create index if not exists actions_session_status_idx
     on actions(session_id, status);
 
+create table if not exists mcp_session_manifests (
+    fingerprint text primary key,
+    manifest jsonb not null,
+    created_at timestamptz not null default now(),
+    last_used_at timestamptz not null default now()
+);
+
+alter table sessions
+    add column if not exists mcp_manifest_fingerprint text null
+        references mcp_session_manifests(fingerprint);
+
+create index if not exists sessions_mcp_manifest_idx
+    on sessions(mcp_manifest_fingerprint)
+    where mcp_manifest_fingerprint is not null;
+
+-- Remove the unshipped turn-scoped MCP prototype if this feature branch was
+-- run against a development database.
+drop table if exists mcp_legacy_zero_turns;
+drop table if exists mcp_turn_bindings;
+alter table actions drop column if exists mcp_manifest_fingerprint;
+alter table actions drop column if exists toolset_fingerprint;
+drop table if exists mcp_catalog_manifests;
+
 create table if not exists events (
     id bigserial primary key,
     session_id text not null references sessions(id) on delete cascade,

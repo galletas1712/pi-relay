@@ -496,7 +496,13 @@ the normal frontend path for a brand-new draft.
   "priority": "follow_up",
   "content": [
     { "type": "text", "text": "Hello" }
-  ]
+  ],
+  "mcp": {
+    "inventory_revision": "sha256...",
+    "servers": [
+      { "server": "workspace", "tools": ["read_file", "search"] }
+    ]
+  }
 }
 ```
 
@@ -530,8 +536,25 @@ workspace. Selected workspaces are materialized in the project's declared order
 regardless of request order. The field is ignored for ephemeral sessions.
 
 The daemon writes `session.created`, `input.accepted`, transcript entries,
-actions, and events in the same session-start transition before dispatching
-provider/tool work. For project sessions it snapshots the project's current
+actions, the optional content-addressed MCP-only manifest reference, and events
+in the same session-start transition before dispatching provider/tool work.
+Omitting `mcp` (or sending an empty `servers` list) explicitly creates an
+MCP-free session. A nonempty selection contains sorted raw server/tool
+identities only; it never contains schemas, server configuration, commands,
+environment values, or credentials. The daemon validates the semantic
+`inventory_revision`, the complete selected server catalogs, and all raw names
+before inserting the session. It returns `mcp_inventory_changed` for a stale
+revision, `mcp_selection_invalid` for unknown/duplicate/disallowed identities,
+and `mcp_unavailable` when a selected server cannot be validated. The client
+must refresh/reconcile and must not silently select newly published tools.
+
+The selected MCP manifest is frozen for the whole durable session. Later
+configuration refreshes, reconnects, and `tools/list_changed` notifications
+affect only New Session inventory. A retry with the same stable `session_id`
+returns the existing session before consulting current inventory and cannot
+replace its binding.
+
+For project sessions the daemon snapshots the project's current
 `workspaces` into the new session row and assigns a per-session `outer_cwd`;
 later `project.update` calls do not change existing sessions. Retrying the same stable
 `session_id` returns the
@@ -1669,7 +1692,34 @@ later/running; use the per-subagent `task_prompt.md`, `final_message.md`, and
 notifications are de-duplicated per completed terminal child state, not for the
 child session lifetime.
 
-## Tools
+## MCP inventory and tools
+
+### `mcp.inventory`
+
+Requires `provider: "openai" | "claude"` and returns the bounded configured
+New Session inventory:
+
+```json
+{
+  "revision": "sha256...",
+  "servers": [{
+    "server": "workspace",
+    "revision": "sha256...",
+    "health": "healthy",
+    "tools": [{
+      "raw_name": "read_file",
+      "description": "Read a file",
+      "context_token_estimate": 94
+    }]
+  }]
+}
+```
+
+The inventory and per-server revisions are semantic hashes; health is excluded.
+`context_token_estimate` is computed from that provider's exact declaration
+JSON and estimates additional MCP declaration context only, not total model
+context. The frontend has a distinct provider-keyed inventory cache; inventory
+refreshes never overwrite an existing session's tool inspector.
 
 ### `tools.list`
 
@@ -1686,6 +1736,19 @@ surface without delegation tools. `prompt_profile` may be supplied only as a
 fallback when no `session_id` is available. There are no `read`/`write` tools.
 Each returned entry carries `name`, `description`, `input_schema`,
 `canonical_name`, `prompt_alias`, `execution`, and `kind: "local_tool"`.
+
+With a `session_id`, the response also includes only that session's frozen MCP
+tools. These entries use `kind: "mcp_tool"` and add observational `source`, raw
+`server`/`raw_name`, `manifest_fingerprint`, `contract_fingerprint`, and
+`health` fields. Without `session_id`, `tools.list` is first-party-only;
+`mcp.inventory` exclusively owns New Session discovery. Health is not part of
+provider declarations or the persisted prompt. Exact provider declarations,
+not this inspector response or PI.md prose, determine what a model may call.
+
+Full and read-only delegation children inherit the parent's exact MCP manifest;
+only parent-specific first-party delegation tools are filtered from child
+profiles. Read-only status constrains the child's local filesystem view, not
+remote MCP side effects.
 
 No other tool RPC exists. Tool requests are automatic. A tool-level failure,
 such as a missing file, missing edit target, malformed args, non-zero bash exit,

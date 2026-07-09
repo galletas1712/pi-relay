@@ -1,3 +1,4 @@
+use agent_mcp::McpSessionSnapshot;
 use agent_provider::{ModelRequest, ModelResponse, ProviderToolProfile};
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
@@ -24,15 +25,12 @@ pub(crate) async fn run_model(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
-    turn_id: TurnId,
-    model_context: ModelContext,
+    request: ModelRequest,
 ) -> Result<ModelResponse> {
     #[cfg(test)]
     if let Some(result) = injected_model_result(config, session_id) {
         return result;
     }
-    let request =
-        build_model_request(state, config, session_id, Some(turn_id), model_context).await?;
     complete_model_request(state, config, session_id, request).await
 }
 
@@ -68,17 +66,33 @@ fn injected_model_result(
             stop_reason: ModelStopReason::Complete,
             stop_details: None,
         }),
+        "tool_once" if attempt > 1 => Ok(ModelResponse {
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::Text("injected completion".to_string())],
+            },
+            provider_replay: Vec::new(),
+            usage: None,
+            stop_reason: ModelStopReason::Complete,
+            stop_details: None,
+        }),
         "retry_once_then_complete" => Err(ProviderError::Status {
             status: 503,
             message: "injected retryable provider failure".to_string(),
         }
         .into()),
-        "tool" => Ok(ModelResponse {
+        "tool" | "tool_once" => Ok(ModelResponse {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::ToolCall(ToolCall {
                     id: ToolCallId::from_u64(1),
                     tool_name: "Bash".to_string(),
-                    args_json: r#"{"command":"true"}"#.to_string(),
+                    args_json: serde_json::json!({
+                        "command": config
+                            .metadata
+                            .pointer("/fault_injection/tool_command")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("true"),
+                    })
+                    .to_string(),
                 })],
             },
             provider_replay: Vec::new(),
@@ -157,19 +171,22 @@ pub(crate) async fn build_model_request(
     session_id: &str,
     turn_id: Option<TurnId>,
     model_context: ModelContext,
+    snapshot: &McpSessionSnapshot,
 ) -> Result<ModelRequest> {
     let prompt = assemble_agent_prompt(state, config, session_id).await?;
+    let mut tools = provider_tools_for_session(
+        state,
+        config.provider.kind,
+        effective_prompt_profile(state, config, session_id).await?,
+    );
+    tools.extend(snapshot.provider_tools(config.provider.kind));
     Ok(ModelRequest {
         model: config.provider.model.clone(),
         transcript_cache_prefix_len: None,
         prompt,
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: provider_tools_for_session(
-            state,
-            config.provider.kind,
-            effective_prompt_profile(state, config, session_id).await?,
-        ),
+        tools,
         // Provider adapters apply authoritative discovered/static output
         // ceilings. Do not pre-clamp here or stale daemon metadata could
         // override a newer Models API result.

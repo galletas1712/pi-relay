@@ -30,13 +30,11 @@ text_enum! {
         Consumed => "consumed",
         Cancelled => "cancelled",
     }
-
     pub enum ActionKind {
         Model => "model",
         Tool => "tool",
         Compaction => "compaction",
     }
-
     pub enum ActionStatus {
         Pending => "pending",
         Blocked => "blocked",
@@ -114,6 +112,12 @@ text_enum! {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpSessionManifestBinding {
+    pub manifest_fingerprint: String,
+    pub manifest: Value,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub project_id: Option<Uuid>,
@@ -122,6 +126,9 @@ pub struct SessionConfig {
     pub system_prompt: String,
     pub provider: ProviderConfig,
     pub metadata: Value,
+    /// Opaque MCP-only content-addressed manifest. `None` is explicitly
+    /// MCP-free and never means "resolve the current inventory".
+    pub mcp_manifest: Option<McpSessionManifestBinding>,
 }
 
 /// Complete provider request-shaping state captured for accepted or recoverable work.

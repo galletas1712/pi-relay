@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use agent_prompt::{
-    load_pi_compaction_md, load_pi_md, render_prompt, PromptContext, PromptProfile,
-    PromptWorkspace, PromptWorkspaceKind, Skill, SubagentRole, ToolSpec,
+    load_pi_compaction_md, load_pi_md, render_prompt, PromptContext, PromptMcpServer,
+    PromptProfile, PromptWorkspace, PromptWorkspaceKind, Skill, SubagentRole, ToolSpec,
 };
 use agent_store::{SessionConfig, SessionWorkspace, WorkspaceKind};
 use agent_tools::ProviderTool;
@@ -24,7 +24,7 @@ pub(super) async fn assemble_agent_prompt(
 
 pub(crate) fn render_pi_prompt(state: &AppState, config: &SessionConfig) -> anyhow::Result<String> {
     let template = load_pi_md(&state.prompt_root)?;
-    Ok(render_prompt(&template, &prompt_context(state, config)))
+    Ok(render_prompt(&template, &prompt_context(state, config)?))
 }
 
 pub(crate) fn current_pi_template(state: &AppState) -> anyhow::Result<String> {
@@ -36,12 +36,27 @@ pub(super) fn render_pi_compaction_prompt(
     config: &SessionConfig,
 ) -> anyhow::Result<String> {
     let template = load_pi_compaction_md(&state.prompt_root)?;
-    Ok(render_prompt(&template, &prompt_context(state, config)))
+    Ok(render_prompt(&template, &prompt_context(state, config)?))
 }
 
-pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> PromptContext {
+pub(super) fn prompt_context(
+    state: &AppState,
+    config: &SessionConfig,
+) -> anyhow::Result<PromptContext> {
     let profile = prompt_profile(config);
-    PromptContext {
+    let snapshot = crate::provider_runtime::mcp_snapshot_for_session(config)?;
+    let mut servers = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for tool in &snapshot.manifest().tools {
+        servers
+            .entry(tool.server_id.clone())
+            .or_default()
+            .push(tool.exposed_name.clone());
+    }
+    let mcp_servers = servers
+        .into_iter()
+        .map(|(server, tools)| PromptMcpServer { server, tools })
+        .collect();
+    Ok(PromptContext {
         profile,
         cwd: PathBuf::from(&config.outer_cwd),
         has_project: config.project_id.is_some(),
@@ -64,7 +79,8 @@ pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> Prompt
         tools: tool_specs(state, config.provider.kind, profile),
         skills: load_prompt_skills(&state.prompt_root, config, profile),
         subagent_roles: load_packaged_subagent_role_catalog(&state.prompt_root),
-    }
+        mcp_servers,
+    })
 }
 
 pub(crate) fn prompt_profile(config: &SessionConfig) -> PromptProfile {
@@ -524,6 +540,7 @@ mod tests {
                 prompt_cache: None,
             },
             metadata: serde_json::Value::Null,
+            mcp_manifest: None,
         };
 
         let skills = load_prompt_skills(&prompt_root, &config, PromptProfile::Parent);
@@ -559,8 +576,8 @@ mod tests {
             .map(|tool| tool.canonical_name)
             .collect::<Vec<_>>();
         let parent_provider_names = parent_provider_tools
-            .into_iter()
-            .map(|tool| tool.canonical_name)
+            .iter()
+            .map(|tool| tool.canonical_name.clone())
             .collect::<Vec<_>>();
         assert_eq!(parent_spec_names, parent_provider_names);
         assert!(parent_spec_names.contains(&"delegate_writing_task".to_string()));
@@ -577,8 +594,8 @@ mod tests {
             .map(|tool| tool.canonical_name)
             .collect::<Vec<_>>();
         let subagent_provider_names = subagent_provider_tools
-            .into_iter()
-            .map(|tool| tool.canonical_name)
+            .iter()
+            .map(|tool| tool.canonical_name.clone())
             .collect::<Vec<_>>();
         assert_eq!(subagent_spec_names, subagent_provider_names);
         assert!(subagent_spec_names.contains(&"LoadSkill".to_string()));
@@ -588,6 +605,11 @@ mod tests {
         assert!(!subagent_spec_names.contains(&"cancel_delegation".to_string()));
         assert!(!subagent_spec_names.contains(&"steer_subagent".to_string()));
         assert!(!subagent_spec_names.contains(&"interrupt_subagent".to_string()));
+        assert_ne!(
+            crate::provider_runtime::provider_toolset_fingerprint(&parent_provider_tools),
+            crate::provider_runtime::provider_toolset_fingerprint(&subagent_provider_tools),
+            "parent usage anchors must not be reused by a child with a different first-party profile"
+        );
     }
 
     #[test]
@@ -608,6 +630,7 @@ mod tests {
                 "prompt_profile": "parent",
                 "subagent": true,
             }),
+            mcp_manifest: None,
         };
 
         assert_eq!(prompt_profile(&config), PromptProfile::Subagent);

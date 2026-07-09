@@ -16,6 +16,7 @@ type ComposerSubmitShortcutEvent = Pick<KeyboardEvent<HTMLTextAreaElement>, "ctr
 export type PendingSubmittedDraft = {
 	value: string;
 	version: number;
+	newSessionSetupGeneration: number;
 	clientControlId: string;
 	newSessionId: string;
 };
@@ -48,9 +49,13 @@ export function isComposerSubmitShortcut(event: ComposerSubmitShortcutEvent): bo
 export function submissionIdsForDraft(
 	pending: PendingSubmittedDraft | undefined,
 	text: string,
+	newSessionSetupGeneration: number,
 	createId: (prefix: string) => string = randomId,
 ): Pick<PendingSubmittedDraft, "clientControlId" | "newSessionId"> {
-	if (pending?.value === text) {
+	if (
+		pending?.value === text &&
+		pending.newSessionSetupGeneration === newSessionSetupGeneration
+	) {
 		return {
 			clientControlId: pending.clientControlId,
 			newSessionId: pending.newSessionId,
@@ -83,6 +88,7 @@ export const Composer = memo(function Composer({
 	queuedInputs,
 	mutationBlockedReason,
 	cachedHistoryAvailable = false,
+	newSessionSetupGeneration = 0,
 	onSubmit,
 	onStop,
 	onPromoteQueued,
@@ -99,6 +105,7 @@ export const Composer = memo(function Composer({
 	queuedInputs: QueuedInput[];
 	mutationBlockedReason?: string | null;
 	cachedHistoryAvailable?: boolean;
+	newSessionSetupGeneration?: number;
 	onSubmit: (submission: ComposerSubmission) => Promise<boolean> | boolean;
 	onStop: () => void;
 	onPromoteQueued: (inputId: string) => void;
@@ -263,11 +270,18 @@ export const Composer = memo(function Composer({
 		const submittedSessionId = selectedIdRef.current;
 		const key = composerDraftKey(submittedSessionId);
 		const previous = pendingSubmittedDraftsRef.current.get(key);
-		const { clientControlId, newSessionId } = submissionIdsForDraft(previous, text);
+		const submittedSetupGeneration =
+			submittedSessionId === null ? newSessionSetupGeneration : 0;
+		const { clientControlId, newSessionId } = submissionIdsForDraft(
+			previous,
+			text,
+			submittedSetupGeneration,
+		);
 		const submittedVersion = storeDraft(submittedSessionId, text);
 		pendingSubmittedDraftsRef.current.set(key, {
 			value: text,
 			version: submittedVersion,
+			newSessionSetupGeneration: submittedSetupGeneration,
 			clientControlId,
 			newSessionId,
 		});
@@ -289,7 +303,7 @@ export const Composer = memo(function Composer({
 		} else {
 			restoreSubmittedDraft(submittedSessionId, text, submittedVersion);
 		}
-	}, [cachedHistoryAvailable, clearSubmittedDraft, mutationBlockedReason, onSubmit, restoreSubmittedDraft, sending, storeDraft]);
+	}, [cachedHistoryAvailable, clearSubmittedDraft, mutationBlockedReason, newSessionSetupGeneration, onSubmit, restoreSubmittedDraft, sending, storeDraft]);
 
 	const onKeyDown = useCallback(
 		(event: KeyboardEvent<HTMLTextAreaElement>) => {
