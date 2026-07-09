@@ -295,7 +295,7 @@ pre {
 	gap: 6px;
 }
 
-.mobile-topbar-title-main > span:last-child {
+.mobile-topbar-title-text {
 	min-width: 0;
 	max-width: 100%;
 	overflow: hidden;
@@ -313,17 +313,8 @@ pre {
 	height: 20px;
 }
 
-.mobile-topbar-status {
-	display: flex;
-	flex-wrap: wrap;
-	justify-content: center;
-	align-items: center;
-	gap: 4px;
-	max-width: 100%;
-}
-
-.mobile-topbar-status .parent-session-link {
-	height: 22px;
+.mobile-topbar-title-main .parent-session-link {
+	height: 24px;
 	padding: 0 6px;
 	font-size: var(--text-2xs);
 }
@@ -880,14 +871,7 @@ pre {
 	overflow: hidden;
 }
 
-.workspace-conversation-notices {
-	flex: 0 0 auto;
-	border-bottom: 1px solid var(--border);
-	background: var(--background);
-}
-
-.workspace-route-warning,
-.workspace-recipient-label {
+.workspace-route-warning {
 	display: flex;
 	flex-wrap: wrap;
 	align-items: center;
@@ -900,22 +884,6 @@ pre {
 	border-bottom: 1px solid color-mix(in oklch, var(--warning) 30%, var(--border));
 	background: color-mix(in oklch, var(--warning) 8%, var(--background));
 	color: var(--warning);
-}
-
-.workspace-recipient-label {
-	color: var(--muted-foreground);
-}
-
-.workspace-recipient-label strong {
-	color: var(--foreground);
-}
-
-.workspace-recipient-label code {
-	overflow: hidden;
-	max-width: min(42ch, 100%);
-	color: var(--muted-foreground);
-	text-overflow: ellipsis;
-	white-space: nowrap;
 }
 
 .workspace-route-state {
