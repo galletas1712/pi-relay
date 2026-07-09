@@ -102,6 +102,7 @@ import {
 	withReasoningEffort,
 } from "./sessionDefaults.ts";
 import {
+	IntermediateUiStateError,
 	isSelectedSessionFetchError,
 	SelectedSessionFetchCoordinator,
 	shouldReportActionError,
@@ -541,13 +542,16 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const assertServerReadAllowed = useCallback(() => {
 		assertRemoteActionAllowed(remoteActionBlockedReason(connectionRef.current));
 		if (!routeRemoteReadsEnabledRef.current) {
-			throw new Error("Conversation is still loading.");
+			throw new IntermediateUiStateError("Conversation is still loading.");
 		}
 	}, []);
 
 	const pushNotice = useCallback((tone: Notice["tone"], text: string, persistent = false) => {
 		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_NOTICES + 1)), { id: randomId("notice"), tone, text, persistent }]);
 	}, []);
+	const reportActionError = useCallback((error: unknown) => {
+		if (shouldReportActionError(error)) pushNotice("error", errorMessage(error));
+	}, [pushNotice]);
 	const dismissNotice = useCallback((noticeId: string) => {
 		setNotices((current) => current.filter((notice) => notice.id !== noticeId));
 	}, []);
@@ -654,11 +658,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		try {
 			assertServerReadAllowed();
 		} catch (error) {
-			pushNotice("error", errorMessage(error));
+			reportActionError(error);
 			return;
 		}
 		void sessionListCoordinator.retry(selectedProjectId, sessionsQuery.refetch);
-	}, [assertServerReadAllowed, pushNotice, selectedProjectId, sessionListCoordinator, sessionsQuery.refetch]);
+	}, [assertServerReadAllowed, reportActionError, selectedProjectId, sessionListCoordinator, sessionsQuery.refetch]);
 	const backgroundSessionsQueries = useQueries({
 		queries: backgroundSessionProjectIds.map((projectId) => ({
 			queryKey: queryKeys.sessions(projectId),
@@ -940,7 +944,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		try {
 			assertServerReadAllowed();
 		} catch (error) {
-			pushNotice("error", errorMessage(error));
+			reportActionError(error);
 			return;
 		}
 		const refetch = showAllDelegations
@@ -955,7 +959,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		defaultDelegationsQuery.refetch,
 		delegationListRetryScope,
 		expandedDelegationsQuery.refetch,
-		pushNotice,
+		reportActionError,
 		showAllDelegations,
 	]);
 	const delegations = displayedDelegationsQuery.data?.delegations ?? [];
@@ -1672,13 +1676,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				replaceSelectedCache(completion.cache);
 				return resultFor(completion.status, completion.turnPageHydrationRevision);
 			} catch (error) {
-				if (selectedRef.current === sessionId) pushNotice("error", errorMessage(error));
+				if (selectedRef.current === sessionId) reportActionError(error);
 				return resultFor("failed");
 			} finally {
 				setLoadingOlderTurns(false);
 			}
 		},
-		[api, assertServerReadAllowed, loadingOlderTurns, pushNotice, replaceSelectedCache],
+		[api, assertServerReadAllowed, loadingOlderTurns, replaceSelectedCache, reportActionError],
 	);
 
 	const getFreshSession = useCallback(
@@ -1836,11 +1840,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		try {
 			assertServerReadAllowed();
 		} catch (error) {
-			pushNotice("error", errorMessage(error));
+			reportActionError(error);
 			return;
 		}
 		void refreshSelectedSessionState(sessionId).catch(() => undefined);
-	}, [assertServerReadAllowed, pushNotice, refreshSelectedSessionState]);
+	}, [assertServerReadAllowed, refreshSelectedSessionState, reportActionError]);
 
 	const loadTurnDetail = useCallback(
 		async (cardId: string, options: { mode: "manual" | "auto" }) => {
@@ -1908,13 +1912,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					});
 				}
 			} catch (error) {
-				if (selectedRef.current === sessionId) pushNotice("error", errorMessage(error));
+				if (selectedRef.current === sessionId) reportActionError(error);
 			} finally {
 				if (options.mode === "manual") setLoadingTurnId((current) => (current === cardId ? null : current));
 				else setAutoLoadingTurnId((current) => (current === cardId ? null : current));
 			}
 		},
-		[api, assertServerReadAllowed, pushNotice, updateSelectedCache],
+		[api, assertServerReadAllowed, reportActionError, updateSelectedCache],
 	);
 	const expandTurn = useCallback(
 		(cardId: string) => {
@@ -2130,11 +2134,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				if (event.event === "compaction.requested") pushNotice("info", compactionRequestedNotice(event.data));
 				if (event.event === "compaction.completed") pushNotice("success", compactionCompletedNotice(event.data));
 				if (event.event === "compaction.error") pushNotice("error", compactionErrorNotice(event.data));
-				if (event.event === "subagent.running") pushNotice("info", subagentRunningNotice(event.data));
 				if (event.event === "subagent.idle") {
 					const outcome = typeof event.data.outcome === "string" ? event.data.outcome : null;
-					const level = outcome === "Crashed" ? "error" : outcome === "Interrupted" ? "info" : "success";
-					pushNotice(level, subagentIdleNotice(event.data));
+					if (outcome === "Crashed") pushNotice("error", subagentFailureNotice(event.data));
 				}
 				if (event.event === "turn.finished") {
 					const outcome = typeof event.data.outcome === "string" ? event.data.outcome : null;
@@ -2690,7 +2692,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const expectedTranscriptRevision =
 				targetCache.treeTranscriptRevision ?? snapshot.transcript_revision ?? null;
 			if (targetCache.sessionId !== sessionId || targetCache.snapshot?.session_id !== sessionId) {
-				throw new Error("session is still loading");
+				throw new IntermediateUiStateError("session is still loading");
 			}
 			if (snapshot.activity !== "idle") {
 				throw new Error("stop the active turn before switching history");
@@ -2788,17 +2790,16 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const snapshot = targetCache?.snapshot;
 			if (!targetCache || !snapshot || snapshot.session_id !== sessionId) {
 				setHistoryDialog(null);
-				pushNotice("error", "session is still loading");
 				return;
 			}
 			const projectId = snapshot.project_id;
 			setHistoryDialog(null);
 			void switchToTarget(sessionId, projectId, snapshot, targetCache, target)
 				.catch((error) => {
-					if (!isSelectedSessionFetchError(error)) pushNotice("error", errorMessage(error));
+					reportActionError(error);
 				});
 		},
-		[assertServerMutationAllowed, getSelectedCache, historyDialog, pushNotice, switchToTarget],
+		[assertServerMutationAllowed, getSelectedCache, historyDialog, reportActionError, switchToTarget],
 	);
 
 	const promoteQueuedInput = useCallback(
@@ -2883,11 +2884,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					}),
 			});
 		} catch (error) {
-			if (!isSelectedSessionFetchError(error)) pushNotice("error", errorMessage(error));
+			reportActionError(error);
 		} finally {
 			setStopping(false);
 		}
-	}, [api, assertServerMutationAllowed, pushNotice, queryClient, requireSelected, syncActiveBranchNow]);
+	}, [api, assertServerMutationAllowed, queryClient, reportActionError, requireSelected, syncActiveBranchNow]);
 
 	const invalidateDelegations = useCallback(
 		(parentSessionId: string) =>
@@ -3052,7 +3053,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 
 			if (!submittedSessionId || submittedSnapshot?.session_id !== submittedSessionId) {
-				throw new Error("session is still loading");
+				throw new IntermediateUiStateError("session is still loading");
 			}
 			const sessionId = submittedSessionId;
 			if (name === "switch") {
@@ -3287,11 +3288,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	}, []);
 	const handleResumeTurn = useCallback(
 		(entryId: string) => {
-			void resumeTerminalTurn(entryId).catch((error) => {
-				if (!isSelectedSessionFetchError(error)) pushNotice("error", errorMessage(error));
-			});
+			void resumeTerminalTurn(entryId).catch(reportActionError);
 		},
-		[pushNotice, resumeTerminalTurn],
+		[reportActionError, resumeTerminalTurn],
 	);
 	const handleStop = useCallback(() => {
 		void stopActiveTurn();
@@ -3835,17 +3834,12 @@ function subagentLabel(data: Record<string, unknown>): string {
 	return typeof data.role === "string" && data.role.trim() ? data.role.trim() : "Agent";
 }
 
-function subagentRunningNotice(data: Record<string, unknown>): string {
-	return `${subagentLabel(data)} started`;
-}
-
-function subagentIdleNotice(data: Record<string, unknown>): string {
-	const outcome = typeof data.outcome === "string" && data.outcome.trim() ? data.outcome.trim() : "completed";
+function subagentFailureNotice(data: Record<string, unknown>): string {
 	const preview =
 		typeof data.summary_preview === "string" && data.summary_preview.trim()
 			? `: ${truncate(data.summary_preview.trim(), 180)}`
 			: "";
-	return `${subagentLabel(data)} idle (${outcome})${preview}`;
+	return `${subagentLabel(data)} crashed${preview}`;
 }
 
 function activityFromEvent(event: EventFrame): SessionSummary["activity"] | null {

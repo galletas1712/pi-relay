@@ -1,4 +1,5 @@
 import { parseSlash, type ParsedSlash } from "./slash.ts";
+import { IntermediateUiStateError } from "./selectedSessionFetchState.ts";
 import type { SessionSnapshot } from "./types.ts";
 
 export interface ComposerSubmission {
@@ -62,7 +63,7 @@ export async function routeComposerSubmission(
 		}
 
 		if (!snapshot || snapshot.session_id !== submission.sessionId) {
-			throw new Error("session is still loading");
+			throw new IntermediateUiStateError("session is still loading");
 		}
 		if (snapshot.parent_session_id) {
 			await dependencies.steerSubagent({
