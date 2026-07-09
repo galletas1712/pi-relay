@@ -383,7 +383,7 @@ export function RunBoardDelegationList({
 					{showToggle ? (
 						<>
 							<button
-								className="run-board-toggle"
+								className="link-button run-board-toggle"
 								type="button"
 								disabled={!!toggleBlockedReason}
 								onClick={onToggleShowAllDelegations}

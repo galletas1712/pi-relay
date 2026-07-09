@@ -1,4 +1,4 @@
-import { Folder, FolderGit2 } from "lucide-react";
+import { Folder, FolderGit2, Plus } from "lucide-react";
 import { useEffect, useRef, useState, type RefObject } from "react";
 import {
 	AppAlertDialog,
@@ -343,8 +343,15 @@ export function ProjectDialog({
 					<div className="workspace-editor">
 						<div className="workspace-editor-head">
 							<span>Workspaces</span>
-							<button type="button" className="secondary-button" onClick={addWorkspace} disabled={busy}>
-								Add workspace
+							<button
+								type="button"
+								className="icon-button"
+								onClick={addWorkspace}
+								disabled={busy}
+								aria-label="add workspace"
+								title="Add workspace"
+							>
+								<Plus size={14} aria-hidden />
 							</button>
 						</div>
 						<div className="workspace-editor-list">

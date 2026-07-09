@@ -253,7 +253,7 @@ pre {
 	display: flex;
 	align-items: center;
 	gap: 10px;
-	height: 48px;
+	height: var(--top-header-height);
 	border-bottom: 1px solid var(--border);
 	background: color-mix(in oklch, var(--background) 94%, transparent);
 	padding: 0 max(10px, env(safe-area-inset-right, 0px)) 0 max(10px, env(safe-area-inset-left, 0px));
@@ -1245,9 +1245,8 @@ pre {
 	color: var(--foreground);
 }
 
-/* The empty-state CTA reuses .primary-button, but that base style is built for
- * the sidebar toolbar where it stretches (flex: 1) and left-aligns its label.
- * Here it is a standalone action, so size it to its content and center it. */
+/* The empty-state CTA is standalone, so size the shared primary button to its
+ * content instead of letting it stretch and left-align its label. */
 .empty-state-cta {
 	flex: 0 0 auto;
 	justify-content: center;
@@ -3251,6 +3250,8 @@ pre {
 
 .inspector-tabs {
 	display: flex;
+	height: var(--top-header-height);
+	min-height: var(--top-header-height);
 	align-items: center;
 	gap: 4px;
 	border-bottom: 1px solid var(--border);
@@ -3494,22 +3495,6 @@ pre {
 .run-board-toggle {
 	align-self: flex-start;
 	margin: 7px 12px 10px;
-	border: 0;
-	background: transparent;
-	padding: 4px 0;
-	color: var(--primary);
-	font-size: var(--text-sm);
-	cursor: pointer;
-}
-
-.run-board-toggle:hover,
-.run-board-toggle:focus-visible {
-	text-decoration: underline;
-}
-
-.run-board-toggle:focus-visible {
-	outline: 2px solid var(--ring);
-	outline-offset: 2px;
 }
 
 .run-board-subagents {
@@ -3658,6 +3643,12 @@ pre {
 .link-button:focus-visible {
 	outline: 2px solid var(--ring);
 	outline-offset: 2px;
+}
+
+.link-button:disabled {
+	cursor: default;
+	opacity: 0.65;
+	text-decoration: none;
 }
 
 .tool-list {
@@ -4210,8 +4201,10 @@ pre {
 }
 
 @media (max-width: 430px) {
-	.mobile-topbar {
+	.mobile-topbar,
+	.inspector-tabs {
 		height: 46px;
+		min-height: 46px;
 	}
 
 	.header-select select,

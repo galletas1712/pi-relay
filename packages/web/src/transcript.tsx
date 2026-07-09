@@ -1311,7 +1311,7 @@ const TurnCardRow = memo(function TurnCardRow({
 						<>
 							<button
 								type="button"
-								className="turn-card-expand"
+								className="link-button"
 								disabled={(isLoading && !isExpanded) || !!detailLoadBlockedReason}
 								onClick={onToggleDetails}
 							>
