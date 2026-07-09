@@ -146,6 +146,7 @@ export interface DelegationSubagent {
 	status: Activity | DelegationSubagentStatus;
 	activity?: Activity;
 	role?: string | null;
+	title?: string | null;
 	type?: SubagentType | null;
 	subagent_type?: SubagentType | null;
 	steerable?: boolean;

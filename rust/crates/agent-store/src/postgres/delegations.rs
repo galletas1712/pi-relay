@@ -69,6 +69,7 @@ pub struct DelegationSubagentOverview {
     pub activity: SessionActivity,
     pub subagent_type: Option<SubagentType>,
     pub role: Option<String>,
+    pub title: Option<String>,
     pub has_task: bool,
     pub terminal_status: Option<String>,
 }
@@ -174,6 +175,11 @@ impl PostgresAgentStore {
                 .get("role_name")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let title = metadata
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
             let has_task = metadata
                 .get("task")
                 .and_then(Value::as_str)
@@ -209,6 +215,7 @@ impl PostgresAgentStore {
                 activity: session_activity(has_running_work, has_queued_input),
                 subagent_type,
                 role,
+                title,
                 has_task,
                 terminal_status,
             });

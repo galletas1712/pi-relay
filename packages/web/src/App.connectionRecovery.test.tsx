@@ -438,6 +438,49 @@ describe("App connection recovery integration", () => {
 		client.clear();
 	});
 
+	it("names a subagent from delegation.list title even when the child warm fails", async () => {
+		const api = createControllableApi();
+		api.listDelegations.mockResolvedValue({
+			parent_session_id: SESSION_ID,
+			has_more: false,
+			delegations: [
+				appDelegation({
+					delegation_id: "titled",
+					label: "Titled work",
+					status: "running",
+					progress: { expected: 1, spawned: 1, terminal: 0, running: 1, failed: 0 },
+					subagents: [{
+						id: "titled-child",
+						status: "running",
+						activity: "running",
+						role: "implementer",
+						title: "Wire up the store",
+						subagent_type: "full",
+						task_prompt_file: "titled-child/task_prompt.md",
+					}],
+				}),
+			],
+		});
+		// The child session never yields a usable snapshot: its warm read fails, so
+		// the only possible name source is `delegation.list`'s `title`.
+		api.getSession.mockImplementation(async (sessionId: string) => {
+			if (sessionId === SESSION_ID) return sessionSnapshot();
+			throw new Error(`no warm for ${sessionId}`);
+		});
+		const { client, unmount } = renderApp(api);
+		await openAndLoad(api);
+
+		expect(
+			await screen.findByRole("button", {
+				name: /Open agent Wire up the store, implementer, running/,
+			}),
+		).toBeTruthy();
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
 	it("keeps effort editable during a running response while model remains locked", async () => {
 		const api = createControllableApi();
 		const running = {

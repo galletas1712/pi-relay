@@ -1583,6 +1583,7 @@ Result:
           "status": "done",
           "activity": "idle",
           "role": "implementer",
+          "title": "Implement change",
           "subagent_type": "full",
           "task_prompt_file": "session_.../task_prompt.md",
           "transcript_file": null,

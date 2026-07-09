@@ -702,6 +702,21 @@ async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact()
     )
     .await;
 
+    // A blank/whitespace title must be filtered out, while a real title on a
+    // sibling is surfaced verbatim by the overview query.
+    db.store
+        .update_session_metadata(
+            "child_done",
+            &json!({
+                "created_by": "test",
+                "role_name": "reviewer",
+                "task": "review this",
+                "title": "Review this",
+            }),
+        )
+        .await
+        .expect("set subagent title");
+
     let overview = db
         .store
         .delegation_subagent_overview(&overview_delegation.id)
@@ -711,9 +726,11 @@ async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact()
     assert_eq!(overview[0].session_id, "child_done");
     assert_eq!(overview[0].activity, crate::SessionActivity::Idle);
     assert_eq!(overview[0].role.as_deref(), Some("reviewer"));
+    assert_eq!(overview[0].title.as_deref(), Some("Review this"));
     assert!(overview[0].has_task);
     assert_eq!(overview[0].terminal_status.as_deref(), Some("done"));
     assert_eq!(overview[1].session_id, "child_running");
+    assert_eq!(overview[1].title, None);
     assert!(!overview[1].has_task);
     assert_eq!(overview[1].terminal_status, None);
 
