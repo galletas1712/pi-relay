@@ -1,5 +1,27 @@
 # Rust Rewrite Worklog
 
+## 2026-07-09
+
+### Pinned Codex Client Version Bump 0.142.3 -> 0.144.0
+
+- Bumped `CODEX_CLIENT_VERSION` from `0.142.3` to `0.144.0`. The ChatGPT Codex
+  backend filters the account catalog by the advertised `client_version`, and
+  the GPT-5.6 family (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`) now carries
+  `minimal_client_version=0.144.0`. The prior pin of `0.142.3` fetched a catalog
+  without `gpt-5.6-sol`, so any session pinned to that model failed
+  deterministically at exact-slug lookup ("Codex model catalog does not contain
+  exact model slug gpt-5.6-sol"). A live probe with the same account token,
+  varying only `client_version`, confirmed the gate: `0.142.3` and `0.143.0`
+  returned seven models without GPT-5.6, while `0.144.0` returned ten models
+  including `gpt-5.6-sol`.
+- `0.144.0` is a real, currently-released Codex CLI version (the release that
+  gated GPT-5.6 into the ChatGPT-account catalog), so the pin preserves the
+  anti-abuse property that the originator+UA pair must look like a real
+  installed Codex CLI build. The single constant still feeds both the
+  `?client_version=` query and the Codex-shaped User-Agent, so no other wiring
+  changed. Version-bump only: catalog cache TTLs, exact-slug lookup, and
+  fallback behavior are unchanged.
+
 ## 2026-07-04
 
 ### Authenticated Private-Codex Model Capability Discovery
