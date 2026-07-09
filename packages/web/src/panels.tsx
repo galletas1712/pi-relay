@@ -478,6 +478,7 @@ export const Sidebar = memo(function Sidebar({
 	mutationBlockedReason,
 	remoteReadBlockedReason,
 }: SidebarProps) {
+	const sessionLoadError = sessionsHasCachedData ? null : sessionsError;
 	return (
 		<aside className="sidebar" data-slot="sidebar" inert={inert}>
 			<ProjectList
@@ -503,11 +504,11 @@ export const Sidebar = memo(function Sidebar({
 				onNew={onNew}
 				newSessionButtonRef={newSessionButtonRef}
 			/>
-			{sessionsError ? (
+			{sessionLoadError ? (
 				<div className="load-error-banner sidebar-load-error" role="alert">
 					<div>
-						<strong>{sessionsHasCachedData ? "Session refresh failed" : "Couldn’t load sessions"}</strong>
-						<span>{sessionsError}</span>
+						<strong>Couldn’t load sessions</strong>
+						<span>{sessionLoadError}</span>
 					</div>
 					{onRetrySessions ? (
 						<>
@@ -539,7 +540,7 @@ export const Sidebar = memo(function Sidebar({
 							mutationBlockedReason={mutationBlockedReason}
 						/>
 					))}
-					{filteredSessions.length === 0 && !sessionsError ? (
+					{filteredSessions.length === 0 && !sessionLoadError ? (
 						<li className="empty-list">
 							{sessionsLoading ? "Loading sessions…" : sessionsFetching ? "Refreshing sessions…" : "No sessions"}
 						</li>

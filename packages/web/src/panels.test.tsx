@@ -239,7 +239,7 @@ describe("Sidebar session list loading states", () => {
 		);
 	}
 
-	it("keeps cached rows visible when their refresh fails", () => {
+	it("keeps cached rows visible without surfacing background refresh failures", () => {
 		const cachedSession: SessionSummary = {
 			session_id: "cached-session",
 			project_id: null,
@@ -260,8 +260,9 @@ describe("Sidebar session list loading states", () => {
 		});
 
 		expect(html).toContain("Cached session");
-		expect(html).toContain("Session refresh failed");
-		expect(html).toContain("refresh failed");
+		expect(html).not.toContain("Session refresh failed");
+		expect(html).not.toContain("refresh failed");
+		expect(html).not.toContain(`role="alert"`);
 	});
 
 	it("renders project and session navigation as semantic lists with sibling selection and menu buttons", () => {
