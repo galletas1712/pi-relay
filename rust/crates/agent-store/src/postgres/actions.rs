@@ -187,7 +187,8 @@ impl PostgresAgentStore {
             .map_err(transient_post_compaction_claim)?;
         let Some(row) = sqlx::query(&format!(
             r#"
-            select a.status, a.kind, a.action_id, a.turn_id, a.payload, s.active_leaf_id,
+            select a.status, a.kind, a.action_id, a.turn_id, a.payload, a.provider_config,
+                s.active_leaf_id,
                 (extract(epoch from clock_timestamp()) * 1000)::bigint as now_ms
             from actions a
             join sessions s on s.id=a.session_id
@@ -342,6 +343,8 @@ impl PostgresAgentStore {
                     model_context,
                     context_leaf_id: Some(context_leaf_id),
                 },
+                provider: serde_json::from_value(row.get("provider_config"))
+                    .map_err(transient_post_compaction_claim)?,
             },
             lease,
         }))
@@ -748,7 +751,8 @@ impl PostgresAgentStore {
     ) -> Result<Vec<PendingDispatchAction>> {
         let rows = sqlx::query(&format!(
             r#"
-            select session_id, id, attempt_id, kind, action_id, turn_id, payload
+            select session_id, id, attempt_id, kind, action_id, turn_id, payload,
+                provider_config
             from actions
             where session_id=$1
                 and status='pending'
@@ -802,6 +806,7 @@ impl PostgresAgentStore {
                 model_context,
                 context_leaf_id: Some(context_leaf_id),
             },
+            provider: serde_json::from_value(row.get("provider_config"))?,
         })
     }
 
@@ -961,6 +966,7 @@ fn pending_tool_dispatch_from_row(row: sqlx::postgres::PgRow) -> Result<PendingD
             turn_id: agent_vocab::TurnId(row.get::<i64, _>("turn_id") as u64),
             tool_call: serde_json::from_value(payload)?,
         },
+        provider: serde_json::from_value(row.get("provider_config"))?,
     })
 }
 

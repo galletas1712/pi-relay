@@ -1094,13 +1094,31 @@ export function LogHeader({
 	);
 }
 
-export function NoticeStack({ notices, rightOpen }: { notices: Notice[]; rightOpen: boolean }) {
+export function NoticeStack({
+	notices,
+	rightOpen,
+	onDismiss,
+}: {
+	notices: Notice[];
+	rightOpen: boolean;
+	onDismiss?: (noticeId: string) => void;
+}) {
 	if (notices.length === 0) return null;
 	return (
 		<div className={`notice-stack ${rightOpen ? "with-inspector" : ""}`} aria-live="polite">
 			{notices.slice(-4).map((notice) => (
 				<div className={`notice-toast ${notice.tone}`} key={notice.id}>
-					{notice.text}
+					<span>{notice.text}</span>
+					{notice.persistent && onDismiss ? (
+						<button
+							type="button"
+							className="notice-dismiss"
+							aria-label="Dismiss notification"
+							onClick={() => onDismiss(notice.id)}
+						>
+							<X size={14} />
+						</button>
+					) : null}
 				</div>
 			))}
 		</div>

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     ActionKind, ActionStatus, ActionUpdate, EventFrame, EventType, OutputBatch, PersistedAction,
-    QueuedInputContent,
+    ProviderConfig, QueuedInputContent,
 };
 
 use super::action_records::{
@@ -48,6 +48,7 @@ pub(super) async fn persist_outputs_tx(
         consumed_input,
         accepted_input,
         control_interrupt_input_id,
+        provider,
     } = batch;
     let had_action_update = action_update.is_some();
     let had_accepted_input = accepted_input.is_some();
@@ -65,7 +66,7 @@ pub(super) async fn persist_outputs_tx(
     lock_session_tx(tx, session_id).await?;
     let session_row = sqlx::query(
         r#"
-            select active_leaf_id,
+            select active_leaf_id, provider_config,
                 exists(select 1 from transcript_entries where session_id=$1) as has_transcript_entries
             from sessions
             where id=$1
@@ -76,6 +77,10 @@ pub(super) async fn persist_outputs_tx(
     .await?;
     let current_active_leaf_id = session_row.get::<Option<String>, _>("active_leaf_id");
     let has_transcript_entries = session_row.get::<bool, _>("has_transcript_entries");
+    let provider = match provider {
+        Some(provider) => provider,
+        None => serde_json::from_value::<ProviderConfig>(session_row.get("provider_config"))?,
+    };
     let active_leaf_changed = current_active_leaf_id.as_deref() != active_leaf_id;
     if let Some(first_entry) = entries.first() {
         if has_transcript_entries
@@ -170,8 +175,10 @@ pub(super) async fn persist_outputs_tx(
             let id = format!("input_{}", Uuid::new_v4());
             let inserted = sqlx::query(
                 r#"
-                    insert into queued_inputs (id, session_id, priority, content, status, client_input_id)
-                    values ($1, $2, $3, $4, 'consumed', $5)
+                    insert into queued_inputs (
+                        id, session_id, priority, content, status, client_input_id, provider_config
+                    )
+                    values ($1, $2, $3, $4, 'consumed', $5, $6)
                     on conflict (session_id, client_input_id) where client_input_id is not null
                     do nothing
                     returning id
@@ -184,6 +191,7 @@ pub(super) async fn persist_outputs_tx(
                 input.content.clone(),
             ))?)
             .bind(client_input_id)
+            .bind(serde_json::to_value(&provider)?)
             .fetch_optional(&mut **tx)
             .await
             .context("record accepted input")?;
@@ -379,8 +387,13 @@ pub(super) async fn persist_outputs_tx(
         let attempt_id = Uuid::new_v4().to_string();
         sqlx::query(
             r#"
-            insert into actions (id, session_id, turn_id, action_id, attempt_id, kind, status, payload)
-            values ($1::text, $2::text, $3::bigint, $4, $5::text, $6::text, $7::text, $8)
+            insert into actions (
+                id, session_id, turn_id, action_id, attempt_id, kind, status, payload,
+                provider_config
+            )
+            values (
+                $1::text, $2::text, $3::bigint, $4, $5::text, $6::text, $7::text, $8, $9
+            )
             "#,
         )
         .bind(&row_id)
@@ -391,6 +404,7 @@ pub(super) async fn persist_outputs_tx(
         .bind(kind.as_str())
         .bind(initial_action_status(kind).as_str())
         .bind(&payload)
+        .bind(serde_json::to_value(&provider)?)
         .execute(&mut **tx)
         .await
         .context("insert action row")?;
@@ -399,6 +413,7 @@ pub(super) async fn persist_outputs_tx(
             row_id,
             attempt_id,
             action: action.clone(),
+            provider: provider.clone(),
         });
     }
 

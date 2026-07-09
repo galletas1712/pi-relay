@@ -807,9 +807,8 @@ async fn session_configure(
         metadata,
     };
     let events = state.repo.configure_session(&session_id, &config).await?;
-    if let Some(active) = driver.active_session().await {
-        active.lock().await.config = config.clone();
-    }
+    // Session provider config is the default for future work. An active
+    // runtime owns the immutable route captured for its open turn.
     publish_events(state, events);
     clear_event_buffer_if_idle(state, &session_id).await?;
     Ok(json!({

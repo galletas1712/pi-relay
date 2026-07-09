@@ -210,8 +210,14 @@ impl PostgresAgentStore {
 
         sqlx::query(
             r#"
-            insert into actions (id, session_id, turn_id, action_id, attempt_id, kind, status, payload)
-            values ($1::text, $2::text, null, 0, $3::text, $4::text, $5::text, $6)
+            insert into actions (
+                id, session_id, turn_id, action_id, attempt_id, kind, status, payload,
+                provider_config
+            )
+            select $1::text, $2::text, null, 0, $3::text, $4::text, $5::text, $6,
+                provider_config
+            from actions
+            where session_id=$2 and id=$7 and attempt_id=$8
             "#,
         )
         .bind(&action_row_id)
@@ -220,6 +226,8 @@ impl PostgresAgentStore {
         .bind(ActionKind::Compaction.as_str())
         .bind(ActionStatus::Running.as_str())
         .bind(&compaction_payload)
+        .bind(model_action_row_id)
+        .bind(model_attempt_id)
         .execute(&mut *tx)
         .await?;
 
@@ -342,8 +350,14 @@ impl PostgresAgentStore {
         });
         sqlx::query(
             r#"
-            insert into actions (id, session_id, turn_id, action_id, attempt_id, kind, status, payload)
-            values ($1::text, $2::text, null, 0, $3::text, $4::text, $5::text, $6)
+            insert into actions (
+                id, session_id, turn_id, action_id, attempt_id, kind, status, payload,
+                provider_config
+            )
+            select $1::text, $2::text, null, 0, $3::text, $4::text, $5::text, $6,
+                provider_config
+            from sessions
+            where id=$2
             "#,
         )
         .bind(&action_row_id)
@@ -571,7 +585,8 @@ impl PostgresAgentStore {
             if updated == 1 {
                 if let Some(row) = sqlx::query(
                     r#"
-                    select id, attempt_id, kind, action_id, turn_id, payload
+                    select id, attempt_id, kind, action_id, turn_id, payload,
+                        provider_config
                     from actions
                     where session_id=$1 and id=$2::text and attempt_id=$3::text
                     "#,
@@ -584,10 +599,12 @@ impl PostgresAgentStore {
                 {
                     let new_model_context =
                         model_context_from_installed_entries(&installed_entries);
+                    let provider = serde_json::from_value(row.get("provider_config"))?;
                     resumed_model_action = Some(PersistedAction {
                         row_id: row.get("id"),
                         attempt_id: row.get("attempt_id"),
                         action: session_action_from_model_row(row, new_model_context)?,
+                        provider,
                     });
                 }
             } else {

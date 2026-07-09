@@ -375,7 +375,12 @@ impl SessionDriver {
                 return Ok(recovered);
             }
             let config = match self
-                .install_post_compaction_runtime(context_leaf_id, *turn_id, *action_id)
+                .install_post_compaction_runtime(
+                    context_leaf_id,
+                    *turn_id,
+                    *action_id,
+                    &claimed.pending.provider,
+                )
                 .await
             {
                 Ok(config) => config,
@@ -460,17 +465,19 @@ impl SessionDriver {
         context_leaf_id: &str,
         turn_id: agent_vocab::TurnId,
         action_id: agent_vocab::ActionId,
+        provider: &agent_vocab::ProviderConfig,
     ) -> std::result::Result<SessionConfig, RpcError> {
         let stored = self
             .state
             .repo
             .load_stored_session(&self.session_id)
             .await?;
-        let config = self
+        let mut config = self
             .state
             .repo
             .load_session_config(&self.session_id)
             .await?;
+        config.provider = provider.clone();
         self.state
             .workspaces
             .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
@@ -752,6 +759,10 @@ impl SessionDriver {
                 if let Some(active) = active {
                     let enqueue_result = {
                         let mut runtime = active.lock().await;
+                        // Ordinary queue consumption starts future work. Install
+                        // the provider route captured when this item was
+                        // accepted before the session creates its first action.
+                        runtime.config.provider = queued.provider.clone();
                         runtime.session.enqueue_input(agent_input)
                     };
                     if let Err(error) = enqueue_result {
@@ -1171,7 +1182,8 @@ impl SessionDriver {
         let mut batch = OutputBatch::new(&entries, active_leaf_id.as_deref(), &events, &actions)
             .with_action_update(action_update)
             .with_consumed_input(consumed_input)
-            .with_accepted_input(accepted_input);
+            .with_accepted_input(accepted_input)
+            .with_provider(config.provider.clone());
         if let Some(input_id) = control_interrupt_input_id {
             batch = batch.with_control_interrupt(input_id);
         }
@@ -1231,14 +1243,23 @@ impl SessionDriver {
             .workspaces
             .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
             .await?;
+        if let Some(provider) = pending.first().map(|action| action.provider.clone()) {
+            if let Some(active) = self.active_session().await {
+                active.lock().await.config.provider = provider;
+            }
+        }
         let resolved = pending
             .into_iter()
-            .map(|action| DispatchAction {
-                row_id: action.row_id,
-                attempt_id: action.attempt_id,
-                post_compaction_dispatch_lease: None,
-                action: action.action,
-                config: config.clone(),
+            .map(|action| {
+                let mut dispatch_config = config.clone();
+                dispatch_config.provider = action.provider;
+                DispatchAction {
+                    row_id: action.row_id,
+                    attempt_id: action.attempt_id,
+                    post_compaction_dispatch_lease: None,
+                    action: action.action,
+                    config: dispatch_config,
+                }
             })
             .collect::<Vec<_>>();
         self.dispatch_pending_or_direct(resolved.clone()).await?;
@@ -1273,7 +1294,10 @@ pub(crate) async fn replace_active_session_config(
 ) {
     let active = state.active.lock().await.get(session_id).cloned();
     if let Some(active) = active {
-        active.lock().await.config = config;
+        let mut active = active.lock().await;
+        let provider = active.config.provider.clone();
+        active.config = config;
+        active.config.provider = provider;
     }
 }
 

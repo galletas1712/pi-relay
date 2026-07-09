@@ -859,11 +859,13 @@ impl PostgresAgentStore {
                    s.delegation_id,
                    s.subagent_type,
                    s.active_leaf_id,
+                   coalesce(generation.provider_config, s.provider_config) as provider_config,
                    generation.turn_id as target_turn_id,
                    coalesce(generation.attempt_ids, '[]'::jsonb) as target_action_attempt_ids
             from sessions s
             left join lateral (
                 select newest.turn_id,
+                       newest.provider_config,
                        (
                            select jsonb_agg(a.attempt_id order by a.created_at, a.id)
                            from actions a
@@ -872,7 +874,7 @@ impl PostgresAgentStore {
                              and a.turn_id is not distinct from newest.turn_id
                        ) as attempt_ids
                 from (
-                    select a.turn_id
+                    select a.turn_id, a.provider_config
                     from actions a
                     where a.session_id=s.id
                       and a.status in ('pending', 'blocked', 'running')
@@ -897,6 +899,7 @@ impl PostgresAgentStore {
         let target_active_leaf_id: Option<String> = session_row.get("active_leaf_id");
         let target_turn_id: Option<i64> = session_row.get("target_turn_id");
         let target_action_attempt_ids: Value = session_row.get("target_action_attempt_ids");
+        let provider_config: Value = session_row.get("provider_config");
         if child_parent.as_deref() != Some(parent_session_id)
             || child_delegation.as_deref() != Some(delegation_id)
             || !matches!(subagent_type.as_deref(), Some("full") | Some("read_only"))
@@ -985,7 +988,8 @@ impl PostgresAgentStore {
         let inserted = sqlx::query(
             r#"
             insert into queued_inputs (
-                id, session_id, priority, content, status, client_input_id, origin
+                id, session_id, priority, content, status, client_input_id, origin,
+                provider_config
             )
             values (
                 $1, $2, 'steer', $3, 'queued', $4,
@@ -1001,7 +1005,8 @@ impl PostgresAgentStore {
                     'target_active_leaf_id', $8::text,
                     'target_turn_id', $9::bigint,
                     'target_action_attempt_ids', $10::jsonb
-                )
+                ),
+                $12
             )
             on conflict (session_id, client_input_id) where client_input_id is not null
             do nothing
@@ -1024,6 +1029,7 @@ impl PostgresAgentStore {
         .bind(target_turn_id)
         .bind(target_action_attempt_ids)
         .bind(control_kind.as_str())
+        .bind(provider_config)
         .fetch_optional(&mut *tx)
         .await?;
         let input_id = if let Some(inserted) = inserted {
@@ -1910,15 +1916,36 @@ async fn enqueue_steer_content_tx(
     client_input_id: &str,
 ) -> Result<bool> {
     lock_session_tx(tx, parent_session_id).await?;
+    let provider_config: Value = sqlx::query_scalar(
+        r#"
+        select coalesce(
+            (
+                select provider_config
+                from actions
+                where session_id=$1
+                order by created_at desc, id desc
+                limit 1
+            ),
+            provider_config
+        )
+        from sessions
+        where id=$1
+        "#,
+    )
+    .bind(parent_session_id)
+    .fetch_one(&mut **tx)
+    .await?;
     let id = format!("input_{}", Uuid::new_v4());
     let inserted = sqlx::query(
         r#"
             insert into queued_inputs (
-                id, session_id, priority, content, status, client_input_id, origin
+                id, session_id, priority, content, status, client_input_id, origin,
+                provider_config
             )
             values (
                 $1, $2, 'steer', $3, 'queued', $4,
-                jsonb_build_object('promoted_at', clock_timestamp()::text)
+                jsonb_build_object('promoted_at', clock_timestamp()::text),
+                $5
             )
             on conflict (session_id, client_input_id) where client_input_id is not null
             do nothing
@@ -1929,6 +1956,7 @@ async fn enqueue_steer_content_tx(
     .bind(parent_session_id)
     .bind(serde_json::to_value(&content)?)
     .bind(client_input_id)
+    .bind(provider_config)
     .fetch_optional(&mut **tx)
     .await?;
     let Some(inserted) = inserted else {

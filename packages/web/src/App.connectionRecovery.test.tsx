@@ -416,6 +416,202 @@ describe("App connection recovery integration", () => {
 		client.clear();
 	});
 
+	it("keeps effort editable during a running response while model remains locked", async () => {
+		const api = createControllableApi();
+		const running = {
+			...sessionSnapshot(),
+			activity: "running" as const,
+			provider: { kind: "openai" as const, model: "gpt-5.1", reasoning_effort: "medium" as const },
+		};
+		api.getSession.mockResolvedValue(running);
+		api.listSessions.mockResolvedValue([{ ...sessionSummary(), ...running }]);
+		api.configureSession.mockResolvedValue({
+			session_id: SESSION_ID,
+			activity: "running",
+			provider: { ...running.provider, reasoning_effort: "high" },
+			metadata: running.metadata,
+		});
+		const { client, unmount } = renderApp(api);
+		await openAndLoad(api);
+
+		const model = screen.getByRole("combobox", { name: "Model, locked" }) as HTMLSelectElement;
+		const effort = screen.getByRole("combobox", { name: "Reasoning effort" }) as HTMLSelectElement;
+		expect(model.disabled).toBe(true);
+		expect(effort.disabled).toBe(false);
+		expect(document.body.textContent).not.toContain("Applies next turn");
+
+		await emitStatus(api, "closed");
+		await waitFor(() => expect(effort.disabled).toBe(true));
+		await emitStatus(api, "open");
+		await waitFor(() => expect(effort.disabled).toBe(false));
+
+		fireEvent.change(effort, { target: { value: "high" } });
+		await waitFor(() =>
+			expect(api.configureSession).toHaveBeenCalledWith({
+				sessionId: SESSION_ID,
+				provider: { ...running.provider, reasoning_effort: "high" },
+			}),
+		);
+		expect(effort.value).toBe("high");
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
+	it("serializes rapid effort edits to the latest value and rolls back a failed update", async () => {
+		const api = createControllableApi();
+		const first = deferred<{
+			session_id: string;
+			activity: "idle";
+			provider: { kind: "openai"; model: string; reasoning_effort: "high" };
+			metadata: Record<string, unknown>;
+		}>();
+		let canonicalEffort: "xhigh" | "low" = "xhigh";
+		api.getSession.mockImplementation(async () => ({
+			...sessionSnapshot(),
+			provider: {
+				kind: "openai",
+				model: "gpt-5.1",
+				reasoning_effort: canonicalEffort,
+			},
+		}));
+		api.configureSession
+			.mockImplementationOnce(() => first.promise)
+			.mockImplementationOnce(async () => {
+				canonicalEffort = "low";
+				return {
+					session_id: SESSION_ID,
+					activity: "idle",
+					provider: { kind: "openai", model: "gpt-5.1", reasoning_effort: "low" },
+					metadata: { title: SESSION_TITLE },
+				};
+			})
+			.mockRejectedValueOnce(new Error("catalog rejected effort"));
+		const { client, unmount } = renderApp(api);
+		await openAndLoad(api);
+		const effort = screen.getByRole("combobox", { name: "Reasoning effort" }) as HTMLSelectElement;
+
+		fireEvent.change(effort, { target: { value: "high" } });
+		fireEvent.change(effort, { target: { value: "low" } });
+		expect(effort.value).toBe("low");
+		expect(api.configureSession).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			first.resolve({
+				session_id: SESSION_ID,
+				activity: "idle",
+				provider: { kind: "openai", model: "gpt-5.1", reasoning_effort: "high" },
+				metadata: { title: SESSION_TITLE },
+			});
+			await first.promise;
+		});
+		await waitFor(() => expect(api.configureSession).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(effort.value).toBe("low"));
+		expect(api.configureSession.mock.calls[1]?.[0]).toMatchObject({
+			sessionId: SESSION_ID,
+			provider: { reasoning_effort: "low" },
+		});
+
+		fireEvent.change(effort, { target: { value: "high" } });
+		expect(effort.value).toBe("high");
+		await waitFor(() => expect(api.configureSession).toHaveBeenCalledTimes(3));
+		await waitFor(() => expect(effort.value).toBe("low"));
+		expect(document.body.textContent).toContain(
+			"Could not update reasoning effort: catalog rejected effort. Try again.",
+		);
+		expect(screen.getByRole("button", { name: "Dismiss notification" })).toBeTruthy();
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
+	it("keeps pending effort updates targeted and cached by session across navigation", async () => {
+		const api = createControllableApi();
+		const secondSessionId = "session-2";
+		const firstUpdate = deferred<{
+			session_id: string;
+			activity: "idle";
+			provider: { kind: "openai"; model: string; reasoning_effort: "high" };
+			metadata: Record<string, unknown>;
+		}>();
+		let firstEffort: "xhigh" | "high" = "xhigh";
+		let secondEffort: "medium" | "low" = "medium";
+		const summary = (sessionId: string, title: string, effort: typeof firstEffort | typeof secondEffort) => ({
+			...sessionSummary(),
+			session_id: sessionId,
+			provider: { kind: "openai" as const, model: "gpt-5.1", reasoning_effort: effort },
+			metadata: { title },
+		});
+		api.listSessions.mockImplementation(async () => [
+			summary(SESSION_ID, SESSION_TITLE, firstEffort),
+			summary(secondSessionId, "Second session", secondEffort),
+		]);
+		api.getSession.mockImplementation(async (sessionId: string) => ({
+			...sessionSnapshot(),
+			...summary(
+				sessionId,
+				sessionId === SESSION_ID ? SESSION_TITLE : "Second session",
+				sessionId === SESSION_ID ? firstEffort : secondEffort,
+			),
+		}));
+		api.configureSession.mockImplementation(async ({ sessionId, provider }) => {
+			if (sessionId === SESSION_ID) return firstUpdate.promise;
+			secondEffort = provider.reasoning_effort as typeof secondEffort;
+			return {
+				session_id: secondSessionId,
+				activity: "idle",
+				provider: { ...provider, reasoning_effort: secondEffort },
+				metadata: { title: "Second session" },
+			};
+		});
+		const { client, unmount } = renderApp(api);
+		const user = userEvent.setup();
+		await openAndLoad(api);
+
+		const effort = screen.getByRole("combobox", { name: "Reasoning effort" }) as HTMLSelectElement;
+		fireEvent.change(effort, { target: { value: "high" } });
+		expect(effort.value).toBe("high");
+
+		await user.click(sessionNavigationButtonNamed("Second session"));
+		const secondEffortControl = await screen.findByRole<HTMLSelectElement>("combobox", {
+			name: "Reasoning effort",
+		});
+		await waitFor(() => expect(secondEffortControl.value).toBe("medium"));
+		fireEvent.change(secondEffortControl, { target: { value: "low" } });
+		await waitFor(() =>
+			expect(api.configureSession).toHaveBeenCalledWith({
+				sessionId: secondSessionId,
+				provider: expect.objectContaining({ reasoning_effort: "low" }),
+			}),
+		);
+		await waitFor(() => expect(secondEffortControl.value).toBe("low"));
+
+		firstEffort = "high";
+		firstUpdate.resolve({
+			session_id: SESSION_ID,
+			activity: "idle",
+			provider: { kind: "openai", model: "gpt-5.1", reasoning_effort: "high" },
+			metadata: { title: SESSION_TITLE },
+		});
+		await act(async () => {
+			await firstUpdate.promise;
+		});
+		expect(secondEffortControl.value).toBe("low");
+
+		await user.click(sessionNavigationButtonNamed(SESSION_TITLE));
+		await waitFor(() =>
+			expect(
+				screen.getByRole<HTMLSelectElement>("combobox", { name: "Reasoning effort" }).value,
+			).toBe("high"),
+		);
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
 	it("retries an initial Agents list failure through the canonical query", async () => {
 		const api = createControllableApi();
 		api.listDelegations
@@ -694,7 +890,11 @@ async function emitStatus(api: ControllableApi, status: ConnectionStatus) {
 }
 
 function sessionNavigationButton(): HTMLButtonElement {
-	const candidates = screen.getAllByRole("button", { name: new RegExp(SESSION_TITLE) });
+	return sessionNavigationButtonNamed(SESSION_TITLE);
+}
+
+function sessionNavigationButtonNamed(title: string): HTMLButtonElement {
+	const candidates = screen.getAllByRole("button", { name: new RegExp(title) });
 	const navigation = candidates.find((button) => !button.hasAttribute("aria-haspopup"));
 	if (!(navigation instanceof HTMLButtonElement)) throw new Error("missing cached session navigation");
 	return navigation;

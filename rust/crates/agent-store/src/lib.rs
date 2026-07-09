@@ -252,6 +252,7 @@ pub struct PersistedAction {
     pub row_id: String,
     pub attempt_id: String,
     pub action: SessionAction,
+    pub provider: ProviderConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +260,7 @@ pub struct PendingDispatchAction {
     pub row_id: String,
     pub attempt_id: String,
     pub action: SessionAction,
+    pub provider: ProviderConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -614,6 +616,7 @@ pub struct QueuedInputRecord {
     pub priority: InputPriority,
     pub status: QueuedInputStatus,
     pub content: QueuedInputContent,
+    pub provider: ProviderConfig,
     pub client_input_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -837,6 +840,7 @@ pub struct QueuedInput {
     pub id: String,
     pub priority: InputPriority,
     pub content: QueuedInputContent,
+    pub provider: ProviderConfig,
     pub client_input_id: Option<String>,
     pub claim_id: String,
     pub row_version: String,
@@ -930,6 +934,7 @@ pub struct OutputBatch<'a> {
     pub(crate) consumed_input: Option<QueuedInput>,
     pub(crate) accepted_input: Option<AcceptedInput>,
     pub(crate) control_interrupt_input_id: Option<&'a str>,
+    pub(crate) provider: Option<ProviderConfig>,
 }
 
 impl<'a> OutputBatch<'a> {
@@ -948,6 +953,7 @@ impl<'a> OutputBatch<'a> {
             consumed_input: None,
             accepted_input: None,
             control_interrupt_input_id: None,
+            provider: None,
         }
     }
 
@@ -968,6 +974,11 @@ impl<'a> OutputBatch<'a> {
 
     pub fn with_control_interrupt(mut self, input_id: &'a str) -> Self {
         self.control_interrupt_input_id = Some(input_id);
+        self
+    }
+
+    pub fn with_provider(mut self, provider: ProviderConfig) -> Self {
+        self.provider = Some(provider);
         self
     }
 }

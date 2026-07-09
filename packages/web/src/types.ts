@@ -361,4 +361,5 @@ export interface Notice {
 	id: string;
 	tone: NoticeTone;
 	text: string;
+	persistent?: boolean;
 }

@@ -40,9 +40,11 @@ transcript_entries(session_id, id, parent_id?, timestamp_ms, item jsonb,
                    provider_replay jsonb, turn_id?, sequence bigserial)
                    primary key (session_id, id)
 queued_inputs(id, session_id, priority, content jsonb, origin jsonb?,
-              status, follow_up_position?, client_input_id?, created/updated_at)
+              status, follow_up_position?, client_input_id?,
+              provider_config jsonb, created/updated_at)
 actions(id, session_id, turn_id?, action_id, attempt_id, kind, status,
-        payload jsonb, result jsonb?, created/updated_at)
+        payload jsonb, result jsonb?, provider_config jsonb?,
+        created/updated_at)
 events(id bigserial, session_id, type, payload jsonb, created_at)
 ```
 
@@ -52,6 +54,13 @@ events(id bigserial, session_id, type, payload jsonb, created_at)
   replays are idempotent.
 - `queued_inputs` idempotency is keyed by a partial unique index on
   `(session_id, client_input_id)`.
+- `queued_inputs.provider_config` snapshots the complete provider route when
+  input is accepted. Follow-ups use the current session default; steering an
+  open turn uses its latest action route.
+- Routable `actions.provider_config` snapshots the open turn's route. Dispatch,
+  provider retries, tool continuations, compaction resume, and crash recovery
+  use this value instead of rereading the mutable session default. Legacy rows
+  are backfilled from the session config during migration.
 - `provider_replay` is a sidecar column holding raw provider continuation data.
   It is never serialized to RPC/web responses (see Notes).
 

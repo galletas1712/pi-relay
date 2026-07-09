@@ -391,8 +391,13 @@ async fn run_compaction_job(
     }
     if let Some(resumed) = resumed {
         super::ensure_post_compaction_dispatch_recovery(&state);
-        let resumed_config = match install_runtime_compaction_checkpoint(&state, &session_id, &job)
-            .await
+        let resumed_config = match install_runtime_compaction_checkpoint(
+            &state,
+            &session_id,
+            &job,
+            &resumed.provider,
+        )
+        .await
         {
             Ok(config) => config,
             Err(error) => {
@@ -548,9 +553,11 @@ async fn install_runtime_compaction_checkpoint(
     state: &AppState,
     session_id: &str,
     job: &CompactionJob,
+    provider: &agent_vocab::ProviderConfig,
 ) -> std::result::Result<SessionConfig, RpcError> {
     let stored = state.repo.load_stored_session(session_id).await?;
-    let config = state.repo.load_session_config(session_id).await?;
+    let mut config = state.repo.load_session_config(session_id).await?;
+    config.provider = provider.clone();
     state
         .workspaces
         .ensure_session(session_id, &config.outer_cwd, &config.workspaces)

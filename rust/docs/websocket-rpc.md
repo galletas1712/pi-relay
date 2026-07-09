@@ -895,10 +895,16 @@ subscribed clients can update lists/snapshots without a transcript refresh.
 Idle-only for metadata or model/source-changing updates. Replaces provider
 config and/or metadata. Once a session has any transcript entry, `provider.kind`
 and `provider.model` are locked; clients may still change provider-adjacent
-knobs such as `reasoning_effort` during or between turns. Runtime changes apply
-to subsequently created provider requests, not to an already in-flight request.
-Responses and `session.configured` events include `provider`, `metadata`, and
-`activity` so clients can patch cached summaries and selected snapshots.
+knobs such as `reasoning_effort` during or between turns. An effort-only update
+persists immediately as the session default for future accepted work; it does
+not replace an active runtime's route. Each queued input captures the provider
+config when accepted, and each action captures its open-turn route. Existing
+queued items, provider retries, tool continuations, compaction/recovery, and
+steering consumed into an open turn therefore retain their captured config;
+newly accepted future work captures the new default. These route snapshots are
+daemon-internal and do not add fields to queue RPC views. Responses and
+`session.configured` events include `provider`, `metadata`, and `activity` so
+clients can patch cached summaries and selected snapshots.
 
 ### `session.sync_active_branch`
 

@@ -70,6 +70,29 @@ impl PostgresAgentStore {
             }
         }
         ensure_expected_active_leaf_tx(&mut tx, session_id, expected_active_leaf_id).await?;
+        let provider_config: Value = sqlx::query_scalar(
+            r#"
+            select case
+                when $2='steer' then coalesce(
+                    (
+                        select provider_config
+                        from actions
+                        where session_id=$1
+                        order by created_at desc, id desc
+                        limit 1
+                    ),
+                    provider_config
+                )
+                else provider_config
+            end
+            from sessions
+            where id=$1
+            "#,
+        )
+        .bind(session_id)
+        .bind(priority.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
         let inserted = sqlx::query(
             r#"
                 insert into queued_inputs (
@@ -80,7 +103,8 @@ impl PostgresAgentStore {
                     status,
                     client_input_id,
                     origin,
-                    follow_up_position
+                    follow_up_position,
+                    provider_config
                 )
                 values (
                     $1,
@@ -102,7 +126,8 @@ impl PostgresAgentStore {
                                 and status='queued'
                         )
                         else null
-                    end
+                    end,
+                    $6
                 )
                 on conflict (session_id, client_input_id) where client_input_id is not null
                 do nothing
@@ -114,6 +139,7 @@ impl PostgresAgentStore {
         .bind(priority.as_str())
         .bind(serde_json::to_value(QueuedInputContent::user_message(content.clone()))?)
         .bind(client_input_id)
+        .bind(provider_config)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(inserted) = inserted else {
@@ -219,7 +245,8 @@ impl PostgresAgentStore {
         let priority_filter = priority.map(|priority| priority.as_str().to_string());
         let query = format!(
             r#"
-                select id, priority, content, client_input_id, xmin::text as row_version
+                select id, priority, content, provider_config, client_input_id,
+                    xmin::text as row_version
                 from queued_inputs
                 where session_id=$1
                     and {editable_queue}
@@ -254,6 +281,7 @@ impl PostgresAgentStore {
             id: row.get("id"),
             priority: row_text::<InputPriority>(&row, "priority")?,
             content,
+            provider: serde_json::from_value(row.get("provider_config"))?,
             client_input_id: row.get("client_input_id"),
             claim_id: String::new(),
             row_version: row.get("row_version"),
@@ -759,6 +787,7 @@ pub(super) async fn queue_state_tx(
                 priority,
                 status,
                 content,
+                provider_config,
                 client_input_id,
                 created_at::text as created_at,
                 updated_at::text as updated_at,
@@ -794,6 +823,7 @@ pub(super) async fn queue_state_tx(
                     priority: row_text(&row, "priority")?,
                     status: row_text::<QueuedInputStatus>(&row, "status")?,
                     content: queued_input_content_from_value(content_value)?,
+                    provider: serde_json::from_value(row.get("provider_config"))?,
                     client_input_id: row.get("client_input_id"),
                     created_at: row.get("created_at"),
                     updated_at: row.get("updated_at"),
@@ -1113,6 +1143,12 @@ mod tests {
         config
     }
 
+    fn with_effort(config: &SessionConfig, effort: ReasoningEffort) -> SessionConfig {
+        let mut config = config.clone();
+        config.provider.reasoning_effort = effort;
+        config
+    }
+
     fn queued_follow_up_ids(queue: &QueueState) -> Vec<String> {
         queue
             .queued_inputs
@@ -1134,6 +1170,134 @@ mod tests {
             item,
             provider_replay: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn queued_inputs_and_actions_keep_submission_time_provider_routes() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "queue-provider-route";
+        let medium = create_session(store, session_id).await;
+        let before = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::FollowUp,
+                &UserMessage::text("before"),
+                Some("before-effort"),
+                None,
+            )
+            .await
+            .expect("pre-change input enqueues");
+
+        let low = with_effort(&medium, ReasoningEffort::Low);
+        store
+            .configure_session(session_id, &low)
+            .await
+            .expect("new default persists while work is queued");
+        let after = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::FollowUp,
+                &UserMessage::text("after"),
+                Some("after-effort"),
+                None,
+            )
+            .await
+            .expect("post-change input enqueues");
+
+        let queue = store.queue_state(session_id).await.expect("queue state");
+        let before_provider = queue
+            .queued_inputs
+            .iter()
+            .find(|input| input.input_id == before.input_id)
+            .expect("pre-change row")
+            .provider
+            .clone();
+        let after_provider = queue
+            .queued_inputs
+            .iter()
+            .find(|input| input.input_id == after.input_id)
+            .expect("post-change row")
+            .provider
+            .clone();
+        assert_eq!(before_provider.reasoning_effort, ReasoningEffort::Medium);
+        assert_eq!(after_provider.reasoning_effort, ReasoningEffort::Low);
+        assert_eq!(
+            store
+                .load_session_config(session_id)
+                .await
+                .expect("reload default")
+                .provider
+                .reasoning_effort,
+            ReasoningEffort::Low
+        );
+
+        let context_entry = entry(
+            "entry-route",
+            None,
+            agent_vocab::TranscriptItem::UserMessage(UserMessage::text("route context")),
+        );
+        let action = agent_session::SessionAction::RequestModel {
+            action_id: agent_vocab::ActionId(1),
+            turn_id: agent_vocab::TurnId(1),
+            model_context: agent_session::ModelContext::new(),
+            context_leaf_id: Some(context_entry.id.clone()),
+        };
+        let (_, persisted) = store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(
+                    &[context_entry.clone()],
+                    Some(&context_entry.id),
+                    &[],
+                    &[action],
+                )
+                .with_provider(before_provider),
+            )
+            .await
+            .expect("turn action persists");
+        assert_eq!(
+            persisted[0].provider.reasoning_effort,
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            store
+                .pending_actions_for_dispatch(session_id)
+                .await
+                .expect("reload pending action")[0]
+                .provider
+                .reasoning_effort,
+            ReasoningEffort::Medium
+        );
+        let steer = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::Steer,
+                &UserMessage::text("steer current turn"),
+                Some("steer-effort"),
+                None,
+            )
+            .await
+            .expect("steer enqueues");
+        assert_eq!(
+            store
+                .queue_state(session_id)
+                .await
+                .expect("queue with steer")
+                .queued_inputs
+                .iter()
+                .find(|input| input.input_id == steer.input_id)
+                .expect("steer row")
+                .provider
+                .reasoning_effort,
+            ReasoningEffort::Medium,
+            "steering preserves the active turn route"
+        );
+
+        db.cleanup().await;
     }
 
     #[tokio::test]

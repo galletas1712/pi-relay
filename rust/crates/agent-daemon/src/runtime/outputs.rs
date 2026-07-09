@@ -77,12 +77,16 @@ pub(crate) fn attach_dispatch_config(
 ) -> Vec<DispatchAction> {
     persisted_actions
         .into_iter()
-        .map(|action| DispatchAction {
-            row_id: action.row_id,
-            attempt_id: action.attempt_id,
-            post_compaction_dispatch_lease: None,
-            action: action.action,
-            config: config.clone(),
+        .map(|action| {
+            let mut dispatch_config = config.clone();
+            dispatch_config.provider = action.provider;
+            DispatchAction {
+                row_id: action.row_id,
+                attempt_id: action.attempt_id,
+                post_compaction_dispatch_lease: None,
+                action: action.action,
+                config: dispatch_config,
+            }
         })
         .collect()
 }
