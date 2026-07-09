@@ -9,6 +9,7 @@ import { App } from "./App.tsx";
 import type { ConnectionStatus } from "./rpc.ts";
 import type {
 	DelegationListResult,
+	EventFrame,
 	Project,
 	SessionSnapshot,
 	SessionSummary,
@@ -174,35 +175,85 @@ describe("App workspace route identity integration", () => {
 	});
 
 	it("pushes child/parent Conversation navigation and restores both identities atomically with Back/Forward", async () => {
+		const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 100 : 0;
+		});
+		const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 1000 : 0;
+		});
 		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
 		const api = createRouteApi();
 		const mounted = renderRouteApp(api, browser);
 		const user = userEvent.setup();
 
 		await open(api);
+		expect(document.querySelector<HTMLDivElement>(".message-scroll")?.scrollTop).toBe(900);
+		document.querySelector<HTMLDivElement>(".message-scroll")!.scrollTop = 137;
+		fireEvent.scroll(document.querySelector<HTMLDivElement>(".message-scroll")!);
 		const child = await screen.findByRole("button", { name: /Open agent Child one, implementer/ });
 		await user.click(child);
 		await waitFor(() => expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1"));
 		expect(await screen.findByText("Conversation recipient:")).toBeTruthy();
+		expect(document.querySelector<HTMLDivElement>(".message-scroll")?.scrollTop).toBe(900);
 		expect(api.listDelegations.mock.calls.at(-1)?.[0]).toBe("root-1");
 
+		document.querySelector<HTMLDivElement>(".message-scroll")!.scrollTop = 211;
+		fireEvent.scroll(document.querySelector<HTMLDivElement>(".message-scroll")!);
 		const parentLinks = screen.getAllByRole("button", { name: "parent" });
 		await user.click(parentLinks[0]);
 		await waitFor(() => expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1"));
+		expect(document.querySelector<HTMLDivElement>(".message-scroll")?.scrollTop).toBe(900);
 
 		const mutationsBeforePop = mutationCallCount(api);
 		const pushesBeforePop = browser.pushCalls.length;
 		const replacesBeforePop = browser.replaceCalls.length;
+		document.querySelector<HTMLDivElement>(".message-scroll")!.scrollTop = 315;
+		fireEvent.scroll(document.querySelector<HTMLDivElement>(".message-scroll")!);
 		await act(async () => browser.back());
 		expect(await screen.findByText("Conversation recipient:")).toBeTruthy();
 		expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1");
+		expect(document.querySelector<HTMLDivElement>(".message-scroll")?.scrollTop).toBe(900);
+		document.querySelector<HTMLDivElement>(".message-scroll")!.scrollTop = 417;
+		fireEvent.scroll(document.querySelector<HTMLDivElement>(".message-scroll")!);
 		await act(async () => browser.forward());
 		await waitFor(() => expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1"));
+		expect(document.querySelector<HTMLDivElement>(".message-scroll")?.scrollTop).toBe(900);
 		expect(mutationCallCount(api)).toBe(mutationsBeforePop);
 		expect(browser.pushCalls).toHaveLength(pushesBeforePop);
 		expect(browser.replaceCalls).toHaveLength(replacesBeforePop);
 
 		await mounted.dispose();
+		clientHeightSpy.mockRestore();
+		scrollHeightSpy.mockRestore();
+	});
+
+	it("waits for late non-empty route transcript hydration before initializing at latest", async () => {
+		const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 100 : 0;
+		});
+		const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 1000 : 0;
+		});
+		const turns = deferred<TranscriptTurnsResult>();
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const api = createRouteApi({
+			activeLeafIds: new Map([["root-1", "entry-finish"]]),
+			deferredTranscriptTurns: new Map([["root-1", turns.promise]]),
+		});
+		const mounted = renderRouteApp(api, browser);
+
+		await openStatusOnly(api);
+		await waitFor(() => expect(api.getTranscriptTurns).toHaveBeenCalledWith("root-1", { limit: 50 }));
+		const scroller = document.querySelector<HTMLDivElement>(".message-scroll");
+		if (!scroller) throw new Error("missing transcript scroller");
+		scroller.scrollTop = 137;
+		await act(async () => turns.resolve(nonEmptyTurns("root-1")));
+
+		await waitFor(() => expect(screen.getByText("late routed content")).toBeTruthy());
+		expect(scroller.scrollTop).toBe(900);
+		await mounted.dispose();
+		clientHeightSpy.mockRestore();
+		scrollHeightSpy.mockRestore();
 	});
 
 	it("updates an Agent fallback from the existing warmed child snapshot without changing route identity", async () => {
@@ -293,7 +344,13 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
-	it("preserves child drafts across Execution and returns to the effective Conversation", async () => {
+	it("preserves child drafts across Execution and re-enters the effective Conversation at latest", async () => {
+		const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 100 : 0;
+		});
+		const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 1000 : 0;
+		});
 		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/child-1");
 		const api = createRouteApi();
 		const mounted = renderRouteApp(api, browser);
@@ -304,10 +361,6 @@ describe("App workspace route identity integration", () => {
 		await user.type(composer, "child draft survives");
 		const scroller = document.querySelector<HTMLDivElement>(".message-scroll");
 		if (!scroller) throw new Error("missing transcript scroller");
-		Object.defineProperties(scroller, {
-			clientHeight: { configurable: true, value: 100 },
-			scrollHeight: { configurable: true, value: 1000 },
-		});
 		scroller.scrollTop = 137;
 		fireEvent.scroll(scroller);
 		await act(async () => {
@@ -321,10 +374,12 @@ describe("App workspace route identity integration", () => {
 		const restored = await screen.findByRole<HTMLTextAreaElement>("textbox");
 		expect(restored.value).toBe("child draft survives");
 		const restoredScroller = document.querySelector<HTMLDivElement>(".message-scroll");
-		expect(restoredScroller?.scrollTop).toBe(137);
+		expect(restoredScroller?.scrollTop).toBe(900);
 		expect(api.getTranscriptTurns.mock.calls.filter(([sessionId]) => sessionId === "child-1")).toHaveLength(1);
 
 		await mounted.dispose();
+		clientHeightSpy.mockRestore();
+		scrollHeightSpy.mockRestore();
 	});
 
 	it("fences stale validation and keeps in-flight composer targets immutable across popstate", async () => {
@@ -470,6 +525,252 @@ describe("App workspace route identity integration", () => {
 
 		await mounted.dispose();
 	});
+
+	it.each(["failed", "noop"] as const)("preserves the current viewport after a %s history switch", async (outcome) => {
+		const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 100 : 0;
+		});
+		const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 1000 : 0;
+		});
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const api = createRouteApi({ historySessionIds: new Set(["root-1"]) });
+		if (outcome === "failed") {
+			api.switchHistory.mockRejectedValue(new Error("switch rejected"));
+		} else {
+			api.switchHistory.mockImplementation(async () => ({
+				session_id: "root-1",
+				active_leaf_id: "entry-active",
+			}));
+		}
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+		await open(api);
+		const scroller = document.querySelector<HTMLDivElement>(".message-scroll");
+		if (!scroller) throw new Error("missing transcript scroller");
+		scroller.scrollTop = 243;
+		fireEvent.scroll(scroller);
+
+		await user.type(screen.getByRole("textbox"), "/switch");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await user.click(await screen.findByRole("treeitem", { name: /Original answer/ }));
+		await waitFor(() => expect(api.switchHistory).toHaveBeenCalledOnce());
+		if (outcome === "failed") await screen.findByText("switch rejected");
+
+		expect(scroller.scrollTop).toBe(243);
+		expect(screen.queryByText("Loading session…")).toBeNull();
+		await mounted.dispose();
+		clientHeightSpy.mockRestore();
+		scrollHeightSpy.mockRestore();
+	});
+
+	it("abandons a pending history destination when the route selects another conversation", async () => {
+		const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 100 : 0;
+		});
+		const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 1000 : 0;
+		});
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const api = createRouteApi({
+			historySessionIds: new Set(["root-1"]),
+			includeDestinationHistoryTarget: true,
+		});
+		api.getTranscriptTurns.mockResolvedValue(
+			turnsWithContent("root-1", "entry-active", "old rendered page", 1),
+		);
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+		await open(api);
+		expect(await screen.findByText("old rendered page")).toBeTruthy();
+
+		const oldRefresh = deferred<SessionSnapshot>();
+		const destinationTurns = deferred<TranscriptTurnsResult>();
+		const getSessionCallsBeforeRefresh = api.getSession.mock.calls.length;
+		api.getSession
+			.mockImplementationOnce(() => oldRefresh.promise)
+			.mockImplementationOnce(async () => ({
+				...snapshot("root-1", null, null, "Root one", "entry-destination"),
+				session_revision: 2,
+				transcript_revision: 2,
+				last_event_id: 3,
+			}));
+		api.getTranscriptTurns.mockImplementationOnce(() => destinationTurns.promise);
+		api.emitEvent({
+			event_id: 2,
+			event: "session.configured",
+			session_id: "root-1",
+			data: {},
+		});
+		await waitFor(() =>
+			expect(api.getSession.mock.calls.length).toBe(getSessionCallsBeforeRefresh + 1),
+		);
+
+		api.switchHistory.mockImplementation(async () => ({
+			session_id: "root-1",
+			active_leaf_id: "entry-destination",
+			session_revision: 2,
+			transcript_revision: 2,
+			last_event_id: 3,
+		}));
+		await user.type(screen.getByRole("textbox"), "/switch");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await user.click(await screen.findByRole("treeitem", { name: /Destination answer/ }));
+		await waitFor(() => expect(api.getTranscriptTurns).toHaveBeenCalledTimes(2));
+		expect(screen.getByText("old rendered page")).toBeTruthy();
+
+		await act(async () => {
+			browser.navigate("/w/host/run/root-1/conversation/child-1");
+		});
+		await waitFor(() => {
+			expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1");
+			expect(document.querySelector(".log-pane")?.textContent).toContain("Child one");
+			expect(api.getTranscriptTurns.mock.calls.some(([sessionId]) => sessionId === "child-1")).toBe(true);
+		});
+		const childScroller = document.querySelector<HTMLDivElement>(".message-scroll");
+		if (!childScroller) throw new Error("missing child transcript scroller");
+		childScroller.scrollTop = 321;
+		fireEvent.scroll(childScroller);
+
+		await act(async () => {
+			destinationTurns.resolve(
+				turnsWithContent(
+					"root-1",
+					"entry-destination",
+					"abandoned destination page",
+					2,
+				),
+			);
+			oldRefresh.resolve(snapshot("root-1", null, null, "Root one", "entry-active"));
+			await Promise.all([destinationTurns.promise, oldRefresh.promise]);
+		});
+		expect(document.querySelector(".log-pane")?.textContent).toContain("Child one");
+		expect(screen.queryByText("abandoned destination page")).toBeNull();
+		expect(childScroller.scrollTop).toBe(321);
+
+		await mounted.dispose();
+		clientHeightSpy.mockRestore();
+		scrollHeightSpy.mockRestore();
+	});
+
+	it("waits for canonical destination cards when history switch races an in-flight usable-cache refresh", async () => {
+		const clientHeightSpy = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 100 : 0;
+		});
+		const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+			return this.classList.contains("message-scroll") ? 1000 : 0;
+		});
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const api = createRouteApi({
+			historySessionIds: new Set(["root-1"]),
+			includeDestinationHistoryTarget: true,
+		});
+		api.getTranscriptTurns.mockResolvedValue(
+			turnsWithContent("root-1", "entry-active", "old rendered page", 1),
+		);
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+		await open(api);
+		expect(await screen.findByText("old rendered page")).toBeTruthy();
+
+		const scroller = document.querySelector<HTMLDivElement>(".message-scroll");
+		if (!scroller) throw new Error("missing transcript scroller");
+		let scrollTop = 243;
+		const writes: number[] = [];
+		Object.defineProperty(scroller, "scrollTop", {
+			configurable: true,
+			get: () => scrollTop,
+			set: (value: number) => {
+				scrollTop = value;
+				writes.push(value);
+			},
+		});
+		fireEvent.scroll(scroller);
+
+		const oldRefresh = deferred<SessionSnapshot>();
+		const destinationTurns = deferred<TranscriptTurnsResult>();
+		const destinationSnapshot = {
+			...snapshot("root-1", null, null, "Root one", "entry-destination"),
+			session_revision: 2,
+			transcript_revision: 2,
+			last_event_id: 3,
+		};
+		const getSessionCallsBeforeRefresh = api.getSession.mock.calls.length;
+		api.getSession
+			.mockImplementationOnce(() => oldRefresh.promise)
+			.mockImplementationOnce(async () => destinationSnapshot);
+		api.getTranscriptTurns.mockImplementationOnce(() => destinationTurns.promise);
+
+		api.emitEvent({
+			event_id: 2,
+			event: "session.configured",
+			session_id: "root-1",
+			data: {},
+		});
+		await waitFor(() =>
+			expect(api.getSession.mock.calls.length).toBe(getSessionCallsBeforeRefresh + 1),
+		);
+
+		api.switchHistory.mockImplementation(async () => ({
+			session_id: "root-1",
+			active_leaf_id: "entry-destination",
+			session_revision: 2,
+			transcript_revision: 2,
+			last_event_id: 3,
+		}));
+		await user.type(screen.getByRole("textbox"), "/switch");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await user.click(await screen.findByRole("treeitem", { name: /Destination answer/ }));
+
+		await waitFor(() => expect(api.switchHistory).toHaveBeenCalledOnce());
+		await waitFor(() => expect(api.getTranscriptTurns).toHaveBeenCalledTimes(2));
+		expect(screen.getByText("old rendered page")).toBeTruthy();
+		expect(screen.queryByText("canonical destination page")).toBeNull();
+		expect(screen.queryByText("Loading session…")).toBeNull();
+		expect(writes).toEqual([]);
+
+		await act(async () => {
+			browser.navigate("/w/host/run/root-1/execution/overview");
+		});
+		expect(await screen.findByRole("heading", { name: /Execution workspace is not available/ })).toBeTruthy();
+		await user.click(screen.getByRole("button", { name: "Open effective Conversation" }));
+		expect(await screen.findByText("old rendered page")).toBeTruthy();
+		const remountedScroller = document.querySelector<HTMLDivElement>(".message-scroll");
+		if (!remountedScroller) throw new Error("missing remounted transcript scroller");
+		// A fresh MessageList mount must not run ordinary session initialization
+		// against the stale rendered page while App still owns this destination.
+		expect(remountedScroller.scrollTop).toBe(0);
+		Object.defineProperty(remountedScroller, "scrollTop", {
+			configurable: true,
+			get: () => scrollTop,
+			set: (value: number) => {
+				scrollTop = value;
+				writes.push(value);
+			},
+		});
+
+		await act(async () => destinationTurns.resolve(
+			turnsWithContent(
+				"root-1",
+				"entry-destination",
+				"canonical destination page",
+				2,
+			),
+		));
+		expect(await screen.findByText("canonical destination page")).toBeTruthy();
+		expect(screen.queryByText("old rendered page")).toBeNull();
+		expect(writes).toEqual([900]);
+
+		await act(async () => oldRefresh.resolve(
+			snapshot("root-1", null, null, "Root one", "entry-active"),
+		));
+		expect(screen.getByText("canonical destination page")).toBeTruthy();
+		expect(writes).toEqual([900]);
+
+		await mounted.dispose();
+		clientHeightSpy.mockRestore();
+		scrollHeightSpy.mockRestore();
+	});
 });
 
 type ApiSpy = ReturnType<typeof vi.fn>;
@@ -483,6 +784,7 @@ type RouteApi = AgentApi & {
 	startSession: ApiSpy;
 	switchHistory: ApiSpy;
 	emitStatus(status: ConnectionStatus): void;
+	emitEvent(event: EventFrame): void;
 };
 
 function createRouteApi(
@@ -490,6 +792,9 @@ function createRouteApi(
 		missingSessionIds?: Set<string>;
 		deferredSessions?: Map<string, Promise<SessionSnapshot>>;
 		historySessionIds?: Set<string>;
+		includeDestinationHistoryTarget?: boolean;
+		activeLeafIds?: Map<string, string | null>;
+		deferredTranscriptTurns?: Map<string, Promise<TranscriptTurnsResult>>;
 		deferredTranscriptEntries?: Promise<{
 			session_id: string;
 			session_revision: number;
@@ -500,7 +805,7 @@ function createRouteApi(
 ): RouteApi {
 	let open = false;
 	const statusListeners = new Set<(status: ConnectionStatus) => void>();
-	const eventListeners = new Set<(event: never) => void>();
+	const eventListeners = new Set<(event: EventFrame) => void>();
 	const summaries = [
 		summary("root-1", null, null, "Root one"),
 		summary("legacy-root", null, null, "Legacy root"),
@@ -548,7 +853,8 @@ function createRouteApi(
 				null,
 				null,
 				"Root one",
-				options.historySessionIds?.has(sessionId) ? "entry-active" : null,
+				options.activeLeafIds?.get(sessionId) ??
+					(options.historySessionIds?.has(sessionId) ? "entry-active" : null),
 			);
 		}
 		if (sessionId === "child-1") return snapshot("child-1", "root-1", null, "Child one");
@@ -604,7 +910,7 @@ function createRouteApi(
 			statusListeners.add(listener);
 			return () => statusListeners.delete(listener);
 		},
-		onEvent: (listener: (event: never) => void) => {
+		onEvent: (listener: (event: EventFrame) => void) => {
 			eventListeners.add(listener);
 			return () => eventListeners.delete(listener);
 		},
@@ -615,9 +921,11 @@ function createRouteApi(
 		listTools: vi.fn(async () => []),
 		getSession,
 		getTranscriptTurns: vi.fn(async (sessionId: string) =>
+			options.deferredTranscriptTurns?.get(sessionId) ??
 			emptyTurns(
 				sessionId,
-				options.historySessionIds?.has(sessionId) ? "entry-active" : null,
+				options.activeLeafIds?.get(sessionId) ??
+					(options.historySessionIds?.has(sessionId) ? "entry-active" : null),
 			)),
 		subscribeEvents: vi.fn(async () => []),
 		unsubscribeEvents: vi.fn(async () => undefined),
@@ -643,7 +951,7 @@ function createRouteApi(
 		deleteProject: mutation(),
 		getTranscriptIndex: vi.fn(async (sessionId: string) =>
 			options.historySessionIds?.has(sessionId)
-				? historyIndex(sessionId)
+				? historyIndex(sessionId, options.includeDestinationHistoryTarget)
 				: Promise.reject(new Error("unexpected transcript index read"))),
 		getTranscriptEntries: vi.fn(async () =>
 			options.deferredTranscriptEntries ??
@@ -657,6 +965,9 @@ function createRouteApi(
 		emitStatus(status: ConnectionStatus) {
 			open = status === "open";
 			for (const listener of statusListeners) listener(status);
+		},
+		emitEvent(event: EventFrame) {
+			for (const listener of eventListeners) listener(event);
 		},
 	} as unknown as RouteApi;
 	return api;
@@ -681,6 +992,48 @@ function renderRouteApp(api: RouteApi, browser: FakeWorkspaceBrowser) {
 			await client.cancelQueries();
 			client.clear();
 		},
+	};
+}
+
+function nonEmptyTurns(sessionId: string): TranscriptTurnsResult {
+	return turnsWithContent(sessionId, "entry-finish", "late routed content", 1);
+}
+
+function turnsWithContent(
+	sessionId: string,
+	activeLeafId: string,
+	text: string,
+	transcriptRevision: number,
+): TranscriptTurnsResult {
+	return {
+		...emptyTurns(sessionId, activeLeafId),
+		session_revision: transcriptRevision,
+		transcript_revision: transcriptRevision,
+		cards: [{
+			id: activeLeafId,
+			turn_id: 1,
+			status: "completed",
+			outcome: "Graceful",
+			start_entry_id: `${activeLeafId}-start`,
+			boundary_entry_id: activeLeafId,
+			active_leaf_id: activeLeafId,
+			start_sequence: 1,
+			end_sequence: 3,
+			start_timestamp_ms: 1,
+			timestamp_ms: 3,
+			user_messages: [{
+				id: `${activeLeafId}-user`,
+				parent_id: `${activeLeafId}-start`,
+				timestamp_ms: 2,
+				item: {
+					type: "user_message",
+					content: [{ type: "text", text }],
+				},
+			}],
+			assistant_message: null,
+			summary: null,
+			can_resume: false,
+		}],
 	};
 }
 
@@ -757,18 +1110,31 @@ function rememberLegacy(sessionId: string) {
 	rememberUiSelection(null, sessionId);
 }
 
-function historyIndex(sessionId: string): TranscriptTreeIndex {
+function historyIndex(
+	sessionId: string,
+	includeDestinationHistoryTarget = false,
+): TranscriptTreeIndex {
+	const destination = includeDestinationHistoryTarget
+		? [historyNode(
+				"entry-destination",
+				"entry-user",
+				3,
+				"turn_finished",
+				"Destination answer",
+			)]
+		: [];
 	return {
 		session_id: sessionId,
 		active_leaf_id: "entry-active",
 		session_revision: 1,
 		transcript_revision: 1,
 		after_sequence: 0,
-		max_sequence: 2,
+		max_sequence: includeDestinationHistoryTarget ? 3 : 2,
 		complete: true,
 		nodes: [
 			historyNode("entry-user", null, 1, "user_message", "Edit original prompt"),
 			historyNode("entry-active", "entry-user", 2, "turn_finished", "Original answer"),
+			...destination,
 		],
 	};
 }

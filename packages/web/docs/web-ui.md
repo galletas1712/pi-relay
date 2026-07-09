@@ -130,8 +130,32 @@ entry stream.
   in its segment.
 - Crashed or interrupted terminal turns expose a Continue/Retry action inline that calls `turn.resume`.
 - Turn-start, graceful turn-finish, and tool-call-start bookkeeping entries are not rendered as messages.
-- Turn-jump controls page between turn anchors; scroll position is sticky-to-bottom and persisted per session in
-  `localStorage`.
+- Turn-jump controls page between turn anchors. Entering a root or subagent
+  conversation—through direct load, navigation, Back/Forward, or a transcript
+  branch switch—waits for the matching rendered canonical turn page and
+  initializes once at latest/bottom. A successful branch-switch destination is
+  bound to its response session/leaf and a newer turn-page hydration revision;
+  loading state alone is not treated as content readiness. App owns and clears
+  the destination by ID only after `MessageList` acknowledges matching rendered
+  content, so a temporary Conversation/Execution remount still waits and a
+  later destination cannot be cleared by an older acknowledgement. Changing
+  conversation identity abandons the old destination. There is no per-session
+  mid-transcript scroll restoration.
+  After initialization, streaming remains sticky-to-bottom only while the user
+  stays near the bottom; deliberate scroll-up is preserved, including across
+  sparse canonical refreshes. An older-page request records whether the reader
+  was pinned. Every committed update—including an in-place duplicate card or
+  cursor-only update—waits for its rendered page hydration, then either restores
+  request-time bottom or preserves a measured visible-card offset, excluding
+  unrelated growth below the viewport. No-op, stale, failed, and rejected
+  outcomes also restore bottom after concurrent growth for a reader who started
+  pinned. Wheel, touch, scrollbar-drag, or keyboard scroll intent during the
+  request cancels both restoration modes; arbitrary browser/programmatic
+  `scroll` events alone do not.
+- The `/switch` branch dialog keeps focus on its heading and, once its async
+  history rows are available, scrolls the current target into view. If there is
+  no current target it starts at the bottom/latest row. This happens once per
+  dialog opening and does not fight later manual list scrolling.
 
 ### Tool calls render as collapsible groups
 
@@ -334,8 +358,9 @@ Composer text is persisted per session in `localStorage` under `piRelayComposerD
 Submission IDs are retained in memory with the pending draft for an unchanged
 retry, but are not persisted across a full page reload.
 There are no browser-local *session* drafts — only Postgres-backed sessions appear in the sidebar, and starting a new
-chat is purely composer state. UI selection (`piRelayUiResume:v1`) and transcript scroll position are the other
-`localStorage`-backed UI state.
+chat is purely composer state. Legacy UI selection migration uses
+`piRelayUiResume:v1`; transcript scroll position is not persisted, and the
+retired `piRelayTranscriptScroll:v1` key is removed defensively.
 
 ### Slash commands
 

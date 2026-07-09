@@ -18,6 +18,7 @@ import {
 	mergeSessionActivityEvent,
 	selectedEntries,
 	snapshotWithTranscriptTurnsMetadata,
+	prependTranscriptTurns,
 	treeNodesInOrder,
 } from "./selectedSessionCache.ts";
 import {
@@ -971,6 +972,80 @@ describe("selected session cache", () => {
 		);
 
 		expect(next).toBe(cache);
+	});
+
+	it("distinguishes committed insertions, committed in-place changes, true no-ops, and stale pages", () => {
+		let cache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([], {
+				activeLeafId: "entry_finish_new",
+				sessionRevision: 3,
+				transcriptRevision: 2,
+			}),
+		);
+		cache = applyTranscriptTurns(cache, {
+			session_id: sessionId,
+			active_leaf_id: "entry_finish_new",
+			session_revision: 3,
+			transcript_revision: 2,
+			before_entry_id: null,
+			next_before_entry_id: "entry_finish_old",
+			has_more_before: true,
+			limit: 1,
+			cards: [turnCard("entry_finish_new", 2)],
+		});
+		const older = {
+			session_id: sessionId,
+			active_leaf_id: "entry_finish_new",
+			session_revision: 3,
+			transcript_revision: 2,
+			before_entry_id: "entry_finish_old",
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 1,
+			cards: [turnCard("entry_finish_old", 1)],
+		};
+
+		const prepended = prependTranscriptTurns(cache, older);
+		expect(prepended.status).toBe("committed");
+		expect(prepended.turnPageHydrationRevision).toBe(
+			cache.turnPageHydrationRevision + 1,
+		);
+
+		const unchangedDuplicatePage = {
+			...older,
+			next_before_entry_id: "entry_finish_old",
+			has_more_before: true,
+			cards: [turnCard("entry_finish_new", 2)],
+		};
+		const duplicate = prependTranscriptTurns(cache, unchangedDuplicatePage);
+		expect(duplicate.status).toBe("noop");
+		expect(duplicate.cache).toBe(cache);
+
+		const changedDuplicate = prependTranscriptTurns(cache, {
+			...unchangedDuplicatePage,
+			cards: [{
+				...turnCard("entry_finish_new", 2),
+				summary: "changed duplicate summary",
+			}],
+		});
+		expect(changedDuplicate.status).toBe("committed");
+		expect(changedDuplicate.cache.turnCardsById.get("entry_finish_new")?.summary)
+			.toBe("changed duplicate summary");
+
+		const cursorOnly = prependTranscriptTurns(cache, {
+			...unchangedDuplicatePage,
+			next_before_entry_id: "next-cursor",
+		});
+		expect(cursorOnly.status).toBe("committed");
+		expect(cursorOnly.cache.turnBeforeEntryId).toBe("next-cursor");
+
+		const stale = prependTranscriptTurns(cache, {
+			...older,
+			before_entry_id: "stale-cursor",
+		});
+		expect(stale.status).toBe("stale");
+		expect(stale.cache).toBe(cache);
 	});
 
 	it("ignores stale replacement transcript.turns pages after append events advance the cache", () => {

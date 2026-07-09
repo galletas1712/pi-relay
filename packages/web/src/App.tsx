@@ -3,6 +3,13 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { ArrowUp, Bot, Menu, PanelRightOpen } from "lucide-react";
 import { createAgentApi, type AgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
+import { clearAcknowledgedTranscriptDestination } from "./transcript.tsx";
+import type {
+	OlderTurnsLoadRequest,
+	OlderTurnsLoadResult,
+	TranscriptDestination,
+	TranscriptTurnPageIdentity,
+} from "./transcript.tsx";
 import { Composer, type ComposerHandle } from "./composer.tsx";
 import { routeComposerSubmission, type ComposerSubmission } from "./composerRouting.ts";
 import {
@@ -61,6 +68,7 @@ import {
 	emptySelectedSessionCache,
 	hasUsableSelectedSessionCache,
 	mergeSessionActivityEvent,
+	prependTranscriptTurns,
 	queueProjectionFromEvent,
 	captureSelectedSessionRefresh,
 	commitSelectedSessionRefresh,
@@ -394,7 +402,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [sending, setSending] = useState(false);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
-	const [historySwitchingSessionId, setHistorySwitchingSessionId] = useState<string | null>(null);
+	const [transcriptDestination, setTranscriptDestination] = useState<TranscriptDestination | null>(null);
 	const [sidebarOpen, setSidebarOpen] = useState(() => defaultPanelState(panelModeForViewport()).sidebarOpen);
 	const [rightOpen, setRightOpen] = useState(() => defaultPanelState(panelModeForViewport()).rightOpen);
 	const [panelMode, setPanelMode] = useState<PanelMode>(() => panelModeForViewport());
@@ -460,6 +468,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
 	const sidebarSelectTimer = useRef<number | null>(null);
 	const autoLoadedTurnDetailRef = useRef<string | null>(null);
+	const nextTranscriptDestinationIdRef = useRef(0);
 	const lastForegroundReconcileAt = useRef(Date.now());
 	const lastAwakeAt = useRef(Date.now());
 	const foregroundReconnectInFlight = useRef<Promise<void> | null>(null);
@@ -672,13 +681,12 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 
 	const loadedSnapshot = selectedCache.sessionId === selectedId ? selectedCache.snapshot : null;
-	const historySwitchingSelectedSession = !!selectedId && historySwitchingSessionId === selectedId;
 	const selectedLoading = selectedFetchState.sessionId === selectedId && selectedFetchState.loading;
 	const selectedRetrying = selectedFetchState.sessionId === selectedId && selectedFetchState.retrying;
 	const selectedError = selectedFetchState.sessionId === selectedId ? selectedFetchState.error : null;
 	const selectedErrorHasUsableCache =
 		selectedFetchState.sessionId === selectedId && selectedFetchState.hadUsableCache;
-	const transcriptLoading = !!selectedId && (selectedLoading || historySwitchingSelectedSession);
+	const transcriptLoading = !!selectedId && selectedLoading;
 	const loadedEntries = useMemo(
 		() => (selectedCache.sessionId === selectedId ? selectedEntries(selectedCache) : []),
 		[selectedCache.activeBranchEntryIds, selectedCache.entriesById, selectedCache.sessionId, selectedId],
@@ -690,6 +698,23 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const orderedTurnCards = useMemo(
 		() => (selectedCache.sessionId === selectedId ? turnCardsInOrder(selectedCache) : []),
 		[selectedCache.sessionId, selectedCache.turnCardsById, selectedCache.turnOrder, selectedId],
+	);
+	const transcriptTurnPageIdentity = useMemo<TranscriptTurnPageIdentity | null>(
+		() =>
+			selectedCache.sessionId === selectedId && selectedCache.transcriptTurnsLoaded && selectedId
+				? {
+						sessionId: selectedId,
+						leafId: selectedCache.turnActiveLeafId,
+						hydrationRevision: selectedCache.turnPageHydrationRevision,
+					}
+				: null,
+		[
+			selectedCache.sessionId,
+			selectedCache.transcriptTurnsLoaded,
+			selectedCache.turnActiveLeafId,
+			selectedCache.turnPageHydrationRevision,
+			selectedId,
+		],
 	);
 	const latestTurnCard = orderedTurnCards.at(-1) ?? null;
 	const runningTurnCardId = loadedSnapshot?.activity === "running" && latestTurnCard?.status === "open" ? latestTurnCard.id : null;
@@ -948,6 +973,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			return;
 		}
 		if (sessionId === null) nextSessionTitleRef.current = null;
+		setTranscriptDestination((current) =>
+			current?.sessionId === sessionId ? current : null
+		);
 		setHistoryDialog((current) => current?.sessionId === sessionId ? current : null);
 		selectedRef.current = sessionId;
 		setConversationSessionId(sessionId);
@@ -958,6 +986,12 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			hasUsableSelectedSessionCache(nextCache, sessionId),
 		);
 	}, [resetSelectedCache, selectedFetchCoordinator]);
+
+	const acknowledgeTranscriptDestination = useCallback((destinationId: number) => {
+		setTranscriptDestination((current) =>
+			clearAcknowledgedTranscriptDestination(current, destinationId)
+		);
+	}, []);
 
 	const applyProjectConversationIdentity = useCallback((projectId: string | null, sessionId: string | null) => {
 		selectedProjectRef.current = projectId;
@@ -1513,11 +1547,17 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	}, [allKnownSessions, backgroundSubagentWarmCandidates, connection, getSelectedCache, warmBackgroundSession]);
 
 	const loadOlderTranscriptTurns = useCallback(
-		async () => {
+		async (request: OlderTurnsLoadRequest): Promise<OlderTurnsLoadResult> => {
 			const sessionId = selectedRef.current;
-			if (!sessionId || loadingOlderTurns) return;
+			const resultFor = (
+				status: OlderTurnsLoadResult["status"],
+				turnPageHydrationRevision?: number,
+			): OlderTurnsLoadResult => ({ ...request, status, turnPageHydrationRevision });
+			if (!sessionId || sessionId !== request.sessionId || loadingOlderTurns) return resultFor("stale");
 			const cache = selectedCacheRef.current;
-			if (cache.sessionId !== sessionId || !cache.turnHasMoreBefore || !cache.turnBeforeEntryId) return;
+			if (cache.sessionId !== sessionId || !cache.turnHasMoreBefore || !cache.turnBeforeEntryId) {
+				return resultFor("noop");
+			}
 			const beforeEntryId = cache.turnBeforeEntryId;
 			try {
 				assertServerReadAllowed();
@@ -1526,17 +1566,18 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					beforeEntryId,
 					limit: TRANSCRIPT_TURN_PAGE_SIZE,
 				});
-				if (selectedRef.current !== sessionId) return;
-				updateSelectedCache((current) =>
-					applyTranscriptTurns(current.sessionId === sessionId ? current : selectedCacheRef.current, result, { mode: "prepend" }),
-				);
+				if (selectedRef.current !== sessionId) return resultFor("stale");
+				const completion = prependTranscriptTurns(selectedCacheRef.current, result);
+				replaceSelectedCache(completion.cache);
+				return resultFor(completion.status, completion.turnPageHydrationRevision);
 			} catch (error) {
 				if (selectedRef.current === sessionId) pushNotice("error", errorMessage(error));
+				return resultFor("failed");
 			} finally {
 				setLoadingOlderTurns(false);
 			}
 		},
-		[api, assertServerReadAllowed, loadingOlderTurns, pushNotice, updateSelectedCache],
+		[api, assertServerReadAllowed, loadingOlderTurns, pushNotice, replaceSelectedCache],
 	);
 
 	const getFreshSession = useCallback(
@@ -1601,11 +1642,16 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 
 	const refreshSelectedSessionState = useCallback(
-		async (sessionId: string) => {
+		async (
+			sessionId: string,
+			options: { preserveRenderedCache?: boolean } = {},
+		) => {
 			if (sessionId !== selectedRef.current) return null;
 			assertServerReadAllowed();
 			const cacheBeforeRequest = selectedCacheRef.current;
-			const hasUsableCache = hasUsableSelectedSessionCache(cacheBeforeRequest, sessionId);
+			const hasUsableCache =
+				options.preserveRenderedCache ||
+				hasUsableSelectedSessionCache(cacheBeforeRequest, sessionId);
 			return selectedFetchCoordinator.run(sessionId, hasUsableCache, async (selectionVersion) => {
 				for (;;) {
 					const cacheAtRefreshStart = selectedCacheRef.current;
@@ -2531,13 +2577,33 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				invalidateSessionList(projectId);
 				return;
 			}
+			const destinationChanged =
+				result.active_leaf_id !== (snapshot.active_leaf_id ?? null);
+			const turnPageHydrationRevisionBeforeSwitch =
+				selectedCacheRef.current.turnPageHydrationRevision;
+			const hadUsableCacheBeforeSwitch =
+				hasUsableSelectedSessionCache(selectedCacheRef.current, sessionId);
 			if (restoreText !== null) composerHandleRef.current?.setValue(restoreText);
 			updateSelectedCache((current) =>
 				current.sessionId === sessionId
 					? applySwitchResultToCache(current, result)
 					: current,
 			);
-			await refreshSelectedSessionState(sessionId);
+			if (destinationChanged) {
+				setTranscriptDestination({
+					id: ++nextTranscriptDestinationIdRef.current,
+					sessionId,
+					targetLeafId: result.active_leaf_id,
+					minimumTurnPageHydrationRevision:
+						turnPageHydrationRevisionBeforeSwitch + 1,
+				});
+				// Fence an old usable-cache refresh and start a new canonical
+				// request without replacing the still-valid rendered page.
+				selectedFetchCoordinator.restart(hadUsableCacheBeforeSwitch);
+			}
+			await refreshSelectedSessionState(sessionId, {
+				preserveRenderedCache: destinationChanged && hadUsableCacheBeforeSwitch,
+			});
 			if (result.last_event_id !== undefined) lastEventIds.current.set(sessionId, result.last_event_id);
 			invalidateSessionList(projectId);
 			pushNotice("success", restoreText !== null ? "message restored for editing" : "switched to selected history point");
@@ -2550,6 +2616,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			invalidateSessionList,
 			pushNotice,
 			refreshSelectedSessionState,
+			selectedFetchCoordinator,
 			updateSelectedCache,
 		],
 	);
@@ -2574,13 +2641,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			const projectId = snapshot.project_id;
 			setHistoryDialog(null);
-			setHistorySwitchingSessionId(sessionId);
 			void switchToTarget(sessionId, projectId, snapshot, targetCache, target)
 				.catch((error) => {
 					if (!isSelectedSessionFetchError(error)) pushNotice("error", errorMessage(error));
-				})
-				.finally(() => {
-					setHistorySwitchingSessionId((current) => (current === sessionId ? null : current));
 				});
 		},
 		[assertServerMutationAllowed, getSelectedCache, historyDialog, pushNotice, switchToTarget],
@@ -3321,6 +3384,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						hasOlderTurns={selectedCache.sessionId === selectedId && selectedCache.turnHasMoreBefore}
 						loadingOlderTurns={loadingOlderTurns}
 						onLoadOlderTurns={loadOlderTranscriptTurns}
+						transcriptDestination={transcriptDestination}
+						transcriptTurnPageIdentity={transcriptTurnPageIdentity}
+						onAcknowledgeTranscriptDestination={acknowledgeTranscriptDestination}
 						onRetryTranscript={retrySelected}
 						routeNotice={
 							persistentRouteWarnings.length > 0 || recipientLabel ? (

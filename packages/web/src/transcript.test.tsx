@@ -3,19 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	adjacentTurnJumpTargetId,
 	assistantRenderParts,
-	captureScrollPosition,
 	editToolPreview,
 	formatElapsed,
 	isScrolledAtBottom,
-	loadTranscriptScrollPositions,
 	MessageList,
-	restoreScrollPosition,
 	runningTurnClockAnchor,
 	runningTurnStartMs,
-	saveTranscriptScrollPositions,
 	stableWorkingElapsedMs,
-	TRANSCRIPT_SCROLL_STORAGE_KEY,
-	type TranscriptScrollStorage,
 	ToolOutput,
 } from "./transcript.tsx";
 import type { AssistantItem, PendingAction, TranscriptEntry, TurnCard } from "./types.ts";
@@ -312,47 +306,6 @@ describe("isScrolledAtBottom", () => {
 
 	it("treats overscroll past the bottom as pinned", () => {
 		expect(isScrolledAtBottom({ scrollHeight: 1000, scrollTop: 601, clientHeight: 400 })).toBe(true);
-	});
-});
-
-describe("scroll position snapshots", () => {
-	it("restores an unpinned scroll offset", () => {
-		const node = { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 };
-		const position = captureScrollPosition({ ...node, scrollTop: 250 });
-
-		const sticky = restoreScrollPosition(node, position);
-
-		expect(node.scrollTop).toBe(250);
-		expect(sticky).toBe(false);
-	});
-
-	it("restores sticky-bottom as the current bottom", () => {
-		const node = { scrollHeight: 1400, scrollTop: 0, clientHeight: 400 };
-
-		const sticky = restoreScrollPosition(node, { scrollTop: 600, sticky: true });
-
-		expect(node.scrollTop).toBe(1000);
-		expect(sticky).toBe(true);
-	});
-
-	it("persists transcript scroll positions by session key", () => {
-		const storage = memoryStorage();
-		const positions = new Map([
-			["session_a", { scrollTop: 250, sticky: false }],
-			["session_b", { scrollTop: 900, sticky: true }],
-		]);
-
-		saveTranscriptScrollPositions(positions, storage);
-
-		expect(loadTranscriptScrollPositions(storage)).toEqual(positions);
-	});
-
-	it("clears persisted transcript scroll positions when none remain", () => {
-		const storage = memoryStorage();
-
-		saveTranscriptScrollPositions(new Map(), storage);
-
-		expect(storage.getItem(TRANSCRIPT_SCROLL_STORAGE_KEY)).toBeNull();
 	});
 });
 
@@ -1096,19 +1049,6 @@ function turnCard(id: string, turnId: number, userText: string): TurnCard {
 		assistant_message: assistantEntry(`assistant_${turnId}`, `user_${turnId}`, `answer ${turnId}`),
 		summary: null,
 		can_resume: false,
-	};
-}
-
-function memoryStorage(): TranscriptScrollStorage {
-	const data = new Map<string, string>();
-	return {
-		getItem: (key) => data.get(key) ?? null,
-		setItem: (key, value) => {
-			data.set(key, value);
-		},
-		removeItem: (key) => {
-			data.delete(key);
-		}
 	};
 }
 

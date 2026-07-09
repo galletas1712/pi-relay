@@ -153,6 +153,145 @@ describe("compact history branch disclosure", () => {
 		expect(document.activeElement).toBe(opener);
 	});
 
+	it("scrolls the current branch target into view once without moving heading focus", async () => {
+		const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function () {
+			if (this.getAttribute("aria-selected") === "true") return rect(150, 180);
+			if (this.getAttribute("role") === "tree") return rect(0, 100);
+			return rect(0, 0);
+		});
+		const { rerender } = render(
+			<CompactHistoryPickerDialog
+				nodes={[]}
+				activeLeafId="active"
+				loading
+				onClose={() => undefined}
+				onSwitch={() => undefined}
+			/>,
+		);
+		const list = screen.getByRole("tree", { name: "switch targets" });
+		list.scrollTop = 10;
+		rerender(
+			<CompactHistoryPickerDialog
+				nodes={branchFixture()}
+				activeLeafId="active"
+				onClose={() => undefined}
+				onSwitch={() => undefined}
+			/>,
+		);
+
+		expect(list.scrollTop).toBe(90);
+		expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Switch branch" }));
+		list.scrollTop = 25;
+		rerender(
+			<CompactHistoryPickerDialog
+				nodes={[...branchFixture()]}
+				activeLeafId="active"
+				onClose={() => undefined}
+				onSwitch={() => undefined}
+			/>,
+		);
+		expect(list.scrollTop).toBe(25);
+		rectSpy.mockRestore();
+	});
+
+	it("falls back to the bottom when no current target exists", () => {
+		const { rerender } = render(
+			<CompactHistoryPickerDialog
+				nodes={[]}
+				activeLeafId={null}
+				loading
+				onClose={() => undefined}
+				onSwitch={() => undefined}
+			/>,
+		);
+		const list = screen.getByRole("tree", { name: "switch targets" });
+		Object.defineProperties(list, {
+			clientHeight: { configurable: true, value: 100 },
+			scrollHeight: { configurable: true, value: 500 },
+		});
+		rerender(
+			<CompactHistoryPickerDialog
+				nodes={branchFixture()}
+				activeLeafId={null}
+				onClose={() => undefined}
+				onSwitch={() => undefined}
+			/>,
+		);
+
+		expect(list.scrollTop).toBe(400);
+	});
+
+	it("reinitializes on close/reopen and waits for a late active row", async () => {
+		const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function () {
+			if (this.getAttribute("aria-selected") === "true") return rect(140, 170);
+			if (this.getAttribute("role") === "tree") return rect(0, 100);
+			return rect(0, 0);
+		});
+		const partial = branchFixture().filter((node) => node.id !== "active");
+		const user = userEvent.setup();
+		const view = render(
+			<HistoryLauncher nodes={[]} loading={false}>
+				{(close) => (
+					<CompactHistoryPickerDialog
+						nodes={partial}
+						activeLeafId="active"
+						onClose={close}
+						onSwitch={() => undefined}
+					/>
+				)}
+			</HistoryLauncher>,
+		);
+		const opener = screen.getByRole("button", { name: "Open history" });
+		await user.click(opener);
+		let list = screen.getByRole("tree", { name: "switch targets" });
+		list.scrollTop = 10;
+		view.rerender(
+			<HistoryLauncher nodes={[]} loading={false}>
+				{(close) => (
+					<CompactHistoryPickerDialog
+						nodes={branchFixture()}
+						activeLeafId="active"
+						onClose={close}
+						onSwitch={() => undefined}
+					/>
+				)}
+			</HistoryLauncher>,
+		);
+		expect(list.scrollTop).toBe(80);
+		await user.keyboard("{Escape}");
+		await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+		view.rerender(
+			<HistoryLauncher nodes={[]} loading={false}>
+				{(close) => (
+					<CompactHistoryPickerDialog
+						nodes={partial}
+						activeLeafId="active"
+						onClose={close}
+						onSwitch={() => undefined}
+					/>
+				)}
+			</HistoryLauncher>,
+		);
+		await user.click(opener);
+		list = screen.getByRole("tree", { name: "switch targets" });
+		list.scrollTop = 5;
+		view.rerender(
+			<HistoryLauncher nodes={[]} loading={false}>
+				{(close) => (
+					<CompactHistoryPickerDialog
+						nodes={branchFixture()}
+						activeLeafId="active"
+						onClose={close}
+						onSwitch={() => undefined}
+					/>
+				)}
+			</HistoryLauncher>,
+		);
+		expect(list.scrollTop).toBe(75);
+		rectSpy.mockRestore();
+	});
+
 	it("closes on an outside pointer interaction and restores opener focus", async () => {
 		const user = userEvent.setup({ pointerEventsCheck: 0 });
 		render(
@@ -229,4 +368,18 @@ function HistoryLauncher({
 			{open ? children(() => setOpen(false), fallbackRef) : null}
 		</>
 	);
+}
+
+function rect(top: number, bottom: number): DOMRect {
+	return {
+		x: 0,
+		y: top,
+		top,
+		bottom,
+		left: 0,
+		right: 100,
+		width: 100,
+		height: bottom - top,
+		toJSON: () => ({}),
+	};
 }

@@ -17,6 +17,7 @@ export interface SelectedSessionCache {
 	turnOrder: string[];
 	turnDetailsById: Map<string, string[]>;
 	transcriptTurnsLoaded: boolean;
+	turnPageHydrationRevision: number;
 	turnTranscriptRevision: number | null;
 	turnActiveLeafId: string | null;
 	turnHasMoreBefore: boolean;

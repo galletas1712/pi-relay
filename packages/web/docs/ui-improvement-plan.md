@@ -82,7 +82,7 @@ Line citations describe the repository state used to write this plan and may mov
 | Immutable send routing | Composer routing uses the captured session ID, requires a matching snapshot, and routes root follow-up versus parent-scoped subagent steering without rereading current selection (`packages/web/src/composerRouting.ts:30-86`). | Preserve this capture-at-intent pattern for every message and mutation. |
 | Stale-response protection | Selected-session refreshes verify the current selected ID before committing, coalesce requests per session, and ignore late selection changes (`packages/web/src/App.tsx:878-938`). Cache reducers reject session-mismatched entry, branch, tree, queue, and turn payloads and reject stale revision/page combinations where applicable (`packages/web/src/selectedSessionCache.ts:112-218`, `packages/web/src/selectedSessionCache/turns.ts:6-21`). | Generalize the guard from a single selection to root/conversation/focus stores; never weaken it. |
 | Warm per-session cache | The selected-session store retains a map of session caches and repoints without evicting other sessions (`packages/web/src/selectedSessionStore.ts:20-69`). | Conversation switching within a root run should remain fast and must not force a full reload. |
-| Scroll safety | Sticky-bottom and explicit scroll positions are saved per session, restored after content is ready, and maintained through resize (`packages/web/src/transcript.tsx:233-369`). | Preserve manual scroll-up, sticky-bottom behavior, and viewport anchoring while a conversation remains active. **Superseded for navigation entry:** entering a root/subagent chat through navigation, direct-link refresh, Back/Forward, or history branch switch starts at the destination transcript's latest/bottom rather than restoring an old mid-transcript position. A dedicated next PR implements this policy. |
+| Scroll safety | Destination initialization is keyed to conversation entry or an explicit successful branch-switch destination. Switch destinations carry the response session/leaf plus a minimum canonical turn-page hydration revision, so root/subagent navigation, direct-link refresh, Back/Forward, and committed branch switches wait for the matching rendered page and then start at latest/bottom. Per-session mid-transcript persistence has been removed and its legacy key is retired. After initialization, ordinary daemon/cache leaf advances follow only while pinned, and every committed older-page update preserves a measured visible-card offset using the matching load result (`packages/web/src/transcript.tsx`). | Preserve manual scroll-up, one-shot destination initialization, sticky-bottom streaming behavior, and measured prepend anchoring. Do not reintroduce mid-transcript restoration or infer navigation from sparse rendered bodies/loading flags. |
 | Bounded/lazy transcript loading | The app loads a 50-turn page and lazily fetches older turns/detail (`packages/web/src/App.tsx:113-114`, `packages/web/src/transcript.tsx:483-507`). | Measure before virtualizing; do not discard paging and lazy detail. |
 | Live-work feedback | Current-turn detail and a server-anchored elapsed “Working…” indicator expose progress (`packages/web/src/transcript.tsx:420-444`, `packages/web/src/transcript.tsx:535-537`). | Preserve live visibility while reducing ambient motion elsewhere. |
 | Visual identity and theme foundations | Light/dark Gruvbox tokens, Geist Sans/Mono, and Space Grotesk are declared centrally (`packages/web/src/styles.css:1-32`, `packages/web/src/styles.css:112-154`). | Correct contrast and hierarchy in place rather than replacing the palette or typography. |
@@ -612,13 +612,21 @@ Implementation slices:
 - Add a **Jump to latest** / `N new events` affordance when live content arrives while the reader is not sticky-bottom.
 - Preserve current previous/next turn controls as secondary navigation; the new-event affordance solves a different problem.
 - Do not auto-scroll readers who moved away from the bottom.
-- **Dedicated next PR — destination initialization:** root/subagent navigation,
+- **Implemented (PR12) — destination initialization:** root/subagent navigation,
   direct-link refresh, Back/Forward, and history branch switch initialize the
-  destination transcript at latest/bottom. The Switch dialog opens scrolled to
-  the active/latest target or bottom. After initialization, respect manual
-  scroll-up and sticky-bottom behavior; loading older turns preserves the
-  viewport anchor. This supersedes restoring an old mid-transcript scroll when
-  entering a chat via navigation.
+  destination transcript at latest/bottom only after its explicit canonical
+  leaf/page hydration identity is rendered. Destination ownership and
+  ID-matched acknowledgement live in App, so temporary transcript remounts
+  defer stale-card initialization and cannot replay or clear a newer
+  destination. The Switch dialog opens scrolled to the active/latest target or
+  bottom. After initialization, respect manual scroll-up and sticky-bottom
+  behavior. Older-page requests record request-time pinned state: committed
+  pages wait for matching rendered hydration before bottom restoration or
+  measured unpinned anchor correction, while no-op/stale/failure/rejection also
+  restore bottom after concurrent growth. Explicit wheel, touch,
+  scrollbar-drag, or keyboard scroll intent cancels either restoration. This
+  supersedes restoring an old mid-transcript scroll when entering a chat via
+  navigation.
 
 **Code and tools**
 
@@ -632,7 +640,7 @@ Implementation slices:
 
 - Instrument render/commit time, interaction latency, node count, memory, and scroll correction first.
 - Test long sessions with collapsed and expanded details.
-- Add virtualization only if agreed thresholds are exceeded and a prototype preserves sticky-bottom, persisted positions, expanded detail, browser find expectations, and screen-reader reading order.
+- Add virtualization only if agreed thresholds are exceeded and a prototype preserves latest-on-entry initialization, sticky-bottom/manual-scroll state, older-page viewport anchors, expanded detail, browser find expectations, and screen-reader reading order.
 
 ### 9.7 Composer and command discovery
 
@@ -897,9 +905,8 @@ Exit gate:
 - Root and conversation can differ without changing the root execution query.
 - Conversation and Execution deep links—including absent, valid non-root, and invalid Execution `conversation` queries—pass refresh, canonicalization, and Back/Forward browser tests.
 - Focus-only changes never alter the effective conversation or recipient; explicit Message/Open conversation actions navigate to Conversation.
-- Drafts survive route transitions. A dedicated next PR makes every destination
-  chat entry start at latest/bottom while preserving manual scroll behavior
-  after initialization.
+- Drafts survive route transitions. Destination chat entry starts at
+  latest/bottom while preserving manual scroll behavior after initialization.
 - Mutation-target safety tests prove selection/focus changes cannot retarget an in-flight action.
 - Overlay background inerting and focus restoration pass.
 
@@ -1399,7 +1406,7 @@ These are bounded decisions, not reasons to defer the architecture:
 | R54 | Metrics, observability, rollout flags, migration, rollback | 0-7 | Dashboard and rollout checklist |
 | R55 | No duplicate authoritative run surfaces | 3 | Feature-flag/product-path audit |
 | R56 | No wholesale rebrand or premature graph/durable timeline claims | All | Design/content review |
-| R57 | Destination chat entry starts at latest/bottom for root/subagent navigation, direct-link refresh, Back/Forward, and branch switch; Switch dialog opens at active/latest or bottom; later manual scroll/sticky behavior and older-turn viewport anchors remain stable. This supersedes old mid-transcript restoration on navigation. | Dedicated next PR, then 5 | Route/refresh/Back/Forward/branch-switch interaction tests plus viewport-anchor tests |
+| R57 | **Implemented in PR12.** Destination chat entry starts at latest/bottom for root/subagent navigation, direct-link refresh, Back/Forward, and branch switch after matching canonical session/leaf/page hydration; App owns ID-keyed acknowledgement across transcript remounts. Switch opens once per opening at active/current or bottom. Older-page loads restore request-time pinned readers after committed/no-op/stale/failed/rejected outcomes, preserve measured unpinned anchors for matching committed hydration, and cancel both behaviors on deliberate scroll intent. Per-session mid-transcript restoration was removed. | 5 | Route/remount/refresh/Back/Forward/branch-switch coordinator-race tests, metadata-rerender and streaming tests, plus Switch and pinned/unpinned prepend outcome matrices |
 
 ## 20. Overall Definition of Done
 

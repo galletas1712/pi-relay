@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { ChevronRight, Loader2, RotateCcw } from "lucide-react";
 import {
 	AppDialog,
@@ -57,6 +57,8 @@ export function CompactHistoryPickerDialog({
 	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
 	const titleRef = useRef<HTMLHeadingElement>(null);
+	const optionsRef = useRef<HTMLDivElement>(null);
+	const initializedScrollRef = useRef(false);
 	const [expandedBranches, setExpandedBranches] = useState<Set<string>>(() => new Set());
 	const options = useMemo(
 		() => historySwitchOptionsFromNodes(nodes, activeLeafId),
@@ -106,6 +108,19 @@ export function CompactHistoryPickerDialog({
 		});
 	};
 	const targetCount = visibleRows.length;
+	useLayoutEffect(() => {
+		if (initializedScrollRef.current || loading || error || renderedRows.length === 0) return;
+		const list = optionsRef.current;
+		if (!list) return;
+		const active = list.querySelector<HTMLElement>('[role="treeitem"][aria-selected="true"]');
+		if (active) scrollHistoryTargetIntoView(list, active);
+		else if (activeLeafId === null || nodes.some((node) => node.id === activeLeafId)) {
+			list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+		} else {
+			return;
+		}
+		initializedScrollRef.current = true;
+	}, [activeLeafId, error, loading, nodes, renderedRows]);
 
 	return (
 		<AppDialog
@@ -127,7 +142,7 @@ export function CompactHistoryPickerDialog({
 				<DialogCloseButton label="close picker" />
 			</div>
 
-			<div className="history-options tree" role="tree" aria-label="switch targets">
+			<div ref={optionsRef} className="history-options tree" role="tree" aria-label="switch targets">
 				<ConnectionBlockedReason reason={mutationBlockedReason} className="history-blocked-reason" />
 				{historyPickerContent({
 					loading,
@@ -146,6 +161,16 @@ export function CompactHistoryPickerDialog({
 			</div>
 		</AppDialog>
 	);
+}
+
+export function scrollHistoryTargetIntoView(list: HTMLElement, target: HTMLElement): void {
+	const listRect = list.getBoundingClientRect();
+	const targetRect = target.getBoundingClientRect();
+	if (targetRect.top < listRect.top) {
+		list.scrollTop += targetRect.top - listRect.top;
+	} else if (targetRect.bottom > listRect.bottom) {
+		list.scrollTop += targetRect.bottom - listRect.bottom;
+	}
 }
 
 function historyPickerContent({
