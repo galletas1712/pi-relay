@@ -349,6 +349,10 @@ pre {
 	transform: translateX(0);
 }
 
+.sidebar-resize-handle {
+	display: none;
+}
+
 .log-header {
 	display: flex;
 	align-items: center;
@@ -3152,11 +3156,11 @@ pre {
 
 @media (min-width: 1280px) {
 	.app-shell {
-		grid-template-columns: 320px minmax(0, 1fr) minmax(320px, 380px);
+		grid-template-columns: var(--sidebar-width, 320px) minmax(0, 1fr) minmax(320px, 380px);
 	}
 
 	.app-shell:not(.inspector-open) {
-		grid-template-columns: 320px minmax(0, 1fr);
+		grid-template-columns: var(--sidebar-width, 320px) minmax(0, 1fr);
 	}
 
 	.mobile-topbar {
@@ -3172,6 +3176,48 @@ pre {
 		padding-left: 0;
 		box-shadow: none;
 		transform: none;
+	}
+
+	.sidebar-resize-handle {
+		position: absolute;
+		z-index: 45;
+		top: 0;
+		bottom: 0;
+		left: calc(var(--sidebar-width, 320px) - 5px);
+		display: block;
+		width: 10px;
+		border: 0;
+		background: transparent;
+		padding: 0;
+		cursor: col-resize;
+		touch-action: none;
+	}
+
+	.sidebar-resize-handle::after {
+		content: "";
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		left: 4px;
+		width: 2px;
+		background: transparent;
+		transition: background 120ms ease;
+	}
+
+	.sidebar-resize-handle:hover::after,
+	.sidebar-resize-handle:focus-visible::after,
+	.app-shell.sidebar-resizing .sidebar-resize-handle::after {
+		background: var(--primary);
+	}
+
+	.sidebar-resize-handle:focus-visible {
+		outline: 0;
+	}
+
+	.app-shell.sidebar-resizing,
+	.app-shell.sidebar-resizing * {
+		cursor: col-resize !important;
+		user-select: none;
 	}
 
 	/* sidebar is part of the static grid here, so its close X is meaningless */
