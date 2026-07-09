@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_provider::{ModelResponse, ModelStopDetails, ModelStopReason, ModelTranscriptEntry};
 use agent_session::{
-    AgentSession, ModelContext, ModelContextEntry, SessionAction, TranscriptStorageNode,
+    AgentSession, ModelContext, ModelContextEntry, SessionAction, StoredSession,
+    TranscriptStorageNode,
 };
 use agent_store::{
     ActionKind, ActionStatus, ActionUpdate, CompactionCompletion, CompactionScope,
@@ -73,7 +74,7 @@ use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart,
 };
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
-use crate::types::DispatchAction;
+use crate::types::{DispatchAction, RuntimeSession};
 use crate::workspaces::WorkspaceManager;
 
 use super::{
@@ -348,6 +349,187 @@ async fn empty_dispatch_stops_after_the_pending_query() {
         .expect("missing session has no pending actions");
 
     assert!(dispatched.is_empty());
+    drop(driver);
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn true_empty_active_output_pass_opens_no_transaction_or_events() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let session_id = "empty-active-output";
+    let project_id = Uuid::new_v4();
+    let active = Arc::new(Mutex::new(RuntimeSession {
+        session: AgentSession::new(),
+        config: session_config(&env, project_id, json!({})),
+        persisted_active_leaf_id: None,
+    }));
+    let mut events = env.state.events.subscribe();
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    env.state.repo.close().await;
+
+    let dispatched = driver
+        .persist_active_outputs(active, None, None, None, Vec::new())
+        .await
+        .expect("empty output does not touch the closed pool");
+
+    assert!(dispatched.is_empty());
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    drop(driver);
+    env.cleanup().await;
+}
+
+fn active_leaf_test_entries(session_id: &str) -> Vec<TranscriptStorageNode> {
+    ["a", "b"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, suffix)| TranscriptStorageNode {
+            id: format!("{session_id}-{suffix}"),
+            parent_id: None,
+            timestamp_ms: index as u64 + 1,
+            item: TranscriptItem::CompactionSummary(CompactionSummary::new(
+                session_id,
+                format!("source-{suffix}"),
+                suffix,
+                None,
+                TurnId(index as u64 + 1),
+            )),
+            provider_replay: Vec::new(),
+        })
+        .collect()
+}
+
+fn recovered_session_at(
+    session_id: &str,
+    entries: &[TranscriptStorageNode],
+    active_leaf_id: Option<&str>,
+) -> AgentSession {
+    let mut stored = StoredSession::new(session_id);
+    stored.active_leaf_id = active_leaf_id.map(str::to_string);
+    stored.entries = entries.iter().cloned().map(Into::into).collect();
+    AgentSession::from_stored_session(stored).expect("test session recovers")
+}
+
+async fn create_active_leaf_test_session(
+    env: &TestEnv,
+    session_id: &str,
+    entries: &[TranscriptStorageNode],
+    active_leaf_id: Option<&str>,
+) -> SessionConfig {
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "active leaf persistence test", &[], json!({}))
+        .await
+        .expect("create active-leaf test project");
+    let config = session_config(env, project_id, json!({}));
+    env.state
+        .repo
+        .start_session_outputs(
+            session_id,
+            &config,
+            entries,
+            active_leaf_id,
+            &[],
+            &[],
+            InputPriority::FollowUp,
+            &UserMessage::text("setup"),
+            None,
+        )
+        .await
+        .expect("create active-leaf test session");
+    config
+}
+
+#[tokio::test]
+async fn persisted_active_leaf_tracks_set_change_and_clear() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let session_id = "persisted-active-leaf-transitions";
+    let entries = active_leaf_test_entries(session_id);
+    let first_leaf = entries[0].id.as_str();
+    let second_leaf = entries[1].id.as_str();
+    let config = create_active_leaf_test_session(&env, session_id, &entries, None).await;
+    let active = Arc::new(Mutex::new(RuntimeSession {
+        session: recovered_session_at(session_id, &entries, Some(first_leaf)),
+        config,
+        persisted_active_leaf_id: None,
+    }));
+    env.state
+        .active
+        .lock()
+        .await
+        .insert(session_id.to_string(), active.clone());
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+
+    for expected in [Some(first_leaf), Some(second_leaf), None] {
+        active.lock().await.session = recovered_session_at(session_id, &entries, expected);
+        driver
+            .persist_active_outputs(active.clone(), None, None, None, Vec::new())
+            .await
+            .expect("active-leaf transition persists");
+        assert_eq!(
+            active.lock().await.persisted_active_leaf_id.as_deref(),
+            expected
+        );
+        assert_eq!(
+            env.state
+                .repo
+                .load_stored_session(session_id)
+                .await
+                .expect("stored session reloads")
+                .active_leaf_id
+                .as_deref(),
+            expected
+        );
+    }
+
+    drop(driver);
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_persistence_does_not_advance_persisted_active_leaf() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let session_id = "persisted-active-leaf-failure";
+    let entries = active_leaf_test_entries(session_id);
+    let first_leaf = entries[0].id.as_str();
+    let second_leaf = entries[1].id.as_str();
+    let config =
+        create_active_leaf_test_session(&env, session_id, &entries, Some(first_leaf)).await;
+    let active = Arc::new(Mutex::new(RuntimeSession {
+        session: recovered_session_at(session_id, &entries, Some(second_leaf)),
+        config,
+        persisted_active_leaf_id: Some(first_leaf.to_string()),
+    }));
+    env.state
+        .active
+        .lock()
+        .await
+        .insert(session_id.to_string(), active.clone());
+    let driver = SessionDriver::acquire(&env.state, session_id).await;
+    env.state.repo.close().await;
+
+    driver
+        .persist_active_outputs(active.clone(), None, None, None, Vec::new())
+        .await
+        .expect_err("closed pool rejects active-leaf change");
+
+    assert_eq!(
+        active.lock().await.persisted_active_leaf_id.as_deref(),
+        Some(first_leaf)
+    );
+    assert!(!env.state.active.lock().await.contains_key(session_id));
     drop(driver);
     env.cleanup().await;
 }

@@ -31,6 +31,7 @@ pub(crate) struct RpcErrorBody {
 pub(crate) struct RuntimeSession {
     pub(crate) session: AgentSession,
     pub(crate) config: SessionConfig,
+    pub(crate) persisted_active_leaf_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
