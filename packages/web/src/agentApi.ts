@@ -139,7 +139,8 @@ export interface StartSessionWorkspace {
 export interface StartSessionParams {
 	sessionId: string;
 	projectId?: string | null;
-	provider: ProviderConfig;
+	/** Omit for a new session to use the daemon's configured parent default. */
+	provider?: ProviderConfig;
 	metadata: Record<string, unknown>;
 	clientInputId: string;
 	priority: InputPriority;
@@ -564,7 +565,7 @@ class AgentApiClient implements AgentApi {
 			{
 				session_id: params.sessionId,
 				project_id: params.projectId || undefined,
-				provider: params.provider,
+				...(params.provider ? { provider: params.provider } : {}),
 				metadata: params.metadata,
 				client_input_id: params.clientInputId,
 				priority: params.priority,

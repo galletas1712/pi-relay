@@ -106,6 +106,18 @@ describe("AgentApi MCP wire format", () => {
 		expect(calls[0]?.params).not.toHaveProperty("mcp");
 	});
 
+	it("omits an unspecified provider so the daemon can choose its configured default", async () => {
+		const calls: { method: string; params?: Record<string, unknown> }[] = [];
+		await createAgentApi(fakeClient(calls)).startSession({
+			sessionId: "session-default-provider",
+			metadata: {},
+			clientInputId: "input-1",
+			priority: "follow_up",
+			content: [{ type: "text", text: "hello" }],
+		});
+		expect(calls[0]?.params).not.toHaveProperty("provider");
+	});
+
 	it("preserves an explicit empty workspace subset for daemon validation", async () => {
 		const calls: RpcCall[] = [];
 		await createAgentApi(fakeClient(calls)).startSession({

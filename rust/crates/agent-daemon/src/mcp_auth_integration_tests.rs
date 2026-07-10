@@ -257,6 +257,8 @@ async fn test_state() -> Option<(AppState, String, String, String, PathBuf)> {
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(state_dir.clone()),
         prompt_root: state_dir.clone(),
+        config_root: state_dir.clone(),
+        daemon_config: crate::config::DaemonConfig::default(),
         pause_subagent_control_after_commit: Arc::new(AtomicBool::new(false)),
         subagent_control_committed: Arc::new(tokio::sync::Notify::new()),
         fail_subagent_control_reload_after_commit: Arc::new(AtomicBool::new(false)),

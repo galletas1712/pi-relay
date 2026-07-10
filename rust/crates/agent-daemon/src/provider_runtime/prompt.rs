@@ -22,6 +22,36 @@ pub(super) async fn assemble_agent_prompt(
     ))
 }
 
+/// Add daemon-owned fallback skills only when an explicit home/workspace skill
+/// does not already expose the same name.
+pub(super) fn extend_with_fallback_skills(skills: &mut Vec<Skill>, fallback: Vec<Skill>) {
+    let mut names = skills
+        .iter()
+        .map(Skill::exposed_name)
+        .collect::<std::collections::BTreeSet<_>>();
+    for skill in fallback {
+        if names.insert(skill.exposed_name()) {
+            skills.push(skill);
+        }
+    }
+}
+
+/// The first directory wins by skill name. This is only for daemon-owned
+/// fallback catalogs; workspace/home skills retain their existing behavior.
+pub(super) fn load_global_skills_from_dirs(preferred: &Path, fallback: &Path) -> Vec<Skill> {
+    let mut skills = load_global_skills_from_dir(preferred);
+    let mut names = skills
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for skill in load_global_skills_from_dir(fallback) {
+        if names.insert(skill.name.clone()) {
+            skills.push(skill);
+        }
+    }
+    skills
+}
+
 pub(crate) fn render_pi_prompt(state: &AppState, config: &SessionConfig) -> anyhow::Result<String> {
     let template = load_pi_md(&state.prompt_root)?;
     Ok(render_prompt(&template, &prompt_context(state, config)?))
@@ -77,8 +107,8 @@ pub(super) fn prompt_context(
             })
             .collect(),
         tools: tool_specs(state, config.provider.kind, profile),
-        skills: load_prompt_skills(&state.prompt_root, config, profile),
-        subagent_roles: load_packaged_subagent_role_catalog(&state.prompt_root),
+        skills: load_prompt_skills(&state.config_root, &state.prompt_root, config, profile),
+        subagent_roles: load_packaged_subagent_role_catalog(&state.config_root, &state.prompt_root),
         mcp_servers,
     })
 }
@@ -174,6 +204,7 @@ fn tool_specs_from_provider_tools(tools: Vec<ProviderTool>) -> Vec<ToolSpec> {
 }
 
 fn load_prompt_skills(
+    config_root: &Path,
     prompt_root: &Path,
     config: &SessionConfig,
     profile: PromptProfile,
@@ -181,16 +212,28 @@ fn load_prompt_skills(
     let mut skills =
         load_skills_for_session_workspaces(&PathBuf::from(&config.outer_cwd), &config.workspaces);
     if profile == PromptProfile::Parent {
-        skills.extend(load_global_skills_from_dir(&prompt_root.join("workflows")));
+        extend_with_fallback_skills(
+            &mut skills,
+            load_global_skills_from_dirs(
+                &config_root.join("workflows"),
+                &prompt_root.join("workflows"),
+            ),
+        );
     }
     skills
 }
 
-fn load_packaged_subagent_role_catalog(prompt_root: &Path) -> Vec<SubagentRole> {
-    load_global_skills_from_dir(&prompt_root.join("subagent-roles"))
-        .into_iter()
-        .map(|skill| SubagentRole::new(skill.name, skill.description))
-        .collect()
+fn load_packaged_subagent_role_catalog(
+    config_root: &Path,
+    prompt_root: &Path,
+) -> Vec<SubagentRole> {
+    load_global_skills_from_dirs(
+        &config_root.join("subagent-roles"),
+        &prompt_root.join("subagent-roles"),
+    )
+    .into_iter()
+    .map(|skill| SubagentRole::new(skill.name, skill.description))
+    .collect()
 }
 
 #[derive(Debug)]
@@ -543,25 +586,98 @@ mod tests {
             mcp_manifest: None,
         };
 
-        let skills = load_prompt_skills(&prompt_root, &config, PromptProfile::Parent);
+        let skills = load_prompt_skills(&prompt_root, &prompt_root, &config, PromptProfile::Parent);
         assert!(skills
             .iter()
             .any(|skill| skill.workspace.is_none() && skill.name == "workflow-explore"));
         assert!(skills.iter().any(|skill| skill.name == "visible"));
         assert!(!skills.iter().any(|skill| skill.name == "explore"));
 
-        let subagent_skills = load_prompt_skills(&prompt_root, &config, PromptProfile::Subagent);
+        let subagent_skills =
+            load_prompt_skills(&prompt_root, &prompt_root, &config, PromptProfile::Subagent);
         assert!(!subagent_skills
             .iter()
             .any(|skill| skill.name == "workflow-explore"));
         assert!(subagent_skills.iter().any(|skill| skill.name == "visible"));
 
-        let roles = load_packaged_subagent_role_catalog(&prompt_root);
+        let roles = load_packaged_subagent_role_catalog(&prompt_root, &prompt_root);
         assert!(roles
             .iter()
             .any(|role| role.name == "explore" && role.description == "default subagent role"));
 
         std::fs::remove_dir_all(prompt_root).ok();
+    }
+
+    #[test]
+    fn config_catalog_precedes_packaged_catalog_in_parent_prompt() {
+        let prompt_root = make_temp_dir("packaged-prompt-catalog");
+        let config_root = make_temp_dir("config-prompt-catalog");
+        let outer = prompt_root.join("outer");
+        std::fs::create_dir_all(&outer).expect("outer");
+        write_skill(
+            &prompt_root.join("workflows/review/SKILL.md"),
+            "review",
+            "bundled workflow",
+        );
+        write_skill(
+            &prompt_root.join("workflows/fallback/SKILL.md"),
+            "fallback",
+            "bundled fallback",
+        );
+        write_skill(
+            &config_root.join("workflows/review/SKILL.md"),
+            "review",
+            "configured workflow",
+        );
+        write_skill(
+            &prompt_root.join("subagent-roles/reviewer/SKILL.md"),
+            "reviewer",
+            "bundled reviewer",
+        );
+        write_skill(
+            &config_root.join("subagent-roles/reviewer/SKILL.md"),
+            "reviewer",
+            "configured reviewer",
+        );
+        let config = SessionConfig {
+            project_id: None,
+            outer_cwd: outer.to_string_lossy().to_string(),
+            workspaces: Vec::new(),
+            system_prompt: String::new(),
+            provider: agent_vocab::ProviderConfig {
+                kind: ProviderKind::OpenAi,
+                model: "test".to_string(),
+                reasoning_effort: agent_vocab::ReasoningEffort::Medium,
+                max_tokens: None,
+                prompt_cache: None,
+            },
+            metadata: serde_json::Value::Null,
+            mcp_manifest: None,
+        };
+
+        let skills = load_prompt_skills(&config_root, &prompt_root, &config, PromptProfile::Parent);
+        assert_eq!(
+            skills
+                .iter()
+                .filter(|skill| skill.workspace.is_none() && skill.name == "review")
+                .count(),
+            1
+        );
+        assert!(skills
+            .iter()
+            .any(|skill| { skill.name == "review" && skill.description == "configured workflow" }));
+        assert!(skills.iter().any(|skill| skill.name == "fallback"));
+        let roles = load_packaged_subagent_role_catalog(&config_root, &prompt_root);
+        assert_eq!(
+            roles.iter().filter(|role| role.name == "reviewer").count(),
+            1
+        );
+        assert!(roles
+            .iter()
+            .any(|role| role.name == "reviewer" && role.description == "configured reviewer"));
+
+        std::fs::remove_dir_all(prompt_root).ok();
+        std::fs::remove_dir_all(config_root).ok();
     }
 
     #[test]

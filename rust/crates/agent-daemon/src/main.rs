@@ -60,12 +60,13 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
+    let prompt_root = find_prompt_root(std::env::current_dir()?)?;
+    config.bootstrap_catalog(&prompt_root)?;
     let repo = Arc::new(PostgresAgentStore::connect(&config.database_url).await?);
     repo.migrate().await?;
 
     let (events, _) = broadcast::channel(1024);
     let workspaces = WorkspaceManager::from_default_state_dir()?;
-    let prompt_root = find_prompt_root(std::env::current_dir()?)?;
     let mcp = match config.mcp_config.as_deref() {
         Some(path) => {
             McpManager::start_with_credential_file(
@@ -94,6 +95,8 @@ async fn main() -> Result<()> {
         session_titles: SessionTitleScheduler::default(),
         workspaces,
         prompt_root,
+        config_root: config.config_root,
+        daemon_config: config.daemon_config,
         #[cfg(test)]
         pause_subagent_control_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         #[cfg(test)]

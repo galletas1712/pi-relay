@@ -11,6 +11,7 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::config::DaemonConfig;
 use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
 use crate::types::RuntimeSession;
 use crate::workspaces::WorkspaceManager;
@@ -52,6 +53,8 @@ pub(crate) struct AppState {
     pub(crate) session_titles: SessionTitleScheduler,
     pub(crate) workspaces: WorkspaceManager,
     pub(crate) prompt_root: PathBuf,
+    pub(crate) config_root: PathBuf,
+    pub(crate) daemon_config: DaemonConfig,
     #[cfg(test)]
     pub(crate) pause_subagent_control_after_commit: Arc<AtomicBool>,
     #[cfg(test)]

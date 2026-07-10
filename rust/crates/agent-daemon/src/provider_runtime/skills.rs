@@ -8,12 +8,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::prompt::{
-    load_global_skills_from_dir, load_parsed_skill_file, load_skills_for_session_workspaces,
-    load_skills_for_session_workspaces_with_home,
+    extend_with_fallback_skills, load_global_skills_from_dirs, load_parsed_skill_file,
+    load_skills_for_session_workspaces, load_skills_for_session_workspaces_with_home,
 };
 
 pub(crate) fn load_skill_result(
     prompt_root: &Path,
+    config_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
@@ -22,6 +23,7 @@ pub(crate) fn load_skill_result(
 ) -> ToolResultMessage {
     match load_skill_output(
         prompt_root,
+        config_root,
         outer_cwd,
         workspaces,
         loaded_skills,
@@ -33,14 +35,22 @@ pub(crate) fn load_skill_result(
     }
 }
 
-fn is_packaged_workflow_skill(prompt_root: &Path, requested_name: &str) -> bool {
-    load_global_skills_from_dir(&prompt_root.join("workflows"))
-        .into_iter()
-        .any(|skill| skill.exposed_name() == requested_name)
+fn is_packaged_workflow_skill(
+    config_root: &Path,
+    prompt_root: &Path,
+    requested_name: &str,
+) -> bool {
+    load_global_skills_from_dirs(
+        &config_root.join("workflows"),
+        &prompt_root.join("workflows"),
+    )
+    .into_iter()
+    .any(|skill| skill.exposed_name() == requested_name)
 }
 
 fn load_skill_output(
     prompt_root: &Path,
+    config_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
@@ -49,6 +59,7 @@ fn load_skill_output(
 ) -> Result<String> {
     load_skill_output_with_home(
         prompt_root,
+        config_root,
         outer_cwd,
         workspaces,
         loaded_skills,
@@ -60,6 +71,7 @@ fn load_skill_output(
 
 fn load_skill_output_with_home(
     prompt_root: &Path,
+    config_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
@@ -79,13 +91,19 @@ fn load_skill_output_with_home(
         None => load_skills_for_session_workspaces(outer_cwd, workspaces),
     };
     if profile == PromptProfile::Parent {
-        skills.extend(load_global_skills_from_dir(&prompt_root.join("workflows")));
+        extend_with_fallback_skills(
+            &mut skills,
+            load_global_skills_from_dirs(
+                &config_root.join("workflows"),
+                &prompt_root.join("workflows"),
+            ),
+        );
     }
     let skill = match resolve_load_skill(&skills, name) {
         Ok(skill) => skill,
         Err(_error)
             if profile == PromptProfile::Subagent
-                && is_packaged_workflow_skill(prompt_root, name) =>
+                && is_packaged_workflow_skill(config_root, prompt_root, name) =>
         {
             return Err(anyhow!(
                 "workflow skills are not available to subagent sessions"
@@ -155,6 +173,7 @@ pub(crate) struct ResolvedSkillRole {
 
 pub(crate) fn resolve_skill_role(
     prompt_root: &Path,
+    config_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     name: &str,
@@ -180,17 +199,20 @@ pub(crate) fn resolve_skill_role(
         }
     }
 
-    packaged_role(prompt_root, name)
+    packaged_role(config_root, prompt_root, name)
         .ok_or_else(|| anyhow!("role skill not found: {name}"))
         .and_then(role_from_skill)
 }
 
-fn load_packaged_role_skills(prompt_root: &Path) -> Vec<Skill> {
-    load_global_skills_from_dir(&prompt_root.join("subagent-roles"))
+fn load_packaged_role_skills(config_root: &Path, prompt_root: &Path) -> Vec<Skill> {
+    load_global_skills_from_dirs(
+        &config_root.join("subagent-roles"),
+        &prompt_root.join("subagent-roles"),
+    )
 }
 
-fn packaged_role(prompt_root: &Path, name: &str) -> Option<Skill> {
-    load_packaged_role_skills(prompt_root)
+fn packaged_role(config_root: &Path, prompt_root: &Path, name: &str) -> Option<Skill> {
+    load_packaged_role_skills(config_root, prompt_root)
         .into_iter()
         .find(|skill| skill.name == name)
 }
@@ -237,6 +259,7 @@ mod tests {
         let first = load_skill_result(
             &outer_cwd,
             &outer_cwd,
+            &outer_cwd,
             &workspaces,
             &loaded,
             &call,
@@ -253,6 +276,7 @@ mod tests {
 
         loaded.insert(skill_identifier(Some("repo"), "rust-refactor"));
         let second = load_skill_result(
+            &outer_cwd,
             &outer_cwd,
             &outer_cwd,
             &workspaces,
@@ -292,6 +316,7 @@ mod tests {
         let result = load_skill_result(
             &outer_cwd,
             &outer_cwd,
+            &outer_cwd,
             &workspaces,
             &loaded,
             &call,
@@ -324,6 +349,7 @@ mod tests {
         let workspaces = vec![SessionWorkspace::local("repo", "")];
 
         let result = load_skill_result(
+            &outer_cwd,
             &outer_cwd,
             &outer_cwd,
             &workspaces,
@@ -359,6 +385,7 @@ mod tests {
 
         let result = load_skill_result(
             &prompt_root,
+            &prompt_root,
             &outer_cwd,
             &[],
             &loaded,
@@ -375,13 +402,115 @@ mod tests {
             .expect("content string")
             .contains("delegate_readonly_tasks"));
 
-        let error = resolve_skill_role(&prompt_root, &outer_cwd, &[], "workflow-only-test-role")
-            .expect_err("workflow skills are not packaged subagent roles");
+        let error = resolve_skill_role(
+            &prompt_root,
+            &prompt_root,
+            &outer_cwd,
+            &[],
+            "workflow-only-test-role",
+        )
+        .expect_err("workflow skills are not packaged subagent roles");
         assert!(error
             .to_string()
             .contains("role skill not found: workflow-only-test-role"));
 
         std::fs::remove_dir_all(prompt_root).ok();
+    }
+
+    #[test]
+    fn config_catalog_overrides_bundled_workflows_and_roles_without_duplicates() {
+        let prompt_root = make_temp_dir("bundled-catalog");
+        let config_root = make_temp_dir("config-catalog");
+        let outer_cwd = prompt_root.join("outer");
+        std::fs::create_dir_all(&outer_cwd).expect("outer cwd");
+        write_role(
+            &prompt_root.join("workflows/review/SKILL.md"),
+            "review",
+            "Bundled workflow",
+            "Bundled workflow body.",
+        );
+        write_role(
+            &prompt_root.join("workflows/fallback/SKILL.md"),
+            "fallback",
+            "Fallback workflow",
+            "Fallback workflow body.",
+        );
+        write_role(
+            &config_root.join("workflows/review/SKILL.md"),
+            "review",
+            "Configured workflow",
+            "Configured workflow body.",
+        );
+        write_role(
+            &prompt_root.join("subagent-roles/reviewer/SKILL.md"),
+            "reviewer",
+            "Bundled reviewer",
+            "Bundled reviewer body.",
+        );
+        write_role(
+            &config_root.join("subagent-roles/reviewer/SKILL.md"),
+            "reviewer",
+            "Configured reviewer",
+            "Configured reviewer body.",
+        );
+
+        let call = ToolCall {
+            id: ToolCallId::from_u64(1),
+            tool_name: "LoadSkill".to_string(),
+            args_json: r#"{"name":"review"}"#.to_string(),
+        };
+        let result = load_skill_result(
+            &prompt_root,
+            &config_root,
+            &outer_cwd,
+            &[],
+            &std::collections::BTreeSet::new(),
+            &call,
+            PromptProfile::Parent,
+        );
+        assert_eq!(result.status, agent_vocab::ToolResultStatus::Success);
+        assert!(result.output.contains("Configured workflow body."));
+        let fallback_call = ToolCall {
+            id: ToolCallId::from_u64(2),
+            tool_name: "LoadSkill".to_string(),
+            args_json: r#"{"name":"fallback"}"#.to_string(),
+        };
+        let fallback = load_skill_result(
+            &prompt_root,
+            &config_root,
+            &outer_cwd,
+            &[],
+            &std::collections::BTreeSet::new(),
+            &fallback_call,
+            PromptProfile::Parent,
+        );
+        assert_eq!(fallback.status, agent_vocab::ToolResultStatus::Success);
+        assert!(fallback.output.contains("Fallback workflow body."));
+
+        let role = resolve_skill_role(&prompt_root, &config_root, &outer_cwd, &[], "reviewer")
+            .expect("configured role resolves");
+        assert_eq!(role.description, "Configured reviewer");
+        assert!(role.content.contains("Configured reviewer body."));
+
+        let workspace_role = outer_cwd.join("repo/.agents/skills/reviewer/SKILL.md");
+        write_role(
+            &workspace_role,
+            "reviewer",
+            "Workspace reviewer",
+            "Workspace reviewer body.",
+        );
+        let role = resolve_skill_role(
+            &prompt_root,
+            &config_root,
+            &outer_cwd,
+            &[SessionWorkspace::local("repo", "")],
+            "repo/reviewer",
+        )
+        .expect("workspace role resolves first");
+        assert_eq!(role.description, "Workspace reviewer");
+
+        std::fs::remove_dir_all(prompt_root).ok();
+        std::fs::remove_dir_all(config_root).ok();
     }
 
     #[test]
@@ -405,6 +534,7 @@ mod tests {
         let loaded = std::collections::BTreeSet::new();
 
         let result = load_skill_result(
+            &prompt_root,
             &prompt_root,
             &outer_cwd,
             &[],
@@ -435,6 +565,7 @@ mod tests {
         let role = resolve_skill_role(
             &outer_cwd,
             &outer_cwd,
+            &outer_cwd,
             &[SessionWorkspace::local("repo", "")],
             "repo/reviewer",
         )
@@ -460,6 +591,7 @@ mod tests {
         .expect("skill file");
 
         let error = resolve_skill_role(
+            &outer_cwd,
             &outer_cwd,
             &outer_cwd,
             &[SessionWorkspace::local("repo", "")],
@@ -489,6 +621,7 @@ mod tests {
         }
 
         let error = resolve_skill_role(
+            &outer_cwd,
             &outer_cwd,
             &outer_cwd,
             &[
@@ -521,6 +654,7 @@ mod tests {
         let role = resolve_skill_role(
             &outer_cwd,
             &outer_cwd,
+            &outer_cwd,
             &[SessionWorkspace::local("repo", "")],
             "repo/context-inspector",
         )
@@ -541,6 +675,7 @@ mod tests {
             "You are a delegated worker subagent.\n\nReport clearly.",
         );
         let role = resolve_skill_role(
+            &outer_cwd,
             &outer_cwd,
             &outer_cwd,
             &[SessionWorkspace::local("repo", "")],
@@ -577,6 +712,7 @@ mod tests {
         let error = resolve_skill_role(
             &outer_cwd,
             &outer_cwd,
+            &outer_cwd,
             &[SessionWorkspace::local("repo", "")],
             "repo/worker",
         )
@@ -608,6 +744,7 @@ mod tests {
         let loaded = std::collections::BTreeSet::new();
 
         let result = load_skill_output_with_home(
+            &outer_cwd,
             &outer_cwd,
             &outer_cwd,
             &[],
