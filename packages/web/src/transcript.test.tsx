@@ -379,7 +379,7 @@ describe("MessageList session loading guard", () => {
 			/>
 		);
 
-		expect(html).toContain("Loading session");
+		expect(html).toContain("Loading conversation…");
 		expect(html).not.toContain("stale transcript text");
 	});
 
@@ -402,7 +402,7 @@ describe("MessageList session loading guard", () => {
 		expect(html).toContain("Couldn’t load session");
 		expect(html).toContain("daemon unavailable");
 		expect(html).toContain(">Retry</button>");
-		expect(html).not.toContain("Loading session");
+		expect(html).not.toContain("Loading conversation");
 	});
 
 	it("keeps matching cached content visible with a refresh warning and Retry", () => {

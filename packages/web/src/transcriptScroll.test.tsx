@@ -423,7 +423,7 @@ describe("MessageList latest-on-entry scrolling", () => {
 		);
 
 		expect(scroller.scrollTop).toBe(250);
-		expect(screen.queryByText("Loading session…")).toBeNull();
+		expect(screen.queryByText("Loading conversation…")).toBeNull();
 	});
 
 	it("preserves manual scroll on a sparse batched multi-descendant canonical refresh", () => {

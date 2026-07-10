@@ -760,7 +760,7 @@ export const MessageList = memo(function MessageList({
 				<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 					<div className="empty-state">
 						<Loader2 className="spin" size={28} />
-						<span>Loading session…</span>
+						<span>Loading conversation…</span>
 					</div>
 				</div>
 			</div>
