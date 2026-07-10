@@ -137,7 +137,10 @@ import {
 	workspaceScopeForProject,
 	type WorkspaceScopeEntry,
 } from "./workspaceScope.ts";
-import { NewSessionSetup } from "./newSessionSetup.tsx";
+import {
+	NewSessionSetup,
+	type WorkspaceConfiguration,
+} from "./newSessionSetup.tsx";
 import { McpOAuthDialog } from "./mcpOAuthDialog.tsx";
 import {
 	clearMcpServerSelection,
@@ -507,6 +510,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		useState<string | null>(null);
 	const [newSessionSetupGeneration, setNewSessionSetupGeneration] = useState(0);
 	const [sending, setSending] = useState(false);
+	const [workspacePreparation, setWorkspacePreparation] = useState<{
+		projectId: string | null;
+		workspaceDirs: string[];
+	} | null>(null);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
 	const [transcriptDestination, setTranscriptDestination] = useState<TranscriptDestination | null>(null);
@@ -820,6 +827,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	// projectWorkspaceKey captures the workspace set so renames/edits re-derive scope
 	// while a plain projects refetch leaves in-progress edits untouched.
 	const [workspaceScope, setWorkspaceScope] = useState<WorkspaceScopeEntry[]>([]);
+	const [workspaceScopeSourceKey, setWorkspaceScopeSourceKey] = useState<string | null>(null);
 	const workspaceScopeRef = useRef<WorkspaceScopeEntry[]>(workspaceScope);
 	workspaceScopeRef.current = workspaceScope;
 	const projectWorkspaces = selectedProject?.workspaces ?? null;
@@ -831,9 +839,21 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			kind: workspace.kind ?? "git",
 		})) ?? [],
 	);
+	const currentWorkspaceScopeSourceKey = selectedProjectId
+		? `${selectedProjectId}\u0000${projectWorkspaceKey}`
+		: null;
 	useEffect(() => {
 		setWorkspaceScope(workspaceScopeForProject(selectedProjectId, projectWorkspacesRef.current ?? []));
-	}, [selectedProjectId, projectWorkspaceKey]);
+		setWorkspaceScopeSourceKey(currentWorkspaceScopeSourceKey);
+	}, [currentWorkspaceScopeSourceKey, selectedProjectId]);
+	const workspaceConfiguration: WorkspaceConfiguration =
+		selectedProjectId === null
+			? { status: "ready", scope: null }
+			: selectedProject && workspaceScopeSourceKey === currentWorkspaceScopeSourceKey
+				? { status: "ready", scope: workspaceScope }
+				: !selectedProject && (projectsQuery.status === "success" || projectsError)
+					? { status: "unavailable" }
+					: { status: "loading" };
 	const handleWorkspaceScopeChange = useCallback((scope: WorkspaceScopeEntry[]) => {
 		setWorkspaceScope(scope);
 		rememberWorkspaceScope(selectedProjectRef.current, scope);
@@ -3020,34 +3040,51 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const projectId = selectedProjectRef.current;
 			const title = nextSessionTitleRef.current || titleFromText(text);
 			nextSessionTitleRef.current = null;
+			const submittedWorkspaceScope = projectId
+				? workspaceScopeRef.current.map((entry) => ({ ...entry }))
+				: [];
+			const workspaces = projectId
+				? startWorkspacesFromScope(submittedWorkspaceScope)
+				: undefined;
+			const params = {
+				sessionId,
+				projectId,
+				provider: newSessionProvider,
+				metadata: {
+					title,
+					created_by: "web",
+					compaction: {
+						config: newSessionCompactionConfig(),
+					},
+				},
+				clientInputId,
+				priority: "follow_up" as const,
+				content: textContent(text),
+				workspaces,
+				mcp: mcpSelectionPayloadForProvider(
+					newSessionProvider.kind,
+					mcpSelectionProviderRef.current,
+					mcpInventoryProvider,
+					mcpInventory,
+					mcpInventoryReady,
+					mcpSelectionRef.current,
+					mcpAuthStatus,
+					mcpAuthStatusReady,
+				),
+			};
 			let result;
 			try {
-				result = await api.startSession({
-					sessionId,
+				setWorkspacePreparation({
 					projectId,
-					provider: newSessionProvider,
-					metadata: {
-						title,
-						created_by: "web",
-						compaction: {
-							config: newSessionCompactionConfig(),
-						},
-					},
-					clientInputId,
-					priority: "follow_up",
-					content: textContent(text),
-					workspaces: projectId ? startWorkspacesFromScope(workspaceScopeRef.current) : undefined,
-					mcp: mcpSelectionPayloadForProvider(
-						newSessionProvider.kind,
-						mcpSelectionProviderRef.current,
-						mcpInventoryProvider,
-						mcpInventory,
-						mcpInventoryReady,
-						mcpSelectionRef.current,
-						mcpAuthStatus,
-						mcpAuthStatusReady,
-					),
+					workspaceDirs: submittedWorkspaceScope
+						.filter((entry) => entry.included)
+						.map((entry) => entry.workspaceDir),
 				});
+				try {
+					result = await api.startSession(params);
+				} finally {
+					setWorkspacePreparation(null);
+				}
 			} catch (error) {
 				if (errorMessage(error).startsWith("mcp_inventory_changed:")) {
 					await queryClient.refetchQueries({
@@ -3818,6 +3855,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		workspaceRouteResult.kind === "route"
 			? workspaceRouteResult.warnings.filter((warning) => warning.persistent)
 			: [];
+	const preparingWorkspaceDirs =
+		workspacePreparation?.projectId === selectedProjectId
+			? workspacePreparation.workspaceDirs
+			: [];
 	const mobileTitle = selectedChatSession
 		? sessionTitle(selectedChatSession)
 		: selectedProject
@@ -4019,6 +4060,33 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						transcriptTurnPageIdentity={transcriptTurnPageIdentity}
 						onAcknowledgeTranscriptDestination={acknowledgeTranscriptDestination}
 						onRetryTranscript={retrySelected}
+						emptySessionContent={
+							!selectedId ? (
+								<NewSessionSetup
+									workspaceConfiguration={workspaceConfiguration}
+									onWorkspaceScopeChange={handleWorkspaceScopeChange}
+									mcpInventory={mcpInventory}
+									mcpSelection={mcpSelection}
+									onMcpSelectionChange={handleMcpSelectionChange}
+									mcpLoading={mcpInventoryQuery.isFetching || mcpStatusQuery.isFetching}
+									mcpReady={mcpInventoryReady}
+									mcpError={
+										mcpInventoryQuery.error || mcpStatusQuery.error
+											? errorMessage(mcpInventoryQuery.error ?? mcpStatusQuery.error)
+											: null
+									}
+									onRetryMcp={retryMcpInventory}
+									mcpAuthStatus={mcpAuthStatus}
+									mcpAuthStatusReady={mcpAuthStatusReady}
+									onMcpLogin={(server) => void loginMcp(server)}
+									onMcpLogout={cancelOrLogoutMcp}
+									mcpAuthBusyServer={mcpAuthBusyServer}
+									disabled={sending}
+									preparingWorkspaceDirs={preparingWorkspaceDirs}
+									mcpAuthMutationBlockedReason={connectionRemoteActionBlockedReason}
+								/>
+							) : null
+						}
 						routeNotice={
 							persistentRouteWarnings.length > 0 ? (
 								<div className="workspace-route-warning" role="alert">
@@ -4097,30 +4165,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					retrying={retryingConnection}
 					onRetry={retryConnection}
 				/>
-				{conversationVisible && !selectedId ? (
-					<NewSessionSetup
-						workspaceScope={selectedProject ? workspaceScope : null}
-						onWorkspaceScopeChange={handleWorkspaceScopeChange}
-						mcpInventory={mcpInventory}
-						mcpSelection={mcpSelection}
-						onMcpSelectionChange={handleMcpSelectionChange}
-						mcpLoading={mcpInventoryQuery.isFetching || mcpStatusQuery.isFetching}
-						mcpReady={mcpInventoryReady}
-						mcpError={
-							mcpInventoryQuery.error || mcpStatusQuery.error
-								? errorMessage(mcpInventoryQuery.error ?? mcpStatusQuery.error)
-								: null
-						}
-						onRetryMcp={retryMcpInventory}
-						mcpAuthStatus={mcpAuthStatus}
-						mcpAuthStatusReady={mcpAuthStatusReady}
-						onMcpLogin={(server) => void loginMcp(server)}
-						onMcpLogout={cancelOrLogoutMcp}
-						mcpAuthBusyServer={mcpAuthBusyServer}
-						disabled={sending}
-						mcpAuthMutationBlockedReason={connectionRemoteActionBlockedReason}
-					/>
-				) : null}
 				{conversationVisible ? (
 					<Composer
 						selectedId={selectedId}

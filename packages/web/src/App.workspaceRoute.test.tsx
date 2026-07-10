@@ -62,6 +62,245 @@ afterEach(() => {
 });
 
 describe("App workspace route identity integration", () => {
+	it("shows workspace and MCP setup in the central pane and keeps both controls functional", async () => {
+		const api = createRouteApi();
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		const setup = await screen.findByRole("heading", { name: "Choose the context to bring in" });
+		const setupSurface = setup.closest("[data-slot='new-session-setup']");
+		expect(setupSurface?.closest(".message-scroll")).toBeTruthy();
+		expect(setupSurface?.closest(".chat-dock")).toBeNull();
+		expect(screen.getByRole("textbox")).toBeTruthy();
+
+		const projectButton = screen
+			.getAllByRole("button", { name: /Project one/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectButton) throw new Error("missing Project one selector");
+		await user.click(projectButton);
+		expect(await screen.findByRole("heading", { name: "Workspace scope" })).toBeTruthy();
+		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
+		await user.click(screen.getByRole("checkbox", { name: /docs/ }));
+		expect(screen.getByRole("button", { name: /Workspaces/ }).textContent).toContain("1 of 2");
+
+		await user.click(screen.getByRole("button", { name: /MCP tools/ }));
+		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
+
+		await mounted.dispose();
+	});
+
+	it("shows preparation only for included workspaces while session.start is pending and clears it on rejection", async () => {
+		const start = deferred<never>();
+		const api = createRouteApi();
+		api.startSession.mockImplementation(() => start.promise);
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		const projectButton = screen
+			.getAllByRole("button", { name: /Project one/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectButton) throw new Error("missing Project one selector");
+		await user.click(projectButton);
+		await user.click(await screen.findByRole("button", { name: /Workspaces/ }));
+		await user.click(screen.getByRole("checkbox", { name: /docs/ }));
+		await user.type(
+			screen.getByPlaceholderText("Create or select a session"),
+			"prepare scoped workspaces",
+		);
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
+		expect(screen.getByRole("status", { name: "Preparing workspace repo-a" })).toBeTruthy();
+		expect(screen.queryByRole("status", { name: "Preparing workspace docs" })).toBeNull();
+
+		await act(async () => start.reject(new Error("workspace preparation failed")));
+		await waitFor(() =>
+			expect(screen.queryByRole("status", { name: "Preparing workspace repo-a" })).toBeNull(),
+		);
+
+		await mounted.dispose();
+	});
+
+	it("shows no preparation for another project during a pending start and restores the submitted rows on return", async () => {
+		const start = deferred<never>();
+		const api = createRouteApi();
+		api.startSession.mockImplementation(() => start.promise);
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		const projectOneButton = screen
+			.getAllByRole("button", { name: /Project one/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectOneButton) throw new Error("missing Project one selector");
+		await user.click(projectOneButton);
+		await user.click(await screen.findByRole("button", { name: /Workspaces/ }));
+		await user.click(screen.getByRole("checkbox", { name: /docs/ }));
+		await user.type(
+			screen.getByPlaceholderText("Create or select a session"),
+			"prepare original project",
+		);
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
+		expect(screen.getByRole("status", { name: "Preparing workspace repo-a" })).toBeTruthy();
+
+		const projectTwoButton = screen
+			.getAllByRole("button", { name: /Project two/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectTwoButton) throw new Error("missing Project two selector");
+		await user.click(projectTwoButton);
+		expect(await screen.findByRole("button", { name: /Workspaces/ })).toBeTruthy();
+		expect(screen.queryByRole("status", { name: /Preparing workspace/ })).toBeNull();
+
+		await user.click(projectOneButton);
+		expect(await screen.findByRole("status", { name: "Preparing workspace repo-a" })).toBeTruthy();
+		expect(screen.queryByRole("status", { name: "Preparing workspace docs" })).toBeNull();
+
+		await act(async () => start.reject(new Error("workspace preparation failed")));
+		await mounted.dispose();
+	});
+
+	it("shows no workspace preparation after opening New Session during an existing-session send", async () => {
+		const followUp = deferred<{ queued: true }>();
+		const api = createRouteApi();
+		api.queueFollowUp.mockImplementation(() => followUp.promise);
+		const mounted = renderRouteApp(
+			api,
+			new FakeWorkspaceBrowser(
+				"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+			),
+		);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.type(await screen.findByRole("textbox"), "pending follow-up");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await waitFor(() => expect(api.queueFollowUp).toHaveBeenCalledTimes(1));
+		await user.click(screen.getByRole("button", { name: "new session" }));
+
+		expect(await screen.findByRole("heading", { name: "Workspace scope" })).toBeTruthy();
+		expect(screen.queryByRole("status", { name: /Preparing workspace/ })).toBeNull();
+		expect(api.startSession).not.toHaveBeenCalled();
+
+		await act(async () => followUp.resolve({ queued: true }));
+		await mounted.dispose();
+	});
+
+	it("does not prepare workspaces or call session.start for a no-session slash command", async () => {
+		const api = createRouteApi();
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		const projectButton = screen
+			.getAllByRole("button", { name: /Project one/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectButton) throw new Error("missing Project one selector");
+		await user.click(projectButton);
+		await user.type(await screen.findByRole("textbox"), "/compact");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		await waitFor(() => expect(screen.getByRole<HTMLTextAreaElement>("textbox").value).toBe("/compact"));
+		expect(api.startSession).not.toHaveBeenCalled();
+		expect(screen.queryByRole("status", { name: /Preparing workspace/ })).toBeNull();
+
+		await mounted.dispose();
+	});
+
+	it("replaces workspace preparation feedback with the session after session.start succeeds", async () => {
+		const start = deferred<{ session_id: string; activity: "queued" }>();
+		const api = createRouteApi();
+		api.startSession.mockImplementation(() => start.promise);
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		const projectButton = screen
+			.getAllByRole("button", { name: /Project one/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectButton) throw new Error("missing Project one selector");
+		await user.click(projectButton);
+		await user.type(
+			screen.getByPlaceholderText("Create or select a session"),
+			"prepare all workspaces",
+		);
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
+		expect(screen.getAllByRole("status", { name: /Preparing workspace/ })).toHaveLength(2);
+		const sessionId = api.startSession.mock.calls[0][0].sessionId;
+
+		await act(async () => start.resolve({ session_id: sessionId, activity: "queued" }));
+		await waitFor(() =>
+			expect(document.querySelector("[data-slot='new-session-setup']")).toBeNull(),
+		);
+		expect(screen.queryByRole("status", { name: /Preparing workspace/ })).toBeNull();
+
+		await mounted.dispose();
+	});
+
+	it("never renders new-session setup over an existing transcript", async () => {
+		const api = createRouteApi();
+		const mounted = renderRouteApp(
+			api,
+			new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1"),
+		);
+
+		await open(api);
+		expect(document.querySelector("[data-slot='new-session-setup']")).toBeNull();
+		expect(screen.queryByRole("heading", { name: "Choose the context to bring in" })).toBeNull();
+		expect(screen.getByRole("region", { name: "Conversation transcript" })).toBeTruthy();
+
+		await mounted.dispose();
+	});
+
+	it("shows a useful first-message state when no workspace or MCP configuration exists", async () => {
+		const api = createRouteApi({ noMcpConfiguration: true });
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+
+		await open(api);
+		expect(await screen.findByRole("heading", { name: "No optional context configured" })).toBeTruthy();
+		expect(screen.getByText("Write your first message below to start with the host environment.")).toBeTruthy();
+		expect(screen.getByRole("textbox")).toBeTruthy();
+		expect(screen.queryByText("No session open")).toBeNull();
+
+		await mounted.dispose();
+	});
+
+	it("waits for a selected project's workspace configuration before showing the empty state", async () => {
+		rememberUiSelection("project-1", null);
+		const projects = deferred<Project[]>();
+		const api = createRouteApi({ noMcpConfiguration: true });
+		api.listProjects.mockImplementation(() => projects.promise);
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+
+		await openStatusOnly(api);
+		expect(await screen.findByText("Loading project workspaces…")).toBeTruthy();
+		expect(screen.queryByRole("heading", { name: "No optional context configured" })).toBeNull();
+
+		await act(async () => projects.resolve([]));
+		await mounted.dispose();
+	});
+
+	it("reports unavailable workspace configuration when a selected project fails to load", async () => {
+		rememberUiSelection("project-1", null);
+		const api = createRouteApi({ noMcpConfiguration: true });
+		api.listProjects.mockRejectedValue(new Error("project list unavailable"));
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+
+		await openStatusOnly(api);
+		expect(
+			await screen.findByText("Workspace configuration unavailable. Retry from the Projects panel."),
+		).toBeTruthy();
+		expect(screen.queryByRole("heading", { name: "No optional context configured" })).toBeNull();
+
+		await mounted.dispose();
+	});
+
 	it.each([
 		{
 			name: "wrong project",
@@ -167,6 +406,11 @@ describe("App workspace route identity integration", () => {
 		const user = userEvent.setup();
 
 		await open(api);
+		const projectButton = screen
+			.getAllByRole("button", { name: /Project one/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectButton) throw new Error("missing Project one selector");
+		await user.click(projectButton);
 		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
 		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
 		await act(async () => {
@@ -177,6 +421,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("button", { name: "send message" }));
 
 		expect(api.startSession).not.toHaveBeenCalled();
+		expect(screen.queryByRole("status", { name: /Preparing workspace/ })).toBeNull();
 		expect(await screen.findByText(/workspace is not authorized/)).toBeTruthy();
 		expect(composer.value).toBe("do not send with stale OAuth");
 		await mounted.dispose();
@@ -685,7 +930,7 @@ describe("App workspace route identity integration", () => {
 		await user.selectOptions(screen.getByRole("combobox", { name: "Reasoning effort" }), "high");
 		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
 
-		await user.selectOptions(screen.getByRole("combobox", { name: "Model" }), "claude:claude-sonnet-5");
+		await user.selectOptions(screen.getByRole("combobox", { name: "Model" }), "claude:claude-opus-4-8");
 		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledWith("claude"));
 		expect((await screen.findByRole("button", { name: /MCP tools/ })).textContent).toContain(
 			"0 selected",
@@ -1336,6 +1581,7 @@ function createRouteApi(
 			transcript_revision: number;
 			entries: TranscriptEntry[];
 		}>;
+		noMcpConfiguration?: boolean;
 	} = {},
 ): RouteApi {
 	let open = false;
@@ -1372,7 +1618,11 @@ function createRouteApi(
 		{
 			project_id: "project-2",
 			name: "Project two",
-			workspaces: [],
+			workspaces: [{
+				kind: "local",
+				workspace_dir: "other-repo",
+				source_path: "/srv/other-repo",
+			}],
 			metadata: {},
 			created_at: "2026-01-01T00:00:00Z",
 			updated_at: "2026-01-01T00:00:00Z",
@@ -1454,9 +1704,10 @@ function createRouteApi(
 			summaries.filter((session) => session.project_id === projectId)),
 		listDelegations,
 		listTools: vi.fn(async () => []),
-		getMcpInventory: vi.fn(async () => mcpInventory()),
+		getMcpInventory: vi.fn(async () =>
+			options.noMcpConfiguration ? { revision: "empty", servers: [] } : mcpInventory()),
 		getMcpStatus: vi.fn(async () => ({
-			servers: [{
+			servers: options.noMcpConfiguration ? [] : [{
 				server: "workspace",
 				auth_kind: "none",
 				auth_state: "not_applicable",

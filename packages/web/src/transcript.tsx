@@ -222,6 +222,7 @@ export const MessageList = memo(function MessageList({
 	retryingSession = false,
 	onRetrySession,
 	onNewSession,
+	emptySessionContent,
 	onResumeTurn,
 	resumingTurnId,
 	resumeBlockedReason,
@@ -251,6 +252,7 @@ export const MessageList = memo(function MessageList({
 	retryingSession?: boolean;
 	onRetrySession?: () => void;
 	onNewSession?: () => void;
+	emptySessionContent?: ReactNode;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
 	resumeBlockedReason?: string | null;
@@ -710,17 +712,19 @@ export const MessageList = memo(function MessageList({
 		return (
 			<div className="message-list-shell">
 				<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
-					<div className="empty-state">
-						<Terminal size={34} />
-						<div className="empty-state-title">No session open</div>
-						<div className="empty-state-sub">Start a new one, or pick a session from the sidebar.</div>
-						{onNewSession ? (
-							<button type="button" className="primary-button empty-state-cta" onClick={onNewSession}>
-								<Plus size={14} />
-								New session
-							</button>
-						) : null}
-					</div>
+					{emptySessionContent ?? (
+						<div className="empty-state">
+							<Terminal size={34} />
+							<div className="empty-state-title">No session open</div>
+							<div className="empty-state-sub">Start a new one, or pick a session from the sidebar.</div>
+							{onNewSession ? (
+								<button type="button" className="primary-button empty-state-cta" onClick={onNewSession}>
+									<Plus size={14} />
+									New session
+								</button>
+							) : null}
+						</div>
+					)}
 				</div>
 			</div>
 		);
