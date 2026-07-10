@@ -41,7 +41,7 @@ import {
 	type AgentStatusIconKey,
 } from "./delegationBoard.ts";
 import type {
-	Notice,
+	ErrorNotice,
 	Project,
 	ReasoningEffort,
 	SessionSnapshot,
@@ -995,26 +995,25 @@ export function NoticeStack({
 	rightOpen,
 	onDismiss,
 }: {
-	notices: Notice[];
+	notices: ErrorNotice[];
 	rightOpen: boolean;
-	onDismiss?: (noticeId: string) => void;
+	onDismiss: (noticeId: string) => void;
 }) {
 	if (notices.length === 0) return null;
 	return (
-		<div className={`notice-stack ${rightOpen ? "with-inspector" : ""}`} aria-live="polite">
+		<div className={`notice-stack ${rightOpen ? "with-inspector" : ""}`} aria-live="assertive">
 			{notices.slice(-4).map((notice) => (
-				<div className={`notice-toast ${notice.tone}`} key={notice.id}>
+				<div className="notice-toast error" key={notice.id}>
 					<span>{notice.text}</span>
-					{notice.persistent && onDismiss ? (
-						<button
-							type="button"
-							className="notice-dismiss"
-							aria-label="Dismiss notification"
-							onClick={() => onDismiss(notice.id)}
-						>
-							<X size={14} />
-						</button>
-					) : null}
+					<button
+						type="button"
+						className="notice-dismiss"
+						aria-label="Dismiss notification"
+						title="Dismiss"
+						onClick={() => onDismiss(notice.id)}
+					>
+						<X size={14} />
+					</button>
 				</div>
 			))}
 		</div>

@@ -419,9 +419,8 @@ export interface StartSessionMcpSelection {
 
 export type NoticeTone = "info" | "success" | "error";
 
-export interface Notice {
+export interface ErrorNotice {
 	id: string;
-	tone: NoticeTone;
 	text: string;
 	persistent?: boolean;
 }
