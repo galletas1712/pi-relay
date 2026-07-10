@@ -26,7 +26,7 @@ hierarchical subagent machinery from the TypeScript fork.
 | `agent-store` | Postgres-only session/transcript/queue/action/event persistence and recovery. | [docs/modules/agent-store.md](docs/modules/agent-store.md) |
 | `agent-provider` | `ModelProvider` plus OpenAI/Codex and Anthropic adapters. | [docs/modules/agent-provider.md](docs/modules/agent-provider.md) |
 | `agent-tools` | `AgentTool`, `ToolRegistry`, and builtins: `apply_patch` / `str_replace_based_edit_tool`, `Bash`, `web_search`, `web_fetch`, `LoadSkill`, and delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). | [docs/modules/agent-tools.md](docs/modules/agent-tools.md) |
-| `agent-mcp` | Session-scoped local MCP stdio clients, New Session inventory/selection, deterministic frozen manifests, and result normalization. | [docs/plans/mcp-client.md](docs/plans/mcp-client.md) |
+| `agent-mcp` | Session-scoped stdio and generic Streamable HTTP MCP clients, New Session inventory/selection, deterministic frozen manifests, and result normalization. | [docs/plans/mcp-client.md](docs/plans/mcp-client.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch. | [docs/modules/agent-daemon.md](docs/modules/agent-daemon.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt. | [docs/modules/agent-prompt.md](docs/modules/agent-prompt.md) |
 
@@ -59,7 +59,7 @@ cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
 ```
 
 `--database-url`/`DATABASE_URL` is required; `--bind`/`PI_AGENTD_BIND` defaults
-to `127.0.0.1:8787`. Optional local MCP configuration is selected with
+to `127.0.0.1:8787`. Optional MCP configuration is selected with
 `--mcp-config PATH` or `PI_AGENTD_MCP_CONFIG`; its typed JSON shape and trust
 model are documented in [`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
 For example:
@@ -68,10 +68,13 @@ For example:
 {
   "servers": {
     "workspace": {
-      "command": "npx",
-      "args": ["-y", "@example/workspace-mcp"],
-      "cwd": "/trusted/workspace",
-      "inherit_env": ["EXAMPLE_TOKEN"],
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@example/workspace-mcp"],
+        "cwd": "/trusted/workspace",
+        "inherit_env": ["EXAMPLE_TOKEN"]
+      },
       "enabled_tools": ["read_file", "search"],
       "call_timeout_ms": 30000,
       "parallel_calls": 1
@@ -79,6 +82,41 @@ For example:
   }
 }
 ```
+
+Generic remote servers use Streamable HTTP. HTTPS is required except for
+loopback development/test endpoints. An optional bearer token is read at
+connection time from the configured environment variable; only its name is
+configuration identity:
+
+```json
+{
+  "servers": {
+    "remote": {
+      "transport": {
+        "type": "streamable_http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": {
+          "type": "bearer_env",
+          "env": "EXAMPLE_MCP_TOKEN"
+        }
+      },
+      "enabled_tools": ["search"]
+    }
+  }
+}
+```
+
+The tagged `transport` object is preferred. Earlier flat stdio fields remain
+accepted with the same route fingerprint so existing frozen manifests and
+configuration files remain compatible.
+Bearer environment authentication is only a transport prerequisite, not the
+interactive authentication objective. Browser OAuth login is not implemented
+in this stage. The next active generic stage is protected-resource and
+authorization-server discovery, DCR by default or static client IDs, PKCE,
+resource indicators, loopback/browser callbacks, secure credential
+persistence/refresh, explicit scope allowlists, and login/status/logout in New
+Session before tool selection. There is no built-in or provider-specific server
+catalog.
 
 All configured servers appear as New Session inventory sources. Operators use
 `enabled_tools` (or explicit `allow_all_tools: true`) as the hard allowlist;

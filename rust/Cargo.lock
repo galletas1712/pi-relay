@@ -45,14 +45,18 @@ dependencies = [
  "agent-vocab",
  "anyhow",
  "futures-util",
+ "http",
  "pretty_assertions",
  "process-wrap",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",
  "sha2",
+ "sse-stream",
  "thiserror",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1745,10 +1749,12 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "http",
  "pin-project-lite",
  "process-wrap",
  "serde",
  "serde_json",
+ "sse-stream",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -2194,6 +2200,19 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39f24a9b78c40b90817bbcd1821c74ddfd74916aadd29403d001532a9195532d"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]

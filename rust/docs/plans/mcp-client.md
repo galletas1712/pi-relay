@@ -1,4 +1,4 @@
-# Local MCP client: session-scoped design and implementation plan
+# MCP client: session-scoped design and implementation plan
 
 Status: session-scoped refactor rebased onto the provider-route and compact web
 workspace architecture. The combined New Session setup, public RPC, provider
@@ -20,9 +20,11 @@ declarations. No later inventory refresh, reconnect, configuration change, or
 `tools/list_changed` notification can mutate an existing session's prompt,
 declarations, routes, or selected names.
 
-The initial transport remains local stdio using the Rust `rmcp` SDK. The
-existing process cleanup, environment boundary, protocol bounds, result
-normalization, and exact-contract route verification remain in scope.
+Transports are operator-configured local stdio or generic remote Streamable
+HTTP using the Rust `rmcp` SDK. The existing process cleanup, environment
+boundary, protocol bounds, result normalization, and exact-contract route
+verification remain in scope. There is no built-in or provider-specific server
+catalog.
 
 ## Live checklist
 
@@ -40,6 +42,61 @@ normalization, and exact-contract route verification remain in scope.
   retaining child-specific first-party profiles.
 - [x] Specify conditional PI.md output containing server IDs and exposed names
   only.
+
+### Generic remote stage 1: Streamable HTTP prerequisite
+
+- [x] Replace the stdio-only config fields with an explicit typed transport:
+  `stdio` or `streamable_http`. Keep timeouts, concurrency, and tool allowlists
+  common to both.
+- [x] Add generic Streamable HTTP discovery and calls through `rmcp` 1.8,
+  including JSON/SSE responses, stateless servers, stateful session IDs, empty
+  successful notification responses, and bounded SSE reconnection.
+- [x] Add an optional tagged HTTP auth policy with a `bearer_env` prerequisite.
+  Resolve its token from a named environment variable at connection time. Keep
+  the value out of config identity, manifests, Debug, logs, RPC, and model
+  context; the environment variable name remains semantic route config. This
+  does not satisfy the interactive OAuth objective.
+- [x] Disable SDK stale-session request replay. A stale session or failed/timed
+  out POST closes the route; a later operation may establish a fresh client,
+  but the possibly-sent call is never replayed.
+- [x] Bound bytes before JSON deserialization and SSE line/event accumulation,
+  cap events and reconnect attempts, and apply connect/header and body-idle
+  timeouts. Timeout/task cancellation aborts only the in-flight POST before a
+  separately bounded `notifications/cancelled` and stateful DELETE cleanup.
+- [x] Scrub the exact resolved bearer from every inbound JSON value, SSE field,
+  session ID, result, and error before it reaches rmcp logging or catalog/result
+  processing. Retain downstream fixed-size catalog/result/error bounds.
+- [x] Restrict cleartext HTTP to loopback hosts for local development and
+  bounded integration tests; require HTTPS for remote hosts.
+- [x] Add bounded fake Streamable HTTP coverage for initialize, initialized,
+  tools/list, calls, bearer reflection, stateless/stateful JSON and SSE,
+  ignored server instructions, adversarial chunking/stalls, reconnect
+  exhaustion, cancellation/DELETE observations, `tools/list_changed`, and no
+  replay.
+
+### Generic remote stage 2: OAuth (next active stage)
+
+- [ ] Add protected-resource metadata discovery and authorization-server
+  metadata discovery with bounded responses, redirect/origin policy, and
+  issuer/resource validation.
+- [ ] Support Dynamic Client Registration by default and an optional
+  operator-configured static client ID; do not add provider-specific clients or
+  endpoint catalogs.
+- [ ] Implement authorization-code login with PKCE, resource indicators, a
+  loopback callback, browser launch/manual URL fallback, strict state
+  validation, and bounded callback lifetime.
+- [ ] Add explicit per-server scope allowlists. Reject discovered/requested
+  scopes outside operator policy rather than silently widening access.
+- [ ] Store OAuth client/credential state securely and persistently, refresh
+  access tokens at route connection time, serialize refreshes, and ensure
+  access/refresh/client secrets never enter Debug, logs, errors, RPC,
+  fingerprints, manifests, or model context.
+- [ ] Add generic login/status/logout RPC and New Session UI before tool
+  selection, including unavailable/login-required health without mutating
+  existing frozen session declarations.
+- [ ] Add integration coverage for DCR and static-client flows, PKCE/state/
+  resource/scope validation, refresh rotation, restart persistence,
+  concurrent refresh, logout, redaction, and OAuth error handling.
 
 ### MCP inventory and frozen manifests
 
@@ -143,7 +200,9 @@ normalization, and exact-contract route verification remain in scope.
 6. **No unsafe substitution/replay.** Calls resolve by server config
    fingerprint, raw name, and contract fingerprint. Revocation, contract
    change, unavailability, timeout, and protocol failures never substitute a
-   newer route or automatically replay a possibly side-effecting call.
+   newer route or automatically replay a possibly side-effecting call. This
+   also disables `rmcp` transparent stale-session reinitialization because it
+   replays the in-flight request.
 7. **Exact inheritance.** Full and read-only children reuse the parent's exact
    MCP manifest. Their first-party profile still removes parent-only delegation
    tools. Read-only describes filesystem access only and does not constrain
@@ -307,6 +366,9 @@ the inherited MCP set at parent session creation.
 admission. Reconnect/refresh updates only the global New Session inventory,
 revision, and health. Publication happens after bounded full-catalog
 validation. Existing manifests and provider-visible bytes do not change.
+Streamable HTTP may reconnect its auxiliary server-event SSE stream, but never
+retries a POSTed tool call. A stale `Mcp-Session-Id` fails the current operation
+and lets the existing manager reconnect only for a later operation.
 
 Existing calls continue to return:
 
@@ -320,7 +382,7 @@ No result is automatically replayed.
 ## Explicit non-goals
 
 - Agent-facing MCP search, discovery, enable/disable, or generic call brokers.
-- Streamable HTTP/SSE MCP transport, OAuth, or remote credential flows.
+- Built-in, provider-specific, or curated remote server catalogs.
 - MCP resources/prompts as independently exposed agent capabilities.
 - MCP sampling, elicitation, or server-initiated model work.
 - Dynamic `ToolRegistry` mutation or prompt rewriting.
@@ -409,3 +471,8 @@ No result is automatically replayed.
   `too_many_arguments` lint, all 454 web tests, the web production build, the
   unused TypeScript check, and `git diff --check`. Windows and macOS remain
   untested.
+- 2026-07-10: Generic remote stage 1 adds only operator-configured Streamable
+  HTTP routes and optional tagged `bearer_env` authentication as an OAuth
+  prerequisite. Remote initialization `instructions` are deliberately ignored;
+  resources and prompts remain out of scope. Provider-neutral OAuth is the next
+  active stage and no OAuth checklist item is implemented here.

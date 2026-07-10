@@ -166,10 +166,10 @@ fn initialize_result(mode: &str, line: &str) -> String {
     } else {
         json_string_field(line, "protocolVersion").unwrap_or("2025-11-25")
     };
-    let capabilities = if mode == "missing_tools" {
-        "{}"
-    } else {
-        r#"{"tools":{"listChanged":true}}"#
+    let capabilities = match mode {
+        "missing_tools" => "{}",
+        "unsolicited_list_changed" => r#"{"tools":{"listChanged":false}}"#,
+        _ => r#"{"tools":{"listChanged":true}}"#,
     };
     format!(
         r#"{{"protocolVersion":"{protocol}","capabilities":{capabilities},"serverInfo":{{"name":"fixture","version":"1"}}}}"#

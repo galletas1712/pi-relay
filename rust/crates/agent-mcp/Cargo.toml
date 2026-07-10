@@ -10,13 +10,17 @@ agent-tools = { workspace = true }
 agent-vocab = { workspace = true }
 anyhow = { workspace = true }
 futures-util = { workspace = true }
+http = { workspace = true }
 rmcp = { workspace = true }
 process-wrap = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+sse-stream = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
