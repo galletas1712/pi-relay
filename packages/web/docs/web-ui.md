@@ -451,9 +451,9 @@ transcript revision server-side, refreshing the picker if history changed undern
 ## Model and reasoning controls
 
 The chat header exposes a model picker and a provider-specific reasoning-effort picker (`sessionDefaults.ts`). OpenAI
-offers `gpt-5.6-sol` (default), `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude offers Sonnet 5, Opus 4.8, and Fable 5.
-Sonnet 5 is the normal Claude default at `high` effort. Fable 5 is listed last as an explicit opt-in, and its option text
-and tooltip state Anthropic's required 30-day retention and lack of Zero Data Retention. The provider/model is locked
+offers `gpt-5.6-sol` (default), `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude offers Opus 4.8 and Fable 5.
+Fable 5 is listed last as an explicit opt-in, and its option text and tooltip state that it is not ZDR.
+The provider/model is locked
 once the session has any transcript history, because both providers carry provider-shaped replay state across turns.
 The model control keeps its `Model, locked` accessible name after that point and
 retains the existing running-state lock. Reasoning effort is independently

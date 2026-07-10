@@ -20,19 +20,14 @@ export const MODEL_OPTIONS: ModelOption[] = [
 		provider: { kind: "openai" as const, model, reasoning_effort: "xhigh" as const }
 	})),
 	{
-		id: "claude:claude-sonnet-5",
-		label: "Claude Sonnet 5",
-		provider: { kind: "claude", model: "claude-sonnet-5", reasoning_effort: "high" }
-	},
-	{
 		id: "claude:claude-opus-4-8",
 		label: "Claude Opus 4.8",
 		provider: { kind: "claude", model: "claude-opus-4-8", reasoning_effort: "xhigh" }
 	},
 	{
 		id: "claude:claude-fable-5",
-		label: "Claude Fable 5 — 30-day retention; not ZDR",
-		description: "Explicit opt-in: Anthropic requires 30-day data retention for Fable 5; zero data retention is unavailable.",
+		label: "Claude Fable 5",
+		description: "Explicit opt-in: not ZDR.",
 		provider: { kind: "claude", model: "claude-fable-5", reasoning_effort: "high" }
 	}
 ];
