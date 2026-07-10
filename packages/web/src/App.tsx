@@ -621,7 +621,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	}, []);
 
 	const pushErrorNotice = useCallback((text: string, persistent = false) => {
-		if (connectionRef.current !== "open" || isConnectionLossNotice(text)) return;
+		if (connectionRef.current !== "open") return;
 		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_ERROR_NOTICES + 1)), { id: randomId("notice"), text, persistent }]);
 	}, []);
 	const reportActionError = useCallback((error: unknown) => {
@@ -4294,14 +4294,6 @@ function errorMessageOrNull(error: unknown): string | null {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
-}
-
-function isConnectionLossNotice(text: string): boolean {
-	const normalized = text.trim().toLowerCase();
-	return normalized.includes("websocket")
-		|| normalized === "waiting for connection"
-		|| normalized.startsWith("connection retry failed")
-		|| normalized.startsWith("failed to connect");
 }
 
 function isHistoryChangedError(error: unknown): boolean {
