@@ -1,5 +1,16 @@
 import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
+import {
+	useCallback,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+	useSyncExternalStore,
+	type CSSProperties,
+	type KeyboardEvent as ReactKeyboardEvent,
+	type PointerEvent as ReactPointerEvent,
+	type RefObject,
+} from "react";
 import { ArrowUp, Bot, Menu, PanelRightOpen } from "lucide-react";
 import { createAgentApi, type AgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
@@ -178,6 +189,35 @@ const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
 const SIDEBAR_CLOSE_BEFORE_SELECT_MS = 200;
 const MEDIUM_PANEL_QUERY = "(min-width: 900px)";
 const WIDE_PANEL_QUERY = "(min-width: 1280px)";
+const SIDEBAR_WIDTH_STORAGE_KEY = "piRelaySidebarWidth:v1";
+const DEFAULT_SIDEBAR_WIDTH = 320;
+const MIN_SIDEBAR_WIDTH = 240;
+const MAX_SIDEBAR_WIDTH = 480;
+const SIDEBAR_KEYBOARD_STEP = 16;
+
+function clampSidebarWidth(width: number): number {
+	return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(width)));
+}
+
+function loadSidebarWidth(): number {
+	if (typeof window === "undefined") return DEFAULT_SIDEBAR_WIDTH;
+	try {
+		const stored = Number(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
+		return Number.isFinite(stored) && stored > 0
+			? clampSidebarWidth(stored)
+			: DEFAULT_SIDEBAR_WIDTH;
+	} catch {
+		return DEFAULT_SIDEBAR_WIDTH;
+	}
+}
+
+function saveSidebarWidth(width: number): void {
+	try {
+		window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(clampSidebarWidth(width)));
+	} catch {
+		// localStorage persistence is best-effort.
+	}
+}
 
 function delegationQueryPrefix(parentSessionId: string) {
 	return ["delegations", parentSessionId] as const;
@@ -456,6 +496,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [sidebarOpen, setSidebarOpen] = useState(() => defaultPanelState(panelModeForViewport()).sidebarOpen);
 	const [rightOpen, setRightOpen] = useState(() => defaultPanelState(panelModeForViewport()).rightOpen);
 	const [panelMode, setPanelMode] = useState<PanelMode>(() => panelModeForViewport());
+	const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+	const [sidebarResizing, setSidebarResizing] = useState(false);
 	const [showArchived, setShowArchived] = useState(false);
 	const [showAllDelegations, setShowAllDelegations] = useState(false);
 	const [backgroundWarmRevision, setBackgroundWarmRevision] = useState(0);
@@ -499,8 +541,15 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const backgroundWarmUpdatedAt = useRef(new Map<string, string>());
 	const backgroundWarmInFlight = useRef(new Set<string>());
 	const composerHandleRef = useRef<ComposerHandle | null>(null);
+	const appShellRef = useRef<HTMLDivElement | null>(null);
 	const mobileSidebarToggleRef = useRef<HTMLButtonElement | null>(null);
 	const sidebarNewSessionButtonRef = useRef<HTMLButtonElement | null>(null);
+	const sidebarWidthRef = useRef(sidebarWidth);
+	const sidebarResizeRef = useRef<{
+		pointerId: number;
+		startX: number;
+		startWidth: number;
+	} | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
 	const selectedProjectRef = useRef<string | null>(initialSelection.projectId);
 	const routeValidationGenerationRef = useRef(0);
@@ -3277,6 +3326,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (nextMode === panelModeRef.current) return;
 			panelModeRef.current = nextMode;
 			setPanelMode(nextMode);
+			if (nextMode !== "wide") {
+				if (sidebarResizeRef.current) {
+					setSidebarWidth(sidebarWidthRef.current);
+					saveSidebarWidth(sidebarWidthRef.current);
+				}
+				sidebarResizeRef.current = null;
+				setSidebarResizing(false);
+			}
 			const defaults = defaultPanelState(nextMode);
 			setSidebarOpen(defaults.sidebarOpen);
 			setRightOpen(defaults.rightOpen);
@@ -3287,6 +3344,77 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			for (const query of queries) query.removeEventListener("change", syncPanelsToViewport);
 		};
 	}, []);
+	const applySidebarWidth = useCallback((width: number, persist = false) => {
+		const nextWidth = clampSidebarWidth(width);
+		sidebarWidthRef.current = nextWidth;
+		appShellRef.current?.style.setProperty("--sidebar-width", `${nextWidth}px`);
+		if (persist) {
+			setSidebarWidth(nextWidth);
+			saveSidebarWidth(nextWidth);
+		}
+	}, []);
+	const handleSidebarResizePointerDown = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			if (event.button !== 0 || panelModeRef.current !== "wide") return;
+			event.preventDefault();
+			sidebarResizeRef.current = {
+				pointerId: event.pointerId,
+				startX: event.clientX,
+				startWidth: sidebarWidthRef.current,
+			};
+			event.currentTarget.setPointerCapture(event.pointerId);
+			setSidebarResizing(true);
+		},
+		[],
+	);
+	const handleSidebarResizePointerMove = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			const resize = sidebarResizeRef.current;
+			if (!resize || resize.pointerId !== event.pointerId) return;
+			applySidebarWidth(resize.startWidth + event.clientX - resize.startX);
+		},
+		[applySidebarWidth],
+	);
+	const handleSidebarResizePointerEnd = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			const resize = sidebarResizeRef.current;
+			if (!resize || resize.pointerId !== event.pointerId) return;
+			sidebarResizeRef.current = null;
+			setSidebarResizing(false);
+			applySidebarWidth(sidebarWidthRef.current, true);
+			if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+				event.currentTarget.releasePointerCapture(event.pointerId);
+			}
+		},
+		[applySidebarWidth],
+	);
+	const handleSidebarResizeKeyDown = useCallback(
+		(event: ReactKeyboardEvent<HTMLDivElement>) => {
+			let nextWidth: number;
+			switch (event.key) {
+				case "ArrowLeft":
+					nextWidth = sidebarWidthRef.current - SIDEBAR_KEYBOARD_STEP;
+					break;
+				case "ArrowRight":
+					nextWidth = sidebarWidthRef.current + SIDEBAR_KEYBOARD_STEP;
+					break;
+				case "Home":
+					nextWidth = MIN_SIDEBAR_WIDTH;
+					break;
+				case "End":
+					nextWidth = MAX_SIDEBAR_WIDTH;
+					break;
+				default:
+					return;
+			}
+			event.preventDefault();
+			applySidebarWidth(nextWidth, true);
+		},
+		[applySidebarWidth],
+	);
+	const resetSidebarWidth = useCallback(() => {
+		applySidebarWidth(DEFAULT_SIDEBAR_WIDTH, true);
+	}, [applySidebarWidth]);
 	const handleResumeTurn = useCallback(
 		(entryId: string) => {
 			void resumeTerminalTurn(entryId).catch(reportActionError);
@@ -3390,10 +3518,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		}),
 		[],
 	);
-	const appClassName = `app-shell ${sidebarOpen ? "sidebar-open" : ""} ${rightOpen ? "inspector-open" : ""}`;
+	const appClassName = `app-shell ${sidebarOpen ? "sidebar-open" : ""} ${rightOpen ? "inspector-open" : ""} ${sidebarResizing ? "sidebar-resizing" : ""}`;
+	const appStyle = { "--sidebar-width": `${sidebarWidth}px` } as CSSProperties;
 
 	return (
-		<div className={appClassName}>
+		<div ref={appShellRef} className={appClassName} style={appStyle}>
 			<div className="mobile-topbar">
 				<button
 					ref={mobileSidebarToggleRef}
@@ -3497,6 +3626,27 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				mutationBlockedReason={connectionRemoteActionBlockedReason}
 				remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 			/>
+			{panelMode === "wide" ? (
+				<div
+					className="sidebar-resize-handle"
+					role="separator"
+					aria-label="Resize sidebar"
+					aria-orientation="vertical"
+					aria-valuemin={MIN_SIDEBAR_WIDTH}
+					aria-valuemax={MAX_SIDEBAR_WIDTH}
+					aria-valuenow={sidebarWidth}
+					aria-valuetext={`${sidebarWidth} pixels`}
+					tabIndex={0}
+					title="Drag to resize sidebar. Double-click to reset."
+					onDoubleClick={resetSidebarWidth}
+					onKeyDown={handleSidebarResizeKeyDown}
+					onPointerDown={handleSidebarResizePointerDown}
+					onPointerMove={handleSidebarResizePointerMove}
+					onPointerUp={handleSidebarResizePointerEnd}
+					onPointerCancel={handleSidebarResizePointerEnd}
+					onLostPointerCapture={handleSidebarResizePointerEnd}
+				/>
+			) : null}
 
 			{conversationVisible ? (
 				<ChatPane
