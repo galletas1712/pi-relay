@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentRpcClient, RPC_REQUEST_TIMEOUT_MS, resolveWsUrl } from "./rpc.ts";
+import {
+	AgentRpcClient,
+	RPC_REQUEST_TIMEOUT_MS,
+	SESSION_START_REQUEST_TIMEOUT_MS,
+	resolveWsUrl,
+} from "./rpc.ts";
 
 class FakeWebSocket {
 	static readonly CONNECTING = 0;
@@ -90,6 +95,15 @@ function localLocation(): Pick<Location, "hostname" | "port" | "protocol"> {
 }
 
 describe("AgentRpcClient reconnect hardening", () => {
+	it.each([0, Number.POSITIVE_INFINITY])("rejects an invalid request timeout of %s", async (timeoutMs) => {
+		const client = new AgentRpcClient("ws://agent.test/ws");
+
+		await expect(client.request("session.list", {}, { timeoutMs })).rejects.toThrow(
+			"RPC request timeout must be a positive finite number",
+		);
+		expect(FakeWebSocket.instances).toHaveLength(0);
+	});
+
 	it("times out a hung request and starts reconnecting", async () => {
 		const client = new AgentRpcClient("ws://agent.test/ws");
 		const statuses: string[] = [];
@@ -112,6 +126,40 @@ describe("AgentRpcClient reconnect hardening", () => {
 
 		await vi.advanceTimersByTimeAsync(750);
 		expect(FakeWebSocket.instances).toHaveLength(2);
+		client.close();
+	});
+
+	it("honors a longer per-request timeout", async () => {
+		const client = new AgentRpcClient("ws://agent.test/ws");
+		const connect = client.connect();
+		const socket = FakeWebSocket.instances[0];
+		socket.open();
+		await connect;
+
+		let settled = false;
+		const request = client.request("session.start", {}, {
+			timeoutMs: SESSION_START_REQUEST_TIMEOUT_MS,
+		});
+		void request.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		const requestRejected = expect(request).rejects.toThrow("websocket request timed out");
+
+		await vi.advanceTimersByTimeAsync(RPC_REQUEST_TIMEOUT_MS);
+		expect(settled).toBe(false);
+		expect(client.isOpen()).toBe(true);
+
+		await vi.advanceTimersByTimeAsync(
+			SESSION_START_REQUEST_TIMEOUT_MS - RPC_REQUEST_TIMEOUT_MS,
+		);
+		await requestRejected;
+		expect(settled).toBe(true);
+		expect(client.isOpen()).toBe(false);
 		client.close();
 	});
 

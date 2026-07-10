@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { createAgentApi } from "./agentApi.ts";
-import type { RpcClient } from "./rpc.ts";
+import {
+	SESSION_START_REQUEST_TIMEOUT_MS,
+	type RpcClient,
+	type RpcRequestOptions,
+} from "./rpc.ts";
+
+type RpcCall = {
+	method: string;
+	params?: Record<string, unknown>;
+	options?: RpcRequestOptions;
+};
 
 describe("AgentApi MCP wire format", () => {
 	it("requests inventory and serializes sorted raw session selection", async () => {
-		const calls: { method: string; params?: Record<string, unknown> }[] = [];
+		const calls: RpcCall[] = [];
 		const client = fakeClient(calls);
 		const api = createAgentApi(client);
 		await api.getMcpInventory("openai");
@@ -45,11 +55,12 @@ describe("AgentApi MCP wire format", () => {
 					],
 				},
 			},
+			options: { timeoutMs: SESSION_START_REQUEST_TIMEOUT_MS },
 		});
 	});
 
 	it("maps the sanitized MCP OAuth lifecycle without browser storage", async () => {
-		const calls: { method: string; params?: Record<string, unknown> }[] = [];
+		const calls: RpcCall[] = [];
 		const storageSet = globalThis.localStorage?.setItem;
 		const api = createAgentApi(fakeClient(calls));
 		await api.getMcpStatus();
@@ -83,7 +94,7 @@ describe("AgentApi MCP wire format", () => {
 	});
 
 	it("omits MCP for an MCP-free session", async () => {
-		const calls: { method: string; params?: Record<string, unknown> }[] = [];
+		const calls: RpcCall[] = [];
 		await createAgentApi(fakeClient(calls)).startSession({
 			sessionId: "session-1",
 			provider: { kind: "openai", model: "gpt-test" },
@@ -96,7 +107,7 @@ describe("AgentApi MCP wire format", () => {
 	});
 
 	it("preserves an explicit empty workspace subset for daemon validation", async () => {
-		const calls: { method: string; params?: Record<string, unknown> }[] = [];
+		const calls: RpcCall[] = [];
 		await createAgentApi(fakeClient(calls)).startSession({
 			sessionId: "session-1",
 			projectId: "project-1",
@@ -111,7 +122,7 @@ describe("AgentApi MCP wire format", () => {
 	});
 });
 
-function fakeClient(calls: { method: string; params?: Record<string, unknown> }[]): RpcClient {
+function fakeClient(calls: RpcCall[]): RpcClient {
 	return {
 		connect: async () => {},
 		reconnect: async () => {},
@@ -119,8 +130,12 @@ function fakeClient(calls: { method: string; params?: Record<string, unknown> }[
 		isOpen: () => true,
 		onEvent: () => () => {},
 		onStatus: () => () => {},
-		request: async <T>(method: string, params?: Record<string, unknown>) => {
-			calls.push({ method, params });
+		request: async <T>(
+			method: string,
+			params?: Record<string, unknown>,
+			options?: RpcRequestOptions,
+		) => {
+			calls.push({ method, params, ...(options ? { options } : {}) });
 			if (method === "mcp.inventory") return { revision: "inventory-1", servers: [] } as T;
 			if (method === "mcp.status") return { servers: [] } as T;
 			if (method === "mcp.login") {

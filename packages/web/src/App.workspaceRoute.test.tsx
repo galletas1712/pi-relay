@@ -91,7 +91,7 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
-	it("shows preparation only for included workspaces while session.start is pending and clears it on rejection", async () => {
+	it("shows one workspace preparation status while session.start is pending and clears it on rejection", async () => {
 		const start = deferred<never>();
 		const api = createRouteApi();
 		api.startSession.mockImplementation(() => start.promise);
@@ -113,18 +113,20 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("button", { name: "send message" }));
 
 		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
-		expect(screen.getByRole("status", { name: "Preparing workspace repo-a" })).toBeTruthy();
-		expect(screen.queryByRole("status", { name: "Preparing workspace docs" })).toBeNull();
+		const preparing = screen.getByRole("status", { name: "Preparing workspaces…" });
+		expect(preparing.textContent).toBe("Preparing workspaces…");
+		expect(preparing.querySelector("svg")?.classList.contains("spin")).toBe(true);
+		expect(screen.getAllByRole("status", { name: "Preparing workspaces…" })).toHaveLength(1);
 
 		await act(async () => start.reject(new Error("workspace preparation failed")));
 		await waitFor(() =>
-			expect(screen.queryByRole("status", { name: "Preparing workspace repo-a" })).toBeNull(),
+			expect(screen.queryByRole("status", { name: "Preparing workspaces…" })).toBeNull(),
 		);
 
 		await mounted.dispose();
 	});
 
-	it("shows no preparation for another project during a pending start and restores the submitted rows on return", async () => {
+	it("shows no preparation for another project during a pending start and restores it on return", async () => {
 		const start = deferred<never>();
 		const api = createRouteApi();
 		api.startSession.mockImplementation(() => start.promise);
@@ -146,7 +148,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("button", { name: "send message" }));
 
 		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
-		expect(screen.getByRole("status", { name: "Preparing workspace repo-a" })).toBeTruthy();
+		expect(screen.getByRole("status", { name: "Preparing workspaces…" })).toBeTruthy();
 
 		const projectTwoButton = screen
 			.getAllByRole("button", { name: /Project two/ })
@@ -154,11 +156,10 @@ describe("App workspace route identity integration", () => {
 		if (!projectTwoButton) throw new Error("missing Project two selector");
 		await user.click(projectTwoButton);
 		expect(await screen.findByRole("button", { name: /Workspaces/ })).toBeTruthy();
-		expect(screen.queryByRole("status", { name: /Preparing workspace/ })).toBeNull();
+		expect(screen.queryByRole("status", { name: "Preparing workspaces…" })).toBeNull();
 
 		await user.click(projectOneButton);
-		expect(await screen.findByRole("status", { name: "Preparing workspace repo-a" })).toBeTruthy();
-		expect(screen.queryByRole("status", { name: "Preparing workspace docs" })).toBeNull();
+		expect(await screen.findByRole("status", { name: "Preparing workspaces…" })).toBeTruthy();
 
 		await act(async () => start.reject(new Error("workspace preparation failed")));
 		await mounted.dispose();
@@ -183,7 +184,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("button", { name: "new session" }));
 
 		expect(await screen.findByRole("heading", { name: "Workspace scope" })).toBeTruthy();
-		expect(screen.queryByRole("status", { name: /Preparing workspace/ })).toBeNull();
+		expect(screen.queryByRole("status", { name: "Preparing workspaces…" })).toBeNull();
 		expect(api.startSession).not.toHaveBeenCalled();
 
 		await act(async () => followUp.resolve({ queued: true }));
@@ -206,8 +207,27 @@ describe("App workspace route identity integration", () => {
 
 		await waitFor(() => expect(screen.getByRole<HTMLTextAreaElement>("textbox").value).toBe("/compact"));
 		expect(api.startSession).not.toHaveBeenCalled();
-		expect(screen.queryByRole("status", { name: /Preparing workspace/ })).toBeNull();
+		expect(screen.queryByRole("status", { name: "Preparing workspaces…" })).toBeNull();
 
+		await mounted.dispose();
+	});
+
+	it("does not show workspace preparation for a pending host-only start", async () => {
+		const start = deferred<never>();
+		const api = createRouteApi();
+		api.startSession.mockImplementation(() => start.promise);
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.type(await screen.findByRole("textbox"), "start on host");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
+		expect(api.startSession.mock.calls[0][0].workspaces).toBeUndefined();
+		expect(screen.queryByRole("status", { name: "Preparing workspaces…" })).toBeNull();
+
+		await act(async () => start.reject(new Error("host start failed")));
 		await mounted.dispose();
 	});
 
@@ -224,6 +244,7 @@ describe("App workspace route identity integration", () => {
 			.find((button) => button.classList.contains("project-row-primary"));
 		if (!projectButton) throw new Error("missing Project one selector");
 		await user.click(projectButton);
+		expect(await screen.findByRole("button", { name: /Workspaces/ })).toBeTruthy();
 		await user.type(
 			screen.getByPlaceholderText("Create or select a session"),
 			"prepare all workspaces",
@@ -231,14 +252,14 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("button", { name: "send message" }));
 
 		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
-		expect(screen.getAllByRole("status", { name: /Preparing workspace/ })).toHaveLength(2);
+		expect(screen.getAllByRole("status", { name: "Preparing workspaces…" })).toHaveLength(1);
 		const sessionId = api.startSession.mock.calls[0][0].sessionId;
 
 		await act(async () => start.resolve({ session_id: sessionId, activity: "queued" }));
 		await waitFor(() =>
 			expect(document.querySelector("[data-slot='new-session-setup']")).toBeNull(),
 		);
-		expect(screen.queryByRole("status", { name: /Preparing workspace/ })).toBeNull();
+		expect(screen.queryByRole("status", { name: "Preparing workspaces…" })).toBeNull();
 
 		await mounted.dispose();
 	});
@@ -421,7 +442,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("button", { name: "send message" }));
 
 		expect(api.startSession).not.toHaveBeenCalled();
-		expect(screen.queryByRole("status", { name: /Preparing workspace/ })).toBeNull();
+		expect(screen.queryByRole("status", { name: "Preparing workspaces…" })).toBeNull();
 		expect(await screen.findByText(/workspace is not authorized/)).toBeTruthy();
 		expect(composer.value).toBe("do not send with stale OAuth");
 		await mounted.dispose();

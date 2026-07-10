@@ -3008,13 +3008,11 @@ pre {
 	opacity: 0.5;
 }
 
-.workspace-scope-preparing {
+.workspace-preparation-status {
 	display: inline-flex;
 	flex: 0 0 auto;
 	align-items: center;
 	gap: 4px;
-	color: var(--muted-foreground);
-	font-size: var(--text-xs);
 	white-space: nowrap;
 }
 
