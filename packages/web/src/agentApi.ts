@@ -1,4 +1,10 @@
-import { AgentRpcClient, defaultWsUrl, type ConnectionStatus, type RpcClient } from "./rpc.ts";
+import {
+	AgentRpcClient,
+	defaultWsUrl,
+	SESSION_START_REQUEST_TIMEOUT_MS,
+	type ConnectionStatus,
+	type RpcClient,
+} from "./rpc.ts";
 import type {
 	Activity,
 	ActiveBranchSyncResponse,
@@ -553,32 +559,36 @@ class AgentApiClient implements AgentApi {
 	}
 
 	startSession(params: StartSessionParams): Promise<StartSessionResult> {
-		return this.client.request<StartSessionResult>("session.start", {
-			session_id: params.sessionId,
-			project_id: params.projectId || undefined,
-			provider: params.provider,
-			metadata: params.metadata,
-			client_input_id: params.clientInputId,
-			priority: params.priority,
-			content: params.content,
-			...(params.mcp?.servers.length
-				? { mcp: {
-						inventory_revision: params.mcp.inventoryRevision,
-						servers: [...params.mcp.servers].sort((left, right) =>
-							left.server < right.server ? -1 : left.server > right.server ? 1 : 0
-						).map((server) => ({
-							server: server.server,
-							tools: [...server.tools].sort(),
-						})),
-					} }
-				: {}),
-			workspaces: params.workspaces == null
-				? undefined
-				: params.workspaces.map((workspace) => ({
-						workspace_dir: workspace.workspaceDir,
-						branch: workspace.branch?.trim() || undefined
-					}))
-		});
+		return this.client.request<StartSessionResult>(
+			"session.start",
+			{
+				session_id: params.sessionId,
+				project_id: params.projectId || undefined,
+				provider: params.provider,
+				metadata: params.metadata,
+				client_input_id: params.clientInputId,
+				priority: params.priority,
+				content: params.content,
+				...(params.mcp?.servers.length
+					? { mcp: {
+							inventory_revision: params.mcp.inventoryRevision,
+							servers: [...params.mcp.servers].sort((left, right) =>
+								left.server < right.server ? -1 : left.server > right.server ? 1 : 0
+							).map((server) => ({
+								server: server.server,
+								tools: [...server.tools].sort(),
+							})),
+						} }
+					: {}),
+				workspaces: params.workspaces == null
+					? undefined
+					: params.workspaces.map((workspace) => ({
+							workspace_dir: workspace.workspaceDir,
+							branch: workspace.branch?.trim() || undefined
+						}))
+			},
+			{ timeoutMs: SESSION_START_REQUEST_TIMEOUT_MS },
+		);
 	}
 
 	queueFollowUp(params: QueueFollowUpParams): Promise<FollowUpResult> {

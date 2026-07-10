@@ -31,10 +31,19 @@ export interface RpcClient {
 	isOpen(): boolean;
 	onEvent(handler: EventHandler): () => void;
 	onStatus(handler: StatusHandler): () => void;
-	request<T>(method: string, params?: Record<string, unknown>): Promise<T>;
+	request<T>(
+		method: string,
+		params?: Record<string, unknown>,
+		options?: RpcRequestOptions,
+	): Promise<T>;
+}
+
+export interface RpcRequestOptions {
+	timeoutMs?: number;
 }
 
 export const RPC_REQUEST_TIMEOUT_MS = 15_000;
+export const SESSION_START_REQUEST_TIMEOUT_MS = 300_000;
 
 export class AgentRpcClient implements RpcClient {
 	private ws: WebSocket | null = null;
@@ -147,7 +156,15 @@ export class AgentRpcClient implements RpcClient {
 		return () => this.statusHandlers.delete(handler);
 	}
 
-	async request<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+	async request<T>(
+		method: string,
+		params: Record<string, unknown> = {},
+		options?: RpcRequestOptions,
+	): Promise<T> {
+		const timeoutMs = options?.timeoutMs ?? RPC_REQUEST_TIMEOUT_MS;
+		if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+			throw new Error("RPC request timeout must be a positive finite number");
+		}
 		await this.connect();
 		const ws = this.ws;
 		if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -163,7 +180,7 @@ export class AgentRpcClient implements RpcClient {
 			});
 		});
 		ws.send(JSON.stringify({ id, method, params }));
-		return this.withRequestTimeout(id, promise);
+		return this.withRequestTimeout(id, promise, timeoutMs);
 	}
 
 	private handleMessage(message: MessageEvent<string>): void {
@@ -225,7 +242,11 @@ export class AgentRpcClient implements RpcClient {
 		reject?.(new Error(message));
 	}
 
-	private withRequestTimeout<T>(id: string, promise: Promise<T>): Promise<T> {
+	private withRequestTimeout<T>(
+		id: string,
+		promise: Promise<T>,
+		timeoutMs: number,
+	): Promise<T> {
 		return new Promise<T>((resolve, reject) => {
 			const timer = globalThis.setTimeout(() => {
 				const pending = this.pending.get(id);
@@ -240,7 +261,7 @@ export class AgentRpcClient implements RpcClient {
 				reject(error);
 				this.emitStatus("closed");
 				if (!this.closedByUser) this.scheduleReconnect();
-			}, RPC_REQUEST_TIMEOUT_MS);
+			}, timeoutMs);
 			promise.then(
 				(value) => {
 					globalThis.clearTimeout(timer);

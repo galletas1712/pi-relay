@@ -1,4 +1,4 @@
-import { FolderTree, Plug } from "lucide-react";
+import { FolderTree, Loader2, Plug } from "lucide-react";
 import { useState } from "react";
 import { McpToolPicker } from "./mcpToolPicker.tsx";
 import type { McpSelectionState } from "./mcpSelection.ts";
@@ -30,7 +30,7 @@ export function NewSessionSetup({
 	mcpAuthBusyServer,
 	mcpAuthMutationBlockedReason,
 	disabled,
-	preparingWorkspaceDirs,
+	preparingWorkspaces,
 }: {
 	workspaceConfiguration: WorkspaceConfiguration;
 	onWorkspaceScopeChange: (scope: WorkspaceScopeEntry[]) => void;
@@ -48,7 +48,7 @@ export function NewSessionSetup({
 	mcpAuthBusyServer?: string | null;
 	mcpAuthMutationBlockedReason?: string | null;
 	disabled?: boolean;
-	preparingWorkspaceDirs: readonly string[];
+	preparingWorkspaces: boolean;
 }) {
 	const [open, setOpen] = useState<OpenSetup>(null);
 	const workspaceScope =
@@ -85,8 +85,7 @@ export function NewSessionSetup({
 										scope={workspaceScope}
 										onChange={onWorkspaceScopeChange}
 										disabled={disabled}
-										preparingWorkspaceDirs={preparingWorkspaceDirs}
-										open={preparingWorkspaceDirs.length > 0 || open === "workspaces"}
+										open={open === "workspaces"}
 										onOpenChange={(nextOpen) => setOpen(nextOpen ? "workspaces" : null)}
 									/>
 								) : workspaceConfiguration.status === "loading" ? (
@@ -98,6 +97,16 @@ export function NewSessionSetup({
 										Workspace configuration unavailable. Retry from the Projects panel.
 									</p>
 								)}
+								{preparingWorkspaces ? (
+									<p
+										className="new-session-setup-status workspace-preparation-status"
+										role="status"
+										aria-label="Preparing workspaces…"
+									>
+										<Loader2 className="spin" size={14} aria-hidden />
+										<span>Preparing workspaces…</span>
+									</p>
+								) : null}
 							</section>
 						) : null}
 						{showMcpSection ? (

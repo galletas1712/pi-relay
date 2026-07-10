@@ -510,10 +510,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		useState<string | null>(null);
 	const [newSessionSetupGeneration, setNewSessionSetupGeneration] = useState(0);
 	const [sending, setSending] = useState(false);
-	const [workspacePreparation, setWorkspacePreparation] = useState<{
-		projectId: string | null;
-		workspaceDirs: string[];
-	} | null>(null);
+	const [workspacePreparationProjectId, setWorkspacePreparationProjectId] =
+		useState<string | null>(null);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
 	const [transcriptDestination, setTranscriptDestination] = useState<TranscriptDestination | null>(null);
@@ -3074,16 +3072,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			};
 			let result;
 			try {
-				setWorkspacePreparation({
-					projectId,
-					workspaceDirs: submittedWorkspaceScope
-						.filter((entry) => entry.included)
-						.map((entry) => entry.workspaceDir),
-				});
+				setWorkspacePreparationProjectId(
+					submittedWorkspaceScope.some((entry) => entry.included) ? projectId : null,
+				);
 				try {
 					result = await api.startSession(params);
 				} finally {
-					setWorkspacePreparation(null);
+					setWorkspacePreparationProjectId(null);
 				}
 			} catch (error) {
 				if (errorMessage(error).startsWith("mcp_inventory_changed:")) {
@@ -3855,10 +3850,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		workspaceRouteResult.kind === "route"
 			? workspaceRouteResult.warnings.filter((warning) => warning.persistent)
 			: [];
-	const preparingWorkspaceDirs =
-		workspacePreparation?.projectId === selectedProjectId
-			? workspacePreparation.workspaceDirs
-			: [];
+	const preparingWorkspaces =
+		workspacePreparationProjectId !== null &&
+		workspacePreparationProjectId === selectedProjectId;
 	const mobileTitle = selectedChatSession
 		? sessionTitle(selectedChatSession)
 		: selectedProject
@@ -4082,7 +4076,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 									onMcpLogout={cancelOrLogoutMcp}
 									mcpAuthBusyServer={mcpAuthBusyServer}
 									disabled={sending}
-									preparingWorkspaceDirs={preparingWorkspaceDirs}
+									preparingWorkspaces={preparingWorkspaces}
 									mcpAuthMutationBlockedReason={connectionRemoteActionBlockedReason}
 								/>
 							) : null
