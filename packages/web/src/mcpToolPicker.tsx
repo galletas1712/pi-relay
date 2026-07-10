@@ -2,12 +2,13 @@ import { memo, useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import {
 	mcpSelectionTotals,
+	clearMcpServerSelection,
 	serverSelectionState,
 	toggleServer,
 	toggleTool,
 	type McpSelectionState,
 } from "./mcpSelection.ts";
-import type { McpInventory } from "./types.ts";
+import type { McpAuthServerStatus, McpInventory, McpInventoryServer } from "./types.ts";
 
 function MixedCheckbox({
 	checked,
@@ -29,6 +30,12 @@ export const McpToolPicker = memo(function McpToolPicker({
 	inventoryReady = true,
 	open: controlledOpen,
 	onOpenChange,
+	authStatus = [],
+	authStatusReady = true,
+	onLogin,
+	onLogout,
+	authBusyServer = null,
+	authMutationBlockedReason = null,
 }: {
 	inventory: McpInventory;
 	selection: McpSelectionState;
@@ -37,11 +44,23 @@ export const McpToolPicker = memo(function McpToolPicker({
 	inventoryReady?: boolean;
 	open?: boolean;
 	onOpenChange?: (open: boolean) => void;
+	authStatus?: McpAuthServerStatus[];
+	authStatusReady?: boolean;
+	onLogin?: (server: string) => void;
+	onLogout?: (server: string) => void;
+	authBusyServer?: string | null;
+	authMutationBlockedReason?: string | null;
 }) {
 	const [internalOpen, setInternalOpen] = useState(false);
 	const open = controlledOpen ?? internalOpen;
 	const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
-	if (!inventory.servers.length) return null;
+	const inventoryByServer = new Map(inventory.servers.map((server) => [server.server, server]));
+	const authByServer = new Map(authStatus.map((status) => [status.server, status]));
+	const serverIds = [...new Set([
+		...authStatus.map((status) => status.server),
+		...inventory.servers.map((server) => server.server),
+	])].sort();
+	if (!serverIds.length) return null;
 	const total = mcpSelectionTotals(inventory, selection);
 	const setOpen = (nextOpen: boolean) => {
 		if (controlledOpen === undefined) setInternalOpen(nextOpen);
@@ -76,13 +95,20 @@ export const McpToolPicker = memo(function McpToolPicker({
 			) : null}
 			{open ? (
 				<div className="mcp-picker-list">
-					{inventory.servers.map((server) => {
+					{serverIds.map((serverId) => {
+						const server = inventoryByServer.get(serverId) ?? missingInventoryServer(serverId);
+						const auth = authByServer.get(serverId);
 						const state = serverSelectionState(inventory, selection, server.server);
 						const isExpanded = expanded.has(server.server);
 						const selected = selection.get(server.server);
+						const selectionReady =
+							authStatusReady &&
+							!!auth &&
+							(auth.auth_kind !== "oauth" || auth.auth_state === "ready");
 						const canToggleServer =
 							server.tools.length > 0 &&
-							(inventoryReady || state === "all");
+							(!!selected?.size ||
+								(selectionReady && inventoryReady && server.health === "healthy"));
 						const contextTokens = server.tools
 							.filter((tool) => selected?.has(tool.raw_name))
 							.reduce((sum, tool) => sum + tool.context_token_estimate, 0);
@@ -106,19 +132,103 @@ export const McpToolPicker = memo(function McpToolPicker({
 												mixed={state === "some"}
 												disabled={
 													disabled ||
-													!canToggleServer ||
-													(server.health !== "healthy" && !selected?.size)
+													!canToggleServer
 												}
-												onChange={() => onChange(toggleServer(inventory, selection, server.server))}
+												onChange={() =>
+													onChange(
+														selectionReady &&
+															inventoryReady &&
+															server.health === "healthy"
+															? toggleServer(inventory, selection, server.server)
+															: clearMcpServerSelection(selection, server.server),
+													)}
 											/>
 										) : null}
 										<span>{server.server}</span>
 									</label>
+									{auth ? (
+										<span
+											className={`mcp-picker-auth ${auth.auth_state}`}
+										>
+											{authLabel(auth)}
+											{auth.failure ? ` · ${authFailureLabel(auth.failure)}` : ""}
+										</span>
+									) : null}
 									<span className={`mcp-picker-health ${server.health}`}>{server.health}</span>
 									<span className="mcp-picker-meta">
 										{selected?.size ?? 0}/{server.tools.length} tools · ≈{contextTokens.toLocaleString()} tokens
 									</span>
+									{auth?.auth_kind === "oauth" && auth.can_login ? (
+										<button
+											type="button"
+											className="mcp-picker-auth-action"
+											onClick={() => onLogin?.(server.server)}
+											disabled={
+												disabled ||
+												authBusyServer !== null ||
+												!!authMutationBlockedReason
+											}
+											title={authMutationBlockedReason ?? undefined}
+										>
+											{authBusyServer === server.server ? "Starting…" : "Login"}
+										</button>
+									) : null}
+									{auth?.auth_kind === "oauth" &&
+									auth.auth_state !== "authorization_pending" &&
+									auth.can_logout ? (
+										<button
+											type="button"
+											className="mcp-picker-auth-action"
+											onClick={() => {
+												if (
+													selected?.size &&
+													!window.confirm(
+														`Continue and clear ${server.server}'s selected draft tools?`,
+													)
+												) return;
+												onLogout?.(server.server);
+											}}
+											disabled={
+												disabled ||
+												authBusyServer !== null ||
+												!!authMutationBlockedReason
+											}
+											title={authMutationBlockedReason ?? undefined}
+										>
+											{authBusyServer === server.server ? "Logging out…" : "Logout"}
+										</button>
+									) : null}
+									{auth?.auth_kind === "oauth" &&
+									auth.auth_state === "authorization_pending" &&
+									auth.can_logout ? (
+										<button
+											type="button"
+											className="mcp-picker-auth-action"
+											onClick={() => {
+												if (
+													selected?.size &&
+													!window.confirm(
+														`Continue and clear ${server.server}'s selected draft tools?`,
+													)
+												) return;
+												onLogout?.(server.server);
+											}}
+											disabled={
+												disabled ||
+												authBusyServer !== null ||
+												!!authMutationBlockedReason
+											}
+											title={authMutationBlockedReason ?? undefined}
+										>
+											{authBusyServer === server.server ? "Cancelling…" : "Cancel"}
+										</button>
+									) : null}
 								</div>
+								{auth?.auth_state === "authorization_pending" ? (
+									<p className="mcp-picker-pending" role="status">
+										Authorization is pending. If this page was reloaded, cancel it and start again.
+									</p>
+								) : null}
 								{isExpanded ? (
 									<div className="mcp-picker-tools">
 										{server.tools.map((tool) => (
@@ -128,6 +238,7 @@ export const McpToolPicker = memo(function McpToolPicker({
 													checked={selected?.has(tool.raw_name) ?? false}
 													disabled={
 														disabled ||
+														(!selectionReady && !selected?.has(tool.raw_name)) ||
 														(!inventoryReady && !selected?.has(tool.raw_name)) ||
 														(server.health !== "healthy" && !selected?.has(tool.raw_name))
 													}
@@ -150,3 +261,28 @@ export const McpToolPicker = memo(function McpToolPicker({
 		</div>
 	);
 });
+
+function missingInventoryServer(server: string): McpInventoryServer {
+	return { server, revision: "", health: "unavailable", tools: [] };
+}
+
+function authLabel(status: McpAuthServerStatus): string {
+	if (status.auth_kind === "none") return "no auth";
+	if (status.auth_kind === "bearer") return "bearer";
+	switch (status.auth_state) {
+		case "ready": return "OAuth ready";
+		case "login_required": return "login required";
+		case "reauthentication_required": return "login expired";
+		case "authorization_pending": return "login pending";
+		case "unsupported": return "OAuth unsupported";
+		case "unknown": return "OAuth unknown";
+		case "not_applicable": return "OAuth";
+	}
+}
+
+function authFailureLabel(failure: NonNullable<McpAuthServerStatus["failure"]>): string {
+	switch (failure) {
+		case "credential_store_unavailable": return "OAuth credential storage is unavailable";
+		case "discovery_failed": return "OAuth discovery failed";
+	}
+}

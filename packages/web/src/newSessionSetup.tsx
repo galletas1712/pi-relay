@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { McpToolPicker } from "./mcpToolPicker.tsx";
 import type { McpSelectionState } from "./mcpSelection.ts";
-import type { McpInventory } from "./types.ts";
+import type { McpAuthServerStatus, McpInventory } from "./types.ts";
 import type { WorkspaceScopeEntry } from "./workspaceScope.ts";
 import { WorkspaceScopePicker } from "./workspaceScopePicker.tsx";
 
@@ -17,6 +17,12 @@ export function NewSessionSetup({
 	mcpReady,
 	mcpError,
 	onRetryMcp,
+	mcpAuthStatus,
+	mcpAuthStatusReady,
+	onMcpLogin,
+	onMcpLogout,
+	mcpAuthBusyServer,
+	mcpAuthMutationBlockedReason,
 	disabled,
 }: {
 	workspaceScope: WorkspaceScopeEntry[] | null;
@@ -28,11 +34,17 @@ export function NewSessionSetup({
 	mcpReady: boolean;
 	mcpError: string | null;
 	onRetryMcp: () => void;
+	mcpAuthStatus: McpAuthServerStatus[];
+	mcpAuthStatusReady: boolean;
+	onMcpLogin: (server: string) => void;
+	onMcpLogout: (server: string) => void;
+	mcpAuthBusyServer?: string | null;
+	mcpAuthMutationBlockedReason?: string | null;
 	disabled?: boolean;
 }) {
 	const [open, setOpen] = useState<OpenSetup>(null);
 	const showWorkspaces = !!workspaceScope?.length;
-	const showMcp = !!mcpInventory?.servers.length;
+	const showMcp = !!mcpInventory?.servers.length || mcpAuthStatus.length > 0;
 	if (!showWorkspaces && !showMcp && !mcpLoading && !mcpError) return null;
 
 	return (
@@ -46,15 +58,21 @@ export function NewSessionSetup({
 					onOpenChange={(nextOpen) => setOpen(nextOpen ? "workspaces" : null)}
 				/>
 			) : null}
-			{showMcp && mcpInventory ? (
+			{showMcp ? (
 				<McpToolPicker
-					inventory={mcpInventory}
+					inventory={mcpInventory ?? { revision: "", servers: [] }}
 					selection={mcpSelection}
 					onChange={onMcpSelectionChange}
 					disabled={disabled}
 					inventoryReady={mcpReady}
 					open={open === "mcp"}
 					onOpenChange={(nextOpen) => setOpen(nextOpen ? "mcp" : null)}
+					authStatus={mcpAuthStatus}
+					authStatusReady={mcpAuthStatusReady}
+					onLogin={onMcpLogin}
+					onLogout={onMcpLogout}
+					authBusyServer={mcpAuthBusyServer}
+					authMutationBlockedReason={mcpAuthMutationBlockedReason}
 				/>
 			) : mcpLoading ? (
 				<p className="new-session-setup-status" role="status">

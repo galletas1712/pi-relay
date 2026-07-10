@@ -160,8 +160,11 @@ async fn proactive_compaction_blocks_pending_selected_mcp_action_without_model_e
     let mcp_config: agent_mcp::McpConfig = serde_json::from_value(json!({
         "servers": {
             "fixture": {
-                "command": fake_mcp_server(),
-                "env": { "MCP_FIXTURE_MODE": "simple" },
+                "transport": {
+                    "type": "stdio",
+                    "command": fake_mcp_server(),
+                    "env": { "MCP_FIXTURE_MODE": "simple" }
+                },
                 "allow_all_tools": true,
             }
         }
@@ -320,10 +323,13 @@ async fn public_rpc_mcp_selection_is_fenced_frozen_and_inherited() {
     let mcp_config: agent_mcp::McpConfig = serde_json::from_value(json!({
         "servers": {
             "fixture": {
-                "command": fake_mcp_server(),
-                "env": {
-                    "MCP_FIXTURE_MODE": "notification_race",
-                    "MCP_FIXTURE_MARKER": marker,
+                "transport": {
+                    "type": "stdio",
+                    "command": fake_mcp_server(),
+                    "env": {
+                        "MCP_FIXTURE_MODE": "notification_race",
+                        "MCP_FIXTURE_MARKER": marker
+                    }
                 },
                 "allow_all_tools": true,
                 "call_timeout_ms": 1_000,

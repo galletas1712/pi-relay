@@ -1,4 +1,9 @@
-import type { McpInventory, ProviderConfig, StartSessionMcpSelection } from "./types.ts";
+import type {
+	McpAuthServerStatus,
+	McpInventory,
+	ProviderConfig,
+	StartSessionMcpSelection,
+} from "./types.ts";
 
 export type McpSelectionState = ReadonlyMap<string, ReadonlySet<string>>;
 export type McpTriState = "none" | "some" | "all";
@@ -12,6 +17,16 @@ export function serverSelectionState(
 	const selected = selection.get(serverId)?.size ?? 0;
 	if (!server || selected === 0) return "none";
 	return selected === server.tools.length ? "all" : "some";
+}
+
+export function clearMcpServerSelection(
+	selection: McpSelectionState,
+	serverId: string,
+): McpSelectionState {
+	if (!selection.has(serverId)) return selection;
+	const next = new Map(selection);
+	next.delete(serverId);
+	return next;
 }
 
 export function toggleServer(
@@ -65,19 +80,29 @@ export function mcpSelectionPayloadForProvider(
 	inventory: McpInventory | null,
 	inventoryReady: boolean,
 	selection: McpSelectionState,
+	authStatus: McpAuthServerStatus[],
+	authStatusReady: boolean,
 ): StartSessionMcpSelection | undefined {
+	if (mcpSelectedToolCount(selection) === 0) return undefined;
 	if (
-		mcpSelectedToolCount(selection) > 0 &&
-		(!inventoryReady ||
-			selectionProvider !== provider ||
-			inventoryProvider !== provider ||
-			!inventory)
+		!inventoryReady ||
+		selectionProvider !== provider ||
+		inventoryProvider !== provider ||
+		!inventory
 	) {
 		throw new Error("MCP inventory for the selected provider is still loading; review the MCP selection before sending");
 	}
-	return inventory && inventoryProvider === provider
-		? mcpSelectionPayload(inventory, selection)
-		: undefined;
+	if (!authStatusReady) {
+		throw new Error("MCP authorization status is still loading; review the MCP selection before sending");
+	}
+	const authByServer = new Map(authStatus.map((status) => [status.server, status]));
+	for (const server of selection.keys()) {
+		const auth = authByServer.get(server);
+		if (!auth || (auth.auth_kind === "oauth" && auth.auth_state !== "ready")) {
+			throw new Error(`MCP server ${server} is not authorized; review the MCP selection before sending`);
+		}
+	}
+	return mcpSelectionPayload(inventory, selection);
 }
 
 export function mcpSelectedToolCount(selection: McpSelectionState): number {

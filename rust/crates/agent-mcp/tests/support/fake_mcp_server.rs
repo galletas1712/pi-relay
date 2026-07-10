@@ -22,6 +22,7 @@ fn main() {
     if matches!(
         mode.as_str(),
         "slow_reconnect"
+            | "stalled_startup"
             | "startup_timeout_descendant"
             | "missing_after_restart"
             | "cancel_backpressure"
@@ -61,7 +62,7 @@ fn write_stdout(line: &str) {
                 && marker
                     .as_deref()
                     .and_then(|path| std::fs::read_to_string(path).ok())
-                    .is_some_and(|contents| contents.matches("START").count() > 1)
+                    .is_some_and(|contents| contents.matches("START").count() == 2)
             {
                 append_marker(marker.as_deref(), "RECONNECT_WAITING\n");
                 std::thread::sleep(Duration::from_secs(60));
@@ -82,6 +83,15 @@ fn write_stdout(line: &str) {
             }
             initialize_result(&mode, &line)
         } else if line.contains(r#""method":"tools/list""#) {
+            if mode == "stalled_startup"
+                && marker
+                    .as_deref()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .is_some_and(|contents| contents.matches("START").count() == 2)
+            {
+                append_marker(marker.as_deref(), "RECONNECT_LIST_WAITING\n");
+                std::thread::sleep(Duration::from_secs(60));
+            }
             if mode == "notification_refresh_failure"
                 && generation == 2
                 && !marker_contains(marker.as_deref(), "RECOVER")
@@ -99,10 +109,17 @@ fn write_stdout(line: &str) {
                         std::process::exit(0);
                     });
                 }
-            } else if mode == "slow_reconnect" {
+            } else if matches!(mode.as_str(), "slow_reconnect" | "stalled_startup")
+                && marker
+                    .as_deref()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .is_some_and(|contents| contents.matches("START").count() == 1)
+            {
                 if let Some(marker) = marker.clone() {
                     std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_millis(100));
+                        while !marker_contains(Some(&marker), "EXIT_REQUESTED") {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
                         append_marker(Some(&marker), "EXITED\n");
                         std::process::exit(0);
                     });
@@ -166,10 +183,10 @@ fn initialize_result(mode: &str, line: &str) -> String {
     } else {
         json_string_field(line, "protocolVersion").unwrap_or("2025-11-25")
     };
-    let capabilities = if mode == "missing_tools" {
-        "{}"
-    } else {
-        r#"{"tools":{"listChanged":true}}"#
+    let capabilities = match mode {
+        "missing_tools" => "{}",
+        "unsolicited_list_changed" => r#"{"tools":{"listChanged":false}}"#,
+        _ => r#"{"tools":{"listChanged":true}}"#,
     };
     format!(
         r#"{{"protocolVersion":"{protocol}","capabilities":{capabilities},"serverInfo":{{"name":"fixture","version":"1"}}}}"#

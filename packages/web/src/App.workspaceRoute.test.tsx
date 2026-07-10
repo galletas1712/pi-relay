@@ -113,6 +113,230 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
+	it("recovers an independent status failure by retrying status and inventory together", async () => {
+		const api = createRouteApi();
+		api.getMcpStatus
+			.mockRejectedValueOnce(new Error("status failed"))
+			.mockResolvedValueOnce({
+				servers: [{
+					server: "workspace",
+					auth_kind: "none",
+					auth_state: "not_applicable",
+					can_login: false,
+					can_logout: false,
+				}],
+			});
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		const retry = await screen.findByRole("button", { name: "Retry" });
+		expect(api.getMcpStatus).toHaveBeenCalledTimes(1);
+		expect(api.getMcpInventory).toHaveBeenCalledTimes(1);
+		await user.click(retry);
+
+		await waitFor(() => expect(api.getMcpStatus).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(screen.queryByRole("button", { name: "Retry" })).toBeNull());
+		expect(await screen.findByRole("button", { name: /MCP tools/ })).toBeTruthy();
+		await mounted.dispose();
+	});
+
+	it("fails a selected OAuth start closed after ready changes to reauthentication required", async () => {
+		const api = createRouteApi();
+		api.getMcpStatus
+			.mockResolvedValueOnce({
+				servers: [{
+					server: "workspace",
+					auth_kind: "oauth",
+					auth_state: "ready",
+					can_login: false,
+					can_logout: true,
+				}],
+			})
+			.mockResolvedValueOnce({
+				servers: [{
+					server: "workspace",
+					auth_kind: "oauth",
+					auth_state: "reauthentication_required",
+					can_login: true,
+					can_logout: true,
+				}],
+			});
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
+		await act(async () => {
+			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus });
+		});
+		const composer = screen.getByRole<HTMLTextAreaElement>("textbox");
+		await user.type(composer, "do not send with stale OAuth");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		expect(api.startSession).not.toHaveBeenCalled();
+		expect(await screen.findByText(/workspace is not authorized/)).toBeTruthy();
+		expect(composer.value).toBe("do not send with stale OAuth");
+		await mounted.dispose();
+	});
+
+	it("closes a login dialog on ready and refreshes inventory", async () => {
+		const localSet = vi.spyOn(window.localStorage, "setItem");
+		const sessionSet = vi.spyOn(window.sessionStorage, "setItem");
+		const api = createRouteApi();
+		api.getMcpStatus
+			.mockResolvedValueOnce({
+				servers: [{
+					server: "workspace",
+					auth_kind: "oauth",
+					auth_state: "login_required",
+					can_login: true,
+					can_logout: false,
+				}],
+			})
+			.mockResolvedValueOnce({
+				servers: [{
+					server: "workspace",
+					auth_kind: "oauth",
+					auth_state: "authorization_pending",
+					can_login: false,
+					can_logout: true,
+				}],
+			})
+			.mockResolvedValueOnce({
+				servers: [{
+					server: "workspace",
+					auth_kind: "oauth",
+					auth_state: "ready",
+					can_login: false,
+					can_logout: true,
+				}],
+			});
+		api.loginMcp.mockResolvedValue({
+			login_id: "0000000000000001",
+			authorization_url: "https://auth.example.test/authorize",
+			expires_at_unix_seconds: 1_900_000_000,
+		});
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+		await user.click(screen.getByRole("button", { name: "Login" }));
+		expect(await screen.findByRole("heading", { name: "Log in to workspace" })).toBeTruthy();
+		await act(async () => {
+			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus });
+		});
+		await waitFor(() =>
+			expect(screen.queryByRole("heading", { name: "Log in to workspace" })).toBeNull(),
+		);
+		await waitFor(() => expect(api.getMcpInventory.mock.calls.length).toBeGreaterThan(1));
+		expect(localSet).not.toHaveBeenCalled();
+		expect(sessionSet).not.toHaveBeenCalled();
+		await mounted.dispose();
+	});
+
+	it("clears a stale login dialog on a non-ready terminal status", async () => {
+		const api = createRouteApi();
+		api.getMcpStatus
+			.mockResolvedValueOnce({
+				servers: [{
+					server: "workspace",
+					auth_kind: "oauth",
+					auth_state: "login_required",
+					can_login: true,
+					can_logout: false,
+				}],
+			})
+			.mockResolvedValueOnce({
+				servers: [{
+					server: "workspace",
+					auth_kind: "oauth",
+					auth_state: "authorization_pending",
+					can_login: false,
+					can_logout: true,
+				}],
+			})
+			.mockResolvedValueOnce({
+				servers: [{
+					server: "workspace",
+					auth_kind: "oauth",
+					auth_state: "unsupported",
+					can_login: false,
+					can_logout: false,
+				}],
+			});
+		api.loginMcp.mockResolvedValue({
+			login_id: "0000000000000001",
+			authorization_url: "https://auth.example.test/authorize",
+			expires_at_unix_seconds: 1_900_000_000,
+		});
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+		await user.click(screen.getByRole("button", { name: "Login" }));
+		expect(await screen.findByRole("heading", { name: "Log in to workspace" })).toBeTruthy();
+		await act(async () => {
+			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus });
+		});
+
+		await waitFor(() =>
+			expect(screen.queryByRole("heading", { name: "Log in to workspace" })).toBeNull(),
+		);
+		expect(await screen.findByText("MCP login ended before authorization completed")).toBeTruthy();
+		await mounted.dispose();
+	});
+
+	it("discards and cancels a login response after navigation changes context", async () => {
+		const login = deferred<{
+			login_id: string;
+			authorization_url: string;
+			expires_at_unix_seconds: number;
+		}>();
+		const api = createRouteApi();
+		api.getMcpStatus.mockResolvedValue({
+			servers: [{
+				server: "workspace",
+				auth_kind: "oauth",
+				auth_state: "login_required",
+				can_login: true,
+				can_logout: false,
+			}],
+		});
+		api.loginMcp.mockImplementation(() => login.promise);
+		api.cancelMcpLogin.mockResolvedValue({ cancelled: true });
+		const browser = new FakeWorkspaceBrowser("/");
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+		await user.click(screen.getByRole("button", { name: "Login" }));
+		await waitFor(() => expect(api.loginMcp).toHaveBeenCalledWith("workspace"));
+		await act(async () => browser.navigate("/w/host/run/root-1/conversation/root-1"));
+		await act(async () => {
+			login.resolve({
+				login_id: "0000000000000001",
+				authorization_url: "https://auth.example.test/authorize",
+				expires_at_unix_seconds: 1_900_000_000,
+			});
+			await login.promise;
+		});
+
+		await waitFor(() =>
+			expect(api.cancelMcpLogin).toHaveBeenCalledWith(
+				"workspace",
+				"0000000000000001",
+			),
+		);
+		expect(screen.queryByRole("heading", { name: "Log in to workspace" })).toBeNull();
+		await mounted.dispose();
+	});
+
 	it("reuses new-session IDs when an uncertain start is retried without setup edits", async () => {
 		const api = createRouteApi();
 		api.startSession
@@ -283,6 +507,7 @@ describe("App workspace route identity integration", () => {
 		api.getMcpInventory.mockImplementationOnce(() => retry.promise);
 		await user.click(retryButton);
 		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledTimes(3));
+		await waitFor(() => expect(api.getMcpStatus).toHaveBeenCalledTimes(2));
 		expect(retryButton.disabled).toBe(true);
 		fireEvent.click(retryButton);
 		expect(api.getMcpInventory).toHaveBeenCalledTimes(3);
@@ -1085,6 +1310,9 @@ type RouteApi = AgentApi & {
 	listSessions: ApiSpy;
 	listTools: ApiSpy;
 	getMcpInventory: ApiSpy;
+	getMcpStatus: ApiSpy;
+	loginMcp: ApiSpy;
+	cancelMcpLogin: ApiSpy;
 	listDelegations: ApiSpy;
 	subscribeEvents: ApiSpy;
 	queueFollowUp: ApiSpy;
@@ -1227,6 +1455,19 @@ function createRouteApi(
 		listDelegations,
 		listTools: vi.fn(async () => []),
 		getMcpInventory: vi.fn(async () => mcpInventory()),
+		getMcpStatus: vi.fn(async () => ({
+			servers: [{
+				server: "workspace",
+				auth_kind: "none",
+				auth_state: "not_applicable",
+				can_login: false,
+				can_logout: false,
+			}],
+		})),
+		loginMcp: mutation(),
+		completeMcpLogin: mutation(),
+		cancelMcpLogin: mutation(),
+		logoutMcp: mutation(),
 		getSession,
 		getTranscriptTurns: vi.fn(async (sessionId: string) =>
 			options.deferredTranscriptTurns?.get(sessionId) ??

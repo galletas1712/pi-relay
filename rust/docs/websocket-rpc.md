@@ -1694,6 +1694,55 @@ child session lifetime.
 
 ## MCP inventory and tools
 
+### MCP OAuth status and user actions
+
+The daemon exposes five user-only MCP authentication methods. They are
+independent of `mcp.inventory`, so a configured login-required server remains
+visible even when it has no coherent tool inventory.
+
+`mcp.status` accepts `{}` and returns every configured server:
+
+```json
+{
+  "servers": [{
+    "server": "remote",
+    "auth_kind": "oauth",
+    "auth_state": "login_required",
+    "can_login": true,
+    "can_logout": false
+  }]
+}
+```
+
+`auth_kind` is `none`, `bearer`, or `oauth`. `auth_state` is
+`not_applicable`, `ready`, `login_required`, `reauthentication_required`,
+`authorization_pending`, `unsupported`, or `unknown`. The optional `failure`
+is one of the fixed categories `credential_store_unavailable` or
+`discovery_failed`; provider bodies and credential details are never returned.
+
+- `mcp.login` takes `{ "server": "remote" }` and, only after an explicit user
+  action, returns `login_id`, `authorization_url`, and
+  `expires_at_unix_seconds`. A second login for the same server fails with the
+  fixed `mcp_oauth_login_already_pending` error.
+- `mcp.complete` takes `server`, `login_id`, and the **entire**
+  `callback_url`. The coordinator validates the exact transaction redirect and
+  state, including the stable Codex-compatible callback path; a bare code or
+  state is not accepted. Success returns
+  `{ "completed": true }`.
+- `mcp.cancel` takes `server` and `login_id` and returns
+  `{ "cancelled": true }` only after the listener and transaction are cleaned
+  up.
+- `mcp.logout` takes `{ "server": "remote" }` and returns
+  `{ "result": "removed" }` or `{ "result": "not_found" }`. It deletes only
+  local daemon credentials and does not call a provider revocation endpoint,
+  matching Codex CLI logout.
+
+Server IDs, login IDs, and callback URLs are bounded. Errors use fixed local
+codes/messages and contain no provider response, token, client ID, scope,
+credential path, callback/authorization URL, code, state, or verifier. The
+websocket has no implicit OAuth callback handling; manual remote-daemon
+completion is only through `mcp.complete`.
+
 ### `mcp.inventory`
 
 Requires `provider: "openai" | "claude"` and returns the bounded configured

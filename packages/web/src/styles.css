@@ -95,6 +95,48 @@
 	--elev-pop: 0 12px 40px color-mix(in oklch, var(--foreground) 14%, transparent);
 }
 
+.mcp-picker-auth {
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	padding: 1px 6px;
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+	white-space: nowrap;
+}
+
+.mcp-picker-auth.ready {
+	color: var(--success);
+}
+
+.mcp-picker-auth.login_required,
+.mcp-picker-auth.reauthentication_required,
+.mcp-picker-auth.unsupported,
+.mcp-picker-auth.unknown {
+	color: var(--destructive);
+}
+
+.mcp-picker-auth-action {
+	border: 0;
+	background: transparent;
+	padding: 2px;
+	color: var(--foreground);
+	font: inherit;
+	font-size: var(--text-xs);
+	text-decoration: underline;
+	cursor: pointer;
+}
+
+.mcp-picker-auth-action:disabled {
+	cursor: default;
+	opacity: 0.5;
+}
+
+.mcp-picker-pending {
+	margin: 0 0 0 32px;
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+}
+
 .queue-blocked-reason,
 .history-blocked-reason {
 	margin: 7px 10px 0;
@@ -2914,7 +2956,7 @@ pre {
 
 .mcp-picker-server-row {
 	display: grid;
-	grid-template-columns: 24px minmax(0, 1fr) auto auto;
+	grid-template-columns: 24px minmax(0, 1fr) auto auto auto auto;
 	align-items: center;
 	gap: 8px;
 	font-size: var(--text-sm);
@@ -3016,9 +3058,59 @@ pre {
 		grid-template-columns: 24px minmax(0, 1fr) auto;
 	}
 
-	.mcp-picker-meta {
+	.mcp-picker-meta,
+	.mcp-picker-auth-action {
 		grid-column: 2 / -1;
 	}
+}
+
+.mcp-oauth-dialog {
+	width: min(620px, calc(100vw - 48px));
+	max-height: min(760px, calc(100vh - 48px));
+	overflow-y: auto;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-lg);
+	background: var(--card);
+	box-shadow: var(--elev-modal);
+}
+
+.mcp-oauth-dialog-body {
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+
+.mcp-oauth-open {
+	align-self: flex-start;
+	text-decoration: none;
+}
+
+.mcp-oauth-url {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+}
+
+.mcp-oauth-url > div {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	gap: 8px;
+}
+
+.mcp-oauth-url input,
+.mcp-oauth-dialog textarea {
+	width: 100%;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--background);
+	padding: 7px 9px;
+	color: var(--foreground);
+	font: inherit;
+}
+
+.mcp-oauth-dialog textarea {
+	resize: vertical;
+	overflow-wrap: anywhere;
 }
 
 .chat-dock {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	clearMcpServerSelection,
 	mcpSelectionPayload,
 	mcpSelectionForProviderChange,
 	mcpSelectionPayloadForProvider,
@@ -10,7 +11,7 @@ import {
 	toggleServer,
 	toggleTool,
 } from "./mcpSelection.ts";
-import type { McpInventory } from "./types.ts";
+import type { McpAuthServerStatus, McpInventory } from "./types.ts";
 
 const INVENTORY: McpInventory = {
 	revision: "inventory-1",
@@ -32,6 +33,13 @@ const INVENTORY: McpInventory = {
 		},
 	],
 };
+const AUTH_STATUS: McpAuthServerStatus[] = INVENTORY.servers.map((server) => ({
+	server: server.server,
+	auth_kind: "none",
+	auth_state: "not_applicable",
+	can_login: false,
+	can_logout: false,
+}));
 
 describe("MCP selection", () => {
 	it("selects a whole server by default and tracks tri-state tool changes", () => {
@@ -42,6 +50,17 @@ describe("MCP selection", () => {
 		const some = toggleTool(all, "zeta", "read");
 		expect(serverSelectionState(INVENTORY, some, "zeta")).toBe("some");
 		expect(toggleTool(some, "zeta", "write")).toEqual(new Map());
+	});
+
+	it("clears only the logged-out server's selected draft tools", () => {
+		const selected = new Map([
+			["zeta", new Set(["read"])],
+			["alpha", new Set(["search"])],
+		]);
+		expect(clearMcpServerSelection(selected, "zeta")).toEqual(
+			new Map([["alpha", new Set(["search"])]]),
+		);
+		expect(clearMcpServerSelection(selected, "missing")).toBe(selected);
 	});
 
 	it("emits sorted raw identities and omits an empty selection", () => {
@@ -103,10 +122,28 @@ describe("MCP selection", () => {
 			reset: true,
 		});
 		expect(() =>
-			mcpSelectionPayloadForProvider("claude", "openai", null, null, false, selected)
+			mcpSelectionPayloadForProvider(
+				"claude",
+				"openai",
+				null,
+				null,
+				false,
+				selected,
+				AUTH_STATUS,
+				true,
+			)
 		).toThrow("MCP inventory for the selected provider is still loading");
 		expect(
-			mcpSelectionPayloadForProvider("claude", "claude", "claude", INVENTORY, true, selected)
+			mcpSelectionPayloadForProvider(
+				"claude",
+				"claude",
+				"claude",
+				INVENTORY,
+				true,
+				selected,
+				AUTH_STATUS,
+				true,
+			)
 		).toEqual({
 			inventoryRevision: INVENTORY.revision,
 			servers: [{ server: "zeta", tools: ["read"] }],
@@ -116,11 +153,89 @@ describe("MCP selection", () => {
 	it("fails closed while retained inventory is fetching or errored", () => {
 		const selected = new Map([["zeta", new Set(["read"])]]);
 		expect(() =>
-			mcpSelectionPayloadForProvider("openai", "openai", "openai", INVENTORY, false, selected)
+			mcpSelectionPayloadForProvider(
+				"openai",
+				"openai",
+				"openai",
+				INVENTORY,
+				false,
+				selected,
+				AUTH_STATUS,
+				true,
+			)
 		).toThrow("MCP inventory for the selected provider is still loading");
 		expect(
-			mcpSelectionPayloadForProvider("openai", "openai", "openai", INVENTORY, false, new Map())
+			mcpSelectionPayloadForProvider(
+				"openai",
+				"openai",
+				"openai",
+				INVENTORY,
+				false,
+				new Map(),
+				[],
+				false,
+			)
 		).toBeUndefined();
+	});
+
+	it("fails closed for missing, loading, and non-ready OAuth status", () => {
+		const selected = new Map([["zeta", new Set(["read"])]]);
+		const oauth = {
+			...AUTH_STATUS[0],
+			auth_kind: "oauth" as const,
+			auth_state: "ready" as const,
+		};
+		expect(() =>
+			mcpSelectionPayloadForProvider(
+				"openai",
+				"openai",
+				"openai",
+				INVENTORY,
+				true,
+				selected,
+				[],
+				true,
+			)
+		).toThrow("not authorized");
+		expect(() =>
+			mcpSelectionPayloadForProvider(
+				"openai",
+				"openai",
+				"openai",
+				INVENTORY,
+				true,
+				selected,
+				[oauth],
+				false,
+			)
+		).toThrow("authorization status is still loading");
+		expect(() =>
+			mcpSelectionPayloadForProvider(
+				"openai",
+				"openai",
+				"openai",
+				INVENTORY,
+				true,
+				selected,
+				[{ ...oauth, auth_state: "reauthentication_required" }],
+				true,
+			)
+		).toThrow("not authorized");
+		expect(
+			mcpSelectionPayloadForProvider(
+				"openai",
+				"openai",
+				"openai",
+				INVENTORY,
+				true,
+				selected,
+				[oauth, AUTH_STATUS[1]],
+				true,
+			),
+		).toEqual({
+			inventoryRevision: INVENTORY.revision,
+			servers: [{ server: "zeta", tools: ["read"] }],
+		});
 	});
 
 	it("never creates a phantom selection for a healthy zero-tool server", () => {
@@ -138,7 +253,16 @@ describe("MCP selection", () => {
 		expect(toggleServer(emptyInventory, phantom, "empty")).toEqual(new Map());
 		expect(mcpSelectedToolCount(phantom)).toBe(0);
 		expect(
-			mcpSelectionPayloadForProvider("openai", "openai", "openai", emptyInventory, false, phantom)
+			mcpSelectionPayloadForProvider(
+				"openai",
+				"openai",
+				"openai",
+				emptyInventory,
+				false,
+				phantom,
+				[],
+				false,
+			)
 		).toBeUndefined();
 	});
 });

@@ -376,6 +376,42 @@ export interface McpInventory {
 	servers: McpInventoryServer[];
 }
 
+export type McpAuthKind = "none" | "bearer" | "oauth";
+export type McpAuthState =
+	| "not_applicable"
+	| "ready"
+	| "login_required"
+	| "reauthentication_required"
+	| "authorization_pending"
+	| "unsupported"
+	| "unknown";
+export type McpAuthFailure =
+	| "credential_store_unavailable"
+	| "discovery_failed";
+
+export interface McpAuthServerStatus {
+	server: string;
+	auth_kind: McpAuthKind;
+	auth_state: McpAuthState;
+	can_login: boolean;
+	can_logout: boolean;
+	failure?: McpAuthFailure;
+}
+
+export interface McpStatus {
+	servers: McpAuthServerStatus[];
+}
+
+export interface McpLoginResult {
+	login_id: string;
+	authorization_url: string;
+	expires_at_unix_seconds: number;
+}
+
+export interface McpLogoutResult {
+	result: "removed" | "not_found";
+}
+
 export interface StartSessionMcpSelection {
 	inventoryRevision: string;
 	servers: { server: string; tools: string[] }[];
