@@ -11,7 +11,7 @@ agent-vocab = { workspace = true }
 anyhow = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
-rmcp = { workspace = true }
+rmcp = { workspace = true, features = ["auth"] }
 process-wrap = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -23,4 +23,5 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+agent-prompt = { workspace = true }
 pretty_assertions = { workspace = true }

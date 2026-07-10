@@ -57,6 +57,7 @@ const SESSION_ID_HEADER: &str = "mcp-session-id";
 const LAST_EVENT_ID_HEADER: &str = "last-event-id";
 
 pub(crate) type HttpTransport = StreamableHttpClientTransport<BoundedHttpClient>;
+pub(crate) type BearerResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 pub(crate) struct HttpConnection {
     pub(crate) transport: HttpTransport,
@@ -68,7 +69,18 @@ pub(crate) fn build(
     notifications: Arc<ClientNotifications>,
     liveness: Arc<ClientLiveness>,
 ) -> Result<HttpConnection> {
-    let scrubber = resolve_scrubber_with(config, |name| std::env::var(name).ok())?;
+    build_with_bearer_resolver(config, notifications, liveness, &|name| {
+        std::env::var(name).ok()
+    })
+}
+
+pub(crate) fn build_with_bearer_resolver(
+    config: &McpStreamableHttpTransportConfig,
+    notifications: Arc<ClientNotifications>,
+    liveness: Arc<ClientLiveness>,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Result<HttpConnection> {
+    let scrubber = resolve_scrubber_with(config, resolve)?;
     let client = build_reqwest_client(reqwest::Client::builder())?;
     let requests = Arc::new(RequestRegistry::default());
     let stream_attempts = Arc::new(Mutex::new(CommonStreams::default()));
@@ -114,21 +126,21 @@ pub(crate) fn resolve_scrubber_with(
     config: &McpStreamableHttpTransportConfig,
     resolve: impl FnOnce(&str) -> Option<String>,
 ) -> Result<Option<SecretScrubber>> {
-    config
+    let Some(name) = config
         .auth
         .as_ref()
-        .map(|auth| {
-            let name = auth.bearer_env();
-            let value = resolve(name)
-                .ok_or_else(|| anyhow!("bearer token environment variable {name} is not set"))?;
-            if value.is_empty() {
-                return Err(anyhow!(
-                    "bearer token environment variable {name} must not be empty"
-                ));
-            }
-            Ok(SecretScrubber::new(value))
-        })
-        .transpose()
+        .and_then(crate::config::McpHttpAuthConfig::bearer_env)
+    else {
+        return Ok(None);
+    };
+    let value = resolve(name)
+        .ok_or_else(|| anyhow!("bearer token environment variable {name} is not set"))?;
+    if value.is_empty() {
+        return Err(anyhow!(
+            "bearer token environment variable {name} must not be empty"
+        ));
+    }
+    Ok(Some(SecretScrubber::new(value)))
 }
 
 #[derive(Clone)]
@@ -779,7 +791,7 @@ async fn read_bounded(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContentType {
+pub(crate) enum ContentType {
     Json,
     Sse,
 }
@@ -788,7 +800,7 @@ fn content_type(response: &reqwest::Response) -> Option<ContentType> {
     parse_content_type(response.headers().get(CONTENT_TYPE)?.as_bytes())
 }
 
-fn parse_content_type(value: &[u8]) -> Option<ContentType> {
+pub(crate) fn parse_content_type(value: &[u8]) -> Option<ContentType> {
     if !value.is_ascii() {
         return None;
     }
@@ -813,12 +825,10 @@ fn parse_content_type(value: &[u8]) -> Option<ContentType> {
         index += 1;
         skip_ows(value, &mut index);
         consume_token(value, &mut index)?;
-        skip_ows(value, &mut index);
         if value.as_bytes().get(index) != Some(&b'=') {
             return None;
         }
         index += 1;
-        skip_ows(value, &mut index);
         if value.as_bytes().get(index) == Some(&b'"') {
             consume_quoted_string(value, &mut index)?;
         } else {

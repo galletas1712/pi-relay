@@ -6,8 +6,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+#[path = "oauth_config.rs"]
+mod oauth_config;
+
+pub use oauth_config::McpHttpAuthConfig;
 
 const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_CALL_TIMEOUT_MS: u64 = 30_000;
@@ -156,6 +161,10 @@ impl McpStreamableHttpTransportConfig {
             auth.validate()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn canonical_url(&self) -> Result<reqwest::Url> {
+        reqwest::Url::parse(&self.url).context("parse Streamable HTTP URL")
     }
 }
 
@@ -326,27 +335,6 @@ impl<'de> Deserialize<'de> for McpServerConfig {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-#[non_exhaustive]
-pub enum McpHttpAuthConfig {
-    BearerEnv { env: String },
-}
-
-impl McpHttpAuthConfig {
-    fn validate(&self) -> Result<()> {
-        match self {
-            Self::BearerEnv { env } => validate_env_name(env),
-        }
-    }
-
-    pub(crate) fn bearer_env(&self) -> &str {
-        match self {
-            Self::BearerEnv { env } => env,
-        }
-    }
-}
-
 impl fmt::Debug for McpServerConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -381,17 +369,6 @@ impl fmt::Debug for McpTransportConfig {
     }
 }
 
-impl fmt::Debug for McpHttpAuthConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BearerEnv { env } => formatter
-                .debug_struct("BearerEnv")
-                .field("env", env)
-                .finish(),
-        }
-    }
-}
-
 impl McpServerConfig {
     pub(crate) fn semantic_fingerprint(&self) -> String {
         crate::fingerprint_json(&self.semantic_fingerprint_input())
@@ -419,16 +396,42 @@ impl McpServerConfig {
                     "enabled_tools": self.enabled_tools,
                 })
             }
-            McpTransportConfig::StreamableHttp(config) => serde_json::json!({
-                "transport": {
-                    "type": "streamable_http",
-                    "url": config.url,
-                    "auth": config.auth,
-                },
-                "parallel_calls": self.parallel_calls,
-                "allow_all_tools": self.allow_all_tools,
-                "enabled_tools": self.enabled_tools,
-            }),
+            McpTransportConfig::StreamableHttp(config) => {
+                let transport = if let Some(McpHttpAuthConfig::Oauth {
+                    client_id,
+                    scopes,
+                    resource,
+                    ..
+                }) = &config.auth
+                {
+                    serde_json::json!({
+                        "type": "streamable_http",
+                        "url": config
+                            .canonical_url()
+                            .expect("validated Streamable HTTP URL")
+                            .as_str(),
+                        "auth": {
+                            "type": "oauth",
+                            "client_id": client_id,
+                            "scopes": scopes,
+                            "resource": resource,
+                        },
+                    })
+                } else {
+                    // Preserve the pre-OAuth Streamable HTTP fingerprint bytes.
+                    serde_json::json!({
+                        "type": "streamable_http",
+                        "url": config.url,
+                        "auth": config.auth,
+                    })
+                };
+                serde_json::json!({
+                    "transport": transport,
+                    "parallel_calls": self.parallel_calls,
+                    "allow_all_tools": self.allow_all_tools,
+                    "enabled_tools": self.enabled_tools,
+                })
+            }
         }
     }
 
@@ -494,7 +497,7 @@ fn validate_server_id(server_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_env_name(name: &str) -> Result<()> {
+pub(super) fn validate_env_name(name: &str) -> Result<()> {
     let mut chars = name.chars();
     if !chars
         .next()

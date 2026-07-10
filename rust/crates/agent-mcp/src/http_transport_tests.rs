@@ -110,6 +110,8 @@ fn content_type_parser_accepts_only_exact_media_type_essences() {
         ("application/json;", None),
         ("application/json; charset", None),
         ("application/json; =utf-8", None),
+        ("application/json; charset =utf-8", None),
+        ("application/json; charset= utf-8", None),
         ("application/json; charset=\"unterminated", None),
         ("application/json, text/event-stream", None),
         ("text/plain", None),

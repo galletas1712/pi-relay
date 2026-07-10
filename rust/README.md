@@ -86,7 +86,9 @@ For example:
 Generic remote servers use Streamable HTTP. HTTPS is required except for
 loopback development/test endpoints. An optional bearer token is read at
 connection time from the configured environment variable; only its name is
-configuration identity:
+configuration identity. Generic OAuth delegates discovery, public-client
+dynamic registration, S256 PKCE, state validation, and token exchange to the
+pinned rmcp 1.8 state machine:
 
 ```json
 {
@@ -106,16 +108,49 @@ configuration identity:
 }
 ```
 
+```json
+{
+  "servers": {
+    "oauth_remote": {
+      "transport": {
+        "type": "streamable_http",
+        "url": "https://mcp.example.com/mcp",
+        "auth": {
+          "type": "oauth",
+          "client_id": "operator-configured-public-client",
+          "scopes": ["read", "search"],
+          "resource": "https://api.example.com/audience",
+          "callback_port": 8765,
+          "callback_timeout_ms": 300000
+        }
+      },
+      "enabled_tools": ["search"]
+    }
+  }
+}
+```
+
+Omit `client_id` to let rmcp perform Dynamic Client Registration. `scopes` and
+the RFC 8707 `resource` authorization parameter are optional. A fixed
+`callback_port` may be configured; otherwise pi-relay binds an ephemeral port
+on `127.0.0.1`. `callback_timeout_ms` defaults to five minutes. Both callback
+settings are operational and do not change route identity. Streamable HTTP
+keeps its existing URL rule for OAuth: HTTPS is required remotely, while HTTP
+is permitted for loopback; MCP resource URLs may include a query.
+
+The transient, unlanded Stage 1 keys (`registration`, `client_secret_env`,
+`allowed_scopes`, `initial_scopes`, issuer pins, and trusted origins) are not
+accepted. Replace them with optional `client_id`, `scopes`, and `resource`.
+
 The tagged `transport` object is preferred. Earlier flat stdio fields remain
 accepted with the same route fingerprint so existing frozen manifests and
 configuration files remain compatible.
-Bearer environment authentication is only a transport prerequisite, not the
-interactive authentication objective. Browser OAuth login is not implemented
-in this stage. The next active generic stage is protected-resource and
-authorization-server discovery, DCR by default or static client IDs, PKCE,
-resource indicators, loopback/browser callbacks, secure credential
-persistence/refresh, explicit scope allowlists, and login/status/logout in New
-Session before tool selection. There is no built-in or provider-specific server
+Bearer environment authentication remains a transport prerequisite. OAuth
+login is exposed only through the internal `McpManager` boundary and retains
+the rmcp OAuth state and token response in memory. The OAuth route remains
+login-required and unavailable for MCP calls. Credential persistence, refresh,
+authenticated transport injection, public OAuth RPCs, and New Session controls
+are not yet implemented. There is no built-in or provider-specific server
 catalog.
 
 All configured servers appear as New Session inventory sources. Operators use

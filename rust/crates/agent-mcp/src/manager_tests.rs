@@ -658,6 +658,117 @@ async fn startup_timeout_kills_the_process_tree() {
 }
 
 #[tokio::test]
+async fn slow_reconnect_uses_the_total_call_deadline_without_replaying() {
+    assert_reconnect_call_deadline("slow_reconnect", "RECONNECT_WAITING").await;
+}
+
+#[tokio::test]
+async fn stalled_startup_cleanup_stays_outside_the_total_call_deadline() {
+    assert_reconnect_call_deadline("stalled_startup", "RECONNECT_LIST_WAITING").await;
+}
+
+async fn assert_reconnect_call_deadline(mode: &str, waiting_marker: &str) {
+    const CALL_TIMEOUT: Duration = Duration::from_millis(250);
+    const DEADLINE_ALLOWANCE: Duration = Duration::from_millis(250);
+
+    let marker = temp_path(&format!("mcp-{mode}"));
+    let mut config = one_server_config(mode, Some(&marker));
+    config
+        .servers
+        .get_mut("fixture")
+        .expect("fixture config")
+        .call_timeout_ms = CALL_TIMEOUT.as_millis() as u64;
+    let manager = McpManager::start(config).await.expect("manager starts");
+    let snapshot = select_all(&manager).await;
+    let tool = snapshot.manifest().tools.first().expect("tool advertised");
+    let initial_client = manager
+        .servers
+        .read()
+        .await
+        .get("fixture")
+        .and_then(|server| server.client.clone())
+        .expect("initial client is present");
+    {
+        use std::io::Write;
+
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&marker)
+                .expect("fixture marker opens"),
+            "EXIT_REQUESTED"
+        )
+        .expect("fixture exit marker writes");
+    }
+    wait_for_marker(&marker, "EXITED").await;
+    tokio::time::timeout(Duration::from_secs(2), initial_client.wait_for_closed())
+        .await
+        .expect("initial client exit is observed");
+
+    let started = tokio::time::Instant::now();
+    let result = manager
+        .call(
+            &snapshot,
+            &tool.exposed_name,
+            json!({"value": "never-issued"}),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        result,
+        Err(McpCallError::Timeout {
+            tool: tool.exposed_name.clone(),
+        })
+    );
+    assert!(
+        elapsed >= CALL_TIMEOUT.saturating_sub(Duration::from_millis(25)),
+        "call returned before its reconnect deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed <= CALL_TIMEOUT + DEADLINE_ALLOWANCE,
+        "call exceeded its reconnect deadline allowance: {elapsed:?}"
+    );
+    wait_for_marker(&marker, waiting_marker).await;
+    {
+        let servers = manager.servers.read().await;
+        let server = servers.get("fixture").expect("fixture remains configured");
+        assert_eq!(server.health, McpHealth::Unavailable);
+        assert!(server.client.is_none());
+    }
+
+    let recovered = manager
+        .inventory(ProviderKind::OpenAi, &first_party())
+        .await
+        .expect("a newer reconnect publishes a coherent catalog");
+    assert_eq!(recovered.servers[0].health, McpHealth::Healthy);
+    let (recovered_generation, recovered_client, recovered_tools) = {
+        let servers = manager.servers.read().await;
+        let server = servers.get("fixture").expect("fixture remains configured");
+        (
+            server.refresh.generation,
+            server.client.clone().expect("newer client is published"),
+            server.tools.clone(),
+        )
+    };
+    tokio::time::sleep(DEADLINE_ALLOWANCE).await;
+    {
+        let servers = manager.servers.read().await;
+        let server = servers.get("fixture").expect("fixture remains configured");
+        assert_eq!(server.refresh.generation, recovered_generation);
+        assert_eq!(server.tools, recovered_tools);
+        assert!(server
+            .client
+            .as_ref()
+            .is_some_and(|client| Arc::ptr_eq(client, &recovered_client)));
+    }
+    let contents = std::fs::read_to_string(&marker).expect("fixture marker exists");
+    assert_eq!(contents.matches("CALL").count(), 0);
+
+    manager.shutdown().await;
+    std::fs::remove_file(marker).ok();
+}
+
+#[tokio::test]
 async fn blocked_writer_does_not_extend_deadline_or_replay() {
     let marker = temp_path("mcp-backpressure");
     let manager = McpManager::start(one_server_config("cancel_backpressure", Some(&marker)))

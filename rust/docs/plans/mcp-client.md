@@ -1,10 +1,24 @@
 # MCP client: session-scoped design and implementation plan
 
-Status: session-scoped refactor rebased onto the provider-route and compact web
-workspace architecture. The combined New Session setup, public RPC, provider
-routing, compaction recovery, tool claim, and PostgreSQL migration paths are
-implemented and locally validated. Windows and macOS validation remain
-follow-up work. This is the live checklist and durable design record.
+Status: the session-scoped MCP client and generic Streamable HTTP prerequisite
+are implemented. Generic OAuth login is implemented through the pinned rmcp
+OAuth state machine and an internal loopback/manual-completion boundary.
+Credential persistence/refresh, authenticated transport, public RPC, and UI
+stages remain follow-up work. Windows and macOS validation remain follow-up
+work. This is the live checklist and durable design record.
+
+**Implementation ceiling:** Codex is the OAuth complexity ceiling. Follow
+`codex-rs/rmcp-client/src/perform_oauth_login.rs`,
+`codex-rs/rmcp-client/src/oauth_http_client.rs`, and rmcp 1.8
+`AuthorizationManager`/`OAuthState`. Do not add a stricter parallel OAuth
+protocol implementation, exhaustive secret-buffer framework, or bespoke
+provider behavior in pi-relay.
+
+rmcp owns RFC 9728/RFC 8414/OIDC discovery, wire types, path fallbacks, Dynamic
+Client Registration, endpoint validation, scope selection, PKCE/state, and
+token exchange. Authorization endpoints may retain provider query parameters,
+as in Codex/rmcp. `oauth2` is used only transitively through pinned rmcp; there
+is no parallel pi-relay OAuth protocol implementation.
 
 ## Objective
 
@@ -74,29 +88,117 @@ catalog.
   exhaustion, cancellation/DELETE observations, `tools/list_changed`, and no
   replay.
 
-### Generic remote stage 2: OAuth (next active stage)
+### Generic OAuth accepted plan
 
-- [ ] Add protected-resource metadata discovery and authorization-server
-  metadata discovery with bounded responses, redirect/origin policy, and
-  issuer/resource validation.
-- [ ] Support Dynamic Client Registration by default and an optional
-  operator-configured static client ID; do not add provider-specific clients or
-  endpoint catalogs.
-- [ ] Implement authorization-code login with PKCE, resource indicators, a
-  loopback callback, browser launch/manual URL fallback, strict state
-  validation, and bounded callback lifetime.
-- [ ] Add explicit per-server scope allowlists. Reject discovered/requested
-  scopes outside operator policy rather than silently widening access.
-- [ ] Store OAuth client/credential state securely and persistently, refresh
-  access tokens at route connection time, serialize refreshes, and ensure
-  access/refresh/client secrets never enter Debug, logs, errors, RPC,
-  fingerprints, manifests, or model context.
-- [ ] Add generic login/status/logout RPC and New Session UI before tool
-  selection, including unavailable/login-required health without mutating
-  existing frozen session declarations.
-- [ ] Add integration coverage for DCR and static-client flows, PKCE/state/
-  resource/scope validation, refresh rotation, restart persistence,
-  concurrent refresh, logout, redaction, and OAuth error handling.
+OAuth is generic configuration and daemon behavior, never a vendor catalog.
+The `oauth` and `bearer_env` variants are mutually exclusive by construction.
+No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
+
+#### OAuth Stages 1 and 2: rmcp discovery and login (implemented)
+
+- [x] Use a minimal Codex-like OAuth config: optional `client_id` (omission
+  means DCR), optional `scopes`, optional RFC 8707 `resource`, and operational
+  callback port/timeout. There is no client secret, registration enum, issuer
+  pin, trusted-origin list, scope ceiling, or custom auth method.
+- [x] Apply the existing Streamable HTTP URL rule unchanged: HTTPS remotely,
+  HTTP on loopback, and query-bearing MCP URLs allowed and preserved. Delegate
+  discovery URL/path behavior and endpoint validation to rmcp.
+- [x] Keep OAuth routes immediately unavailable/login-required at startup
+  instead of running an independent discovery gate. A future Stage 4 status
+  check can call the thin `AuthorizationManager::discover_metadata` wrapper.
+- [x] Follow Codex `start_authorization`: use
+  `OAuthState::start_authorization` for DCR and
+  `discover_metadata`/`set_metadata`/`configure_client`/
+  `get_authorization_url` plus `AuthorizationSession::for_scope_upgrade` for a
+  configured public client. rmcp owns scope precedence, DCR, PKCE/state, and
+  token exchange. Preserve provider authorization-endpoint query parameters.
+- [x] Use a bounded direct/no-proxy OAuth adapter with separate redirect-follow
+  and redirect-stop reqwest clients. Discovery and DCR follow redirects; token
+  exchange stops.
+- [x] Include OAuth mode, the full MCP URL, client ID, scopes, and resource in
+  semantic route identity. Exclude callback port/timeout, metadata, DCR output,
+  tokens, state, and PKCE. Preserve fixed legacy stdio and bearer fingerprints.
+- [x] Allow only the generated loopback redirect URI for the transaction: one
+  listener, one unique per-login callback path, one bounded lifetime, one
+  completion, exact state, exact method/path, bounded query, and fail-closed
+  OAuth error handling. The authorization URL is returned for explicit opening;
+  browser launch remains a caller concern.
+- [x] The loopback listener runs on the daemon host. Therefore automatic
+  browser callback works only when the browser can reach loopback on that same
+  host. For a remote/headless daemon, the user completes authorization in
+  their browser, then pastes the **entire callback URL** (not only `code`) into
+  the internal manager completion boundary. Public completion RPC design
+  remains Stage 4 work.
+- [x] Route listener and manual callback submissions through one per-login owner
+  task. Dropped waiters do not cancel it; timeout, cancellation, and shutdown
+  clean it up. Success/cancel acknowledgement occurs only after credential
+  handoff, reservation/flow removal, and listener release. Retain only rmcp
+  `OAuthState` in memory. Public errors are local categories and authorization
+  URLs are redacted from Debug.
+
+#### OAuth Stage 3: daemon credentials, refresh, and transport injection
+
+- [ ] Make the daemon the sole owner of DCR and token records. Store them
+  persistently in a credential-specific repository keyed by stable OAuth route
+  policy, with restrictive access and secret-redacting types. Configuration,
+  web clients, providers, sessions, workers, and subagents never receive raw
+  credentials.
+- [ ] Persist access token, optional refresh token, expiry, granted scopes, and
+  DCR client data atomically. Rotation replaces refresh tokens atomically and
+  never resurrects an old token after a failed write.
+- [ ] Refresh near expiry at authenticated route acquisition through one
+  per-credential single-flight. Concurrent inventory/call demand shares the
+  result. Handle refresh rotation and restart persistence; invalid/revoked
+  credentials become login-required without deleting frozen session
+  declarations.
+- [ ] Inject the resulting bearer only into requests to the exact configured
+  MCP resource. Discovery/registration endpoints never receive it. Preserve
+  existing response scrubbing, bounded transport, stale session behavior, and
+  no replay: a token refresh or reconnect may prepare a later operation but
+  never retries a possibly side-effecting MCP request.
+- [ ] Keep credentials and OAuth transaction material out of Debug, logs,
+  errors, status payloads, fingerprints, manifests, PI.md, provider/model
+  context, traces, and metrics. Optional OS keyring wrapping/backends may be
+  added later; OAuth correctness and redaction must not depend on a keyring.
+
+#### OAuth Stage 4: sanitized RPC and New Session UX
+
+- [ ] Add sanitized `status`, `login`, `complete`, `cancel`, and `logout`
+  daemon RPCs with bounded server IDs and transaction IDs. Responses expose
+  only stable states and bounded operator-safe categories; never tokens,
+  client secrets, verifier/state, codes, raw response bodies, full callback
+  URLs, or server-provided instructions. `login` may return the generated
+  authorization URL exactly once to the requesting trusted client; ordinary
+  status never does.
+- [ ] Make completion/cancellation transaction-owned, expiring, and
+  idempotently fail closed. Logout deletes daemon credentials and cancels
+  outstanding login state, but does not rewrite existing session manifests.
+- [ ] Add New Session OAuth status and login controls before MCP tool
+  selection. Inventory distinguishes login-required, discovering, unavailable,
+  and healthy without exposing credentials. Reconcile only removal/health;
+  successful login never silently selects tools or changes an existing frozen
+  session.
+- [ ] Add end-to-end public RPC coverage for static public clients and DCR,
+  loopback and manual full-callback completion, PKCE/state/resource/scope
+  validation, cancellation/expiry, refresh single-flight and rotation,
+  restart, logout, transport injection/no replay, and whole-surface redaction.
+
+#### Cross-stage credential and session invariants
+
+1. OAuth config may affect semantic route identity. Credentials, DCR output,
+   and ephemeral authorization state never do.
+2. MCP session manifests remain credential-free. They contain only the frozen
+   selected declarations and semantic route fingerprints already described
+   below; no OAuth config object, endpoint, scope, client information, token,
+   or credential-store key is added.
+3. PI.md and provider/model context remain credential- and OAuth-policy-free.
+   They continue to contain only selected server IDs and exposed tool names.
+4. Full/read-only subagents inherit the exact parent MCP manifest, not a copy
+   of credentials. Calls resolve through the daemon-owned route and credential
+   repository under the same no-replay and exact-contract checks.
+5. Discovery and login are bounded control-plane operations. They cannot
+   mutate a frozen manifest, replay an MCP operation, or inject server-provided
+   text into model context.
 
 ### MCP inventory and frozen manifests
 
@@ -366,6 +468,9 @@ the inherited MCP set at parent session creation.
 admission. Reconnect/refresh updates only the global New Session inventory,
 revision, and health. Publication happens after bounded full-catalog
 validation. Existing manifests and provider-visible bytes do not change.
+Refresh attempts are single-flight per route. A waiter consumes the completed
+attempt generation instead of immediately starting another attempt; unrelated
+healthy route selection does not wait for a coherent unavailable route.
 Streamable HTTP may reconnect its auxiliary server-event SSE stream, but never
 retries a POSTed tool call. A stale `Mcp-Session-Id` fails the current operation
 and lets the existing manager reconnect only for a later operation.
@@ -476,3 +581,10 @@ No result is automatically replayed.
   prerequisite. Remote initialization `instructions` are deliberately ignored;
   resources and prompts remain out of scope. Provider-neutral OAuth is the next
   active stage and no OAuth checklist item is implemented here.
+- 2026-07-11: The transient custom Stage 1 parser/discovery stack and bespoke
+  registration/scope/trust policy were retired before landing. OAuth now uses
+  Codex as its strict complexity ceiling: a minimal config, pinned rmcp
+  discovery/DCR/PKCE/token behavior, and Codex redirect semantics. pi-relay
+  adds only its daemon-specific owner task, internal manual callback path, and
+  finalization ordering. Credentials/refresh, authenticated transport, public
+  RPC, status/UI, and cross-platform validation remain unchecked.

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -17,7 +17,7 @@ use rmcp::model::{
 };
 use rmcp::service::{
     NotificationContext, PeerRequestOptions, RequestHandle, RoleClient, RunningService,
-    RxJsonRpcMessage, TxJsonRpcMessage,
+    RunningServiceCancellationToken, RxJsonRpcMessage, TxJsonRpcMessage,
 };
 use rmcp::transport::{which_command, Transport};
 use rmcp::ClientHandler;
@@ -354,6 +354,7 @@ impl Transport<RoleClient> for BoundedChildTransport {
 
 pub(crate) struct McpClient {
     service: Mutex<Service>,
+    service_cancellation: StdMutex<Option<RunningServiceCancellationToken>>,
     calls: Semaphore,
     active_calls: AtomicUsize,
     calls_idle: Notify,
@@ -362,16 +363,37 @@ pub(crate) struct McpClient {
     http_control: Option<crate::http_transport::HttpRequestControl>,
 }
 
+pub(crate) enum McpClientStart {
+    Connected(Arc<McpClient>, Vec<Tool>),
+    OAuthLoginRequired,
+    ConnectionFailed(anyhow::Error),
+}
+
 impl McpClient {
-    pub(crate) async fn start(config: &McpServerConfig) -> Result<(Arc<Self>, Vec<Tool>)> {
+    pub(crate) async fn start(
+        config: &McpServerConfig,
+        startup_deadline: Instant,
+        bearer_resolver: Option<&crate::http_transport::BearerResolver>,
+    ) -> McpClientStart {
+        match Self::start_inner(config, startup_deadline, bearer_resolver).await {
+            Ok(started) => started,
+            Err(error) => McpClientStart::ConnectionFailed(error),
+        }
+    }
+
+    async fn start_inner(
+        config: &McpServerConfig,
+        startup_deadline: Instant,
+        bearer_resolver: Option<&crate::http_transport::BearerResolver>,
+    ) -> Result<McpClientStart> {
         let liveness = Arc::new(ClientLiveness::default());
         let notifications = Arc::new(ClientNotifications::default());
         let (service, http_control) = match &config.transport {
             McpTransportConfig::Stdio(stdio) => {
                 let transport =
                     BoundedChildTransport::spawn(stdio, liveness.clone(), notifications.clone())?;
-                let service = timeout(
-                    config.startup_timeout(),
+                let service = timeout_at(
+                    startup_deadline,
                     rmcp::serve_client(notifications.clone(), transport),
                 )
                 .await
@@ -380,11 +402,26 @@ impl McpClient {
                 (service, None)
             }
             McpTransportConfig::StreamableHttp(http) => {
-                let connection =
-                    crate::http_transport::build(http, notifications.clone(), liveness.clone())?;
+                if http
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.oauth().is_some())
+                {
+                    return Ok(McpClientStart::OAuthLoginRequired);
+                }
+                let connection = if let Some(resolve) = bearer_resolver {
+                    crate::http_transport::build_with_bearer_resolver(
+                        http,
+                        notifications.clone(),
+                        liveness.clone(),
+                        resolve.as_ref(),
+                    )?
+                } else {
+                    crate::http_transport::build(http, notifications.clone(), liveness.clone())?
+                };
                 let control = connection.control.clone();
                 let service = timeout(
-                    config.startup_timeout(),
+                    startup_deadline.saturating_duration_since(Instant::now()),
                     rmcp::serve_client(notifications.clone(), connection.transport),
                 )
                 .await
@@ -416,6 +453,7 @@ impl McpClient {
             control.apply_negotiated_capabilities(&notifications, &liveness);
         }
         let client = Arc::new(Self {
+            service_cancellation: StdMutex::new(Some(service.cancellation_token())),
             service: Mutex::new(service),
             calls: Semaphore::new(config.parallel_calls),
             active_calls: AtomicUsize::new(0),
@@ -424,18 +462,18 @@ impl McpClient {
             liveness,
             http_control,
         });
-        let (tools, _) = match client.refresh_tools(config).await {
+        let (tools, _) = match client.refresh_tools_until(startup_deadline).await {
             Ok(result) => result,
             Err(error) => {
-                client.shutdown().await;
+                client.shutdown_in_background();
                 return Err(error);
             }
         };
         if client.http_control.is_some() && (client.is_closed() || client.tools_uncertain()) {
-            client.shutdown().await;
+            client.shutdown_in_background();
             bail!("MCP notification stream became unavailable during startup");
         }
-        Ok((client, tools))
+        Ok(McpClientStart::Connected(client, tools))
     }
 
     async fn list_tools_bounded(&self) -> Result<Vec<Tool>> {
@@ -470,8 +508,7 @@ impl McpClient {
         bail!("MCP tools/list has more than {MAX_LIST_PAGES} pages")
     }
 
-    pub(crate) async fn refresh_tools(&self, config: &McpServerConfig) -> Result<(Vec<Tool>, u64)> {
-        let deadline = Instant::now() + config.startup_timeout();
+    pub(crate) async fn refresh_tools_until(&self, deadline: Instant) -> Result<(Vec<Tool>, u64)> {
         let _admission = timeout_at(deadline, self.notifications.admission_barrier.write())
             .await
             .map_err(|_| anyhow!("MCP tools/list refresh barrier timed out"))?;
@@ -562,12 +599,31 @@ impl McpClient {
     }
 
     pub(crate) async fn shutdown(&self) {
+        self.abort();
+        let mut service = self.service.lock().await;
+        let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+    }
+
+    fn abort(&self) {
         if let Some(control) = &self.http_control {
             control.abort_all();
         }
-        let mut service = self.service.lock().await;
-        let _ = service.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+        if let Some(cancellation) = self
+            .service_cancellation
+            .lock()
+            .expect("MCP service cancellation lock")
+            .take()
+        {
+            cancellation.cancel();
+        }
         self.liveness.mark_closed();
+    }
+
+    pub(crate) fn shutdown_in_background(self: Arc<Self>) {
+        self.abort();
+        tokio::spawn(async move {
+            self.shutdown().await;
+        });
     }
 
     pub(crate) fn is_closed(&self) -> bool {

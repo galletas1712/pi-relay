@@ -18,6 +18,234 @@ fn allowlist_is_required_without_explicit_allow_all() {
 }
 
 #[test]
+fn oauth_callback_settings_are_operational() {
+    fn config(port: u16, timeout: u64) -> McpConfig {
+        serde_json::from_value(serde_json::json!({
+            "servers": {
+                "remote": {
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": "https://mcp.example.test/service",
+                        "auth": {
+                            "type": "oauth",
+                            "callback_port": port,
+                            "callback_timeout_ms": timeout
+                        }
+                    },
+                    "allow_all_tools": true
+                }
+            }
+        }))
+        .expect("OAuth config")
+    }
+
+    let original = config(3210, 10_000);
+    let different_timeout = config(3210, 20_000);
+    let different_port = config(3211, 10_000);
+    for config in [&original, &different_timeout, &different_port] {
+        config.validate().expect("valid config");
+    }
+    assert_eq!(
+        original.servers["remote"].semantic_fingerprint(),
+        different_timeout.servers["remote"].semantic_fingerprint()
+    );
+    assert_eq!(
+        original.servers["remote"].semantic_fingerprint(),
+        different_port.servers["remote"].semantic_fingerprint()
+    );
+}
+
+#[test]
+fn oauth_config_is_codex_shaped_and_uses_streamable_http_url_rules() {
+    for url in [
+        "https://mcp.example.test/service?tenant=one",
+        "http://localhost:3000/mcp?tenant=one",
+        "http://127.0.0.1:3000/mcp?tenant=one",
+        "http://[::1]:3000/mcp?tenant=one",
+    ] {
+        let config: McpConfig = serde_json::from_value(serde_json::json!({
+            "servers": {
+                "remote": {
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": url,
+                        "auth": {
+                            "type": "oauth",
+                            "client_id": "public-client",
+                            "scopes": ["read", "search"],
+                            "resource": "https://api.example.test/a?tenant=one",
+                        }
+                    },
+                    "allow_all_tools": true
+                }
+            }
+        }))
+        .expect("OAuth config parses");
+        config.validate().expect("OAuth config validates");
+    }
+
+    for auth in [
+        serde_json::json!({"type": "oauth", "callback_port": 0}),
+        serde_json::json!({"type": "oauth", "callback_timeout_ms": 600001}),
+    ] {
+        let config: McpConfig = serde_json::from_value(serde_json::json!({
+            "servers": {
+                "remote": {
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": "https://mcp.example.test/service",
+                        "auth": auth
+                    },
+                    "allow_all_tools": true
+                }
+            }
+        }))
+        .expect("invalid OAuth config still parses");
+        assert!(config.validate().is_err());
+    }
+
+    for abandoned_field in [
+        serde_json::json!({"registration": {"type": "dynamic"}}),
+        serde_json::json!({"client_secret_env": "CLIENT_SECRET"}),
+        serde_json::json!({"allowed_scopes": ["read"]}),
+        serde_json::json!({"initial_scopes": ["read"]}),
+        serde_json::json!({"authorization_server_issuer": "https://auth.example.test"}),
+        serde_json::json!({"trusted_authorization_origins": ["https://auth.example.test"]}),
+    ] {
+        let mut auth = serde_json::json!({"type": "oauth"});
+        auth.as_object_mut()
+            .expect("auth object")
+            .extend(abandoned_field.as_object().expect("field object").clone());
+        assert!(serde_json::from_value::<McpConfig>(serde_json::json!({
+            "servers": {
+                "remote": {
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": "https://mcp.example.test/service",
+                        "auth": auth
+                    },
+                    "allow_all_tools": true
+                }
+            }
+        }))
+        .is_err());
+    }
+}
+
+#[test]
+fn oauth_fingerprint_contains_semantic_config_and_no_operational_state() {
+    fn config(callback_port: u16, timeout: u64) -> McpConfig {
+        serde_json::from_value(serde_json::json!({
+            "servers": {
+                "remote": {
+                    "transport": {
+                        "type": "streamable_http",
+                        "url": "https://mcp.example.test/service?tenant=one",
+                        "auth": {
+                            "type": "oauth",
+                            "client_id": "public-client",
+                            "scopes": ["read", "search"],
+                            "resource": "https://api.example.test/a?tenant=one",
+                            "callback_port": callback_port,
+                            "callback_timeout_ms": timeout,
+                        }
+                    },
+                    "enabled_tools": ["read"]
+                }
+            }
+        }))
+        .expect("OAuth config parses")
+    }
+
+    let first = config(3210, 10_000);
+    let operationally_different = config(3211, 20_000);
+    first.validate().expect("first config validates");
+    operationally_different
+        .validate()
+        .expect("second config validates");
+    assert_eq!(
+        first.servers["remote"].semantic_fingerprint(),
+        operationally_different.servers["remote"].semantic_fingerprint()
+    );
+
+    let input = first.semantic_fingerprint_input().to_string();
+    for expected in [
+        "\"type\":\"oauth\"",
+        "public-client",
+        "https://mcp.example.test/service?tenant=one",
+        "https://api.example.test/a?tenant=one",
+        "\"scopes\":[\"read\",\"search\"]",
+    ] {
+        assert!(input.contains(expected), "{expected}");
+    }
+    for forbidden in [
+        "callback_port",
+        "callback_timeout_ms",
+        "access_token",
+        "refresh_token",
+        "code_verifier",
+        "metadata_cache",
+    ] {
+        assert!(!input.contains(forbidden), "{forbidden}");
+    }
+
+    let server = &first.servers["remote"];
+    let catalog = crate::catalog::build_inventory_catalog(
+        &BTreeMap::from([("remote".to_string(), server.semantic_fingerprint())]),
+        vec![crate::catalog::DiscoveredTool {
+            server_id: "remote".to_string(),
+            server_config_fingerprint: server.semantic_fingerprint(),
+            raw_name: "read".to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }],
+        &BTreeSet::new(),
+    )
+    .expect("manifest builds");
+    let manifest = serde_json::to_string(&catalog).expect("manifest serializes");
+    for forbidden in [
+        "public-client",
+        "mcp.example.test",
+        "api.example.test",
+        "\"search\"",
+    ] {
+        assert!(!manifest.contains(forbidden), "{forbidden}");
+    }
+
+    let debug = format!("{first:?}");
+    for redacted in ["public-client", "mcp.example.test", "api.example.test"] {
+        assert!(!debug.contains(redacted), "{redacted}");
+    }
+}
+
+#[test]
+fn oauth_fingerprint_has_a_fixed_regression_fixture() {
+    let config: McpConfig = serde_json::from_value(serde_json::json!({
+        "servers": {
+            "remote": {
+                "transport": {
+                    "type": "streamable_http",
+                    "url": "https://mcp.example.test/service?tenant=one",
+                    "auth": {
+                        "type": "oauth",
+                        "client_id": "public-client",
+                        "scopes": ["read", "search"],
+                        "resource": "https://api.example.test/a?tenant=one",
+                    }
+                },
+                "enabled_tools": ["read"]
+            }
+        }
+    }))
+    .expect("OAuth config");
+
+    assert_eq!(
+        config.servers["remote"].semantic_fingerprint(),
+        "58da63fd45549f1134a6eb0b603a854e931125f60de442b524b71c095e0f8785"
+    );
+}
+
+#[test]
 fn semantic_identity_includes_concurrency_but_not_operational_deadlines() {
     let mut config: McpConfig = serde_json::from_value(serde_json::json!({
         "servers": {
@@ -244,7 +472,33 @@ fn legacy_flat_and_tagged_stdio_retain_the_legacy_fingerprint() {
         tagged.servers["example"].semantic_fingerprint(),
         expected_legacy_fingerprint
     );
+    assert_eq!(
+        expected_legacy_fingerprint,
+        "94e1bcd5e733490f8908db743a74a804f7dd02e11cd3bcbf403546ca9be0fb0c"
+    );
     assert_eq!(legacy.servers["example"], tagged.servers["example"]);
+}
+
+#[test]
+fn bearer_env_fingerprint_retains_the_pre_oauth_fixture() {
+    let config: McpConfig = serde_json::from_value(serde_json::json!({
+        "servers": {
+            "remote": {
+                "transport": {
+                    "type": "streamable_http",
+                    "url": "https://mcp.example.test/service",
+                    "auth": {"type": "bearer_env", "env": "EXAMPLE_MCP_TOKEN"}
+                },
+                "enabled_tools": ["read"]
+            }
+        }
+    }))
+    .expect("bearer config parses");
+
+    assert_eq!(
+        config.servers["remote"].semantic_fingerprint(),
+        "8c0d8822a2dae49040d310f2488ae41e667201a428a9862eb062e2f89b4cf6a3"
+    );
 }
 
 #[test]

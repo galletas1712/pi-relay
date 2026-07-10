@@ -25,12 +25,12 @@ dependencies = [
  "async-trait",
  "futures-util",
  "reflink-copy",
- "reqwest",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
  "sqlx",
- "thiserror",
+ "thiserror 2.0.18",
  "time",
  "tokio",
  "tokio-tungstenite",
@@ -41,6 +41,7 @@ dependencies = [
 name = "agent-mcp"
 version = "0.1.0"
 dependencies = [
+ "agent-prompt",
  "agent-tools",
  "agent-vocab",
  "anyhow",
@@ -48,13 +49,13 @@ dependencies = [
  "http",
  "pretty_assertions",
  "process-wrap",
- "reqwest",
+ "reqwest 0.12.28",
  "rmcp",
  "serde",
  "serde_json",
  "sha2",
  "sse-stream",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
 ]
@@ -75,11 +76,11 @@ dependencies = [
  "agent-vocab",
  "async-trait",
  "os_info",
- "reqwest",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "uuid",
  "zstd",
@@ -119,10 +120,10 @@ version = "0.1.0"
 dependencies = [
  "agent-vocab",
  "async-trait",
- "reqwest",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -275,8 +276,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -1193,6 +1196,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "oauth2"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
+dependencies = [
+ "base64",
+ "chrono",
+ "getrandom 0.2.17",
+ "http",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "objc2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1537,7 +1559,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "web-time",
@@ -1558,7 +1580,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror",
+ "thiserror 2.0.18",
  "tinyvec",
  "tracing",
  "web-time",
@@ -1727,6 +1749,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqwest"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+dependencies = [
+ "base64",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "sync_wrapper",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-streams",
+ "web-sys",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1750,16 +1806,19 @@ dependencies = [
  "chrono",
  "futures",
  "http",
+ "oauth2",
  "pin-project-lite",
  "process-wrap",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "sse-stream",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "url",
  "which",
 ]
 
@@ -1902,6 +1961,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -2049,7 +2119,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smallvec",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -2133,7 +2203,7 @@ dependencies = [
  "smallvec",
  "sqlx-core",
  "stringprep",
- "thiserror",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
  "whoami",
@@ -2171,7 +2241,7 @@ dependencies = [
  "smallvec",
  "sqlx-core",
  "stringprep",
- "thiserror",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
  "whoami",
@@ -2196,7 +2266,7 @@ dependencies = [
  "serde",
  "serde_urlencoded",
  "sqlx-core",
- "thiserror",
+ "thiserror 2.0.18",
  "tracing",
  "url",
  "uuid",
@@ -2271,11 +2341,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.18",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -2514,7 +2604,7 @@ dependencies = [
  "log",
  "rand 0.9.4",
  "sha1",
- "thiserror",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2572,6 +2662,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -2718,6 +2809,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

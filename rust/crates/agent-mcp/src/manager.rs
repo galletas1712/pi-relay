@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use crate::catalog::{
     build_inventory_catalog, declaration_token_estimate, select_manifest, DiscoveredTool, MAX_TOOLS,
 };
-use crate::client::{McpClient, McpClientCallError};
+use crate::client::{McpClient, McpClientCallError, McpClientStart};
 use crate::config::{McpConfig, McpServerConfig};
 use crate::result::normalize_call_result;
 use crate::{McpSessionManifest, McpSessionSnapshot};
@@ -161,6 +161,40 @@ struct ServerState {
     /// last observation retained for diagnostics.
     catalog_coherent: bool,
     route_lock: Arc<Mutex<()>>,
+    refresh: RefreshState,
+}
+
+struct RefreshState {
+    generation: u64,
+    disposition: RetryDisposition,
+}
+
+enum RetryDisposition {
+    Automatic,
+    UserActionRequired,
+}
+
+enum RefreshAttempt {
+    Connected(Arc<McpClient>, Vec<rmcp::model::Tool>, u64),
+    Failed {
+        error: anyhow::Error,
+        disposition: RetryDisposition,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefreshOutcome {
+    Complete,
+    DeadlineElapsed,
+}
+
+impl RetryDisposition {
+    fn permits_automatic_attempt(&self) -> bool {
+        match self {
+            Self::Automatic => true,
+            Self::UserActionRequired => false,
+        }
+    }
 }
 
 impl ServerState {
@@ -182,55 +216,89 @@ impl ServerState {
     fn mark_unavailable(&mut self) {
         self.health = McpHealth::Unavailable;
         self.client = None;
+        self.refresh.disposition = RetryDisposition::Automatic;
     }
 }
 
 pub struct McpManager {
     servers: RwLock<BTreeMap<String, ServerState>>,
-    refresh_lock: Mutex<()>,
+    bearer_resolver: Option<crate::http_transport::BearerResolver>,
+    oauth: Arc<crate::oauth_login::OAuthCoordinator>,
     shutting_down: AtomicBool,
     shutdown_notify: Notify,
 }
 
 impl McpManager {
     pub async fn start(config: McpConfig) -> Result<Arc<Self>, McpManagerError> {
+        Self::start_with_bearer_resolver(config, None).await
+    }
+
+    async fn start_with_bearer_resolver(
+        config: McpConfig,
+        bearer_resolver: Option<crate::http_transport::BearerResolver>,
+    ) -> Result<Arc<Self>, McpManagerError> {
         config.validate()?;
+        let startup_parallelism = config.servers.len().max(1);
         let starts = futures_util::stream::iter(config.servers.clone())
-            .map(|(server_id, server_config)| async move {
-                let state = match McpClient::start(&server_config).await {
-                    Ok((client, tools)) => {
-                        match discovered_tools(&server_id, &server_config, tools) {
-                            Ok(tools) => ServerState {
-                                config: server_config,
-                                catalog_tools_revision: client.tools_revision(),
-                                client: Some(client),
-                                tools,
-                                health: McpHealth::Healthy,
-                                catalog_coherent: true,
-                                route_lock: Arc::new(Mutex::new(())),
-                            },
-                            Err(error) => {
-                                eprintln!(
+            .map(|(server_id, server_config)| {
+                let start_resolver = bearer_resolver.clone();
+                async move {
+                    let deadline = tokio::time::Instant::now() + server_config.startup_timeout();
+                    let state =
+                        match McpClient::start(&server_config, deadline, start_resolver.as_ref())
+                            .await
+                        {
+                            McpClientStart::Connected(client, tools) => {
+                                match discovered_tools(&server_id, &server_config, tools) {
+                                    Ok(tools) => ServerState {
+                                        config: server_config,
+                                        catalog_tools_revision: client.tools_revision(),
+                                        client: Some(client),
+                                        tools,
+                                        health: McpHealth::Healthy,
+                                        catalog_coherent: true,
+                                        route_lock: Arc::new(Mutex::new(())),
+                                        refresh: RefreshState {
+                                            generation: 1,
+                                            disposition: RetryDisposition::Automatic,
+                                        },
+                                    },
+                                    Err(error) => {
+                                        eprintln!(
                                     "MCP server {server_id} returned an invalid catalog: {error:#}"
                                 );
-                                client.shutdown().await;
-                                unavailable_server(server_config)
+                                        client.shutdown().await;
+                                        unavailable_server(
+                                            server_config,
+                                            RetryDisposition::Automatic,
+                                        )
+                                    }
+                                }
                             }
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("MCP server {server_id} unavailable during startup: {error:#}");
-                        unavailable_server(server_config)
-                    }
-                };
-                (server_id, state)
+                            McpClientStart::OAuthLoginRequired => {
+                                eprintln!("MCP server {server_id} requires OAuth login");
+                                unavailable_server(
+                                    server_config,
+                                    RetryDisposition::UserActionRequired,
+                                )
+                            }
+                            McpClientStart::ConnectionFailed(error) => {
+                                eprintln!(
+                                    "MCP server {server_id} unavailable during startup: {error:#}"
+                                );
+                                unavailable_server(server_config, RetryDisposition::Automatic)
+                            }
+                        };
+                    (server_id, state)
+                }
             })
-            .buffer_unordered(8)
+            .buffer_unordered(startup_parallelism)
             .collect::<Vec<_>>()
             .await;
         Ok(Arc::new(Self {
             servers: RwLock::new(starts.into_iter().collect()),
-            refresh_lock: Mutex::new(()),
+            bearer_resolver,
+            oauth: crate::oauth_login::OAuthCoordinator::new(),
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         }))
@@ -239,7 +307,8 @@ impl McpManager {
     pub fn disabled() -> Arc<Self> {
         Arc::new(Self {
             servers: RwLock::new(BTreeMap::new()),
-            refresh_lock: Mutex::new(()),
+            bearer_resolver: None,
+            oauth: crate::oauth_login::OAuthCoordinator::new(),
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         })
@@ -302,7 +371,7 @@ impl McpManager {
         first_party: &HashMap<ProviderKind, Vec<ProviderTool>>,
     ) -> Result<McpSessionSnapshot, McpManagerError> {
         let selected = validate_selection_shape(selection)?;
-        self.refresh_inventory().await;
+        self.refresh_selection(&selected).await;
         let (catalog, globally_coherent) = self.inventory_catalog(first_party).await?;
         if !globally_coherent {
             return Err(McpManagerError::InventoryChanged {
@@ -384,6 +453,7 @@ impl McpManager {
         exposed_name: &str,
         arguments: Value,
     ) -> Result<McpCallOutput, McpCallError> {
+        let started = tokio::time::Instant::now();
         let tool = snapshot.manifest().tool(exposed_name).ok_or_else(|| {
             McpCallError::ContractChanged {
                 tool: exposed_name.to_string(),
@@ -394,7 +464,7 @@ impl McpManager {
                 server: tool.server_id.clone(),
             });
         }
-        let (route_lock, deadline) = {
+        let (route_lock, mut observed_generation, deadline) = {
             let servers = self.servers.read().await;
             let Some(server) = servers.get(&tool.server_id) else {
                 return Err(McpCallError::Revoked {
@@ -408,7 +478,8 @@ impl McpManager {
             }
             (
                 server.route_lock.clone(),
-                tokio::time::Instant::now() + server.config.call_timeout(),
+                server.refresh.generation,
+                started + server.config.call_timeout(),
             )
         };
         let arguments = match arguments {
@@ -419,56 +490,69 @@ impl McpManager {
                 });
             }
         };
-        let result = loop {
-            let _route = tokio::time::timeout_at(deadline, route_lock.lock())
-                .await
-                .map_err(|_| McpCallError::Timeout {
-                    tool: exposed_name.to_string(),
-                })?;
-            if tokio::time::timeout_at(deadline, self.refresh_server_if_needed(&tool.server_id))
-                .await
-                .is_err()
-            {
-                self.mark_server_unavailable(&tool.server_id).await;
-                return Err(McpCallError::Timeout {
-                    tool: exposed_name.to_string(),
-                });
-            }
-            let (client, tools_revision) = self.select_exact_route(tool, exposed_name).await?;
-            let pin = client.pin();
-            drop(_route);
-            match client
-                .call(
-                    pin,
-                    deadline,
-                    tools_revision,
-                    &tool.raw_name,
-                    arguments.clone(),
-                )
-                .await
-            {
-                Err(McpClientCallError::ToolsChanged) => continue,
-                result => break result,
-            }
+        let operation = async {
+            let result = loop {
+                let _route = route_lock.lock().await;
+                if self
+                    .refresh_server_if_needed(&tool.server_id, observed_generation, deadline)
+                    .await
+                    == RefreshOutcome::DeadlineElapsed
+                {
+                    return Err(McpCallError::Timeout {
+                        tool: exposed_name.to_string(),
+                    });
+                }
+                observed_generation = self
+                    .servers
+                    .read()
+                    .await
+                    .get(&tool.server_id)
+                    .map_or(observed_generation, |server| server.refresh.generation);
+                let (client, tools_revision) = self.select_exact_route(tool, exposed_name).await?;
+                let pin = client.pin();
+                drop(_route);
+                match client
+                    .call(
+                        pin,
+                        deadline,
+                        tools_revision,
+                        &tool.raw_name,
+                        arguments.clone(),
+                    )
+                    .await
+                {
+                    Err(McpClientCallError::ToolsChanged) => continue,
+                    result => break result,
+                }
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(McpClientCallError::Timeout) => {
+                    self.mark_server_unavailable(&tool.server_id).await;
+                    return Err(McpCallError::Timeout {
+                        tool: exposed_name.to_string(),
+                    });
+                }
+                Err(McpClientCallError::Protocol(message)) => {
+                    self.mark_server_unavailable(&tool.server_id).await;
+                    return Err(McpCallError::Protocol {
+                        message: bounded_error_message(message),
+                    });
+                }
+                Err(McpClientCallError::ToolsChanged) => {
+                    unreachable!("handled in admission loop")
+                }
+            };
+            let (output, is_error) = normalize_call_result(result);
+            Ok(McpCallOutput { output, is_error })
         };
-        let result = match result {
-            Ok(result) => result,
-            Err(McpClientCallError::Timeout) => {
-                self.mark_server_unavailable(&tool.server_id).await;
-                return Err(McpCallError::Timeout {
+        tokio::time::timeout_at(deadline, operation)
+            .await
+            .unwrap_or_else(|_| {
+                Err(McpCallError::Timeout {
                     tool: exposed_name.to_string(),
-                });
-            }
-            Err(McpClientCallError::Protocol(message)) => {
-                self.mark_server_unavailable(&tool.server_id).await;
-                return Err(McpCallError::Protocol {
-                    message: bounded_error_message(message),
-                });
-            }
-            Err(McpClientCallError::ToolsChanged) => unreachable!("handled in admission loop"),
-        };
-        let (output, is_error) = normalize_call_result(result);
-        Ok(McpCallOutput { output, is_error })
+                })
+            })
     }
 
     pub async fn tool_views(&self, snapshot: &McpSessionSnapshot) -> Vec<McpToolView> {
@@ -499,6 +583,7 @@ impl McpManager {
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();
+        self.oauth.shutdown().await;
         let route_locks = self
             .servers
             .read()
@@ -527,6 +612,47 @@ impl McpManager {
         drop(route_guards);
     }
 
+    pub async fn begin_oauth_login(
+        &self,
+        server_id: &str,
+    ) -> Result<crate::McpOAuthLoginStart, crate::McpOAuthLoginError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(crate::McpOAuthLoginError::Unavailable);
+        }
+        let (config, deadline) = {
+            let servers = self.servers.read().await;
+            let server = servers
+                .get(server_id)
+                .ok_or(crate::McpOAuthLoginError::NotConfigured)?;
+            let crate::config::McpTransportConfig::StreamableHttp(config) =
+                &server.config.transport
+            else {
+                return Err(crate::McpOAuthLoginError::NotConfigured);
+            };
+            (
+                config.clone(),
+                tokio::time::Instant::now() + server.config.startup_timeout(),
+            )
+        };
+        self.oauth.begin(server_id, &config, deadline).await
+    }
+
+    pub async fn complete_oauth_login(
+        &self,
+        login_id: &str,
+        callback_url: &str,
+    ) -> Result<(), crate::McpOAuthLoginError> {
+        self.oauth.complete(login_id, callback_url).await
+    }
+
+    pub async fn cancel_oauth_login(
+        &self,
+        server_id: &str,
+        login_id: &str,
+    ) -> Result<(), crate::McpOAuthLoginError> {
+        self.oauth.cancel(server_id, login_id).await
+    }
+
     async fn inventory_catalog(
         &self,
         first_party: &HashMap<ProviderKind, Vec<ProviderTool>>,
@@ -552,52 +678,87 @@ impl McpManager {
     }
 
     async fn refresh_inventory(&self) {
-        let server_ids = self.servers.read().await.keys().cloned().collect();
-        self.refresh_servers(server_ids).await;
+        let routes = self.refresh_routes(|_, _| true).await;
+        self.run_refresh_routes(routes).await;
     }
 
-    async fn refresh_servers(&self, server_ids: Vec<String>) {
-        if self.shutting_down.load(Ordering::Acquire) {
-            return;
-        }
-        let _refresh = self.refresh_lock.lock().await;
-        let servers = {
-            let servers = self.servers.read().await;
-            server_ids
-                .into_iter()
-                .filter_map(|server_id| {
-                    servers
-                        .get(&server_id)
-                        .map(|server| (server_id, server.route_lock.clone()))
-                })
-                .collect::<Vec<_>>()
-        };
-        futures_util::stream::iter(servers)
-            .for_each_concurrent(8, |(server_id, route_lock)| async move {
-                let _route = route_lock.lock().await;
-                self.refresh_server_if_needed(&server_id).await;
+    async fn refresh_selection(&self, selected: &BTreeMap<String, BTreeSet<String>>) {
+        let routes = self
+            .refresh_routes(|server_id, server| {
+                selected.contains_key(server_id) || !server.catalog_is_current()
             })
+            .await;
+        self.run_refresh_routes(routes).await;
+    }
+
+    async fn refresh_routes(
+        &self,
+        include: impl Fn(&str, &ServerState) -> bool,
+    ) -> Vec<(String, Arc<Mutex<()>>, u64, tokio::time::Instant)> {
+        self.servers
+            .read()
+            .await
+            .iter()
+            .filter(|(server_id, server)| include(server_id, server))
+            .map(|(server_id, server)| {
+                (
+                    server_id.clone(),
+                    server.route_lock.clone(),
+                    server.refresh.generation,
+                    tokio::time::Instant::now() + server.config.startup_timeout(),
+                )
+            })
+            .collect()
+    }
+
+    async fn run_refresh_routes(
+        &self,
+        routes: Vec<(String, Arc<Mutex<()>>, u64, tokio::time::Instant)>,
+    ) {
+        futures_util::stream::iter(routes)
+            .for_each_concurrent(
+                None,
+                |(server_id, route_lock, observed_generation, deadline)| async move {
+                    let Ok(_route) = tokio::time::timeout_at(deadline, route_lock.lock()).await
+                    else {
+                        return;
+                    };
+                    self.refresh_server_if_needed(&server_id, observed_generation, deadline)
+                        .await;
+                },
+            )
             .await;
     }
 
-    async fn refresh_server_if_needed(&self, server_id: &str) {
+    async fn refresh_server_if_needed(
+        &self,
+        server_id: &str,
+        observed_generation: u64,
+        deadline: tokio::time::Instant,
+    ) -> RefreshOutcome {
         let shutdown = self.shutdown_notify.notified();
         tokio::pin!(shutdown);
         shutdown.as_mut().enable();
         if self.shutting_down.load(Ordering::Acquire) {
-            return;
+            return RefreshOutcome::Complete;
         }
         let plan = {
             let mut servers = self.servers.write().await;
             let Some(server) = servers.get_mut(server_id) else {
-                return;
+                return RefreshOutcome::Complete;
             };
+            if server.refresh.generation != observed_generation {
+                return RefreshOutcome::Complete;
+            }
             if server
                 .client
                 .as_ref()
                 .is_some_and(|client| client.is_closed())
             {
                 server.mark_unavailable();
+            }
+            if !server.refresh.disposition.permits_automatic_attempt() {
+                return RefreshOutcome::Complete;
             }
             let reconnect = server.health != McpHealth::Healthy || server.client.is_none();
             let refresh = server.client.as_ref().is_some_and(|client| {
@@ -613,66 +774,111 @@ impl McpManager {
             })
         };
         let Some((config, reconnect, refreshing_stale_catalog, current_client)) = plan else {
-            return;
+            return RefreshOutcome::Complete;
         };
         if let Some(client) = &current_client {
             tokio::select! {
                 () = client.wait_for_calls_idle() => {}
-                () = &mut shutdown => return,
+                () = &mut shutdown => return RefreshOutcome::Complete,
+                () = tokio::time::sleep_until(deadline) => {
+                    return RefreshOutcome::DeadlineElapsed;
+                },
             }
         }
         let refresh = async {
             if reconnect {
-                McpClient::start(&config).await.map(|(client, tools)| {
-                    let revision = client.tools_revision();
-                    (client, tools, revision)
-                })
+                match McpClient::start(&config, deadline, self.bearer_resolver.as_ref()).await {
+                    McpClientStart::Connected(client, tools) => {
+                        let revision = client.tools_revision();
+                        RefreshAttempt::Connected(client, tools, revision)
+                    }
+                    McpClientStart::OAuthLoginRequired => RefreshAttempt::Failed {
+                        error: anyhow::anyhow!("MCP OAuth login is required"),
+                        disposition: RetryDisposition::UserActionRequired,
+                    },
+                    McpClientStart::ConnectionFailed(error) => RefreshAttempt::Failed {
+                        error,
+                        disposition: RetryDisposition::Automatic,
+                    },
+                }
             } else if let Some(client) = current_client {
-                client
-                    .refresh_tools(&config)
-                    .await
-                    .map(|(tools, revision)| (client, tools, revision))
+                match client.refresh_tools_until(deadline).await {
+                    Ok((tools, revision)) => RefreshAttempt::Connected(client, tools, revision),
+                    Err(error) => RefreshAttempt::Failed {
+                        error,
+                        disposition: RetryDisposition::Automatic,
+                    },
+                }
             } else {
-                Err(anyhow::anyhow!("MCP client disappeared before refresh"))
+                RefreshAttempt::Failed {
+                    error: anyhow::anyhow!("MCP client disappeared before refresh"),
+                    disposition: RetryDisposition::Automatic,
+                }
             }
         };
         let refreshed = tokio::select! {
             refreshed = refresh => refreshed,
-            () = &mut shutdown => return,
+            () = &mut shutdown => return RefreshOutcome::Complete,
         };
         if self.shutting_down.load(Ordering::Acquire) {
-            if let Ok((client, _, _)) = refreshed {
-                client.shutdown().await;
+            if let RefreshAttempt::Connected(client, _, _) = refreshed {
+                client.shutdown_in_background();
             }
-            return;
+            return RefreshOutcome::Complete;
         }
         let mut servers = self.servers.write().await;
         let Some(server) = servers.get_mut(server_id) else {
-            return;
+            return RefreshOutcome::Complete;
         };
-        match refreshed.and_then(|(client, tools, revision)| {
-            discovered_tools(server_id, &config, tools).map(|tools| (client, tools, revision))
-        }) {
-            Ok((client, tools, revision)) => {
+        if server.refresh.generation != observed_generation {
+            drop(servers);
+            if let RefreshAttempt::Connected(client, _, _) = refreshed {
+                client.shutdown_in_background();
+            }
+            return RefreshOutcome::Complete;
+        }
+        server.refresh.generation = server.refresh.generation.wrapping_add(1);
+        match refreshed {
+            RefreshAttempt::Connected(client, tools, revision) => {
+                let tools = match discovered_tools(server_id, &config, tools) {
+                    Ok(tools) => tools,
+                    Err(error) => {
+                        eprintln!("MCP server {server_id} refresh failed: {error:#}");
+                        drop(client);
+                        if refreshing_stale_catalog {
+                            server.catalog_coherent = false;
+                        }
+                        server.mark_unavailable();
+                        return RefreshOutcome::Complete;
+                    }
+                };
                 server.tools = tools;
                 server.client = Some(client);
                 server.health = McpHealth::Healthy;
                 server.catalog_tools_revision = revision;
                 server.catalog_coherent = true;
+                server.refresh.disposition = RetryDisposition::Automatic;
             }
-            Err(error) => {
+            RefreshAttempt::Failed { error, disposition } => {
                 eprintln!("MCP server {server_id} refresh failed: {error:#}");
                 if refreshing_stale_catalog {
                     server.catalog_coherent = false;
                 }
                 server.mark_unavailable();
+                server.refresh.disposition = disposition;
             }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            RefreshOutcome::DeadlineElapsed
+        } else {
+            RefreshOutcome::Complete
         }
     }
 
     async fn mark_server_unavailable(&self, server_id: &str) {
         if let Some(server) = self.servers.write().await.get_mut(server_id) {
             server.mark_unavailable();
+            server.refresh.generation = server.refresh.generation.wrapping_add(1);
         }
     }
 
@@ -725,7 +931,7 @@ impl McpManager {
     }
 }
 
-fn unavailable_server(config: McpServerConfig) -> ServerState {
+fn unavailable_server(config: McpServerConfig, disposition: RetryDisposition) -> ServerState {
     ServerState {
         config,
         client: None,
@@ -734,6 +940,10 @@ fn unavailable_server(config: McpServerConfig) -> ServerState {
         catalog_tools_revision: 0,
         catalog_coherent: true,
         route_lock: Arc::new(Mutex::new(())),
+        refresh: RefreshState {
+            generation: 1,
+            disposition,
+        },
     }
 }
 
@@ -823,3 +1033,7 @@ fn contract_fingerprint(tool: &DiscoveredTool) -> String {
 #[cfg(test)]
 #[path = "manager_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "manager_oauth_tests.rs"]
+mod oauth_tests;

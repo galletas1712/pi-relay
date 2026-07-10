@@ -45,7 +45,7 @@ agent-session    transcript forest, model-context materialization,
    +-- agent-store     Postgres persistence (the only durable backend)
    +-- agent-provider  ModelProvider + OpenAI/Codex and Anthropic adapters
    +-- agent-tools     AgentTool, ToolRegistry, builtin tools
-   +-- agent-mcp       stdio/Streamable HTTP MCP manager + immutable session manifests
+   +-- agent-mcp       stdio/HTTP MCP + rmcp-backed OAuth + immutable manifests
    +-- agent-prompt    renders the PI.md system prompt
             |
             v
@@ -61,7 +61,7 @@ agent-vocab      shared ids, message blocks, tool calls/results,
 | `agent-store` | Postgres-only session/transcript/queue/action/event persistence plus recovery and revision/queue projections. | [modules/agent-store.md](modules/agent-store.md) |
 | `agent-provider` | `ModelProvider` plus OpenAI/Codex (Responses) and Anthropic (Messages) adapters, prompt-cache shaping, and provider compaction. | [modules/agent-provider.md](modules/agent-provider.md) |
 | `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`web_search`/`web_fetch`/`LoadSkill`/delegation tools. | [modules/agent-tools.md](modules/agent-tools.md) |
-| `agent-mcp` | Operator-configured stdio/Streamable HTTP MCP clients, New Session inventory, and deterministic MCP-only session manifests kept separate from `ToolRegistry`. | [plans/mcp-client.md](plans/mcp-client.md) |
+| `agent-mcp` | Operator-configured stdio/Streamable HTTP MCP clients, a Codex-parity rmcp-backed OAuth loopback flow with an internal manual-completion boundary, New Session inventory, and deterministic MCP-only session manifests kept separate from `ToolRegistry`. OAuth credentials are memory-only; persistence, refresh, authenticated transport, public RPC, and UI are not implemented yet. | [plans/mcp-client.md](plans/mcp-client.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. | [modules/agent-daemon.md](modules/agent-daemon.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt from session/workspace/tool/skill context. | [modules/agent-prompt.md](modules/agent-prompt.md) |
 
