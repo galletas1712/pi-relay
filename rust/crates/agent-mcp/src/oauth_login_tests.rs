@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -11,28 +11,22 @@ use tokio::task::JoinHandle;
 
 use super::*;
 
-static FIXED_PORT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static NEXT_FIXED_PORT: AtomicU16 = AtomicU16::new(20_000);
+pub(crate) static CALLBACK_PORT_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn rmcp_dynamic_login_follows_discovery_and_registration_redirects() {
-    let _fixed_port = FIXED_PORT_TEST_LOCK.lock().await;
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
-    let port = reserve_port().await;
-    let coordinator = OAuthCoordinator::new();
-    let config = oauth_config(
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let (coordinator, config, start) = begin_with_fixed_callback_port(
         &server.origin,
         OAuthConfig {
             scopes: Some(&["read", "search"]),
             resource: Some("https://api.example.test/a?tenant=one"),
-            callback_port: Some(port),
             ..OAuthConfig::default()
         },
-    );
-    let start = coordinator
-        .begin("server", &config, Instant::now() + Duration::from_secs(5))
-        .await
-        .expect("login starts");
+    )
+    .await;
     assert_eq!(
         coordinator
             .begin("server", &config, Instant::now() + Duration::from_secs(5))
@@ -65,9 +59,6 @@ async fn rmcp_dynamic_login_follows_discovery_and_registration_redirects() {
         .await
         .expect("manual callback completes");
     assert_finalized(&coordinator, "server", CredentialExpectation::Present);
-    TcpListener::bind(("127.0.0.1", port))
-        .await
-        .expect("success acknowledgement releases callback port");
 
     let requests = server.requests();
     for target in [
@@ -105,10 +96,120 @@ async fn rmcp_dynamic_login_follows_discovery_and_registration_redirects() {
     assert!(!token["code_verifier"].is_empty());
 }
 
+fn callback_port(authorization_url: &str) -> u16 {
+    let (redirect_uri, _) = login_values(authorization_url);
+    reqwest::Url::parse(&redirect_uri)
+        .expect("redirect URI")
+        .port()
+        .expect("redirect port")
+}
+
+#[tokio::test]
+async fn cancel_during_discovery_releases_reservation_for_immediate_restart() {
+    let server = OAuthServer::spawn(OAuthServerOptions {
+        metadata_delay: Duration::from_secs(1),
+        ..OAuthServerOptions::default()
+    })
+    .await;
+    let callback_port_guard = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let repository = OAuthCredentialRepository::memory();
+    let coordinator = OAuthCoordinator::with_runtime(OAuthRuntimeManager::new(repository.clone()));
+    let config = oauth_config(&server.origin, OAuthConfig::default());
+    let begin = {
+        let coordinator = coordinator.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            coordinator
+                .begin("server", &config, Instant::now() + Duration::from_secs(5))
+                .await
+        })
+    };
+    server.wait_for_target("/metadata-final").await;
+    let login_id = coordinator
+        .state
+        .lock()
+        .expect("state lock")
+        .active_by_server
+        .get("server")
+        .cloned()
+        .expect("reservation is active during discovery");
+    coordinator
+        .cancel("server", &login_id)
+        .await
+        .expect("pre-flow cancellation is acknowledged");
+    assert_eq!(
+        begin.await.expect("begin task"),
+        Err(McpOAuthLoginError::Cancelled)
+    );
+    assert_finalized(&coordinator, "server", CredentialExpectation::Absent);
+    assert_eq!(
+        repository
+            .get("server", &format!("{}/mcp?tenant=one", server.origin))
+            .await
+            .expect("store is available"),
+        None
+    );
+
+    drop(callback_port_guard);
+    let second_server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let second_config = oauth_config(&second_server.origin, OAuthConfig::default());
+    let second = coordinator
+        .begin(
+            "server",
+            &second_config,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("cancellation permits immediate restart");
+    coordinator
+        .cancel("server", &second.login_id)
+        .await
+        .expect("second login cancels");
+}
+
+#[tokio::test]
+async fn blank_configured_client_id_uses_dcr_and_persists_normalized_identity() {
+    let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let repository = OAuthCredentialRepository::memory();
+    let coordinator = OAuthCoordinator::with_runtime(OAuthRuntimeManager::new(repository.clone()));
+    let config = oauth_config(
+        &server.origin,
+        OAuthConfig {
+            client_id: Some(" \t "),
+            ..OAuthConfig::default()
+        },
+    );
+    let start = coordinator
+        .begin("server", &config, Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("blank client id starts DCR login");
+    complete(&coordinator, &start)
+        .await
+        .expect("DCR login completes");
+
+    let stored = repository
+        .get("server", &format!("{}/mcp?tenant=one", server.origin))
+        .await
+        .expect("store is available")
+        .expect("DCR credential persists");
+    assert_eq!(
+        (stored.configured_client_id, stored.client_id),
+        (None, "dynamic-client".to_string())
+    );
+    assert!(server
+        .requests()
+        .iter()
+        .any(|request| request.target == "/register"));
+}
+
 #[tokio::test]
 async fn static_client_skips_dcr_and_uses_discovered_scopes() {
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
-    let coordinator = OAuthCoordinator::new();
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let repository = OAuthCredentialRepository::memory();
+    let coordinator = OAuthCoordinator::with_runtime(OAuthRuntimeManager::new(repository.clone()));
     let config = oauth_config(
         &server.origin,
         OAuthConfig {
@@ -127,6 +228,25 @@ async fn static_client_skips_dcr_and_uses_discovered_scopes() {
         .await
         .expect("login completes");
     assert_finalized(&coordinator, "server", CredentialExpectation::Present);
+    let stored = repository
+        .get("server", &format!("{}/mcp?tenant=one", server.origin))
+        .await
+        .expect("store is available")
+        .expect("static-client credential persists");
+    assert_eq!(
+        (
+            stored.client_id,
+            stored.access_token,
+            stored.refresh_token,
+            stored.granted_scopes,
+        ),
+        (
+            "static-client".to_string(),
+            "access-token".to_string(),
+            Some("refresh-token".to_string()),
+            vec!["read".to_string(), "search".to_string()],
+        )
+    );
     assert!(!server
         .requests()
         .iter()
@@ -140,6 +260,7 @@ async fn token_redirect_is_not_followed() {
         ..OAuthServerOptions::default()
     })
     .await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
     let start = coordinator
         .begin(
@@ -168,6 +289,7 @@ async fn token_redirect_is_not_followed() {
 #[tokio::test]
 async fn wrong_state_is_rejected_by_rmcp() {
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
     let start = coordinator
         .begin(
@@ -200,22 +322,21 @@ async fn wrong_state_is_rejected_by_rmcp() {
 
 #[tokio::test]
 async fn callback_timeout_cleans_up_flow_and_port() {
-    let _fixed_port = FIXED_PORT_TEST_LOCK.lock().await;
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
-    let port = reserve_port().await;
     let config = oauth_config(
         &server.origin,
         OAuthConfig {
-            callback_port: Some(port),
             callback_timeout_ms: 20,
             ..OAuthConfig::default()
         },
     );
-    coordinator
+    let start = coordinator
         .begin("server", &config, Instant::now() + Duration::from_secs(5))
         .await
         .expect("login starts");
+    let port = callback_port(&start.authorization_url);
     wait_for_finalized(&coordinator).await;
     assert_finalized(&coordinator, "server", CredentialExpectation::Absent);
     TcpListener::bind(("127.0.0.1", port))
@@ -231,6 +352,7 @@ async fn dropped_begin_and_completion_waiters_do_not_cancel_owner() {
         ..OAuthServerOptions::default()
     })
     .await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
     let begin = {
         let coordinator = coordinator.clone();
@@ -292,6 +414,7 @@ async fn listener_and_manual_callbacks_converge_on_one_exchange() {
         ..OAuthServerOptions::default()
     })
     .await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
     let start = coordinator
         .begin(
@@ -325,8 +448,8 @@ async fn listener_and_manual_callbacks_converge_on_one_exchange() {
 
 #[tokio::test]
 async fn listener_success_waits_for_cleanup_and_allows_immediate_port_reuse() {
-    let _fixed_port = FIXED_PORT_TEST_LOCK.lock().await;
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
     let finalization_reached = Arc::new(Barrier::new(2));
     let release_finalization = Arc::new(Barrier::new(2));
@@ -335,19 +458,13 @@ async fn listener_success_waits_for_cleanup_and_allows_immediate_port_reuse() {
         .lock()
         .expect("barrier lock") =
         Some((finalization_reached.clone(), release_finalization.clone()));
-    let port = reserve_port().await;
-    let config = oauth_config(
-        &server.origin,
-        OAuthConfig {
-            callback_port: Some(port),
-            ..OAuthConfig::default()
-        },
-    );
+    let config = oauth_config(&server.origin, OAuthConfig::default());
     let first = coordinator
         .begin("server", &config, Instant::now() + Duration::from_secs(5))
         .await
         .expect("first login starts");
     let (redirect_uri, state) = login_values(&first.authorization_url);
+    let port = callback_port(&first.authorization_url);
     let callback = tokio::spawn(send_callback(format!(
         "{redirect_uri}?code=authorization-code&state={state}"
     )));
@@ -376,43 +493,44 @@ async fn listener_success_waits_for_cleanup_and_allows_immediate_port_reuse() {
 
 #[tokio::test]
 async fn cancel_acknowledgement_allows_immediate_restart_and_port_reuse() {
-    let _fixed_port = FIXED_PORT_TEST_LOCK.lock().await;
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
-    let port = reserve_port().await;
-    let config = oauth_config(
-        &server.origin,
-        OAuthConfig {
-            callback_port: Some(port),
-            ..OAuthConfig::default()
-        },
-    );
+    let config = oauth_config(&server.origin, OAuthConfig::default());
     let first = coordinator
         .begin("server", &config, Instant::now() + Duration::from_secs(5))
         .await
         .expect("first login starts");
+    let first_port = callback_port(&first.authorization_url);
     coordinator
         .cancel("server", &first.login_id)
         .await
         .expect("cancel is acknowledged");
     assert_finalized(&coordinator, "server", CredentialExpectation::Absent);
+    drop(
+        TcpListener::bind(("127.0.0.1", first_port))
+            .await
+            .expect("cancel acknowledgement releases first callback port"),
+    );
 
     let second = coordinator
         .begin("server", &config, Instant::now() + Duration::from_secs(5))
         .await
         .expect("cancel acknowledgement permits immediate restart");
+    let second_port = callback_port(&second.authorization_url);
     coordinator
         .cancel("server", &second.login_id)
         .await
         .expect("second cancel is acknowledged");
-    TcpListener::bind(("127.0.0.1", port))
+    TcpListener::bind(("127.0.0.1", second_port))
         .await
-        .expect("cancel acknowledgement releases callback port");
+        .expect("second cancel acknowledgement releases callback port");
 }
 
 #[tokio::test]
 async fn cancel_distinguishes_completed_login_from_wrong_or_replaced_login() {
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
     let config = oauth_config(&server.origin, OAuthConfig::default());
     let completed = coordinator
@@ -449,6 +567,7 @@ async fn cancel_distinguishes_completed_login_from_wrong_or_replaced_login() {
 #[tokio::test]
 async fn cancel_with_arbitrary_login_id_after_completion_is_not_found() {
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
     let config = oauth_config(&server.origin, OAuthConfig::default());
     let completed = coordinator
@@ -468,6 +587,7 @@ async fn cancel_with_arbitrary_login_id_after_completion_is_not_found() {
 #[tokio::test]
 async fn cancelled_replacement_is_not_completed_by_older_credential() {
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
     let config = oauth_config(&server.origin, OAuthConfig::default());
     let completed = coordinator
@@ -500,6 +620,7 @@ async fn cancelled_replacement_is_not_completed_by_older_credential() {
 #[tokio::test]
 async fn cancel_after_token_exchange_is_linearized_with_credential_commit() {
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
     let finalization_reached = Arc::new(Barrier::new(2));
     let release_finalization = Arc::new(Barrier::new(2));
@@ -581,28 +702,22 @@ async fn cancel_after_token_exchange_is_linearized_with_credential_commit() {
 
 #[tokio::test]
 async fn cancel_interrupts_token_exchange_and_finalizes_waiters() {
-    let _fixed_port = FIXED_PORT_TEST_LOCK.lock().await;
     let server = OAuthServer::spawn(OAuthServerOptions {
         token_delay: Duration::from_secs(1),
         ..OAuthServerOptions::default()
     })
     .await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
-    let port = reserve_port().await;
     let start = coordinator
         .begin(
             "server",
-            &oauth_config(
-                &server.origin,
-                OAuthConfig {
-                    callback_port: Some(port),
-                    ..OAuthConfig::default()
-                },
-            ),
+            &oauth_config(&server.origin, OAuthConfig::default()),
             Instant::now() + Duration::from_secs(5),
         )
         .await
         .expect("login starts");
+    let port = callback_port(&start.authorization_url);
     let (redirect_uri, state) = login_values(&start.authorization_url);
     let completion = {
         let coordinator = coordinator.clone();
@@ -636,21 +751,15 @@ async fn cancel_interrupts_token_exchange_and_finalizes_waiters() {
 
 #[tokio::test]
 async fn provider_errors_are_generic_and_shutdown_awaits_cleanup() {
-    let _fixed_port = FIXED_PORT_TEST_LOCK.lock().await;
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
     let coordinator = OAuthCoordinator::new();
-    let port = reserve_port().await;
-    let config = oauth_config(
-        &server.origin,
-        OAuthConfig {
-            callback_port: Some(port),
-            ..OAuthConfig::default()
-        },
-    );
+    let config = oauth_config(&server.origin, OAuthConfig::default());
     let start = coordinator
         .begin("server", &config, Instant::now() + Duration::from_secs(5))
         .await
         .expect("login starts");
+    let first_port = callback_port(&start.authorization_url);
     let (redirect_uri, state) = login_values(&start.authorization_url);
     let reflected = "client-secret-state-code-access-refresh-registration";
     let error = coordinator
@@ -664,11 +773,17 @@ async fn provider_errors_are_generic_and_shutdown_awaits_cleanup() {
     assert!(!format!("{error:?}").contains(reflected));
     assert!(!error.to_string().contains(reflected));
     assert_finalized(&coordinator, "server", CredentialExpectation::Absent);
+    drop(
+        TcpListener::bind(("127.0.0.1", first_port))
+            .await
+            .expect("provider error releases callback port"),
+    );
 
     let active = coordinator
         .begin("server", &config, Instant::now() + Duration::from_secs(5))
         .await
         .expect("another login starts");
+    let active_port = callback_port(&active.authorization_url);
     coordinator.shutdown().await;
     assert_finalized(&coordinator, "server", CredentialExpectation::Absent);
     assert_eq!(
@@ -681,7 +796,7 @@ async fn provider_errors_are_generic_and_shutdown_awaits_cleanup() {
             .await,
         Err(McpOAuthLoginError::Unavailable)
     );
-    TcpListener::bind(("127.0.0.1", port))
+    TcpListener::bind(("127.0.0.1", active_port))
         .await
         .expect("shutdown releases callback port");
 }
@@ -754,7 +869,7 @@ fn query_values(url: &str) -> BTreeMap<String, Vec<String>> {
     values
 }
 
-async fn send_callback(url: String) -> Vec<u8> {
+pub(crate) async fn send_callback(url: String) -> Vec<u8> {
     let url = reqwest::Url::parse(&url).expect("callback URL");
     let port = url.port().expect("callback port");
     let mut stream = TcpStream::connect(("127.0.0.1", port))
@@ -773,14 +888,36 @@ async fn send_callback(url: String) -> Vec<u8> {
     response
 }
 
-async fn reserve_port() -> u16 {
-    loop {
-        let port = NEXT_FIXED_PORT.fetch_add(1, Ordering::Relaxed);
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)).await {
-            drop(listener);
-            return port;
+async fn begin_with_fixed_callback_port(
+    origin: &str,
+    oauth: OAuthConfig<'_>,
+) -> (
+    Arc<OAuthCoordinator>,
+    McpStreamableHttpTransportConfig,
+    McpOAuthLoginStart,
+) {
+    for port in 20_000..20_128 {
+        let coordinator = OAuthCoordinator::new();
+        let config = oauth_config(
+            origin,
+            OAuthConfig {
+                callback_port: Some(port),
+                ..oauth
+            },
+        );
+        match coordinator
+            .begin("server", &config, Instant::now() + Duration::from_secs(5))
+            .await
+        {
+            Ok(start) => {
+                assert_eq!(callback_port(&start.authorization_url), port);
+                return (coordinator, config, start);
+            }
+            Err(McpOAuthLoginError::CallbackBind) => coordinator.shutdown().await,
+            Err(error) => panic!("fixed-port login failed: {error:?}"),
         }
     }
+    panic!("no fixed callback port candidate was available");
 }
 
 async fn wait_for_flow(coordinator: &OAuthCoordinator) -> String {
@@ -842,32 +979,41 @@ fn assert_finalized(
 }
 
 #[derive(Clone)]
-struct Request {
-    target: String,
-    body: Vec<u8>,
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) body: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Default)]
-struct OAuthServerOptions {
-    metadata_delay: Duration,
-    token_delay: Duration,
-    token_redirect: bool,
+pub(crate) struct OAuthServerOptions {
+    pub(crate) metadata_delay: Duration,
+    pub(crate) token_delay: Duration,
+    pub(crate) refresh_delay: Duration,
+    pub(crate) token_redirect: bool,
+    pub(crate) mcp_unauthorized_once: bool,
+    pub(crate) refresh_failures: u64,
+    pub(crate) refresh_invalid_grant: bool,
 }
 
-struct OAuthServer {
-    origin: String,
+pub(crate) struct OAuthServer {
+    pub(crate) origin: String,
     requests: Arc<StdMutex<Vec<Request>>>,
     task: JoinHandle<()>,
 }
 
 impl OAuthServer {
-    async fn spawn(options: OAuthServerOptions) -> Self {
+    pub(crate) async fn spawn(options: OAuthServerOptions) -> Self {
+        let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind server");
         let address = listener.local_addr().expect("address");
         let origin = format!("http://{address}");
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let task_requests = requests.clone();
         let task_origin = origin.clone();
+        let reject_mcp = Arc::new(AtomicBool::new(options.mcp_unauthorized_once));
+        let refresh_failures = Arc::new(AtomicU64::new(options.refresh_failures));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -875,12 +1021,38 @@ impl OAuthServer {
                 };
                 let requests = task_requests.clone();
                 let origin = task_origin.clone();
+                let reject_mcp = reject_mcp.clone();
+                let refresh_failures = refresh_failures.clone();
                 tokio::spawn(async move {
                     let Some(request) = read_request(&mut stream).await else {
                         return;
                     };
                     requests.lock().expect("request lock").push(request.clone());
-                    let (status, headers, body) = match request.target.as_str() {
+                    let authenticated_mcp = request.target == "/mcp?tenant=one"
+                        && request
+                            .headers
+                            .get("authorization")
+                            .map(String::as_str)
+                            .is_some_and(|authorization| {
+                                matches!(
+                                    authorization,
+                                    "Bearer access-token" | "Bearer rotated-access-token"
+                                )
+                            });
+                    let reject_request = authenticated_mcp
+                        && request.method == "POST"
+                        && serde_json::from_slice::<serde_json::Value>(&request.body)
+                            .ok()
+                            .and_then(|payload| payload["method"].as_str().map(ToString::to_string))
+                            .as_deref()
+                            == Some("tools/call")
+                        && reject_mcp.swap(false, Ordering::AcqRel);
+                    let (status, headers, body) = if reject_request {
+                        (401, String::new(), String::new())
+                    } else if authenticated_mcp {
+                        mcp_response(&request)
+                    } else {
+                        match request.target.as_str() {
                         "/mcp?tenant=one" => (
                             302,
                             "Location: /mcp-final?tenant=one\r\n".to_string(),
@@ -954,21 +1126,64 @@ impl OAuthServer {
                             String::new(),
                         ),
                         "/token" => {
-                            tokio::time::sleep(options.token_delay).await;
-                            (
-                                200,
-                                String::new(),
-                                serde_json::json!({
-                                    "access_token": "access-token",
-                                    "refresh_token": "refresh-token",
-                                    "token_type": "Bearer",
-                                    "expires_in": 3600,
-                                    "scope": "read search",
-                                })
-                                .to_string(),
-                            )
+                            let refresh = String::from_utf8_lossy(&request.body)
+                                .contains("grant_type=refresh_token");
+                            tokio::time::sleep(if refresh {
+                                options.refresh_delay
+                            } else {
+                                options.token_delay
+                            })
+                            .await;
+                            if refresh {
+                                if options.refresh_invalid_grant {
+                                    (
+                                        400,
+                                        String::new(),
+                                        serde_json::json!({"error": "invalid_grant"}).to_string(),
+                                    )
+                                } else if refresh_failures
+                                    .fetch_update(
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                        |remaining| remaining.checked_sub(1),
+                                    )
+                                    .is_ok()
+                                {
+                                    (
+                                        503,
+                                        String::new(),
+                                        serde_json::json!({"error": "temporarily_unavailable"})
+                                            .to_string(),
+                                    )
+                                } else {
+                                    (
+                                        200,
+                                        String::new(),
+                                        serde_json::json!({
+                                            "access_token": "rotated-access-token",
+                                            "token_type": "Bearer",
+                                            "expires_in": 3600,
+                                        })
+                                        .to_string(),
+                                    )
+                                }
+                            } else {
+                                (
+                                    200,
+                                    String::new(),
+                                    serde_json::json!({
+                                        "access_token": "access-token",
+                                        "refresh_token": "refresh-token",
+                                        "token_type": "Bearer",
+                                        "expires_in": 3600,
+                                        "scope": "read search",
+                                    })
+                                    .to_string(),
+                                )
+                            }
                         }
                         target => panic!("unexpected OAuth request {target}"),
+                    }
                     };
                     let reply = format!(
                         "HTTP/1.1 {status} Status\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -988,11 +1203,11 @@ impl OAuthServer {
         }
     }
 
-    fn requests(&self) -> Vec<Request> {
+    pub(crate) fn requests(&self) -> Vec<Request> {
         self.requests.lock().expect("request lock").clone()
     }
 
-    async fn wait_for_target(&self, target: &str) {
+    pub(crate) async fn wait_for_target(&self, target: &str) {
         self.wait_for_target_count(target, 1).await;
     }
 
@@ -1066,15 +1281,75 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         if bytes.len() < head_end + content_length {
             continue;
         }
-        let target = head
+        let mut request_line = head.lines().next()?.split_ascii_whitespace();
+        let method = request_line.next()?.to_string();
+        let target = request_line.next()?.to_string();
+        let headers = head
             .lines()
-            .next()?
-            .split_ascii_whitespace()
-            .nth(1)?
-            .to_string();
+            .skip(1)
+            .filter_map(|line| {
+                line.split_once(':')
+                    .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            })
+            .collect();
         return Some(Request {
+            method,
             target,
+            headers,
             body: bytes[head_end..head_end + content_length].to_vec(),
         });
     }
+}
+
+fn mcp_response(request: &Request) -> (u16, String, String) {
+    if request.method == "DELETE" {
+        return (200, String::new(), String::new());
+    }
+    if request.method == "GET" {
+        return (405, String::new(), String::new());
+    }
+    let payload: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("MCP request JSON");
+    if payload["method"] == "notifications/initialized" {
+        return (202, String::new(), String::new());
+    }
+    let result = match payload["method"].as_str() {
+        Some("initialize") => serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "oauth-fixture", "version": "1"},
+        }),
+        Some("tools/list") => serde_json::json!({
+            "tools": [{
+                "name": "echo",
+                "description": "Echo a value",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}}
+                }
+            }]
+        }),
+        Some("tools/call") => serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": payload["params"]["arguments"]["value"]
+            }]
+        }),
+        method => panic!("unexpected MCP method {method:?}"),
+    };
+    let headers = if payload["method"] == "initialize" {
+        "Mcp-Session-Id: oauth-session\r\n".to_string()
+    } else {
+        String::new()
+    };
+    (
+        200,
+        headers,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": payload["id"],
+            "result": result,
+        })
+        .to_string(),
+    )
 }

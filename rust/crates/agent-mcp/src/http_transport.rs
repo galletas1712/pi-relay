@@ -81,6 +81,26 @@ pub(crate) fn build_with_bearer_resolver(
     resolve: &dyn Fn(&str) -> Option<String>,
 ) -> Result<HttpConnection> {
     let scrubber = resolve_scrubber_with(config, resolve)?;
+    build_with_scrubber(config, notifications, liveness, scrubber, None)
+}
+
+pub(crate) fn build_with_oauth(
+    config: &McpStreamableHttpTransportConfig,
+    notifications: Arc<ClientNotifications>,
+    liveness: Arc<ClientLiveness>,
+    token: crate::oauth_runtime::OAuthAccessToken,
+) -> Result<HttpConnection> {
+    let scrubber = Some(SecretScrubber::new(token.secret().to_string()));
+    build_with_scrubber(config, notifications, liveness, scrubber, Some(token))
+}
+
+fn build_with_scrubber(
+    config: &McpStreamableHttpTransportConfig,
+    notifications: Arc<ClientNotifications>,
+    liveness: Arc<ClientLiveness>,
+    scrubber: Option<SecretScrubber>,
+    oauth_token: Option<crate::oauth_runtime::OAuthAccessToken>,
+) -> Result<HttpConnection> {
     let client = build_reqwest_client(reqwest::Client::builder())?;
     let requests = Arc::new(RequestRegistry::default());
     let stream_attempts = Arc::new(Mutex::new(CommonStreams::default()));
@@ -96,12 +116,15 @@ pub(crate) fn build_with_bearer_resolver(
         requests,
         stream_attempts,
         notifications,
-        liveness,
+        liveness: liveness.clone(),
+        oauth_token,
     };
     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(config.url.clone());
     // A possibly delivered tools/call is never replayed after a stale session.
     transport_config.reinit_on_expired_session = false;
-    transport_config.retry_config = Arc::new(BoundedRetryPolicy);
+    transport_config.retry_config = Arc::new(BoundedRetryPolicy {
+        liveness: liveness.clone(),
+    });
     Ok(HttpConnection {
         transport: StreamableHttpClientTransport::with_client(client, transport_config),
         control,
@@ -256,12 +279,20 @@ struct RequestRegistryInner {
     requests: HashMap<RequestId, (u64, CancellationToken)>,
 }
 
-#[derive(Debug)]
-struct BoundedRetryPolicy;
+struct BoundedRetryPolicy {
+    liveness: Arc<ClientLiveness>,
+}
+
+impl std::fmt::Debug for BoundedRetryPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BoundedRetryPolicy")
+    }
+}
 
 impl SseRetryPolicy for BoundedRetryPolicy {
     fn retry(&self, current_times: usize) -> Option<Duration> {
-        (current_times < SSE_RECONNECT_LIMIT).then_some(SSE_RECONNECT_DELAY)
+        (!self.liveness.is_closed() && current_times < SSE_RECONNECT_LIMIT)
+            .then_some(SSE_RECONNECT_DELAY)
     }
 }
 
@@ -343,6 +374,7 @@ pub(crate) struct BoundedHttpClient {
     stream_attempts: Arc<Mutex<CommonStreams>>,
     notifications: Arc<ClientNotifications>,
     liveness: Arc<ClientLiveness>,
+    oauth_token: Option<crate::oauth_runtime::OAuthAccessToken>,
 }
 
 #[derive(Default)]
@@ -447,7 +479,7 @@ impl BoundedHttpClient {
     ) -> Result<reqwest::Response, StreamableHttpError<BoundedHttpError>> {
         let send = timeout(HEADER_TIMEOUT, request.send());
         tokio::pin!(send);
-        if let Some(registration) = registration {
+        let result = if let Some(registration) = registration {
             tokio::select! {
                 result = &mut send => map_send_result(result),
                 () = registration.cancellation.cancelled() => {
@@ -456,7 +488,17 @@ impl BoundedHttpClient {
             }
         } else {
             map_send_result(send.await)
+        };
+        if let Ok(response) = &result {
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                if let Some(token) = &self.oauth_token {
+                    token.mark_rejected();
+                }
+                self.liveness.mark_closed();
+                self.requests.abort_all();
+            }
         }
+        result
     }
 
     fn session_id(&self, response: &reqwest::Response) -> Result<Option<String>> {

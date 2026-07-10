@@ -62,6 +62,15 @@ cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
 to `127.0.0.1:8787`. Optional MCP configuration is selected with
 `--mcp-config PATH` or `PI_AGENTD_MCP_CONFIG`; its typed JSON shape and trust
 model are documented in [`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
+When that configuration contains OAuth routes, the daemon stores their
+credentials in `mcp-oauth-credentials.json` directly beneath its existing
+`$XDG_STATE_HOME/pi-relay` state root (or `~/.local/state/pi-relay` when
+`XDG_STATE_HOME` is unset). This is a plaintext file protected by restrictive
+OS directory/file permissions. A corrupt, empty, oversized, or unreadable file
+is preserved and makes only OAuth credential operations unavailable; unrelated
+stdio/bearer routes and daemon startup continue. The backend intentionally has
+no repair/migration, cross-process locking, keyring, or credential-database
+fallback.
 For example:
 
 ```json
@@ -145,13 +154,21 @@ accepted. Replace them with optional `client_id`, `scopes`, and `resource`.
 The tagged `transport` object is preferred. Earlier flat stdio fields remain
 accepted with the same route fingerprint so existing frozen manifests and
 configuration files remain compatible.
-Bearer environment authentication remains a transport prerequisite. OAuth
-login is exposed only through the internal `McpManager` boundary and retains
-the rmcp OAuth state and token response in memory. The OAuth route remains
-login-required and unavailable for MCP calls. Credential persistence, refresh,
-authenticated transport injection, public OAuth RPCs, and New Session controls
-are not yet implemented. There is no built-in or provider-specific server
-catalog.
+Bearer environment authentication remains supported. OAuth login is exposed
+only through the internal `McpManager` boundary. Successful static-client and
+DCR login is persisted after callback cleanup, restored across daemon restart,
+and refreshed through rmcp with a 30-second skew. Status is observational:
+expired credentials with a refresh token remain OAuth-ready without consuming
+that token; refresh occurs only on route acquisition/reconnect. A transient
+refresh or atomic-save failure preserves the old durable record for a later
+attempt. The current access token is injected only into pi-relay's
+bounded/no-replay Streamable HTTP client, whose
+POST, common GET/SSE, and DELETE behavior and secret scrubbing remain shared
+with `bearer_env`. An MCP 401 closes the route without replaying the current
+operation; a later inventory or call may refresh and reconnect. Internal
+sanitized status and local credential-only logout are implemented. Public
+OAuth RPCs, browser UI, and New Session controls remain Stage 4 work. There is
+no built-in or provider-specific server catalog.
 
 All configured servers appear as New Session inventory sources. Operators use
 `enabled_tools` (or explicit `allow_all_tools: true`) as the hard allowlist;

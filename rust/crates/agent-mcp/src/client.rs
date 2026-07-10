@@ -374,8 +374,9 @@ impl McpClient {
         config: &McpServerConfig,
         startup_deadline: Instant,
         bearer_resolver: Option<&crate::http_transport::BearerResolver>,
+        oauth_token: Option<crate::oauth_runtime::OAuthAccessToken>,
     ) -> McpClientStart {
-        match Self::start_inner(config, startup_deadline, bearer_resolver).await {
+        match Self::start_inner(config, startup_deadline, bearer_resolver, oauth_token).await {
             Ok(started) => started,
             Err(error) => McpClientStart::ConnectionFailed(error),
         }
@@ -385,6 +386,7 @@ impl McpClient {
         config: &McpServerConfig,
         startup_deadline: Instant,
         bearer_resolver: Option<&crate::http_transport::BearerResolver>,
+        oauth_token: Option<crate::oauth_runtime::OAuthAccessToken>,
     ) -> Result<McpClientStart> {
         let liveness = Arc::new(ClientLiveness::default());
         let notifications = Arc::new(ClientNotifications::default());
@@ -402,14 +404,20 @@ impl McpClient {
                 (service, None)
             }
             McpTransportConfig::StreamableHttp(http) => {
-                if http
+                let connection = if let Some(token) = oauth_token {
+                    crate::http_transport::build_with_oauth(
+                        http,
+                        notifications.clone(),
+                        liveness.clone(),
+                        token,
+                    )?
+                } else if http
                     .auth
                     .as_ref()
                     .is_some_and(|auth| auth.oauth().is_some())
                 {
                     return Ok(McpClientStart::OAuthLoginRequired);
-                }
-                let connection = if let Some(resolve) = bearer_resolver {
+                } else if let Some(resolve) = bearer_resolver {
                     crate::http_transport::build_with_bearer_resolver(
                         http,
                         notifications.clone(),

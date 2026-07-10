@@ -27,6 +27,10 @@ impl From<agent_mcp::McpManagerError> for RpcError {
                 "mcp_unavailable",
                 format!("selected MCP server {server} is unavailable"),
             ),
+            agent_mcp::McpManagerError::CredentialStore(_) => Self::new(
+                "mcp_oauth_credential_store_failed",
+                "MCP OAuth credential storage is unavailable".to_string(),
+            ),
             agent_mcp::McpManagerError::Catalog(error) => Self::new(
                 "mcp_selection_invalid",
                 format!("invalid MCP catalog: {error:#}"),

@@ -6,9 +6,11 @@ mod config;
 mod http_transport;
 mod manager;
 mod oauth_callback;
+mod oauth_credentials;
 mod oauth_discovery;
 mod oauth_http;
 mod oauth_login;
+mod oauth_runtime;
 mod result;
 
 pub use catalog::{
@@ -19,7 +21,9 @@ pub use config::{
     McpStreamableHttpTransportConfig, McpTransportConfig,
 };
 pub use manager::{
-    McpCallError, McpCallOutput, McpHealth, McpInventory, McpInventoryServer, McpInventoryTool,
-    McpManager, McpManagerError, McpServerSelection, McpSessionSelection, McpToolView,
+    McpAuthStatus, McpCallError, McpCallOutput, McpHealth, McpInventory, McpInventoryServer,
+    McpInventoryTool, McpLogoutResult, McpManager, McpManagerError, McpServerSelection,
+    McpSessionSelection, McpToolView,
 };
+pub use oauth_credentials::OAuthCredentialStoreError;
 pub use oauth_login::{McpOAuthLoginError, McpOAuthLoginStart};

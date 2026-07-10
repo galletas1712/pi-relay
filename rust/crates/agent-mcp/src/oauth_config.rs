@@ -89,6 +89,14 @@ pub(crate) struct McpOAuthConfigRef<'a> {
     pub(crate) callback_timeout_ms: u64,
 }
 
+impl McpOAuthConfigRef<'_> {
+    pub(crate) fn normalized_client_id(&self) -> Option<&str> {
+        self.client_id
+            .map(str::trim)
+            .filter(|client_id| !client_id.is_empty())
+    }
+}
+
 impl fmt::Debug for McpHttpAuthConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -14,7 +14,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{McpHttpAuthConfig, McpStreamableHttpTransportConfig};
 use crate::oauth_callback::{respond, CallbackListener, CallbackRequest};
+#[cfg(test)]
+use crate::oauth_credentials::OAuthCredentialRepository;
+use crate::oauth_credentials::StoredOAuthCredential;
 use crate::oauth_http::DirectOAuthClient;
+use crate::oauth_runtime::OAuthRuntimeManager;
 
 const CONTROL_CAPACITY: usize = 1;
 const MAX_CALLBACK_URL_BYTES: usize = 16 * 1024;
@@ -79,6 +83,8 @@ pub enum McpOAuthLoginError {
     Provider,
     #[error("oauth_token_endpoint_error")]
     TokenEndpoint,
+    #[error("oauth_credential_store_failed")]
+    Persistence,
     #[error("oauth_network_failed")]
     Network,
     #[error("oauth_login_unavailable")]
@@ -87,12 +93,15 @@ pub enum McpOAuthLoginError {
 
 pub(crate) struct OAuthCoordinator {
     state: StdMutex<CoordinatorState>,
+    runtime: Arc<OAuthRuntimeManager>,
     shutdown: CancellationToken,
     shutdown_lock: Mutex<()>,
     #[cfg(test)]
     finalization_barriers: StdMutex<Option<FinalizationBarriers>>,
     #[cfg(test)]
     acknowledgement_barriers: StdMutex<Option<FinalizationBarriers>>,
+    #[cfg(test)]
+    persistence_barriers: StdMutex<Option<FinalizationBarriers>>,
 }
 
 #[derive(Default)]
@@ -100,7 +109,7 @@ struct CoordinatorState {
     shutting_down: bool,
     active_by_server: BTreeMap<String, String>,
     flows: BTreeMap<String, FlowHandle>,
-    credentials: BTreeMap<String, InMemoryCredential>,
+    credentials: BTreeMap<String, String>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -117,9 +126,10 @@ enum FlowControl {
     },
 }
 
-struct InMemoryCredential {
+struct CompletedCredential {
     login_id: String,
-    _oauth_state: OAuthState,
+    stored: StoredOAuthCredential,
+    oauth_state: OAuthState,
 }
 
 struct FlowSetup {
@@ -132,6 +142,9 @@ struct FlowSetup {
     callback_port: Option<u16>,
     callback_timeout: Duration,
     operation_deadline: Instant,
+    login_generation: u64,
+    control_rx: Option<mpsc::Receiver<FlowControl>>,
+    cancel: CancellationToken,
 }
 
 struct PreparedFlow {
@@ -139,20 +152,21 @@ struct PreparedFlow {
     oauth_state: Option<OAuthState>,
     redirect_uri: String,
     expected_state: String,
+    requested_scopes: Vec<String>,
     deadline: Instant,
     control_rx: mpsc::Receiver<FlowControl>,
     cancel: CancellationToken,
 }
 
 struct FlowOutcome {
-    result: Result<InMemoryCredential, McpOAuthLoginError>,
+    result: Result<CompletedCredential, McpOAuthLoginError>,
     acknowledgement: Option<ResponseSender>,
     browser_stream: Option<tokio::net::TcpStream>,
 }
 
 impl FlowOutcome {
     fn complete(
-        result: Result<InMemoryCredential, McpOAuthLoginError>,
+        result: Result<CompletedCredential, McpOAuthLoginError>,
         acknowledgement: Option<ResponseSender>,
     ) -> Self {
         Self {
@@ -164,16 +178,37 @@ impl FlowOutcome {
 }
 
 impl OAuthCoordinator {
+    #[cfg(test)]
     pub(crate) fn new() -> Arc<Self> {
+        let repository = OAuthCredentialRepository::memory();
+        let runtime = OAuthRuntimeManager::new(repository.clone());
+        Self::with_runtime(runtime)
+    }
+
+    pub(crate) fn with_runtime(runtime: Arc<OAuthRuntimeManager>) -> Arc<Self> {
         Arc::new(Self {
             state: StdMutex::new(CoordinatorState::default()),
+            runtime,
             shutdown: CancellationToken::new(),
             shutdown_lock: Mutex::new(()),
             #[cfg(test)]
             finalization_barriers: StdMutex::new(None),
             #[cfg(test)]
             acknowledgement_barriers: StdMutex::new(None),
+            #[cfg(test)]
+            persistence_barriers: StdMutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_persistence_barriers(
+        &self,
+        barriers: (Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>),
+    ) {
+        *self
+            .persistence_barriers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(barriers);
     }
 
     pub(crate) async fn begin(
@@ -188,7 +223,13 @@ impl OAuthCoordinator {
             .and_then(McpHttpAuthConfig::oauth)
             .ok_or(McpOAuthLoginError::NotConfigured)?;
         let login_id = format!("{:016x}", NEXT_LOGIN_ID.fetch_add(1, Ordering::Relaxed));
+        self.runtime
+            .store_available()
+            .map_err(|_| McpOAuthLoginError::Persistence)?;
+        let login_generation = self.runtime.login_generation(server_id, &config.url).await;
         let (start_tx, start_rx) = oneshot::channel::<StartResult>();
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
+        let cancel = self.shutdown.child_token();
         {
             let mut state = self
                 .state
@@ -204,17 +245,28 @@ impl OAuthCoordinator {
             state
                 .active_by_server
                 .insert(server_id.to_string(), login_id.clone());
+            state.flows.insert(
+                login_id.clone(),
+                FlowHandle {
+                    control: control_tx,
+                    cancel: cancel.clone(),
+                    cancel_response: None,
+                },
+            );
             let task = tokio::spawn(self.clone().run_flow(
                 FlowSetup {
                     server_id: server_id.to_string(),
                     login_id,
                     server_url: config.url.clone(),
-                    client_id: oauth.client_id.map(ToString::to_string),
+                    client_id: oauth.normalized_client_id().map(ToString::to_string),
                     scopes: oauth.scopes.map(<[String]>::to_vec),
                     resource: oauth.resource.map(ToString::to_string),
                     callback_port: oauth.callback_port,
                     callback_timeout: Duration::from_millis(oauth.callback_timeout_ms),
                     operation_deadline,
+                    login_generation,
+                    control_rx: Some(control_rx),
+                    cancel,
                 },
                 start_tx,
             ));
@@ -256,6 +308,19 @@ impl OAuthCoordinator {
             .unwrap_or(Err(McpOAuthLoginError::AlreadyCompleted))
     }
 
+    pub(crate) async fn cancel_active(&self, server_id: &str) {
+        let login_id = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_by_server
+            .get(server_id)
+            .cloned();
+        if let Some(login_id) = login_id {
+            let _ = self.cancel(server_id, &login_id).await;
+        }
+    }
+
     pub(crate) async fn cancel(
         &self,
         server_id: &str,
@@ -273,7 +338,7 @@ impl OAuthCoordinator {
                 None if state
                     .credentials
                     .get(server_id)
-                    .is_some_and(|credential| credential.login_id == login_id) =>
+                    .is_some_and(|completed_login_id| completed_login_id == login_id) =>
                 {
                     return Err(McpOAuthLoginError::AlreadyCompleted);
                 }
@@ -320,11 +385,11 @@ impl OAuthCoordinator {
         state.credentials.clear();
     }
 
-    async fn run_flow(self: Arc<Self>, setup: FlowSetup, start_tx: StartSender) {
+    async fn run_flow(self: Arc<Self>, mut setup: FlowSetup, start_tx: StartSender) {
         let mut start_tx = Some(start_tx);
-        let outcome = match self.prepare_flow(&setup, &mut start_tx).await {
+        let outcome = match self.prepare_flow(&mut setup, &mut start_tx).await {
             Ok(mut flow) => {
-                let outcome = self.run_prepared_flow(&setup.login_id, &mut flow).await;
+                let outcome = self.run_prepared_flow(&setup, &mut flow).await;
                 #[cfg(test)]
                 if outcome.result.is_ok() {
                     let barriers = self
@@ -360,7 +425,7 @@ impl OAuthCoordinator {
             acknowledgement,
             mut browser_stream,
         } = outcome;
-        let (cancel_response, response_result) = {
+        let cancel_response = {
             let mut state = self
                 .state
                 .lock()
@@ -372,13 +437,56 @@ impl OAuthCoordinator {
             if state.active_by_server.get(&setup.server_id) == Some(&setup.login_id) {
                 state.active_by_server.remove(&setup.server_id);
             }
-            let response_result = result.as_ref().map(|_| ()).map_err(Clone::clone);
-            if let Ok(credential) = result {
-                state
-                    .credentials
-                    .insert(setup.server_id.clone(), credential);
+            flow.and_then(|flow| flow.cancel_response)
+        };
+        #[cfg(test)]
+        if result.is_ok() {
+            let barriers = self
+                .persistence_barriers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some((reached, release)) = barriers {
+                reached.wait().await;
+                release.wait().await;
             }
-            (flow.and_then(|flow| flow.cancel_response), response_result)
+        }
+        let completed_login_id = match result {
+            Ok(credential) => {
+                let stored = credential.stored.clone();
+                match self
+                    .runtime
+                    .install_durable(stored, credential.oauth_state, setup.login_generation)
+                    .await
+                {
+                    Ok(()) => Ok(credential.login_id),
+                    Err(crate::oauth_runtime::OAuthRouteFailure::Store) => {
+                        Err(McpOAuthLoginError::Persistence)
+                    }
+                    Err(
+                        crate::oauth_runtime::OAuthRouteFailure::LoginRequired
+                        | crate::oauth_runtime::OAuthRouteFailure::ReauthenticationRequired
+                        | crate::oauth_runtime::OAuthRouteFailure::Unsupported
+                        | crate::oauth_runtime::OAuthRouteFailure::Unknown,
+                    ) => Err(McpOAuthLoginError::Unavailable),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        if let Ok(login_id) = &completed_login_id {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .credentials
+                .insert(setup.server_id.clone(), login_id.clone());
+        }
+        let response_result = completed_login_id.map(|_| ());
+        {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            debug_assert!(!state.flows.contains_key(&setup.login_id));
         };
         #[cfg(test)]
         if response_result.is_ok() {
@@ -405,7 +513,7 @@ impl OAuthCoordinator {
 
     async fn prepare_flow(
         &self,
-        setup: &FlowSetup,
+        setup: &mut FlowSetup,
         start_tx: &mut Option<StartSender>,
     ) -> Result<PreparedFlow, McpOAuthLoginError> {
         let callback_path = format!("/oauth/callback/{}", setup.login_id);
@@ -416,7 +524,7 @@ impl OAuthCoordinator {
         let http_client: Arc<dyn OAuthHttpClient> =
             Arc::new(DirectOAuthClient::build().map_err(|_| McpOAuthLoginError::Network)?);
         let oauth_state = tokio::select! {
-            () = self.shutdown.cancelled() => {
+            () = setup.cancel.cancelled() => {
                 return Err(McpOAuthLoginError::Cancelled);
             }
             result = tokio::time::timeout_at(
@@ -449,14 +557,25 @@ impl OAuthCoordinator {
                     .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
             })
             .ok_or(McpOAuthLoginError::Unavailable)?;
+        let requested_scopes = reqwest::Url::parse(&authorization_url)
+            .ok()
+            .and_then(|url| {
+                url.query_pairs()
+                    .find_map(|(name, value)| (name == "scope").then(|| value.into_owned()))
+            })
+            .map(|scopes| {
+                scopes
+                    .split_ascii_whitespace()
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         let deadline = Instant::now() + setup.callback_timeout;
         let expires_at_unix_seconds = unix_seconds()
             .checked_add(setup.callback_timeout.as_secs().max(1))
             .ok_or(McpOAuthLoginError::Unavailable)?;
-        let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
-        let cancel = self.shutdown.child_token();
         {
-            let mut state = self
+            let state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -465,14 +584,6 @@ impl OAuthCoordinator {
             {
                 return Err(McpOAuthLoginError::Cancelled);
             }
-            state.flows.insert(
-                setup.login_id.clone(),
-                FlowHandle {
-                    control: control_tx,
-                    cancel: cancel.clone(),
-                    cancel_response: None,
-                },
-            );
         }
         if let Some(start_tx) = start_tx.take() {
             let _ = start_tx.send(Ok(McpOAuthLoginStart {
@@ -487,13 +598,17 @@ impl OAuthCoordinator {
             oauth_state: Some(oauth_state),
             redirect_uri,
             expected_state,
+            requested_scopes,
             deadline,
-            control_rx,
-            cancel,
+            control_rx: setup
+                .control_rx
+                .take()
+                .expect("flow control receiver is prepared once"),
+            cancel: setup.cancel.clone(),
         })
     }
 
-    async fn run_prepared_flow(&self, login_id: &str, flow: &mut PreparedFlow) -> FlowOutcome {
+    async fn run_prepared_flow(&self, setup: &FlowSetup, flow: &mut PreparedFlow) -> FlowOutcome {
         loop {
             enum Source {
                 Control(FlowControl),
@@ -610,10 +725,23 @@ impl OAuthCoordinator {
                 .get_credentials()
                 .await
                 .map_err(map_auth_error)
-                .and_then(|(_, credentials)| credentials.ok_or(McpOAuthLoginError::TokenEndpoint));
-            let result = credentials.map(|_| InMemoryCredential {
-                login_id: login_id.to_string(),
-                _oauth_state: oauth_state,
+                .and_then(|(client_id, credentials)| {
+                    credentials
+                        .map(|credentials| (client_id, credentials))
+                        .ok_or(McpOAuthLoginError::TokenEndpoint)
+                });
+            let result = credentials.map(|(client_id, credentials)| CompletedCredential {
+                login_id: setup.login_id.clone(),
+                stored: StoredOAuthCredential::from_token_response(
+                    setup.server_id.clone(),
+                    setup.server_url.clone(),
+                    setup.client_id.clone(),
+                    setup.resource.clone(),
+                    client_id,
+                    &credentials,
+                    &flow.requested_scopes,
+                ),
+                oauth_state,
             });
             if result.is_err() {
                 if let Some(stream) = stream.as_mut() {
@@ -731,4 +859,4 @@ fn unix_seconds() -> u64 {
 
 #[cfg(test)]
 #[path = "oauth_login_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -404,6 +404,10 @@ impl McpServerConfig {
                     ..
                 }) = &config.auth
                 {
+                    let client_id = client_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|client_id| !client_id.is_empty());
                     serde_json::json!({
                         "type": "streamable_http",
                         "url": config

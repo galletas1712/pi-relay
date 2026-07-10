@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,6 +74,24 @@ pub enum McpHealth {
     Revoked,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuthStatus {
+    NonOauth,
+    Unsupported,
+    Unknown,
+    Bearer,
+    LoginRequired,
+    ReauthenticationRequired,
+    OauthReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpLogoutResult {
+    Removed,
+    NotFound,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct McpInventoryTool {
     pub raw_name: String,
@@ -131,6 +150,8 @@ pub enum McpManagerError {
     SelectionInvalid { message: String },
     #[error("mcp_unavailable: selected MCP server {server} is unavailable")]
     Unavailable { server: String },
+    #[error("mcp_oauth_credential_store_failed")]
+    CredentialStore(#[from] crate::OAuthCredentialStoreError),
     #[error("invalid MCP catalog: {0}")]
     Catalog(#[from] anyhow::Error),
 }
@@ -197,6 +218,37 @@ impl RetryDisposition {
     }
 }
 
+async fn oauth_access_token(
+    runtime: &crate::oauth_runtime::OAuthRuntimeManager,
+    server_id: &str,
+    config: &McpServerConfig,
+) -> Result<Option<crate::oauth_runtime::OAuthAccessToken>, RetryDisposition> {
+    let crate::config::McpTransportConfig::StreamableHttp(http) = &config.transport else {
+        return Ok(None);
+    };
+    if http
+        .auth
+        .as_ref()
+        .and_then(crate::McpHttpAuthConfig::oauth)
+        .is_none()
+    {
+        return Ok(None);
+    }
+    runtime
+        .access_token(server_id, http)
+        .await
+        .map(Some)
+        .map_err(|failure| match failure {
+            crate::oauth_runtime::OAuthRouteFailure::LoginRequired
+            | crate::oauth_runtime::OAuthRouteFailure::ReauthenticationRequired
+            | crate::oauth_runtime::OAuthRouteFailure::Unsupported
+            | crate::oauth_runtime::OAuthRouteFailure::Store => {
+                RetryDisposition::UserActionRequired
+            }
+            crate::oauth_runtime::OAuthRouteFailure::Unknown => RetryDisposition::Automatic,
+        })
+}
+
 impl ServerState {
     fn is_healthy(&self) -> bool {
         self.health == McpHealth::Healthy
@@ -224,29 +276,51 @@ pub struct McpManager {
     servers: RwLock<BTreeMap<String, ServerState>>,
     bearer_resolver: Option<crate::http_transport::BearerResolver>,
     oauth: Arc<crate::oauth_login::OAuthCoordinator>,
+    oauth_runtime: Arc<crate::oauth_runtime::OAuthRuntimeManager>,
     shutting_down: AtomicBool,
     shutdown_notify: Notify,
 }
 
 impl McpManager {
     pub async fn start(config: McpConfig) -> Result<Arc<Self>, McpManagerError> {
-        Self::start_with_bearer_resolver(config, None).await
+        let repository = crate::oauth_credentials::OAuthCredentialRepository::memory();
+        Self::start_with_repository(config, None, repository).await
     }
 
-    async fn start_with_bearer_resolver(
+    pub async fn start_with_credential_file(
+        config: McpConfig,
+        path: PathBuf,
+    ) -> Result<Arc<Self>, McpManagerError> {
+        let repository = crate::oauth_credentials::OAuthCredentialRepository::open_file(path)
+            .unwrap_or_else(crate::oauth_credentials::OAuthCredentialRepository::unavailable);
+        Self::start_with_repository(config, None, repository).await
+    }
+
+    async fn start_with_repository(
         config: McpConfig,
         bearer_resolver: Option<crate::http_transport::BearerResolver>,
+        repository: Arc<crate::oauth_credentials::OAuthCredentialRepository>,
     ) -> Result<Arc<Self>, McpManagerError> {
         config.validate()?;
+        let oauth_runtime = crate::oauth_runtime::OAuthRuntimeManager::new(repository.clone());
         let startup_parallelism = config.servers.len().max(1);
         let starts = futures_util::stream::iter(config.servers.clone())
             .map(|(server_id, server_config)| {
                 let start_resolver = bearer_resolver.clone();
+                let start_oauth = oauth_runtime.clone();
                 async move {
                     let deadline = tokio::time::Instant::now() + server_config.startup_timeout();
-                    let state =
-                        match McpClient::start(&server_config, deadline, start_resolver.as_ref())
-                            .await
+                    let oauth_token =
+                        oauth_access_token(&start_oauth, &server_id, &server_config).await;
+                    let state = match oauth_token {
+                        Err(disposition) => unavailable_server(server_config, disposition),
+                        Ok(oauth_token) => match McpClient::start(
+                            &server_config,
+                            deadline,
+                            start_resolver.as_ref(),
+                            oauth_token,
+                        )
+                        .await
                         {
                             McpClientStart::Connected(client, tools) => {
                                 match discovered_tools(&server_id, &server_config, tools) {
@@ -288,7 +362,8 @@ impl McpManager {
                                 );
                                 unavailable_server(server_config, RetryDisposition::Automatic)
                             }
-                        };
+                        },
+                    };
                     (server_id, state)
                 }
             })
@@ -298,17 +373,21 @@ impl McpManager {
         Ok(Arc::new(Self {
             servers: RwLock::new(starts.into_iter().collect()),
             bearer_resolver,
-            oauth: crate::oauth_login::OAuthCoordinator::new(),
+            oauth: crate::oauth_login::OAuthCoordinator::with_runtime(oauth_runtime.clone()),
+            oauth_runtime,
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         }))
     }
 
     pub fn disabled() -> Arc<Self> {
+        let repository = crate::oauth_credentials::OAuthCredentialRepository::memory();
+        let oauth_runtime = crate::oauth_runtime::OAuthRuntimeManager::new(repository.clone());
         Arc::new(Self {
             servers: RwLock::new(BTreeMap::new()),
             bearer_resolver: None,
-            oauth: crate::oauth_login::OAuthCoordinator::new(),
+            oauth: crate::oauth_login::OAuthCoordinator::with_runtime(oauth_runtime.clone()),
+            oauth_runtime,
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         })
@@ -653,6 +732,106 @@ impl McpManager {
         self.oauth.cancel(server_id, login_id).await
     }
 
+    pub async fn oauth_status(&self, server_id: &str) -> McpAuthStatus {
+        let (config, healthy) = {
+            let servers = self.servers.read().await;
+            let Some(server) = servers.get(server_id) else {
+                return McpAuthStatus::NonOauth;
+            };
+            let crate::config::McpTransportConfig::StreamableHttp(config) =
+                &server.config.transport
+            else {
+                return McpAuthStatus::NonOauth;
+            };
+            (config.clone(), server.is_healthy())
+        };
+        match config.auth.as_ref() {
+            Some(crate::McpHttpAuthConfig::BearerEnv { .. }) => McpAuthStatus::Bearer,
+            Some(crate::McpHttpAuthConfig::Oauth { .. }) if healthy => McpAuthStatus::OauthReady,
+            Some(crate::McpHttpAuthConfig::Oauth { .. }) => {
+                match self.oauth_runtime.stored_status(server_id, &config).await {
+                    Ok(crate::oauth_runtime::StoredOAuthStatus::Ready) => McpAuthStatus::OauthReady,
+                    Ok(crate::oauth_runtime::StoredOAuthStatus::ReauthenticationRequired) => {
+                        McpAuthStatus::ReauthenticationRequired
+                    }
+                    Ok(crate::oauth_runtime::StoredOAuthStatus::Missing) => {
+                        match self.oauth_runtime.discover(&config).await {
+                            Ok(()) => McpAuthStatus::LoginRequired,
+                            Err(crate::oauth_runtime::OAuthRouteFailure::Unsupported) => {
+                                McpAuthStatus::Unsupported
+                            }
+                            Err(
+                                crate::oauth_runtime::OAuthRouteFailure::LoginRequired
+                                | crate::oauth_runtime::OAuthRouteFailure::ReauthenticationRequired
+                                | crate::oauth_runtime::OAuthRouteFailure::Unknown
+                                | crate::oauth_runtime::OAuthRouteFailure::Store,
+                            ) => McpAuthStatus::Unknown,
+                        }
+                    }
+                    Err(crate::oauth_runtime::OAuthRouteFailure::Unsupported) => {
+                        McpAuthStatus::Unsupported
+                    }
+                    Err(
+                        crate::oauth_runtime::OAuthRouteFailure::LoginRequired
+                        | crate::oauth_runtime::OAuthRouteFailure::ReauthenticationRequired
+                        | crate::oauth_runtime::OAuthRouteFailure::Unknown
+                        | crate::oauth_runtime::OAuthRouteFailure::Store,
+                    ) => McpAuthStatus::Unknown,
+                }
+            }
+            None => McpAuthStatus::NonOauth,
+        }
+    }
+
+    pub async fn logout_oauth(
+        &self,
+        server_id: &str,
+    ) -> Result<McpLogoutResult, crate::OAuthCredentialStoreError> {
+        let (route_lock, server_url) = {
+            let servers = self.servers.read().await;
+            let Some(server) = servers.get(server_id) else {
+                return Ok(McpLogoutResult::NotFound);
+            };
+            let crate::config::McpTransportConfig::StreamableHttp(config) =
+                &server.config.transport
+            else {
+                return Ok(McpLogoutResult::NotFound);
+            };
+            if config
+                .auth
+                .as_ref()
+                .and_then(crate::McpHttpAuthConfig::oauth)
+                .is_none()
+            {
+                return Ok(McpLogoutResult::NotFound);
+            }
+            (server.route_lock.clone(), config.url.clone())
+        };
+        let _route = route_lock.lock().await;
+        self.oauth.cancel_active(server_id).await;
+        let removed = self.oauth_runtime.logout(server_id, &server_url).await;
+        let client = {
+            let mut servers = self.servers.write().await;
+            let server = servers
+                .get_mut(server_id)
+                .expect("OAuth server remains configured while route lock is held");
+            let client = server.client.take();
+            server.health = McpHealth::Unavailable;
+            server.refresh.generation = server.refresh.generation.wrapping_add(1);
+            server.refresh.disposition = RetryDisposition::UserActionRequired;
+            client
+        };
+        if let Some(client) = client {
+            client.shutdown().await;
+        }
+        let removed = removed?;
+        Ok(if removed {
+            McpLogoutResult::Removed
+        } else {
+            McpLogoutResult::NotFound
+        })
+    }
+
     async fn inventory_catalog(
         &self,
         first_party: &HashMap<ProviderKind, Vec<ProviderTool>>,
@@ -757,7 +936,16 @@ impl McpManager {
             {
                 server.mark_unavailable();
             }
-            if !server.refresh.disposition.permits_automatic_attempt() {
+            let oauth_route = matches!(
+                &server.config.transport,
+                crate::config::McpTransportConfig::StreamableHttp(config)
+                    if config
+                        .auth
+                        .as_ref()
+                        .and_then(crate::McpHttpAuthConfig::oauth)
+                        .is_some()
+            );
+            if !server.refresh.disposition.permits_automatic_attempt() && !oauth_route {
                 return RefreshOutcome::Complete;
             }
             let reconnect = server.health != McpHealth::Healthy || server.client.is_none();
@@ -787,7 +975,24 @@ impl McpManager {
         }
         let refresh = async {
             if reconnect {
-                match McpClient::start(&config, deadline, self.bearer_resolver.as_ref()).await {
+                let oauth_token = oauth_access_token(&self.oauth_runtime, server_id, &config).await;
+                let oauth_token = match oauth_token {
+                    Ok(token) => token,
+                    Err(disposition) => {
+                        return RefreshAttempt::Failed {
+                            error: anyhow::anyhow!("MCP OAuth authorization is required"),
+                            disposition,
+                        };
+                    }
+                };
+                match McpClient::start(
+                    &config,
+                    deadline,
+                    self.bearer_resolver.as_ref(),
+                    oauth_token,
+                )
+                .await
+                {
                     McpClientStart::Connected(client, tools) => {
                         let revision = client.tools_revision();
                         RefreshAttempt::Connected(client, tools, revision)

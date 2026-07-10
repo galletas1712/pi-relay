@@ -71,6 +71,10 @@ impl WorkspaceManager {
         Self::new(state_root)
     }
 
+    pub(crate) fn mcp_oauth_credentials_path(&self) -> PathBuf {
+        self.state_root.join("mcp-oauth-credentials.json")
+    }
+
     /// Materialize a new session's workspaces under a private `outer_cwd`.
     ///
     /// `project_workspaces` is the project's full declared set and is used to

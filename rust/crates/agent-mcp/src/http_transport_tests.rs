@@ -268,6 +268,7 @@ fn terminal_capability_fence_is_exactly_once_during_concurrent_transition() {
         stream_attempts: stream_attempts.clone(),
         notifications: notifications.clone(),
         liveness: liveness.clone(),
+        oauth_token: None,
     };
     let control = HttpRequestControl {
         requests: Arc::new(RequestRegistry::default()),
@@ -315,6 +316,7 @@ fn terminal_common_stream_does_not_fence_static_tools() {
         stream_attempts: stream_attempts.clone(),
         notifications: notifications.clone(),
         liveness: liveness.clone(),
+        oauth_token: None,
     };
     let control = HttpRequestControl {
         requests: Arc::new(RequestRegistry::default()),
@@ -380,6 +382,9 @@ impl Drop for FakeHttpServer {
 
 impl FakeHttpServer {
     async fn spawn(mode: FakeMode, expected_bearer: Option<String>) -> Self {
+        let _callback_port = crate::oauth_login::tests::CALLBACK_PORT_TEST_LOCK
+            .lock()
+            .await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fake HTTP server");

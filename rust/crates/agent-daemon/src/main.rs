@@ -66,7 +66,13 @@ async fn main() -> Result<()> {
     let workspaces = WorkspaceManager::from_default_state_dir()?;
     let prompt_root = find_prompt_root(std::env::current_dir()?)?;
     let mcp = match config.mcp_config.as_deref() {
-        Some(path) => McpManager::start(McpConfig::from_path(path)?).await?,
+        Some(path) => {
+            McpManager::start_with_credential_file(
+                McpConfig::from_path(path)?,
+                workspaces.mcp_oauth_credentials_path(),
+            )
+            .await?
+        }
         None => McpManager::disabled(),
     };
     let state = AppState {
