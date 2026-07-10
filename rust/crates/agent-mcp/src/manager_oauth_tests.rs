@@ -60,6 +60,27 @@ async fn oauth_route_is_immediately_login_required_without_blocking_healthy_rout
             .await
             .is_err()
     );
+    assert_eq!(
+        manager.auth_statuses().await,
+        vec![
+            crate::McpAuthServerStatus {
+                server: "oauth".to_string(),
+                auth_kind: crate::McpAuthKind::Oauth,
+                auth_state: McpAuthStatus::Unsupported,
+                can_login: false,
+                can_logout: false,
+                failure: None,
+            },
+            crate::McpAuthServerStatus {
+                server: "stdio".to_string(),
+                auth_kind: crate::McpAuthKind::None,
+                auth_state: McpAuthStatus::NonOauth,
+                can_login: false,
+                can_logout: false,
+                failure: None,
+            },
+        ]
+    );
 
     let first_party = first_party();
     let inventory = manager
@@ -629,6 +650,7 @@ async fn login_persistence_failure_is_not_reported_as_success() {
     assert_eq!(
         manager
             .complete_oauth_login(
+                "oauth",
                 &login.login_id,
                 &format!(
                     "{}?code=authorization-code&state={}",
@@ -641,6 +663,141 @@ async fn login_persistence_failure_is_not_reported_as_success() {
     assert_eq!(
         manager.oauth_status("oauth").await,
         McpAuthStatus::LoginRequired
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn delayed_persistence_failure_stays_pending_until_store_failure() {
+    let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let temp = TempDir::new();
+    let blocked_parent = temp.path.join("credential-parent");
+    fs::create_dir(&blocked_parent).expect("create credential parent");
+    let manager = McpManager::start_with_credential_file(
+        oauth_manager_config(&server.origin),
+        blocked_parent.join("credentials.json"),
+    )
+    .await
+    .expect("empty credential path starts");
+    fs::remove_dir(&blocked_parent).expect("remove empty credential parent");
+    fs::write(&blocked_parent, "blocked").expect("replace parent with blocking file");
+    let reached = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    manager
+        .oauth
+        .set_persistence_barriers((reached.clone(), release.clone()));
+    let login = manager
+        .begin_oauth_login("oauth")
+        .await
+        .expect("OAuth login starts");
+    let authorization = reqwest::Url::parse(&login.authorization_url).expect("authorization URL");
+    let values = authorization
+        .query_pairs()
+        .into_owned()
+        .collect::<HashMap<_, _>>();
+    let completion = {
+        let manager = manager.clone();
+        let login_id = login.login_id.clone();
+        tokio::spawn(async move {
+            manager
+                .complete_oauth_login(
+                    "oauth",
+                    &login_id,
+                    &format!(
+                        "{}?code=authorization-code&state={}",
+                        values["redirect_uri"], values["state"]
+                    ),
+                )
+                .await
+        })
+    };
+
+    reached.wait().await;
+    assert_eq!(
+        manager.oauth_status("oauth").await,
+        McpAuthStatus::AuthorizationPending
+    );
+    assert_eq!(
+        manager.cancel_oauth_login("oauth", &login.login_id).await,
+        Err(McpOAuthLoginError::AlreadyCompleted)
+    );
+    assert_eq!(
+        manager.begin_oauth_login("oauth").await,
+        Err(McpOAuthLoginError::AlreadyPending)
+    );
+    assert!(!completion.is_finished());
+
+    release.wait().await;
+    assert_eq!(
+        completion.await.expect("completion task"),
+        Err(McpOAuthLoginError::Persistence)
+    );
+    assert_eq!(
+        manager.oauth_status("oauth").await,
+        McpAuthStatus::LoginRequired
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn delayed_persistence_success_stays_pending_until_ready() {
+    let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let manager = McpManager::start(oauth_manager_config(&server.origin))
+        .await
+        .expect("manager starts");
+    let reached = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    manager
+        .oauth
+        .set_persistence_barriers((reached.clone(), release.clone()));
+    let login = manager
+        .begin_oauth_login("oauth")
+        .await
+        .expect("OAuth login starts");
+    let authorization = reqwest::Url::parse(&login.authorization_url).expect("authorization URL");
+    let values = authorization
+        .query_pairs()
+        .into_owned()
+        .collect::<HashMap<_, _>>();
+    let completion = {
+        let manager = manager.clone();
+        let login_id = login.login_id.clone();
+        tokio::spawn(async move {
+            manager
+                .complete_oauth_login(
+                    "oauth",
+                    &login_id,
+                    &format!(
+                        "{}?code=authorization-code&state={}",
+                        values["redirect_uri"], values["state"]
+                    ),
+                )
+                .await
+        })
+    };
+
+    reached.wait().await;
+    assert_eq!(
+        manager.oauth_status("oauth").await,
+        McpAuthStatus::AuthorizationPending
+    );
+    assert_eq!(
+        manager.cancel_oauth_login("oauth", &login.login_id).await,
+        Err(McpOAuthLoginError::AlreadyCompleted)
+    );
+    assert_eq!(
+        manager.begin_oauth_login("oauth").await,
+        Err(McpOAuthLoginError::AlreadyPending)
+    );
+    assert!(!completion.is_finished());
+
+    release.wait().await;
+    assert_eq!(completion.await.expect("completion task"), Ok(()));
+    assert_eq!(
+        manager.oauth_status("oauth").await,
+        McpAuthStatus::OauthReady
     );
     manager.shutdown().await;
 }
@@ -676,6 +833,7 @@ async fn logout_between_callback_cleanup_and_persistence_wins() {
         tokio::spawn(async move {
             manager
                 .complete_oauth_login(
+                    "oauth",
                     &login.login_id,
                     &format!(
                         "{}?code=authorization-code&state={}",
@@ -820,6 +978,7 @@ async fn login(manager: &McpManager) {
         .collect::<HashMap<_, _>>();
     manager
         .complete_oauth_login(
+            "oauth",
             &login.login_id,
             &format!(
                 "{}?code=authorization-code&state={}",

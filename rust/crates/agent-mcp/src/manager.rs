@@ -84,6 +84,33 @@ pub enum McpAuthStatus {
     LoginRequired,
     ReauthenticationRequired,
     OauthReady,
+    AuthorizationPending,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuthKind {
+    None,
+    Bearer,
+    Oauth,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuthFailure {
+    CredentialStoreUnavailable,
+    DiscoveryFailed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct McpAuthServerStatus {
+    pub server: String,
+    pub auth_kind: McpAuthKind,
+    pub auth_state: McpAuthStatus,
+    pub can_login: bool,
+    pub can_logout: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<McpAuthFailure>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,10 +745,11 @@ impl McpManager {
 
     pub async fn complete_oauth_login(
         &self,
+        server_id: &str,
         login_id: &str,
         callback_url: &str,
     ) -> Result<(), crate::McpOAuthLoginError> {
-        self.oauth.complete(login_id, callback_url).await
+        self.oauth.complete(server_id, login_id, callback_url).await
     }
 
     pub async fn cancel_oauth_login(
@@ -733,53 +761,134 @@ impl McpManager {
     }
 
     pub async fn oauth_status(&self, server_id: &str) -> McpAuthStatus {
+        self.oauth_status_detail(server_id).await.0
+    }
+
+    pub async fn auth_statuses(&self) -> Vec<McpAuthServerStatus> {
+        let servers = self
+            .servers
+            .read()
+            .await
+            .iter()
+            .map(|(server_id, server)| {
+                let auth_kind = match &server.config.transport {
+                    crate::config::McpTransportConfig::Stdio(_) => McpAuthKind::None,
+                    crate::config::McpTransportConfig::StreamableHttp(config) => {
+                        match config.auth.as_ref() {
+                            Some(crate::McpHttpAuthConfig::BearerEnv { .. }) => McpAuthKind::Bearer,
+                            Some(crate::McpHttpAuthConfig::Oauth { .. }) => McpAuthKind::Oauth,
+                            None => McpAuthKind::None,
+                        }
+                    }
+                };
+                (server_id.clone(), auth_kind)
+            })
+            .collect::<Vec<_>>();
+        let mut statuses = futures_util::stream::iter(servers)
+            .map(|(server, auth_kind)| async move {
+                let (auth_state, failure) = self.oauth_status_detail(&server).await;
+                let can_login = auth_kind == McpAuthKind::Oauth
+                    && failure != Some(McpAuthFailure::CredentialStoreUnavailable)
+                    && matches!(
+                        auth_state,
+                        McpAuthStatus::LoginRequired
+                            | McpAuthStatus::ReauthenticationRequired
+                            | McpAuthStatus::Unknown
+                    );
+                let can_logout = auth_kind == McpAuthKind::Oauth
+                    && failure != Some(McpAuthFailure::CredentialStoreUnavailable)
+                    && matches!(
+                        auth_state,
+                        McpAuthStatus::OauthReady
+                            | McpAuthStatus::ReauthenticationRequired
+                            | McpAuthStatus::AuthorizationPending
+                    );
+                McpAuthServerStatus {
+                    server,
+                    auth_kind,
+                    auth_state,
+                    can_login,
+                    can_logout,
+                    failure,
+                }
+            })
+            .buffer_unordered(64)
+            .collect::<Vec<_>>()
+            .await;
+        statuses.sort_by(|left, right| left.server.cmp(&right.server));
+        statuses
+    }
+
+    async fn oauth_status_detail(
+        &self,
+        server_id: &str,
+    ) -> (McpAuthStatus, Option<McpAuthFailure>) {
         let (config, healthy) = {
             let servers = self.servers.read().await;
             let Some(server) = servers.get(server_id) else {
-                return McpAuthStatus::NonOauth;
+                return (McpAuthStatus::NonOauth, None);
             };
             let crate::config::McpTransportConfig::StreamableHttp(config) =
                 &server.config.transport
             else {
-                return McpAuthStatus::NonOauth;
+                return (McpAuthStatus::NonOauth, None);
             };
             (config.clone(), server.is_healthy())
         };
         match config.auth.as_ref() {
-            Some(crate::McpHttpAuthConfig::BearerEnv { .. }) => McpAuthStatus::Bearer,
-            Some(crate::McpHttpAuthConfig::Oauth { .. }) if healthy => McpAuthStatus::OauthReady,
+            Some(crate::McpHttpAuthConfig::BearerEnv { .. }) => (McpAuthStatus::Bearer, None),
+            Some(crate::McpHttpAuthConfig::Oauth { .. }) if self.oauth.is_pending(server_id) => {
+                (McpAuthStatus::AuthorizationPending, None)
+            }
+            Some(crate::McpHttpAuthConfig::Oauth { .. }) if healthy => {
+                (McpAuthStatus::OauthReady, None)
+            }
             Some(crate::McpHttpAuthConfig::Oauth { .. }) => {
                 match self.oauth_runtime.stored_status(server_id, &config).await {
-                    Ok(crate::oauth_runtime::StoredOAuthStatus::Ready) => McpAuthStatus::OauthReady,
+                    Ok(crate::oauth_runtime::StoredOAuthStatus::Ready) => {
+                        (McpAuthStatus::OauthReady, None)
+                    }
                     Ok(crate::oauth_runtime::StoredOAuthStatus::ReauthenticationRequired) => {
-                        McpAuthStatus::ReauthenticationRequired
+                        (McpAuthStatus::ReauthenticationRequired, None)
                     }
                     Ok(crate::oauth_runtime::StoredOAuthStatus::Missing) => {
                         match self.oauth_runtime.discover(&config).await {
-                            Ok(()) => McpAuthStatus::LoginRequired,
+                            Ok(()) => (McpAuthStatus::LoginRequired, None),
                             Err(crate::oauth_runtime::OAuthRouteFailure::Unsupported) => {
-                                McpAuthStatus::Unsupported
+                                (McpAuthStatus::Unsupported, None)
                             }
                             Err(
                                 crate::oauth_runtime::OAuthRouteFailure::LoginRequired
                                 | crate::oauth_runtime::OAuthRouteFailure::ReauthenticationRequired
-                                | crate::oauth_runtime::OAuthRouteFailure::Unknown
-                                | crate::oauth_runtime::OAuthRouteFailure::Store,
-                            ) => McpAuthStatus::Unknown,
+                                | crate::oauth_runtime::OAuthRouteFailure::Unknown,
+                            ) => (
+                                McpAuthStatus::Unknown,
+                                Some(McpAuthFailure::DiscoveryFailed),
+                            ),
+                            Err(crate::oauth_runtime::OAuthRouteFailure::Store) => (
+                                McpAuthStatus::Unknown,
+                                Some(McpAuthFailure::CredentialStoreUnavailable),
+                            ),
                         }
                     }
                     Err(crate::oauth_runtime::OAuthRouteFailure::Unsupported) => {
-                        McpAuthStatus::Unsupported
+                        (McpAuthStatus::Unsupported, None)
                     }
                     Err(
                         crate::oauth_runtime::OAuthRouteFailure::LoginRequired
                         | crate::oauth_runtime::OAuthRouteFailure::ReauthenticationRequired
-                        | crate::oauth_runtime::OAuthRouteFailure::Unknown
-                        | crate::oauth_runtime::OAuthRouteFailure::Store,
-                    ) => McpAuthStatus::Unknown,
+                        | crate::oauth_runtime::OAuthRouteFailure::Unknown,
+                    ) => (
+                        McpAuthStatus::Unknown,
+                        Some(McpAuthFailure::DiscoveryFailed),
+                    ),
+                    Err(crate::oauth_runtime::OAuthRouteFailure::Store) => (
+                        McpAuthStatus::Unknown,
+                        Some(McpAuthFailure::CredentialStoreUnavailable),
+                    ),
                 }
             }
-            None => McpAuthStatus::NonOauth,
+            None => (McpAuthStatus::NonOauth, None),
         }
     }
 

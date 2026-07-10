@@ -1,13 +1,13 @@
 # MCP client: session-scoped design and implementation plan
 
-Status: the session-scoped MCP client and generic Streamable HTTP prerequisite
-are implemented. Generic OAuth login is implemented through the pinned rmcp
-OAuth state machine and an internal loopback/manual-completion boundary.
+Status: the session-scoped MCP client, generic Streamable HTTP transport, and
+generic OAuth Stages 1-4 are implemented. Public sanitized RPCs and the React
+New Session login/logout UI use the pinned rmcp OAuth state machine and the
+daemon-owned loopback/manual-completion boundary.
 Daemon-owned file credentials, restart restoration, refresh, bounded
-authenticated transport, sanitized internal status, and local logout are also
-implemented. Public RPC and UI remain follow-up work. Windows and macOS
-validation remain follow-up work. This is the live checklist and durable
-design record.
+authenticated transport, sanitized public auth RPCs, local logout, and the web
+New Session OAuth UI are also implemented. Windows and macOS validation remain
+follow-up work. This is the live checklist and durable design record.
 
 **Implementation ceiling:** Codex is the OAuth complexity ceiling. Follow
 `codex-rs/rmcp-client/src/perform_oauth_login.rs`,
@@ -108,8 +108,8 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
   HTTP on loopback, and query-bearing MCP URLs allowed and preserved. Delegate
   discovery URL/path behavior and endpoint validation to rmcp.
 - [x] Keep OAuth routes immediately unavailable/login-required at startup
-  instead of running an independent discovery gate. A future Stage 4 status
-  check can call the thin `AuthorizationManager::discover_metadata` wrapper.
+  instead of running an independent discovery gate. The Stage 4 status check
+  calls the thin `AuthorizationManager::discover_metadata` wrapper.
 - [x] Follow Codex `start_authorization`: use
   `OAuthState::start_authorization` for DCR and
   `discover_metadata`/`set_metadata`/`configure_client`/
@@ -131,8 +131,8 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
   browser callback works only when the browser can reach loopback on that same
   host. For a remote/headless daemon, the user completes authorization in
   their browser, then pastes the **entire callback URL** (not only `code`) into
-  the internal manager completion boundary. Public completion RPC design
-  remains Stage 4 work.
+  the web dialog, which submits it to the bounded public completion RPC and
+  existing manager completion boundary.
 - [x] Route listener and manual callback submissions through one per-login owner
   task. Dropped waiters do not cancel it; timeout, cancellation, and shutdown
   clean it up. Success/cancel acknowledgement occurs only after credential
@@ -181,25 +181,27 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
 
 #### OAuth Stage 4: sanitized RPC and New Session UX
 
-- [ ] Add sanitized `status`, `login`, `complete`, `cancel`, and `logout`
+- [x] Add sanitized `status`, `login`, `complete`, `cancel`, and `logout`
   daemon RPCs with bounded server IDs and transaction IDs. Responses expose
   only stable states and bounded operator-safe categories; never tokens,
   client secrets, verifier/state, codes, raw response bodies, full callback
   URLs, or server-provided instructions. `login` may return the generated
   authorization URL exactly once to the requesting trusted client; ordinary
   status never does.
-- [ ] Make completion/cancellation transaction-owned, expiring, and
+- [x] Make completion/cancellation transaction-owned, expiring, and
   idempotently fail closed. Logout deletes daemon credentials and cancels
   outstanding login state, but does not rewrite existing session manifests.
-- [ ] Add New Session OAuth status and login controls before MCP tool
-  selection. Inventory distinguishes login-required, discovering, unavailable,
-  and healthy without exposing credentials. Reconcile only removal/health;
-  successful login never silently selects tools or changes an existing frozen
-  session.
-- [ ] Add end-to-end public RPC coverage for static public clients and DCR,
-  loopback and manual full-callback completion, PKCE/state/resource/scope
-  validation, cancellation/expiry, and the already-internal Stage 3
-  refresh/restart/logout/transport behavior without exposing credentials.
+- [x] Add New Session OAuth status and login controls before MCP tool
+  selection. Sanitized status is independent from inventory, so
+  login-required/pending/unsupported servers remain visible without tools.
+  Successful login refreshes inventory but never silently selects tools or
+  changes an existing frozen session.
+- [x] Add public RPC lifecycle coverage for generic static-client login,
+  pending polling, manual full-callback completion, ready inventory, logout,
+  sanitized errors, and manifest invariance. Existing `agent-mcp` integration
+  coverage retains DCR, automatic loopback completion, PKCE/state/resource/
+  scope validation, cancellation/expiry, refresh/restart/logout, and
+  authenticated transport without exposing credentials.
 
 #### Cross-stage credential and session invariants
 

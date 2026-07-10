@@ -53,6 +53,7 @@ async fn rmcp_dynamic_login_follows_discovery_and_registration_redirects() {
 
     coordinator
         .complete(
+            "server",
             &start.login_id,
             &format!("{redirect_uri}?code=authorization-code&state={state}"),
         )
@@ -94,6 +95,105 @@ async fn rmcp_dynamic_login_follows_discovery_and_registration_redirects() {
         format!("{}/mcp?tenant=one", server.origin)
     );
     assert!(!token["code_verifier"].is_empty());
+}
+
+#[tokio::test]
+async fn durable_commit_keeps_pending_reservation_until_success() {
+    let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let coordinator = OAuthCoordinator::new();
+    let reached = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    coordinator.set_persistence_barriers((reached.clone(), release.clone()));
+    let config = oauth_config(&server.origin, OAuthConfig::default());
+    let start = coordinator
+        .begin("server", &config, Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("login starts");
+    let (redirect_uri, state) = login_values(&start.authorization_url);
+    let completion = {
+        let coordinator = coordinator.clone();
+        let login_id = start.login_id.clone();
+        tokio::spawn(async move {
+            coordinator
+                .complete(
+                    "server",
+                    &login_id,
+                    &format!("{redirect_uri}?code=authorization-code&state={state}"),
+                )
+                .await
+        })
+    };
+
+    reached.wait().await;
+    assert!(coordinator.is_pending("server"));
+    assert_eq!(
+        coordinator.cancel("server", &start.login_id).await,
+        Err(McpOAuthLoginError::AlreadyCompleted)
+    );
+    assert_eq!(
+        coordinator
+            .begin("server", &config, Instant::now() + Duration::from_secs(5))
+            .await,
+        Err(McpOAuthLoginError::AlreadyPending)
+    );
+    assert!(!completion.is_finished());
+
+    release.wait().await;
+    assert_eq!(completion.await.expect("completion task"), Ok(()));
+    assert_finalized(&coordinator, "server", CredentialExpectation::Present);
+}
+
+#[tokio::test]
+async fn oversized_authorization_url_cleans_up_flow_and_port_for_restart() {
+    let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve callback port");
+    let port = listener.local_addr().expect("callback address").port();
+    drop(listener);
+    let coordinator = OAuthCoordinator::new();
+    let config = oauth_config(
+        &server.origin,
+        OAuthConfig {
+            resource: Some(&"r".repeat(MAX_AUTHORIZATION_URL_BYTES)),
+            callback_port: Some(port),
+            ..OAuthConfig::default()
+        },
+    );
+
+    assert_eq!(
+        coordinator
+            .begin("server", &config, Instant::now() + Duration::from_secs(5))
+            .await,
+        Err(McpOAuthLoginError::AuthorizationUrlTooLong)
+    );
+    assert_finalized(&coordinator, "server", CredentialExpectation::Absent);
+    drop(
+        TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("oversize cleanup releases callback port"),
+    );
+
+    let restart = coordinator
+        .begin(
+            "server",
+            &oauth_config(
+                &server.origin,
+                OAuthConfig {
+                    callback_port: Some(port),
+                    ..OAuthConfig::default()
+                },
+            ),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("oversize cleanup permits immediate restart");
+    coordinator
+        .cancel("server", &restart.login_id)
+        .await
+        .expect("restart cancels");
 }
 
 fn callback_port(authorization_url: &str) -> u16 {
@@ -303,6 +403,7 @@ async fn wrong_state_is_rejected_by_rmcp() {
     assert_eq!(
         coordinator
             .complete(
+                "server",
                 &start.login_id,
                 &format!("{redirect_uri}?code=authorization-code&state=wrong"),
             )
@@ -395,6 +496,7 @@ async fn dropped_begin_and_completion_waiters_do_not_cancel_owner() {
         tokio::spawn(async move {
             coordinator
                 .complete(
+                    "server",
                     &login_id,
                     &format!("{redirect_uri}?code=authorization-code&state={state}"),
                 )
@@ -430,7 +532,11 @@ async fn listener_and_manual_callbacks_converge_on_one_exchange() {
         let coordinator = coordinator.clone();
         let login_id = start.login_id.clone();
         let callback_url = callback_url.clone();
-        tokio::spawn(async move { coordinator.complete(&login_id, &callback_url).await })
+        tokio::spawn(async move {
+            coordinator
+                .complete("server", &login_id, &callback_url)
+                .await
+        })
     };
     let listener = tokio::spawn(send_callback(callback_url));
     let _ = manual.await.expect("manual task");
@@ -644,6 +750,7 @@ async fn cancel_after_token_exchange_is_linearized_with_credential_commit() {
         tokio::spawn(async move {
             coordinator
                 .complete(
+                    "server",
                     &login_id,
                     &format!("{redirect_uri}?code=authorization-code&state={state}"),
                 )
@@ -725,6 +832,7 @@ async fn cancel_interrupts_token_exchange_and_finalizes_waiters() {
         tokio::spawn(async move {
             coordinator
                 .complete(
+                    "server",
                     &login_id,
                     &format!("{redirect_uri}?code=authorization-code&state={state}"),
                 )
@@ -764,6 +872,7 @@ async fn provider_errors_are_generic_and_shutdown_awaits_cleanup() {
     let reflected = "client-secret-state-code-access-refresh-registration";
     let error = coordinator
         .complete(
+            "server",
             &start.login_id,
             &format!("{redirect_uri}?error={reflected}&state={state}"),
         )
@@ -844,6 +953,7 @@ async fn complete(
     let (redirect_uri, state) = login_values(&start.authorization_url);
     coordinator
         .complete(
+            "server",
             &start.login_id,
             &format!("{redirect_uri}?code=authorization-code&state={state}"),
         )

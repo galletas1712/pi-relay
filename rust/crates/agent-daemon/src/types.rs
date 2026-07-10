@@ -4,7 +4,7 @@ use agent_store::{PostCompactionDispatchLease, SessionConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub(crate) struct RpcRequest {
     pub(crate) id: Value,
     pub(crate) method: String,
@@ -39,7 +39,7 @@ impl From<agent_mcp::McpManagerError> for RpcError {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct RpcResponse {
     pub(crate) id: Value,
     pub(crate) ok: bool,
@@ -103,6 +103,11 @@ pub(crate) enum RpcMethod {
     HistorySwitch,
     TurnResume,
     McpInventory,
+    McpStatus,
+    McpLogin,
+    McpComplete,
+    McpCancel,
+    McpLogout,
     ToolsList,
     CompactionRequest,
     DelegationStartFull,
@@ -148,6 +153,11 @@ impl RpcMethod {
             "history.switch" => Some(Self::HistorySwitch),
             "turn.resume" => Some(Self::TurnResume),
             "mcp.inventory" => Some(Self::McpInventory),
+            "mcp.status" => Some(Self::McpStatus),
+            "mcp.login" => Some(Self::McpLogin),
+            "mcp.complete" => Some(Self::McpComplete),
+            "mcp.cancel" => Some(Self::McpCancel),
+            "mcp.logout" => Some(Self::McpLogout),
             "tools.list" => Some(Self::ToolsList),
             "compaction.request" => Some(Self::CompactionRequest),
             "delegation.start_full" => Some(Self::DelegationStartFull),

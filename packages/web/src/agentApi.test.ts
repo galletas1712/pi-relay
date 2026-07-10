@@ -48,6 +48,40 @@ describe("AgentApi MCP wire format", () => {
 		});
 	});
 
+	it("maps the sanitized MCP OAuth lifecycle without browser storage", async () => {
+		const calls: { method: string; params?: Record<string, unknown> }[] = [];
+		const storageSet = globalThis.localStorage?.setItem;
+		const api = createAgentApi(fakeClient(calls));
+		await api.getMcpStatus();
+		await api.loginMcp("remote");
+		await api.completeMcpLogin(
+			"remote",
+			"0000000000000001",
+			"http://127.0.0.1:43123/oauth/callback/0000000000000001?code=code&state=state",
+		);
+		await api.cancelMcpLogin("remote", "0000000000000001");
+		await api.logoutMcp("remote");
+		expect(calls).toEqual([
+			{ method: "mcp.status", params: undefined },
+			{ method: "mcp.login", params: { server: "remote" } },
+			{
+				method: "mcp.complete",
+				params: {
+					server: "remote",
+					login_id: "0000000000000001",
+					callback_url:
+						"http://127.0.0.1:43123/oauth/callback/0000000000000001?code=code&state=state",
+				},
+			},
+			{
+				method: "mcp.cancel",
+				params: { server: "remote", login_id: "0000000000000001" },
+			},
+			{ method: "mcp.logout", params: { server: "remote" } },
+		]);
+		expect(globalThis.localStorage?.setItem).toBe(storageSet);
+	});
+
 	it("omits MCP for an MCP-free session", async () => {
 		const calls: { method: string; params?: Record<string, unknown> }[] = [];
 		await createAgentApi(fakeClient(calls)).startSession({
@@ -88,6 +122,15 @@ function fakeClient(calls: { method: string; params?: Record<string, unknown> }[
 		request: async <T>(method: string, params?: Record<string, unknown>) => {
 			calls.push({ method, params });
 			if (method === "mcp.inventory") return { revision: "inventory-1", servers: [] } as T;
+			if (method === "mcp.status") return { servers: [] } as T;
+			if (method === "mcp.login") {
+				return {
+					login_id: "0000000000000001",
+					authorization_url: "https://auth.example.test/authorize",
+					expires_at_unix_seconds: 1,
+				} as T;
+			}
+			if (method === "mcp.logout") return { result: "removed" } as T;
 			return { session_id: "session-1", activity: "running" } as T;
 		},
 	};

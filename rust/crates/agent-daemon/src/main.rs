@@ -8,6 +8,7 @@ mod delegation_runner;
 mod delegation_snapshot;
 mod delegation_tools;
 mod handoff;
+mod mcp_auth;
 mod provider_runtime;
 mod rpc_views;
 mod runtime;
@@ -501,6 +502,11 @@ async fn dispatch_request(
         RpcMethod::HistorySwitch => history_switch(state, params).await,
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::McpInventory => mcp_inventory(state, params).await,
+        RpcMethod::McpStatus => mcp_auth::status(state, params).await,
+        RpcMethod::McpLogin => mcp_auth::login(state, params).await,
+        RpcMethod::McpComplete => mcp_auth::complete(state, params).await,
+        RpcMethod::McpCancel => mcp_auth::cancel(state, params).await,
+        RpcMethod::McpLogout => mcp_auth::logout(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params).await,
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
         RpcMethod::DelegationStartFull => delegation_tools::rpc_start_full(state, params).await,

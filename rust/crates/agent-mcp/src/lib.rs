@@ -21,9 +21,9 @@ pub use config::{
     McpStreamableHttpTransportConfig, McpTransportConfig,
 };
 pub use manager::{
-    McpAuthStatus, McpCallError, McpCallOutput, McpHealth, McpInventory, McpInventoryServer,
-    McpInventoryTool, McpLogoutResult, McpManager, McpManagerError, McpServerSelection,
-    McpSessionSelection, McpToolView,
+    McpAuthFailure, McpAuthKind, McpAuthServerStatus, McpAuthStatus, McpCallError, McpCallOutput,
+    McpHealth, McpInventory, McpInventoryServer, McpInventoryTool, McpLogoutResult, McpManager,
+    McpManagerError, McpServerSelection, McpSessionSelection, McpToolView,
 };
 pub use oauth_credentials::OAuthCredentialStoreError;
 pub use oauth_login::{McpOAuthLoginError, McpOAuthLoginStart};

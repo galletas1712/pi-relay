@@ -22,6 +22,7 @@ use crate::oauth_runtime::OAuthRuntimeManager;
 
 const CONTROL_CAPACITY: usize = 1;
 const MAX_CALLBACK_URL_BYTES: usize = 16 * 1024;
+const MAX_AUTHORIZATION_URL_BYTES: usize = 16 * 1024;
 static NEXT_LOGIN_ID: AtomicU64 = AtomicU64::new(1);
 type StartResult = Result<McpOAuthLoginStart, McpOAuthLoginError>;
 type StartSender = oneshot::Sender<StartResult>;
@@ -89,6 +90,8 @@ pub enum McpOAuthLoginError {
     Network,
     #[error("oauth_login_unavailable")]
     Unavailable,
+    #[error("oauth_authorization_url_too_long")]
+    AuthorizationUrlTooLong,
 }
 
 pub(crate) struct OAuthCoordinator {
@@ -117,6 +120,13 @@ struct FlowHandle {
     control: mpsc::Sender<FlowControl>,
     cancel: CancellationToken,
     cancel_response: Option<ResponseSender>,
+    phase: FlowPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlowPhase {
+    Active,
+    Committing,
 }
 
 enum FlowControl {
@@ -251,6 +261,7 @@ impl OAuthCoordinator {
                     control: control_tx,
                     cancel: cancel.clone(),
                     cancel_response: None,
+                    phase: FlowPhase::Active,
                 },
             );
             let task = tokio::spawn(self.clone().run_flow(
@@ -277,6 +288,7 @@ impl OAuthCoordinator {
 
     pub(crate) async fn complete(
         &self,
+        server_id: &str,
         login_id: &str,
         callback_url: &str,
     ) -> Result<(), McpOAuthLoginError> {
@@ -288,6 +300,9 @@ impl OAuthCoordinator {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.active_by_server.get(server_id).map(String::as_str) != Some(login_id) {
+                return Err(McpOAuthLoginError::NotFound);
+            }
             state
                 .flows
                 .get(login_id)
@@ -306,6 +321,14 @@ impl OAuthCoordinator {
         response_rx
             .await
             .unwrap_or(Err(McpOAuthLoginError::AlreadyCompleted))
+    }
+
+    pub(crate) fn is_pending(&self, server_id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_by_server
+            .contains_key(server_id)
     }
 
     pub(crate) async fn cancel_active(&self, server_id: &str) {
@@ -348,6 +371,9 @@ impl OAuthCoordinator {
                 .flows
                 .get_mut(login_id)
                 .ok_or(McpOAuthLoginError::NotFound)?;
+            if flow.phase == FlowPhase::Committing {
+                return Err(McpOAuthLoginError::AlreadyCompleted);
+            }
             if flow.cancel_response.is_some() {
                 return Err(McpOAuthLoginError::AlreadyCompleted);
             }
@@ -405,42 +431,49 @@ impl OAuthCoordinator {
                 drop(flow);
                 outcome
             }
-            Err(error) => {
-                if let Some(start_tx) = start_tx.take() {
-                    let _ = start_tx.send(Err(error.clone()));
-                }
-                FlowOutcome {
-                    result: Err(error),
-                    acknowledgement: None,
-                    browser_stream: None,
-                }
-            }
+            Err(error) => FlowOutcome {
+                result: Err(error),
+                acknowledgement: None,
+                browser_stream: None,
+            },
         };
-        if let Some(start_tx) = start_tx.take() {
-            let _ = start_tx.send(Err(McpOAuthLoginError::Cancelled));
-        }
 
         let FlowOutcome {
             mut result,
             acknowledgement,
             mut browser_stream,
         } = outcome;
-        let cancel_response = {
+        let mut cancel_response = None;
+        let committing = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let flow = state.flows.remove(&setup.login_id);
-            if flow.as_ref().is_some_and(|flow| flow.cancel.is_cancelled()) {
+            if state
+                .flows
+                .get(&setup.login_id)
+                .is_some_and(|flow| flow.cancel.is_cancelled())
+            {
                 result = Err(McpOAuthLoginError::Cancelled);
             }
-            if state.active_by_server.get(&setup.server_id) == Some(&setup.login_id) {
-                state.active_by_server.remove(&setup.server_id);
+            if result.is_ok() {
+                if let Some(flow) = state.flows.get_mut(&setup.login_id) {
+                    flow.phase = FlowPhase::Committing;
+                }
+                true
+            } else {
+                cancel_response = state
+                    .flows
+                    .remove(&setup.login_id)
+                    .and_then(|flow| flow.cancel_response);
+                if state.active_by_server.get(&setup.server_id) == Some(&setup.login_id) {
+                    state.active_by_server.remove(&setup.server_id);
+                }
+                false
             }
-            flow.and_then(|flow| flow.cancel_response)
         };
         #[cfg(test)]
-        if result.is_ok() {
+        if committing {
             let barriers = self
                 .persistence_barriers
                 .lock()
@@ -473,20 +506,28 @@ impl OAuthCoordinator {
             }
             Err(error) => Err(error),
         };
-        if let Ok(login_id) = &completed_login_id {
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .credentials
-                .insert(setup.server_id.clone(), login_id.clone());
-        }
         let response_result = completed_login_id.map(|_| ());
         {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if committing {
+                cancel_response = state
+                    .flows
+                    .remove(&setup.login_id)
+                    .and_then(|flow| flow.cancel_response);
+                if state.active_by_server.get(&setup.server_id) == Some(&setup.login_id) {
+                    state.active_by_server.remove(&setup.server_id);
+                }
+            }
+            if response_result.is_ok() {
+                state
+                    .credentials
+                    .insert(setup.server_id.clone(), setup.login_id.clone());
+            }
             debug_assert!(!state.flows.contains_key(&setup.login_id));
+            debug_assert!(state.active_by_server.get(&setup.server_id) != Some(&setup.login_id));
         };
         #[cfg(test)]
         if response_result.is_ok() {
@@ -503,8 +544,18 @@ impl OAuthCoordinator {
         if let Some(response) = acknowledgement {
             let _ = response.send(response_result.clone());
         }
+        if let Some(response) = start_tx.take() {
+            let error = response_result
+                .clone()
+                .expect_err("the login start is acknowledged before callback completion");
+            let _ = response.send(Err(error));
+        }
         if let Some(response) = cancel_response {
-            let _ = response.send(Ok(()));
+            let _ = response.send(if committing {
+                Err(McpOAuthLoginError::AlreadyCompleted)
+            } else {
+                Ok(())
+            });
         }
         if let Some(stream) = browser_stream.as_mut() {
             respond(stream, response_result.is_ok()).await;
@@ -550,6 +601,9 @@ impl OAuthCoordinator {
             "resource",
             setup.resource.as_deref(),
         );
+        if authorization_url.len() > MAX_AUTHORIZATION_URL_BYTES {
+            return Err(McpOAuthLoginError::AuthorizationUrlTooLong);
+        }
         let expected_state = reqwest::Url::parse(&authorization_url)
             .ok()
             .and_then(|url| {

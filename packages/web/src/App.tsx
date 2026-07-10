@@ -138,7 +138,9 @@ import {
 	type WorkspaceScopeEntry,
 } from "./workspaceScope.ts";
 import { NewSessionSetup } from "./newSessionSetup.tsx";
+import { McpOAuthDialog } from "./mcpOAuthDialog.tsx";
 import {
+	clearMcpServerSelection,
 	mcpSelectionForProviderChange,
 	mcpSelectionPayloadForProvider,
 	reconcileMcpSelection,
@@ -169,6 +171,7 @@ import type {
 	DelegationSubagent,
 	EventFrame,
 	McpInventory,
+	McpLoginResult,
 	Notice,
 	Project,
 	ProviderConfig,
@@ -522,6 +525,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
 	const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
 	const [promptDialog, setPromptDialog] = useState<SystemPromptDialogState | null>(null);
+	const [mcpLoginDialog, setMcpLoginDialog] = useState<{
+		server: string;
+		login: McpLoginResult;
+		context: string;
+		terminalArmed: boolean;
+	} | null>(null);
+	const [mcpAuthBusyServer, setMcpAuthBusyServer] = useState<string | null>(null);
+	const mcpLoginContextRef = useRef("");
 	const {
 		cache: selectedCache,
 		cacheRef: selectedCacheRef,
@@ -944,6 +955,25 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		},
 		enabled: connection === "open" && routeRemoteReadsEnabled && !selectedId,
 	});
+	const mcpStatusQuery = useQuery({
+		queryKey: queryKeys.mcpStatus,
+		queryFn: () => {
+			assertServerReadAllowed();
+			return api.getMcpStatus();
+		},
+		enabled: connection === "open" && routeRemoteReadsEnabled && !selectedId,
+		refetchInterval: (query) =>
+			query.state.data?.servers.some(
+				(server) => server.auth_state === "authorization_pending",
+			)
+				? 2_000
+				: false,
+	});
+	const mcpAuthStatus = mcpStatusQuery.data?.servers ?? [];
+	const mcpAuthStatusReady =
+		mcpStatusQuery.status === "success" &&
+		!mcpStatusQuery.isFetching &&
+		!mcpStatusQuery.error;
 	const mcpInventoryProvider =
 		mcpInventoryQuery.data?.provider === newSessionProvider.kind
 			? mcpInventoryQuery.data.provider
@@ -981,15 +1011,210 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		setNewSessionSetupGeneration((generation) => generation + 1);
 	}, []);
 	const retryMcpInventory = useCallback(() => {
-		if (mcpInventoryQuery.isFetching) return;
+		if (mcpInventoryQuery.isFetching || mcpStatusQuery.isFetching) return;
 		try {
 			assertServerReadAllowed();
 		} catch (error) {
 			pushNotice("error", errorMessage(error));
 			return;
 		}
+		void Promise.allSettled([
+			mcpStatusQuery.refetch(),
+			mcpInventoryQuery.refetch(),
+		]);
+	}, [
+		assertServerReadAllowed,
+		mcpInventoryQuery.isFetching,
+		mcpInventoryQuery.refetch,
+		mcpStatusQuery.isFetching,
+		mcpStatusQuery.refetch,
+		pushNotice,
+	]);
+	const refreshMcpAfterAuthChange = useCallback(async () => {
+		await Promise.allSettled([
+			mcpStatusQuery.refetch(),
+			mcpInventoryQuery.refetch(),
+		]);
+	}, [mcpInventoryQuery.refetch, mcpStatusQuery.refetch]);
+	const mcpLoginContext = `${selectedId ?? "new"}\u0000${selectedProjectId ?? "host"}\u0000${newSessionProvider.kind}\u0000${newSessionSetupGeneration}`;
+	mcpLoginContextRef.current = mcpLoginContext;
+	const loginMcp = useCallback(async (server: string) => {
+		if (mcpAuthBusyServer) return;
+		setMcpAuthBusyServer(server);
+		try {
+			assertServerMutationAllowed();
+			const context = mcpLoginContext;
+			const login = await api.loginMcp(server);
+			if (context !== mcpLoginContextRef.current || selectedRef.current !== null) {
+				void api.cancelMcpLogin(server, login.login_id).catch(() => undefined);
+				return;
+			}
+			setMcpLoginDialog({ server, login, context, terminalArmed: false });
+			const statusResult = await mcpStatusQuery.refetch();
+			if (statusResult.error) {
+				setMcpLoginDialog(null);
+				void api.cancelMcpLogin(server, login.login_id).catch(() => undefined);
+				pushNotice("error", "Could not verify MCP login status");
+				return;
+			}
+			setMcpLoginDialog((current) =>
+				current?.server === server && current.login.login_id === login.login_id
+					? { ...current, terminalArmed: true }
+					: current
+			);
+		} catch (error) {
+			pushNotice("error", errorMessage(error));
+		} finally {
+			setMcpAuthBusyServer(null);
+		}
+	}, [
+		api,
+		assertServerMutationAllowed,
+		mcpAuthBusyServer,
+		mcpLoginContext,
+		mcpStatusQuery.refetch,
+		pushNotice,
+	]);
+	const completeMcpLogin = useCallback(async (callbackUrl: string) => {
+		if (!mcpLoginDialog) return;
+		assertServerMutationAllowed();
+		await api.completeMcpLogin(
+			mcpLoginDialog.server,
+			mcpLoginDialog.login.login_id,
+			callbackUrl,
+		);
+		setMcpLoginDialog(null);
+		await refreshMcpAfterAuthChange();
+	}, [
+		api,
+		assertServerMutationAllowed,
+		mcpLoginDialog,
+		refreshMcpAfterAuthChange,
+	]);
+	const cancelMcpLogin = useCallback(async (confirmCleanup = true) => {
+		if (!mcpLoginDialog) return;
+		if (
+			confirmCleanup &&
+			mcpSelectionRef.current.get(mcpLoginDialog.server)?.size &&
+			!window.confirm(
+				`Continue and clear ${mcpLoginDialog.server}'s selected draft tools?`,
+			)
+		) return;
+		try {
+			assertServerMutationAllowed();
+			await api.cancelMcpLogin(
+				mcpLoginDialog.server,
+				mcpLoginDialog.login.login_id,
+			);
+		} catch (error) {
+			const message = errorMessage(error);
+			if (
+				![
+					"mcp_oauth_login_not_found:",
+					"mcp_oauth_login_finished:",
+					"mcp_oauth_login_cancelled:",
+					"mcp_oauth_login_expired:",
+				].some((code) => message.startsWith(code))
+			) {
+				pushNotice("error", message);
+				return;
+			}
+		}
+		const next = clearMcpServerSelection(
+			mcpSelectionRef.current,
+			mcpLoginDialog.server,
+		);
+		if (next !== mcpSelectionRef.current) {
+			mcpSelectionRef.current = next;
+			setMcpSelection(next);
+			setNewSessionSetupGeneration((generation) => generation + 1);
+		}
+		setMcpLoginDialog(null);
+		await mcpStatusQuery.refetch().catch((error) => {
+			pushNotice("error", errorMessage(error));
+		});
+	}, [
+		api,
+		assertServerMutationAllowed,
+		mcpLoginDialog,
+		mcpStatusQuery.refetch,
+		pushNotice,
+	]);
+	const logoutMcp = useCallback(async (server: string) => {
+		if (mcpAuthBusyServer) return;
+		setMcpAuthBusyServer(server);
+		try {
+			assertServerMutationAllowed();
+			await api.logoutMcp(server);
+			const next = clearMcpServerSelection(mcpSelectionRef.current, server);
+			mcpSelectionRef.current = next;
+			setMcpSelection(next);
+			setNewSessionSetupGeneration((generation) => generation + 1);
+			await refreshMcpAfterAuthChange();
+		} catch (error) {
+			pushNotice("error", errorMessage(error));
+		} finally {
+			setMcpAuthBusyServer(null);
+		}
+	}, [
+		api,
+		assertServerMutationAllowed,
+		mcpAuthBusyServer,
+		pushNotice,
+		refreshMcpAfterAuthChange,
+	]);
+	const cancelOrLogoutMcp = useCallback((server: string) => {
+		if (mcpLoginDialog?.server === server) {
+			void cancelMcpLogin(false);
+			return;
+		}
+		void logoutMcp(server);
+	}, [cancelMcpLogin, logoutMcp, mcpLoginDialog?.server]);
+	useEffect(() => {
+		if (!mcpLoginDialog || mcpLoginDialog.context === mcpLoginContext) return;
+		const stale = mcpLoginDialog;
+		setMcpLoginDialog(null);
+		void api
+			.cancelMcpLogin(stale.server, stale.login.login_id)
+			.catch(() => undefined);
+	}, [api, mcpLoginContext, mcpLoginDialog]);
+	useEffect(() => {
+		if (!mcpLoginDialog?.terminalArmed) return;
+		if (mcpStatusQuery.error) {
+			const stale = mcpLoginDialog;
+			setMcpLoginDialog(null);
+			void api
+				.cancelMcpLogin(stale.server, stale.login.login_id)
+				.catch(() => undefined);
+			pushNotice("error", "Could not verify MCP login status");
+			return;
+		}
+		if (mcpStatusQuery.status !== "success") return;
+		const status = mcpAuthStatus.find(
+			(server) => server.server === mcpLoginDialog.server,
+		);
+		if (status?.auth_state === "authorization_pending") return;
+		if (!status || status.auth_kind !== "oauth") {
+			setMcpLoginDialog(null);
+			pushNotice("error", "MCP login is no longer available");
+			return;
+		}
+		if (status.auth_state !== "ready") {
+			setMcpLoginDialog(null);
+			pushNotice("error", "MCP login ended before authorization completed");
+			return;
+		}
+		setMcpLoginDialog(null);
 		void mcpInventoryQuery.refetch();
-	}, [assertServerReadAllowed, mcpInventoryQuery.isFetching, mcpInventoryQuery.refetch, pushNotice]);
+	}, [
+		api,
+		mcpAuthStatus,
+		mcpInventoryQuery.refetch,
+		mcpLoginDialog,
+		mcpStatusQuery.error,
+		mcpStatusQuery.status,
+		pushNotice,
+	]);
 	// A selected child keeps its direct parent's board visible so the child row
 	// can expose current navigation semantics. This intentionally follows only
 	// the canonical direct parent; it does not infer a root or traverse a graph.
@@ -2702,6 +2927,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			nextSessionTitleRef.current = title?.trim() || null;
 			mcpSelectionRef.current = new Map();
 			setMcpSelection(new Map());
+			setNewSessionSetupGeneration((generation) => generation + 1);
 			selectSession(null);
 			composerHandleRef.current?.setValue("");
 			requestAnimationFrame(() => composerHandleRef.current?.focus());
@@ -2831,6 +3057,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						mcpInventory,
 						mcpInventoryReady,
 						mcpSelectionRef.current,
+						mcpAuthStatus,
+						mcpAuthStatusReady,
 					),
 				});
 			} catch (error) {
@@ -2855,6 +3083,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			mcpInventory,
 			mcpInventoryProvider,
 			mcpInventoryReady,
+			mcpAuthStatus,
+			mcpAuthStatusReady,
 			newSessionProvider,
 			openRootConversation,
 			queryClient,
@@ -3903,11 +4133,21 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						mcpInventory={mcpInventory}
 						mcpSelection={mcpSelection}
 						onMcpSelectionChange={handleMcpSelectionChange}
-						mcpLoading={mcpInventoryQuery.isFetching}
+						mcpLoading={mcpInventoryQuery.isFetching || mcpStatusQuery.isFetching}
 						mcpReady={mcpInventoryReady}
-						mcpError={mcpInventoryQuery.error ? errorMessage(mcpInventoryQuery.error) : null}
+						mcpError={
+							mcpInventoryQuery.error || mcpStatusQuery.error
+								? errorMessage(mcpInventoryQuery.error ?? mcpStatusQuery.error)
+								: null
+						}
 						onRetryMcp={retryMcpInventory}
+						mcpAuthStatus={mcpAuthStatus}
+						mcpAuthStatusReady={mcpAuthStatusReady}
+						onMcpLogin={(server) => void loginMcp(server)}
+						onMcpLogout={cancelOrLogoutMcp}
+						mcpAuthBusyServer={mcpAuthBusyServer}
 						disabled={sending}
+						mcpAuthMutationBlockedReason={connectionRemoteActionBlockedReason}
 					/>
 				) : null}
 				{conversationVisible ? (
@@ -4028,6 +4268,17 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					state={promptDialog}
 					onChangeView={(view) => setPromptDialog((current) => (current ? { ...current, view } : current))}
 					onClose={() => setPromptDialog(null)}
+					returnFocusFallbackRef={composerDialogReturnFocusRef}
+				/>
+			) : null}
+
+			{mcpLoginDialog ? (
+				<McpOAuthDialog
+					server={mcpLoginDialog.server}
+					login={mcpLoginDialog.login}
+					onComplete={completeMcpLogin}
+					onCancel={cancelMcpLogin}
+					mutationBlockedReason={connectionRemoteActionBlockedReason}
 					returnFocusFallbackRef={composerDialogReturnFocusRef}
 				/>
 			) : null}

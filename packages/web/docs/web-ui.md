@@ -40,6 +40,7 @@ TanStack Query                          SelectedSessionCache (per sessionId)
 projects        queryKeys.projects      snapshot (head/revisions/queue/metadata)
 session lists   queryKeys.sessions(pid) activeBranchEntryIds + entriesById
 tools           queryKeys.tools(kind)   tree* (compact topology for /switch)
+mcp auth status queryKeys.mcpStatus
 mcp inventory   queryKeys.mcpInventory
 system prompt   queryKeys.systemPrompt  turnCardsById/turnOrder/turnDetailsById
 ```
@@ -346,9 +347,37 @@ never display `0 of N` and accidentally serialize it as omission/all.
 Per-project choices persist under `piRelayWorkspaceScope:v1`; stale workspace
 entries are dropped when the picker re-derives.
 
-The MCP inventory query is enabled only while the connection is open, the route
-allows remote reads, and no durable session is selected. Loading and failures
-are field-local and do not block an MCP-free session; failure offers Retry.
+The MCP auth-status and inventory queries are independently enabled only while
+the connection is open, the route allows remote reads, and no durable session
+is selected. Loading and failures are field-local and do not block an MCP-free
+session; failure offers Retry. The picker renders the union of configured
+status IDs and inventory IDs, so a login-required OAuth server remains visible
+without a coherent inventory. `none` and bearer routes show concise
+non-interactive auth badges. OAuth routes show ready, login-required,
+reauthentication-required, pending, unsupported, or unknown state.
+
+Non-ready OAuth routes disable new tool selection, while existing selections
+remain removable. Login actions are shown whenever `can_login` is true. The
+accessible dialog provides an explicit
+`target="_blank"`/`noopener noreferrer` authorization link, a copyable URL,
+loopback explanation, and a bounded field for the **entire callback URL** when
+the browser and daemon are on different machines. While a login is pending,
+the client polls only sanitized `mcp.status` at a modest fixed interval.
+Automatic loopback completion closes the dialog and refreshes inventory when
+status becomes ready; manual completion calls `mcp.complete`. Cancel waits for
+daemon cleanup. A page reload intentionally loses the in-memory login handle;
+the pending row uses the local login handle for cancel when available; a
+reloaded externally pending row uses the daemon-advertised cleanup capability.
+Login responses are fenced to the originating New Session project, provider,
+setup generation, and navigation context.
+
+OAuth actions follow the daemon's `can_login` and `can_logout` capabilities.
+Ready OAuth routes offer **Logout**. If that route has selected draft tools,
+the UI confirms first, then clears only that server's draft selection and
+refreshes status/inventory. Logout is local credential deletion, not remote
+revocation. Login IDs and authorization URLs are component state only; no MCP
+OAuth response is written to localStorage or sessionStorage.
+
 Nothing is initially selected. Clicking a healthy server selects all currently
 operator-allowed tools; expanding it allows individual
 deselection/reselection. The server checkbox is accessible tri-state

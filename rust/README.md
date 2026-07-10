@@ -154,10 +154,10 @@ accepted. Replace them with optional `client_id`, `scopes`, and `resource`.
 The tagged `transport` object is preferred. Earlier flat stdio fields remain
 accepted with the same route fingerprint so existing frozen manifests and
 configuration files remain compatible.
-Bearer environment authentication remains supported. OAuth login is exposed
-only through the internal `McpManager` boundary. Successful static-client and
-DCR login is persisted after callback cleanup, restored across daemon restart,
-and refreshed through rmcp with a 30-second skew. Status is observational:
+Bearer environment authentication remains supported. Successful static-client
+and DCR login is persisted after callback cleanup, restored across daemon
+restart, and refreshed through rmcp with a 30-second skew. Status is
+observational:
 expired credentials with a refresh token remain OAuth-ready without consuming
 that token; refresh occurs only on route acquisition/reconnect. A transient
 refresh or atomic-save failure preserves the old durable record for a later
@@ -166,9 +166,20 @@ bounded/no-replay Streamable HTTP client, whose
 POST, common GET/SSE, and DELETE behavior and secret scrubbing remain shared
 with `bearer_env`. An MCP 401 closes the route without replaying the current
 operation; a later inventory or call may refresh and reconnect. Internal
-sanitized status and local credential-only logout are implemented. Public
-OAuth RPCs, browser UI, and New Session controls remain Stage 4 work. There is
-no built-in or provider-specific server catalog.
+sanitized status and local credential-only logout are implemented. The bounded
+`mcp.status`, `mcp.login`, `mcp.complete`, `mcp.cancel`, and
+`mcp.logout` websocket RPCs expose only sanitized status/categories plus the
+one authorization URL returned by an explicit login action. The New Session
+MCP picker shows OAuth state separately from inventory, disables tools until a
+route is ready, and opens an accessible login dialog with an explicit
+authorization link, URL-copy fallback, and full-callback-URL completion.
+Automatic callback works when the browser can reach loopback on the daemon
+host. For a remote daemon, complete authorization in the browser, copy its
+entire failed/unreachable loopback callback URL from the address bar, and paste
+that URL into the dialog. Login IDs and authorization URLs remain in memory
+only and are never written to browser storage. Logout removes only local
+credentials; it does not remotely revoke access or rewrite existing frozen
+session manifests. There is no built-in or provider-specific server catalog.
 
 All configured servers appear as New Session inventory sources. Operators use
 `enabled_tools` (or explicit `allow_all_tools: true`) as the hard allowlist;

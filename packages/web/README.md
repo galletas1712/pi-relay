@@ -21,3 +21,8 @@ first - see [`../../rust/README.md`](../../rust/README.md).
   RPC contract this client speaks.
 - [`../../rust/docs/architecture.md`](../../rust/docs/architecture.md) - the
   overall system and crate map.
+
+The New Session MCP picker includes generic OAuth login/logout when configured
+by the daemon. OAuth transaction handles and authorization URLs are held only
+in React memory, never browser storage. For a remote daemon, the login dialog
+accepts the entire loopback callback URL copied from the browser.
