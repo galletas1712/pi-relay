@@ -36,6 +36,19 @@ You may use the following tools to help you accomplish your tasks:
 - Prefer purpose-built tools over ad hoc shell commands:
   - Use `{{ tools.aliases.edit | default(value="Edit") }}` instead of manually editing files via `{{ tools.aliases.shell | default(value="Bash") }}` commands.
 
+{% if mcp.servers_markdown %}
+### Selected MCP tools
+
+The following MCP servers and exposed tool names are frozen for this session:
+
+{{ mcp.servers_markdown }}
+
+Their exact provider declarations are authoritative. If a selected server is
+unavailable or a contract changed, continue without automatically replaying a
+possibly side-effecting call. Read-only subagent status constrains local
+filesystem access, not remote MCP side effects.
+{% endif %}
+
 {% if capabilities.can_delegate %}
 ## Subagent delegation
 

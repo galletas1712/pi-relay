@@ -75,6 +75,8 @@ pub(crate) fn attach_dispatch_config(
     persisted_actions: Vec<PersistedAction>,
     config: &SessionConfig,
 ) -> Vec<DispatchAction> {
+    let mcp_snapshot = crate::provider_runtime::mcp_snapshot_for_session(config)
+        .expect("persisted MCP manifest was validated before dispatch");
     persisted_actions
         .into_iter()
         .map(|action| DispatchAction {
@@ -83,6 +85,7 @@ pub(crate) fn attach_dispatch_config(
             post_compaction_dispatch_lease: None,
             action: action.action,
             config: config.clone(),
+            mcp_snapshot: mcp_snapshot.clone(),
         })
         .collect()
 }

@@ -124,6 +124,7 @@ fn session_config(project_id: Uuid) -> SessionConfig {
             prompt_cache: None,
         },
         metadata: json!({}),
+        mcp_manifest: None,
     }
 }
 

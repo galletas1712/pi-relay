@@ -55,6 +55,7 @@ impl SessionDriver {
             &self.session_id,
             context_leaf_id.as_deref(),
             model_context.clone(),
+            &dispatch.mcp_snapshot,
         )
         .await
         {
@@ -341,9 +342,16 @@ async fn run_compaction_job(
             {
                 std::future::pending::<()>().await;
             }
-            run_compaction(&state, &config, &session_id, job.compaction_context.clone())
-                .await
-                .map(|output| (output, continuation_suffix))
+            let snapshot = crate::provider_runtime::mcp_snapshot_for_session(&config)?;
+            run_compaction(
+                &state,
+                &config,
+                &session_id,
+                job.compaction_context.clone(),
+                &snapshot,
+            )
+            .await
+            .map(|output| (output, continuation_suffix))
         }
         Err(error) => Err(anyhow::anyhow!(error.message)),
     };
@@ -415,6 +423,7 @@ async fn run_compaction_job(
             attempt_id: resumed.attempt_id.clone(),
             post_compaction_dispatch_lease: None,
             action: resumed.action.clone(),
+            mcp_snapshot: crate::provider_runtime::mcp_snapshot_for_session(&resumed_config)?,
             config: resumed_config,
         };
         // Harness sessions deliberately expose pending model actions to the
@@ -476,6 +485,7 @@ async fn run_compaction_job(
             post_compaction_dispatch_lease: Some(claimed.lease),
             action: claimed.pending.action,
             config: dispatch.config,
+            mcp_snapshot: dispatch.mcp_snapshot,
         };
         let lease = dispatch.post_compaction_dispatch_lease.clone();
         let registration_id =

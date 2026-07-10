@@ -34,7 +34,9 @@ Tables (created idempotently by `migrate`; see `postgres/schema.rs`):
 projects(id, name, workspaces jsonb, metadata jsonb, ...)
 sessions(id, project_id?, outer_cwd, workspaces jsonb, active_leaf_id?,
          system_prompt, provider_config jsonb, metadata jsonb,
-         session_revision, queue_revision, transcript_revision)
+         mcp_manifest_fingerprint?, session_revision, queue_revision,
+         transcript_revision)
+mcp_session_manifests(fingerprint, manifest jsonb, created_at, last_used_at)
 daemon_config(key, value jsonb)
 transcript_entries(session_id, id, parent_id?, timestamp_ms, item jsonb,
                    provider_replay jsonb, turn_id?, sequence bigserial)
@@ -70,6 +72,12 @@ events(id bigserial, session_id, type, payload jsonb, created_at)
   retains one.
 - `provider_replay` is a sidecar column holding raw provider continuation data.
   It is never serialized to RPC/web responses (see Notes).
+- `mcp_session_manifests` stores content-addressed MCP-only declarations and
+  route identities. Session creation collision-checks and inserts the manifest,
+  then inserts the nullable session FK, initial transcript, actions, and events
+  in one transaction. `NULL` is explicitly MCP-free, including pre-schema
+  sessions; it never means "use current inventory". Child sessions copy the
+  parent's exact fingerprint in their own creation transaction.
 
 The persistence-facing vocabularies (`ProviderKind`, `InputPriority`,
 `QueuedInputStatus`, `ActionKind`, `ActionStatus`, `SessionActivity`,

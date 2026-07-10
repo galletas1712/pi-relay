@@ -5,6 +5,7 @@
 //! into terminal/running states by writing their durable transcripts directly,
 //! so the tests are fully deterministic and need no provider.
 
+use crate::provider_runtime::{first_party_toolsets, mcp_snapshot_for_session};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,8 +19,9 @@ use agent_session::{
 use agent_store::{
     ActionKind, ActionStatus, ActionUpdate, CompactionCompletion, CompactionScope,
     CompactionTrigger, Delegation, DelegationKind, DelegationStatus, EventType, InputPriority,
-    OutputBatch, PostgresAgentStore, QueuedInputContent, QueuedInputStatus, SessionConfig,
-    SubagentControlPhase, SubagentType, TranscriptEntryBodyMode, TranscriptEntryScope,
+    McpSessionManifestBinding, OutputBatch, PostgresAgentStore, QueuedInputContent,
+    QueuedInputStatus, SessionConfig, SubagentControlPhase, SubagentType, TranscriptEntryBodyMode,
+    TranscriptEntryScope,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{
@@ -35,6 +37,721 @@ use uuid::Uuid;
 /// A unique temp directory removed on drop, so tests need no `tempfile` dep.
 struct TempDir {
     path: PathBuf,
+}
+
+#[tokio::test]
+async fn ordinary_tool_dispatch_claims_starts_and_completes_exactly_once() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "ordinary tool claim", &[], json!({}))
+        .await
+        .expect("create project");
+    let marker = env.cwd.path().join("ordinary-tool-runs");
+    let command = format!("printf run >> '{}'", marker.display());
+    let session_id = "ordinary_tool_claim_once";
+    start_prepared_session(
+        &env.state,
+        PreparedSessionStart {
+            session_id: session_id.to_string(),
+            config: session_config(
+                &env,
+                project_id,
+                json!({
+                    "created_by": "test",
+                    "fault_injection": {
+                        "model_result": "tool_once",
+                        "tool_command": command,
+                    }
+                }),
+            ),
+            priority: InputPriority::FollowUp,
+            content: UserMessage::text("run the injected tool"),
+            client_input_id: None,
+            parent_session_id: None,
+            subagent_type: None,
+            delegation_id: None,
+            dispatch_mode: PreparedSessionDispatchMode::Auto,
+        },
+    )
+    .await
+    .expect("session starts");
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if env.state.repo.activity(session_id).await.unwrap()
+                == agent_store::SessionActivity::Idle
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("tool reaches durable completion");
+
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("tool side effect exists"),
+        "run"
+    );
+    let events = env
+        .state
+        .repo
+        .events_after(session_id, None)
+        .await
+        .expect("events load");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event == EventType::ToolStarted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event == EventType::ToolCompleted)
+            .count(),
+        1
+    );
+    let started = events
+        .iter()
+        .find(|event| event.event == EventType::ToolStarted)
+        .expect("tool.started exists");
+    let completed = events
+        .iter()
+        .find(|event| event.event == EventType::ToolCompleted)
+        .expect("tool.completed exists");
+    assert!(started.event_id < completed.event_id);
+    let actions = env
+        .state
+        .repo
+        .session_snapshot(session_id)
+        .await
+        .expect("session snapshot loads")
+        .pending_actions;
+    assert!(actions
+        .iter()
+        .all(|action| action.kind != ActionKind::Tool || action.status == ActionStatus::Completed));
+
+    SessionDriver::acquire(&env.state, session_id)
+        .await
+        .dispatch_ready_actions()
+        .await
+        .expect("repeat dispatch scan succeeds");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("tool side effect remains"),
+        "run"
+    );
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn proactive_compaction_blocks_pending_selected_mcp_action_without_model_error() {
+    let Some(mut env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let mcp_config: agent_mcp::McpConfig = serde_json::from_value(json!({
+        "servers": {
+            "fixture": {
+                "command": fake_mcp_server(),
+                "env": { "MCP_FIXTURE_MODE": "simple" },
+                "allow_all_tools": true,
+            }
+        }
+    }))
+    .expect("MCP config parses");
+    env.state.mcp = agent_mcp::McpManager::start(mcp_config)
+        .await
+        .expect("MCP manager starts");
+    let inventory = env
+        .state
+        .mcp
+        .inventory(
+            ProviderKind::OpenAi,
+            &first_party_toolsets(&env.state, agent_prompt::PromptProfile::Parent),
+        )
+        .await
+        .expect("MCP inventory loads");
+    let selected_tool = inventory.servers[0].tools[0].raw_name.clone();
+    let selected = env
+        .state
+        .mcp
+        .select(
+            &agent_mcp::McpSessionSelection {
+                inventory_revision: inventory.revision,
+                servers: vec![agent_mcp::McpServerSelection {
+                    server: inventory.servers[0].server.clone(),
+                    tools: vec![selected_tool],
+                }],
+            },
+            &first_party_toolsets(&env.state, agent_prompt::PromptProfile::Parent),
+        )
+        .await
+        .expect("MCP tool selection resolves");
+
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "proactive pending compaction", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "proactive_pending_selected_mcp";
+    let mut config = session_config(
+        &env,
+        project_id,
+        json!({
+            "created_by": "test",
+            "fault_injection": {
+                "pause_compaction_dispatch_before_provider": true,
+            },
+            "compaction": {
+                "config": {
+                    "auto_enabled": true,
+                    "auto_limit_tokens": 8_000,
+                }
+            }
+        }),
+    );
+    config.mcp_manifest = Some(McpSessionManifestBinding {
+        manifest_fingerprint: selected.manifest_fingerprint().to_string(),
+        manifest: serde_json::to_value(selected.manifest()).expect("MCP manifest serializes"),
+    });
+    let started = start_prepared_session(
+        &env.state,
+        PreparedSessionStart {
+            session_id: session_id.to_string(),
+            config,
+            priority: InputPriority::FollowUp,
+            content: UserMessage::text("threshold token ".repeat(12_000)),
+            client_input_id: None,
+            parent_session_id: None,
+            subagent_type: None,
+            delegation_id: None,
+            dispatch_mode: PreparedSessionDispatchMode::Deferred,
+        },
+    )
+    .await
+    .expect("session starts with pending model action");
+    let model_action = started
+        .dispatches
+        .first()
+        .expect("model dispatch persists")
+        .row_id
+        .clone();
+    assert!(env
+        .state
+        .repo
+        .session_snapshot(session_id)
+        .await
+        .expect("pending session snapshot loads")
+        .pending_actions
+        .iter()
+        .any(|action| {
+            action.action_row_id == model_action && action.status == ActionStatus::Pending
+        }));
+
+    SessionDriver::acquire(&env.state, session_id)
+        .await
+        .dispatch_ready_actions()
+        .await
+        .expect("proactive gate dispatches compaction");
+
+    let snapshot = env
+        .state
+        .repo
+        .session_snapshot(session_id)
+        .await
+        .expect("session snapshot loads");
+    assert!(snapshot.pending_actions.iter().any(|action| {
+        action.action_row_id == model_action
+            && action.kind == ActionKind::Model
+            && action.status == ActionStatus::Blocked
+    }));
+    assert!(snapshot.pending_actions.iter().any(|action| {
+        action.kind == ActionKind::Compaction && action.status == ActionStatus::Running
+    }));
+    assert!(env
+        .state
+        .repo
+        .events_after(session_id, None)
+        .await
+        .expect("events load")
+        .iter()
+        .all(|event| event.event != EventType::ModelError));
+    assert!(env
+        .state
+        .repo
+        .load_session_config(session_id)
+        .await
+        .expect("session config loads")
+        .mcp_manifest
+        .is_some());
+
+    env.state.mcp.shutdown().await;
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn public_rpc_mcp_selection_is_fenced_frozen_and_inherited() {
+    let Some(mut env) = test_env().await else {
+        eprintln!(
+            "SKIPPED PostgreSQL selected-session RPC test: PI_RELAY_TEST_DATABASE_URL is not set"
+        );
+        return;
+    };
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    std::fs::copy(source_root.join("PI.md"), env.cwd.path().join("PI.md"))
+        .expect("copy PI template");
+    let role_dir = env.cwd.path().join("subagent-roles/implementer");
+    std::fs::create_dir_all(&role_dir).expect("create role dir");
+    std::fs::copy(
+        source_root.join("subagent-roles/implementer/SKILL.md"),
+        role_dir.join("SKILL.md"),
+    )
+    .expect("copy implementer role");
+    let marker = env.cwd.path().join("public-rpc-mcp-marker");
+    let mcp_config: agent_mcp::McpConfig = serde_json::from_value(json!({
+        "servers": {
+            "fixture": {
+                "command": fake_mcp_server(),
+                "env": {
+                    "MCP_FIXTURE_MODE": "notification_race",
+                    "MCP_FIXTURE_MARKER": marker,
+                },
+                "allow_all_tools": true,
+                "call_timeout_ms": 1_000,
+            }
+        }
+    }))
+    .expect("MCP config parses");
+    env.state.mcp = agent_mcp::McpManager::start(mcp_config)
+        .await
+        .expect("MCP manager starts");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "public RPC MCP", &[], json!({}))
+        .await
+        .expect("create project");
+    let provider = json!({
+        "kind": "openai",
+        "model": "gpt-5.2",
+        "reasoning_effort": "medium",
+    });
+    let inventory = public_rpc(&env.state, "mcp.inventory", json!({ "provider": "openai" }))
+        .await
+        .expect("inventory RPC succeeds");
+    let revision = inventory["revision"]
+        .as_str()
+        .expect("inventory revision")
+        .to_string();
+    assert_eq!(inventory["servers"][0]["server"], "fixture");
+    assert_eq!(inventory["servers"][0]["tools"][0]["raw_name"], "echo");
+
+    let stale_error = public_rpc(
+        &env.state,
+        "session.start",
+        json!({
+            "session_id": "rpc-stale",
+            "project_id": project_id,
+            "provider": provider,
+            "metadata": { "harness": true },
+            "content": [{ "type": "text", "text": "stale" }],
+            "mcp": {
+                "inventory_revision": "stale",
+                "servers": [{ "server": "fixture", "tools": ["echo"] }],
+            },
+        }),
+    )
+    .await
+    .expect_err("stale selection rejects");
+    assert_eq!(stale_error.code, "mcp_inventory_changed");
+    assert!(!env
+        .state
+        .repo
+        .session_exists("rpc-stale")
+        .await
+        .expect("stale session absence loads"));
+
+    public_rpc(
+        &env.state,
+        "session.start",
+        json!({
+            "session_id": "rpc-no-mcp",
+            "project_id": project_id,
+            "provider": provider,
+            "metadata": { "harness": true },
+            "content": [{ "type": "text", "text": "no MCP" }],
+        }),
+    )
+    .await
+    .expect("MCP-free session starts");
+    let no_mcp_config = env
+        .state
+        .repo
+        .load_session_config("rpc-no-mcp")
+        .await
+        .expect("MCP-free config loads");
+    assert!(no_mcp_config.mcp_manifest.is_none());
+    let no_mcp_prompt = public_rpc(
+        &env.state,
+        "system.prompt",
+        json!({ "session_id": "rpc-no-mcp" }),
+    )
+    .await
+    .expect("MCP-free prompt loads");
+    assert!(!no_mcp_prompt["rendered"]
+        .as_str()
+        .expect("MCP-free rendered prompt")
+        .contains("Selected MCP tools"));
+    let global_tools = public_rpc(&env.state, "tools.list", json!({ "provider": "openai" }))
+        .await
+        .expect("global tools list succeeds");
+    assert!(global_tools["tools"]
+        .as_array()
+        .expect("global tools array")
+        .iter()
+        .all(|tool| tool["kind"] == "local_tool"));
+
+    public_rpc(
+        &env.state,
+        "session.start",
+        json!({
+            "session_id": "rpc-selected",
+            "project_id": project_id,
+            "provider": provider,
+            "metadata": { "harness": true },
+            "content": [{ "type": "text", "text": "selected MCP" }],
+            "mcp": {
+                "inventory_revision": revision,
+                "servers": [{ "server": "fixture", "tools": ["echo"] }],
+            },
+        }),
+    )
+    .await
+    .expect("selected session starts");
+    let selected_config = env
+        .state
+        .repo
+        .load_session_config("rpc-selected")
+        .await
+        .expect("selected config loads");
+    let selected_binding = selected_config
+        .mcp_manifest
+        .clone()
+        .expect("selected manifest is bound");
+    let snapshot = mcp_snapshot_for_session(&selected_config).expect("selected snapshot loads");
+    let mut future_default = selected_config.clone();
+    future_default.provider.reasoning_effort = ReasoningEffort::High;
+    env.state
+        .repo
+        .configure_session("rpc-selected", &future_default)
+        .await
+        .expect("change selected session future provider default");
+    let dispatches = SessionDriver::acquire(&env.state, "rpc-selected")
+        .await
+        .dispatch_ready_actions()
+        .await
+        .expect("selected session action dispatches");
+    assert_eq!(dispatches.len(), 1);
+    assert_eq!(
+        dispatches[0].config.provider.reasoning_effort,
+        ReasoningEffort::Medium,
+        "dispatch keeps the provider route captured by the initial action"
+    );
+    assert_eq!(
+        dispatches[0].mcp_snapshot.manifest_fingerprint(),
+        snapshot.manifest_fingerprint(),
+        "dispatch independently carries the frozen session MCP manifest"
+    );
+    assert!(
+        !dispatches[0]
+            .mcp_snapshot
+            .provider_tools(dispatches[0].config.provider.kind)
+            .is_empty(),
+        "MCP declarations are shaped for the captured dispatch provider"
+    );
+    let selected_action_row_id = dispatches[0].row_id.clone();
+    let selected_action_attempt_id = dispatches[0].attempt_id.clone();
+    let selected_tool = snapshot.manifest().tools[0].clone();
+    let prompt = public_rpc(
+        &env.state,
+        "system.prompt",
+        json!({ "session_id": "rpc-selected" }),
+    )
+    .await
+    .expect("selected prompt loads")["rendered"]
+        .as_str()
+        .expect("rendered prompt")
+        .to_string();
+    let selected_section = prompt
+        .split("### Selected MCP tools")
+        .nth(1)
+        .and_then(|section| section.split("\n## ").next())
+        .expect("selected MCP section exists");
+    assert!(selected_section.contains("fixture"));
+    assert!(selected_section.contains(&selected_tool.exposed_name));
+    for secret in [
+        selected_tool.description.as_str(),
+        "inputSchema",
+        "input_schema",
+        "healthy",
+        "contract_fingerprint",
+        "manifest_fingerprint",
+        &selected_tool.contract_fingerprint,
+    ] {
+        assert!(
+            !selected_section.contains(secret),
+            "selected MCP prompt section leaked {secret}"
+        );
+    }
+    let tools_before = public_rpc(
+        &env.state,
+        "tools.list",
+        json!({ "provider": "openai", "session_id": "rpc-selected" }),
+    )
+    .await
+    .expect("selected tools list loads");
+    assert!(tools_before["tools"]
+        .as_array()
+        .expect("selected tools array")
+        .iter()
+        .any(|tool| {
+            tool["kind"] == "mcp_tool"
+                && tool["server"] == "fixture"
+                && tool["name"] == selected_tool.exposed_name
+        }));
+    let request_before = build_model_request(
+        &env.state,
+        &selected_config,
+        "rpc-selected",
+        None,
+        ModelContext::new(),
+        &snapshot,
+    )
+    .await
+    .expect("initial selected request builds");
+
+    env.state
+        .mcp
+        .call(
+            &snapshot,
+            &selected_tool.exposed_name,
+            json!({ "value": "refresh" }),
+        )
+        .await
+        .expect("fixture call triggers list_changed");
+    let refreshed_inventory =
+        public_rpc(&env.state, "mcp.inventory", json!({ "provider": "openai" }))
+            .await
+            .expect("inventory refreshes");
+    assert_ne!(refreshed_inventory["revision"], revision);
+    let tools_after = public_rpc(
+        &env.state,
+        "tools.list",
+        json!({ "provider": "openai", "session_id": "rpc-selected" }),
+    )
+    .await
+    .expect("frozen tools list reloads");
+    assert_eq!(tools_after, tools_before);
+    let request_after = build_model_request(
+        &env.state,
+        &selected_config,
+        "rpc-selected",
+        None,
+        ModelContext::new(),
+        &snapshot,
+    )
+    .await
+    .expect("later selected request builds");
+    assert_eq!(request_after.tools, request_before.tools);
+
+    let full = public_rpc(
+        &env.state,
+        "delegation.start_full",
+        json!({
+            "parent_session_id": "rpc-selected",
+            "role": "implementer",
+            "prompt": "full child",
+        }),
+    )
+    .await
+    .expect("full child starts");
+    let full_id = full["subagent_session_id"].as_str().expect("full child id");
+    assert_eq!(
+        env.state
+            .repo
+            .load_session_config(full_id)
+            .await
+            .expect("full child config")
+            .mcp_manifest,
+        Some(selected_binding.clone())
+    );
+    env.state
+        .repo
+        .set_delegation_status(
+            full["delegation_id"].as_str().expect("full delegation id"),
+            DelegationStatus::Failed,
+        )
+        .await
+        .expect("finish full delegation for test");
+
+    let read_only = public_rpc(
+        &env.state,
+        "delegation.start_readonly_fanout",
+        json!({
+            "parent_session_id": "rpc-selected",
+            "tasks": [{ "role": "implementer", "prompt": "read-only child" }],
+        }),
+    )
+    .await
+    .expect("read-only child starts");
+    let read_only_id = read_only["subagent_session_ids"][0]
+        .as_str()
+        .expect("read-only child id");
+    assert_eq!(
+        env.state
+            .repo
+            .load_session_config(read_only_id)
+            .await
+            .expect("read-only child config")
+            .mcp_manifest,
+        Some(selected_binding)
+    );
+
+    assert!(env
+        .state
+        .repo
+        .claim_pending_model_action(
+            "rpc-selected",
+            &selected_action_row_id,
+            &selected_action_attempt_id,
+        )
+        .await
+        .expect("selected model action claims for compaction"));
+    let compaction = env
+        .state
+        .repo
+        .block_model_action_for_compaction(
+            "rpc-selected",
+            &selected_action_row_id,
+            &selected_action_attempt_id,
+            ActionStatus::Running,
+            None,
+            CompactionTrigger::Auto {
+                reason: "selected MCP recovery test".to_string(),
+            },
+            None,
+            Some(100_000),
+        )
+        .await
+        .expect("selected model action blocks for compaction");
+    env.state
+        .repo
+        .complete_compaction_action(
+            &compaction.job,
+            successful_compaction("selected MCP recovery summary"),
+        )
+        .await
+        .expect("selected MCP compaction completes");
+    env.state.active.lock().await.remove("rpc-selected");
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .expect("selected MCP post-compaction action recovers"),
+        1
+    );
+    let recovered = env
+        .state
+        .active
+        .lock()
+        .await
+        .get("rpc-selected")
+        .cloned()
+        .expect("selected MCP runtime is reconstructed");
+    let recovered = recovered.lock().await;
+    assert_eq!(
+        recovered.config.provider.reasoning_effort,
+        ReasoningEffort::Medium,
+        "compaction recovery keeps the captured provider route"
+    );
+    assert_eq!(
+        mcp_snapshot_for_session(&recovered.config)
+            .expect("recovered selected MCP snapshot validates")
+            .manifest_fingerprint(),
+        snapshot.manifest_fingerprint(),
+        "compaction recovery keeps the exact selected MCP manifest"
+    );
+
+    env.state.mcp.shutdown().await;
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn harness_post_compaction_boot_recovery_keeps_legacy_session_mcp_free() {
+    let Some(env) = test_env().await else {
+        eprintln!(
+            "SKIPPED PostgreSQL harness MCP recovery test: PI_RELAY_TEST_DATABASE_URL is not set"
+        );
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "legacy harness MCP recovery", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "legacy_harness_post_compaction";
+    let (resumed, _) = commit_post_compaction_dispatch(&env, project_id, session_id).await;
+    env.state
+        .repo
+        .update_session_metadata(
+            session_id,
+            &json!({ "created_by": "test", "harness": true }),
+        )
+        .await
+        .expect("session switches to harness recovery");
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .expect("harness boot recovery succeeds"),
+        1
+    );
+    let config = env
+        .state
+        .repo
+        .load_session_config(session_id)
+        .await
+        .expect("legacy session config loads");
+    assert!(config.mcp_manifest.is_none());
+    assert!(mcp_snapshot_for_session(&config)
+        .expect("legacy session resolves empty snapshot")
+        .manifest()
+        .tools
+        .is_empty());
+    assert!(env
+        .state
+        .repo
+        .load_harness_model_action(session_id, &resumed.row_id)
+        .await
+        .expect("recovered harness action loads")
+        .post_compaction_dispatch_lease
+        .is_some());
+    assert!(env
+        .state
+        .tasks
+        .lock()
+        .expect("task registry lock")
+        .is_empty());
+
+    env.cleanup().await;
 }
 
 impl TempDir {
@@ -156,6 +873,7 @@ async fn test_env() -> Option<TestEnv> {
         shutting_down: Arc::new(AtomicBool::new(false)),
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        mcp: agent_mcp::McpManager::disabled(),
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
@@ -173,6 +891,47 @@ async fn test_env() -> Option<TestEnv> {
         _state_dir: state_dir,
         cwd,
     })
+}
+
+async fn public_rpc(
+    state: &AppState,
+    method: &str,
+    params: serde_json::Value,
+) -> std::result::Result<serde_json::Value, crate::types::RpcError> {
+    crate::dispatch_request(
+        state,
+        &mut std::collections::BTreeSet::new(),
+        &mut std::collections::BTreeMap::new(),
+        method.to_string(),
+        params,
+    )
+    .await
+}
+
+fn fake_mcp_server() -> PathBuf {
+    let target = std::env::current_exe()
+        .expect("current test executable")
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("Cargo target profile directory")
+        .to_path_buf();
+    let executable = if cfg!(windows) {
+        "fake_mcp_server.exe"
+    } else {
+        "fake_mcp_server"
+    };
+    std::fs::read_dir(target.join("build"))
+        .expect("Cargo build directory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("agent-mcp-")
+        })
+        .map(|entry| entry.path().join("out").join(executable))
+        .find(|path| path.is_file())
+        .expect("agent-mcp fake server executable")
 }
 
 fn database_url_with_name(base: &str, name: &str) -> String {
@@ -205,6 +964,7 @@ fn test_app_state(
         shutting_down: Arc::new(AtomicBool::new(false)),
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        mcp: agent_mcp::McpManager::disabled(),
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
@@ -297,6 +1057,7 @@ fn session_config(env: &TestEnv, project_id: Uuid, metadata: serde_json::Value) 
             prompt_cache: None,
         },
         metadata,
+        mcp_manifest: None,
     }
 }
 
@@ -976,6 +1737,7 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
         shutting_down: Arc::new(AtomicBool::new(false)),
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        mcp: agent_mcp::McpManager::disabled(),
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(restarted_state_dir.path().to_path_buf()),
@@ -1092,16 +1854,18 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
     else {
         unreachable!()
     };
+    let recovered_config = restarted_state
+        .repo
+        .load_session_config(session_id)
+        .await
+        .expect("load recovered config");
     let terminal_dispatch = DispatchAction {
         row_id: resumed.row_id.clone(),
         attempt_id: resumed.attempt_id.clone(),
         post_compaction_dispatch_lease: Some(reclaimed_lease),
         action: crashed_claim.pending.action,
-        config: restarted_state
-            .repo
-            .load_session_config(session_id)
-            .await
-            .expect("load recovered config"),
+        mcp_snapshot: mcp_snapshot_for_session(&recovered_config).expect("recovered MCP snapshot"),
+        config: recovered_config,
     };
     apply_model_response(
         &restarted_state,
@@ -1120,6 +1884,7 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
             stop_reason: ModelStopReason::Complete,
             stop_details: None,
         },
+        "recovered-test-toolset",
     )
     .await
     .expect("ordinary terminal completion commits");
@@ -2559,6 +3324,7 @@ async fn unexpected_ordinary_turn_stops_discard_partial_content_and_replay() {
                 project_id,
                 json!({ "created_by": "test", "harness": true }),
             ),
+            mcp_snapshot: agent_mcp::McpSessionSnapshot::empty(),
         };
         apply_model_response(
             &env.state,
@@ -2580,6 +3346,7 @@ async fn unexpected_ordinary_turn_stops_discard_partial_content_and_replay() {
                     explanation: Some("declined".to_string()),
                 }),
             },
+            "unexpected-stop-test-toolset",
         )
         .await
         .expect("unexpected stop persists failure");
@@ -4273,9 +5040,16 @@ async fn structural_subagent_stays_subagent_profile_after_session_configure() {
         .expect("subagent config");
     config.metadata = json!({ "prompt_profile": "parent" });
     config.system_prompt = "Subagent prompt".to_string();
-    let request = build_model_request(&env.state, &config, "impl_child", None, ModelContext::new())
-        .await
-        .expect("build structurally-subagent model request");
+    let request = build_model_request(
+        &env.state,
+        &config,
+        "impl_child",
+        None,
+        ModelContext::new(),
+        &mcp_snapshot_for_session(&config).expect("empty MCP snapshot"),
+    )
+    .await
+    .expect("build structurally-subagent model request");
     let request_tool_names = request
         .tools
         .iter()
@@ -4659,9 +5433,16 @@ async fn parent_model_context_does_not_inject_current_delegations() {
         .await
         .expect("parent config");
     config.system_prompt = "PI stable prompt".to_string();
-    let request = build_model_request(&env.state, &config, "parent", None, ModelContext::new())
-        .await
-        .expect("build model request");
+    let request = build_model_request(
+        &env.state,
+        &config,
+        "parent",
+        None,
+        ModelContext::new(),
+        &mcp_snapshot_for_session(&config).expect("empty MCP snapshot"),
+    )
+    .await
+    .expect("build model request");
 
     assert_eq!(
         request.prompt.stable_prefix.as_deref(),
@@ -4793,9 +5574,16 @@ async fn subagent_model_context_does_not_get_parent_delegation_summary() {
         .await
         .expect("subagent config");
     config.system_prompt = "Subagent PI prompt".to_string();
-    let request = build_model_request(&env.state, &config, "impl_busy", None, ModelContext::new())
-        .await
-        .expect("build subagent model request");
+    let request = build_model_request(
+        &env.state,
+        &config,
+        "impl_busy",
+        None,
+        ModelContext::new(),
+        &mcp_snapshot_for_session(&config).expect("empty MCP snapshot"),
+    )
+    .await
+    .expect("build subagent model request");
 
     assert_eq!(
         request.prompt.stable_prefix.as_deref(),
@@ -5000,9 +5788,11 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         })
         .into(),
     ];
-    let native_request = native_compaction_request(&env.state, &config, "parent", transcript)
-        .await
-        .expect("build native compaction request");
+    let snapshot = mcp_snapshot_for_session(&config).expect("load MCP snapshot");
+    let native_request =
+        native_compaction_request(&env.state, &config, "parent", transcript, &snapshot)
+            .await
+            .expect("build native compaction request");
 
     assert_eq!(
         native_request.prompt.stable_prefix.as_deref(),
@@ -5176,6 +5966,7 @@ async fn subagent_compaction_excludes_parent_delegation_ledger_and_sibling_state
         &subagent_config,
         "subagent_under_compaction",
         own_transcript,
+        &mcp_snapshot_for_session(&subagent_config).expect("load subagent MCP snapshot"),
     )
     .await
     .expect("build native subagent compaction request");

@@ -7,9 +7,11 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentApi } from "./agentApi.ts";
 import { App } from "./App.tsx";
 import type { ConnectionStatus } from "./rpc.ts";
+import { queryKeys } from "./queryKeys.ts";
 import type {
 	DelegationListResult,
 	EventFrame,
+	McpInventory,
 	Project,
 	SessionSnapshot,
 	SessionSummary,
@@ -111,6 +113,445 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
+	it("reuses new-session IDs when an uncertain start is retried without setup edits", async () => {
+		const api = createRouteApi();
+		api.startSession
+			.mockRejectedValueOnce(new Error("response lost"))
+			.mockImplementation(async (params: { sessionId: string }) => ({
+				session_id: params.sessionId,
+				activity: "queued",
+			}));
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
+		await user.type(composer, "retry the same setup");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await waitFor(() => expect(composer.value).toBe("retry the same setup"));
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(2));
+		expect(api.startSession.mock.calls[1][0]).toEqual(api.startSession.mock.calls[0][0]);
+
+		await mounted.dispose();
+	});
+
+	it.each(["workspace inclusion", "workspace branch", "MCP", "model", "effort"] as const)(
+		"uses new IDs and payload after an uncertain start followed by a %s-only setup edit",
+		async (setupEdit) => {
+			const api = createRouteApi();
+			api.startSession.mockRejectedValue(new Error("response lost"));
+			const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+			const user = userEvent.setup();
+
+			await open(api);
+			if (setupEdit === "workspace inclusion" || setupEdit === "workspace branch") {
+				const projectButton = screen
+					.getAllByRole("button", { name: /Project one/ })
+					.find((button) => button.classList.contains("project-row-primary"));
+				if (!projectButton) throw new Error("missing Project one selector");
+				await user.click(projectButton);
+			}
+			const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
+			await user.type(composer, "retry changed setup");
+			await user.click(screen.getByRole("button", { name: "send message" }));
+			await waitFor(() => expect(composer.value).toBe("retry changed setup"));
+
+			if (setupEdit === "workspace inclusion") {
+				await user.click(screen.getByRole("button", { name: /Workspaces/ }));
+				await user.click(screen.getByRole("checkbox", { name: /docs/ }));
+			} else if (setupEdit === "workspace branch") {
+				await user.click(screen.getByRole("button", { name: /Workspaces/ }));
+				await user.type(
+					screen.getByRole("textbox", { name: "branch for repo-a" }),
+					"feature/retry",
+				);
+			} else if (setupEdit === "MCP") {
+				await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+				await user.click(screen.getByRole("checkbox", { name: "workspace" }));
+			} else if (setupEdit === "model") {
+				await user.selectOptions(
+					screen.getByRole("combobox", { name: "Model" }),
+					"openai:gpt-5.6-terra",
+				);
+			} else if (setupEdit === "effort") {
+				await user.selectOptions(
+					screen.getByRole("combobox", { name: "Reasoning effort" }),
+					"high",
+				);
+			}
+			await user.click(screen.getByRole("button", { name: "send message" }));
+
+			await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(2));
+			const first = api.startSession.mock.calls[0][0];
+			const second = api.startSession.mock.calls[1][0];
+			expect(second.sessionId).not.toBe(first.sessionId);
+			expect(second.clientInputId).not.toBe(first.clientInputId);
+			if (setupEdit === "workspace inclusion") {
+				expect(first.workspaces).toBeUndefined();
+				expect(second.workspaces).toEqual([{ workspaceDir: "repo-a", branch: undefined }]);
+			} else if (setupEdit === "workspace branch") {
+				expect(first.workspaces).toBeUndefined();
+				expect(second.workspaces).toEqual([
+					{ workspaceDir: "repo-a", branch: "feature/retry" },
+					{ workspaceDir: "docs", branch: undefined },
+				]);
+			} else if (setupEdit === "MCP") {
+				expect(first.mcp).toBeUndefined();
+				expect(second.mcp).toEqual({
+					inventoryRevision: "inventory-1",
+					servers: [{ server: "workspace", tools: ["read", "write"] }],
+				});
+			} else if (setupEdit === "model") {
+				expect(first.provider.model).toBe("gpt-5.6-sol");
+				expect(second.provider.model).toBe("gpt-5.6-terra");
+			} else if (setupEdit === "effort") {
+				expect(first.provider.reasoning_effort).toBe("xhigh");
+				expect(second.provider.reasoning_effort).toBe("high");
+			}
+
+			await mounted.dispose();
+		},
+	);
+
+	it("fails closed during a retained-inventory refetch but allows deselection and an MCP-free start", async () => {
+		const refresh = deferred<McpInventory>();
+		const api = createRouteApi();
+		api.startSession.mockImplementation(async (params: { sessionId: string }) => ({
+			session_id: params.sessionId,
+			activity: "queued",
+		}));
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+		await user.click(screen.getByRole("button", { name: "expand workspace tools" }));
+		await user.click(screen.getByRole("checkbox", { name: /^read/i }));
+		api.getMcpInventory.mockImplementationOnce(() => refresh.promise);
+		act(() => {
+			void mounted.client.invalidateQueries({
+				queryKey: queryKeys.mcpInventory("openai"),
+			});
+		});
+		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledTimes(2));
+		expect(await screen.findByText("MCP tools · Refreshing…")).toBeTruthy();
+		expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /^read/i }).disabled).toBe(false);
+		expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /^write/i }).disabled).toBe(true);
+
+		const composer = screen.getByRole<HTMLTextAreaElement>("textbox");
+		await user.type(composer, "start after stale inventory");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await waitFor(() => expect(composer.value).toBe("start after stale inventory"));
+		expect(api.startSession).not.toHaveBeenCalled();
+
+		await user.click(screen.getByRole("checkbox", { name: /^read/i }));
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
+		expect(api.startSession.mock.calls[0][0].mcp).toBeUndefined();
+
+		await mounted.dispose();
+	});
+
+	it("keeps errored retained inventory closed and reconciles a successful retry before submit", async () => {
+		const retry = deferred<McpInventory>();
+		const api = createRouteApi();
+		api.startSession.mockImplementation(async (params: { sessionId: string }) => ({
+			session_id: params.sessionId,
+			activity: "queued",
+		}));
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
+		api.getMcpInventory.mockRejectedValueOnce(new Error("refresh failed"));
+		await act(async () => {
+			await mounted.client.invalidateQueries({
+				queryKey: queryKeys.mcpInventory("openai"),
+			});
+		});
+		const retryButton = await screen.findByRole<HTMLButtonElement>("button", { name: "Retry" });
+		const composer = screen.getByRole<HTMLTextAreaElement>("textbox");
+		await user.type(composer, "retry current inventory");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await waitFor(() => expect(composer.value).toBe("retry current inventory"));
+		expect(api.startSession).not.toHaveBeenCalled();
+
+		api.getMcpInventory.mockImplementationOnce(() => retry.promise);
+		await user.click(retryButton);
+		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledTimes(3));
+		expect(retryButton.disabled).toBe(true);
+		fireEvent.click(retryButton);
+		expect(api.getMcpInventory).toHaveBeenCalledTimes(3);
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		expect(api.startSession).not.toHaveBeenCalled();
+
+		await act(async () => {
+			retry.resolve({ ...mcpInventory(), revision: "inventory-2" });
+			await retry.promise;
+		});
+		await waitFor(() => expect(screen.queryByRole("button", { name: "Retry" })).toBeNull());
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
+		expect(api.startSession.mock.calls[0][0].mcp).toEqual({
+			inventoryRevision: "inventory-2",
+			servers: [{ server: "workspace", tools: ["read", "write"] }],
+		});
+
+		await mounted.dispose();
+	});
+
+	it("rederives workspace controls and payload when a directory changes from git to local", async () => {
+		const api = createRouteApi();
+		api.startSession.mockImplementation(async (params: { sessionId: string }) => ({
+			session_id: params.sessionId,
+			activity: "queued",
+		}));
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		const projectButton = screen
+			.getAllByRole("button", { name: /Project one/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectButton) throw new Error("missing Project one selector");
+		await user.click(projectButton);
+		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
+		await user.click(screen.getByRole("checkbox", { name: /docs/ }));
+		await user.type(screen.getByRole("textbox", { name: "branch for repo-a" }), "stale-branch");
+		const currentProjects = await api.listProjects.mock.results[0].value as Project[];
+		api.listProjects.mockResolvedValueOnce(currentProjects.map((project) =>
+			project.project_id === "project-1"
+				? {
+						...project,
+						workspaces: project.workspaces.map((workspace) =>
+							workspace.workspace_dir === "repo-a"
+								? {
+										kind: "local" as const,
+										workspace_dir: workspace.workspace_dir,
+										source_path: "/srv/repo-a",
+									}
+								: workspace
+						),
+					}
+				: project
+		));
+		await act(async () => {
+			await mounted.client.invalidateQueries({ queryKey: queryKeys.projects });
+		});
+
+		await waitFor(() =>
+			expect(screen.queryByRole("textbox", { name: "branch for repo-a" })).toBeNull()
+		);
+		await user.type(screen.getByRole("textbox"), "local workspace refresh");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
+		expect(api.startSession.mock.calls[0][0].workspaces).toEqual([
+			{ workspaceDir: "repo-a", branch: undefined },
+		]);
+
+		await mounted.dispose();
+	});
+
+	it("starts a project session with one immutable workspace and MCP payload, then clears MCP selection", async () => {
+		const browser = new FakeWorkspaceBrowser("/");
+		const api = createRouteApi();
+		api.startSession.mockImplementation(async (params: { sessionId: string }) => ({
+			session_id: params.sessionId,
+			activity: "queued",
+		}));
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		const projectButton = screen
+			.getAllByRole("button", { name: /Project one/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectButton) throw new Error("missing Project one selector");
+		await user.click(projectButton);
+		await user.type(await screen.findByRole("textbox"), "start combined setup");
+
+		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
+		await user.click(screen.getByRole("checkbox", { name: /docs/ }));
+		const lastWorkspace = screen.getByRole<HTMLInputElement>("checkbox", { name: /repo-a/ });
+		expect(lastWorkspace.disabled).toBe(true);
+		expect(lastWorkspace.title).toBe("At least one workspace must remain selected");
+		await user.type(screen.getByRole("textbox", { name: "branch for repo-a" }), "feature/mcp");
+
+		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+		expect(screen.queryByRole("textbox", { name: "branch for repo-a" })).toBeNull();
+		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
+		await user.click(screen.getByRole("button", { name: "expand workspace tools" }));
+		await user.click(screen.getByRole("checkbox", { name: /^write/i }));
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
+		const params = api.startSession.mock.calls[0][0];
+		expect(params).toEqual({
+			sessionId: params.sessionId,
+			projectId: "project-1",
+			provider: {
+				kind: "openai",
+				model: "gpt-5.6-sol",
+				reasoning_effort: "xhigh",
+			},
+			metadata: {
+				title: "start combined setup",
+				created_by: "web",
+				compaction: {
+					config: {
+						auto_enabled: true,
+						max_consecutive_failures: 3,
+					},
+				},
+			},
+			clientInputId: params.clientInputId,
+			priority: "follow_up",
+			content: [{ type: "text", text: "start combined setup" }],
+			workspaces: [{ workspaceDir: "repo-a", branch: "feature/mcp" }],
+			mcp: {
+				inventoryRevision: "inventory-1",
+				servers: [{ server: "workspace", tools: ["read"] }],
+			},
+		});
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe(
+				`/w/project/project-1/run/${params.sessionId}/conversation/${params.sessionId}`,
+			));
+
+		await act(async () => browser.navigate("/"));
+		expect((await screen.findByRole("button", { name: /MCP tools/ })).textContent).toContain(
+			"0 selected",
+		);
+		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
+		expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /docs/ }).checked).toBe(false);
+		expect(screen.getByRole<HTMLInputElement>("textbox", { name: "branch for repo-a" }).value).toBe(
+			"feature/mcp",
+		);
+
+		await mounted.dispose();
+	});
+
+	it("shows MCP without Workspaces for a host new session", async () => {
+		const api = createRouteApi();
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+
+		await open(api);
+		expect(await screen.findByRole("button", { name: /MCP tools/ })).toBeTruthy();
+		expect(screen.queryByRole("button", { name: /Workspaces/ })).toBeNull();
+
+		await mounted.dispose();
+	});
+
+	it("retains MCP selection for effort changes and clears it for provider-kind changes", async () => {
+		const api = createRouteApi();
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
+
+		await user.selectOptions(screen.getByRole("combobox", { name: "Reasoning effort" }), "high");
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
+
+		await user.selectOptions(screen.getByRole("combobox", { name: "Model" }), "claude:claude-sonnet-5");
+		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledWith("claude"));
+		expect((await screen.findByRole("button", { name: /MCP tools/ })).textContent).toContain(
+			"0 selected",
+		);
+
+		await mounted.dispose();
+	});
+
+	it("reconciles changed MCP inventory after a fenced start failure without losing workspace scope or draft", async () => {
+		const changedInventory = {
+			...mcpInventory(),
+			revision: "inventory-2",
+			servers: [{
+				...mcpInventory().servers[0],
+				revision: "workspace-2",
+				tools: [
+					...mcpInventory().servers[0].tools,
+					{ raw_name: "new", description: "New tool", context_token_estimate: 8 },
+				],
+			}],
+		};
+		const api = createRouteApi();
+		api.getMcpInventory
+			.mockResolvedValueOnce(mcpInventory())
+			.mockResolvedValueOnce(changedInventory);
+		api.startSession.mockRejectedValueOnce(
+			new Error("mcp_inventory_changed: MCP inventory changed; refresh and review the selection"),
+		);
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		const projectButton = screen
+			.getAllByRole("button", { name: /Project one/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectButton) throw new Error("missing Project one selector");
+		await user.click(projectButton);
+		const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
+		await user.type(composer, "retry unchanged draft");
+		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
+		await user.click(screen.getByRole("checkbox", { name: /docs/ }));
+		await user.type(screen.getByRole("textbox", { name: "branch for repo-a" }), "feature/retry");
+		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledTimes(2));
+		expect(composer.value).toBe("retry unchanged draft");
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("0 selected");
+		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
+		expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /docs/ }).checked).toBe(false);
+		expect(screen.getByRole<HTMLInputElement>("textbox", { name: "branch for repo-a" }).value).toBe(
+			"feature/retry",
+		);
+		expect(api.startSession.mock.calls[0][0].mcp).toEqual({
+			inventoryRevision: "inventory-1",
+			servers: [{ server: "workspace", tools: ["read", "write"] }],
+		});
+
+		await mounted.dispose();
+	});
+
+	it("retains workspace, MCP selection, and draft after an ordinary start failure", async () => {
+		const api = createRouteApi();
+		api.startSession.mockRejectedValueOnce(new Error("start failed"));
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		const user = userEvent.setup();
+
+		await open(api);
+		const projectButton = screen
+			.getAllByRole("button", { name: /Project one/ })
+			.find((button) => button.classList.contains("project-row-primary"));
+		if (!projectButton) throw new Error("missing Project one selector");
+		await user.click(projectButton);
+		const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
+		await user.type(composer, "retain failed start");
+		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
+		await user.click(screen.getByRole("checkbox", { name: /docs/ }));
+		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
+		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
+		expect(composer.value).toBe("retain failed start");
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
+		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
+		expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /docs/ }).checked).toBe(false);
+
+		await mounted.dispose();
+	});
+
 	it("starts session, transcript, tools, events, delegations, and project session reads only after validation", async () => {
 		const validation = deferred<SessionSnapshot>();
 		const browser = new FakeWorkspaceBrowser(
@@ -142,6 +583,7 @@ describe("App workspace route identity integration", () => {
 			expect(api.subscribeEvents).toHaveBeenCalled();
 			expect(api.listDelegations).toHaveBeenCalledWith("project-root-1", 3);
 		});
+		expect(api.getMcpInventory).not.toHaveBeenCalled();
 
 		await mounted.dispose();
 	});
@@ -636,11 +1078,13 @@ describe("App workspace route identity integration", () => {
 type ApiSpy = ReturnType<typeof vi.fn>;
 
 type RouteApi = AgentApi & {
+	listProjects: ApiSpy;
 	getSession: ApiSpy;
 	getTranscriptEntries: ApiSpy;
 	getTranscriptTurns: ApiSpy;
 	listSessions: ApiSpy;
 	listTools: ApiSpy;
+	getMcpInventory: ApiSpy;
 	listDelegations: ApiSpy;
 	subscribeEvents: ApiSpy;
 	queueFollowUp: ApiSpy;
@@ -782,6 +1226,7 @@ function createRouteApi(
 			summaries.filter((session) => session.project_id === projectId)),
 		listDelegations,
 		listTools: vi.fn(async () => []),
+		getMcpInventory: vi.fn(async () => mcpInventory()),
 		getSession,
 		getTranscriptTurns: vi.fn(async (sessionId: string) =>
 			options.deferredTranscriptTurns?.get(sessionId) ??
@@ -850,6 +1295,7 @@ function renderRouteApp(api: RouteApi, browser: FakeWorkspaceBrowser) {
 	);
 	return {
 		...result,
+		client,
 		async dispose() {
 			result.unmount();
 			await client.cancelQueries();
@@ -969,6 +1415,21 @@ function emptyTurns(sessionId: string, activeLeafId: string | null = null): Tran
 	};
 }
 
+function mcpInventory(): McpInventory {
+	return {
+		revision: "inventory-1",
+		servers: [{
+			server: "workspace",
+			revision: "workspace-1",
+			health: "healthy",
+			tools: [
+				{ raw_name: "read", description: "Read", context_token_estimate: 12 },
+				{ raw_name: "write", description: "Write", context_token_estimate: 18 },
+			],
+		}],
+	};
+}
+
 function rememberLegacy(sessionId: string) {
 	rememberUiSelection(null, sessionId);
 }
@@ -978,6 +1439,7 @@ function expectSensitiveReads(api: RouteApi, count: number): void {
 		api.listSessions,
 		api.getTranscriptTurns,
 		api.listTools,
+		api.getMcpInventory,
 		api.subscribeEvents,
 		api.listDelegations,
 		api.getTranscriptEntries,

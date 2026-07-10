@@ -1,3 +1,4 @@
+use agent_mcp::McpSessionSnapshot;
 use agent_provider::{
     ModelTranscriptEntry, PromptSections, ProviderCompactionRequest, ProviderCompactionResponse,
     ProviderModelMetadata, ProviderToolProfile,
@@ -15,9 +16,7 @@ use crate::delegation_context::compaction_delegation_ledger;
 use crate::state::AppState;
 
 use super::auth_retry::compact_with_auth_retry;
-use super::prompt::{
-    effective_prompt_profile, provider_tools_for_session, render_pi_compaction_prompt,
-};
+use super::prompt::render_pi_compaction_prompt;
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
 
@@ -235,12 +234,13 @@ pub(crate) async fn run_compaction(
     config: &SessionConfig,
     session_id: &str,
     model_context: ModelContext,
+    snapshot: &McpSessionSnapshot,
 ) -> Result<CompactionOutput> {
     eprintln!(
         "attempting provider-native compaction for {session_id} with {}",
         config.provider.kind
     );
-    let output = run_native_compaction(state, config, session_id, model_context).await?;
+    let output = run_native_compaction(state, config, session_id, model_context, snapshot).await?;
     append_delegation_ledger_to_output(state, session_id, output).await
 }
 
@@ -249,12 +249,14 @@ async fn run_native_compaction(
     config: &SessionConfig,
     session_id: &str,
     model_context: ModelContext,
+    snapshot: &McpSessionSnapshot,
 ) -> Result<CompactionOutput> {
     run_native_compaction_once(
         config.provider.kind,
         model_context,
         |transcript| async move {
-            let request = native_compaction_request(state, config, session_id, transcript).await?;
+            let request =
+                native_compaction_request(state, config, session_id, transcript, snapshot).await?;
             let credentials = Credentials::load();
             let provider = provider_for_config(state, config, &credentials, session_id).await?;
             compact_with_auth_retry(state, config, session_id, provider, request)
@@ -308,6 +310,7 @@ pub(crate) async fn native_compaction_request(
     config: &SessionConfig,
     session_id: &str,
     transcript: Vec<ModelTranscriptEntry>,
+    snapshot: &McpSessionSnapshot,
 ) -> Result<ProviderCompactionRequest> {
     let compaction_instructions = if config.provider.kind == ProviderKind::Claude {
         Some(format!(
@@ -317,6 +320,9 @@ pub(crate) async fn native_compaction_request(
     } else {
         None
     };
+    let profile = super::prompt::effective_prompt_profile(state, config, session_id).await?;
+    let mut tools = super::prompt::provider_tools_for_session(state, config.provider.kind, profile);
+    tools.extend(snapshot.provider_tools(config.provider.kind));
     Ok(ProviderCompactionRequest {
         model: config.provider.model.clone(),
         // Compaction uses the stable prompt plus transcript/model history. Any
@@ -326,11 +332,7 @@ pub(crate) async fn native_compaction_request(
         prompt: PromptSections::stable(config.system_prompt.clone()),
         transcript,
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: provider_tools_for_session(
-            state,
-            config.provider.kind,
-            effective_prompt_profile(state, config, session_id).await?,
-        ),
+        tools,
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
         session_id: Some(session_id.to_string()),
@@ -379,6 +381,7 @@ mod tests {
                 prompt_cache: None,
             },
             metadata,
+            mcp_manifest: None,
         }
     }
 

@@ -45,6 +45,7 @@ agent-session    transcript forest, model-context materialization,
    +-- agent-store     Postgres persistence (the only durable backend)
    +-- agent-provider  ModelProvider + OpenAI/Codex and Anthropic adapters
    +-- agent-tools     AgentTool, ToolRegistry, builtin tools
+   +-- agent-mcp       local stdio MCP manager + immutable session manifests
    +-- agent-prompt    renders the PI.md system prompt
             |
             v
@@ -60,6 +61,7 @@ agent-vocab      shared ids, message blocks, tool calls/results,
 | `agent-store` | Postgres-only session/transcript/queue/action/event persistence plus recovery and revision/queue projections. | [modules/agent-store.md](modules/agent-store.md) |
 | `agent-provider` | `ModelProvider` plus OpenAI/Codex (Responses) and Anthropic (Messages) adapters, prompt-cache shaping, and provider compaction. | [modules/agent-provider.md](modules/agent-provider.md) |
 | `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`web_search`/`web_fetch`/`LoadSkill`/delegation tools. | [modules/agent-tools.md](modules/agent-tools.md) |
+| `agent-mcp` | Local stdio MCP clients, New Session inventory, and deterministic MCP-only session manifests kept separate from `ToolRegistry`. | [plans/mcp-client.md](plans/mcp-client.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. | [modules/agent-daemon.md](modules/agent-daemon.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt from session/workspace/tool/skill context. | [modules/agent-prompt.md](modules/agent-prompt.md) |
 

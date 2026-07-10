@@ -2,6 +2,7 @@ mod auth_retry;
 mod compaction;
 mod connections;
 mod context_accounting;
+mod mcp;
 mod prompt;
 mod provider;
 mod requests;
@@ -23,6 +24,9 @@ pub(crate) use compaction::{
 };
 pub(crate) use connections::ProviderConnectionRegistry;
 pub(crate) use context_accounting::model_input_tokens_for_gate;
+pub(crate) use mcp::{
+    first_party_toolsets, mcp_snapshot_for_session, provider_toolset_fingerprint,
+};
 pub(crate) use prompt::{
     current_pi_template, effective_prompt_profile, provider_tools_for_session, render_pi_prompt,
 };

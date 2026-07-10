@@ -1,0 +1,825 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_tools::ProviderTool;
+use agent_vocab::ProviderKind;
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use thiserror::Error;
+use tokio::sync::{Mutex, Notify, RwLock};
+
+use crate::catalog::{
+    build_inventory_catalog, declaration_token_estimate, select_manifest, DiscoveredTool, MAX_TOOLS,
+};
+use crate::client::{McpClient, McpClientCallError};
+use crate::config::{McpConfig, McpServerConfig};
+use crate::result::normalize_call_result;
+use crate::{McpSessionManifest, McpSessionSnapshot};
+
+const MAX_SELECTED_SERVERS: usize = 64;
+const MAX_REVISION_BYTES: usize = 128;
+const MAX_SERVER_ID_BYTES: usize = 128;
+const MAX_RAW_TOOL_NAME_BYTES: usize = 256;
+const MAX_MCP_PROMPT_SUMMARY_BYTES: usize = 16 * 1024;
+const MAX_PROVIDER_TOOLSET_BYTES: usize = 1024 * 1024;
+
+fn bounded_error_message(mut message: String) -> String {
+    const MAX_ERROR_BYTES: usize = 16 * 1024;
+    if message.len() <= MAX_ERROR_BYTES {
+        return message;
+    }
+    let mut end = MAX_ERROR_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    message.push_str(" [truncated]");
+    message
+}
+
+fn discovered_tools(
+    server_id: &str,
+    config: &McpServerConfig,
+    tools: Vec<rmcp::model::Tool>,
+) -> anyhow::Result<Vec<DiscoveredTool>> {
+    let tools = tools
+        .into_iter()
+        .filter(|tool| config.tool_enabled(tool.name.as_ref()))
+        .map(|tool| DiscoveredTool {
+            server_id: server_id.to_string(),
+            server_config_fingerprint: config.semantic_fingerprint(),
+            raw_name: tool.name.into_owned(),
+            description: tool
+                .description
+                .map(|value| value.into_owned())
+                .unwrap_or_default(),
+            input_schema: Value::Object((*tool.input_schema).clone()),
+        })
+        .collect::<Vec<_>>();
+    let config_fingerprints =
+        BTreeMap::from([(server_id.to_string(), config.semantic_fingerprint())]);
+    build_inventory_catalog(&config_fingerprints, tools.clone(), &BTreeSet::new())?;
+    Ok(tools)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpHealth {
+    Healthy,
+    Unavailable,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct McpInventoryTool {
+    pub raw_name: String,
+    pub description: String,
+    pub context_token_estimate: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct McpInventoryServer {
+    pub server: String,
+    pub revision: String,
+    pub health: McpHealth,
+    pub tools: Vec<McpInventoryTool>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct McpInventory {
+    pub revision: String,
+    pub servers: Vec<McpInventoryServer>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpSessionSelection {
+    pub inventory_revision: String,
+    pub servers: Vec<McpServerSelection>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerSelection {
+    pub server: String,
+    pub tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct McpToolView {
+    pub server: String,
+    pub raw_name: String,
+    pub exposed_name: String,
+    pub contract_fingerprint: String,
+    pub health: McpHealth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpCallOutput {
+    pub output: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum McpManagerError {
+    #[error("mcp_inventory_changed: MCP inventory changed")]
+    InventoryChanged { current_revision: String },
+    #[error("mcp_selection_invalid: {message}")]
+    SelectionInvalid { message: String },
+    #[error("mcp_unavailable: selected MCP server {server} is unavailable")]
+    Unavailable { server: String },
+    #[error("invalid MCP catalog: {0}")]
+    Catalog(#[from] anyhow::Error),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum McpCallError {
+    #[error("mcp_tool_revoked: MCP tool {tool} is no longer allowed")]
+    Revoked { tool: String },
+    #[error("mcp_server_unavailable: MCP server {server} is unavailable")]
+    ServerUnavailable { server: String },
+    #[error("mcp_tool_contract_changed: MCP tool {tool} no longer has the advertised contract")]
+    ContractChanged { tool: String },
+    #[error("mcp_call_timeout: MCP tool {tool} exceeded its total call deadline")]
+    Timeout { tool: String },
+    #[error("mcp_protocol_error: {message}")]
+    Protocol { message: String },
+}
+
+struct ServerState {
+    config: McpServerConfig,
+    client: Option<Arc<McpClient>>,
+    /// The last fully validated catalog is retained for inventory diagnostics
+    /// and existing session contract checks even while the route is down.
+    tools: Vec<DiscoveredTool>,
+    health: McpHealth,
+    catalog_tools_revision: u64,
+    /// Whether `tools` is a coherent semantic catalog rather than only the
+    /// last observation retained for diagnostics.
+    catalog_coherent: bool,
+    route_lock: Arc<Mutex<()>>,
+}
+
+impl ServerState {
+    fn is_healthy(&self) -> bool {
+        self.health == McpHealth::Healthy
+            && self
+                .client
+                .as_ref()
+                .is_some_and(|client| !client.is_closed() && !client.tools_uncertain())
+    }
+
+    fn catalog_is_current(&self) -> bool {
+        self.catalog_coherent
+            && self.client.as_ref().is_none_or(|client| {
+                !client.tools_uncertain() && client.tools_revision() == self.catalog_tools_revision
+            })
+    }
+
+    fn mark_unavailable(&mut self) {
+        self.health = McpHealth::Unavailable;
+        self.client = None;
+    }
+}
+
+pub struct McpManager {
+    servers: RwLock<BTreeMap<String, ServerState>>,
+    refresh_lock: Mutex<()>,
+    shutting_down: AtomicBool,
+    shutdown_notify: Notify,
+}
+
+impl McpManager {
+    pub async fn start(config: McpConfig) -> Result<Arc<Self>, McpManagerError> {
+        config.validate()?;
+        let starts = futures_util::stream::iter(config.servers.clone())
+            .map(|(server_id, server_config)| async move {
+                let state = match McpClient::start(&server_config).await {
+                    Ok((client, tools)) => {
+                        match discovered_tools(&server_id, &server_config, tools) {
+                            Ok(tools) => ServerState {
+                                config: server_config,
+                                catalog_tools_revision: client.tools_revision(),
+                                client: Some(client),
+                                tools,
+                                health: McpHealth::Healthy,
+                                catalog_coherent: true,
+                                route_lock: Arc::new(Mutex::new(())),
+                            },
+                            Err(error) => {
+                                eprintln!(
+                                    "MCP server {server_id} returned an invalid catalog: {error:#}"
+                                );
+                                client.shutdown().await;
+                                unavailable_server(server_config)
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("MCP server {server_id} unavailable during startup: {error:#}");
+                        unavailable_server(server_config)
+                    }
+                };
+                (server_id, state)
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        Ok(Arc::new(Self {
+            servers: RwLock::new(starts.into_iter().collect()),
+            refresh_lock: Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
+            shutdown_notify: Notify::new(),
+        }))
+    }
+
+    pub fn disabled() -> Arc<Self> {
+        Arc::new(Self {
+            servers: RwLock::new(BTreeMap::new()),
+            refresh_lock: Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
+            shutdown_notify: Notify::new(),
+        })
+    }
+
+    pub async fn inventory(
+        &self,
+        provider: ProviderKind,
+        first_party: &HashMap<ProviderKind, Vec<ProviderTool>>,
+    ) -> Result<McpInventory, McpManagerError> {
+        self.refresh_inventory().await;
+        let (catalog, globally_coherent) = self.inventory_catalog(first_party).await?;
+        if !globally_coherent {
+            return Err(McpManagerError::InventoryChanged {
+                current_revision: catalog.inventory_revision,
+            });
+        }
+        let servers = self.servers.read().await;
+        let inventory_servers = catalog
+            .server_revisions
+            .iter()
+            .map(|(server_id, revision)| {
+                let server = servers
+                    .get(server_id)
+                    .expect("inventory revision only contains configured servers");
+                let declarations = catalog.provider_tools(provider);
+                let tools = catalog
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.server_id == *server_id)
+                    .map(|tool| {
+                        let declaration = declarations
+                            .iter()
+                            .find(|candidate| candidate.name == tool.exposed_name)
+                            .expect("inventory provider declaration matches its tool");
+                        Ok(McpInventoryTool {
+                            raw_name: tool.raw_name.clone(),
+                            description: tool.description.clone(),
+                            context_token_estimate: declaration_token_estimate(declaration)?,
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Ok(McpInventoryServer {
+                    server: server_id.clone(),
+                    revision: revision.clone(),
+                    health: server.health,
+                    tools,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(McpInventory {
+            revision: catalog.inventory_revision,
+            servers: inventory_servers,
+        })
+    }
+
+    pub async fn select(
+        &self,
+        selection: &McpSessionSelection,
+        first_party: &HashMap<ProviderKind, Vec<ProviderTool>>,
+    ) -> Result<McpSessionSnapshot, McpManagerError> {
+        let selected = validate_selection_shape(selection)?;
+        self.refresh_inventory().await;
+        let (catalog, globally_coherent) = self.inventory_catalog(first_party).await?;
+        if !globally_coherent {
+            return Err(McpManagerError::InventoryChanged {
+                current_revision: catalog.inventory_revision,
+            });
+        }
+        if catalog.inventory_revision != selection.inventory_revision {
+            return Err(McpManagerError::InventoryChanged {
+                current_revision: catalog.inventory_revision,
+            });
+        }
+        {
+            let servers = self.servers.read().await;
+            for server_id in selected.keys() {
+                let Some(server) = servers.get(server_id) else {
+                    return Err(McpManagerError::SelectionInvalid {
+                        message: format!("unknown MCP server {server_id}"),
+                    });
+                };
+                if !server.is_healthy() {
+                    return Err(McpManagerError::Unavailable {
+                        server: server_id.clone(),
+                    });
+                }
+            }
+        }
+        let manifest = select_manifest(&catalog, &selected).map_err(|error| {
+            McpManagerError::SelectionInvalid {
+                message: error.to_string(),
+            }
+        })?;
+        let prompt_summary_bytes = manifest
+            .tools
+            .iter()
+            .map(|tool| tool.server_id.len() + tool.exposed_name.len() + 8)
+            .sum::<usize>();
+        if prompt_summary_bytes > MAX_MCP_PROMPT_SUMMARY_BYTES {
+            return Err(McpManagerError::SelectionInvalid {
+                message: format!(
+                    "selected MCP names exceed the {MAX_MCP_PROMPT_SUMMARY_BYTES}-byte prompt summary limit"
+                ),
+            });
+        }
+        for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
+            let first_party_bytes = first_party
+                .get(&provider)
+                .into_iter()
+                .flatten()
+                .map(|tool| serde_json::to_vec(&tool.declaration).map(|bytes| bytes.len()))
+                .sum::<serde_json::Result<usize>>()
+                .map_err(anyhow::Error::from)?;
+            let mcp_bytes = manifest
+                .provider_tools(provider)
+                .iter()
+                .map(|tool| serde_json::to_vec(&tool.declaration).map(|bytes| bytes.len()))
+                .sum::<serde_json::Result<usize>>()
+                .map_err(anyhow::Error::from)?;
+            if first_party_bytes.saturating_add(mcp_bytes) > MAX_PROVIDER_TOOLSET_BYTES {
+                return Err(McpManagerError::SelectionInvalid {
+                    message: format!(
+                        "selected provider toolset exceeds {MAX_PROVIDER_TOOLSET_BYTES} bytes"
+                    ),
+                });
+            }
+        }
+        Ok(McpSessionSnapshot::new(manifest)?)
+    }
+
+    pub fn snapshot_from_manifest(
+        &self,
+        manifest: McpSessionManifest,
+    ) -> Result<McpSessionSnapshot, McpManagerError> {
+        Ok(McpSessionSnapshot::from_persisted(manifest)?)
+    }
+
+    pub async fn call(
+        &self,
+        snapshot: &McpSessionSnapshot,
+        exposed_name: &str,
+        arguments: Value,
+    ) -> Result<McpCallOutput, McpCallError> {
+        let tool = snapshot.manifest().tool(exposed_name).ok_or_else(|| {
+            McpCallError::ContractChanged {
+                tool: exposed_name.to_string(),
+            }
+        })?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(McpCallError::ServerUnavailable {
+                server: tool.server_id.clone(),
+            });
+        }
+        let (route_lock, deadline) = {
+            let servers = self.servers.read().await;
+            let Some(server) = servers.get(&tool.server_id) else {
+                return Err(McpCallError::Revoked {
+                    tool: exposed_name.to_string(),
+                });
+            };
+            if !server.config.tool_enabled(&tool.raw_name) {
+                return Err(McpCallError::Revoked {
+                    tool: exposed_name.to_string(),
+                });
+            }
+            (
+                server.route_lock.clone(),
+                tokio::time::Instant::now() + server.config.call_timeout(),
+            )
+        };
+        let arguments = match arguments {
+            Value::Object(arguments) => arguments,
+            _ => {
+                return Err(McpCallError::Protocol {
+                    message: "MCP tool arguments must be a JSON object".to_string(),
+                });
+            }
+        };
+        let result = loop {
+            let _route = tokio::time::timeout_at(deadline, route_lock.lock())
+                .await
+                .map_err(|_| McpCallError::Timeout {
+                    tool: exposed_name.to_string(),
+                })?;
+            if tokio::time::timeout_at(deadline, self.refresh_server_if_needed(&tool.server_id))
+                .await
+                .is_err()
+            {
+                self.mark_server_unavailable(&tool.server_id).await;
+                return Err(McpCallError::Timeout {
+                    tool: exposed_name.to_string(),
+                });
+            }
+            let (client, tools_revision) = self.select_exact_route(tool, exposed_name).await?;
+            let pin = client.pin();
+            drop(_route);
+            match client
+                .call(
+                    pin,
+                    deadline,
+                    tools_revision,
+                    &tool.raw_name,
+                    arguments.clone(),
+                )
+                .await
+            {
+                Err(McpClientCallError::ToolsChanged) => continue,
+                result => break result,
+            }
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(McpClientCallError::Timeout) => {
+                self.mark_server_unavailable(&tool.server_id).await;
+                return Err(McpCallError::Timeout {
+                    tool: exposed_name.to_string(),
+                });
+            }
+            Err(McpClientCallError::Protocol(message)) => {
+                self.mark_server_unavailable(&tool.server_id).await;
+                return Err(McpCallError::Protocol {
+                    message: bounded_error_message(message),
+                });
+            }
+            Err(McpClientCallError::ToolsChanged) => unreachable!("handled in admission loop"),
+        };
+        let (output, is_error) = normalize_call_result(result);
+        Ok(McpCallOutput { output, is_error })
+    }
+
+    pub async fn tool_views(&self, snapshot: &McpSessionSnapshot) -> Vec<McpToolView> {
+        let servers = self.servers.read().await;
+        snapshot
+            .manifest()
+            .tools
+            .iter()
+            .map(|tool| McpToolView {
+                server: tool.server_id.clone(),
+                raw_name: tool.raw_name.clone(),
+                exposed_name: tool.exposed_name.clone(),
+                contract_fingerprint: tool.contract_fingerprint.clone(),
+                health: servers
+                    .get(&tool.server_id)
+                    .map(|server| {
+                        if server.config.tool_enabled(&tool.raw_name) {
+                            server.health
+                        } else {
+                            McpHealth::Revoked
+                        }
+                    })
+                    .unwrap_or(McpHealth::Revoked),
+            })
+            .collect()
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
+        let route_locks = self
+            .servers
+            .read()
+            .await
+            .values()
+            .map(|server| server.route_lock.clone())
+            .collect::<Vec<_>>();
+        let mut route_guards = Vec::with_capacity(route_locks.len());
+        for route_lock in &route_locks {
+            route_guards.push(route_lock.lock().await);
+        }
+        let clients = self
+            .servers
+            .write()
+            .await
+            .values_mut()
+            .filter_map(|server| server.client.take())
+            .collect::<Vec<_>>();
+        let shutdown = async {
+            let tasks = clients
+                .into_iter()
+                .map(|client| async move { client.shutdown().await });
+            futures_util::future::join_all(tasks).await;
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(5), shutdown).await;
+        drop(route_guards);
+    }
+
+    async fn inventory_catalog(
+        &self,
+        first_party: &HashMap<ProviderKind, Vec<ProviderTool>>,
+    ) -> Result<(McpSessionManifest, bool), McpManagerError> {
+        let servers = self.servers.read().await;
+        let builtin_names = first_party
+            .values()
+            .flatten()
+            .flat_map(|tool| [tool.name.clone(), tool.canonical_name.clone()])
+            .collect::<BTreeSet<_>>();
+        let config_fingerprints = servers
+            .iter()
+            .map(|(server_id, server)| (server_id.clone(), server.config.semantic_fingerprint()))
+            .collect::<BTreeMap<_, _>>();
+        let tools = servers
+            .values()
+            .filter(|server| server.catalog_is_current())
+            .flat_map(|server| server.tools.clone())
+            .collect();
+        let catalog = build_inventory_catalog(&config_fingerprints, tools, &builtin_names)?;
+        let globally_coherent = servers.values().all(ServerState::catalog_is_current);
+        Ok((catalog, globally_coherent))
+    }
+
+    async fn refresh_inventory(&self) {
+        let server_ids = self.servers.read().await.keys().cloned().collect();
+        self.refresh_servers(server_ids).await;
+    }
+
+    async fn refresh_servers(&self, server_ids: Vec<String>) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        let _refresh = self.refresh_lock.lock().await;
+        let servers = {
+            let servers = self.servers.read().await;
+            server_ids
+                .into_iter()
+                .filter_map(|server_id| {
+                    servers
+                        .get(&server_id)
+                        .map(|server| (server_id, server.route_lock.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        futures_util::stream::iter(servers)
+            .for_each_concurrent(8, |(server_id, route_lock)| async move {
+                let _route = route_lock.lock().await;
+                self.refresh_server_if_needed(&server_id).await;
+            })
+            .await;
+    }
+
+    async fn refresh_server_if_needed(&self, server_id: &str) {
+        let shutdown = self.shutdown_notify.notified();
+        tokio::pin!(shutdown);
+        shutdown.as_mut().enable();
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        let plan = {
+            let mut servers = self.servers.write().await;
+            let Some(server) = servers.get_mut(server_id) else {
+                return;
+            };
+            if server
+                .client
+                .as_ref()
+                .is_some_and(|client| client.is_closed())
+            {
+                server.mark_unavailable();
+            }
+            let reconnect = server.health != McpHealth::Healthy || server.client.is_none();
+            let refresh = server.client.as_ref().is_some_and(|client| {
+                client.tools_uncertain() || client.tools_revision() != server.catalog_tools_revision
+            });
+            (reconnect || refresh).then(|| {
+                (
+                    server.config.clone(),
+                    reconnect,
+                    refresh,
+                    server.client.clone(),
+                )
+            })
+        };
+        let Some((config, reconnect, refreshing_stale_catalog, current_client)) = plan else {
+            return;
+        };
+        if let Some(client) = &current_client {
+            tokio::select! {
+                () = client.wait_for_calls_idle() => {}
+                () = &mut shutdown => return,
+            }
+        }
+        let refresh = async {
+            if reconnect {
+                McpClient::start(&config).await.map(|(client, tools)| {
+                    let revision = client.tools_revision();
+                    (client, tools, revision)
+                })
+            } else if let Some(client) = current_client {
+                client
+                    .refresh_tools(&config)
+                    .await
+                    .map(|(tools, revision)| (client, tools, revision))
+            } else {
+                Err(anyhow::anyhow!("MCP client disappeared before refresh"))
+            }
+        };
+        let refreshed = tokio::select! {
+            refreshed = refresh => refreshed,
+            () = &mut shutdown => return,
+        };
+        if self.shutting_down.load(Ordering::Acquire) {
+            if let Ok((client, _, _)) = refreshed {
+                client.shutdown().await;
+            }
+            return;
+        }
+        let mut servers = self.servers.write().await;
+        let Some(server) = servers.get_mut(server_id) else {
+            return;
+        };
+        match refreshed.and_then(|(client, tools, revision)| {
+            discovered_tools(server_id, &config, tools).map(|tools| (client, tools, revision))
+        }) {
+            Ok((client, tools, revision)) => {
+                server.tools = tools;
+                server.client = Some(client);
+                server.health = McpHealth::Healthy;
+                server.catalog_tools_revision = revision;
+                server.catalog_coherent = true;
+            }
+            Err(error) => {
+                eprintln!("MCP server {server_id} refresh failed: {error:#}");
+                if refreshing_stale_catalog {
+                    server.catalog_coherent = false;
+                }
+                server.mark_unavailable();
+            }
+        }
+    }
+
+    async fn mark_server_unavailable(&self, server_id: &str) {
+        if let Some(server) = self.servers.write().await.get_mut(server_id) {
+            server.mark_unavailable();
+        }
+    }
+
+    async fn select_exact_route(
+        &self,
+        tool: &crate::McpManifestTool,
+        exposed_name: &str,
+    ) -> Result<(Arc<McpClient>, u64), McpCallError> {
+        let servers = self.servers.read().await;
+        let Some(server) = servers.get(&tool.server_id) else {
+            return Err(McpCallError::Revoked {
+                tool: exposed_name.to_string(),
+            });
+        };
+        if !server.config.tool_enabled(&tool.raw_name) {
+            return Err(McpCallError::Revoked {
+                tool: exposed_name.to_string(),
+            });
+        }
+        if server.health != McpHealth::Healthy {
+            return Err(McpCallError::ServerUnavailable {
+                server: tool.server_id.clone(),
+            });
+        }
+        let matching_raw = server
+            .tools
+            .iter()
+            .filter(|current| current.raw_name == tool.raw_name)
+            .collect::<Vec<_>>();
+        if matching_raw.is_empty() {
+            return Err(McpCallError::ServerUnavailable {
+                server: tool.server_id.clone(),
+            });
+        }
+        if server.config.semantic_fingerprint() != tool.server_config_fingerprint
+            || matching_raw
+                .iter()
+                .all(|current| contract_fingerprint(current) != tool.contract_fingerprint)
+        {
+            return Err(McpCallError::ContractChanged {
+                tool: exposed_name.to_string(),
+            });
+        }
+        let Some(client) = server.client.clone() else {
+            return Err(McpCallError::ServerUnavailable {
+                server: tool.server_id.clone(),
+            });
+        };
+        Ok((client, server.catalog_tools_revision))
+    }
+}
+
+fn unavailable_server(config: McpServerConfig) -> ServerState {
+    ServerState {
+        config,
+        client: None,
+        tools: Vec::new(),
+        health: McpHealth::Unavailable,
+        catalog_tools_revision: 0,
+        catalog_coherent: true,
+        route_lock: Arc::new(Mutex::new(())),
+    }
+}
+
+fn validate_selection_shape(
+    selection: &McpSessionSelection,
+) -> Result<BTreeMap<String, BTreeSet<String>>, McpManagerError> {
+    if selection.inventory_revision.is_empty()
+        || selection.inventory_revision.len() > MAX_REVISION_BYTES
+        || selection.servers.len() > MAX_SELECTED_SERVERS
+    {
+        return Err(McpManagerError::SelectionInvalid {
+            message: "invalid inventory revision or too many selected servers".to_string(),
+        });
+    }
+    if selection
+        .servers
+        .windows(2)
+        .any(|pair| !strictly_utf16_ordered(&pair[0].server, &pair[1].server))
+    {
+        return Err(McpManagerError::SelectionInvalid {
+            message: "selected MCP server identities must be sorted and unique".to_string(),
+        });
+    }
+    let mut selected = BTreeMap::new();
+    let mut tool_count = 0_usize;
+    for server in &selection.servers {
+        if server.server.is_empty()
+            || server.server.len() > MAX_SERVER_ID_BYTES
+            || server.tools.is_empty()
+        {
+            return Err(McpManagerError::SelectionInvalid {
+                message: "selected servers and tool lists must be nonempty".to_string(),
+            });
+        }
+        if server
+            .tools
+            .windows(2)
+            .any(|pair| !strictly_utf16_ordered(&pair[0], &pair[1]))
+        {
+            return Err(McpManagerError::SelectionInvalid {
+                message: format!(
+                    "MCP server {} tool identities must be sorted and unique",
+                    server.server
+                ),
+            });
+        }
+        let tools = server.tools.iter().cloned().collect::<BTreeSet<_>>();
+        if tools
+            .iter()
+            .any(|tool| tool.is_empty() || tool.len() > MAX_RAW_TOOL_NAME_BYTES)
+        {
+            return Err(McpManagerError::SelectionInvalid {
+                message: format!(
+                    "MCP server {} has an empty or over-limit tool name",
+                    server.server
+                ),
+            });
+        }
+        tool_count = tool_count.saturating_add(tools.len());
+        if selected.insert(server.server.clone(), tools).is_some() {
+            return Err(McpManagerError::SelectionInvalid {
+                message: format!("duplicate MCP server {}", server.server),
+            });
+        }
+    }
+    if tool_count > MAX_TOOLS {
+        return Err(McpManagerError::SelectionInvalid {
+            message: format!("MCP selection has more than {MAX_TOOLS} tools"),
+        });
+    }
+    Ok(selected)
+}
+
+fn strictly_utf16_ordered(left: &str, right: &str) -> bool {
+    left.encode_utf16().cmp(right.encode_utf16()).is_lt()
+}
+
+fn contract_fingerprint(tool: &DiscoveredTool) -> String {
+    crate::fingerprint_json(&serde_json::json!({
+        "server_id": tool.server_id,
+        "raw_name": tool.raw_name,
+        "description": tool.description,
+        "input_schema": crate::canonical_json(&tool.input_schema),
+    }))
+}
+
+#[cfg(test)]
+#[path = "manager_tests.rs"]
+mod tests;

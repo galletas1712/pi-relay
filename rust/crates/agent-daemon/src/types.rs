@@ -1,3 +1,4 @@
+use agent_mcp::McpSessionSnapshot;
 use agent_session::{AgentSession, SessionAction};
 use agent_store::{PostCompactionDispatchLease, SessionConfig};
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,29 @@ pub(crate) struct RpcRequest {
     pub(crate) method: String,
     #[serde(default)]
     pub(crate) params: Value,
+}
+
+impl From<agent_mcp::McpManagerError> for RpcError {
+    fn from(error: agent_mcp::McpManagerError) -> Self {
+        match error {
+            agent_mcp::McpManagerError::InventoryChanged { current_revision } => Self {
+                code: "mcp_inventory_changed".to_string(),
+                message: "MCP inventory changed; refresh and review the selection".to_string(),
+                data: json!({ "current_revision": current_revision }),
+            },
+            agent_mcp::McpManagerError::SelectionInvalid { message } => {
+                Self::new("mcp_selection_invalid", message)
+            }
+            agent_mcp::McpManagerError::Unavailable { server } => Self::new(
+                "mcp_unavailable",
+                format!("selected MCP server {server} is unavailable"),
+            ),
+            agent_mcp::McpManagerError::Catalog(error) => Self::new(
+                "mcp_selection_invalid",
+                format!("invalid MCP catalog: {error:#}"),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -41,6 +65,7 @@ pub(crate) struct DispatchAction {
     pub(crate) post_compaction_dispatch_lease: Option<PostCompactionDispatchLease>,
     pub(crate) action: SessionAction,
     pub(crate) config: SessionConfig,
+    pub(crate) mcp_snapshot: McpSessionSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +98,7 @@ pub(crate) enum RpcMethod {
     HistoryContext,
     HistorySwitch,
     TurnResume,
+    McpInventory,
     ToolsList,
     CompactionRequest,
     DelegationStartFull,
@@ -117,6 +143,7 @@ impl RpcMethod {
             "history.context" => Some(Self::HistoryContext),
             "history.switch" => Some(Self::HistorySwitch),
             "turn.resume" => Some(Self::TurnResume),
+            "mcp.inventory" => Some(Self::McpInventory),
             "tools.list" => Some(Self::ToolsList),
             "compaction.request" => Some(Self::CompactionRequest),
             "delegation.start_full" => Some(Self::DelegationStartFull),

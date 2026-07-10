@@ -26,6 +26,7 @@ hierarchical subagent machinery from the TypeScript fork.
 | `agent-store` | Postgres-only session/transcript/queue/action/event persistence and recovery. | [docs/modules/agent-store.md](docs/modules/agent-store.md) |
 | `agent-provider` | `ModelProvider` plus OpenAI/Codex and Anthropic adapters. | [docs/modules/agent-provider.md](docs/modules/agent-provider.md) |
 | `agent-tools` | `AgentTool`, `ToolRegistry`, and builtins: `apply_patch` / `str_replace_based_edit_tool`, `Bash`, `web_search`, `web_fetch`, `LoadSkill`, and delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). | [docs/modules/agent-tools.md](docs/modules/agent-tools.md) |
+| `agent-mcp` | Session-scoped local MCP stdio clients, New Session inventory/selection, deterministic frozen manifests, and result normalization. | [docs/plans/mcp-client.md](docs/plans/mcp-client.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch. | [docs/modules/agent-daemon.md](docs/modules/agent-daemon.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt. | [docs/modules/agent-prompt.md](docs/modules/agent-prompt.md) |
 
@@ -58,8 +59,35 @@ cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
 ```
 
 `--database-url`/`DATABASE_URL` is required; `--bind`/`PI_AGENTD_BIND` defaults
-to `127.0.0.1:8787`. The daemon creates its schema on startup but does not run
-old-session migrations automatically.
+to `127.0.0.1:8787`. Optional local MCP configuration is selected with
+`--mcp-config PATH` or `PI_AGENTD_MCP_CONFIG`; its typed JSON shape and trust
+model are documented in [`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
+For example:
+
+```json
+{
+  "servers": {
+    "workspace": {
+      "command": "npx",
+      "args": ["-y", "@example/workspace-mcp"],
+      "cwd": "/trusted/workspace",
+      "inherit_env": ["EXAMPLE_TOKEN"],
+      "enabled_tools": ["read_file", "search"],
+      "call_timeout_ms": 30000,
+      "parallel_calls": 1
+    }
+  }
+}
+```
+
+All configured servers appear as New Session inventory sources. Operators use
+`enabled_tools` (or explicit `allow_all_tools: true`) as the hard allowlist;
+there are no required/optional or subagent-exposure settings. Users then choose
+the exact session subset in the New Session UI. Existing sessions and all their
+full/read-only children keep that frozen subset.
+
+The daemon creates its schema on startup but does not run old-session
+migrations automatically.
 
 ## Run The Web UI
 

@@ -1063,6 +1063,7 @@ mod tests {
                 prompt_cache: None,
             },
             metadata: json!({}),
+            mcp_manifest: None,
         }
     }
 
@@ -1088,6 +1089,76 @@ mod tests {
             .await
             .expect("session starts");
         config
+    }
+
+    #[tokio::test]
+    async fn tool_claim_is_a_single_pending_to_running_transition_with_one_start_event() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "tool-claim-once";
+        create_session(store, session_id).await;
+        let (_, actions) = store
+            .persist_outputs(
+                session_id,
+                crate::OutputBatch::new(
+                    &[],
+                    None,
+                    &[],
+                    &[SessionAction::RequestTool {
+                        action_id: ActionId(1),
+                        turn_id: TurnId(1),
+                        tool_call: ToolCall {
+                            id: ToolCallId::from_u64(1),
+                            tool_name: "Bash".to_string(),
+                            args_json: r#"{"command":"true"}"#.to_string(),
+                        },
+                    }],
+                ),
+            )
+            .await
+            .expect("tool action persists");
+        let action = actions.first().expect("tool dispatch persists");
+
+        let first = store
+            .mark_action_running_and_event(
+                session_id,
+                &action.row_id,
+                &action.attempt_id,
+                EventType::ToolStarted,
+            )
+            .await
+            .expect("first claim succeeds");
+        let duplicate = store
+            .mark_action_running_and_event(
+                session_id,
+                &action.row_id,
+                &action.attempt_id,
+                EventType::ToolStarted,
+            )
+            .await
+            .expect("duplicate claim is a no-op");
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].event, EventType::ToolStarted);
+        assert!(duplicate.is_empty());
+        let status: String = sqlx::query_scalar("select status from actions where id=$1::text")
+            .bind(&action.row_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("tool status loads");
+        assert_eq!(status, ActionStatus::Running.as_str());
+        let started_count = store
+            .events_after(session_id, None)
+            .await
+            .expect("events load")
+            .into_iter()
+            .filter(|event| event.event == EventType::ToolStarted)
+            .count();
+        assert_eq!(started_count, 1);
+        db.cleanup().await;
     }
 
     #[tokio::test]

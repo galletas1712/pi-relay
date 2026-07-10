@@ -3,6 +3,7 @@ mod actions;
 mod compaction;
 mod delegations;
 mod events;
+mod mcp;
 mod outputs;
 mod projects;
 mod queue;

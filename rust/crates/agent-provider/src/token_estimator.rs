@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+use agent_tools::ProviderTool;
+
 use crate::{ModelTranscriptEntry, PromptSections, ProviderResult};
 
 // The local token estimator only ever runs for OpenAI: Claude sessions count
@@ -40,14 +42,42 @@ pub fn estimate_model_input_tokens(
     prompt: &PromptSections,
     transcript: &[ModelTranscriptEntry],
 ) -> ProviderResult<usize> {
-    Ok(estimate_model_input(prompt, transcript)?.tokens)
+    estimate_model_input_tokens_with_tools(prompt, transcript, &[])
+}
+
+pub fn estimate_model_input_tokens_with_tools(
+    prompt: &PromptSections,
+    transcript: &[ModelTranscriptEntry],
+    tools: &[ProviderTool],
+) -> ProviderResult<usize> {
+    Ok(estimate_model_input_with_tools(prompt, transcript, tools)?.tokens)
 }
 
 pub fn estimate_model_input(
     prompt: &PromptSections,
     transcript: &[ModelTranscriptEntry],
 ) -> ProviderResult<TokenEstimate> {
-    Ok(prompt_estimate(prompt)?.saturating_add(estimate_transcript_tokens(prompt, transcript)?))
+    estimate_model_input_with_tools(prompt, transcript, &[])
+}
+
+pub fn estimate_model_input_with_tools(
+    prompt: &PromptSections,
+    transcript: &[ModelTranscriptEntry],
+    tools: &[ProviderTool],
+) -> ProviderResult<TokenEstimate> {
+    let tools = if tools.is_empty() {
+        TokenEstimate::from_model_visible_bytes(0)
+    } else {
+        serialized_estimate(
+            &tools
+                .iter()
+                .map(|tool| &tool.declaration)
+                .collect::<Vec<_>>(),
+        )?
+    };
+    Ok(prompt_estimate(prompt)?
+        .saturating_add(estimate_transcript_tokens(prompt, transcript)?)
+        .saturating_add(tools))
 }
 
 pub fn estimate_transcript_tokens(
@@ -261,5 +291,23 @@ mod token_estimator_tests {
         }];
 
         assert!(estimate_transcript_tokens(&PromptSections::default(), &transcript).is_err());
+    }
+
+    #[test]
+    fn model_input_estimator_includes_exact_provider_declarations() {
+        let prompt = PromptSections::stable("stable");
+        let transcript = vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()];
+        let tool = agent_tools::ProviderTool::function_json_named(
+            agent_vocab::ProviderKind::OpenAi,
+            "mcp__server__read",
+            "Read a value",
+            json!({"type":"object","properties":{"key":{"type":"string"}}}),
+        );
+
+        let without = estimate_model_input_with_tools(&prompt, &transcript, &[]).unwrap();
+        let with = estimate_model_input_with_tools(&prompt, &transcript, &[tool]).unwrap();
+
+        assert!(with.model_visible_bytes > without.model_visible_bytes);
+        assert!(with.tokens > without.tokens);
     }
 }

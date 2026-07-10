@@ -23,8 +23,8 @@ use crate::codec::{
 };
 use crate::config::Config;
 use crate::provider_runtime::{
-    current_pi_template, effective_prompt_profile, provider_tools_for_session, PromptProfile,
-    ProviderConnectionRegistry, SessionTitleScheduler,
+    current_pi_template, effective_prompt_profile, mcp_snapshot_for_session,
+    provider_tools_for_session, PromptProfile, ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::*;
 use crate::state::AppState;
@@ -37,6 +37,7 @@ use std::sync::{atomic::AtomicBool, Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use agent_core::AgentInput;
+use agent_mcp::{McpConfig, McpManager};
 use agent_session::SessionInput;
 use agent_store::{
     ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventType, InputPriority,
@@ -64,6 +65,10 @@ async fn main() -> Result<()> {
     let (events, _) = broadcast::channel(1024);
     let workspaces = WorkspaceManager::from_default_state_dir()?;
     let prompt_root = find_prompt_root(std::env::current_dir()?)?;
+    let mcp = match config.mcp_config.as_deref() {
+        Some(path) => McpManager::start(McpConfig::from_path(path)?).await?,
+        None => McpManager::disabled(),
+    };
     let state = AppState {
         repo,
         active: Arc::new(Mutex::new(HashMap::new())),
@@ -77,6 +82,7 @@ async fn main() -> Result<()> {
         shutting_down: Arc::new(AtomicBool::new(false)),
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        mcp,
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         workspaces,
@@ -192,6 +198,7 @@ async fn main() -> Result<()> {
     }
 
     drain_dispatch_tasks(&state).await;
+    state.mcp.shutdown().await;
     state.repo.close().await;
     Ok(())
 }
@@ -487,6 +494,7 @@ async fn dispatch_request(
         RpcMethod::HistoryContext => history_context(state, params).await,
         RpcMethod::HistorySwitch => history_switch(state, params).await,
         RpcMethod::TurnResume => turn_resume(state, params).await,
+        RpcMethod::McpInventory => mcp_inventory(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params).await,
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
         RpcMethod::DelegationStartFull => delegation_tools::rpc_start_full(state, params).await,
@@ -516,7 +524,7 @@ async fn tools_list(state: &AppState, params: Value) -> std::result::Result<Valu
         )
     })?;
     let profile = tools_list_profile(state, &params).await?;
-    let tools = provider_tools_for_session(state, provider, profile)
+    let mut tools = provider_tools_for_session(state, provider, profile)
         .into_iter()
         .map(|tool| {
             json!({
@@ -530,7 +538,68 @@ async fn tools_list(state: &AppState, params: Value) -> std::result::Result<Valu
             })
         })
         .collect::<Vec<_>>();
+    let Some(session_id) = params.get("session_id").and_then(Value::as_str) else {
+        return Ok(json!({ "tools": tools }));
+    };
+    let config = state.repo.load_session_config(session_id).await?;
+    let snapshot = mcp_snapshot_for_session(&config).map_err(|error| {
+        RpcError::new(
+            "corrupt_mcp_manifest",
+            format!("stored MCP manifest failed validation: {error:#}"),
+        )
+    })?;
+    let views = state.mcp.tool_views(&snapshot).await;
+    let views = views
+        .into_iter()
+        .map(|view| (view.exposed_name.clone(), view))
+        .collect::<BTreeMap<_, _>>();
+    tools.extend(
+        snapshot
+            .manifest()
+            .provider_tools(provider)
+            .iter()
+            .filter(|tool| snapshot.manifest().tool(&tool.name).is_some())
+            .filter_map(|tool| views.get(&tool.name).map(|view| (tool, view)))
+            .map(|(tool, view)| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                    "canonical_name": tool.canonical_name,
+                    "prompt_alias": tool.prompt_alias,
+                    "execution": tool.execution,
+                    "kind": "mcp_tool",
+                    "source": "mcp",
+                    "server": view.server,
+                    "raw_name": view.raw_name,
+                    "manifest_fingerprint": snapshot.manifest_fingerprint(),
+                    "contract_fingerprint": view.contract_fingerprint,
+                    "health": view.health,
+                })
+            }),
+    );
     Ok(json!({ "tools": tools }))
+}
+
+async fn mcp_inventory(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let provider = required_string(&params, "provider")?;
+    let provider = provider.parse::<ProviderKind>().map_err(|error| {
+        RpcError::new(
+            "invalid_provider",
+            format!("invalid provider for mcp.inventory: {error}"),
+        )
+    })?;
+    let inventory = state
+        .mcp
+        .inventory(
+            provider,
+            &crate::provider_runtime::first_party_toolsets(state, PromptProfile::Parent),
+        )
+        .await
+        .map_err(RpcError::from)?;
+    serde_json::to_value(inventory)
+        .map_err(anyhow::Error::from)
+        .map_err(RpcError::from)
 }
 
 async fn tools_list_profile(
@@ -805,6 +874,7 @@ async fn session_configure(
         system_prompt: current.system_prompt.clone(),
         provider,
         metadata,
+        mcp_manifest: current.mcp_manifest.clone(),
     };
     let events = state.repo.configure_session(&session_id, &config).await?;
     // Refresh non-provider session state while the active runtime retains the

@@ -49,6 +49,26 @@ describe("workspace scope storage", () => {
 		expect(scope.map((entry) => entry.workspaceDir)).toEqual(["repo-a", "docs", "repo-b"]);
 		expect(scope.every((entry) => entry.included)).toBe(true);
 	});
+
+	it("recovers legacy storage that excluded every declared workspace", () => {
+		const storage = memoryStorage();
+		rememberWorkspaceScope(
+			"project_1",
+			PROJECT_WORKSPACES.map((workspace) => ({
+				workspaceDir: workspace.workspace_dir,
+				kind: workspace.kind ?? "git",
+				included: false,
+				branch: "",
+			})),
+			storage,
+		);
+
+		expect(
+			workspaceScopeForProject("project_1", PROJECT_WORKSPACES, storage).every(
+				(entry) => entry.included,
+			),
+		).toBe(true);
+	});
 });
 
 describe("startWorkspacesFromScope", () => {
@@ -67,6 +87,14 @@ describe("startWorkspacesFromScope", () => {
 			{ workspaceDir: "repo-a", branch: "feature/login" },
 			{ workspaceDir: "repo-b", branch: undefined },
 		]);
+	});
+
+	it("rejects an impossible all-excluded scope instead of treating it as all", () => {
+		expect(() =>
+			startWorkspacesFromScope([
+				{ workspaceDir: "repo-a", kind: "git", included: false, branch: "" },
+			]),
+		).toThrow("At least one project workspace must be selected");
 	});
 });
 

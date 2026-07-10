@@ -2761,14 +2761,6 @@ fn response_tools(
 }
 
 fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
-    let mut tools = tools.to_vec();
-    tools.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.canonical_name.cmp(&right.canonical_name))
-    });
     tools.iter().map(|tool| tool.declaration.clone()).collect()
 }
 
@@ -4518,7 +4510,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_body_sorts_tools_for_cache_stability() {
+    fn responses_body_preserves_snapshot_tool_order() {
         let body = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
@@ -4550,8 +4542,8 @@ mod tests {
         )
         .expect("responses body renders");
 
-        assert_eq!(body["tools"][0]["name"], "read");
-        assert_eq!(body["tools"][1]["name"], "write");
+        assert_eq!(body["tools"][0]["name"], "write");
+        assert_eq!(body["tools"][1]["name"], "read");
     }
 
     #[test]

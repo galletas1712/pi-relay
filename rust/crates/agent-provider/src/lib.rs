@@ -20,6 +20,7 @@ mod transcript;
 
 pub use token_estimator::{
     approx_tokens_from_byte_count, estimate_model_input, estimate_model_input_tokens,
+    estimate_model_input_tokens_with_tools, estimate_model_input_with_tools,
     estimate_transcript_tokens, TokenEstimate,
 };
 pub use transcript::normalize_transcript_for_provider;

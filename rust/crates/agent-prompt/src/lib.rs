@@ -14,6 +14,22 @@ pub struct ToolSpec {
     pub prompt_alias: String,
 }
 
+fn mcp_servers_markdown(servers: &[PromptMcpServer]) -> String {
+    servers
+        .iter()
+        .map(|server| {
+            let tools = server
+                .tools
+                .iter()
+                .map(|tool| format!("`{tool}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("- {}: {tools}", server.server)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl ToolSpec {
     pub fn new(
         name: impl Into<String>,
@@ -148,6 +164,13 @@ pub struct PromptContext {
     pub tools: Vec<ToolSpec>,
     pub skills: Vec<Skill>,
     pub subagent_roles: Vec<SubagentRole>,
+    pub mcp_servers: Vec<PromptMcpServer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptMcpServer {
+    pub server: String,
+    pub tools: Vec<String>,
 }
 
 pub fn load_pi_md(repo_root: &Path) -> std::io::Result<String> {
@@ -206,6 +229,9 @@ fn template_context(ctx: &PromptContext) -> Value {
         },
         "subagent_roles": {
             "catalog": subagent_role_catalog_json(&ctx.subagent_roles),
+        },
+        "mcp": {
+            "servers_markdown": mcp_servers_markdown(&ctx.mcp_servers),
         },
     })
 }
@@ -413,6 +439,7 @@ mod tests {
                 .collect(),
             skills,
             subagent_roles: vec![SubagentRole::new("reviewer", "Review artifacts.")],
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -428,6 +455,42 @@ mod tests {
         assert!(!rendered.contains("Packaged subagent roles"));
         assert!(!rendered.contains("delegate_readonly_tasks"));
         assert!(!rendered.contains("delegate_writing_task"));
+    }
+
+    #[test]
+    fn prompt_mcp_section_is_conditional_and_contains_names_only() {
+        let empty = render_prompt(
+            TEST_PI_MD,
+            &ctx(PromptProfile::Parent, vec!["Bash"], Vec::new()),
+        );
+        assert!(!empty.contains("Selected MCP tools"));
+
+        let mut selected = ctx(PromptProfile::Parent, vec!["Bash"], Vec::new());
+        selected.mcp_servers = vec![PromptMcpServer {
+            server: "workspace".to_string(),
+            tools: vec![
+                "mcp__workspace__read".to_string(),
+                "mcp__workspace__search".to_string(),
+            ],
+        }];
+        let rendered = render_prompt(TEST_PI_MD, &selected);
+        assert!(rendered.contains("### Selected MCP tools"));
+        assert!(rendered.contains("- workspace: `mcp__workspace__read`, `mcp__workspace__search`"));
+        let mcp_section = rendered
+            .split_once("### Selected MCP tools")
+            .expect("selected MCP heading")
+            .1
+            .split_once("## Subagent delegation")
+            .expect("following prompt section")
+            .0;
+        for forbidden in [
+            "input_schema",
+            "catalog_fingerprint",
+            "healthy",
+            "connection epoch",
+        ] {
+            assert!(!mcp_section.contains(forbidden));
+        }
     }
 
     #[test]

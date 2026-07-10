@@ -10,6 +10,7 @@ impl PostgresAgentStore {
         &self,
         session_id: &str,
         leaf_id: &str,
+        toolset_fingerprint: &str,
     ) -> Result<Option<TokenUsageEstimate>> {
         let row = sqlx::query(
             r#"
@@ -31,6 +32,7 @@ impl PostgresAgentStore {
                 where a.session_id=$1
                     and a.kind='model'
                     and a.status in ('completed','error')
+                    and a.result->>'toolset_fingerprint'=$3::text
                     and a.result->'usage' is not null
                     and (
                         a.result->'usage'->>'total_tokens' is not null
@@ -56,6 +58,7 @@ impl PostgresAgentStore {
         )
         .bind(session_id)
         .bind(leaf_id)
+        .bind(toolset_fingerprint)
         .fetch_all(&self.pool)
         .await?;
         let Some(first) = row.first() else {
@@ -204,6 +207,7 @@ mod tests {
                 prompt_cache: None,
             },
             metadata: json!({}),
+            mcp_manifest: None,
         }
     }
     #[tokio::test]
@@ -293,7 +297,7 @@ mod tests {
             insert into actions (id, session_id, turn_id, action_id, attempt_id, kind, status, payload, result)
             values ('model_usage_1', $1, 1, 1, 'attempt_1', 'model', 'completed',
                 '{"context_leaf_id":"leaf_turn1_done"}'::jsonb,
-                '{"usage":{"input_tokens":100,"output_tokens":25,"total_tokens":125}}'::jsonb)
+                '{"mcp_manifest_fingerprint":"manifest_v1","toolset_fingerprint":"tools_v1","usage":{"input_tokens":100,"output_tokens":25,"total_tokens":125}}'::jsonb)
             "#,
         )
         .bind(session_id)
@@ -302,10 +306,20 @@ mod tests {
         .expect("usage action inserts");
 
         let estimate = store
-            .latest_model_token_usage_estimate(session_id, "leaf_turn2_tool_result")
+            .latest_model_token_usage_estimate(session_id, "leaf_turn2_tool_result", "tools_v1")
             .await
             .expect("estimate loads")
             .expect("usage estimate exists");
+
+        assert!(store
+            .latest_model_token_usage_estimate(
+                session_id,
+                "leaf_turn2_tool_result",
+                "different_tools"
+            )
+            .await
+            .expect("mismatched estimate query succeeds")
+            .is_none());
 
         assert_eq!(estimate.base_tokens, 125);
         assert_eq!(
