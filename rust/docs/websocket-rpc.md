@@ -506,6 +506,14 @@ the normal frontend path for a brand-new draft.
 }
 ```
 
+`provider` is optional for a new session. When omitted, the daemon selects its
+configured `default_parent_model` (or the static OpenAI `gpt-5.6-sol`/`xhigh`
+fallback if no daemon config exists) and persists that selected provider in the
+new session. An explicit value always wins. A replay with the same
+`session_id` returns the persisted session before applying defaults, so
+configuration changes do not retarget existing sessions, queued work, or
+existing action routes.
+
 Omit `project_id` to start an ephemeral host session. Ephemeral sessions are not
 assigned to a project, have no project workspace records, and use `$HOME` as
 their `outer_cwd`.

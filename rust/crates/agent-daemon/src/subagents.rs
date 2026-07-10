@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agent_store::{EventFrame, EventType, InputPriority, SessionConfig, SubagentType};
@@ -22,6 +23,17 @@ pub(crate) struct DelegationSubagentSpawn {
     pub(crate) task: String,
     pub(crate) subagent_type: SubagentType,
     pub(crate) delegation_id: String,
+}
+
+fn select_subagent_provider(
+    explicit: Option<ProviderConfig>,
+    subagent_models: &BTreeMap<String, ProviderConfig>,
+    resolved_role_name: &str,
+    parent: ProviderConfig,
+) -> ProviderConfig {
+    explicit
+        .or_else(|| subagent_models.get(resolved_role_name).cloned())
+        .unwrap_or(parent)
 }
 
 impl From<DelegationSubagentSpawn> for SubagentSpawnRequest {
@@ -75,6 +87,7 @@ pub(crate) async fn spawn_subagent(
 
     let role = resolve_skill_role(
         &state.prompt_root,
+        &state.config_root,
         &PathBuf::from(&parent_config.outer_cwd),
         &parent_config.workspaces,
         &request.role,
@@ -116,7 +129,12 @@ pub(crate) async fn spawn_subagent(
         outer_cwd: outer_cwd.clone(),
         workspaces,
         system_prompt: String::new(),
-        provider: request.provider.unwrap_or(parent_config.provider),
+        provider: select_subagent_provider(
+            request.provider,
+            &state.daemon_config.subagent_models,
+            &resolved_role_name,
+            parent_config.provider,
+        ),
         metadata: child_metadata,
         mcp_manifest: parent_config.mcp_manifest.clone(),
     };
@@ -580,5 +598,55 @@ mod tests {
         assert!(contract.contains("Do not load workflow skills"));
         assert!(contract.contains("final message/report is the durable handoff"));
         assert!(contract.contains("read-only subagent"));
+    }
+
+    #[test]
+    fn subagent_provider_precedence_preserves_full_config() {
+        let explicit = ProviderConfig {
+            kind: agent_vocab::ProviderKind::Claude,
+            model: "explicit".to_string(),
+            reasoning_effort: agent_vocab::ReasoningEffort::Low,
+            max_tokens: Some(10),
+            prompt_cache: Some(json!({"key": "explicit"})),
+        };
+        let configured = ProviderConfig {
+            kind: agent_vocab::ProviderKind::OpenAi,
+            model: "configured".to_string(),
+            reasoning_effort: agent_vocab::ReasoningEffort::High,
+            max_tokens: Some(20),
+            prompt_cache: Some(json!({"key": "configured"})),
+        };
+        let parent = ProviderConfig {
+            kind: agent_vocab::ProviderKind::OpenAi,
+            model: "parent".to_string(),
+            reasoning_effort: agent_vocab::ReasoningEffort::XHigh,
+            max_tokens: Some(30),
+            prompt_cache: Some(json!({"key": "parent"})),
+        };
+        let configured_models = BTreeMap::from([("reviewer".to_string(), configured.clone())]);
+
+        let selected = select_subagent_provider(
+            Some(explicit.clone()),
+            &configured_models,
+            "reviewer",
+            parent.clone(),
+        );
+        assert_eq!(
+            serde_json::to_value(selected).expect("serialize"),
+            serde_json::to_value(explicit).expect("serialize")
+        );
+
+        let selected =
+            select_subagent_provider(None, &configured_models, "reviewer", parent.clone());
+        assert_eq!(
+            serde_json::to_value(selected).expect("serialize"),
+            serde_json::to_value(configured).expect("serialize")
+        );
+
+        let selected = select_subagent_provider(None, &configured_models, "worker", parent.clone());
+        assert_eq!(
+            serde_json::to_value(selected).expect("serialize"),
+            serde_json::to_value(parent).expect("serialize")
+        );
     }
 }

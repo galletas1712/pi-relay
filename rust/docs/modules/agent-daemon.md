@@ -24,7 +24,9 @@ main.rs            websocket accept + JSON-RPC routing + most RPC handlers
 session_start.rs   explicit session-start pipeline: workspace materialization,
                    MCP selection validation, prompt render, atomic
                    session/manifest/output persist, initial dispatch
-config.rs          --database-url / --bind, DATABASE_URL / PI_AGENTD_BIND
+config.rs          CLI/environment parsing plus strict XDG daemon config,
+                   model defaults, MCP fallback precedence, and one-time
+                   non-overwriting packaged role/workflow bootstrap
 types.rs           RpcRequest/Response/Error, RpcMethod parse table, DispatchAction, RuntimeSession
 state.rs           AppState: repo handle, active sessions, driver locks, task registry,
                    event broadcaster, tool registry, provider connections, workspaces
@@ -38,7 +40,8 @@ rpc_views.rs       response shaping (snapshots, queue state, transcript views, s
 provider_runtime/  provider selection, model metadata scheduling, model/web-tool
                    execution, compaction, token accounting
 subagents.rs       delegation subagent spawn core: role resolution, full vs
-                   read-only workspace handling, child prompt + lifecycle events
+                   read-only workspace handling, configured role-model selection,
+                   child prompt + lifecycle events
 delegation_tools.rs     delegation tool surface (delegate_writing_task /
                    delegate_readonly_tasks / inspect_delegation /
                    cancel_delegation / steer_subagent / interrupt_subagent)
@@ -51,6 +54,18 @@ delegation_runner.rs    delegation barrier: all-terminal detect, attempt-fenced 
 handoff.rs         renders per-subagent task_prompt.md / final_message.md /
                    transcript.md from durable delegation/session state
 ```
+
+`config.rs` resolves the general configuration root as
+`$XDG_CONFIG_HOME/pi-relay` or `$HOME/.config/pi-relay`. It parses only the
+strict `config.json` daemon schema, including a default parent provider and
+per-resolved-role subagent providers; invalid configuration fails startup.
+`mcp.json` is a separately owned, manually managed optional fallback and is
+never written by bootstrap. Startup copy-bootstraps bundled role/workflow
+`SKILL.md` files only when absent and then records completion, so later
+deletions remain user-owned. Skill/role resolution is explicit workspace/home
+first, configured catalog second, packaged fallback last; workflow names are
+deduplicated across the latter two sources and roles remain hidden from
+ordinary `LoadSkill`.
 
 Subagent work runs as **delegations** (`delegate_writing_task` /
 `delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation` /

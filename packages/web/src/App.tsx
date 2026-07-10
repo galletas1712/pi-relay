@@ -499,6 +499,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [notices, setNotices] = useState<ErrorNotice[]>([]);
 	const [query, setQuery] = useState("");
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
+	const [newSessionProviderWasExplicit, setNewSessionProviderWasExplicit] = useState(false);
 	const [, setProviderConfigurationRevision] = useState(0);
 	const providerConfigurationControllerRef = useRef<ProviderConfigurationController | null>(null);
 	const providerConfigurationMountGenerationRef = useRef(0);
@@ -2776,6 +2777,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					setMcpSelection(providerChange.selection);
 				}
 				setNewSessionProvider(provider);
+				setNewSessionProviderWasExplicit(true);
 				setNewSessionSetupGeneration((generation) => generation + 1);
 				return;
 			}
@@ -2800,6 +2802,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const sessionId = selectedRef.current;
 			if (!sessionId) {
 				setNewSessionProvider(withReasoningEffort(activeProvider, effort));
+				setNewSessionProviderWasExplicit(true);
 				setNewSessionSetupGeneration((generation) => generation + 1);
 				return;
 			}
@@ -3047,7 +3050,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const params = {
 				sessionId,
 				projectId,
-				provider: newSessionProvider,
+				provider: newSessionProviderWasExplicit ? newSessionProvider : undefined,
 				metadata: {
 					title,
 					created_by: "web",
@@ -3105,6 +3108,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			mcpAuthStatus,
 			mcpAuthStatusReady,
 			newSessionProvider,
+			newSessionProviderWasExplicit,
 			openRootConversation,
 			queryClient,
 		],

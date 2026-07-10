@@ -69,6 +69,7 @@ pub(super) async fn run_tool_turn(
         let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
         load_skill_result(
             &state.prompt_root,
+            &state.config_root,
             &tool_context.cwd,
             &dispatch.config.workspaces,
             &loaded_skills,

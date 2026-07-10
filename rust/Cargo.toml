@@ -28,6 +28,8 @@ agent-mcp = { path = "crates/agent-mcp" }
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
+cap-fs-ext = "=3.4.5"
+cap-std = "=3.4.5"
 futures-util = "0.3"
 http = "1"
 oauth2 = { version = "5", default-features = false }

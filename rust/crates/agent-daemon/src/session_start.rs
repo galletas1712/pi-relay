@@ -97,7 +97,10 @@ pub(crate) async fn session_start(
         outer_cwd,
         workspaces,
         system_prompt: String::new(),
-        provider: params.provider,
+        provider: select_parent_provider(
+            params.provider,
+            &state.daemon_config.default_parent_model,
+        ),
         metadata: parent_session_metadata(params.metadata.unwrap_or_else(|| json!({}))),
         mcp_manifest,
     };
@@ -137,6 +140,13 @@ fn parent_session_metadata(metadata: Value) -> Value {
     };
     map.insert("prompt_profile".to_string(), json!("parent"));
     metadata
+}
+
+fn select_parent_provider(
+    explicit: Option<ProviderConfig>,
+    configured_default: &ProviderConfig,
+) -> ProviderConfig {
+    explicit.unwrap_or_else(|| configured_default.clone())
 }
 
 pub(crate) struct PreparedSessionStart {
@@ -278,7 +288,7 @@ async fn start_prepared_session_with_driver(
 struct StartSessionParams {
     session_id: Option<String>,
     project_id: Option<Uuid>,
-    provider: ProviderConfig,
+    provider: Option<ProviderConfig>,
     metadata: Option<Value>,
     client_input_id: Option<String>,
     priority: Option<InputPriority>,
@@ -325,4 +335,37 @@ fn home_dir_for_ephemeral_session() -> std::result::Result<PathBuf, RpcError> {
         ));
     }
     Ok(home)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_start_provider_uses_explicit_then_configured_default() {
+        let configured = ProviderConfig {
+            kind: agent_vocab::ProviderKind::Claude,
+            model: "configured".to_string(),
+            reasoning_effort: agent_vocab::ReasoningEffort::High,
+            max_tokens: Some(123),
+            prompt_cache: Some(json!({"key": "configured"})),
+        };
+        let explicit = ProviderConfig {
+            kind: agent_vocab::ProviderKind::OpenAi,
+            model: "explicit".to_string(),
+            reasoning_effort: agent_vocab::ReasoningEffort::Low,
+            max_tokens: Some(456),
+            prompt_cache: Some(json!({"key": "explicit"})),
+        };
+
+        assert_eq!(
+            serde_json::to_value(select_parent_provider(None, &configured)).expect("serialize"),
+            serde_json::to_value(&configured).expect("serialize")
+        );
+        assert_eq!(
+            serde_json::to_value(select_parent_provider(Some(explicit.clone()), &configured))
+                .expect("serialize"),
+            serde_json::to_value(&explicit).expect("serialize")
+        );
+    }
 }

@@ -59,9 +59,78 @@ cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
 ```
 
 `--database-url`/`DATABASE_URL` is required; `--bind`/`PI_AGENTD_BIND` defaults
-to `127.0.0.1:8787`. Optional MCP configuration is selected with
-`--mcp-config PATH` or `PI_AGENTD_MCP_CONFIG`; its typed JSON shape and trust
-model are documented in [`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
+to `127.0.0.1:8787`.
+
+### Daemon configuration and packaged catalogs
+
+General daemon configuration is read from
+`$XDG_CONFIG_HOME/pi-relay/config.json`; when `XDG_CONFIG_HOME` is unset or
+empty, that is `$HOME/.config/pi-relay/config.json`. In particular, a nonempty
+`XDG_CONFIG_HOME` is used directly and never gains an extra `.config`
+component. `XDG_CONFIG_HOME` and `HOME` must be absolute paths; relative
+values and parent-directory components are rejected rather than being resolved
+against the daemon's working directory. The file is optional: a missing file
+uses the stable default parent model, OpenAI `gpt-5.6-sol` with `xhigh`
+reasoning. Invalid JSON, unknown fields, and blank model names fail daemon
+startup rather than being deferred to a session or subagent.
+
+```json
+{
+  "default_parent_model": {
+    "kind": "openai",
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "xhigh",
+    "max_tokens": 32768,
+    "prompt_cache": { "key": "my-parent-cache" }
+  },
+  "subagent_models": {
+    "reviewer": {
+      "kind": "claude",
+      "model": "claude-opus-4-8",
+      "reasoning_effort": "high"
+    },
+    "repo/reviewer": {
+      "kind": "openai",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "high"
+    }
+  }
+}
+```
+
+Every provider object keeps the normal `kind`, `model`, `reasoning_effort`,
+optional `max_tokens`, and optional `prompt_cache` fields. A new parent session
+uses an explicit `session.start.provider`, otherwise `default_parent_model`,
+otherwise the static default above. A child uses its explicit override, then
+the matching resolved exposed role name in `subagent_models` (for example
+`reviewer` or `repo/reviewer`), then its persisted parent provider. Existing
+or replayed sessions retain their persisted provider and are never retargeted
+by changed defaults.
+
+On first startup, the daemon bootstrap-copies its packaged
+`subagent-roles/*/SKILL.md` and `workflows/*/SKILL.md` into this configuration
+directory. It creates only absent files, never changes permissions or contents
+of existing files, and writes a completion marker so deliberately deleted
+catalog entries stay deleted on future starts. Workspace/home explicit skills
+and roles retain their current precedence. For parent workflow skills and
+subagent-role catalog entries, configured catalog files override same-named
+packaged files, while missing configured entries fall back to the package.
+Roles remain out of ordinary `LoadSkill` discovery; subagents cannot load
+workflow skills. Bootstrap opens each owned configuration component through
+no-follow directory handles, rejecting symlinked roots, catalogs, entries, and
+leaves rather than writing outside the configured configuration home. Each new
+leaf is fully written and synced to a unique hidden staging leaf in the
+already-open configuration root, then capability-published with a no-replace
+hard link. The hidden staging leaves are intentionally retained: after a
+failure their names cannot safely be deleted without risking a concurrently
+created user file.
+
+Optional MCP configuration is selected in this order:
+`--mcp-config PATH`, `PI_AGENTD_MCP_CONFIG`, an already-existing
+`<config-root>/mcp.json`, then disabled. The daemon never creates, edits,
+merges, renames, or chmods that `mcp.json`; it is intentionally separate from
+`config.json`. Its typed JSON shape and trust model are documented in
+[`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
 When that configuration contains OAuth routes, the daemon stores their
 credentials in `mcp-oauth-credentials.json` directly beneath its existing
 `$XDG_STATE_HOME/pi-relay` state root (or `~/.local/state/pi-relay` when

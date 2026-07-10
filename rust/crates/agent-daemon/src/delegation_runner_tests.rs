@@ -884,6 +884,8 @@ async fn test_env() -> Option<TestEnv> {
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
         prompt_root: cwd.path().to_path_buf(),
+        config_root: cwd.path().to_path_buf(),
+        daemon_config: crate::config::DaemonConfig::default(),
         pause_subagent_control_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         subagent_control_committed: Arc::new(tokio::sync::Notify::new()),
         fail_subagent_control_reload_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(
@@ -974,7 +976,9 @@ fn test_app_state(
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
+        config_root: prompt_root.clone(),
         prompt_root,
+        daemon_config: crate::config::DaemonConfig::default(),
         pause_subagent_control_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         subagent_control_committed: Arc::new(tokio::sync::Notify::new()),
         fail_subagent_control_reload_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(
@@ -1748,6 +1752,8 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
         session_titles: SessionTitleScheduler::default(),
         workspaces: WorkspaceManager::for_tests(restarted_state_dir.path().to_path_buf()),
         prompt_root: env.cwd.path().to_path_buf(),
+        config_root: env.cwd.path().to_path_buf(),
+        daemon_config: crate::config::DaemonConfig::default(),
         pause_subagent_control_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         subagent_control_committed: Arc::new(tokio::sync::Notify::new()),
         fail_subagent_control_reload_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(

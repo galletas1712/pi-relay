@@ -694,10 +694,10 @@ describe("App workspace route identity integration", () => {
 					servers: [{ server: "workspace", tools: ["read", "write"] }],
 				});
 			} else if (setupEdit === "model") {
-				expect(first.provider.model).toBe("gpt-5.6-sol");
+				expect(first.provider).toBeUndefined();
 				expect(second.provider.model).toBe("gpt-5.6-terra");
 			} else if (setupEdit === "effort") {
-				expect(first.provider.reasoning_effort).toBe("xhigh");
+				expect(first.provider).toBeUndefined();
 				expect(second.provider.reasoning_effort).toBe("high");
 			}
 
@@ -885,11 +885,7 @@ describe("App workspace route identity integration", () => {
 		expect(params).toEqual({
 			sessionId: params.sessionId,
 			projectId: "project-1",
-			provider: {
-				kind: "openai",
-				model: "gpt-5.6-sol",
-				reasoning_effort: "xhigh",
-			},
+			provider: undefined,
 			metadata: {
 				title: "start combined setup",
 				created_by: "web",
