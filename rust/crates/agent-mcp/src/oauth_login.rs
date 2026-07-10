@@ -4,9 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use rmcp::transport::auth::{AuthError, OAuthClientConfig, OAuthHttpClient, OAuthState};
 use rmcp::transport::AuthorizationManager;
 use rmcp::transport::AuthorizationSession;
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -567,7 +570,8 @@ impl OAuthCoordinator {
         setup: &mut FlowSetup,
         start_tx: &mut Option<StartSender>,
     ) -> Result<PreparedFlow, McpOAuthLoginError> {
-        let callback_path = format!("/oauth/callback/{}", setup.login_id);
+        let callback_id = callback_id_from_server_url(&setup.server_url)?;
+        let callback_path = format!("/callback/{callback_id}");
         let listener = CallbackListener::bind(setup.callback_port, callback_path)
             .await
             .map_err(|_| McpOAuthLoginError::CallbackBind)?;
@@ -809,6 +813,17 @@ impl OAuthCoordinator {
             };
         }
     }
+}
+
+fn callback_id_from_server_url(server_url: &str) -> Result<String, McpOAuthLoginError> {
+    let mut parsed = reqwest::Url::parse(server_url).map_err(|_| McpOAuthLoginError::Discovery)?;
+    if parsed.host_str().is_none() {
+        return Err(McpOAuthLoginError::Discovery);
+    }
+    parsed.set_fragment(None);
+
+    let digest = Sha256::digest(parsed.as_str().as_bytes());
+    Ok(URL_SAFE_NO_PAD.encode(&digest[..9]))
 }
 
 async fn start_authorization(

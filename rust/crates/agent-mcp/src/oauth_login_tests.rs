@@ -14,6 +14,41 @@ use super::*;
 pub(crate) static CALLBACK_PORT_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+#[test]
+fn callback_id_is_bound_to_canonical_server_url_without_fragment() {
+    let callback_id = callback_id_from_server_url("https://mcp.example.com/mcp?tenant=one")
+        .expect("server URL should parse");
+    let same_without_fragment =
+        callback_id_from_server_url("https://mcp.example.com/mcp?tenant=one#unused")
+            .expect("server URL should parse");
+    let different_path = callback_id_from_server_url("https://mcp.example.com/sse?tenant=one")
+        .expect("server URL should parse");
+    let different_query = callback_id_from_server_url("https://mcp.example.com/mcp?tenant=two")
+        .expect("server URL should parse");
+    let different_origin = callback_id_from_server_url("https://mcp.example.com:8443/mcp")
+        .expect("server URL should parse");
+
+    assert_eq!(callback_id, same_without_fragment);
+    assert_ne!(callback_id, different_path);
+    assert_ne!(callback_id, different_query);
+    assert_ne!(callback_id, different_origin);
+    assert_eq!(callback_id.len(), 12);
+    assert!(callback_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric()
+            || character == '-'
+            || character == '_'));
+}
+
+#[test]
+fn callback_redirect_path_matches_codex_shape() {
+    let callback_id = callback_id_from_server_url("https://mcp.example.com/mcp?tenant=one")
+        .expect("server URL should parse");
+
+    assert_eq!(format!("/callback/{callback_id}").len(), 22);
+    assert_eq!(format!("/callback/{callback_id}"), "/callback/XuuuHAzzHOni");
+}
+
 #[tokio::test]
 async fn rmcp_dynamic_login_follows_discovery_and_registration_redirects() {
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
@@ -49,6 +84,16 @@ async fn rmcp_dynamic_login_follows_discovery_and_registration_redirects() {
     assert!(!authorization["code_challenge"][0].is_empty());
     assert!(!authorization["state"][0].is_empty());
     let redirect_uri = authorization["redirect_uri"][0].clone();
+    assert_eq!(
+        reqwest::Url::parse(&redirect_uri)
+            .expect("redirect URI")
+            .path(),
+        format!(
+            "/callback/{}",
+            callback_id_from_server_url(&format!("{}/mcp?tenant=one", server.origin))
+                .expect("server URL")
+        )
+    );
     let state = authorization["state"][0].clone();
 
     coordinator
@@ -305,6 +350,80 @@ async fn blank_configured_client_id_uses_dcr_and_persists_normalized_identity() 
 }
 
 #[tokio::test]
+async fn static_client_authorization_accepts_only_codex_callback_and_login_succeeds() {
+    let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let coordinator = OAuthCoordinator::new();
+    let config = oauth_config(
+        &server.origin,
+        OAuthConfig {
+            client_id: Some("static-client"),
+            ..OAuthConfig::default()
+        },
+    );
+    let start = coordinator
+        .begin("server", &config, Instant::now() + Duration::from_secs(5))
+        .await
+        .expect("login starts");
+    let (redirect_uri, _) = login_values(&start.authorization_url);
+    let redirect_uri = reqwest::Url::parse(&redirect_uri).expect("redirect URI");
+    let expected_callback_id =
+        callback_id_from_server_url(&format!("{}/mcp?tenant=one", server.origin))
+            .expect("fixture server URL");
+    let expected_redirect_uri = format!(
+        "http://127.0.0.1:{}/callback/{expected_callback_id}",
+        redirect_uri.port().expect("callback port")
+    );
+    assert_eq!(redirect_uri.as_str(), expected_redirect_uri);
+    server.allow_redirect_uri(expected_redirect_uri);
+
+    let mut rejected_url =
+        reqwest::Url::parse(&start.authorization_url).expect("authorization URL");
+    let rejected_query = rejected_url
+        .query_pairs()
+        .map(|(name, value)| {
+            let value = if name == "redirect_uri" {
+                "http://127.0.0.1:43210/oauth/callback/per-login-id".into()
+            } else {
+                value
+            };
+            (name.into_owned(), value.into_owned())
+        })
+        .collect::<Vec<_>>();
+    rejected_url.set_query(None);
+    rejected_url.query_pairs_mut().extend_pairs(
+        rejected_query
+            .iter()
+            .map(|(name, value)| (&**name, &**value)),
+    );
+    let no_redirects = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build HTTP client");
+    let rejected = no_redirects
+        .get(rejected_url)
+        .send()
+        .await
+        .expect("authorization server rejects incompatible redirect");
+    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let response = reqwest::get(&start.authorization_url)
+        .await
+        .expect("authorization follows exact callback");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    wait_for_finalized(&coordinator).await;
+    assert_finalized(&coordinator, "server", CredentialExpectation::Present);
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.target.starts_with("/authorize?"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn static_client_skips_dcr_and_uses_discovered_scopes() {
     let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
     let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
@@ -419,6 +538,39 @@ async fn wrong_state_is_rejected_by_rmcp() {
             .count(),
         0
     );
+}
+
+#[tokio::test]
+async fn manual_callback_requires_stable_redirect_path() {
+    let server = OAuthServer::spawn(OAuthServerOptions::default()).await;
+    let _callback_port = CALLBACK_PORT_TEST_LOCK.lock().await;
+    let coordinator = OAuthCoordinator::new();
+    let start = coordinator
+        .begin(
+            "server",
+            &oauth_config(&server.origin, OAuthConfig::default()),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("login starts");
+    let (redirect_uri, state) = login_values(&start.authorization_url);
+    let mut callback_url = reqwest::Url::parse(&redirect_uri).expect("redirect URI");
+    callback_url.set_path(&format!("/oauth/callback/{}", start.login_id));
+    callback_url
+        .query_pairs_mut()
+        .extend_pairs([("code", "authorization-code"), ("state", state.as_str())]);
+
+    assert_eq!(
+        coordinator
+            .complete("server", &start.login_id, callback_url.as_str())
+            .await,
+        Err(McpOAuthLoginError::InvalidCallback)
+    );
+    assert_finalized(&coordinator, "server", CredentialExpectation::Absent);
+    assert!(!server
+        .requests()
+        .iter()
+        .any(|request| request.target == "/token"));
 }
 
 #[tokio::test]
@@ -607,6 +759,7 @@ async fn cancel_acknowledgement_allows_immediate_restart_and_port_reuse() {
         .begin("server", &config, Instant::now() + Duration::from_secs(5))
         .await
         .expect("first login starts");
+    let first_redirect_uri = login_values(&first.authorization_url).0;
     let first_port = callback_port(&first.authorization_url);
     coordinator
         .cancel("server", &first.login_id)
@@ -623,7 +776,17 @@ async fn cancel_acknowledgement_allows_immediate_restart_and_port_reuse() {
         .begin("server", &config, Instant::now() + Duration::from_secs(5))
         .await
         .expect("cancel acknowledgement permits immediate restart");
+    let second_redirect_uri = login_values(&second.authorization_url).0;
     let second_port = callback_port(&second.authorization_url);
+    assert_ne!(first.login_id, second.login_id);
+    assert_eq!(
+        reqwest::Url::parse(&first_redirect_uri)
+            .expect("first redirect URI")
+            .path(),
+        reqwest::Url::parse(&second_redirect_uri)
+            .expect("second redirect URI")
+            .path()
+    );
     coordinator
         .cancel("server", &second.login_id)
         .await
@@ -1110,6 +1273,7 @@ pub(crate) struct OAuthServerOptions {
 pub(crate) struct OAuthServer {
     pub(crate) origin: String,
     requests: Arc<StdMutex<Vec<Request>>>,
+    allowed_redirect_uri: Arc<StdMutex<Option<String>>>,
     task: JoinHandle<()>,
 }
 
@@ -1122,6 +1286,8 @@ impl OAuthServer {
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let task_requests = requests.clone();
         let task_origin = origin.clone();
+        let allowed_redirect_uri = Arc::new(StdMutex::new(None::<String>));
+        let task_allowed_redirect_uri = allowed_redirect_uri.clone();
         let reject_mcp = Arc::new(AtomicBool::new(options.mcp_unauthorized_once));
         let refresh_failures = Arc::new(AtomicU64::new(options.refresh_failures));
         let task = tokio::spawn(async move {
@@ -1131,6 +1297,7 @@ impl OAuthServer {
                 };
                 let requests = task_requests.clone();
                 let origin = task_origin.clone();
+                let allowed_redirect_uri = task_allowed_redirect_uri.clone();
                 let reject_mcp = reject_mcp.clone();
                 let refresh_failures = refresh_failures.clone();
                 tokio::spawn(async move {
@@ -1212,6 +1379,47 @@ impl OAuthServer {
                                 })
                                 .to_string(),
                             )
+                        }
+                        target if target.starts_with("/authorize?") => {
+                            let authorization = reqwest::Url::parse(&format!("{origin}{target}"))
+                                .expect("authorization request URL");
+                            let redirect_uri = authorization
+                                .query_pairs()
+                                .find_map(|(name, value)| {
+                                    (name == "redirect_uri").then(|| value.into_owned())
+                                })
+                                .and_then(|redirect_uri| {
+                                    (allowed_redirect_uri
+                                        .lock()
+                                        .expect("allowed redirect lock")
+                                        .as_deref()
+                                        == Some(redirect_uri.as_str()))
+                                    .then(|| {
+                                        reqwest::Url::parse(&redirect_uri)
+                                            .expect("allowed redirect URI")
+                                    })
+                                });
+                            let state = authorization.query_pairs().find_map(|(name, value)| {
+                                (name == "state").then(|| value.into_owned())
+                            });
+                            match (redirect_uri, state) {
+                                (Some(mut redirect_uri), Some(state)) => {
+                                    redirect_uri.query_pairs_mut().extend_pairs([
+                                        ("code", "authorization-code"),
+                                        ("state", state.as_str()),
+                                    ]);
+                                    (
+                                        302,
+                                        format!("Location: {redirect_uri}\r\n"),
+                                        String::new(),
+                                    )
+                                }
+                                _ => (
+                                    400,
+                                    String::new(),
+                                    serde_json::json!({"error": "invalid_request"}).to_string(),
+                                ),
+                            }
                         }
                         "/register-redirect" => (
                             307,
@@ -1309,8 +1517,16 @@ impl OAuthServer {
         Self {
             origin,
             requests,
+            allowed_redirect_uri,
             task,
         }
+    }
+
+    fn allow_redirect_uri(&self, redirect_uri: String) {
+        *self
+            .allowed_redirect_uri
+            .lock()
+            .expect("allowed redirect lock") = Some(redirect_uri);
     }
 
     pub(crate) fn requests(&self) -> Vec<Request> {

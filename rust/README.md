@@ -145,7 +145,9 @@ the RFC 8707 `resource` authorization parameter are optional. A fixed
 on `127.0.0.1`. `callback_timeout_ms` defaults to five minutes. Both callback
 settings are operational and do not change route identity. Streamable HTTP
 keeps its existing URL rule for OAuth: HTTPS is required remotely, while HTTP
-is permitted for loopback; MCP resource URLs may include a query.
+is permitted for loopback; MCP resource URLs may include a query. The redirect
+path is `/callback/<stable-id>`, where the 12-character ID is derived from the
+configured MCP URL using Codex-compatible URL canonicalization.
 
 The transient, unlanded Stage 1 keys (`registration`, `client_secret_env`,
 `allowed_scopes`, `initial_scopes`, issuer pins, and trusted origins) are not

@@ -46,6 +46,7 @@ dependencies = [
  "agent-tools",
  "agent-vocab",
  "anyhow",
+ "base64",
  "futures-util",
  "http",
  "oauth2",

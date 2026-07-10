@@ -123,10 +123,10 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
   semantic route identity. Exclude callback port/timeout, metadata, DCR output,
   tokens, state, and PKCE. Preserve fixed legacy stdio and bearer fingerprints.
 - [x] Allow only the generated loopback redirect URI for the transaction: one
-  listener, one unique per-login callback path, one bounded lifetime, one
-  completion, exact state, exact method/path, bounded query, and fail-closed
-  OAuth error handling. The authorization URL is returned for explicit opening;
-  browser launch remains a caller concern.
+  listener, one stable Codex-compatible `/callback/<server-url-hash>` path, one
+  bounded lifetime, one completion, exact state, exact method/path, bounded
+  query, and fail-closed OAuth error handling. The authorization URL is returned
+  for explicit opening; browser launch remains a caller concern.
 - [x] The loopback listener runs on the daemon host. Therefore automatic
   browser callback works only when the browser can reach loopback on that same
   host. For a remote/headless daemon, the user completes authorization in

@@ -1726,7 +1726,8 @@ is one of the fixed categories `credential_store_unavailable` or
   fixed `mcp_oauth_login_already_pending` error.
 - `mcp.complete` takes `server`, `login_id`, and the **entire**
   `callback_url`. The coordinator validates the exact transaction redirect and
-  state; a bare code or state is not accepted. Success returns
+  state, including the stable Codex-compatible callback path; a bare code or
+  state is not accepted. Success returns
   `{ "completed": true }`.
 - `mcp.cancel` takes `server` and `login_id` and returns
   `{ "cancelled": true }` only after the listener and transaction are cleaned
