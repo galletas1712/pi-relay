@@ -1016,7 +1016,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		try {
 			assertServerReadAllowed();
 		} catch (error) {
-			pushNotice("error", errorMessage(error));
+			pushErrorNotice(errorMessage(error));
 			return;
 		}
 		void Promise.allSettled([
@@ -1029,7 +1029,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		mcpInventoryQuery.refetch,
 		mcpStatusQuery.isFetching,
 		mcpStatusQuery.refetch,
-		pushNotice,
+		pushErrorNotice,
 	]);
 	const refreshMcpAfterAuthChange = useCallback(async () => {
 		await Promise.allSettled([
@@ -1055,7 +1055,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (statusResult.error) {
 				setMcpLoginDialog(null);
 				void api.cancelMcpLogin(server, login.login_id).catch(() => undefined);
-				pushNotice("error", "Could not verify MCP login status");
+				pushErrorNotice("Could not verify MCP login status");
 				return;
 			}
 			setMcpLoginDialog((current) =>
@@ -1064,7 +1064,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					: current
 			);
 		} catch (error) {
-			pushNotice("error", errorMessage(error));
+			pushErrorNotice(errorMessage(error));
 		} finally {
 			setMcpAuthBusyServer(null);
 		}
@@ -1074,7 +1074,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		mcpAuthBusyServer,
 		mcpLoginContext,
 		mcpStatusQuery.refetch,
-		pushNotice,
+		pushErrorNotice,
 	]);
 	const completeMcpLogin = useCallback(async (callbackUrl: string) => {
 		if (!mcpLoginDialog) return;
@@ -1117,7 +1117,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					"mcp_oauth_login_expired:",
 				].some((code) => message.startsWith(code))
 			) {
-				pushNotice("error", message);
+				pushErrorNotice(message);
 				return;
 			}
 		}
@@ -1132,14 +1132,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		}
 		setMcpLoginDialog(null);
 		await mcpStatusQuery.refetch().catch((error) => {
-			pushNotice("error", errorMessage(error));
+			pushErrorNotice(errorMessage(error));
 		});
 	}, [
 		api,
 		assertServerMutationAllowed,
 		mcpLoginDialog,
 		mcpStatusQuery.refetch,
-		pushNotice,
+		pushErrorNotice,
 	]);
 	const logoutMcp = useCallback(async (server: string) => {
 		if (mcpAuthBusyServer) return;
@@ -1153,7 +1153,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			setNewSessionSetupGeneration((generation) => generation + 1);
 			await refreshMcpAfterAuthChange();
 		} catch (error) {
-			pushNotice("error", errorMessage(error));
+			pushErrorNotice(errorMessage(error));
 		} finally {
 			setMcpAuthBusyServer(null);
 		}
@@ -1161,7 +1161,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		api,
 		assertServerMutationAllowed,
 		mcpAuthBusyServer,
-		pushNotice,
+		pushErrorNotice,
 		refreshMcpAfterAuthChange,
 	]);
 	const cancelOrLogoutMcp = useCallback((server: string) => {
@@ -1187,7 +1187,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			void api
 				.cancelMcpLogin(stale.server, stale.login.login_id)
 				.catch(() => undefined);
-			pushNotice("error", "Could not verify MCP login status");
+			pushErrorNotice("Could not verify MCP login status");
 			return;
 		}
 		if (mcpStatusQuery.status !== "success") return;
@@ -1197,12 +1197,12 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		if (status?.auth_state === "authorization_pending") return;
 		if (!status || status.auth_kind !== "oauth") {
 			setMcpLoginDialog(null);
-			pushNotice("error", "MCP login is no longer available");
+			pushErrorNotice("MCP login is no longer available");
 			return;
 		}
 		if (status.auth_state !== "ready") {
 			setMcpLoginDialog(null);
-			pushNotice("error", "MCP login ended before authorization completed");
+			pushErrorNotice("MCP login ended before authorization completed");
 			return;
 		}
 		setMcpLoginDialog(null);
@@ -1214,7 +1214,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		mcpLoginDialog,
 		mcpStatusQuery.error,
 		mcpStatusQuery.status,
-		pushNotice,
+		pushErrorNotice,
 	]);
 	// A selected child keeps its direct parent's board visible so the child row
 	// can expose current navigation semantics. This intentionally follows only
@@ -2756,9 +2756,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					previousMcpInventoryRef.current = null;
 					mcpSelectionRef.current = providerChange.selection;
 					setMcpSelection(providerChange.selection);
-					if (providerChange.reset) {
-						pushNotice("info", "MCP selection cleared because the provider changed");
-					}
 				}
 				setNewSessionProvider(provider);
 				setNewSessionSetupGeneration((generation) => generation + 1);
@@ -2777,7 +2774,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			assertServerMutationAllowed,
 			modelLocked,
 			providerConfigurationController,
-			pushNotice,
 		],
 	);
 
