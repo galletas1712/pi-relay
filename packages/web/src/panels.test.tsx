@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	Inspector,
 	LogHeader,
+	NoticeStack,
 	RunBoardDelegationList,
 	sessionMenuItems,
 	Sidebar,
@@ -189,6 +190,21 @@ describe("LogHeader", () => {
 		expect(html).toContain(`title="Model, locked"`);
 		expect(html).toContain(`disabled=""`);
 		expect(html).not.toContain("Model is locked after the first transcript entry");
+	});
+});
+
+describe("Error notices", () => {
+	it("renders a dismiss control for an expiring error", () => {
+		const html = renderToStaticMarkup(
+			<NoticeStack
+				notices={[{ id: "error-1", text: "Could not save" }]}
+				rightOpen={false}
+				onDismiss={() => {}}
+			/>,
+		);
+
+		expect(html).toContain("Could not save");
+		expect(html).toContain('aria-label="Dismiss notification"');
 	});
 });
 

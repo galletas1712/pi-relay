@@ -23,16 +23,12 @@ export function ExportDialog({
 	entries,
 	blocks: providedBlocks,
 	onClose,
-	onCopied,
-	onDownloaded,
 	onError,
 	returnFocusFallbackRef,
 }: {
 	entries: TranscriptEntry[];
 	blocks?: ExportBlock[];
 	onClose: () => void;
-	onCopied: () => void;
-	onDownloaded: () => void;
 	onError: (error: unknown) => void;
 	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
@@ -76,7 +72,6 @@ export function ExportDialog({
 		setCopying(true);
 		try {
 			await navigator.clipboard.writeText(markdown);
-			onCopied();
 			onClose();
 		} catch (error) {
 			onError(error);
@@ -89,7 +84,6 @@ export function ExportDialog({
 	const download = () => {
 		try {
 			downloadMarkdown(`conversation-export-${new Date().toISOString().slice(0, 10)}.md`, markdown);
-			onDownloaded();
 			onClose();
 		} catch (error) {
 			onError(error);

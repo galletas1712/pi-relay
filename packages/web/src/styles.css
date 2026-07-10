@@ -1827,21 +1827,25 @@ pre {
 	display: inline-grid;
 	flex: 0 0 auto;
 	place-items: center;
+	width: 24px;
+	height: 24px;
+	margin: -4px -5px -4px 0;
 	border: 0;
+	border-radius: var(--radius-sm);
 	background: transparent;
-	padding: 1px;
+	padding: 0;
 	color: currentColor;
 	cursor: pointer;
 	pointer-events: auto;
 }
 
-.notice-toast.info {
-	color: var(--muted-foreground);
+.notice-dismiss:hover {
+	background: color-mix(in oklch, currentColor 10%, transparent);
 }
 
-.notice-toast.success {
-	border-color: color-mix(in oklch, var(--success) 30%, var(--border));
-	color: var(--success);
+.notice-dismiss:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
 }
 
 .notice-toast.error {

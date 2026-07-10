@@ -38,8 +38,6 @@ describe("ExportDialog", () => {
 						<ExportDialog
 							entries={exportEntries()}
 							onClose={close}
-							onCopied={actions.onCopied}
-							onDownloaded={actions.onDownloaded}
 							onError={actions.onError}
 						/>
 					)}
@@ -61,8 +59,6 @@ describe("ExportDialog", () => {
 
 			await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 			expect(document.activeElement).toBe(opener);
-			expect(actions.onCopied).not.toHaveBeenCalled();
-			expect(actions.onDownloaded).not.toHaveBeenCalled();
 			expect(actions.onError).not.toHaveBeenCalled();
 		},
 	);
@@ -80,8 +76,6 @@ describe("ExportDialog", () => {
 							actions.onClose();
 							close();
 						}}
-						onCopied={actions.onCopied}
-						onDownloaded={actions.onDownloaded}
 						onError={actions.onError}
 					/>
 				)}
@@ -105,8 +99,6 @@ describe("ExportDialog", () => {
 		expect(clipboardWrite).toHaveBeenCalledTimes(1);
 		expect(clipboardWrite.mock.calls[0]?.[0]).toContain("Final answer.");
 		expect(clipboardWrite.mock.calls[0]?.[0]).not.toContain("I will inspect.");
-		expect(actions.onCopied).toHaveBeenCalledTimes(1);
-		expect(actions.onDownloaded).not.toHaveBeenCalled();
 		expect(actions.onError).not.toHaveBeenCalled();
 		expect(actions.onClose).toHaveBeenCalledTimes(1);
 		expect(document.activeElement).toBe(opener);
@@ -132,8 +124,6 @@ describe("ExportDialog", () => {
 							actions.onClose();
 							close();
 						}}
-						onCopied={actions.onCopied}
-						onDownloaded={actions.onDownloaded}
 						onError={actions.onError}
 					/>
 				)}
@@ -146,9 +136,7 @@ describe("ExportDialog", () => {
 
 		await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 		expect(createObjectURL).toHaveBeenCalledTimes(1);
-		expect(actions.onDownloaded).toHaveBeenCalledTimes(1);
 		expect(actions.onClose).toHaveBeenCalledTimes(1);
-		expect(actions.onCopied).not.toHaveBeenCalled();
 		expect(actions.onError).not.toHaveBeenCalled();
 		expect(document.activeElement).toBe(opener);
 	});
@@ -165,8 +153,6 @@ describe("ExportDialog", () => {
 			<ExportDialog
 				entries={exportEntries()}
 				onClose={actions.onClose}
-				onCopied={actions.onCopied}
-				onDownloaded={actions.onDownloaded}
 				onError={actions.onError}
 			/>,
 		);
@@ -187,7 +173,6 @@ describe("ExportDialog", () => {
 		rejectCopy(error);
 		await waitFor(() => expect(actions.onError).toHaveBeenCalledWith(error));
 		expect(actions.onError).toHaveBeenCalledTimes(1);
-		expect(actions.onCopied).not.toHaveBeenCalled();
 		expect(actions.onClose).not.toHaveBeenCalled();
 		expect(screen.getByRole("button", { name: "Copy to clipboard" })).toBeTruthy();
 	});
@@ -198,8 +183,6 @@ describe("ExportDialog", () => {
 			<ExportDialog
 				entries={[]}
 				onClose={actions.onClose}
-				onCopied={actions.onCopied}
-				onDownloaded={actions.onDownloaded}
 				onError={actions.onError}
 			/>,
 		);
@@ -231,8 +214,6 @@ function DialogLauncher({
 function actionSpies() {
 	return {
 		onClose: vi.fn(),
-		onCopied: vi.fn(),
-		onDownloaded: vi.fn(),
 		onError: vi.fn(),
 	};
 }

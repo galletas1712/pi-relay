@@ -60,7 +60,7 @@ import {
 	type ProviderConfigurationTarget,
 } from "./providerConfigurationController.ts";
 import type { ConnectionStatus } from "./rpc.ts";
-import { COMMANDS, findCommand, type ParsedSlash } from "./slash.ts";
+import { findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
 import { stopSession } from "./stopSession.ts";
 import {
@@ -170,9 +170,9 @@ import type {
 	Activity,
 	DelegationSubagent,
 	EventFrame,
+	ErrorNotice,
 	McpInventory,
 	McpLoginResult,
-	Notice,
 	Project,
 	ProviderConfig,
 	ReasoningEffort,
@@ -184,8 +184,8 @@ import type {
 	TranscriptTurnsResult,
 } from "./types.ts";
 
-const MAX_NOTICES = 24;
-const NOTICE_TTL_MS = 4000;
+const MAX_ERROR_NOTICES = 24;
+const ERROR_NOTICE_TTL_MS = 4000;
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
 const SESSION_LIST_REFETCH_MS = 2000;
 const BACKGROUND_SESSION_WARM_CONCURRENCY = 2;
@@ -493,7 +493,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 	const selectedId = conversationSessionId;
 	const selectedRef = useRef<string | null>(initialSelection.conversationSessionId);
-	const [notices, setNotices] = useState<Notice[]>([]);
+	const [notices, setNotices] = useState<ErrorNotice[]>([]);
 	const [query, setQuery] = useState("");
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
 	const [, setProviderConfigurationRevision] = useState(0);
@@ -620,12 +620,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		}
 	}, []);
 
-	const pushNotice = useCallback((tone: Notice["tone"], text: string, persistent = false) => {
-		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_NOTICES + 1)), { id: randomId("notice"), tone, text, persistent }]);
+	const pushErrorNotice = useCallback((text: string, persistent = false) => {
+		if (connectionRef.current !== "open" || isConnectionLossNotice(text)) return;
+		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_ERROR_NOTICES + 1)), { id: randomId("notice"), text, persistent }]);
 	}, []);
 	const reportActionError = useCallback((error: unknown) => {
-		if (shouldReportActionError(error)) pushNotice("error", errorMessage(error));
-	}, [pushNotice]);
+		if (shouldReportActionError(error)) pushErrorNotice(errorMessage(error));
+	}, [pushErrorNotice]);
 	const dismissNotice = useCallback((noticeId: string) => {
 		setNotices((current) => current.filter((notice) => notice.id !== noticeId));
 	}, []);
@@ -643,7 +644,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		if (!expiringNotice) return;
 		const timer = window.setTimeout(() => {
 			setNotices((current) => current.filter((notice) => notice.id !== expiringNotice.id));
-		}, NOTICE_TTL_MS);
+		}, ERROR_NOTICE_TTL_MS);
 		return () => window.clearTimeout(timer);
 	}, [notices]);
 
@@ -2326,19 +2327,19 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			void foregroundReconnectInFlight.current
 				.then(reconcile)
-				.catch((error) => pushNotice("error", errorMessage(error)));
+				.catch(() => undefined);
 		},
-		[api, invalidateKnownSessionLists, pushNotice, syncActiveBranchNow],
+		[api, invalidateKnownSessionLists, syncActiveBranchNow],
 	);
 
 	const retryConnection = useCallback(() => {
 		setRetryingConnection(true);
 		void connectionRetryController.current.retry(
 			() => api.reconnect(),
-			(error) => pushNotice("error", `connection retry failed: ${errorMessage(error)}`),
+			() => undefined,
 			() => setRetryingConnection(false),
 		);
-	}, [api, pushNotice]);
+	}, [api]);
 
 	useEffect(() => {
 		const awakeHeartbeat = window.setInterval(() => {
@@ -2482,23 +2483,20 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 
 			if (event.session_id === selectedRef.current) {
-				if (event.event === "model.error") pushNotice("error", modelErrorNotice(event.data));
-				if (event.event === "compaction.requested") pushNotice("info", compactionRequestedNotice(event.data));
-				if (event.event === "compaction.completed") pushNotice("success", compactionCompletedNotice(event.data));
-				if (event.event === "compaction.error") pushNotice("error", compactionErrorNotice(event.data));
+				if (event.event === "model.error") pushErrorNotice(modelErrorNotice(event.data));
+				if (event.event === "compaction.error") pushErrorNotice(compactionErrorNotice(event.data));
 				if (event.event === "subagent.idle") {
 					const outcome = typeof event.data.outcome === "string" ? event.data.outcome : null;
-					if (outcome === "Crashed") pushNotice("error", subagentFailureNotice(event.data));
+					if (outcome === "Crashed") pushErrorNotice(subagentFailureNotice(event.data));
 				}
 				if (event.event === "turn.finished") {
 					const outcome = typeof event.data.outcome === "string" ? event.data.outcome : null;
-					if (outcome === "Interrupted") pushNotice("info", "turn interrupted");
-					if (outcome === "Crashed") pushNotice("error", "turn crashed");
+					if (outcome === "Crashed") pushErrorNotice("turn crashed");
 				}
 			}
 		},
 		[
-			pushNotice,
+			pushErrorNotice,
 			queryClient,
 			replaceSelectedCache,
 			scheduleActiveBranchSync,
@@ -2527,10 +2525,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				queryClient.invalidateQueries({ queryKey: queryKeys.projects }),
 				queryClient.invalidateQueries({ queryKey: queryKeys.systemPromptRoot }),
 				invalidateKnownSessionLists(),
-			]).catch((error) => pushNotice("error", errorMessage(error)));
+			]).catch(() => undefined);
 		});
 		const offEvent = api.onEvent((event) => handleSessionEventRef.current(event));
-		void api.connect().catch((error) => pushNotice("error", errorMessage(error)));
+		void api.connect().catch(() => undefined);
 		return () => {
 			offStatus();
 			offEvent();
@@ -2539,11 +2537,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			sessionListRefreshTimers.current.clear();
 			api.close();
 		};
-	}, [api, invalidateKnownSessionLists, pushNotice, queryClient]);
+	}, [api, invalidateKnownSessionLists, queryClient]);
 
 	useEffect(() => {
-		if (toolsQuery.error) pushNotice("error", errorMessage(toolsQuery.error));
-	}, [toolsQuery.error, pushNotice]);
+		if (toolsQuery.error) pushErrorNotice(errorMessage(toolsQuery.error));
+	}, [toolsQuery.error, pushErrorNotice]);
 
 	useEffect(() => {
 		if (projectsQuery.status !== "success") return;
@@ -2676,7 +2674,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				})
 				.catch((error) => {
 					subscribedEventSessionIds.current.delete(sessionId);
-					pushNotice("error", errorMessage(error));
+					pushErrorNotice(errorMessage(error));
 				});
 		}
 	}, [
@@ -2685,7 +2683,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		handleSessionEvent,
 		loadedSnapshot?.last_event_id,
 		loadedSnapshot?.session_id,
-		pushNotice,
+		pushErrorNotice,
 		routeRemoteReadsEnabled,
 		selectedId,
 		sessions,
@@ -2721,7 +2719,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			},
 			commit: commitConfiguredProvider,
 			fail: (target, edit, error) => {
-				pushNotice("error", `Could not update ${edit}: ${errorMessage(error)}. Try again.`, true);
+				pushErrorNotice(`Could not update ${edit}: ${errorMessage(error)}. Try again.`, true);
 				invalidateSessionList(target.projectId);
 				if (selectedRef.current === target.sessionId) {
 					void refreshSelectedSessionState(target.sessionId).catch(() => undefined);
@@ -2836,9 +2834,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			activity: result.activity,
 		}));
 		invalidateSessionList(projectId);
-		pushNotice("success", `renamed session to “${truncate(title, 80)}”`);
 		closeRenameDialog();
-	}, [api, assertServerMutationAllowed, closeRenameDialog, invalidateSessionList, patchSelectedSnapshot, pushNotice, queryClient, renameSessionId, renameValue]);
+	}, [api, assertServerMutationAllowed, closeRenameDialog, invalidateSessionList, patchSelectedSnapshot, queryClient, renameSessionId, renameValue]);
 
 	const setSessionArchived = useCallback(
 		async (session: SessionListItem, archived: boolean) => {
@@ -2870,12 +2867,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				activity: result.activity,
 			}));
 			invalidateSessionList(projectId);
-			pushNotice(
-				"success",
-				archived ? `archived “${truncate(sessionTitle(session), 80)}”` : `unarchived “${truncate(sessionTitle(session), 80)}”`,
-			);
 		},
-		[api, assertServerMutationAllowed, invalidateSessionList, loadedSnapshot, patchSelectedSnapshot, pushNotice, queryClient],
+		[api, assertServerMutationAllowed, invalidateSessionList, loadedSnapshot, patchSelectedSnapshot, queryClient],
 	);
 
 	const closeDeleteDialog = useCallback(() => {
@@ -2888,7 +2881,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		setDeleteDialog((current) => (current ? { ...current, deleting: true } : current));
 		const session = deleteDialog.session;
 		const sessionId = session.session_id;
-		const title = sessionTitle(session);
 		try {
 			const current = sessionId === selectedRef.current ? await refreshSelected(sessionId) : null;
 			const activity = current?.snapshot.activity ?? session.activity;
@@ -2914,13 +2906,12 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 
 			closeDeleteDialog();
 			invalidateSessionList(session.project_id);
-			pushNotice("success", `deleted “${truncate(title, 80)}”`);
 		} catch (error) {
 			setDeleteDialog((current) => (current?.session.session_id === sessionId ? { ...current, deleting: false } : current));
 			if (isSelectedSessionFetchError(error)) return;
 			throw error;
 		}
-	}, [api, assertServerMutationAllowed, closeDeleteDialog, deleteDialog, dropSelectedCache, invalidateSessionList, pushNotice, refreshSelected, removeSessionFromKnownSessionLists, selectSession]);
+	}, [api, assertServerMutationAllowed, closeDeleteDialog, deleteDialog, dropSelectedCache, invalidateSessionList, refreshSelected, removeSessionFromKnownSessionLists, selectSession]);
 
 	const createSession = useCallback(
 		(title?: string) => {
@@ -3171,7 +3162,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			});
 			if (result.last_event_id !== undefined) lastEventIds.current.set(sessionId, result.last_event_id);
 			invalidateSessionList(projectId);
-			pushNotice("success", restoreText !== null ? "message restored for editing" : "switched to selected history point");
 		},
 		[
 			api,
@@ -3179,7 +3169,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			assertServerReadAllowed,
 			ensureTreeIndex,
 			invalidateSessionList,
-			pushNotice,
 			refreshSelectedSessionState,
 			selectedFetchCoordinator,
 			updateSelectedCache,
@@ -3193,7 +3182,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			try {
 				assertServerMutationAllowed();
 			} catch (error) {
-				pushNotice("error", errorMessage(error));
+				pushErrorNotice(errorMessage(error));
 				return;
 			}
 			const sessionId = dialog.sessionId;
@@ -3210,7 +3199,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					reportActionError(error);
 				});
 		},
-		[assertServerMutationAllowed, getSelectedCache, historyDialog, reportActionError, switchToTarget],
+		[assertServerMutationAllowed, getSelectedCache, historyDialog, pushErrorNotice, reportActionError, switchToTarget],
 	);
 
 	const promoteQueuedInput = useCallback(
@@ -3223,11 +3212,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue!));
 			}
 			await queryClient.invalidateQueries({ queryKey: queryKeys.sessions(projectId) });
-			if (!result.promoted && result.status !== "queued") {
-				pushNotice("info", "message is already being processed");
-			}
 		},
-		[api, assertServerMutationAllowed, pushNotice, queryClient, requireSelected, updateSelectedCache],
+		[api, assertServerMutationAllowed, queryClient, requireSelected, updateSelectedCache],
 	);
 
 	const updateQueuedInput = useCallback(
@@ -3238,11 +3224,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const queueRevision = selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current.snapshot?.queue_revision : undefined;
 			const result = await api.updateQueuedInput(sessionId, inputId, textContent(text), queueRevision);
 			updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue));
-			if (!result.updated && result.reason === "queue_changed") pushNotice("info", "queue changed; refreshed");
-			if (!result.updated && result.reason === "not_editable") pushNotice("info", "message is no longer editable");
 			invalidateSessionList(projectId);
 		},
-		[api, assertServerMutationAllowed, invalidateSessionList, pushNotice, requireSelected, updateSelectedCache],
+		[api, assertServerMutationAllowed, invalidateSessionList, requireSelected, updateSelectedCache],
 	);
 
 	const cancelQueuedInput = useCallback(
@@ -3252,11 +3236,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const queueRevision = selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current.snapshot?.queue_revision : undefined;
 			const result = await api.cancelQueuedInput(sessionId, inputId, queueRevision);
 			updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue));
-			if (!result.cancelled && result.reason === "queue_changed") pushNotice("info", "queue changed; refreshed");
-			if (!result.cancelled && result.reason === "not_editable") pushNotice("info", "message is no longer cancellable");
 			invalidateSessionList();
 		},
-		[api, assertServerMutationAllowed, invalidateSessionList, pushNotice, requireSelected, updateSelectedCache],
+		[api, assertServerMutationAllowed, invalidateSessionList, requireSelected, updateSelectedCache],
 	);
 
 	const reorderQueuedInput = useCallback(
@@ -3274,10 +3256,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const queueRevision = cache.sessionId === sessionId ? cache.snapshot?.queue_revision : undefined;
 			const result = await api.reorderQueuedFollowUps(sessionId, nextOrder, queueRevision);
 			updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue));
-			if (!result.reordered && result.reason === "queue_changed") pushNotice("info", "queue changed; refreshed");
 			invalidateSessionList();
 		},
-		[api, assertServerMutationAllowed, invalidateSessionList, loadedSnapshot?.queued_inputs, pushNotice, requireSelected, updateSelectedCache],
+		[api, assertServerMutationAllowed, invalidateSessionList, loadedSnapshot?.queued_inputs, requireSelected, updateSelectedCache],
 	);
 
 	const stopActiveTurn = useCallback(async () => {
@@ -3329,7 +3310,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			setResumingTurnId(activeLeafId);
 			try {
-				const result = await api.resumeTurn({
+				await api.resumeTurn({
 					sessionId,
 					leafId: activeLeafId,
 					expectedActiveLeafId: current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
@@ -3338,12 +3319,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					syncActiveBranchNow(sessionId),
 					queryClient.invalidateQueries({ queryKey: queryKeys.sessions(projectId) }),
 				]);
-				pushNotice("success", result.outcome === "Interrupted" ? "continued turn" : "retry started");
 			} finally {
 				setResumingTurnId(null);
 			}
 		},
-		[api, assertServerMutationAllowed, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, pushNotice, queryClient, refreshSelected, requireSelected, syncActiveBranchNow],
+		[api, assertServerMutationAllowed, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, queryClient, refreshSelected, requireSelected, syncActiveBranchNow],
 	);
 
 	const openHistoryDialog = useCallback(
@@ -3415,11 +3395,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		) => {
 			const name = parsed.name;
 			const args = parsed.args;
-			const pushActionNotice = (tone: Notice["tone"], text: string) => {
-				pushNotice(tone, `/${name}: ${text}`);
-			};
 			if (!name || name === "help") {
-				pushActionNotice("info", `commands: ${COMMANDS.map((command) => `/${command.name}`).join(", ")}`);
+				composerHandleRef.current?.setValue("/");
+				requestAnimationFrame(() => composerHandleRef.current?.focus());
 				return;
 			}
 			if (!findCommand(name)) {
@@ -3427,8 +3405,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			if (name === "system") {
 				if (args) {
-					pushActionNotice("info", "/system is read-only; edit PI.md in the repo to change the prompt");
-					return;
+					throw new Error("/system is read-only; edit PI.md in the repo to change the prompt");
 				}
 				if (!submittedSessionId || submittedSnapshot?.session_id !== submittedSessionId) {
 					throw new Error("/system requires a selected session");
@@ -3501,13 +3478,12 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			if (name === "compact") {
 				assertServerMutationAllowed();
-				const result = await api.requestCompaction(sessionId);
-				pushActionNotice("success", `compaction requested ${result.action_row_id ?? ""}`.trim());
+				await api.requestCompaction(sessionId);
 				return;
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[api, assertServerMutationAllowed, assertServerReadAllowed, commitSelectedSnapshot, openHistoryDialog, pushNotice, queryClient],
+		[api, assertServerMutationAllowed, assertServerReadAllowed, commitSelectedSnapshot, openHistoryDialog, queryClient],
 	);
 
 	const submitComposer = useCallback(
@@ -3533,14 +3509,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					},
 					startNewSession,
 					reportError: (error) => {
-						if (shouldReportActionError(error)) pushNotice("error", errorMessage(error));
+						if (shouldReportActionError(error)) pushErrorNotice(errorMessage(error));
 					},
 				});
 			} finally {
 				setSending(false);
 			}
 		},
-		[api, assertServerMutationAllowed, cachedHistoryAvailable, connectionRemoteActionBlockedReason, executeSlash, getSelectedCache, pushNotice, queueUserInput, sending, startNewSession],
+		[api, assertServerMutationAllowed, cachedHistoryAvailable, connectionRemoteActionBlockedReason, executeSlash, getSelectedCache, pushErrorNotice, queueUserInput, sending, startNewSession],
 	);
 
 	const canStop = !!selectedId && loadedSnapshot?.activity === "running";
@@ -3602,22 +3578,21 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						});
 			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
 			selectProjectSession(saved.project_id, null);
-			pushNotice("success", `${projectDialog.mode === "create" ? "created" : "updated"} project “${truncate(saved.name, 80)}”`);
 			closeProjectDialog();
 		} catch (error) {
 			setProjectDialog((current) => (current ? { ...current, saving: false } : current));
 			throw error;
 		}
-	}, [api, assertServerMutationAllowed, closeProjectDialog, projectDialog, pushNotice, queryClient, selectProjectSession]);
+	}, [api, assertServerMutationAllowed, closeProjectDialog, projectDialog, queryClient, selectProjectSession]);
 	const handleSidebarNew = useCallback(() => {
 		void createSession();
 		if (panelModeRef.current !== "wide") setSidebarOpen(false);
 	}, [createSession]);
 	const handleArchiveToggle = useCallback(
 		(session: SessionListItem) => {
-			void setSessionArchived(session, !isArchivedSession(session)).catch((error) => pushNotice("error", errorMessage(error)));
+			void setSessionArchived(session, !isArchivedSession(session)).catch((error) => pushErrorNotice(errorMessage(error)));
 		},
-		[pushNotice, setSessionArchived],
+		[pushErrorNotice, setSessionArchived],
 	);
 	const handleSidebarDelete = useCallback((session: SessionListItem) => {
 		setDeleteDialog({ session, deleting: false });
@@ -3627,20 +3602,20 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			try {
 				changeModel(value);
 			} catch (error) {
-				pushNotice("error", errorMessage(error));
+				pushErrorNotice(errorMessage(error));
 			}
 		},
-		[changeModel, pushNotice],
+		[changeModel, pushErrorNotice],
 	);
 	const handleReasoningEffortChange = useCallback(
 		(value: ReasoningEffort) => {
 			try {
 				changeReasoningEffort(value);
 			} catch (error) {
-				pushNotice("error", errorMessage(error));
+				pushErrorNotice(errorMessage(error));
 			}
 		},
-		[changeReasoningEffort, pushNotice],
+		[changeReasoningEffort, pushErrorNotice],
 	);
 	const handleToggleRight = useCallback(() => {
 		setRightOpen((open) => !open);
@@ -3787,27 +3762,27 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	}, [stopActiveTurn]);
 	const handlePromoteQueued = useCallback(
 		(inputId: string) => {
-			void promoteQueuedInput(inputId).catch((error) => pushNotice("error", errorMessage(error)));
+			void promoteQueuedInput(inputId).catch((error) => pushErrorNotice(errorMessage(error)));
 		},
-		[promoteQueuedInput, pushNotice],
+		[promoteQueuedInput, pushErrorNotice],
 	);
 	const handleUpdateQueued = useCallback(
 		(inputId: string, text: string) => {
-			void updateQueuedInput(inputId, text).catch((error) => pushNotice("error", errorMessage(error)));
+			void updateQueuedInput(inputId, text).catch((error) => pushErrorNotice(errorMessage(error)));
 		},
-		[pushNotice, updateQueuedInput],
+		[pushErrorNotice, updateQueuedInput],
 	);
 	const handleCancelQueued = useCallback(
 		(inputId: string) => {
-			void cancelQueuedInput(inputId).catch((error) => pushNotice("error", errorMessage(error)));
+			void cancelQueuedInput(inputId).catch((error) => pushErrorNotice(errorMessage(error)));
 		},
-		[cancelQueuedInput, pushNotice],
+		[cancelQueuedInput, pushErrorNotice],
 	);
 	const handleMoveQueued = useCallback(
 		(inputId: string, direction: "up" | "down") => {
-			void reorderQueuedInput(inputId, direction).catch((error) => pushNotice("error", errorMessage(error)));
+			void reorderQueuedInput(inputId, direction).catch((error) => pushErrorNotice(errorMessage(error)));
 		},
-		[pushNotice, reorderQueuedInput],
+		[pushErrorNotice, reorderQueuedInput],
 	);
 	const validatedRoute =
 		workspaceRouteResult.kind === "route" && routeRemoteReadsEnabled
@@ -4223,7 +4198,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					onClose={closeRenameDialog}
 					onSubmit={() => {
 						return renameSession().catch((error) => {
-							pushNotice("error", errorMessage(error));
+							pushErrorNotice(errorMessage(error));
 							throw error;
 						});
 					}}
@@ -4239,7 +4214,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					onClose={closeDeleteDialog}
 					onConfirm={() => {
 						return deleteSession().catch((error) => {
-							pushNotice("error", errorMessage(error));
+							pushErrorNotice(errorMessage(error));
 							throw error;
 						});
 					}}
@@ -4255,7 +4230,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					onClose={closeProjectDialog}
 					onSubmit={() => {
 						return saveProjectDialog().catch((error) => {
-							pushNotice("error", errorMessage(error));
+							pushErrorNotice(errorMessage(error));
 							throw error;
 						});
 					}}
@@ -4300,9 +4275,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					entries={exportDialog.entries}
 					blocks={exportDialog.blocks}
 					onClose={() => setExportDialog(null)}
-					onCopied={() => pushNotice("success", "export copied to clipboard")}
-					onDownloaded={() => pushNotice("success", "export downloaded")}
-					onError={(error) => pushNotice("error", errorMessage(error))}
+					onError={(error) => pushErrorNotice(errorMessage(error))}
 					returnFocusFallbackRef={composerDialogReturnFocusRef}
 				/>
 			) : null}
@@ -4323,6 +4296,14 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function isConnectionLossNotice(text: string): boolean {
+	const normalized = text.trim().toLowerCase();
+	return normalized.includes("websocket")
+		|| normalized === "waiting for connection"
+		|| normalized.startsWith("connection retry failed")
+		|| normalized.startsWith("failed to connect");
+}
+
 function isHistoryChangedError(error: unknown): boolean {
 	return errorMessage(error).startsWith("history_changed:");
 }
@@ -4330,20 +4311,6 @@ function isHistoryChangedError(error: unknown): boolean {
 function modelErrorNotice(data: Record<string, unknown>): string {
 	const error = typeof data.error === "string" ? data.error : "model request failed";
 	return `model error: ${truncate(error, 420)}`;
-}
-
-function compactionRequestedNotice(data: Record<string, unknown>): string {
-	const trigger = typeof data.trigger === "string" ? data.trigger : null;
-	return trigger === "auto" ? "auto-compaction started" : "compaction started";
-}
-
-function compactionCompletedNotice(data: Record<string, unknown>): string {
-	const trigger = typeof data.trigger === "string" ? data.trigger : null;
-	const provider = typeof data.provider === "string" ? data.provider : null;
-	const prefix = trigger === "auto" ? "auto-compaction" : "compaction";
-	if (provider === "openai") return `${prefix} completed with OpenAI provider-native compaction`;
-	if (provider === "claude") return `${prefix} completed with Anthropic provider-native compaction`;
-	return `${prefix} completed`;
 }
 
 function compactionErrorNotice(data: Record<string, unknown>): string {
