@@ -9,16 +9,40 @@ describe("MCP picker layout", () => {
 		expect(css).not.toContain(".mcp-picker-list[hidden]");
 	});
 
-	it("keeps workspace and MCP setup lists internally scrollable on desktop and mobile", () => {
+	it("uses the central transcript scroll and stacks full-width setup cards on mobile", () => {
 		const css = readFileSync(resolve(import.meta.dirname, "styles.css"), "utf8");
-		const mcpListRule = css.match(/\.mcp-picker-list\s*\{[^}]+\}/)?.[0] ?? "";
-		const workspaceListRule = css.match(/\.workspace-scope-list\s*\{[^}]+\}/)?.[0] ?? "";
+		const setupRule = css.match(/\.new-session-setup\s*\{[^}]+\}/)?.[0] ?? "";
+		const gridRule = css.match(/\.new-session-setup-grid\s*\{[^}]+\}/)?.[0] ?? "";
 
-		for (const rule of [workspaceListRule, mcpListRule]) {
-			expect(rule).toContain("max-height: min(40dvh, 420px)");
-			expect(rule).toContain("overflow-y: auto");
-			expect(rule).toContain("overscroll-behavior: contain");
-		}
-		expect(css).toMatch(/\.workspace-scope-list,\s*\.mcp-picker-list\s*\{\s*max-height: min\(32dvh, 280px\)/);
+		expect(setupRule).toContain("width: 100%");
+		expect(gridRule).toContain(
+			"grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr))",
+		);
+		expect(css).not.toMatch(/\.mcp-picker-list\s*\{[^}]*max-height/);
+		expect(css).not.toMatch(/\.workspace-scope-list\s*\{[^}]*max-height/);
+		expect(css).toMatch(
+			/@media \(max-width: 640px\)[\s\S]*?\.new-session-setup-grid\s*\{\s*grid-template-columns: minmax\(0, 1fr\)/,
+		);
+		expect(css).toMatch(
+			/@media \(max-width: 640px\)[\s\S]*?\.workspace-scope-name,[\s\S]*?min-height: 44px/,
+		);
+		expect(css).toMatch(
+			/@media \(max-width: 640px\)[\s\S]*?\.workspace-scope-detail\s*\{[^}]*flex-wrap: wrap/,
+		);
+		expect(css).toContain(
+			`.workspace-scope-toggle,
+	.mcp-picker-toggle,
+	.workspace-scope-name,
+	.workspace-scope-branch,
+	.mcp-picker-tool,
+	.mcp-picker-server-name,
+	.mcp-picker-auth-action,
+	.new-session-setup-error button {
+		min-height: 44px;
+	}`,
+		);
+		expect(css).toMatch(
+			/@media \(max-width: 640px\)[\s\S]*?\.new-session-setup-error\s*\{[^}]*flex-wrap: wrap/,
+		);
 	});
 });

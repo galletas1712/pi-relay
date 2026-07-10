@@ -51,6 +51,7 @@ export interface ChatPaneProps {
 	onAcknowledgeTranscriptDestination?: (destinationId: number) => void;
 	onRetryTranscript: () => void;
 	routeNotice?: ReactNode;
+	emptySessionContent?: ReactNode;
 }
 
 export const ChatPane = memo(function ChatPane({
@@ -92,6 +93,7 @@ export const ChatPane = memo(function ChatPane({
 	onAcknowledgeTranscriptDestination,
 	onRetryTranscript,
 	routeNotice,
+	emptySessionContent,
 }: ChatPaneProps) {
 	const loadedLeafId = activeLeafIdFromEntries(entries);
 	const visibleActiveLeafId = loadedLeafId ?? snapshot?.active_leaf_id ?? null;
@@ -132,6 +134,7 @@ export const ChatPane = memo(function ChatPane({
 				retryingSession={transcriptRetrying}
 				onRetrySession={onRetryTranscript}
 				onNewSession={onNewSession}
+				emptySessionContent={emptySessionContent}
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}
 				resumeBlockedReason={mutationBlockedReason}
