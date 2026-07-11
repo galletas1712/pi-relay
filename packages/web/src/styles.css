@@ -41,12 +41,12 @@
 	 *   --text-2xl 18  Largest content heading (markdown h1).
 	 *   --text-xl  16  Dialog titles (modal <h2>) and markdown h2.
 	 *   --text-lg  15  Reading/writing surfaces: assistant + user messages,
-	 *                  markdown body (and h3-h6), the composer.
+	 *                  form inputs, markdown body (and h3-h6), the composer.
 	 *   --text-md  14  Panel headers (log/inspector head, mobile title) and
 	 *                  primary modal list-option titles.
-	 *   --text-sm  13  Default workhorse: all controls (buttons, inputs,
-	 *                  selects), descriptions, previews, kv rows, tool names,
-	 *                  and sidebar row titles (the latter at weight 600).
+	 *   --text-sm  13  Default workhorse: compact controls (buttons, selects),
+	 *                  descriptions, previews, kv rows, tool names, and sidebar
+	 *                  row titles (the latter at weight 600).
 	 *   --text-xs  12  Labels & eyebrows: form labels, section heads, tool
 	 *                  detail rows, thinking/system lines, toggles.
 	 *   --text-2xs 11  Micro: pills, badges, counts, ids, status chips,
@@ -65,7 +65,6 @@
 	--text-xl: 16px;
 	--text-2xl: 18px;
 	--text-3xl: 26px; /* large display tier (Space Grotesk hero headings) */
-	--text-input-mobile: 17px; /* mobile inputs (>=16px avoids iOS auto-zoom) */
 
 	/*
 	 * Spacing scale (4px base). Theme-independent — defined once here, not
@@ -4403,17 +4402,6 @@ pre {
 		font-size: var(--text-lg);
 	}
 
-	input,
-	textarea,
-	select {
-		font-size: var(--text-input-mobile);
-	}
-
-	.search-box input,
-	.composer {
-		font-size: var(--text-input-mobile);
-	}
-
 	.app-shell {
 		width: 100vw;
 	}
@@ -4454,7 +4442,6 @@ pre {
 		width: 100%;
 		max-width: none;
 		height: 34px;
-		font-size: var(--text-xs);
 	}
 
 	.message-scroll {
