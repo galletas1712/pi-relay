@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { projectTitle, sessionStatusWithDelegations, sessionTitle } from "./sessionList.ts";
+import {
+	activeSessionCountsByProject,
+	projectTitle,
+	sessionStatusWithDelegations,
+	sessionTitle,
+} from "./sessionList.ts";
 import type { Project, SessionSummary } from "./types.ts";
 
 describe("sessionStatusWithDelegations", () => {
@@ -18,6 +23,27 @@ describe("sessionStatusWithDelegations", () => {
 
 	it("treats a queued parent as running even with delegations in flight", () => {
 		expect(sessionStatusWithDelegations("queued", true)).toBe("running");
+	});
+});
+
+describe("activeSessionCountsByProject", () => {
+	it("counts running, queued, and idle-delegating summaries separately by project", () => {
+		const sessions = [
+			{ session_id: "running", project_id: "project-a", activity: "running", has_running_delegations: false },
+			{ session_id: "queued", project_id: "project-a", activity: "queued", has_running_delegations: false },
+			{ session_id: "delegating", project_id: "project-a", activity: "idle", has_running_delegations: true },
+			{ session_id: "idle", project_id: "project-a", activity: "idle", has_running_delegations: false },
+			{ session_id: "other-project", project_id: "project-b", activity: "running", has_running_delegations: false },
+			{ session_id: "inactive-project", project_id: "project-c", activity: "idle", has_running_delegations: false },
+			{ session_id: "host", project_id: null, activity: "running", has_running_delegations: false },
+		] as SessionSummary[];
+
+		const counts = activeSessionCountsByProject(sessions);
+
+		expect(counts.get("project-a")).toBe(3);
+		expect(counts.get("project-b")).toBe(1);
+		expect(counts.get("project-c")).toBeUndefined();
+		expect(counts.has("host")).toBe(false);
 	});
 });
 
