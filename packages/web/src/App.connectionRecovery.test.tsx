@@ -110,11 +110,11 @@ describe("App connection recovery integration", () => {
 		client.clear();
 	});
 
-	it("keeps cached projects visible through a persistent refresh failure and Retry recovery", async () => {
+	it("routes a cached project refresh failure through the disconnected banner and reconnect recovery", async () => {
 		const api = createControllableApi();
 		api.listProjects.mockResolvedValue([project()]);
 		const { client, unmount } = renderApp(api);
-		const retry = deferred<Project[]>();
+		const recovery = deferred<Project[]>();
 
 		await emitStatus(api, "open");
 		expect(await screen.findByText("Recovered project")).toBeTruthy();
@@ -122,19 +122,33 @@ describe("App connection recovery integration", () => {
 			.mockImplementationOnce(async () => {
 				throw new Error("project refresh failed");
 			})
-			.mockImplementationOnce(() => retry.promise);
+			.mockImplementationOnce(() => recovery.promise);
 		await act(async () => {
 			await client.invalidateQueries({ queryKey: ["projects"] });
 		});
 
-		const alert = await screen.findByRole("alert");
-		expect(alert.textContent).toContain("Project refresh failed");
+		const banner = await screen.findByRole("status", { name: "Disconnected" });
+		expect(banner.closest(".chat-dock")).toBeTruthy();
+		expect(document.body.textContent).not.toContain("Project refresh failed");
+		expect(document.body.textContent).not.toContain("project refresh failed");
+		expect(document.querySelector(".project-load-error")).toBeNull();
 		expect(screen.getByText("Recovered project")).toBeTruthy();
-		fireEvent.click(within(alert).getByRole("button", { name: "Retry" }));
+
+		const callsBeforeRetry = api.listProjects.mock.calls.length;
+		const retry = within(banner).getByRole("button", { name: "Retry connection" });
+		fireEvent.click(retry);
+		fireEvent.click(retry);
+		expect(api.reconnect).toHaveBeenCalledTimes(1);
+		await emitStatus(api, "open");
+		await waitFor(() =>
+			expect(api.listProjects).toHaveBeenCalledTimes(callsBeforeRetry + 1));
 		expect(screen.getByText("Recovered project")).toBeTruthy();
-		await act(async () => retry.resolve([project({ name: "Restored project" })]));
+		expect(screen.getByText("Disconnected")).toBeTruthy();
+
+		await act(async () => recovery.resolve([project({ name: "Restored project" })]));
 		expect(await screen.findByText("Restored project")).toBeTruthy();
-		await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+		await waitFor(() =>
+			expect(screen.queryByRole("status", { name: "Disconnected" })).toBeNull());
 
 		unmount();
 		await client.cancelQueries();
@@ -524,7 +538,7 @@ describe("App connection recovery integration", () => {
 		client.clear();
 	});
 
-	it("keeps the cached 3-row page through 100-row pending, failure, Retry, success, and offline reopen", async () => {
+	it("routes a cached agent refresh failure through the disconnected banner and reconnect recovery", async () => {
 		const api = createControllableApi();
 		const firstExpansion = deferred<ReturnType<typeof delegationPage>>();
 		const retryExpansion = deferred<ReturnType<typeof delegationPage>>();
@@ -557,21 +571,32 @@ describe("App connection recovery integration", () => {
 		expect(api.listDelegations).toHaveBeenCalledWith(SESSION_ID, 100);
 
 		firstExpansion.reject(new Error("100-row load failed"));
-		expect(await screen.findByText("Agent refresh failed")).toBeTruthy();
+		const banner = await screen.findByRole("status", { name: "Disconnected" });
+		expect(banner.closest(".chat-dock")).toBeTruthy();
+		expect(document.body.textContent).not.toContain("Agent refresh failed");
+		expect(document.body.textContent).not.toContain("100-row load failed");
+		expect(document.querySelector(".run-board-load-error")).toBeNull();
 		expect(screen.getByRole("article", { name: /Recent 1/ })).toBeTruthy();
 		expect(screen.getByRole("button", { name: /show fewer/i })).toBeTruthy();
 
-		const callsBeforeRetry = api.listDelegations.mock.calls.length;
-		const retry = screen.getByRole("button", { name: "Retry" });
+		const expandedCallsBeforeRetry = api.listDelegations.mock.calls.filter(
+			([, limit]) => limit === 100,
+		).length;
+		const retry = within(banner).getByRole("button", { name: "Retry connection" });
 		fireEvent.click(retry);
 		fireEvent.click(retry);
+		expect(api.reconnect).toHaveBeenCalledTimes(1);
+		await emitStatus(api, "open");
 		await waitFor(() =>
-			expect(api.listDelegations).toHaveBeenCalledTimes(callsBeforeRetry + 1));
-		expect(screen.getByRole("button", { name: "Retrying…" })).toBeTruthy();
+			expect(api.listDelegations.mock.calls.filter(([, limit]) => limit === 100))
+				.toHaveLength(expandedCallsBeforeRetry + 1));
+		expect(screen.getByText("Disconnected")).toBeTruthy();
 		expect(screen.getByRole("article", { name: /Recent 1/ })).toBeTruthy();
 
 		retryExpansion.resolve(expandedPage);
 		expect(await screen.findByRole("article", { name: /Expanded 100/ })).toBeTruthy();
+		await waitFor(() =>
+			expect(screen.queryByRole("status", { name: "Disconnected" })).toBeNull());
 		expect(screen.queryByRole("article", { name: /Recent 1/ })).toBeNull();
 		expect(screen.getByText("Latest 100 shown.")).toBeTruthy();
 

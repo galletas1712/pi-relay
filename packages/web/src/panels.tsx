@@ -360,7 +360,7 @@ function RunBoard({
 			{parentSessionId && error ? (
 				<div className="load-error-banner run-board-load-error" role="alert">
 					<div>
-						<strong>{delegations.length > 0 ? "Agent refresh failed" : "Couldn’t load agents"}</strong>
+						<strong>Couldn’t load agents</strong>
 						<span>{error}</span>
 					</div>
 					{onRetryDelegations ? (
@@ -411,7 +411,6 @@ export interface SidebarProps {
 	projectsLoading?: boolean;
 	projectsFetching?: boolean;
 	projectsError?: string | null;
-	projectsHasCachedData?: boolean;
 	selectedProjectId: string | null;
 	query: string;
 	showArchived: boolean;
@@ -442,7 +441,6 @@ export const Sidebar = memo(function Sidebar({
 	projectsLoading = false,
 	projectsFetching = false,
 	projectsError = null,
-	projectsHasCachedData = false,
 	selectedProjectId,
 	query,
 	showArchived,
@@ -474,7 +472,6 @@ export const Sidebar = memo(function Sidebar({
 				loading={projectsLoading}
 				fetching={projectsFetching}
 				error={projectsError}
-				hasCachedData={projectsHasCachedData}
 				remoteReadBlockedReason={remoteReadBlockedReason}
 				selectedProjectId={selectedProjectId}
 				onRetry={onRetryProjects}
@@ -527,7 +524,6 @@ export function ProjectList({
 	loading = false,
 	fetching = false,
 	error = null,
-	hasCachedData = false,
 	remoteReadBlockedReason,
 	selectedProjectId,
 	onRetry,
@@ -540,7 +536,6 @@ export function ProjectList({
 	loading?: boolean;
 	fetching?: boolean;
 	error?: string | null;
-	hasCachedData?: boolean;
 	remoteReadBlockedReason?: string | null;
 	selectedProjectId: string | null;
 	onRetry?: () => void;
@@ -567,7 +562,7 @@ export function ProjectList({
 			{error ? (
 				<div className="load-error-banner project-load-error" role="alert">
 					<div>
-						<strong>{hasCachedData ? "Project refresh failed" : "Couldn’t load projects"}</strong>
+						<strong>Couldn’t load projects</strong>
 						<span>{error}</span>
 					</div>
 					{onRetry ? (

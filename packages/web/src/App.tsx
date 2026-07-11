@@ -473,7 +473,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 	const [connection, setConnection] = useState<ConnectionStatus>("connecting");
 	const connectionRef = useRef<ConnectionStatus>("connecting");
-	const [disconnected, setDisconnected] = useState(false);
+	const [transportDisconnected, setTransportDisconnected] = useState(false);
 	const [retryingConnection, setRetryingConnection] = useState(false);
 	const [workspaceRouteResult, setWorkspaceRouteResult] =
 		useState<WorkspaceRouteParseResult>(initialWorkspaceRoute);
@@ -1372,6 +1372,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const delegationsRetrying = showAllDelegations
 		? expandedDelegationsQuery.isFetching
 		: defaultDelegationsQuery.isFetching;
+	const delegationHasCachedData =
+		(showAllDelegations
+			? expandedDelegationsQuery.data ?? defaultDelegationsQuery.data
+			: defaultDelegationsQuery.data) !== undefined;
+	const disconnected =
+		transportDisconnected ||
+		(projectsQuery.data !== undefined && !!projectsError) ||
+		(delegationHasCachedData && !!delegationsError);
 	// `delegating` status for the selected session: the parent reports idle while
 	// its subagents are still in flight. Only known for the selected session,
 	// whose delegations are fetched above.
@@ -2534,8 +2542,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		const offStatus = api.onStatus((status) => {
 			connectionRef.current = status;
 			setConnection(status);
-			if (status === "open") setDisconnected(false);
-			else if (status !== "connecting") setDisconnected(true);
+			if (status === "open") setTransportDisconnected(false);
+			else if (status !== "connecting") setTransportDisconnected(true);
 			subscribedEventSessionIds.current.clear();
 			if (status !== "open") return;
 			connectionRetryController.current.opened();
@@ -2543,6 +2551,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			void Promise.all([
 				queryClient.invalidateQueries({ queryKey: queryKeys.projects }),
 				queryClient.invalidateQueries({ queryKey: queryKeys.systemPromptRoot }),
+				queryClient.invalidateQueries({ queryKey: ["delegations"] }),
 				invalidateKnownSessionLists(),
 			]).catch(() => undefined);
 		});
@@ -3952,8 +3961,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				projects={projects}
 				projectsLoading={projectsQuery.isLoading}
 				projectsFetching={projectsQuery.isFetching}
-				projectsError={projectsError}
-				projectsHasCachedData={projectsQuery.data !== undefined}
+				projectsError={projectsQuery.data === undefined ? projectsError : null}
 				selectedProjectId={selectedProjectId}
 				query={query}
 				showArchived={showArchived}
@@ -4204,7 +4212,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					subagentNames={delegationSubagentNames}
 					hasMoreDelegations={hasMoreDelegations}
 					delegationsLoading={delegationsLoading}
-					delegationsError={delegationsError}
+					delegationsError={delegationHasCachedData ? null : delegationsError}
 					showAllDelegations={showAllDelegations}
 					expandedDelegationsAvailable={expandedDelegationsAvailable}
 					onToggleShowAllDelegations={() => setShowAllDelegations((current) => !current)}
