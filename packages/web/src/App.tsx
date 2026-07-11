@@ -119,6 +119,7 @@ import {
 	shouldReportActionError,
 } from "./selectedSessionFetchState.ts";
 import {
+	activeSessionCountsByProject,
 	projectTitle,
 	sessionTitle,
 	isArchivedSession,
@@ -770,6 +771,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			return [...byId.values()];
 		},
 		[backgroundSessions, sessions],
+	);
+	const projectActiveSessionCounts = useMemo(
+		() => activeSessionCountsByProject(allKnownSessions),
+		[allKnownSessions],
 	);
 
 	const invalidateKnownSessionLists = useCallback(() => {
@@ -3950,6 +3955,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 
 			<Sidebar
 				projects={projects}
+				projectActiveSessionCounts={projectActiveSessionCounts}
 				projectsLoading={projectsQuery.isLoading}
 				projectsFetching={projectsQuery.isFetching}
 				projectsError={projectsError}

@@ -42,12 +42,27 @@ function sortableLastUserMessageTimestamp(session: SessionListItem): number {
 
 export type SessionStatus = "idle" | "running" | "delegating";
 
-/** Three-state status for a session whose running-delegation signal is known
- * (currently only the selected session). `delegating` = parent parked but
- * subagents in flight. */
+/** Three-state status for a session summary. `session.list` reports its
+ * running-delegation signal for every listed session. `delegating` = parent
+ * parked but subagents in flight. */
 export function sessionStatusWithDelegations(activity: Activity, hasRunningDelegations: boolean): SessionStatus {
 	if (activity !== "idle") return "running"; // parent itself running (or queued)
 	return hasRunningDelegations ? "delegating" : "idle";
+}
+
+/** Counts active session summaries from the established per-project list data. */
+export function activeSessionCountsByProject(sessions: readonly SessionListItem[]): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const session of sessions) {
+		if (
+			!session.project_id ||
+			sessionStatusWithDelegations(session.activity, session.has_running_delegations ?? false) === "idle"
+		) {
+			continue;
+		}
+		counts.set(session.project_id, (counts.get(session.project_id) ?? 0) + 1);
+	}
+	return counts;
 }
 
 export function projectTitle(project: Project): string {

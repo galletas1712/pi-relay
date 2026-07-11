@@ -523,6 +523,14 @@ pre {
 	font-weight: 600;
 }
 
+.project-active-session-count {
+	flex: 0 0 auto;
+	color: var(--primary);
+	font-size: var(--text-2xs);
+	font-weight: 700;
+	font-variant-numeric: tabular-nums;
+}
+
 .sidebar-section-actions {
 	display: inline-flex;
 	align-items: center;

@@ -321,6 +321,35 @@ describe("Sidebar session list loading states", () => {
 		expect(html).not.toContain(">connected<");
 	});
 
+	it("renders accessible active-session counts only for active projects", () => {
+		const activeProject: Project = {
+			project_id: "project-active",
+			name: "Active project",
+			workspaces: [],
+			metadata: {},
+			created_at: "2024-01-01T00:00:00Z",
+			updated_at: "2024-01-01T00:00:00Z",
+		};
+		const inactiveProject: Project = {
+			...activeProject,
+			project_id: "project-inactive",
+			name: "Inactive project",
+		};
+
+		const html = renderSidebar({
+			projects: [activeProject, inactiveProject],
+			projectActiveSessionCounts: new Map([
+				[activeProject.project_id, 2],
+				[inactiveProject.project_id, 0],
+			]),
+		});
+
+		expect(html).toContain(
+			'<span class="project-active-session-count" title="2 active sessions" aria-label="2 active sessions">2</span>',
+		);
+		expect(html).not.toContain('title="0 active sessions"');
+	});
+
 });
 
 describe("sidebar action menu policies", () => {

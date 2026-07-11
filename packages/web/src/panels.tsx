@@ -53,6 +53,7 @@ import type {
 export const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
 export const RUN_BOARD_EXPANDED_DELEGATION_COUNT = 100;
 const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
+const EMPTY_PROJECT_ACTIVE_SESSION_COUNTS = new Map<string, number>();
 
 export function subagentStatusLabel(subagent: DelegationSubagent): string {
 	const status = typeof subagent.status === "string" ? subagent.status : "idle";
@@ -408,6 +409,7 @@ const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
 
 export interface SidebarProps {
 	projects: Project[];
+	projectActiveSessionCounts?: ReadonlyMap<string, number>;
 	projectsLoading?: boolean;
 	projectsFetching?: boolean;
 	projectsError?: string | null;
@@ -439,6 +441,7 @@ export interface SidebarProps {
 
 export const Sidebar = memo(function Sidebar({
 	projects,
+	projectActiveSessionCounts = EMPTY_PROJECT_ACTIVE_SESSION_COUNTS,
 	projectsLoading = false,
 	projectsFetching = false,
 	projectsError = null,
@@ -471,6 +474,7 @@ export const Sidebar = memo(function Sidebar({
 		<aside className="sidebar" data-slot="sidebar" inert={inert}>
 			<ProjectList
 				projects={projects}
+				projectActiveSessionCounts={projectActiveSessionCounts}
 				loading={projectsLoading}
 				fetching={projectsFetching}
 				error={projectsError}
@@ -524,6 +528,7 @@ function pendingActionLabel(action: SessionSnapshot["pending_actions"][number]):
 
 export function ProjectList({
 	projects,
+	projectActiveSessionCounts = EMPTY_PROJECT_ACTIVE_SESSION_COUNTS,
 	loading = false,
 	fetching = false,
 	error = null,
@@ -537,6 +542,7 @@ export function ProjectList({
 	onClose,
 }: {
 	projects: Project[];
+	projectActiveSessionCounts?: ReadonlyMap<string, number>;
 	loading?: boolean;
 	fetching?: boolean;
 	error?: string | null;
@@ -603,6 +609,8 @@ export function ProjectList({
 					{projects.map((project) => {
 						const title = projectTitle(project);
 						const selected = project.project_id === selectedProjectId;
+						const activeSessionCount = projectActiveSessionCounts.get(project.project_id) ?? 0;
+						const activeSessionLabel = `${activeSessionCount} active session${activeSessionCount === 1 ? "" : "s"}`;
 						return (
 							<li className={`project-row ${selected ? "selected" : ""}`} key={project.project_id}>
 								<button
@@ -613,6 +621,15 @@ export function ProjectList({
 								>
 									<Folder size={14} aria-hidden />
 									<span className="project-title">{title}</span>
+									{activeSessionCount > 0 ? (
+										<span
+											className="project-active-session-count"
+											title={activeSessionLabel}
+											aria-label={activeSessionLabel}
+										>
+											{activeSessionCount}
+										</span>
+									) : null}
 								</button>
 								<ActionMenu
 									triggerLabel={`Open project actions for ${title}`}
