@@ -42,6 +42,15 @@ Per-session composer *text* is web-owned `localStorage` state, keyed by session
 historical user messages after a switch. Composer text is deliberately never
 stored in `sessions.metadata` or transcript rows.
 
+`/fork` is the managed-project counterpart to `/switch`. It uses the same
+picker targets and stale-tree refresh, but creates an independent top-level
+session instead of changing the selected session. The filesystem source is the
+current idle managed cwd, including dirty and untracked files—not a historical
+checkpoint at the chosen transcript boundary. Choosing a historical user
+message stores that text as the child session's web-owned composer draft;
+completed-turn and compaction targets do not create a draft. Host sessions are
+rejected before the picker opens.
+
 Empty web-created durable rows are hidden defensively in `session.list` unless
 they have transcript, queued input, or actions. `metadata.hidden = true` is a
 separate list-filtering convention for local verification cleanup; it is not a
@@ -56,6 +65,9 @@ have dedicated UI controls, without adding a second frontend command model.
   message targets move the active leaf to the previous safe boundary and
   restore that message into the composer for editing; completed turn and
   compaction-summary targets simply become the active leaf.
+- `/fork` opens the same picker for managed project sessions. It is idle-only,
+  clones the current workspace into an independent child, and restores a
+  selected user message as that child's composer draft.
 - `/compact` requests context compaction.
 - `/system` shows the selected session's rendered PI.md prompt and source
   template. It is unavailable before a durable session exists.

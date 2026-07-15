@@ -37,13 +37,22 @@ sending the same websocket frames a frontend would send.
    inputs and unfinished action rows. `Interrupted` and `Crashed` are transcript
    turn outcomes, not session statuses.
 
-5. Source-mutating history writes are idle-only.
-   `history.switch`, `session.configure`, and `compaction.request` fail with
+5. History writes and snapshots are idle-only.
+   `history.switch`, `history.fork`, `session.configure`, and
+   `compaction.request` fail with
    `session_busy` while work is active or queued. Here idle means there are no
-   unfinished actions and no queued inputs waiting to become transcript. A
-   frontend should send `input.interrupt`, wait for idle, then retry.
+   unfinished actions and no queued inputs waiting to become transcript. The two
+   history operations additionally require every delegation for the source
+   session to be terminal. A frontend should interrupt/cancel the relevant
+   work, wait for idle, then retry.
 
-6. Tools are always allowed.
+6. Fork targets are switch targets.
+   `history.fork` accepts the same committed turn boundaries (including
+   compaction roots) and root target as `history.switch`, with the same
+   active-leaf, transcript-revision, and target-branch fences. It does not
+   accept arbitrary mid-turn entries.
+
+7. Tools are always allowed.
    The daemon runs model-requested tools immediately. There is no approval or
    denial RPC. `input.interrupt` is the one user-facing cancellation command and
    interrupts active work. The daemon keeps a per-action task registry and
@@ -51,7 +60,7 @@ sending the same websocket frames a frontend would send.
    session on a best-effort basis; durable action status remains the source of
    truth for stale completions.
 
-7. Daemon death is recoverable state.
+8. Daemon death is recoverable state.
    Startup first reconciles durable selected-subagent controls so an
    already-committed exact-child interrupt settles its captured action
    generation. It then validates and recovers pending/running model actions
@@ -1277,11 +1286,27 @@ both for "switch to the boundary before editing this user message" and for
 "switch the active view to this completed branch or compaction root." The RPC
 never creates a session and never deletes abandoned branches.
 
+`history.switch` and `history.fork` share these target fields:
+
+- `leaf_id` is required and must be a committed turn boundary id or explicit
+  `null` for root.
+- Optional `expected_active_leaf_id` is a string or `null` and fences the
+  source's active leaf.
+- Optional integer `expected_transcript_revision` fences all transcript
+  changes.
+- Optional `active_branch_entry_ids` is the exact ordered, compaction-aware
+  path to `leaf_id`. Omission disables this fence; an explicit empty array
+  asserts an empty root path and is not equivalent to omission.
+
+Malformed, mistyped, or unknown request fields fail with `invalid_params`.
+
 ```json
 {
   "session_id": "s1",
   "leaf_id": "entry_4",
   "expected_active_leaf_id": "entry_9",
+  "expected_transcript_revision": 12,
+  "active_branch_entry_ids": ["entry_1", "entry_4"],
   "return_active_branch": true
 }
 ```
@@ -1292,13 +1317,71 @@ Root switch:
 { "session_id": "s1", "leaf_id": null }
 ```
 
-Running sessions fail with `session_busy`; non-boundaries fail with
-`not_turn_boundary`. If `expected_active_leaf_id` is supplied and the session
-has moved since the picker was opened, switch fails with `history_changed`.
+Running sessions and sessions with any running delegation fail with
+`session_busy`; non-boundaries fail with `not_turn_boundary`. If
+any supplied fence is stale, switch fails with `history_changed`.
 When `return_active_branch` is true, the response includes the new
 `session_revision`, `queue_revision`, `transcript_revision`, `last_event_id`,
 and `active_branch_entries` so the frontend can render the switched branch
 without a follow-up `session.get` in the hot path.
+
+### `history.fork`
+
+Idle-only and available only to managed project sessions. Creates a visible,
+independent top-level session without changing the source. Target semantics
+and fences are the shared contract above. A user-message edit in the picker
+sends the same previous-boundary target used by switch.
+
+```json
+{
+  "session_id": "s1",
+  "leaf_id": "entry_4",
+  "expected_active_leaf_id": "entry_9",
+  "expected_transcript_revision": 12,
+  "active_branch_entry_ids": ["entry_1", "entry_4"]
+}
+```
+
+The child receives the source's complete committed transcript forest in source
+insertion order, preserving entry ids, parent links, typed items, turn ids,
+compaction roots/sibling branches, and opaque `provider_replay`. Its active
+leaf is exactly `leaf_id`; the fork does not synthesize transcript entries. Queued
+inputs, actions, reconnect events, delegations, and subagent relationships are
+not copied. Fork provenance is stored in
+`metadata.fork = { source_session_id, source_leaf_id }`; the child has no
+`parent_session_id` and uses the parent prompt/tool profile. The child inherits
+the source title, auto-title preference, and compaction policy, but starts
+without source archival/subagent state or compaction `auto_state`.
+
+The filesystem is independent from the source: the daemon snapshots the
+source session's **current idle managed cwd**, including current dirty and
+untracked files, into a new session cwd and gives copied Git workspaces child
+branches. Files are not reconstructed as of `leaf_id`, and no per-turn
+filesystem checkpoints are created. Ephemeral/unmanaged/shared session cwds
+are rejected rather than copying `$HOME` or another session's workspace. The
+daemon also rejects a managed session or cwd root that is a symlink or is not a
+directory immediately before cloning; symlinks inside a valid cwd are preserved.
+
+The response includes `session_id`, `source_session_id`, nullable
+`source_leaf_id`, `active_leaf_id`, revisions, and `last_event_id`. Busy
+sources fail with `session_busy`, stale fences with `history_changed`,
+non-boundaries with `not_turn_boundary`, unmanaged sources with
+`project_required` or `workspace_unmanaged`, and generated child workspace
+collisions are never overwritten. A running delegation also reports
+`session_busy`, because a full child can write the parent's cwd while the
+parent itself appears idle.
+
+The server generates each child id. A successful fork is not retry-idempotent:
+if delivery of the response is uncertain, retrying may create another child.
+Clients should use the workspace-operation timeout and refresh the project
+session list before deciding to retry.
+
+Workspace snapshot serialization covers daemon-managed local and MCP tool
+futures that share the exact managed cwd. `history.fork` and read-only
+delegation snapshots wait on that guard; the guard is released when a tool
+future returns or is dropped/aborted. `.pi-handoff` is excluded from clones.
+The daemon does not claim to track independently running background processes
+beyond the managed future lifetime.
 
 ### `turn.resume`
 
