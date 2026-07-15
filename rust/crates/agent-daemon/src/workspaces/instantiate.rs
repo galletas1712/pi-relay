@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -23,23 +24,34 @@ pub(super) async fn instantiate_workspace_from_base(base: &Path, target: &Path) 
 }
 
 pub(super) async fn materialize_tree_from_source(source: &Path, target: &Path) -> Result<()> {
-    materialize_tree_from_source_with_mode(source, target, SymlinkMode::Sanitize).await
+    materialize_tree_from_source_with_mode(source, target, SymlinkMode::Sanitize, None).await
 }
 
-pub(super) async fn materialize_tree_from_source_exact(source: &Path, target: &Path) -> Result<()> {
-    materialize_tree_from_source_with_mode(source, target, SymlinkMode::Preserve).await
+pub(super) async fn materialize_tree_from_source_exact_excluding(
+    source: &Path,
+    target: &Path,
+    excluded_top_level: &OsStr,
+) -> Result<()> {
+    materialize_tree_from_source_with_mode(
+        source,
+        target,
+        SymlinkMode::Preserve,
+        Some(excluded_top_level.to_os_string()),
+    )
+    .await
 }
 
 async fn materialize_tree_from_source_with_mode(
     source: &Path,
     target: &Path,
     symlink_mode: SymlinkMode,
+    excluded_top_level: Option<OsString>,
 ) -> Result<()> {
-    if try_snapshot_tree(source, target, symlink_mode).await? {
+    if try_snapshot_tree(source, target, symlink_mode, excluded_top_level.as_deref()).await? {
         return Ok(());
     }
     if try_btrfs_subvolume_create(target).await? {
-        match reflink_dir_all(source, target, symlink_mode).await {
+        match reflink_dir_all(source, target, symlink_mode, excluded_top_level.clone()).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(target).await;
@@ -52,16 +64,27 @@ async fn materialize_tree_from_source_with_mode(
         }
     }
 
-    copy_dir_all(source, target, symlink_mode).await
+    copy_dir_all(source, target, symlink_mode, excluded_top_level).await
 }
 
 async fn try_snapshot_tree(
     source: &Path,
     target: &Path,
     symlink_mode: SymlinkMode,
+    excluded_top_level: Option<&OsStr>,
 ) -> Result<bool> {
     if !try_btrfs_subvolume_snapshot(source, target).await? {
         return Ok(false);
+    }
+    if let Some(excluded_top_level) = excluded_top_level {
+        let excluded = target.join(excluded_top_level);
+        destroy_workspace_tree(&excluded).await.with_context(|| {
+            format!(
+                "exclude {} from btrfs snapshot {}",
+                excluded.display(),
+                target.display()
+            )
+        })?;
     }
     if matches!(symlink_mode, SymlinkMode::Preserve) {
         return Ok(true);
@@ -132,13 +155,44 @@ async fn try_btrfs_subvolume_create(target: &Path) -> Result<bool> {
 /// remainder. When btrfs is absent the delete is a no-op (mirroring
 /// `try_btrfs_subvolume_create`) and only the `remove_dir_all` runs.
 pub(super) async fn destroy_workspace_tree(root: &Path) -> Result<()> {
+    let metadata = match tokio::fs::symlink_metadata(root).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect workspace tree {}", root.display()))
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return unlink_workspace_root(root).await;
+    }
     delete_btrfs_subvolumes_depth_first(root).await?;
-    if root.exists() {
-        tokio::fs::remove_dir_all(root)
-            .await
-            .with_context(|| format!("remove workspace tree {}", root.display()))?;
+    match tokio::fs::symlink_metadata(root).await {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            unlink_workspace_root(root).await?;
+        }
+        Ok(_) => {
+            tokio::fs::remove_dir_all(root)
+                .await
+                .with_context(|| format!("remove workspace tree {}", root.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect workspace tree {}", root.display()))
+        }
     }
     Ok(())
+}
+
+async fn unlink_workspace_root(root: &Path) -> Result<()> {
+    match tokio::fs::remove_file(root).await {
+        Ok(()) => Ok(()),
+        Err(file_error) => match tokio::fs::remove_dir(root).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                Err(file_error).with_context(|| format!("unlink workspace root {}", root.display()))
+            }
+        },
+    }
 }
 
 async fn delete_btrfs_subvolumes_depth_first(root: &Path) -> Result<()> {
@@ -201,26 +255,46 @@ enum SymlinkMode {
     Preserve,
 }
 
-async fn reflink_dir_all(source: &Path, target: &Path, symlink_mode: SymlinkMode) -> Result<()> {
+async fn reflink_dir_all(
+    source: &Path,
+    target: &Path,
+    symlink_mode: SymlinkMode,
+    excluded_top_level: Option<OsString>,
+) -> Result<()> {
     let source = source.to_path_buf();
     let target = target.to_path_buf();
-    tokio::task::spawn_blocking(move || reflink_dir_all_blocking(&source, &target, symlink_mode))
-        .await
-        .context("reflink local workspace task failed")?
+    tokio::task::spawn_blocking(move || {
+        reflink_dir_all_blocking(
+            &source,
+            &target,
+            symlink_mode,
+            excluded_top_level.as_deref(),
+        )
+    })
+    .await
+    .context("reflink local workspace task failed")?
 }
 
-fn reflink_dir_all_blocking(source: &Path, target: &Path, symlink_mode: SymlinkMode) -> Result<()> {
+fn reflink_dir_all_blocking(
+    source: &Path,
+    target: &Path,
+    symlink_mode: SymlinkMode,
+    excluded_entry: Option<&OsStr>,
+) -> Result<()> {
     std::fs::create_dir_all(target)
         .with_context(|| format!("create reflink workspace copy {}", target.display()))?;
     for entry in std::fs::read_dir(source)
         .with_context(|| format!("read reflink workspace source {}", source.display()))?
     {
         let entry = entry?;
+        if excluded_entry == Some(entry.file_name().as_os_str()) {
+            continue;
+        }
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            reflink_dir_all_blocking(&source_path, &target_path, symlink_mode)?;
+            reflink_dir_all_blocking(&source_path, &target_path, symlink_mode, None)?;
         } else if file_type.is_file() {
             reflink_copy::reflink(&source_path, &target_path).with_context(|| {
                 format!(
@@ -237,26 +311,46 @@ fn reflink_dir_all_blocking(source: &Path, target: &Path, symlink_mode: SymlinkM
     Ok(())
 }
 
-async fn copy_dir_all(source: &Path, target: &Path, symlink_mode: SymlinkMode) -> Result<()> {
+async fn copy_dir_all(
+    source: &Path,
+    target: &Path,
+    symlink_mode: SymlinkMode,
+    excluded_top_level: Option<OsString>,
+) -> Result<()> {
     let source = source.to_path_buf();
     let target = target.to_path_buf();
-    tokio::task::spawn_blocking(move || copy_dir_all_blocking(&source, &target, symlink_mode))
-        .await
-        .context("copy local workspace task failed")?
+    tokio::task::spawn_blocking(move || {
+        copy_dir_all_blocking(
+            &source,
+            &target,
+            symlink_mode,
+            excluded_top_level.as_deref(),
+        )
+    })
+    .await
+    .context("copy local workspace task failed")?
 }
 
-fn copy_dir_all_blocking(source: &Path, target: &Path, symlink_mode: SymlinkMode) -> Result<()> {
+fn copy_dir_all_blocking(
+    source: &Path,
+    target: &Path,
+    symlink_mode: SymlinkMode,
+    excluded_entry: Option<&OsStr>,
+) -> Result<()> {
     std::fs::create_dir_all(target)
         .with_context(|| format!("create local workspace copy {}", target.display()))?;
     for entry in std::fs::read_dir(source)
         .with_context(|| format!("read local workspace source {}", source.display()))?
     {
         let entry = entry?;
+        if excluded_entry == Some(entry.file_name().as_os_str()) {
+            continue;
+        }
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            copy_dir_all_blocking(&source_path, &target_path, symlink_mode)?;
+            copy_dir_all_blocking(&source_path, &target_path, symlink_mode, None)?;
         } else if file_type.is_file() {
             std::fs::copy(&source_path, &target_path).with_context(|| {
                 format!(
@@ -359,5 +453,29 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pi-destroy-missing-{}", Uuid::new_v4()));
         destroy_workspace_tree(&root).await.unwrap();
         assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn destroy_workspace_tree_unlinks_symlink_root_without_touching_target() {
+        let temp = std::env::temp_dir().join(format!("pi-destroy-symlink-{}", Uuid::new_v4()));
+        let target = temp.join("target");
+        let root = temp.join("root");
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        tokio::fs::write(target.join("sentinel.txt"), "untouched")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+
+        destroy_workspace_tree(&root).await.unwrap();
+
+        assert!(tokio::fs::symlink_metadata(&root).await.is_err());
+        assert_eq!(
+            tokio::fs::read_to_string(target.join("sentinel.txt"))
+                .await
+                .unwrap(),
+            "untouched"
+        );
+        tokio::fs::remove_dir_all(temp).await.unwrap();
     }
 }

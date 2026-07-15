@@ -30,6 +30,28 @@ pub(super) async fn run_tool_turn(
         return Ok(());
     };
 
+    let is_mcp_tool = dispatch
+        .mcp_snapshot
+        .manifest()
+        .tool(&tool_call.tool_name)
+        .is_some();
+    // MCP and ordinary tools may mutate the cwd, so snapshots wait for them.
+    // Delegation controls are excluded because read-only child creation takes
+    // this same guard internally and would otherwise self-deadlock.
+    let workspace_guard = if is_mcp_tool
+        || (tool_call.tool_name != "LoadSkill"
+            && !is_web_tool_name(&tool_call.tool_name)
+            && !is_delegation_tool_name(&tool_call.tool_name))
+    {
+        Some(
+            state
+                .workspaces
+                .acquire_cwd_mutation_guard(&dispatch.config.outer_cwd)
+                .await,
+        )
+    } else {
+        None
+    };
     state
         .workspaces
         .ensure_session(
@@ -42,7 +64,7 @@ pub(super) async fn run_tool_turn(
     let tool_context =
         ToolContext::new(std::path::PathBuf::from(dispatch.config.outer_cwd.clone()));
     let snapshot = &dispatch.mcp_snapshot;
-    let mut result = if snapshot.manifest().tool(&tool_call.tool_name).is_some() {
+    let mut result = if is_mcp_tool {
         let arguments = serde_json::from_str(&tool_call.args_json).unwrap_or(Value::Null);
         match state
             .mcp
@@ -101,6 +123,9 @@ pub(super) async fn run_tool_turn(
             ),
         }
     };
+    // Completion persistence acquires the SessionDriver. Release the cwd guard
+    // first so cancellation and source mutation never depend on both locks.
+    drop(workspace_guard);
     finalize_tool_result(&mut result);
     let status = if matches!(result.status, ToolResultStatus::Success) {
         ActionStatus::Completed
