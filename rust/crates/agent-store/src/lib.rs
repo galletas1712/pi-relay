@@ -490,6 +490,39 @@ impl fmt::Display for SourceMutationConflict {
 
 impl std::error::Error for SourceMutationConflict {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunningDelegationConflict;
+
+impl fmt::Display for RunningDelegationConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "a delegation is already running for this session")
+    }
+}
+
+impl std::error::Error for RunningDelegationConflict {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryChanged;
+
+impl fmt::Display for HistoryChanged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "session history changed before the request was applied")
+    }
+}
+
+impl std::error::Error for HistoryChanged {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryTargetNotTurnBoundary;
+
+impl fmt::Display for HistoryTargetNotTurnBoundary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "history target is not a turn boundary")
+    }
+}
+
+impl std::error::Error for HistoryTargetNotTurnBoundary {}
+
 pub struct PromoteQueuedInputResult {
     pub input_id: String,
     pub priority: InputPriority,
@@ -832,6 +865,43 @@ pub struct SwitchActiveLeafResult {
     pub last_event_id: i64,
     pub active_branch_entry_ids: Option<Vec<String>>,
     pub active_branch_entries: Option<Vec<TranscriptEntryRecord>>,
+    pub events: Vec<EventFrame>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HistoryTarget<'a> {
+    pub leaf_id: Option<&'a str>,
+    pub expected_active_leaf_id: Option<Option<&'a str>>,
+    pub expected_transcript_revision: Option<i64>,
+    pub expected_active_branch_entry_ids: Option<&'a [String]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SwitchActiveLeafRequest<'a> {
+    pub session_id: &'a str,
+    pub target: HistoryTarget<'a>,
+    pub return_active_branch: bool,
+    pub missing_body_ids: Option<&'a [String]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CreateForkRequest<'a> {
+    pub source_session_id: &'a str,
+    pub child_session_id: &'a str,
+    pub config: &'a SessionConfig,
+    pub target: HistoryTarget<'a>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForkSessionResult {
+    pub session_id: String,
+    pub source_session_id: String,
+    pub source_leaf_id: Option<String>,
+    pub active_leaf_id: Option<String>,
+    pub session_revision: i64,
+    pub queue_revision: i64,
+    pub transcript_revision: i64,
+    pub last_event_id: i64,
     pub events: Vec<EventFrame>,
 }
 

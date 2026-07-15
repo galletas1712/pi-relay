@@ -3,6 +3,8 @@ mod actions;
 mod compaction;
 mod delegations;
 mod events;
+mod history_fork;
+mod history_target;
 mod mcp;
 mod outputs;
 mod projects;

@@ -9,8 +9,8 @@ use super::queue::{
     append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
 };
 use super::sql::{
-    action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity,
-    steering_route_tx,
+    action_is_unfinished, ensure_no_running_delegation_tx, lock_session_tx, queued_input_is_active,
+    session_activity, steering_route_tx,
 };
 use super::PostgresAgentStore;
 use crate::{
@@ -101,6 +101,9 @@ impl PostgresAgentStore {
         }
         let id = format!("delegation_{}", Uuid::new_v4());
         let attempt_id = Uuid::new_v4().to_string();
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, parent_session_id).await?;
+        ensure_no_running_delegation_tx(&mut tx, parent_session_id).await?;
         sqlx::query(
             r#"
             insert into delegations (id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents)
@@ -115,8 +118,9 @@ impl PostgresAgentStore {
         .bind(DelegationStatus::Running.as_str())
         .bind(&attempt_id)
         .bind(expected_subagents)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(Delegation {
             id,
             parent_session_id: parent_session_id.to_string(),
