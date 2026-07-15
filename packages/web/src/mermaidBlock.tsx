@@ -10,6 +10,7 @@ type MermaidApi = {
 
 let mermaidPromise: Promise<MermaidApi> | null = null;
 let currentTheme: "default" | "dark" | null = null;
+const MERMAID_VIEWPORT_MARGIN = "600px 0px";
 
 function loadMermaid(theme: "default" | "dark"): Promise<MermaidApi> {
 	if (!mermaidPromise) {
@@ -57,7 +58,34 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
 	const [svg, setSvg] = useState<string | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [isDark, setIsDark] = useState<boolean>(prefersDark);
+	const [shouldRender, setShouldRender] = useState(false);
+	const sourceRef = useRef<HTMLPreElement>(null);
 	const renderIdRef = useRef(0);
+
+	// Render shortly before the source scrolls into view. Once activated, keep
+	// rendering updates so scrolling away does not replace the SVG with source.
+	useEffect(() => {
+		const source = sourceRef.current;
+		if (!source) return;
+		if (typeof IntersectionObserver === "undefined") {
+			setShouldRender(true);
+			return;
+		}
+
+		const observer = new IntersectionObserver(
+			(entries) => {
+				if (!entries.some((entry) => entry.isIntersecting)) return;
+				observer.disconnect();
+				setShouldRender(true);
+			},
+			{
+				root: source.closest<HTMLElement>(".message-scroll"),
+				rootMargin: MERMAID_VIEWPORT_MARGIN,
+			},
+		);
+		observer.observe(source);
+		return () => observer.disconnect();
+	}, []);
 
 	// Track prefers-color-scheme changes so the diagram restyles with the page.
 	useEffect(() => {
@@ -69,6 +97,8 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
 	}, []);
 
 	useEffect(() => {
+		if (!shouldRender) return;
+
 		const trimmed = code.trim();
 		if (trimmed.length === 0) {
 			setSvg(null);
@@ -112,11 +142,11 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
 		return () => {
 			cancelled = true;
 		};
-	}, [code, isDark]);
+	}, [code, isDark, shouldRender]);
 
 	if (error) {
 		return (
-			<pre className="mermaid-source mermaid-source-error" data-mermaid-error={error}>
+			<pre ref={sourceRef} className="mermaid-source mermaid-source-error" data-mermaid-error={error}>
 				<code className="language-mermaid">{code}</code>
 			</pre>
 		);
@@ -126,7 +156,7 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
 		// Streaming / pre-render placeholder. Render the source so users still
 		// see something useful while the diagram parses.
 		return (
-			<pre className="mermaid-source">
+			<pre ref={sourceRef} className="mermaid-source">
 				<code className="language-mermaid">{code}</code>
 			</pre>
 		);
