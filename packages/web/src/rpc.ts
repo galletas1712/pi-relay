@@ -43,7 +43,7 @@ export interface RpcRequestOptions {
 }
 
 export const RPC_REQUEST_TIMEOUT_MS = 15_000;
-export const SESSION_START_REQUEST_TIMEOUT_MS = 300_000;
+export const WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS = 300_000;
 
 export class AgentRpcClient implements RpcClient {
 	private ws: WebSocket | null = null;

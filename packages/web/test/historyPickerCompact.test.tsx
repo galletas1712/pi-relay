@@ -69,16 +69,35 @@ function pixelDeclaration(rule: string, property: string): number {
 }
 
 describe("compact history branch disclosure", () => {
+	it("labels fork targets as fork targets", () => {
+		render(
+			<CompactHistoryPickerDialog
+				mode="fork"
+				nodes={branchFixture()}
+				activeLeafId="active"
+				onClose={() => undefined}
+				onSelect={() => undefined}
+			/>
+		);
+
+		expect(screen.getByRole("list", { name: "fork targets" })).toBeTruthy();
+		expect(screen.queryByRole("list", { name: "switch targets" })).toBeNull();
+		expect(screen.getByText(/current workspace—not historical files—will be cloned/i)).toBeTruthy();
+		expect(screen.getAllByText(/fork ·/).length).toBeGreaterThan(0);
+		expect(screen.queryByText(/switch ·/)).toBeNull();
+		expect(screen.getByText(/edit ·/)).toBeTruthy();
+	});
+
 	it("uses list/disclosure semantics with native keyboard traversal and activation", async () => {
 		const onClose = vi.fn();
-		const onSwitch = vi.fn();
+		const onSelect = vi.fn();
 		const user = userEvent.setup();
 		render(
 			<CompactHistoryPickerDialog
 				nodes={branchFixture()}
 				activeLeafId="active"
 				onClose={onClose}
-				onSwitch={onSwitch}
+				onSelect={onSelect}
 			/>
 		);
 		const disclosure = screen.getByRole("button", {
@@ -103,14 +122,14 @@ describe("compact history branch disclosure", () => {
 		expect(disclosure.getAttribute("aria-expanded")).toBe("true");
 		expect(document.getElementById(branchId!)?.hidden).toBe(false);
 		expect(screen.getByRole("button", { name: /hidden alternate turn/ })).toBeTruthy();
-		expect(onSwitch).not.toHaveBeenCalled();
+		expect(onSelect).not.toHaveBeenCalled();
 		expect(onClose).not.toHaveBeenCalled();
 
 		await user.tab();
 		expect(document.activeElement).toBe(switchTarget);
 		await user.keyboard("{Enter}");
-		expect(onSwitch).toHaveBeenCalledTimes(1);
-		expect(onSwitch.mock.calls[0]?.[0]).toMatchObject({
+		expect(onSelect).toHaveBeenCalledTimes(1);
+		expect(onSelect.mock.calls[0]?.[0]).toMatchObject({
 			id: "alternate",
 			preview: "alternate branch",
 		});
@@ -127,7 +146,7 @@ describe("compact history branch disclosure", () => {
 						activeLeafId={null}
 						loading
 						onClose={close}
-						onSwitch={vi.fn()}
+						onSelect={vi.fn()}
 					/>
 				)}
 			</HistoryLauncher>,
@@ -149,7 +168,7 @@ describe("compact history branch disclosure", () => {
 						nodes={branchFixture()}
 						activeLeafId="active"
 						onClose={close}
-						onSwitch={vi.fn()}
+						onSelect={vi.fn()}
 					/>
 				)}
 			</HistoryLauncher>,
@@ -175,7 +194,7 @@ describe("compact history branch disclosure", () => {
 				activeLeafId="active"
 				loading
 				onClose={() => undefined}
-				onSwitch={() => undefined}
+				onSelect={() => undefined}
 			/>,
 		);
 		const scroller = document.querySelector<HTMLElement>(".history-options");
@@ -186,7 +205,7 @@ describe("compact history branch disclosure", () => {
 				nodes={branchFixture()}
 				activeLeafId="active"
 				onClose={() => undefined}
-				onSwitch={() => undefined}
+				onSelect={() => undefined}
 			/>,
 		);
 
@@ -198,7 +217,7 @@ describe("compact history branch disclosure", () => {
 				nodes={[...branchFixture()]}
 				activeLeafId="active"
 				onClose={() => undefined}
-				onSwitch={() => undefined}
+				onSelect={() => undefined}
 			/>,
 		);
 		expect(scroller.scrollTop).toBe(25);
@@ -212,7 +231,7 @@ describe("compact history branch disclosure", () => {
 				activeLeafId={null}
 				loading
 				onClose={() => undefined}
-				onSwitch={() => undefined}
+				onSelect={() => undefined}
 			/>,
 		);
 		const scroller = document.querySelector<HTMLElement>(".history-options");
@@ -226,7 +245,7 @@ describe("compact history branch disclosure", () => {
 				nodes={branchFixture()}
 				activeLeafId={null}
 				onClose={() => undefined}
-				onSwitch={() => undefined}
+				onSelect={() => undefined}
 			/>,
 		);
 
@@ -248,7 +267,7 @@ describe("compact history branch disclosure", () => {
 						nodes={partial}
 						activeLeafId="active"
 						onClose={close}
-						onSwitch={() => undefined}
+						onSelect={() => undefined}
 					/>
 				)}
 			</HistoryLauncher>,
@@ -265,7 +284,7 @@ describe("compact history branch disclosure", () => {
 						nodes={branchFixture()}
 						activeLeafId="active"
 						onClose={close}
-						onSwitch={() => undefined}
+						onSelect={() => undefined}
 					/>
 				)}
 			</HistoryLauncher>,
@@ -281,7 +300,7 @@ describe("compact history branch disclosure", () => {
 						nodes={partial}
 						activeLeafId="active"
 						onClose={close}
-						onSwitch={() => undefined}
+						onSelect={() => undefined}
 					/>
 				)}
 			</HistoryLauncher>,
@@ -297,7 +316,7 @@ describe("compact history branch disclosure", () => {
 						nodes={branchFixture()}
 						activeLeafId="active"
 						onClose={close}
-						onSwitch={() => undefined}
+						onSelect={() => undefined}
 					/>
 				)}
 			</HistoryLauncher>,
@@ -315,7 +334,7 @@ describe("compact history branch disclosure", () => {
 						nodes={[]}
 						activeLeafId={null}
 						onClose={close}
-						onSwitch={vi.fn()}
+						onSelect={vi.fn()}
 					/>
 				)}
 			</HistoryLauncher>,

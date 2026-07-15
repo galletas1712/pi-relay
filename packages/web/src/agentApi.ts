@@ -1,7 +1,7 @@
 import {
 	AgentRpcClient,
 	defaultWsUrl,
-	SESSION_START_REQUEST_TIMEOUT_MS,
+	WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS,
 	type ConnectionStatus,
 	type RpcClient,
 } from "./rpc.ts";
@@ -81,6 +81,7 @@ export interface AgentApi {
 	interrupt(sessionId: string): Promise<InterruptResult>;
 	resumeTurn(params: ResumeTurnParams): Promise<ResumeTurnResult>;
 	switchHistory(params: SwitchHistoryParams): Promise<SwitchHistoryResult>;
+	forkHistory(params: ForkHistoryParams): Promise<ForkHistoryResult>;
 	renameSession(sessionId: string, title: string): Promise<RenameSessionResult>;
 	deleteSession(sessionId: string): Promise<DeleteSessionResult>;
 	configureSession(params: ConfigureSessionParams): Promise<ConfigureSessionResult>;
@@ -90,6 +91,16 @@ export interface AgentApi {
 	reorderQueuedFollowUps(sessionId: string, inputIds: string[], expectedQueueRevision?: number | null): Promise<ReorderQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
+}
+
+function historyTargetPayload(params: HistoryTargetParams) {
+	return {
+		session_id: params.sessionId,
+		leaf_id: params.leafId,
+		expected_active_leaf_id: params.expectedActiveLeafId,
+		expected_transcript_revision: params.expectedTranscriptRevision ?? undefined,
+		active_branch_entry_ids: params.activeBranchEntryIds,
+	};
 }
 
 export interface CreateProjectParams {
@@ -312,14 +323,30 @@ export interface ConfigureSessionResult {
 	metadata?: Record<string, unknown>;
 }
 
-export interface SwitchHistoryParams {
+interface HistoryTargetParams {
 	sessionId: string;
 	leafId: string | null;
-	expectedActiveLeafId: string | null;
-	returnActiveBranch?: boolean;
+	expectedActiveLeafId?: string | null;
 	expectedTranscriptRevision?: number | null;
 	activeBranchEntryIds?: string[];
+}
+
+export interface SwitchHistoryParams extends HistoryTargetParams {
+	returnActiveBranch?: boolean;
 	missingBodyIds?: string[];
+}
+
+export type ForkHistoryParams = HistoryTargetParams;
+
+export interface ForkHistoryResult {
+	session_id: string;
+	source_session_id: string;
+	source_leaf_id: string | null;
+	active_leaf_id: string | null;
+	session_revision: number;
+	queue_revision: number;
+	transcript_revision: number;
+	last_event_id: number;
 }
 
 export interface ConfigureSessionParams {
@@ -588,7 +615,7 @@ class AgentApiClient implements AgentApi {
 							branch: workspace.branch?.trim() || undefined
 						}))
 			},
-			{ timeoutMs: SESSION_START_REQUEST_TIMEOUT_MS },
+			{ timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
 		);
 	}
 
@@ -616,14 +643,18 @@ class AgentApiClient implements AgentApi {
 
 	switchHistory(params: SwitchHistoryParams): Promise<SwitchHistoryResult> {
 		return this.client.request<SwitchHistoryResult>("history.switch", {
-			session_id: params.sessionId,
-			leaf_id: params.leafId,
-			expected_active_leaf_id: params.expectedActiveLeafId,
+			...historyTargetPayload(params),
 			return_active_branch: params.returnActiveBranch || undefined,
-			expected_transcript_revision: params.expectedTranscriptRevision ?? undefined,
-			active_branch_entry_ids: params.activeBranchEntryIds,
 			missing_body_ids: params.missingBodyIds
 		});
+	}
+
+	forkHistory(params: ForkHistoryParams): Promise<ForkHistoryResult> {
+		return this.client.request<ForkHistoryResult>(
+			"history.fork",
+			historyTargetPayload(params),
+			{ timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
+		);
 	}
 
 	renameSession(sessionId: string, title: string): Promise<RenameSessionResult> {

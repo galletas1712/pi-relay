@@ -91,6 +91,186 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
+	it("forks from the current picker target and cold-loads the independent child", async () => {
+		const browser = new FakeWorkspaceBrowser(
+			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+		);
+		const api = createRouteApi({
+			historySessionIds: new Set(["project-root-1"]),
+			runningRootDelegation: false,
+		});
+		api.forkHistory.mockResolvedValue({
+			session_id: "fork-child",
+			source_session_id: "project-root-1",
+			source_leaf_id: "entry-active",
+			active_leaf_id: "entry-active",
+			session_revision: 1,
+			queue_revision: 0,
+			transcript_revision: 1,
+			last_event_id: 1,
+		});
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
+		await user.type(composer, "/fork");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		expect(await screen.findByRole("heading", { name: "Fork session" })).toBeTruthy();
+		await user.click(screen.getByRole("button", { name: /Fork from End of turn 1/ }));
+
+		await waitFor(() => expect(api.forkHistory).toHaveBeenCalledTimes(1));
+		expect(api.forkHistory.mock.calls[0][0]).toMatchObject({
+			sessionId: "project-root-1",
+			leafId: "entry-active",
+			expectedActiveLeafId: "entry-active",
+			expectedTranscriptRevision: 1,
+			activeBranchEntryIds: ["entry-user", "entry-active"],
+		});
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe(
+				"/w/project/project-1/run/fork-child/conversation/fork-child",
+			));
+		await waitFor(() =>
+			expect(api.getSession.mock.calls.some(([sessionId]) => sessionId === "fork-child")).toBe(true),
+		);
+
+		await mounted.dispose();
+	});
+
+	it("rejects /fork before opening the picker for an unmanaged host session", async () => {
+		const api = createRouteApi({
+			historySessionIds: new Set(["root-1"]),
+			runningRootDelegation: false,
+		});
+		const mounted = renderRouteApp(
+			api,
+			new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1"),
+		);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.type(await screen.findByRole("textbox"), "/fork");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		expect(await screen.findByText("/fork requires a managed project session")).toBeTruthy();
+		expect(screen.queryByRole("dialog")).toBeNull();
+		expect(api.forkHistory).not.toHaveBeenCalled();
+
+		await mounted.dispose();
+	});
+
+	it("retains a forked user-message draft when popstate wins a delayed RPC race", async () => {
+		const fork = deferred<ReturnType<typeof forkResult>>();
+		const browser = new FakeWorkspaceBrowser(
+			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+		);
+		const api = createRouteApi({
+			historySessionIds: new Set(["project-root-1"]),
+			runningRootDelegation: false,
+			deferredTranscriptEntries: Promise.resolve({
+				session_id: "project-root-1",
+				session_revision: 1,
+				transcript_revision: 1,
+				entries: [userMessageEntry()],
+			}),
+		});
+		api.forkHistory.mockImplementation(() => fork.promise);
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.type(await screen.findByRole("textbox"), "/fork");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await user.click(await screen.findByRole("button", { name: /Fork from User message/ }));
+		await waitFor(() => expect(api.forkHistory).toHaveBeenCalledTimes(1));
+
+		await act(async () =>
+			browser.popstate(
+				"/w/project/project-1/run/project-root-1/conversation/project-child-1",
+			),
+		);
+		await act(async () => fork.resolve(forkResult("project-root-1")));
+		expect(browser.currentUrl).toBe(
+			"/w/project/project-1/run/project-root-1/conversation/project-child-1",
+		);
+
+		await act(async () =>
+			browser.navigate("/w/project/project-1/run/fork-child/conversation/fork-child"),
+		);
+		expect((await screen.findByRole<HTMLTextAreaElement>("textbox")).value).toBe(
+			"Edit original prompt",
+		);
+
+		await mounted.dispose();
+	});
+
+	it("refreshes a stale fork tree and asks the user to retry", async () => {
+		const browser = new FakeWorkspaceBrowser(
+			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+		);
+		const api = createRouteApi({
+			historySessionIds: new Set(["project-root-1"]),
+			runningRootDelegation: false,
+		});
+		api.forkHistory.mockRejectedValue(
+			new Error("history_changed: transcript revision changed"),
+		);
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.type(await screen.findByRole("textbox"), "/fork");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await user.click(await screen.findByRole("button", { name: /Fork from End of turn 1/ }));
+
+		await waitFor(() => expect(api.getTranscriptIndex).toHaveBeenCalledTimes(2));
+		expect(
+			await screen.findByText("history changed; refreshed the fork list, please choose again"),
+		).toBeTruthy();
+		expect(browser.currentUrl).toBe(
+			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+		);
+
+		await mounted.dispose();
+	});
+
+	it.each(["switch", "fork"] as const)(
+		"rejects /%s while a delegation is running",
+		async (command) => {
+			const sessionId = command === "fork" ? "project-root-1" : "root-1";
+			const api = createRouteApi({
+				historySessionIds: new Set([sessionId]),
+				runningRootDelegation: true,
+			});
+			const mounted = renderRouteApp(
+				api,
+				new FakeWorkspaceBrowser(
+					command === "fork"
+						? "/w/project/project-1/run/project-root-1/conversation/project-root-1"
+						: "/w/host/run/root-1/conversation/root-1",
+				),
+			);
+			const user = userEvent.setup();
+
+			await open(api);
+			await waitFor(() => expect(api.listDelegations).toHaveBeenCalledWith(sessionId, 3));
+			await user.type(await screen.findByRole("textbox"), `/${command}`);
+			await user.click(screen.getByRole("button", { name: "send message" }));
+
+			expect(
+				await screen.findByText(
+					"wait for running delegations to finish before changing history",
+				),
+			).toBeTruthy();
+			expect(screen.queryByRole("dialog")).toBeNull();
+			expect(api.switchHistory).not.toHaveBeenCalled();
+			expect(api.forkHistory).not.toHaveBeenCalled();
+
+			await mounted.dispose();
+		},
+	);
+
 	it("shows one workspace preparation status while session.start is pending and clears it on rejection", async () => {
 		const start = deferred<never>();
 		const api = createRouteApi();
@@ -1430,6 +1610,7 @@ describe("App workspace route identity integration", () => {
 		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
 		const api = createRouteApi({
 			historySessionIds: new Set(["root-1"]),
+			runningRootDelegation: false,
 			deferredTranscriptEntries: restoredEntry.promise,
 		});
 		api.switchHistory.mockImplementation(async (params: { sessionId: string; leafId: string | null }) => ({
@@ -1480,6 +1661,7 @@ describe("App workspace route identity integration", () => {
 		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
 		const api = createRouteApi({
 			historySessionIds: new Set(["root-1"]),
+			runningRootDelegation: false,
 			includeDestinationHistoryTarget: true,
 		});
 		api.getTranscriptTurns.mockResolvedValue(
@@ -1580,6 +1762,7 @@ type RouteApi = AgentApi & {
 	queueFollowUp: ApiSpy;
 	startSession: ApiSpy;
 	switchHistory: ApiSpy;
+	forkHistory: ApiSpy;
 	emitStatus(status: ConnectionStatus): void;
 	emitEvent(event: EventFrame): void;
 };
@@ -1589,6 +1772,7 @@ function createRouteApi(
 		missingSessionIds?: Set<string>;
 		deferredSessions?: Map<string, Promise<SessionSnapshot>>;
 		historySessionIds?: Set<string>;
+		runningRootDelegation?: boolean;
 		includeDestinationHistoryTarget?: boolean;
 		activeLeafIds?: Map<string, string | null>;
 		deferredTranscriptTurns?: Map<string, Promise<TranscriptTurnsResult>>;
@@ -1661,6 +1845,9 @@ function createRouteApi(
 		}
 		if (sessionId === "child-1") return snapshot("child-1", "root-1", null, "Child one");
 		if (sessionId === "child-a") return snapshot("child-a", "root-1", null, "Child A");
+		if (sessionId === "fork-child") {
+			return snapshot("fork-child", null, "project-1", "Fork child");
+		}
 		if (sessionId === "legacy-root") return snapshot("legacy-root", null, null, "Legacy root");
 		if (sessionId === "project-root-1") {
 			return snapshot("project-root-1", null, "project-1", "Project root");
@@ -1682,7 +1869,8 @@ function createRouteApi(
 	const listDelegations = vi.fn(async (parentSessionId: string): Promise<DelegationListResult> => ({
 		parent_session_id: parentSessionId,
 		has_more: false,
-		delegations: parentSessionId === "root-1"
+		delegations: ["root-1", "project-root-1"].includes(parentSessionId)
+			&& options.runningRootDelegation !== false
 			? [{
 				delegation_id: "delegation-1",
 				kind: "full",
@@ -1755,6 +1943,7 @@ function createRouteApi(
 		deleteSession: mutation(),
 		resumeTurn: mutation(),
 		switchHistory: mutation(),
+		forkHistory: mutation(),
 		promoteQueuedInput: mutation(),
 		updateQueuedInput: mutation(),
 		cancelQueuedInput: mutation(),
@@ -2020,6 +2209,19 @@ function userMessageEntry(): TranscriptEntry {
 	};
 }
 
+function forkResult(sourceSessionId = "root-1") {
+	return {
+		session_id: "fork-child",
+		source_session_id: sourceSessionId,
+		source_leaf_id: null,
+		active_leaf_id: null,
+		session_revision: 1,
+		queue_revision: 0,
+		transcript_revision: 1,
+		last_event_id: 1,
+	};
+}
+
 function mutationCallCount(api: RouteApi): number {
 	return [
 		api.queueFollowUp,
@@ -2031,6 +2233,7 @@ function mutationCallCount(api: RouteApi): number {
 		api.deleteSession,
 		api.resumeTurn,
 		api.switchHistory,
+		api.forkHistory,
 	].reduce((total, candidate) => total + (candidate as ApiSpy).mock.calls.length, 0);
 }
 

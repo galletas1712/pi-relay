@@ -1,5 +1,5 @@
 import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
-import { ChevronRight, Loader2, RotateCcw } from "lucide-react";
+import { ChevronRight, GitFork, Loader2, RotateCcw } from "lucide-react";
 import {
 	AppDialog,
 	DialogCloseButton,
@@ -33,26 +33,29 @@ interface HistoryPickerContentParams {
 	mutationBlockedReason?: string | null;
 	rows: VisibleHistoryNodeRow[];
 	hiddenBranchIds: Set<string>;
-	onSwitch: (target: HistoryTargetOption) => void;
+	mode: "fork" | "switch";
+	onSelect: (target: HistoryTargetOption) => void;
 	onToggleBranch: (entryId: string) => void;
 }
 
 export function CompactHistoryPickerDialog({
 	nodes,
 	activeLeafId,
+	mode = "switch",
 	loading = false,
 	error = null,
 	onClose,
-	onSwitch,
+	onSelect,
 	mutationBlockedReason,
 	returnFocusFallbackRef,
 }: {
 	nodes: TranscriptTreeNode[];
 	activeLeafId: string | null;
+	mode?: "fork" | "switch";
 	loading?: boolean;
 	error?: string | null;
 	onClose: () => void;
-	onSwitch: (target: HistoryTargetOption) => void;
+	onSelect: (target: HistoryTargetOption) => void;
 	mutationBlockedReason?: string | null;
 	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
@@ -108,6 +111,9 @@ export function CompactHistoryPickerDialog({
 		});
 	};
 	const targetCount = visibleRows.length;
+	const isFork = mode === "fork";
+	const title = isFork ? "Fork session" : "Switch branch";
+	const Icon = isFork ? GitFork : RotateCcw;
 	useLayoutEffect(() => {
 		if (initializedScrollRef.current || loading || error || renderedRows.length === 0) return;
 		const list = optionsRef.current;
@@ -131,12 +137,14 @@ export function CompactHistoryPickerDialog({
 		>
 			<div className="history-dialog-head">
 				<span className="history-dialog-icon" aria-hidden="true">
-					<RotateCcw size={15} />
+					<Icon size={15} />
 				</span>
 				<div className="history-dialog-copy">
-					<DialogTitle ref={titleRef} tabIndex={-1}>Switch branch</DialogTitle>
+					<DialogTitle ref={titleRef} tabIndex={-1}>{title}</DialogTitle>
 					<DialogDescription>
-						Pick a user message to edit, or a completed turn or compaction root to make active.
+						{isFork
+							? "Pick a user message to edit, or a completed turn or compaction root. The current workspace—not historical files—will be cloned."
+							: "Pick a user message to edit, or a completed turn or compaction root to make active."}
 					</DialogDescription>
 				</div>
 				<DialogCloseButton label="close picker" />
@@ -148,9 +156,10 @@ export function CompactHistoryPickerDialog({
 					loading,
 					error,
 					mutationBlockedReason,
+					mode,
 					rows: visibleRows,
 					hiddenBranchIds,
-					onSwitch,
+					onSelect,
 					onToggleBranch: toggleBranch,
 				})}
 				{!loading && !error && targetCount === 0 ? (
@@ -177,9 +186,10 @@ function historyPickerContent({
 	loading,
 	error,
 	mutationBlockedReason,
+	mode,
 	rows,
 	hiddenBranchIds,
-	onSwitch,
+	onSelect,
 	onToggleBranch,
 }: HistoryPickerContentParams): ReactNode {
 	if (loading) {
@@ -227,10 +237,10 @@ function historyPickerContent({
 					<button
 						className="history-option tree-row"
 						type="button"
-						aria-label={`Switch to ${display.title}: ${display.preview}${row.isActive ? ", current" : ""}`}
+						aria-label={`${mode === "fork" ? "Fork from" : "Switch to"} ${display.title}: ${display.preview}${row.isActive ? ", current" : ""}`}
 						aria-current={row.isActive ? "true" : undefined}
 						disabled={!!mutationBlockedReason}
-						onClick={() => onSwitch(row.option)}
+						onClick={() => onSelect(row.option)}
 					>
 						<span className="tree-guides" aria-hidden="true" />
 						<span className={`history-option-icon ${row.parentId ? "" : "root"}`}>
@@ -247,7 +257,11 @@ function historyPickerContent({
 							</span>
 							<span className="history-option-preview">{display.preview}</span>
 						</span>
-						<span className="history-option-meta">{display.meta}</span>
+						<span className="history-option-meta">
+							{mode === "fork" && display.meta.startsWith("switch ·")
+								? display.meta.replace("switch ·", "fork ·")
+								: display.meta}
+						</span>
 					</button>
 					{childRows.length > 0 ? (
 						<ul
@@ -262,7 +276,7 @@ function historyPickerContent({
 			);
 		});
 	return (
-		<ul className="history-target-list" aria-label="switch targets">
+		<ul className="history-target-list" aria-label={`${mode} targets`}>
 			{renderRows(null)}
 		</ul>
 	);
