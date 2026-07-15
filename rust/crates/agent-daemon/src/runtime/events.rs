@@ -19,3 +19,16 @@ pub(crate) async fn clear_event_buffer_if_idle(
     }
     Ok(())
 }
+
+pub(crate) async fn clear_event_buffer_after_commit(
+    state: &AppState,
+    session_id: &str,
+    operation: &str,
+) {
+    if let Err(error) = clear_event_buffer_if_idle(state, session_id).await {
+        eprintln!(
+            "failed to clear event buffer after committed {operation} for session {session_id}: {}: {}",
+            error.code, error.message
+        );
+    }
+}

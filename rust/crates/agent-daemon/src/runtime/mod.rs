@@ -34,7 +34,9 @@ pub(crate) use dispatch::runner_start_count;
 pub(crate) use errors::{
     history_error_to_rpc, map_queued_mutation_error, map_source_mutation_error,
 };
-pub(crate) use events::{clear_event_buffer_if_idle, publish_events};
+pub(crate) use events::{
+    clear_event_buffer_after_commit, clear_event_buffer_if_idle, publish_events,
+};
 #[cfg(test)]
 pub(crate) use model::apply_model_response;
 use outputs::attach_provider_replay;
