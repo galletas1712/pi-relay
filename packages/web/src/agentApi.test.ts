@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createAgentApi } from "./agentApi.ts";
 import {
-	SESSION_START_REQUEST_TIMEOUT_MS,
+	WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS,
 	type RpcClient,
 	type RpcRequestOptions,
 } from "./rpc.ts";
@@ -55,7 +55,7 @@ describe("AgentApi MCP wire format", () => {
 					],
 				},
 			},
-			options: { timeoutMs: SESSION_START_REQUEST_TIMEOUT_MS },
+			options: { timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
 		});
 	});
 
@@ -131,6 +131,30 @@ describe("AgentApi MCP wire format", () => {
 			workspaces: [],
 		});
 		expect(calls[0]?.params?.workspaces).toEqual([]);
+	});
+});
+
+describe("AgentApi history fork wire format", () => {
+	it("uses switch-compatible target and revision fences", async () => {
+		const calls: RpcCall[] = [];
+		await createAgentApi(fakeClient(calls)).forkHistory({
+			sessionId: "source",
+			leafId: "finish",
+			expectedActiveLeafId: "active",
+			expectedTranscriptRevision: 7,
+			activeBranchEntryIds: ["start", "finish"],
+		});
+		expect(calls).toEqual([{
+			method: "history.fork",
+			params: {
+				session_id: "source",
+				leaf_id: "finish",
+				expected_active_leaf_id: "active",
+				expected_transcript_revision: 7,
+				active_branch_entry_ids: ["start", "finish"],
+			},
+			options: { timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
+		}]);
 	});
 });
 

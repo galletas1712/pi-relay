@@ -1541,10 +1541,6 @@ mod tests {
             .await
             .expect("parent session creates");
 
-        let running = store
-            .create_delegation("parent", DelegationKind::Full, None, Some("running"), 1)
-            .await
-            .expect("running delegation creates");
         let cancelled = store
             .create_delegation("parent", DelegationKind::Full, None, Some("cancelled"), 1)
             .await
@@ -1569,6 +1565,10 @@ mod tests {
             .set_delegation_status(&failed.id, DelegationStatus::Failed)
             .await
             .expect("fail delegation");
+        let running = store
+            .create_delegation("parent", DelegationKind::Full, None, Some("running"), 1)
+            .await
+            .expect("running delegation creates");
 
         for (session_id, delegation_id) in [
             ("running_child", running.id.as_str()),

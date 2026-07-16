@@ -37,6 +37,19 @@ struct StartFullParams {
     label: Option<String>,
 }
 
+fn map_delegation_create_error(error: anyhow::Error) -> RpcError {
+    if error
+        .downcast_ref::<agent_store::RunningDelegationConflict>()
+        .is_some()
+    {
+        return RpcError::new(
+            "delegation_already_running",
+            "a delegation is already running for this session; wait for it to finish before starting another",
+        );
+    }
+    error.into()
+}
+
 pub(crate) struct SubagentWorkState {
     pub(crate) has_unfinished_actions: bool,
     pub(crate) has_queued_inputs: bool,
@@ -643,25 +656,6 @@ fn trim_required(value: &str, field: &str) -> std::result::Result<String, RpcErr
     Ok(trimmed.to_string())
 }
 
-/// One-delegation-per-parent guard: a parent may not start a delegation while
-/// another of its delegations is still running.
-async fn reject_if_delegation_running(
-    state: &AppState,
-    parent_session_id: &str,
-) -> std::result::Result<(), RpcError> {
-    if state
-        .repo
-        .parent_has_running_delegation(parent_session_id)
-        .await?
-    {
-        return Err(RpcError::new(
-            "delegation_already_running",
-            "a delegation is already running for this session; wait for it to finish before starting another",
-        ));
-    }
-    Ok(())
-}
-
 /// Non-recursive invariant: only the top-level session orchestrates
 /// delegations. A subagent (full or read-only) must never spawn its own
 /// delegation.
@@ -799,7 +793,6 @@ pub(crate) async fn start_full_core(
     let prompt = trim_required(&params.prompt, "prompt")?;
 
     reject_if_subagent(state, parent_session_id).await?;
-    reject_if_delegation_running(state, parent_session_id).await?;
 
     let delegation = state
         .repo
@@ -810,7 +803,8 @@ pub(crate) async fn start_full_core(
             params.label.as_deref(),
             1,
         )
-        .await?;
+        .await
+        .map_err(map_delegation_create_error)?;
 
     let spawned = match spawn_subagent(
         state,
@@ -861,7 +855,6 @@ pub(crate) async fn start_readonly_fanout_core(
     }
 
     reject_if_subagent(state, parent_session_id).await?;
-    reject_if_delegation_running(state, parent_session_id).await?;
 
     let expected_subagents = tasks.len();
     let delegation = state
@@ -873,7 +866,8 @@ pub(crate) async fn start_readonly_fanout_core(
             params.label.as_deref(),
             expected_subagents as i32,
         )
-        .await?;
+        .await
+        .map_err(map_delegation_create_error)?;
 
     let mut subagent_session_ids = Vec::with_capacity(expected_subagents);
     for (role, prompt) in tasks {

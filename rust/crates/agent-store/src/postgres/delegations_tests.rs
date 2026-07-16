@@ -287,6 +287,54 @@ async fn create_delegation_persists_kind_status_and_attempt() {
 }
 
 #[tokio::test]
+async fn concurrent_delegation_creation_allows_only_one_running_row() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegation creation race", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+
+    let (first, second) = tokio::join!(
+        db.store
+            .create_delegation("parent", DelegationKind::Full, None, Some("first"), 1),
+        db.store
+            .create_delegation("parent", DelegationKind::Full, None, Some("second"), 1),
+    );
+    let results = [first, second];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.downcast_ref::<crate::RunningDelegationConflict>())
+                    .is_some()
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        db.store
+            .list_parent_delegations("parent")
+            .await
+            .expect("list delegations")
+            .iter()
+            .filter(|delegation| delegation.status == DelegationStatus::Running)
+            .count(),
+        1
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn migration_creates_delegation_ledger_query_indexes() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -442,17 +490,6 @@ async fn parent_delegations_include_complete_parent_set_across_statuses() {
         .create_delegation("other_parent", DelegationKind::Full, None, Some("other"), 1)
         .await
         .expect("create other parent delegation");
-    let running = db
-        .store
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            Some("running-old"),
-            2,
-        )
-        .await
-        .expect("create running delegation");
     let done = db
         .store
         .create_delegation("parent", DelegationKind::Full, None, Some("done"), 1)
@@ -495,6 +532,17 @@ async fn parent_delegations_include_complete_parent_set_across_statuses() {
         .set_delegation_status(&failed.id, DelegationStatus::Failed)
         .await
         .expect("fail delegation");
+    let running = db
+        .store
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            Some("running-old"),
+            2,
+        )
+        .await
+        .expect("create running delegation");
 
     let parent_delegations = db
         .store
@@ -508,7 +556,6 @@ async fn parent_delegations_include_complete_parent_set_across_statuses() {
     assert_eq!(
         ids_and_statuses,
         vec![
-            (running.id.as_str(), DelegationStatus::Running),
             (done.id.as_str(), DelegationStatus::Done),
             (
                 done_with_failures.id.as_str(),
@@ -516,6 +563,7 @@ async fn parent_delegations_include_complete_parent_set_across_statuses() {
             ),
             (cancelled.id.as_str(), DelegationStatus::Cancelled),
             (failed.id.as_str(), DelegationStatus::Failed),
+            (running.id.as_str(), DelegationStatus::Running),
         ]
     );
     assert!(!parent_delegations
@@ -652,6 +700,12 @@ async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact()
             .execute(&db.store.pool)
             .await
             .expect("set deterministic ordering");
+        if index < 4 {
+            db.store
+                .set_delegation_status(&delegation.id, DelegationStatus::Failed)
+                .await
+                .expect("finish historical delegation");
+        }
         delegations.push(delegation);
     }
 
@@ -756,12 +810,6 @@ async fn list_delegation_subagents_returns_only_its_members() {
         .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
         .await
         .expect("create delegation");
-    let other = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
-        .await
-        .expect("create other delegation");
-
     create_delegation_subagent(
         &db,
         "child_a",
@@ -772,6 +820,15 @@ async fn list_delegation_subagents_returns_only_its_members() {
         &delegation.id,
     )
     .await;
+    db.store
+        .set_delegation_status(&delegation.id, DelegationStatus::Done)
+        .await
+        .expect("finish first delegation");
+    let other = db
+        .store
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create other delegation");
     create_delegation_subagent(
         &db,
         "child_b",

@@ -96,6 +96,28 @@ pub(super) async fn lock_session_tx(
     Ok(())
 }
 
+pub(super) async fn ensure_no_running_delegation_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let running: bool = sqlx::query_scalar(
+        r#"
+        select exists(
+            select 1
+            from delegations
+            where parent_session_id=$1 and status='running'
+        )
+        "#,
+    )
+    .bind(session_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if running {
+        return Err(crate::RunningDelegationConflict.into());
+    }
+    Ok(())
+}
+
 /// Returns the route of the newest unfinished model/tool generation.
 ///
 /// Legacy null action routes fall back to the current session default. Every

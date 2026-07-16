@@ -10,15 +10,16 @@ use sqlx::{Postgres, Row, Transaction};
 
 use crate::{
     ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree, SessionActivity,
-    SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryBodyMode,
-    TranscriptEntryRecord, TranscriptEntryScope, TranscriptTreeIndex, TranscriptTreeNodeRecord,
-    TranscriptTurnDetailResult, TranscriptTurnsResult,
+    SwitchActiveLeafRequest, SwitchActiveLeafResult, TranscriptEntriesResult,
+    TranscriptEntryBodyMode, TranscriptEntryRecord, TranscriptEntryScope, TranscriptTreeIndex,
+    TranscriptTreeNodeRecord, TranscriptTurnDetailResult, TranscriptTurnsResult,
 };
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
+use super::history_target::{branch_entry_ids_tx, validate_history_target_tx};
 use super::queue::bump_revisions_tx;
 use super::rows::{row_to_stored_entry, row_to_transcript_entry};
-use super::sql::{ensure_no_active_work_tx, lock_session_tx, stale_unfinished_actions_for_session};
+use super::sql::{lock_session_tx, stale_unfinished_actions_for_session};
 use super::turn_cards::{active_branch_turn_card_page_tx, TurnCardPage};
 use super::PostgresAgentStore;
 
@@ -45,38 +46,13 @@ async fn active_branch_entry_ids_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
 ) -> Result<Vec<String>> {
-    let rows = sqlx::query(
-        r#"
-        with recursive branch as (
-            select t.id, t.parent_id, t.item, t.sequence
-            from transcript_entries t
-            join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
-            where t.session_id = $1
-
-            union all
-
-            select parent.id, parent.parent_id, parent.item, parent.sequence
-            from transcript_entries parent
-            join branch child
-              on parent.session_id = $1
-             and parent.id = coalesce(
-                case
-                    when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
-                    else null
-                end,
-                child.parent_id
-             )
-        )
-        select id from branch order by sequence
-        "#,
-    )
-    .bind(session_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| row.get::<String, _>("id"))
-        .collect())
+    let active_leaf_id: Option<String> =
+        sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
+            .bind(session_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+    branch_entry_ids_tx(tx, session_id, active_leaf_id.as_deref()).await
 }
 
 async fn transcript_entry_records_by_id_tx(
@@ -692,63 +668,37 @@ impl PostgresAgentStore {
         leaf_id: Option<&str>,
     ) -> Result<Vec<EventFrame>> {
         let result = self
-            .switch_active_leaf(session_id, leaf_id, false, None, None, None, None)
+            .switch_active_leaf(SwitchActiveLeafRequest {
+                session_id,
+                target: crate::HistoryTarget {
+                    leaf_id,
+                    expected_active_leaf_id: None,
+                    expected_transcript_revision: None,
+                    expected_active_branch_entry_ids: None,
+                },
+                return_active_branch: false,
+                missing_body_ids: None,
+            })
             .await?;
         Ok(result.events)
     }
 
     pub async fn switch_active_leaf(
         &self,
-        session_id: &str,
-        leaf_id: Option<&str>,
-        return_active_branch: bool,
-        expected_active_leaf_id: Option<Option<&str>>,
-        expected_transcript_revision: Option<i64>,
-        expected_active_branch_entry_ids: Option<&[String]>,
-        missing_body_ids: Option<&[String]>,
+        request: SwitchActiveLeafRequest<'_>,
     ) -> Result<SwitchActiveLeafResult> {
-        let expected_active_branch_entry_ids =
-            expected_active_branch_entry_ids.filter(|ids| !ids.is_empty());
+        let SwitchActiveLeafRequest {
+            session_id,
+            target,
+            return_active_branch,
+            missing_body_ids,
+        } = request;
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
-        let (current_active_leaf_id, current_transcript_revision): (Option<String>, i64) =
-            sqlx::query_as("select active_leaf_id, transcript_revision from sessions where id=$1")
-                .bind(session_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-        ensure_no_active_work_tx(&mut tx, session_id).await?;
-        if let Some(expected) = expected_active_leaf_id {
-            if current_active_leaf_id.as_deref() != expected {
-                return Err(crate::ExpectedActiveLeafMismatch::new(
-                    current_active_leaf_id,
-                    expected.map(str::to_string),
-                )
-                .into());
-            }
-        }
-        if let Some(expected) = expected_transcript_revision {
-            if current_transcript_revision != expected {
-                return Err(anyhow!(
-                    "history_changed: transcript revision changed before history.switch was applied"
-                ));
-            }
-        }
-        if let Some(leaf_id) = leaf_id {
-            let belongs_to_session: bool = sqlx::query_scalar(
-                "select exists(select 1 from transcript_entries where session_id=$1 and id=$2::text)",
-            )
-            .bind(session_id)
-            .bind(leaf_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if !belongs_to_session {
-                return Err(anyhow!("active leaf does not belong to session: {leaf_id}"));
-            }
-        }
+        validate_history_target_tx(&mut tx, session_id, target).await?;
         sqlx::query("update sessions set active_leaf_id=$2::text, updated_at=now() where id=$1")
             .bind(session_id)
-            .bind(leaf_id)
+            .bind(target.leaf_id)
             .execute(&mut *tx)
             .await?;
         bump_revisions_tx(&mut tx, session_id, false, false).await?;
@@ -758,7 +708,7 @@ impl PostgresAgentStore {
             session_id,
             EventType::HistorySwitched,
             json!({
-                "active_leaf_id": leaf_id,
+                "active_leaf_id": target.leaf_id,
                 "activity": state.activity,
                 "session_revision": state.session_revision,
                 "queue_revision": state.queue_revision,
@@ -767,22 +717,15 @@ impl PostgresAgentStore {
         )
         .await?;
         let last_event_id = event.event_id;
-        let expected_ids = expected_active_branch_entry_ids.map(|ids| ids.to_vec());
+        let expected_ids = target
+            .expected_active_branch_entry_ids
+            .map(<[String]>::to_vec);
         let active_branch_entry_ids =
             if return_active_branch || expected_ids.is_some() || missing_body_ids.is_some() {
                 Some(active_branch_entry_ids_tx(&mut tx, session_id).await?)
             } else {
                 None
             };
-        if let (Some(expected_ids), Some(active_branch_entry_ids)) =
-            (expected_ids.as_deref(), active_branch_entry_ids.as_deref())
-        {
-            if expected_ids != active_branch_entry_ids {
-                return Err(anyhow!(
-                    "history_changed: target branch changed before history.switch was applied"
-                ));
-            }
-        }
         let active_branch_entries = if let (Some(missing_ids), Some(active_branch_entry_ids)) =
             (missing_body_ids, active_branch_entry_ids.as_deref())
         {
@@ -819,11 +762,11 @@ impl PostgresAgentStore {
         };
         tx.commit().await?;
         let should_return_branch_ids =
-            expected_active_branch_entry_ids.is_some() || missing_body_ids.is_some();
+            target.expected_active_branch_entry_ids.is_some() || missing_body_ids.is_some();
         let active_branch_entry_ids = active_branch_entry_ids.filter(|_| should_return_branch_ids);
         Ok(SwitchActiveLeafResult {
             session_id: session_id.to_string(),
-            active_leaf_id: leaf_id.map(str::to_string),
+            active_leaf_id: target.leaf_id.map(str::to_string),
             activity: state.activity,
             session_revision: state.session_revision,
             queue_revision: state.queue_revision,
@@ -1228,7 +1171,9 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::{OutputBatch, SessionConfig};
+    use crate::{
+        DelegationKind, HistoryTarget, OutputBatch, SessionConfig, SwitchActiveLeafRequest,
+    };
 
     use super::*;
 
@@ -1548,15 +1493,17 @@ mod tests {
         let missing_ids = vec!["entry_user".to_string(), "not-on-branch".to_string()];
 
         let result = store
-            .switch_active_leaf(
+            .switch_active_leaf(SwitchActiveLeafRequest {
                 session_id,
-                Some("entry_finish"),
-                false,
-                None,
-                Some(before.transcript_revision),
-                Some(&expected_ids),
-                Some(&missing_ids),
-            )
+                target: HistoryTarget {
+                    leaf_id: Some("entry_finish"),
+                    expected_active_leaf_id: None,
+                    expected_transcript_revision: Some(before.transcript_revision),
+                    expected_active_branch_entry_ids: Some(&expected_ids),
+                },
+                return_active_branch: false,
+                missing_body_ids: Some(&missing_ids),
+            })
             .await
             .expect("switch succeeds");
 
@@ -1984,15 +1931,17 @@ mod tests {
             .expect("snapshot loads");
 
         let result = store
-            .switch_active_leaf(
+            .switch_active_leaf(SwitchActiveLeafRequest {
                 session_id,
-                Some("entry_a_finish"),
-                true,
-                None,
-                None,
-                None,
-                None,
-            )
+                target: HistoryTarget {
+                    leaf_id: Some("entry_a_finish"),
+                    expected_active_leaf_id: None,
+                    expected_transcript_revision: None,
+                    expected_active_branch_entry_ids: None,
+                },
+                return_active_branch: true,
+                missing_body_ids: None,
+            })
             .await
             .expect("switch succeeds");
 
@@ -2067,15 +2016,17 @@ mod tests {
             .expect("queued input enqueues");
 
         let switched = store
-            .switch_active_leaf(
+            .switch_active_leaf(SwitchActiveLeafRequest {
                 session_id,
-                Some("entry_b_finish"),
-                false,
-                Some(Some("entry_a_finish")),
-                None,
-                None,
-                None,
-            )
+                target: HistoryTarget {
+                    leaf_id: Some("entry_b_finish"),
+                    expected_active_leaf_id: Some(Some("entry_a_finish")),
+                    expected_transcript_revision: None,
+                    expected_active_branch_entry_ids: None,
+                },
+                return_active_branch: false,
+                missing_body_ids: None,
+            })
             .await;
         assert!(switched
             .as_ref()
@@ -2149,6 +2100,129 @@ mod tests {
         assert_eq!(frame.data["tree_node"]["sequence"].as_i64(), Some(1));
         assert_eq!(frame.data["active_leaf_id"].as_str(), Some("entry_user"));
 
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn delegation_creation_waits_for_history_source_row_lock() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let source_session_id = "history-delegation-lock-race";
+        create_session(&db.store, source_session_id).await;
+        let advisory_key = 824_731_i64;
+        sqlx::raw_sql(
+            r#"
+            create function block_history_switch_for_test() returns trigger
+            language plpgsql as $$
+            begin
+                if new.id = 'history-delegation-lock-race' then
+                    perform pg_advisory_xact_lock(824731);
+                end if;
+                return new;
+            end
+            $$;
+            create trigger block_history_switch_for_test
+            before update of active_leaf_id on sessions
+            for each row execute function block_history_switch_for_test();
+            "#,
+        )
+        .execute(&db.store.pool)
+        .await
+        .expect("install switch pause trigger");
+        let mut blocker = db.store.pool.acquire().await.expect("acquire blocker");
+        sqlx::query("select pg_advisory_lock($1)")
+            .bind(advisory_key)
+            .execute(&mut *blocker)
+            .await
+            .expect("hold advisory lock");
+
+        let switch_store = PostgresAgentStore {
+            pool: db.store.pool.clone(),
+        };
+        let switch = tokio::spawn(async move {
+            switch_store
+                .switch_active_leaf(SwitchActiveLeafRequest {
+                    session_id: source_session_id,
+                    target: HistoryTarget {
+                        leaf_id: None,
+                        expected_active_leaf_id: None,
+                        expected_transcript_revision: None,
+                        expected_active_branch_entry_ids: None,
+                    },
+                    return_active_branch: false,
+                    missing_body_ids: None,
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    r#"
+                    select exists(
+                        select 1
+                        from pg_locks
+                        where locktype='advisory'
+                          and database=(
+                              select oid from pg_database where datname=current_database()
+                          )
+                          and not granted
+                    )
+                    "#,
+                )
+                .fetch_one(&db.store.pool)
+                .await
+                .expect("inspect advisory locks");
+                if waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("switch reaches pause while holding source row");
+
+        let delegation_store = PostgresAgentStore {
+            pool: db.store.pool.clone(),
+        };
+        let create = tokio::spawn(async move {
+            delegation_store
+                .create_delegation(source_session_id, DelegationKind::Full, None, None, 1)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "select exists(select 1 from pg_locks where locktype='transactionid' and not granted)",
+                )
+                .fetch_one(&db.store.pool)
+                .await
+                .expect("inspect transaction locks");
+                if waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delegation creation waits for history's source row lock");
+
+        sqlx::query("select pg_advisory_unlock($1)")
+            .bind(advisory_key)
+            .execute(&mut *blocker)
+            .await
+            .expect("release advisory lock");
+        switch
+            .await
+            .expect("switch task joins")
+            .expect("switch commits first");
+        create
+            .await
+            .expect("delegation task joins")
+            .expect("delegation starts after switch commit");
+
+        drop(blocker);
         db.cleanup().await;
     }
 }

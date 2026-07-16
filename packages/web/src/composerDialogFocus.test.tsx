@@ -80,7 +80,7 @@ function ComposerDialogHarness() {
 					nodes={[]}
 					activeLeafId={null}
 					onClose={() => setOpen(false)}
-					onSwitch={() => undefined}
+					onSelect={() => undefined}
 					returnFocusFallbackRef={returnFocusFallbackRef}
 				/>
 			) : null}

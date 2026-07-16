@@ -8,6 +8,8 @@ mod delegation_runner;
 mod delegation_snapshot;
 mod delegation_tools;
 mod handoff;
+mod history;
+mod history_fork;
 mod mcp_auth;
 mod provider_runtime;
 mod rpc_views;
@@ -502,7 +504,8 @@ async fn dispatch_request(
         RpcMethod::TranscriptTurnDetail => transcript_turn_detail(state, params).await,
         RpcMethod::HistoryTree => history_tree(state, params).await,
         RpcMethod::HistoryContext => history_context(state, params).await,
-        RpcMethod::HistorySwitch => history_switch(state, params).await,
+        RpcMethod::HistorySwitch => history::switch(state, params).await,
+        RpcMethod::HistoryFork => history_fork::fork(state, params).await,
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::McpInventory => mcp_inventory(state, params).await,
         RpcMethod::McpStatus => mcp_auth::status(state, params).await,
@@ -1780,81 +1783,6 @@ async fn history_context(state: &AppState, params: Value) -> std::result::Result
     Ok(json!({ "items": items }))
 }
 
-async fn history_switch(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
-    let session_id = required_string(&params, "session_id")?;
-    let started_at = Instant::now();
-    let driver = SessionDriver::acquire(state, &session_id).await;
-    let acquired_ms = started_at.elapsed().as_millis();
-    driver.ensure_idle_for_source_mutation().await?;
-    let idle_ms = started_at.elapsed().as_millis();
-    let leaf_id = params.get("leaf_id").and_then(Value::as_str);
-    let active_leaf_id = state.repo.active_leaf_id(&session_id).await?;
-    ensure_expected_active_leaf_matches(&active_leaf_id, &params)?;
-    let expected_active_leaf_id = parse_expected_active_leaf_id(&params)?;
-    let expected_ms = started_at.elapsed().as_millis();
-    if !state
-        .repo
-        .transcript_leaf_is_turn_boundary(&session_id, leaf_id)
-        .await?
-    {
-        return Err(RpcError::new(
-            "not_turn_boundary",
-            "history.switch requires a turn boundary",
-        ));
-    }
-    let boundary_ms = started_at.elapsed().as_millis();
-    let return_active_branch = params
-        .get("return_active_branch")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let expected_transcript_revision = params
-        .get("expected_transcript_revision")
-        .and_then(Value::as_i64);
-    let active_branch_entry_ids = optional_string_vec(&params, "active_branch_entry_ids")?;
-    let missing_body_ids = optional_string_vec(&params, "missing_body_ids")?;
-    let result = state
-        .repo
-        .switch_active_leaf(
-            &session_id,
-            leaf_id,
-            return_active_branch,
-            expected_active_leaf_id,
-            expected_transcript_revision,
-            active_branch_entry_ids.as_deref(),
-            missing_body_ids.as_deref(),
-        )
-        .await
-        .map_err(map_source_mutation_error)?;
-    let switch_ms = started_at.elapsed().as_millis();
-    let returned_body_count = result
-        .active_branch_entries
-        .as_ref()
-        .map(Vec::len)
-        .unwrap_or_default();
-    let returned_id_count = result
-        .active_branch_entry_ids
-        .as_ref()
-        .map(Vec::len)
-        .unwrap_or_default();
-    publish_events(state, result.events.clone());
-    clear_event_buffer_if_idle(state, &session_id).await?;
-    let publish_ms = started_at.elapsed().as_millis();
-    let value = rpc_views::switch_active_leaf(result);
-    let total_ms = started_at.elapsed().as_millis();
-    if perf_logging_enabled() {
-        eprintln!(
-            "perf history.switch session={session_id} leaf_id={leaf_id:?} return_active_branch={return_active_branch} branch_ids={returned_id_count} bodies={returned_body_count} acquire_ms={acquired_ms} idle_ms={} expected_ms={} boundary_ms={} switch_ms={} publish_ms={} view_ms={} total_ms={total_ms}",
-            idle_ms.saturating_sub(acquired_ms),
-            expected_ms.saturating_sub(idle_ms),
-            boundary_ms.saturating_sub(expected_ms),
-            switch_ms.saturating_sub(boundary_ms),
-            publish_ms.saturating_sub(switch_ms),
-            total_ms.saturating_sub(publish_ms),
-        );
-    }
-    Ok(value)
-}
-
 fn required_string_vec(params: &Value, key: &str) -> std::result::Result<Vec<String>, RpcError> {
     params
         .get(key)
@@ -1871,20 +1799,6 @@ fn required_i64(params: &Value, key: &str) -> std::result::Result<i64, RpcError>
         .get(key)
         .and_then(Value::as_i64)
         .ok_or_else(|| RpcError::new("invalid_params", format!("{key} is required")))
-}
-
-fn optional_string_vec(
-    params: &Value,
-    key: &str,
-) -> std::result::Result<Option<Vec<String>>, RpcError> {
-    params
-        .get(key)
-        .cloned()
-        .map(|value| {
-            serde_json::from_value::<Vec<String>>(value)
-                .map_err(|error| RpcError::new("invalid_params", error.to_string()))
-        })
-        .transpose()
 }
 
 async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

@@ -102,7 +102,9 @@ bounded `transcript.turns` tail page.
 | Expand a turn | `transcript.turn_detail` | one card's entries, by card id + leaf/sequence bounds |
 | Foreground/focus reconcile | `session.sync_active_branch` | suffix-only sync from the cached base leaf |
 | `/switch` picker | `transcript.index` pages | compact topology only |
+| `/fork` picker | `transcript.index` pages | same targets as switch; managed projects only |
 | Switch target | `history.switch` | revision-fenced; returns branch ids + sparse missing bodies |
+| Fork target | `history.fork` | revision-fenced; clones the current idle workspace |
 | Restore user message | `transcript.entries` | full body for the picked message, only if missing locally |
 
 `session.sync_active_branch` returns `unchanged` / `extended` / `branch_changed`. The cache merges overview metadata on
@@ -440,13 +442,18 @@ Enter on an exact command submits.
 | Command | Action |
 | --- | --- |
 | `/switch` | Opens the same-session history picker (idle only). User-message targets restore the full original message into the composer; turn/compaction targets just become the active leaf. |
+| `/fork` | Opens the same picker for a managed project session (idle only). It clones the current workspace—not historical files—into an independent top-level child. A user-message target becomes the new child's composer draft. |
 | `/compact` | Requests context compaction (`compaction.request`). |
 | `/system` | Shows the selected session's rendered `PI.md` prompt and source template (`system.prompt`). Requires a durable session. |
 | `/export` | Exports the current branch's assistant/user messages, fetching active-branch bodies for the export view. |
 
-Switch never accepts raw transcript ids; the picker is the only path. The picker shows a loading state until the compact
-tree is complete (or a fresh complete tree is cached), and `history.switch` revalidates the expected leaf and
-transcript revision server-side, refreshing the picker if history changed underneath.
+Switch and fork never accept raw transcript ids from the web UI; the picker is
+the only path. Both use the same target mapping and show a loading state until
+the compact tree is complete (or a fresh complete tree is cached). Their RPCs
+revalidate the expected leaf, transcript revision, and exact target branch
+server-side; either picker refreshes if history changed underneath. `/fork`
+rejects host sessions before opening the picker because only daemon-managed
+project workspaces are safe to clone.
 
 ## Model and reasoning controls
 

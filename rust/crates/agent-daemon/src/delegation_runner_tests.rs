@@ -39,6 +39,9 @@ struct TempDir {
     path: PathBuf,
 }
 
+#[path = "history_fork_rpc_tests.rs"]
+mod history_fork_rpc_tests;
+
 #[tokio::test]
 async fn ordinary_tool_dispatch_claims_starts_and_completes_exactly_once() {
     let Some(env) = test_env().await else {
@@ -148,6 +151,47 @@ async fn ordinary_tool_dispatch_claims_starts_and_completes_exactly_once() {
         std::fs::read_to_string(&marker).expect("tool side effect remains"),
         "run"
     );
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn history_switch_and_fork_rpc_reject_running_delegation_identically() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "history delegation guard", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    env.state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create running delegation");
+
+    let switch_error = public_rpc(
+        &env.state,
+        "history.switch",
+        json!({ "session_id": "parent", "leaf_id": null }),
+    )
+    .await
+    .expect_err("running delegation blocks switch");
+    let fork_error = public_rpc(
+        &env.state,
+        "history.fork",
+        json!({ "session_id": "parent", "leaf_id": null }),
+    )
+    .await
+    .expect_err("running delegation blocks fork");
+
+    assert_eq!(switch_error.code, "session_busy");
+    assert_eq!(fork_error.code, switch_error.code);
+    assert_eq!(fork_error.message, switch_error.message);
+
     env.cleanup().await;
 }
 
@@ -5385,20 +5429,6 @@ async fn parent_model_context_does_not_inject_current_delegations() {
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
 
-    let running = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::Full,
-            Some("workflow-implement-review"),
-            Some("implement"),
-            1,
-        )
-        .await
-        .expect("create running delegation");
-    create_busy_full_subagent(&env, project_id, "parent", &running.id, "impl_busy").await;
-
     let done = env
         .state
         .repo
@@ -5437,6 +5467,19 @@ async fn parent_model_context_does_not_inject_current_delegations() {
         "Looks good.\n\noutcome: approved",
     )
     .expect("write final message artifact");
+    let running = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::Full,
+            Some("workflow-implement-review"),
+            Some("implement"),
+            1,
+        )
+        .await
+        .expect("create running delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &running.id, "impl_busy").await;
 
     let mut config = env
         .state
@@ -5644,20 +5687,6 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
 
-    let running = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::Full,
-            Some("workflow-implement-review"),
-            Some("implement"),
-            1,
-        )
-        .await
-        .expect("create running delegation");
-    create_busy_full_subagent(&env, project_id, "parent", &running.id, "impl_running").await;
-
     let done = env
         .state
         .repo
@@ -5777,6 +5806,19 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         .set_delegation_status(&failed.id, DelegationStatus::Failed)
         .await
         .expect("mark failed");
+    let running = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::Full,
+            Some("workflow-implement-review"),
+            Some("implement"),
+            1,
+        )
+        .await
+        .expect("create running delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &running.id, "impl_running").await;
 
     let mut config = env
         .state
@@ -7600,6 +7642,115 @@ async fn cancel_delegation_returns_transcript_only_paths() {
         .await
         .expect("pending control sessions after cancellation")
         .contains(&"impl_to_cancel".to_string()));
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn readonly_delegation_snapshot_waits_for_parent_cwd_guard() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    std::fs::copy(source_root.join("PI.md"), env.cwd.path().join("PI.md"))
+        .expect("copy PI template");
+    let role_dir = env.cwd.path().join("subagent-roles/implementer");
+    std::fs::create_dir_all(&role_dir).expect("create role dir");
+    std::fs::copy(
+        source_root.join("subagent-roles/implementer/SKILL.md"),
+        role_dir.join("SKILL.md"),
+    )
+    .expect("copy implementer role");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "readonly snapshot guard", &[], json!({}))
+        .await
+        .expect("create project");
+    let (outer_cwd, workspaces) = env
+        .state
+        .workspaces
+        .materialize_session(project_id, "parent", &[], &[])
+        .await
+        .expect("materialize parent cwd");
+    std::fs::write(PathBuf::from(&outer_cwd).join("guarded.txt"), "stable")
+        .expect("write parent file");
+    let mut config = session_config(&env, project_id, json!({ "harness": true }));
+    config.outer_cwd = outer_cwd.clone();
+    config.workspaces = workspaces;
+    env.state
+        .repo
+        .start_session_outputs(
+            "parent",
+            &config,
+            &[],
+            None,
+            &[],
+            &[],
+            InputPriority::FollowUp,
+            &UserMessage::text("go"),
+            None,
+        )
+        .await
+        .expect("create parent");
+
+    let held = env
+        .state
+        .workspaces
+        .acquire_cwd_mutation_guard(&outer_cwd)
+        .await;
+    let state = env.state.clone();
+    let mut start = tokio::spawn(async move {
+        crate::delegation_tools::start_readonly_fanout_core(
+            &state,
+            "parent",
+            json!({ "tasks": [{ "role": "implementer", "prompt": "inspect" }] }),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if env
+                .state
+                .repo
+                .parent_has_running_delegation("parent")
+                .await
+                .expect("running delegation check")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delegation reaches guarded snapshot");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut start)
+            .await
+            .is_err()
+    );
+
+    drop(held);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), start)
+        .await
+        .expect("snapshot resumes after guard release")
+        .expect("spawn task joins")
+        .expect("read-only delegation starts");
+    let child_id = result["subagent_session_ids"][0]
+        .as_str()
+        .expect("child session id");
+    let child_config = env
+        .state
+        .repo
+        .load_session_config(child_id)
+        .await
+        .expect("child config loads");
+    assert_eq!(
+        std::fs::read_to_string(PathBuf::from(child_config.outer_cwd).join("guarded.txt"))
+            .expect("child snapshot file"),
+        "stable"
+    );
 
     env.cleanup().await;
 }

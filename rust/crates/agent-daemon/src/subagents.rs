@@ -70,6 +70,8 @@ pub(crate) async fn spawn_subagent(
     request: impl Into<SubagentSpawnRequest>,
 ) -> std::result::Result<SpawnedSubagent, RpcError> {
     let request = request.into();
+    let parent_driver = SessionDriver::acquire(state, &request.parent_session_id).await;
+    parent_driver.recover_if_needed().await?;
     let parent_config = state
         .repo
         .load_session_config(&request.parent_session_id)
@@ -80,10 +82,17 @@ pub(crate) async fn spawn_subagent(
             "subagents can only be spawned from project sessions",
         ));
     }
-    let parent_driver = SessionDriver::acquire(state, &request.parent_session_id).await;
-    parent_driver.recover_if_needed().await?;
 
     let child_session_id = format!("session_{}", Uuid::new_v4());
+    let workspace_guard = match request.subagent_type {
+        SubagentType::Full => None,
+        SubagentType::ReadOnly => Some(
+            state
+                .workspaces
+                .acquire_cwd_mutation_guard(&parent_config.outer_cwd)
+                .await,
+        ),
+    };
 
     let role = resolve_skill_role(
         &state.prompt_root,
@@ -115,6 +124,7 @@ pub(crate) async fn spawn_subagent(
                 .await?
         }
     };
+    drop(workspace_guard);
 
     let child_metadata = subagent_metadata(
         request.metadata,

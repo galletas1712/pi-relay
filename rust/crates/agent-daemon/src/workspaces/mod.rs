@@ -6,14 +6,14 @@ mod sanitize;
 mod selection;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use agent_store::{ProjectWorkspace, SessionWorkspace, WorkspaceKind};
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 pub(crate) use self::config::validate_workspace_dir;
@@ -26,7 +26,7 @@ pub(crate) use self::git::validate_remote_branch;
 use self::git::{fetch_session_branch_head, git_output, refresh_git_workspace_base, run_git};
 use self::instantiate::{
     create_workspace_dir, destroy_workspace_tree, instantiate_workspace_from_base,
-    materialize_tree_from_source_exact,
+    materialize_tree_from_source_exact_excluding,
 };
 use self::local::refresh_local_workspace_base;
 use self::selection::SelectedWorkspace;
@@ -42,6 +42,7 @@ use crate::handoff::HANDOFF_DIR;
 pub(crate) struct WorkspaceManager {
     state_root: PathBuf,
     workspace_base_lock: Arc<Mutex<()>>,
+    cwd_mutation_guards: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
 impl WorkspaceManager {
@@ -63,6 +64,7 @@ impl WorkspaceManager {
         Self {
             state_root,
             workspace_base_lock: Arc::new(Mutex::new(())),
+            cwd_mutation_guards: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -73,6 +75,24 @@ impl WorkspaceManager {
 
     pub(crate) fn mcp_oauth_credentials_path(&self) -> PathBuf {
         self.state_root.join("mcp-oauth-credentials.json")
+    }
+
+    /// Serialize daemon-managed workspace-mutating tool futures and snapshots
+    /// for sessions that share the exact same cwd.
+    ///
+    /// This is an in-process future-lifetime guard. It intentionally does not
+    /// claim to track independently running background processes after their
+    /// daemon-managed tool future has returned or been dropped.
+    pub(crate) async fn acquire_cwd_mutation_guard(&self, outer_cwd: &str) -> OwnedMutexGuard<()> {
+        let guard = {
+            let mut guards = self.cwd_mutation_guards.lock().await;
+            guards.retain(|_, guard| Arc::strong_count(guard) > 1);
+            guards
+                .entry(PathBuf::from(outer_cwd))
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        guard.lock_owned().await
     }
 
     /// Materialize a new session's workspaces under a private `outer_cwd`.
@@ -150,6 +170,42 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    pub(crate) async fn ensure_session_owns_cwd(
+        &self,
+        session_id: &str,
+        outer_cwd: &str,
+    ) -> Result<()> {
+        let session_root = self.session_root(session_id);
+        let expected = session_root.join("cwd");
+        let actual = Path::new(outer_cwd);
+        if actual != expected {
+            bail!(
+                "session cwd is not managed by this session: expected {}, got {}",
+                expected.display(),
+                actual.display()
+            );
+        }
+        let root_metadata = tokio::fs::symlink_metadata(&session_root)
+            .await
+            .with_context(|| format!("inspect managed session root {}", session_root.display()))?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            bail!(
+                "managed session root is not a directory: {}",
+                session_root.display()
+            );
+        }
+        let cwd_metadata = tokio::fs::symlink_metadata(&expected)
+            .await
+            .with_context(|| format!("inspect managed session cwd {}", expected.display()))?;
+        if cwd_metadata.file_type().is_symlink() || !cwd_metadata.is_dir() {
+            bail!(
+                "managed session cwd is not a directory: {}",
+                expected.display()
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) async fn fork_session_from_parent(
         &self,
         parent_session_id: &str,
@@ -173,21 +229,24 @@ impl WorkspaceManager {
             );
         }
         if child_root.exists() {
-            tokio::fs::remove_dir_all(&child_root)
-                .await
-                .with_context(|| {
-                    format!(
-                        "remove existing child session root {}",
-                        child_root.display()
-                    )
-                })?;
+            bail!(
+                "child session workspace already exists: {}",
+                child_root.display()
+            );
         }
-        tokio::fs::create_dir_all(&child_root)
+        tokio::fs::create_dir(&child_root)
             .await
             .with_context(|| format!("create child session root {}", child_root.display()))?;
 
-        let child_cwd = child_root.join("cwd");
-        materialize_tree_from_source_exact(&parent_cwd, &child_cwd)
+        let result = async {
+            self.ensure_session_owns_cwd(parent_session_id, parent_outer_cwd)
+                .await?;
+            let child_cwd = child_root.join("cwd");
+            materialize_tree_from_source_exact_excluding(
+                &parent_cwd,
+                &child_cwd,
+                HANDOFF_DIR.as_ref(),
+            )
             .await
             .with_context(|| {
                 format!(
@@ -197,38 +256,37 @@ impl WorkspaceManager {
                 )
             })?;
 
-        // The durable handoff directory lives under the parent cwd and must
-        // never be carried into a disposable RO fork (the durable copy stays
-        // under the parent). The fork copies the whole cwd, so drop it here.
-        let child_handoff = child_cwd.join(HANDOFF_DIR);
-        if child_handoff.exists() {
-            destroy_workspace_tree(&child_handoff)
-                .await
-                .with_context(|| {
-                    format!("exclude handoff dir from fork {}", child_handoff.display())
-                })?;
-        }
-
-        let mut child_workspaces = Vec::with_capacity(parent_workspaces.len());
-        for workspace in parent_workspaces {
-            validate_workspace_dir(&workspace.workspace_dir)?;
-            let child_workspace_root = child_cwd.join(&workspace.workspace_dir);
-            let mut child_workspace = workspace.clone();
-            if workspace.kind == WorkspaceKind::Git {
-                validate_git_workspace_isolated(&child_workspace_root).await?;
-                let local_branch = local_branch(child_session_id, &workspace.workspace_dir);
-                let head = git_output(&child_workspace_root, ["rev-parse", "HEAD"]).await?;
-                run_git(
-                    &child_workspace_root,
-                    ["switch", "-C", &local_branch, &head],
-                )
-                .await?;
-                child_workspace.local_branch = Some(local_branch);
+            let mut child_workspaces = Vec::with_capacity(parent_workspaces.len());
+            for workspace in parent_workspaces {
+                validate_workspace_dir(&workspace.workspace_dir)?;
+                let child_workspace_root = child_cwd.join(&workspace.workspace_dir);
+                let mut child_workspace = workspace.clone();
+                if workspace.kind == WorkspaceKind::Git {
+                    validate_git_workspace_isolated(&child_workspace_root).await?;
+                    let local_branch = local_branch(child_session_id, &workspace.workspace_dir);
+                    let head = git_output(&child_workspace_root, ["rev-parse", "HEAD"]).await?;
+                    run_git(
+                        &child_workspace_root,
+                        ["switch", "-C", &local_branch, &head],
+                    )
+                    .await?;
+                    child_workspace.local_branch = Some(local_branch);
+                }
+                child_workspaces.push(child_workspace);
             }
-            child_workspaces.push(child_workspace);
-        }
 
-        Ok((child_cwd.to_string_lossy().into_owned(), child_workspaces))
+            Ok((child_cwd.to_string_lossy().into_owned(), child_workspaces))
+        }
+        .await;
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) => match destroy_workspace_tree(&child_root).await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => {
+                    Err(error.context(format!("clean up failed fork: {cleanup_error:#}")))
+                }
+            },
+        }
     }
 
     /// Reclaim a session's entire workspace tree, including any btrfs
@@ -237,9 +295,7 @@ impl WorkspaceManager {
     /// through it so subvolume metadata is never leaked.
     pub(crate) async fn destroy_session_workspaces(&self, session_id: &str) -> Result<()> {
         let root = self.session_root(session_id);
-        if root.exists() {
-            destroy_workspace_tree(&root).await?;
-        }
+        destroy_workspace_tree(&root).await?;
         Ok(())
     }
 

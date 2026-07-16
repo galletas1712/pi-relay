@@ -101,6 +101,7 @@ pub(crate) enum RpcMethod {
     HistoryTree,
     HistoryContext,
     HistorySwitch,
+    HistoryFork,
     TurnResume,
     McpInventory,
     McpStatus,
@@ -151,6 +152,7 @@ impl RpcMethod {
             "history.tree" => Some(Self::HistoryTree),
             "history.context" => Some(Self::HistoryContext),
             "history.switch" => Some(Self::HistorySwitch),
+            "history.fork" => Some(Self::HistoryFork),
             "turn.resume" => Some(Self::TurnResume),
             "mcp.inventory" => Some(Self::McpInventory),
             "mcp.status" => Some(Self::McpStatus),
@@ -283,6 +285,10 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("history.switch"),
             Some(RpcMethod::HistorySwitch)
+        );
+        assert_eq!(
+            RpcMethod::parse("history.fork"),
+            Some(RpcMethod::HistoryFork)
         );
         assert_eq!(RpcMethod::parse("history.rewind"), None);
         assert_eq!(RpcMethod::parse("input.fly"), None);

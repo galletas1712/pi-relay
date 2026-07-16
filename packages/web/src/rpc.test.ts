@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	AgentRpcClient,
 	RPC_REQUEST_TIMEOUT_MS,
-	SESSION_START_REQUEST_TIMEOUT_MS,
+	WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS,
 	resolveWsUrl,
 } from "./rpc.ts";
 
@@ -138,7 +138,7 @@ describe("AgentRpcClient reconnect hardening", () => {
 
 		let settled = false;
 		const request = client.request("session.start", {}, {
-			timeoutMs: SESSION_START_REQUEST_TIMEOUT_MS,
+			timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS,
 		});
 		void request.then(
 			() => {
@@ -155,7 +155,7 @@ describe("AgentRpcClient reconnect hardening", () => {
 		expect(client.isOpen()).toBe(true);
 
 		await vi.advanceTimersByTimeAsync(
-			SESSION_START_REQUEST_TIMEOUT_MS - RPC_REQUEST_TIMEOUT_MS,
+			WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS - RPC_REQUEST_TIMEOUT_MS,
 		);
 		await requestRejected;
 		expect(settled).toBe(true);

@@ -12,6 +12,36 @@ fn select_all(project_workspaces: &[ProjectWorkspace]) -> Vec<SelectedWorkspace>
 }
 
 #[tokio::test]
+async fn cwd_mutation_guards_are_shared_by_exact_cwd() {
+    let temp = TempDir::new("workspace-manager-cwd-guards");
+    let manager = WorkspaceManager::new(temp.path().join("state"));
+    let held = manager.acquire_cwd_mutation_guard("/managed/cwd").await;
+    let waiting_manager = manager.clone();
+    let (attempted_tx, attempted_rx) = tokio::sync::oneshot::channel();
+    let waiting = tokio::spawn(async move {
+        attempted_tx.send(()).expect("signal guard attempt");
+        waiting_manager
+            .acquire_cwd_mutation_guard("/managed/cwd")
+            .await
+    });
+    attempted_rx.await.expect("guard acquisition attempted");
+    let other_cwd = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        manager.acquire_cwd_mutation_guard("/managed/other"),
+    )
+    .await
+    .expect("different cwd guard");
+    drop(other_cwd);
+    assert!(!waiting.is_finished());
+    drop(held);
+    let reused = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+        .await
+        .expect("same cwd guard releases")
+        .expect("same cwd task joins");
+    drop(reused);
+}
+
+#[tokio::test]
 async fn materialize_session_workspaces_from_local_remote() {
     let temp = TempDir::new("workspace-manager");
     let remote = temp.path().join("remote.git");
@@ -277,6 +307,139 @@ async fn fork_session_from_parent_copies_current_state_without_refreshing_base()
 }
 
 #[tokio::test]
+async fn fork_session_from_parent_does_not_overwrite_existing_child_root() {
+    let temp = TempDir::new("workspace-manager-fork-collision");
+    let manager = WorkspaceManager::new(temp.path().join("state"));
+    let parent_cwd = manager.session_root("parent-session").join("cwd");
+    std::fs::create_dir_all(&parent_cwd).expect("parent cwd");
+    std::fs::write(parent_cwd.join("source.txt"), "source").expect("parent file");
+    let child_root = manager.session_root("child-session");
+    std::fs::create_dir_all(&child_root).expect("child root");
+    std::fs::write(child_root.join("sentinel.txt"), "unrelated").expect("child sentinel");
+
+    let error = manager
+        .fork_session_from_parent(
+            "parent-session",
+            parent_cwd.to_str().expect("parent cwd string"),
+            &[],
+            "child-session",
+        )
+        .await
+        .expect_err("existing child root is rejected");
+
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(
+        std::fs::read_to_string(child_root.join("sentinel.txt")).expect("sentinel remains"),
+        "unrelated"
+    );
+}
+
+#[tokio::test]
+async fn fork_session_from_parent_rejects_symlinked_parent_cwd_root() {
+    let temp = TempDir::new("workspace-manager-fork-symlink-root");
+    let manager = WorkspaceManager::new(temp.path().join("state"));
+    let parent_root = manager.session_root("parent-session");
+    let external_cwd = temp.path().join("external-cwd");
+    std::fs::create_dir_all(&parent_root).expect("parent root");
+    std::fs::create_dir_all(&external_cwd).expect("external cwd");
+    std::fs::write(external_cwd.join("secret.txt"), "outside").expect("external file");
+    make_dir_symlink(&external_cwd, &parent_root.join("cwd"));
+
+    let error = manager
+        .fork_session_from_parent(
+            "parent-session",
+            parent_root.join("cwd").to_str().expect("parent cwd string"),
+            &[],
+            "child-session",
+        )
+        .await
+        .expect_err("symlinked parent cwd root is rejected");
+
+    assert!(error
+        .to_string()
+        .contains("managed session cwd is not a directory"));
+    assert!(!manager.session_root("child-session").exists());
+}
+
+#[tokio::test]
+async fn fork_session_from_parent_excludes_live_handoff_symlink_without_touching_target() {
+    let temp = TempDir::new("workspace-manager-fork-live-handoff-symlink");
+    let manager = WorkspaceManager::new(temp.path().join("state"));
+    let parent_cwd = manager.session_root("parent-session").join("cwd");
+    let external = temp.path().join("external-handoff");
+    std::fs::create_dir_all(&parent_cwd).expect("parent cwd");
+    std::fs::create_dir_all(&external).expect("external handoff target");
+    std::fs::write(external.join("sentinel.txt"), "untouched").expect("external sentinel");
+    make_dir_symlink(&external, &parent_cwd.join(HANDOFF_DIR));
+    make_symlink(Path::new("source.txt"), &parent_cwd.join("ordinary-link"));
+    std::fs::write(parent_cwd.join("source.txt"), "source").expect("ordinary link target");
+
+    let (child_cwd, _) = manager
+        .fork_session_from_parent(
+            "parent-session",
+            parent_cwd.to_str().expect("parent cwd string"),
+            &[],
+            "child-session",
+        )
+        .await
+        .expect("fork excludes live handoff symlink");
+    let child_cwd = PathBuf::from(child_cwd);
+
+    assert!(std::fs::symlink_metadata(child_cwd.join(HANDOFF_DIR)).is_err());
+    assert_eq!(
+        std::fs::read_to_string(external.join("sentinel.txt")).expect("external sentinel remains"),
+        "untouched"
+    );
+    assert_eq!(
+        std::fs::read_link(child_cwd.join("ordinary-link")).expect("ordinary symlink remains"),
+        PathBuf::from("source.txt")
+    );
+}
+
+#[tokio::test]
+async fn fork_session_from_parent_excludes_dangling_handoff_symlink() {
+    let temp = TempDir::new("workspace-manager-fork-dangling-handoff-symlink");
+    let manager = WorkspaceManager::new(temp.path().join("state"));
+    let parent_cwd = manager.session_root("parent-session").join("cwd");
+    let missing_target = temp.path().join("missing-handoff");
+    std::fs::create_dir_all(&parent_cwd).expect("parent cwd");
+    make_dir_symlink(&missing_target, &parent_cwd.join(HANDOFF_DIR));
+
+    let (child_cwd, _) = manager
+        .fork_session_from_parent(
+            "parent-session",
+            parent_cwd.to_str().expect("parent cwd string"),
+            &[],
+            "child-session",
+        )
+        .await
+        .expect("fork excludes dangling handoff symlink");
+
+    assert!(std::fs::symlink_metadata(Path::new(&child_cwd).join(HANDOFF_DIR)).is_err());
+}
+
+#[tokio::test]
+async fn fork_session_from_parent_cleans_up_a_failed_clone() {
+    let temp = TempDir::new("workspace-manager-fork-cleanup");
+    let manager = WorkspaceManager::new(temp.path().join("state"));
+    let parent_cwd = manager.session_root("parent-session").join("cwd");
+    std::fs::create_dir_all(parent_cwd.join("repo/.git")).expect("fake parent git workspace");
+    let workspace = SessionWorkspace::git("repo", "remote", "main", "head", "branch");
+
+    manager
+        .fork_session_from_parent(
+            "parent-session",
+            parent_cwd.to_str().expect("parent cwd string"),
+            &[workspace],
+            "child-session",
+        )
+        .await
+        .expect_err("invalid copied git workspace fails");
+
+    assert!(!manager.session_root("child-session").exists());
+}
+
+#[tokio::test]
 async fn materialize_session_workspaces_from_local_folder() {
     let temp = TempDir::new("workspace-manager-local");
     let source = temp.path().join("source");
@@ -499,6 +662,17 @@ fn make_symlink(target: &Path, link: &Path) {
     #[cfg(windows)]
     {
         std::os::windows::fs::symlink_file(target, link).expect("create symlink");
+    }
+}
+
+fn make_dir_symlink(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).expect("create directory symlink");
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link).expect("create directory symlink");
     }
 }
 

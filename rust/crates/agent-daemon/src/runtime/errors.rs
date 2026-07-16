@@ -1,5 +1,8 @@
 use agent_session::{HistoryOperationError, TranscriptStoreError};
-use agent_store::{ExpectedActiveLeafMismatch, QueueMutationError, SourceMutationConflict};
+use agent_store::{
+    ExpectedActiveLeafMismatch, HistoryChanged, HistoryTargetNotTurnBoundary, QueueMutationError,
+    RunningDelegationConflict, SourceMutationConflict,
+};
 
 use crate::types::RpcError;
 
@@ -20,9 +23,14 @@ pub(crate) fn map_source_mutation_error(error: anyhow::Error) -> RpcError {
     if let Some(error) = error.downcast_ref::<SourceMutationConflict>() {
         return RpcError::new("session_busy", error.to_string());
     }
-    let message = error.to_string();
-    if message.starts_with("history_changed:") {
-        return RpcError::new("history_changed", message);
+    if let Some(error) = error.downcast_ref::<RunningDelegationConflict>() {
+        return RpcError::new("session_busy", error.to_string());
+    }
+    if let Some(error) = error.downcast_ref::<HistoryChanged>() {
+        return RpcError::new("history_changed", error.to_string());
+    }
+    if let Some(error) = error.downcast_ref::<HistoryTargetNotTurnBoundary>() {
+        return RpcError::new("not_turn_boundary", error.to_string());
     }
     error.into()
 }
