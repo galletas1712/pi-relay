@@ -59,7 +59,7 @@ import {
 	ProviderConfigurationController,
 	type ProviderConfigurationTarget,
 } from "./providerConfigurationController.ts";
-import type { ConnectionStatus } from "./rpc.ts";
+import { isRpcErrorCode, type ConnectionStatus } from "./rpc.ts";
 import { findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
 import { stopSession } from "./stopSession.ts";
@@ -129,8 +129,14 @@ import {
 } from "./sessionList.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
 import {
+	forgetDeletedSessions,
 	loadUiSelection,
+	rememberActiveUiSelection,
+	rememberSelectedSession,
+	rememberSelectedSubagent,
 	rememberUiSelection,
+	selectedSessionForProject,
+	selectedSubagentForSession,
 } from "./uiResume.ts";
 import {
 	rememberWorkspaceScope,
@@ -159,7 +165,6 @@ import {
 	openAgentConversation,
 	parseWorkspaceRoute,
 	projectRouteScope,
-	rootConversationRoute,
 	selectRootRun,
 	showConversation,
 	unavailableConversationRoute,
@@ -197,6 +202,7 @@ const SELECTED_SESSION_REFRESH_DEBOUNCE_MS = 80;
 const FOREGROUND_RECONCILE_THROTTLE_MS = 2000;
 const FOREGROUND_RECONNECT_AFTER_MS = 5000;
 const AWAKE_HEARTBEAT_MS = 1000;
+const DELETED_EVENT_UNSUBSCRIBE_RETRY_DELAYS_MS = [250, 750] as const;
 const TRANSCRIPT_INDEX_PAGE_SIZE = 5000;
 const TRANSCRIPT_TURN_PAGE_SIZE = 50;
 const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
@@ -296,6 +302,19 @@ type RouteValidationState =
 			state: WorkspaceRouteUnavailable;
 			retryable: boolean;
 		};
+
+type RememberedRouteRestore = {
+	canonicalUrl: string;
+	projectId: string | null;
+	rootSessionId: string;
+	subagentSessionId: string | null;
+};
+
+type DeletedEventSessionTombstone = {
+	token: symbol;
+	attempts: number;
+	retryTimer: number | null;
+};
 
 function routeScopeProjectId(route: WorkspaceRoute): string | null {
 	return route.scope.kind === "project" ? route.scope.projectId : null;
@@ -475,6 +494,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 	const [connection, setConnection] = useState<ConnectionStatus>("connecting");
 	const connectionRef = useRef<ConnectionStatus>("connecting");
+	const [eventSubscriptionRevision, setEventSubscriptionRevision] = useState(0);
 	const [transportDisconnected, setTransportDisconnected] = useState(false);
 	const [retryingConnection, setRetryingConnection] = useState(false);
 	const [workspaceRouteResult, setWorkspaceRouteResult] =
@@ -586,6 +606,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const nextSessionTitleRef = useRef<string | null>(null);
 	const selectedProjectRef = useRef<string | null>(initialSelection.projectId);
 	const routeValidationGenerationRef = useRef(0);
+	const rememberedRouteRestoreRef = useRef<RememberedRouteRestore | null>(null);
 	const workspaceRouteResultRef = useRef(workspaceRouteResult);
 	const routeValidationRef = useRef(routeValidation);
 	const legacyMigrationPendingRef = useRef(
@@ -603,6 +624,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	routeRemoteReadsEnabledRef.current = routeRemoteReadsEnabled;
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
+	const deletedEventSessionTombstones = useRef(
+		new Map<string, DeletedEventSessionTombstone>(),
+	);
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
 	const sidebarSelectTimer = useRef<number | null>(null);
 	const autoLoadedTurnDetailRef = useRef<string | null>(null);
@@ -613,6 +637,109 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const connectionRetryController = useRef(new ConnectionRetryController());
 	const delegationListRetryController = useRef(new DelegationListRetryController());
 	const handleSessionEventRef = useRef<(event: EventFrame) => void>(() => undefined);
+	const clearDeletedEventSessionTombstone = useCallback(
+		(
+			sessionId: string,
+			tombstone: DeletedEventSessionTombstone,
+			reconcile = true,
+		) => {
+			const current = deletedEventSessionTombstones.current.get(sessionId);
+			if (current?.token !== tombstone.token) return false;
+			if (current.retryTimer !== null) {
+				window.clearTimeout(current.retryTimer);
+				current.retryTimer = null;
+			}
+			deletedEventSessionTombstones.current.delete(sessionId);
+			if (reconcile) {
+				setEventSubscriptionRevision((revision) => revision + 1);
+			}
+			return true;
+		},
+		[],
+	);
+	const clearDeletedEventSessionTombstones = useCallback((reconcile = true) => {
+		const hadTombstones = deletedEventSessionTombstones.current.size > 0;
+		for (const tombstone of deletedEventSessionTombstones.current.values()) {
+			if (tombstone.retryTimer !== null) {
+				window.clearTimeout(tombstone.retryTimer);
+				tombstone.retryTimer = null;
+			}
+		}
+		deletedEventSessionTombstones.current.clear();
+		if (reconcile && hadTombstones) {
+			setEventSubscriptionRevision((revision) => revision + 1);
+		}
+	}, []);
+	const recoverDeletedEventSessionSubscription = useCallback(
+		(sessionId: string, tombstone: DeletedEventSessionTombstone) => {
+			const isCurrent = () =>
+				deletedEventSessionTombstones.current.get(sessionId)?.token ===
+				tombstone.token;
+			const resetTransport = () => {
+				if (!isCurrent()) return;
+				if (!foregroundReconnectInFlight.current) {
+					let reconnect: Promise<void>;
+					try {
+						// This replaces only this browser RPC client's WebSocket. The
+						// daemon process and other clients are not affected.
+						reconnect = api.reconnect();
+					} catch (error) {
+						reconnect = Promise.reject(error);
+					}
+					const sharedReconnect = reconnect.finally(() => {
+						if (foregroundReconnectInFlight.current === sharedReconnect) {
+							foregroundReconnectInFlight.current = null;
+						}
+					});
+					foregroundReconnectInFlight.current = sharedReconnect;
+				}
+				void foregroundReconnectInFlight.current
+					.finally(() => {
+						// Status transitions normally clear all tombstones first. This
+						// token-checked fallback also handles a replacement socket that
+						// fails to open: reconnect() has already detached the old socket.
+						clearDeletedEventSessionTombstone(sessionId, tombstone);
+					})
+					.catch(() => undefined);
+			};
+			const handleFailure = () => {
+				if (!isCurrent()) return;
+				const retryDelay =
+					DELETED_EVENT_UNSUBSCRIBE_RETRY_DELAYS_MS[
+						tombstone.attempts - 1
+					];
+				if (retryDelay === undefined) {
+					resetTransport();
+					return;
+				}
+				tombstone.retryTimer = window.setTimeout(attemptUnsubscribe, retryDelay);
+			};
+			const attemptUnsubscribe = () => {
+				if (!isCurrent()) return;
+				tombstone.retryTimer = null;
+				if (!api.isOpen()) {
+					resetTransport();
+					return;
+				}
+				tombstone.attempts += 1;
+				let unsubscribe: Promise<void>;
+				try {
+					unsubscribe = api.unsubscribeEvents(sessionId);
+				} catch {
+					handleFailure();
+					return;
+				}
+				void unsubscribe.then(
+					() => {
+						clearDeletedEventSessionTombstone(sessionId, tombstone);
+					},
+					() => handleFailure(),
+				);
+			};
+			attemptUnsubscribe();
+		},
+		[api, clearDeletedEventSessionTombstone],
+	);
 	const connectionRemoteActionBlockedReason = remoteActionBlockedReason(connection);
 	const cachedHistoryAvailable = hasCanonicalCachedHistory(selectedCache, selectedId);
 	const assertServerMutationAllowed = useCallback(() => {
@@ -1520,7 +1647,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					: { kind: "idle" },
 			);
 			if (next.kind === "none") {
-				rememberUiSelection(selectedProjectRef.current, null);
+				rememberActiveUiSelection(selectedProjectRef.current, null);
 			}
 			applyConversationIdentity(null);
 			return next;
@@ -1534,7 +1661,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 
 	const applyNavigation = useCallback(
-		(navigation: RouteNavigation) => {
+		(navigation: RouteNavigation, rememberedRestore: RememberedRouteRestore | null = null) => {
+			rememberedRouteRestoreRef.current = rememberedRestore;
 			const parsed = routeHistory?.apply(navigation) ?? parseWorkspaceRoute(navigation.url);
 			if (parsed) applyParsedWorkspaceRoute(parsed);
 		},
@@ -1542,8 +1670,29 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 
 	const openRootConversation = useCallback(
-		(projectId: string | null, sessionId: string) => {
-			applyNavigation(selectRootRun(routeScope(projectId), sessionId));
+		(
+			projectId: string | null,
+			sessionId: string,
+			options: { rememberedRoot?: boolean; restoreSubagent?: boolean } = {},
+		) => {
+			const rootNavigation = selectRootRun(routeScope(projectId), sessionId);
+			const subagentSessionId =
+				options.restoreSubagent === false
+					? null
+					: selectedSubagentForSession(sessionId);
+			const navigation = subagentSessionId
+				? openAgentConversation(rootNavigation.route, subagentSessionId)
+				: rootNavigation;
+			const rememberedRestore =
+				options.rememberedRoot || subagentSessionId
+					? {
+							canonicalUrl: navigation.url,
+							projectId,
+							rootSessionId: sessionId,
+							subagentSessionId,
+						}
+					: null;
+			applyNavigation(navigation, rememberedRestore);
 		},
 		[applyNavigation],
 	);
@@ -1555,6 +1704,17 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				workspaceRouteResult.route.destination === "conversation" &&
 				routeConversationSessionId(workspaceRouteResult.route) === sessionId
 			) {
+				return;
+			}
+			if (
+				workspaceRouteResult.kind === "route" &&
+				sessionId === workspaceRouteResult.route.rootSessionId
+			) {
+				openRootConversation(
+					routeScopeProjectId(workspaceRouteResult.route),
+					sessionId,
+					{ restoreSubagent: false },
+				);
 				return;
 			}
 			const knownSession = allKnownSessions.find((session) => session.session_id === sessionId);
@@ -1596,7 +1756,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				const empty = routeHistory?.clear("push") ?? { kind: "none" as const };
 				setWorkspaceRouteResult(empty);
 				setRouteValidation({ kind: "idle" });
-				rememberUiSelection(selectedProjectRef.current, null);
+				rememberActiveUiSelection(selectedProjectRef.current, null);
 				applyConversationIdentity(null);
 				return;
 			}
@@ -1608,17 +1768,48 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const selectProjectSession = useCallback(
 		(projectId: string | null, sessionId: string | null) => {
 			if (sessionId) {
-				openRootConversation(projectId, sessionId);
+				openRootConversation(projectId, sessionId, { rememberedRoot: true });
 				return;
 			}
 			routeValidationGenerationRef.current += 1;
 			const empty = routeHistory?.clear("push") ?? { kind: "none" as const };
 			setWorkspaceRouteResult(empty);
 			setRouteValidation({ kind: "idle" });
-			rememberUiSelection(projectId, null);
+			rememberActiveUiSelection(projectId, null);
 			applyProjectConversationIdentity(projectId, null);
 		},
 		[applyProjectConversationIdentity, openRootConversation, routeHistory],
+	);
+
+	const fallbackRememberedRoot = useCallback(
+		(
+			restore: RememberedRouteRestore,
+			options: { parentDeleted?: boolean } = {},
+		) => {
+			legacyMigrationPendingRef.current = false;
+			rememberedRouteRestoreRef.current = null;
+			rememberActiveUiSelection(restore.projectId, null);
+			rememberSelectedSession(restore.projectId, null);
+			if (options.parentDeleted) {
+				rememberSelectedSubagent(restore.rootSessionId, null);
+			}
+			const empty = routeHistory?.clear("replace") ?? { kind: "none" as const };
+			applyParsedWorkspaceRoute(empty);
+		},
+		[applyParsedWorkspaceRoute, routeHistory],
+	);
+
+	const fallbackRememberedSubagent = useCallback(
+		(restore: RememberedRouteRestore) => {
+			rememberedRouteRestoreRef.current = null;
+			rememberSelectedSubagent(restore.rootSessionId, null);
+			const rootNavigation = selectRootRun(
+				routeScope(restore.projectId),
+				restore.rootSessionId,
+			);
+			applyNavigation({ ...rootNavigation, history: "replace" });
+		},
+		[applyNavigation],
 	);
 
 	useEffect(() => {
@@ -1631,6 +1822,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			applyParsedWorkspaceRoute(initialWorkspaceRoute);
 		}
 		return routeHistory?.subscribe((parsed) => {
+			rememberedRouteRestoreRef.current = null;
 			applyParsedWorkspaceRoute(parsed);
 		});
 	}, [applyParsedWorkspaceRoute, initialWorkspaceRoute, routeHistory]);
@@ -1708,12 +1900,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						: selected;
 					if (!stillCurrent()) return;
 					if (root.parent_session_id) {
-						setRouteValidation({
-							kind: "unavailable",
-							state: routeRootUnavailable(
-								"Nested agent conversations are not available because the backend currently exposes direct parents only.",
-							),
-							retryable: false,
+						fallbackRememberedRoot({
+							canonicalUrl: "",
+							projectId: initialUiSelection.projectId,
+							rootSessionId: root.session_id,
+							subagentSessionId: selected.session_id,
 						});
 						return;
 					}
@@ -1721,25 +1912,45 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						selected.project_id !== initialUiSelection.projectId ||
 						root.project_id !== initialUiSelection.projectId
 					) {
-						setRouteValidation({
-							kind: "unavailable",
-							state: projectMismatchUnavailable(
-								rootConversationRoute(routeScope(initialUiSelection.projectId), root.session_id),
-								root.project_id,
-							),
-							retryable: false,
+						fallbackRememberedRoot({
+							canonicalUrl: "",
+							projectId: initialUiSelection.projectId,
+							rootSessionId: root.session_id,
+							subagentSessionId: selected.parent_session_id ? selected.session_id : null,
 						});
 						return;
 					}
 					legacyMigrationPendingRef.current = false;
-					rememberUiSelection(initialUiSelection.projectId, null);
-					const resume = legacyWorkspaceResume(workspaceRouteResult, initialUiSelection, {
+					const rememberedSubagentId =
+						selected.parent_session_id
+							? selected.session_id
+							: selectedSubagentForSession(root.session_id);
+					const resume = legacyWorkspaceResume(workspaceRouteResult, {
+						projectId: initialUiSelection.projectId,
+						sessionId: rememberedSubagentId ?? root.session_id,
+					}, {
 						kind: "known",
 						rootSessionId: root.session_id,
 					});
-					if (resume.kind === "legacy-route") applyNavigation(resume.navigation);
+					if (resume.kind === "legacy-route") {
+						applyNavigation(resume.navigation, {
+							canonicalUrl: resume.navigation.url,
+							projectId: initialUiSelection.projectId,
+							rootSessionId: root.session_id,
+							subagentSessionId: rememberedSubagentId,
+						});
+					}
 				} catch (error) {
 					if (!stillCurrent()) return;
+					if (isSessionNotFoundError(error)) {
+						fallbackRememberedRoot({
+							canonicalUrl: "",
+							projectId: initialUiSelection.projectId,
+							rootSessionId: initialUiSelection.sessionId,
+							subagentSessionId: null,
+						}, { parentDeleted: true });
+						return;
+					}
 					setRouteValidation({
 						kind: "unavailable",
 						state: {
@@ -1756,11 +1967,27 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			if (workspaceRouteResult.kind !== "route") return;
 			const route = workspaceRouteResult.route;
+			const rememberedRestore =
+				rememberedRouteRestoreRef.current?.canonicalUrl === workspaceRouteResult.canonicalUrl
+					? rememberedRouteRestoreRef.current
+					: null;
+			if (
+				rememberedRouteRestoreRef.current &&
+				!rememberedRestore
+			) {
+				rememberedRouteRestoreRef.current = null;
+			}
 			setRouteValidation({ kind: "pending" });
+			let rootLoaded = false;
 			try {
 				const root = await fetchSessionSnapshot(route.rootSessionId, "route-root", true);
+				rootLoaded = true;
 				if (!stillCurrent()) return;
 				if (!validateProject(route, root)) {
+					if (rememberedRestore) {
+						fallbackRememberedRoot(rememberedRestore);
+						return;
+					}
 					setRouteValidation({
 						kind: "unavailable",
 						state: projectMismatchUnavailable(route, root.project_id),
@@ -1769,6 +1996,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					return;
 				}
 				if (root.parent_session_id) {
+					if (rememberedRestore) {
+						fallbackRememberedRoot(rememberedRestore);
+						return;
+					}
 					setRouteValidation({
 						kind: "unavailable",
 						state: routeRootUnavailable("The requested root run is an agent session, not a root session."),
@@ -1784,6 +2015,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						conversation = await fetchSessionSnapshot(conversationId, "route-conversation", true);
 					} catch (error) {
 						if (!stillCurrent()) return;
+						if (
+							rememberedRestore?.subagentSessionId === conversationId &&
+							isSessionNotFoundError(error)
+						) {
+							fallbackRememberedSubagent(rememberedRestore);
+							return;
+						}
 						if (route.destination === "execution") {
 							applyParsedWorkspaceRoute(
 								fallbackExecutionConversation(route, "unavailable"),
@@ -1798,6 +2036,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						projectMatches &&
 						conversation.parent_session_id === route.rootSessionId;
 					if (!validMembership) {
+						if (rememberedRestore?.subagentSessionId === conversationId) {
+							fallbackRememberedSubagent(rememberedRestore);
+							return;
+						}
 						if (route.destination === "execution") {
 							const fallback = fallbackExecutionConversation(
 								route,
@@ -1880,7 +2122,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					});
 					return;
 				}
-				rememberUiSelection(routeScopeProjectId(route), null);
+				rememberedRouteRestoreRef.current = null;
+				rememberUiSelection(routeScopeProjectId(route), route.rootSessionId);
+				if (conversation.session_id !== route.rootSessionId) {
+					rememberSelectedSubagent(route.rootSessionId, conversation.session_id);
+				}
 				setRouteValidation({
 					kind: "valid",
 					revision: routeRevision,
@@ -1890,6 +2136,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				});
 			} catch (error) {
 				if (!stillCurrent()) return;
+				if (rememberedRestore && !rootLoaded && isSessionNotFoundError(error)) {
+					fallbackRememberedRoot(rememberedRestore, { parentDeleted: true });
+					return;
+				}
 				setRouteValidation({
 					kind: "unavailable",
 					state:
@@ -1915,6 +2165,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		applyNavigation,
 		applyParsedWorkspaceRoute,
 		connection,
+		fallbackRememberedRoot,
+		fallbackRememberedSubagent,
 		fetchSessionSnapshot,
 		initialUiSelection,
 		routeRevision,
@@ -2448,6 +2700,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 
 	const handleSessionEvent = useCallback(
 		(event: EventFrame) => {
+			if (deletedEventSessionTombstones.current.has(event.session_id)) return;
 			const currentSessions = queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(selectedProjectRef.current));
 			const eventSession = currentSessions?.find((session) => session.session_id === event.session_id);
 			const eventProjectId =
@@ -2551,6 +2804,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (status === "open") setTransportDisconnected(false);
 			else if (status !== "connecting") setTransportDisconnected(true);
 			subscribedEventSessionIds.current.clear();
+			// A parse error can leave the current socket alive. Other statuses mark
+			// a transport-generation boundary, where daemon subscriptions are gone.
+			if (status !== "error") clearDeletedEventSessionTombstones();
 			if (status !== "open") return;
 			connectionRetryController.current.opened();
 			setRetryingConnection(false);
@@ -2569,9 +2825,15 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (selectedSyncTimer.current !== null) window.clearTimeout(selectedSyncTimer.current);
 			for (const timer of sessionListRefreshTimers.current.values()) window.clearTimeout(timer);
 			sessionListRefreshTimers.current.clear();
+			clearDeletedEventSessionTombstones(false);
 			api.close();
 		};
-	}, [api, invalidateKnownSessionLists, queryClient]);
+	}, [
+		api,
+		clearDeletedEventSessionTombstones,
+		invalidateKnownSessionLists,
+		queryClient,
+	]);
 
 	useEffect(() => {
 		if (toolsQuery.error) pushErrorNotice(errorMessage(toolsQuery.error));
@@ -2590,7 +2852,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			});
 			return;
 		}
-		selectProjectSession(null, null);
+		selectProjectSession(null, selectedSessionForProject(null));
 		setQuery("");
 		composerHandleRef.current?.setValue("");
 	}, [
@@ -2695,6 +2957,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 		}
 		for (const sessionId of desiredSessionIds) {
+			if (deletedEventSessionTombstones.current.has(sessionId)) continue;
 			if (subscribedEventSessionIds.current.has(sessionId)) continue;
 			subscribedEventSessionIds.current.add(sessionId);
 			const afterEventId =
@@ -2722,6 +2985,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		selectedId,
 		sessions,
 		delegationSubagentIds,
+		eventSubscriptionRevision,
 	]);
 
 	const commitConfiguredProvider = useCallback(
@@ -2919,19 +3183,52 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (activity !== "idle") throw new Error("only idle sessions can be deleted");
 			if (session.has_running_delegations ?? false) throw new Error("can't delete a session with running subagents");
 
-			await api.deleteSession(sessionId);
+			const result = await api.deleteSession(sessionId);
+			const deletedSessionIds = Array.from(new Set([
+				sessionId,
+				...(result.deleted_child_session_ids ?? []),
+			]));
+			for (const deletedSessionId of deletedSessionIds) {
+				const previousTombstone =
+					deletedEventSessionTombstones.current.get(deletedSessionId);
+				if (previousTombstone && previousTombstone.retryTimer !== null) {
+					window.clearTimeout(previousTombstone.retryTimer);
+					previousTombstone.retryTimer = null;
+				}
+				const tombstone: DeletedEventSessionTombstone = {
+					token: Symbol(deletedSessionId),
+					attempts: 0,
+					retryTimer: null,
+				};
+				deletedEventSessionTombstones.current.set(deletedSessionId, tombstone);
+				subscribedEventSessionIds.current.delete(deletedSessionId);
+				// Unsubscribe is idempotent. Send it even if reconciliation already
+				// dropped local bookkeeping so a pending backend subscription cannot
+				// outlive recursive deletion. Acknowledgements are token-fenced:
+				// responses and events share one ordered WebSocket stream, so a
+				// successful acknowledgement proves preceding frames have run.
+				recoverDeletedEventSessionSubscription(deletedSessionId, tombstone);
+			}
 			if (selectedSyncTimer.current !== null) {
 				window.clearTimeout(selectedSyncTimer.current);
 				selectedSyncTimer.current = null;
 			}
-			lastEventIds.current.delete(sessionId);
-			backgroundWarmUpdatedAt.current.delete(sessionId);
-			backgroundWarmInFlight.current.delete(sessionId);
-			dropSelectedCache(sessionId);
-			removeSessionFromKnownSessionLists(sessionId, session.project_id);
-			composerHandleRef.current?.clearSession(sessionId);
+			for (const deletedSessionId of deletedSessionIds) {
+				lastEventIds.current.delete(deletedSessionId);
+				backgroundWarmUpdatedAt.current.delete(deletedSessionId);
+				backgroundWarmInFlight.current.delete(deletedSessionId);
+				dropSelectedCache(deletedSessionId);
+				removeSessionFromKnownSessionLists(deletedSessionId, session.project_id);
+				composerHandleRef.current?.clearSession(deletedSessionId);
+			}
+			forgetDeletedSessions(deletedSessionIds);
 
-			if (selectedRef.current === sessionId) {
+			const activeRoute = workspaceRouteResultRef.current;
+			if (
+				deletedSessionIds.includes(selectedRef.current ?? "") ||
+				(activeRoute.kind === "route" &&
+					activeRoute.route.rootSessionId === sessionId)
+			) {
 				selectSession(null);
 				composerHandleRef.current?.setValue("");
 			}
@@ -2943,7 +3240,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (isSelectedSessionFetchError(error)) return;
 			throw error;
 		}
-	}, [api, assertServerMutationAllowed, closeDeleteDialog, deleteDialog, dropSelectedCache, invalidateSessionList, refreshSelected, removeSessionFromKnownSessionLists, selectSession]);
+	}, [api, assertServerMutationAllowed, closeDeleteDialog, deleteDialog, dropSelectedCache, invalidateSessionList, recoverDeletedEventSessionSubscription, refreshSelected, removeSessionFromKnownSessionLists, selectSession]);
 
 	const createSession = useCallback(
 		(title?: string) => {
@@ -3661,9 +3958,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const handleSelectProject = useCallback(
 		(projectId: string | null) => {
 			if (projectId === selectedProjectRef.current) return;
-			selectProjectSession(projectId, null);
+			const rememberedSessionId = selectedSessionForProject(projectId);
+			selectProjectSession(projectId, rememberedSessionId);
 			setQuery("");
-			composerHandleRef.current?.setValue("");
+			if (!rememberedSessionId) composerHandleRef.current?.setValue("");
 		},
 		[selectProjectSession],
 	);
@@ -4433,6 +4731,10 @@ function errorMessageOrNull(error: unknown): string | null {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function isSessionNotFoundError(error: unknown): boolean {
+	return isRpcErrorCode(error, "session_not_found");
 }
 
 function isHistoryChangedError(error: unknown): boolean {

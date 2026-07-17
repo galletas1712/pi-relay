@@ -602,7 +602,8 @@ Browser-local drafts are not returned by this RPC.
 
 ### `session.get`
 
-Recovers the session if needed, then returns a durable snapshot.
+Recovers the session if needed, then returns a durable snapshot. A missing
+session returns the stable `session_not_found` error code.
 
 ```json
 { "session_id": "s1", "include_entries": true, "entries_scope": "active_branch" }
@@ -968,8 +969,9 @@ row. If a follow-up was accepted concurrently, deletion fails with
 `session_busy` rather than cascade-deleting accepted input. Otherwise the RPC
 evicts any live session, removes the row, and cascades to its transcript
 entries, queued inputs, actions, and events; session workspace directories are
-cleaned up. Returns `{ "session_id", "deleted": true }`. A missing session is
-`session_not_found`.
+cleaned up. Returns `{ "session_id", "deleted": true,
+"deleted_child_session_ids": [...] }`; the child IDs cover the recursively
+deleted hidden subagent tree. A missing session is `session_not_found`.
 
 ## System Prompt RPC
 

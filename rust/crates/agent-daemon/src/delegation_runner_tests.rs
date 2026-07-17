@@ -864,6 +864,26 @@ struct TestEnv {
     cwd: TempDir,
 }
 
+#[tokio::test]
+async fn session_get_missing_returns_stable_not_found() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let error = public_rpc(
+        &env.state,
+        "session.get",
+        json!({ "session_id": "missing-session" }),
+    )
+    .await
+    .expect_err("missing session must fail");
+
+    assert_eq!(error.code, "session_not_found");
+    assert_eq!(error.message, "session not found");
+    env.cleanup().await;
+}
+
 impl TestEnv {
     async fn cleanup(self) {
         for handle in take_tasks(&self.state) {

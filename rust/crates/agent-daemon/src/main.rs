@@ -683,6 +683,9 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
     }
     let driver = SessionDriver::acquire(state, &session_id).await;
     let acquired_ms = started_at.elapsed().as_millis();
+    if !state.repo.session_exists(&session_id).await? {
+        return Err(RpcError::new("session_not_found", "session not found"));
+    }
     driver.recover_if_needed().await?;
     let recovered_ms = started_at.elapsed().as_millis();
     let snapshot = state.repo.session_snapshot(&session_id).await?;
