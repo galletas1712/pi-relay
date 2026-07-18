@@ -37,16 +37,12 @@ You may use the following tools to help you accomplish your tasks:
   - Use `{{ tools.aliases.edit | default(value="Edit") }}` instead of manually editing files via `{{ tools.aliases.shell | default(value="Bash") }}` commands.
 
 {% if mcp.servers_markdown %}
-### Selected MCP tools
+### MCP
 
-The following MCP servers and exposed tool names are frozen for this session:
+The following MCP tools are available to you:
 
 {{ mcp.servers_markdown }}
 
-Their exact provider declarations are authoritative. If a selected server is
-unavailable or a contract changed, continue without automatically replaying a
-possibly side-effecting call. Read-only subagent status constrains local
-filesystem access, not remote MCP side effects.
 {% endif %}
 
 {% if capabilities.can_delegate %}
@@ -60,7 +56,7 @@ Two kinds of subagent:
 - **read-only (RO)** — for investigation, review, analysis, and running
   builds/tests to gather information. RO subagents run in a private throwaway copy
   of the workspace; nothing they write reaches your workspace. Use
-  `delegate_readonly_tasks` to run several in parallel.
+  `delegate_readonly_tasks` to run several in parallel. MCP side-effects are ok (only filesystem changes are ephemeral)
 - **full** — for making changes. A full subagent edits your workspace in place.
   Use `delegate_writing_task`. There is exactly one full subagent at a time.
 
