@@ -52,7 +52,6 @@ describe("connection policy", () => {
 		] as const) {
 			expect(composerTextNeedsConnection(text)).toBe(expected);
 		}
-		expect(composerTextNeedsConnection("/switch", { cachedHistoryAvailable: true })).toBe(false);
 	});
 });
 
@@ -136,14 +135,13 @@ describe("representative component gates", () => {
 				visible
 				selectedIndex={0}
 				mutationBlockedReason={WAITING_FOR_CONNECTION}
-				cachedHistoryAvailable
 				onSetIndex={() => undefined}
 				onSelect={() => undefined}
 			/>,
 		);
 		expect((screen.getByRole("option", { name: /help/i }) as HTMLButtonElement).disabled).toBe(false);
 		expect((screen.getByRole("option", { name: /export/i }) as HTMLButtonElement).disabled).toBe(false);
-		expect((screen.getByRole("option", { name: /switch/i }) as HTMLButtonElement).disabled).toBe(false);
+		expect((screen.getByRole("option", { name: /switch/i }) as HTMLButtonElement).disabled).toBe(true);
 		expect((screen.getByRole("option", { name: /compact/i }) as HTMLButtonElement).disabled).toBe(true);
 	});
 });

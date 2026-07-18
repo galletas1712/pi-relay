@@ -16,13 +16,9 @@ export function assertRemoteActionAllowed(reason: string | null): void {
 	if (reason) throw new Error(reason);
 }
 
-export function composerTextNeedsConnection(
-	text: string,
-	options: { cachedHistoryAvailable?: boolean } = {},
-): boolean {
+export function composerTextNeedsConnection(text: string): boolean {
 	const slash = parseSlash(text);
 	if (!slash) return true;
-	if (slash.name === "switch") return !options.cachedHistoryAvailable;
 	// /export operates only on entries already in memory while disconnected.
 	return !["", "help", "export"].includes(slash.name);
 }

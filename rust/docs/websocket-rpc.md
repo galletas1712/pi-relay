@@ -690,7 +690,8 @@ the persisted transcript topology or model-visible ancestry; model context and
 ### `transcript.index`
 
 Returns compact transcript topology without full message bodies or
-`provider_replay`. This is the normal history-picker endpoint.
+`provider_replay`. This supports clients that need the transcript forest;
+the `/switch` and `/fork` pickers use `history.targets`.
 
 ```json
 { "session_id": "s1", "after_sequence": 0, "limit": 1000 }
@@ -730,8 +731,8 @@ cursor for fetching more rows in the same transcript revision. `display_hint` is
 best-effort UI copy; clients must not treat it as authoritative transcript
 content. `can_switch_to` is daemon-computed boundary truth for direct switch
 targets. Editing a historical user message still switches to the previous turn
-boundary, which clients can derive from compact topology and the daemon validates
-again in `history.switch`.
+boundary. Picker clients should use `history.targets`, whose boundary mapping is
+daemon-computed and validated again in the mutation transaction.
 
 ### `transcript.entries`
 
@@ -753,6 +754,25 @@ Result shape:
   "entries": []
 }
 ```
+
+### `history.targets`
+
+Returns a deterministic newest-first page of editable historical user-message
+targets for the `/switch` and `/fork` pickers without loading the full
+transcript tree.
+
+```json
+{ "session_id": "s1", "before_sequence": null, "limit": 50 }
+```
+
+Each target contains `entry_id`, daemon-resolved `target_leaf_id`,
+`timestamp_ms`, the containing `turn_id`, `is_on_active_branch`, and a preview
+capped at 160 characters.
+`target_leaf_id` is the safe boundary immediately preceding the message, or
+`null` for root. `next_before_sequence` is the exclusive cursor for the next
+older page. The projection omits ancestry paths, assistant/tool/boundary rows,
+and full message bodies; fetch the exact selected message separately with
+`transcript.entries`.
 
 ### `transcript.turns`
 
@@ -1296,6 +1316,10 @@ never creates a session and never deletes abandoned branches.
   source's active leaf.
 - Optional integer `expected_transcript_revision` fences all transcript
   changes.
+- Optional `source_entry_id` identifies a user-message target returned by
+  `history.targets`. When present, the store resolves that message's preceding
+  boundary again in the mutation transaction and requires it to equal
+  `leaf_id`; clients must not compute or substitute ancestry.
 - Optional `active_branch_entry_ids` is the exact ordered, compaction-aware
   path to `leaf_id`. Omission disables this fence; an explicit empty array
   asserts an empty root path and is not equivalent to omission.

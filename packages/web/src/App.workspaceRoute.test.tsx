@@ -102,6 +102,66 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
+	it("ignores a first page from an older same-session picker generation", async () => {
+		const api = createRouteApi({
+			historySessionIds: new Set(["project-root-1"]),
+			runningRootDelegation: false,
+		});
+		const stale = deferred<ReturnType<typeof historyTargetsPage>>();
+		vi.mocked(api.getHistoryTargets)
+			.mockImplementationOnce(() => stale.promise)
+			.mockResolvedValueOnce(historyTargetsPage("fresh-user", "fresh prompt"));
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser(
+			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+		));
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.type(await screen.findByRole("textbox"), "/fork");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await user.click(await screen.findByRole("button", { name: "close picker" }));
+		await user.type(screen.getByRole("textbox"), "/fork");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		expect(await screen.findByRole("button", { name: /Fork from User message: fresh prompt/ })).toBeTruthy();
+
+		await act(async () => stale.resolve(historyTargetsPage("stale-user", "stale prompt")));
+		expect(screen.queryByRole("button", { name: /stale prompt/ })).toBeNull();
+		expect(screen.getByRole("button", { name: /Fork from User message: fresh prompt/ })).toBeTruthy();
+
+		await mounted.dispose();
+	});
+
+	it("ignores an older page after reopening the same session in another mode", async () => {
+		const api = createRouteApi({
+			historySessionIds: new Set(["project-root-1"]),
+			runningRootDelegation: false,
+		});
+		const older = deferred<ReturnType<typeof historyTargetsPage>>();
+		vi.mocked(api.getHistoryTargets)
+			.mockResolvedValueOnce(historyTargetsPage("new-user", "new prompt", 10))
+			.mockImplementationOnce(() => older.promise)
+			.mockResolvedValueOnce(historyTargetsPage("switch-user", "switch prompt"));
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser(
+			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+		));
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.type(await screen.findByRole("textbox"), "/fork");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await user.click(await screen.findByRole("button", { name: "Load older messages" }));
+		await user.click(screen.getByRole("button", { name: "close picker" }));
+		await user.type(screen.getByRole("textbox"), "/switch");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		expect(await screen.findByRole("button", { name: /Switch to User message: switch prompt/ })).toBeTruthy();
+
+		await act(async () => older.resolve(historyTargetsPage("old-user", "old prompt")));
+		expect(screen.queryByRole("button", { name: /old prompt/ })).toBeNull();
+		expect(screen.getByRole("button", { name: /Switch to User message: switch prompt/ })).toBeTruthy();
+
+		await mounted.dispose();
+	});
+
 	it("forks from the current picker target and cold-loads the independent child", async () => {
 		const browser = new FakeWorkspaceBrowser(
 			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
@@ -128,15 +188,15 @@ describe("App workspace route identity integration", () => {
 		await user.type(composer, "/fork");
 		await user.click(screen.getByRole("button", { name: "send message" }));
 		expect(await screen.findByRole("heading", { name: "Fork session" })).toBeTruthy();
-		await user.click(screen.getByRole("button", { name: /Fork from End of turn 1/ }));
+		await user.click(screen.getByRole("button", { name: /Fork from User message/ }));
 
 		await waitFor(() => expect(api.forkHistory).toHaveBeenCalledTimes(1));
 		expect(api.forkHistory.mock.calls[0][0]).toMatchObject({
 			sessionId: "project-root-1",
-			leafId: "entry-active",
+			leafId: null,
+			sourceEntryId: "entry-user",
 			expectedActiveLeafId: "entry-active",
 			expectedTranscriptRevision: 1,
-			activeBranchEntryIds: ["entry-user", "entry-active"],
 		});
 		await waitFor(() =>
 			expect(browser.currentUrl).toBe(
@@ -216,7 +276,7 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
-	it("refreshes a stale fork tree and asks the user to retry", async () => {
+	it("prevents duplicate fork submissions and allows retry after a stale refresh", async () => {
 		const browser = new FakeWorkspaceBrowser(
 			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
 		);
@@ -224,24 +284,54 @@ describe("App workspace route identity integration", () => {
 			historySessionIds: new Set(["project-root-1"]),
 			runningRootDelegation: false,
 		});
-		api.forkHistory.mockRejectedValue(
-			new Error("history_changed: transcript revision changed"),
-		);
+		const getHistoryTargetsMock = vi.mocked(api.getHistoryTargets);
+		const getHistoryTargets = getHistoryTargetsMock.getMockImplementation();
+		if (!getHistoryTargets) throw new Error("missing history target implementation");
+		getHistoryTargetsMock.mockImplementation(async (...args) => ({
+			...await getHistoryTargets(...args),
+			next_before_sequence: 1,
+			has_more: true,
+		}));
+		const staleFork = deferred<ReturnType<typeof forkResult>>();
+		api.forkHistory
+			.mockImplementationOnce(() => staleFork.promise)
+			.mockResolvedValueOnce(forkResult("project-root-1"));
 		const mounted = renderRouteApp(api, browser);
 		const user = userEvent.setup();
 
 		await open(api);
 		await user.type(await screen.findByRole("textbox"), "/fork");
 		await user.click(screen.getByRole("button", { name: "send message" }));
-		await user.click(await screen.findByRole("button", { name: /Fork from End of turn 1/ }));
+		const target = await screen.findByRole("button", { name: /Fork from User message/ });
+		target.click();
+		target.click();
+		await waitFor(() => expect((target as HTMLButtonElement).disabled).toBe(true));
+		const close = screen.getByRole<HTMLButtonElement>("button", { name: "close picker" });
+		expect(close.disabled).toBe(true);
+		await user.keyboard("{Escape}");
+		await user.click(document.querySelector(".dialog-overlay") as HTMLElement);
+		expect(screen.getByRole("heading", { name: "Fork session" })).toBeTruthy();
+		expect((screen.getByRole("button", {
+			name: "Load older messages",
+		}) as HTMLButtonElement).disabled).toBe(true);
+		await waitFor(() => expect(api.forkHistory).toHaveBeenCalledTimes(1));
+		expect(api.getHistoryTargets).toHaveBeenCalledTimes(1);
+		await act(async () =>
+			staleFork.reject(new Error("history_changed: transcript revision changed")),
+		);
 
-		await waitFor(() => expect(api.getTranscriptIndex).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(api.getHistoryTargets).toHaveBeenCalledTimes(2));
 		expect(
 			await screen.findByText("history changed; refreshed the fork list, please choose again"),
 		).toBeTruthy();
+		expect(screen.getByRole("heading", { name: "Fork session" })).toBeTruthy();
+		const retry = screen.getByRole("button", { name: /Fork from User message: Edit original prompt/ });
+		expect((retry as HTMLButtonElement).disabled).toBe(false);
 		expect(browser.currentUrl).toBe(
 			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
 		);
+		await user.click(retry);
+		await waitFor(() => expect(api.forkHistory).toHaveBeenCalledTimes(2));
 
 		await mounted.dispose();
 	});
@@ -2457,9 +2547,59 @@ function createRouteApi(
 			options.historySessionIds?.has(sessionId)
 				? historyIndex(sessionId, options.includeDestinationHistoryTarget)
 				: Promise.reject(new Error("unexpected transcript index read"))),
-		getTranscriptEntries: vi.fn(async () =>
-			options.deferredTranscriptEntries ??
-			Promise.reject(new Error("unexpected transcript entry read"))),
+		getHistoryTargets: vi.fn(async (sessionId: string) => {
+			if (!options.historySessionIds?.has(sessionId)) {
+				throw new Error("unexpected history target read");
+			}
+			const destination = options.includeDestinationHistoryTarget
+				? [{
+						entry_id: "entry-destination",
+						target_leaf_id: "entry-active",
+						timestamp_ms: 3,
+						turn_id: 2,
+						is_on_active_branch: true,
+						preview: "Destination answer",
+					}]
+				: [];
+			return {
+				session_id: sessionId,
+				active_leaf_id: "entry-active",
+				session_revision: 1,
+				transcript_revision: 1,
+				before_sequence: null,
+				next_before_sequence: null,
+				has_more: false,
+				targets: [
+					...destination,
+					{
+						entry_id: "entry-user",
+						target_leaf_id: null,
+						timestamp_ms: 1,
+						turn_id: 1,
+						is_on_active_branch: true,
+						preview: "Edit original prompt",
+					},
+				],
+			};
+		}),
+		getTranscriptEntries: vi.fn(async (sessionId: string) => {
+			if (options.deferredTranscriptEntries) return options.deferredTranscriptEntries;
+			if (!options.historySessionIds?.has(sessionId)) {
+				throw new Error("unexpected transcript entry read");
+			}
+			return {
+				session_id: "project-root-1",
+				session_revision: 1,
+				transcript_revision: 1,
+				entries: [{
+					id: "entry-user",
+					parent_id: null,
+					timestamp_ms: 1,
+					sequence: 1,
+					item: { type: "user_message", content: [{ type: "text", text: "Edit original prompt" }] },
+				}],
+			};
+		}),
 		getTranscriptTurnDetail: mutation(),
 		getHistoryTree: mutation(),
 		getHistoryContext: mutation(),
@@ -2764,6 +2904,26 @@ function deferred<T>() {
 		reject = nextReject;
 	});
 	return { promise, resolve, reject };
+}
+
+function historyTargetsPage(entryId: string, preview: string, nextBeforeSequence: number | null = null) {
+	return {
+		session_id: "project-root-1",
+		active_leaf_id: "entry-active",
+		session_revision: 1,
+		transcript_revision: 1,
+		before_sequence: null,
+		next_before_sequence: nextBeforeSequence,
+		has_more: nextBeforeSequence !== null,
+		targets: [{
+			entry_id: entryId,
+			target_leaf_id: null,
+			timestamp_ms: 1,
+			turn_id: 1,
+			is_on_active_branch: true,
+			preview,
+		}],
+	};
 }
 
 class FakeWorkspaceBrowser implements WorkspaceHistoryLike, WorkspacePopstateSource {

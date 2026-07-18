@@ -6,6 +6,8 @@ use crate::HistoryTarget;
 
 use super::sql::{ensure_no_active_work_tx, ensure_no_running_delegation_tx};
 
+pub(super) const HISTORY_TARGET_ANCESTRY_LIMIT: i64 = 10_000;
+
 pub(super) async fn validate_history_target_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
@@ -53,6 +55,12 @@ pub(super) async fn validate_history_target_tx(
             return Err(crate::HistoryTargetNotTurnBoundary.into());
         }
     }
+    if let Some(source_entry_id) = target.source_entry_id {
+        let resolved = history_target_context_for_user_tx(tx, session_id, source_entry_id).await?;
+        if resolved.as_deref() != target.leaf_id {
+            return Err(crate::HistoryChanged.into());
+        }
+    }
     if let Some(expected_ids) = target.expected_active_branch_entry_ids {
         let target_ids = branch_entry_ids_tx(tx, session_id, target.leaf_id).await?;
         if expected_ids != target_ids {
@@ -60,6 +68,53 @@ pub(super) async fn validate_history_target_tx(
         }
     }
     Ok(())
+}
+
+pub(super) async fn history_target_context_for_user_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    entry_id: &str,
+) -> Result<Option<String>> {
+    let row = sqlx::query(
+        r#"
+        with recursive ancestors as (
+            select t.id, t.parent_id, t.item, 0 as depth
+            from transcript_entries t
+            where t.session_id=$1 and t.id=$2::text
+              and t.item->>'type' = 'user_message'
+
+            union all
+
+            select parent.id, parent.parent_id, parent.item, child.depth + 1
+            from transcript_entries parent
+            join ancestors child
+              on parent.session_id=$1 and parent.id=child.parent_id
+            where child.item->>'type' not in ('turn_finished', 'compaction_summary')
+              and child.depth + 1 < $3
+        ),
+        context as (
+            select
+                (array_agg(id order by depth)
+                    filter (where item->>'type' in ('turn_finished', 'compaction_summary')))[1]
+                    as target_leaf_id,
+                bool_or(parent_id is null) as reached_root
+            from ancestors
+            having count(*) > 0
+        )
+        select target_leaf_id
+        from context
+        where target_leaf_id is not null or reached_root
+        "#,
+    )
+    .bind(session_id)
+    .bind(entry_id)
+    .bind(HISTORY_TARGET_ANCESTRY_LIMIT)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Err(crate::HistoryChanged.into());
+    };
+    Ok(row.get("target_leaf_id"))
 }
 
 pub(super) async fn branch_entry_ids_tx(

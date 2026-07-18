@@ -502,6 +502,7 @@ async fn dispatch_request(
         RpcMethod::TranscriptEntries => transcript_entries(state, params).await,
         RpcMethod::TranscriptTurns => transcript_turns(state, params).await,
         RpcMethod::TranscriptTurnDetail => transcript_turn_detail(state, params).await,
+        RpcMethod::HistoryTargets => history_targets(state, params).await,
         RpcMethod::HistoryTree => history_tree(state, params).await,
         RpcMethod::HistoryContext => history_context(state, params).await,
         RpcMethod::HistorySwitch => history::switch(state, params).await,
@@ -1738,6 +1739,18 @@ async fn transcript_turn_detail(
         );
     }
     Ok(value)
+}
+
+async fn history_targets(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let params = history::parse_history_targets(params)?;
+    let session_id = params.session_id;
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.recover_if_needed().await?;
+    let result = state
+        .repo
+        .history_targets(&session_id, params.before_sequence, params.limit)
+        .await?;
+    Ok(rpc_views::history_targets(result))
 }
 
 async fn history_tree(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

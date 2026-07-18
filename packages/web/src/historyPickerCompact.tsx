@@ -1,5 +1,5 @@
-import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
-import { ChevronRight, GitFork, Loader2, RotateCcw } from "lucide-react";
+import { useRef, type RefObject } from "react";
+import { GitFork, Loader2, RotateCcw } from "lucide-react";
 import {
 	AppDialog,
 	DialogCloseButton,
@@ -7,354 +7,103 @@ import {
 	DialogTitle,
 } from "./dialog.tsx";
 import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
-import { displayParentIdForNode } from "./displayParent.ts";
-import {
-	historySwitchOptionsFromNodes,
-	nodeBranchIds,
-	type HistoryTargetOption
-} from "./historyTargets.ts";
-import { perfEnabled, perfLog, perfNow } from "./perf.ts";
-import type { TranscriptTreeNode } from "./types.ts";
+import type { HistoryTargetsResult } from "./types.ts";
 
-interface VisibleHistoryNodeRow {
-	node: TranscriptTreeNode;
-	option: HistoryTargetOption;
-	depth: number;
-	isActive: boolean;
-	isOnActivePath: boolean;
-	parentId: string | null;
-	isBranchRoot: boolean;
-	descendantCount: number;
+export interface HistoryTargetOption {
+	actionLeafId: string | null;
+	expectedActiveLeafId: string | null;
+	expectedTranscriptRevision: number;
+	sourceEntryId: string;
+	restoreEntryId: string;
+	turnLabel: string;
+	preview: string;
+	meta: string;
 }
 
-interface HistoryPickerContentParams {
-	loading: boolean;
-	error: string | null;
-	mutationBlockedReason?: string | null;
-	rows: VisibleHistoryNodeRow[];
-	hiddenBranchIds: Set<string>;
-	mode: "fork" | "switch";
-	onSelect: (target: HistoryTargetOption) => void;
-	onToggleBranch: (entryId: string) => void;
-}
-
-export function CompactHistoryPickerDialog({
-	nodes,
-	activeLeafId,
-	mode = "switch",
-	loading = false,
-	error = null,
+export function HistoryTargetPickerDialog({
+	targets,
+	mode,
+	loading,
+	submitting,
+	error,
+	hasMore,
+	onLoadMore,
 	onClose,
 	onSelect,
 	mutationBlockedReason,
 	returnFocusFallbackRef,
 }: {
-	nodes: TranscriptTreeNode[];
-	activeLeafId: string | null;
-	mode?: "fork" | "switch";
-	loading?: boolean;
-	error?: string | null;
+	targets: HistoryTargetOption[];
+	mode: "fork" | "switch";
+	loading: boolean;
+	submitting: boolean;
+	error: string | null;
+	hasMore: boolean;
+	onLoadMore: () => void;
 	onClose: () => void;
 	onSelect: (target: HistoryTargetOption) => void;
 	mutationBlockedReason?: string | null;
 	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
 	const titleRef = useRef<HTMLHeadingElement>(null);
-	const optionsRef = useRef<HTMLDivElement>(null);
-	const initializedScrollRef = useRef(false);
-	const [expandedBranches, setExpandedBranches] = useState<Set<string>>(() => new Set());
-	const options = useMemo(
-		() => historySwitchOptionsFromNodes(nodes, activeLeafId),
-		[activeLeafId, nodes]
-	);
-	const visibleRows = useMemo(
-		() => {
-			const shouldLogPerf = perfEnabled();
-			const startedAt = perfNow();
-			const rows = historyPickerNodeRows(nodes, options, activeLeafId);
-			if (shouldLogPerf) {
-				perfLog("historyPickerNodeRows", {
-					nodes: nodes.length,
-					options: options.length,
-					rows: rows.length,
-					deriveMs: Math.round(perfNow() - startedAt)
-				});
-			}
-			return rows;
-		},
-		[activeLeafId, nodes, options]
-	);
-	const hiddenBranchIds = useMemo(() => {
-		const hidden = new Set<string>();
-		for (const row of visibleRows) {
-			if (!row.isBranchRoot || row.isOnActivePath || expandedBranches.has(row.node.id)) continue;
-			hidden.add(row.node.id);
-		}
-		let changed = true;
-		while (changed) {
-			changed = false;
-			for (const row of visibleRows) {
-				if (hidden.has(row.node.id) || !row.parentId || !hidden.has(row.parentId)) continue;
-				hidden.add(row.node.id);
-				changed = true;
-			}
-		}
-		return hidden;
-	}, [expandedBranches, visibleRows]);
-	const renderedRows = visibleRows.filter((row) => !hiddenBranchIds.has(row.node.id) || row.isBranchRoot);
-	const toggleBranch = (entryId: string) => {
-		setExpandedBranches((current) => {
-			const next = new Set(current);
-			if (next.has(entryId)) next.delete(entryId);
-			else next.add(entryId);
-			return next;
-		});
-	};
-	const targetCount = visibleRows.length;
 	const isFork = mode === "fork";
-	const title = isFork ? "Fork session" : "Switch branch";
 	const Icon = isFork ? GitFork : RotateCcw;
-	useLayoutEffect(() => {
-		if (initializedScrollRef.current || loading || error || renderedRows.length === 0) return;
-		const list = optionsRef.current;
-		if (!list) return;
-		const active = list.querySelector<HTMLElement>('.history-option[aria-current="true"]');
-		if (active) scrollHistoryTargetIntoView(list, active);
-		else if (activeLeafId === null || nodes.some((node) => node.id === activeLeafId)) {
-			list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
-		} else {
-			return;
-		}
-		initializedScrollRef.current = true;
-	}, [activeLeafId, error, loading, nodes, renderedRows]);
-
 	return (
 		<AppDialog
 			className="history-dialog"
+			busy={submitting}
 			initialFocusRef={titleRef}
 			returnFocusFallbackRef={returnFocusFallbackRef}
 			onDismiss={onClose}
 		>
 			<div className="history-dialog-head">
-				<span className="history-dialog-icon" aria-hidden="true">
-					<Icon size={15} />
-				</span>
+				<span className="history-dialog-icon" aria-hidden="true"><Icon size={15} /></span>
 				<div className="history-dialog-copy">
-					<DialogTitle ref={titleRef} tabIndex={-1}>{title}</DialogTitle>
-					<DialogDescription>
-						{isFork
-							? "Pick a user message to edit, or a completed turn or compaction root. The current workspace—not historical files—will be cloned."
-							: "Pick a user message to edit, or a completed turn or compaction root to make active."}
-					</DialogDescription>
+					<DialogTitle ref={titleRef} tabIndex={-1}>{isFork ? "Fork session" : "Switch branch"}</DialogTitle>
+					<DialogDescription>Pick a historical user message to restore and edit.</DialogDescription>
 				</div>
-				<DialogCloseButton label="close picker" />
+				<DialogCloseButton label="close picker" disabled={submitting} />
 			</div>
-
-			<div ref={optionsRef} className="history-options tree">
+			<div className="history-options">
 				<ConnectionBlockedReason reason={mutationBlockedReason} className="history-blocked-reason" />
-				{historyPickerContent({
-					loading,
-					error,
-					mutationBlockedReason,
-					mode,
-					rows: visibleRows,
-					hiddenBranchIds,
-					onSelect,
-					onToggleBranch: toggleBranch,
-				})}
-				{!loading && !error && targetCount === 0 ? (
-					<div className="history-empty">
-						No editable messages, completed turns, or compaction roots yet.
-					</div>
-				) : null}
+				{error ? <div className="history-empty error">{error}</div> : null}
+				<ul className="history-target-list" aria-label={`${mode} targets`}>
+					{targets.map((target) => (
+						<li key={target.sourceEntryId}>
+							<button
+								className="history-option"
+								type="button"
+								disabled={submitting || !!mutationBlockedReason}
+								aria-label={`${isFork ? "Fork from" : "Switch to"} User message: ${target.preview}`}
+								onClick={() => onSelect(target)}
+							>
+								<span className="history-option-icon">{target.turnLabel}</span>
+								<span className="history-option-main">
+									<span className="history-option-title">User message</span>
+									<span className="history-option-preview">{target.preview}</span>
+								</span>
+								<span className="history-option-meta">{target.meta}</span>
+							</button>
+						</li>
+					))}
+				</ul>
+				{loading ? <div className="history-loading"><Loader2 className="spin" size={16} /> Loading history…</div> : null}
+				{!loading && targets.length === 0 && !error ? <div className="history-empty">No editable messages yet.</div> : null}
+				{hasMore && !loading ? <button type="button" disabled={submitting} onClick={onLoadMore}>Load older messages</button> : null}
 			</div>
 		</AppDialog>
 	);
 }
 
-export function scrollHistoryTargetIntoView(list: HTMLElement, target: HTMLElement): void {
-	const listRect = list.getBoundingClientRect();
-	const targetRect = target.getBoundingClientRect();
-	if (targetRect.top < listRect.top) {
-		list.scrollTop += targetRect.top - listRect.top;
-	} else if (targetRect.bottom > listRect.bottom) {
-		list.scrollTop += targetRect.bottom - listRect.bottom;
-	}
-}
-
-function historyPickerContent({
-	loading,
-	error,
-	mutationBlockedReason,
-	mode,
-	rows,
-	hiddenBranchIds,
-	onSelect,
-	onToggleBranch,
-}: HistoryPickerContentParams): ReactNode {
-	if (loading) {
-		return (
-			<div className="history-loading">
-				<Loader2 className="spin" size={16} />
-				<span>Loading history index…</span>
-			</div>
-		);
-	}
-	if (error) return <div className="history-empty error">{error}</div>;
-	const children = new Map<string | null, VisibleHistoryNodeRow[]>();
-	for (const row of rows) {
-		const siblings = children.get(row.parentId) ?? [];
-		siblings.push(row);
-		children.set(row.parentId, siblings);
-	}
-	const renderRows = (parentId: string | null): ReactNode =>
-		(children.get(parentId) ?? []).map((row) => {
-			const display = row.option;
-			const isCollapsedBranch = hiddenBranchIds.has(row.node.id);
-			const canCollapse = row.isBranchRoot && !row.isOnActivePath;
-			const branchToggleLabel = `${isCollapsedBranch ? "Expand" : "Collapse"} branch for ${display.title}: ${display.preview}${isCollapsedBranch ? `, ${row.descendantCount} hidden descendant${row.descendantCount === 1 ? "" : "s"}` : ""}`;
-			const outcomeClass = nonGracefulOutcomeClass(display.outcome);
-			const childRows = children.get(row.node.id) ?? [];
-			const branchId = `history-branch-${row.node.id.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
-			return (
-				<li
-					key={row.node.id}
-					className={`history-tree-item ${row.isOnActivePath ? "on-active-path" : ""} ${isCollapsedBranch ? "collapsed" : ""} ${outcomeClass}`}
-					style={{ "--tree-depth": row.depth } as CSSProperties}
-				>
-					{canCollapse ? (
-						<button
-							className="branch-toggle"
-							type="button"
-							onClick={() => onToggleBranch(row.node.id)}
-							aria-label={branchToggleLabel}
-							aria-expanded={!isCollapsedBranch}
-							aria-controls={branchId}
-						>
-							<ChevronRight size={13} />
-						</button>
-					) : null}
-					<button
-						className="history-option tree-row"
-						type="button"
-						aria-label={`${mode === "fork" ? "Fork from" : "Switch to"} ${display.title}: ${display.preview}${row.isActive ? ", current" : ""}`}
-						aria-current={row.isActive ? "true" : undefined}
-						disabled={!!mutationBlockedReason}
-						onClick={() => onSelect(row.option)}
-					>
-						<span className="tree-guides" aria-hidden="true" />
-						<span className={`history-option-icon ${row.parentId ? "" : "root"}`}>
-							{display.turnLabel}
-						</span>
-						<span className="history-option-main">
-							<span className="history-option-title">
-								{display.title}
-								{row.isActive ? <span className="history-badge">current</span> : null}
-								{isCollapsedBranch ? <span className="history-badge muted">{row.descendantCount} hidden</span> : null}
-								{display.outcome && display.outcome !== "Graceful" ? (
-									<span className="history-badge danger">{display.outcome.toLowerCase()}</span>
-								) : null}
-							</span>
-							<span className="history-option-preview">{display.preview}</span>
-						</span>
-						<span className="history-option-meta">
-							{mode === "fork" && display.meta.startsWith("switch ·")
-								? display.meta.replace("switch ·", "fork ·")
-								: display.meta}
-						</span>
-					</button>
-					{childRows.length > 0 ? (
-						<ul
-							id={canCollapse ? branchId : undefined}
-							className="history-branch-list"
-							hidden={canCollapse && isCollapsedBranch}
-						>
-							{renderRows(row.node.id)}
-						</ul>
-					) : null}
-				</li>
-			);
-		});
-	return (
-		<ul className="history-target-list" aria-label={`${mode} targets`}>
-			{renderRows(null)}
-		</ul>
-	);
-}
-
-function historyPickerNodeRows(
-	nodes: TranscriptTreeNode[],
-	options: HistoryTargetOption[],
-	activeLeafId: string | null
-): VisibleHistoryNodeRow[] {
-	const byId = new Map(nodes.map((node) => [node.id, node]));
-	const order = new Map(nodes.map((node, index) => [node.id, index]));
-	const optionById = new Map(options.flatMap((option) => (option.id ? [[option.id, option] as const] : [])));
-	const visibleNodes = nodes.filter((node) => optionById.has(node.id));
-	const visibleIds = new Set(visibleNodes.map((node) => node.id));
-	const activePath = new Set(nodeBranchIds(nodes, activeLeafId));
-	const visibleAncestorCache = new Map<string, string | null>();
-
-	const nearestVisibleAncestor = (node: TranscriptTreeNode): string | null => {
-		const cached = visibleAncestorCache.get(node.id);
-		if (cached !== undefined) return cached;
-		const parentId = displayParentIdForNode(node, byId);
-		let ancestor: string | null = null;
-		if (parentId) {
-			ancestor = visibleIds.has(parentId) ? parentId : nearestVisibleAncestor(byId.get(parentId)!);
-		}
-		visibleAncestorCache.set(node.id, ancestor);
-		return ancestor;
-	};
-
-	const children = new Map<string | null, TranscriptTreeNode[]>();
-	for (const node of visibleNodes) {
-		const parentId = nearestVisibleAncestor(node);
-		const siblings = children.get(parentId) ?? [];
-		siblings.push(node);
-		children.set(parentId, siblings);
-	}
-	for (const siblings of children.values()) {
-		siblings.sort((left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0));
-	}
-
-	const sizeCache = new Map<string, number>();
-	const branchSize = (nodeId: string): number => {
-		const cached = sizeCache.get(nodeId);
-		if (cached !== undefined) return cached;
-		const size = 1 + (children.get(nodeId) ?? []).reduce((sum, child) => sum + branchSize(child.id), 0);
-		sizeCache.set(nodeId, size);
-		return size;
-	};
-
-	const rows: VisibleHistoryNodeRow[] = [];
-	const visit = (node: TranscriptTreeNode, depth: number, parentId: string | null, isBranchRoot: boolean) => {
-		const option = optionById.get(node.id);
-		if (!option) return;
-		rows.push({
-			node,
-			option,
-			depth,
-			isActive: activeLeafId === node.id,
-			isOnActivePath: activePath.has(node.id),
-			parentId,
-			isBranchRoot,
-			descendantCount: branchSize(node.id) - 1
-		});
-		const nodeChildren = children.get(node.id) ?? [];
-		const hasSplit = nodeChildren.length > 1;
-		const activeChild = nodeChildren.find((child) => activePath.has(child.id));
-		for (const child of nodeChildren) {
-			const isAlternateBranch = hasSplit && child.id !== activeChild?.id;
-			visit(child, depth + (isAlternateBranch ? 1 : 0), node.id, hasSplit);
-		}
-	};
-	for (const root of children.get(null) ?? []) visit(root, 0, null, false);
-	return rows;
-}
-
-function nonGracefulOutcomeClass(outcome: HistoryTargetOption["outcome"]): string {
-	if (outcome === "Crashed") return "turn-crashed";
-	if (outcome === "Interrupted") return "turn-interrupted";
-	return "";
+export function historyTargetOptions(page: HistoryTargetsResult): HistoryTargetOption[] {
+	return page.targets.map((target) => ({
+		actionLeafId: target.target_leaf_id,
+		expectedActiveLeafId: page.active_leaf_id,
+		expectedTranscriptRevision: page.transcript_revision,
+		sourceEntryId: target.entry_id,
+		restoreEntryId: target.entry_id,
+		turnLabel: target.turn_id ? `t${target.turn_id}` : "turn",
+		preview: target.preview,
+		meta: `${target.is_on_active_branch ? "active branch" : "alternate history"} · ${new Date(target.timestamp_ms).toLocaleString()}`,
+	}));
 }

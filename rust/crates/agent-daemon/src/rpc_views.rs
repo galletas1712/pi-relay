@@ -19,6 +19,19 @@ pub(crate) fn project(project: Project) -> Value {
     })
 }
 
+pub(crate) fn history_targets(result: agent_store::HistoryTargetsResult) -> Value {
+    json!({
+        "session_id": result.session_id,
+        "active_leaf_id": result.active_leaf_id,
+        "session_revision": result.session_revision,
+        "transcript_revision": result.transcript_revision,
+        "before_sequence": result.before_sequence,
+        "next_before_sequence": result.next_before_sequence,
+        "has_more": result.has_more,
+        "targets": result.targets,
+    })
+}
+
 pub(crate) fn session_summary(summary: SessionSummary) -> Value {
     json!({
         "session_id": summary.session_id,

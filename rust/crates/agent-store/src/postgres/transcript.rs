@@ -9,14 +9,17 @@ use serde_json::{json, Value};
 use sqlx::{Postgres, Row, Transaction};
 
 use crate::{
-    ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree, SessionActivity,
-    SwitchActiveLeafRequest, SwitchActiveLeafResult, TranscriptEntriesResult,
-    TranscriptEntryBodyMode, TranscriptEntryRecord, TranscriptEntryScope, TranscriptTreeIndex,
-    TranscriptTreeNodeRecord, TranscriptTurnDetailResult, TranscriptTurnsResult,
+    ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTargetRecord,
+    HistoryTargetsResult, HistoryTree, SessionActivity, SwitchActiveLeafRequest,
+    SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryBodyMode,
+    TranscriptEntryRecord, TranscriptEntryScope, TranscriptTreeIndex, TranscriptTreeNodeRecord,
+    TranscriptTurnDetailResult, TranscriptTurnsResult,
 };
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
-use super::history_target::{branch_entry_ids_tx, validate_history_target_tx};
+use super::history_target::{
+    branch_entry_ids_tx, validate_history_target_tx, HISTORY_TARGET_ANCESTRY_LIMIT,
+};
 use super::queue::bump_revisions_tx;
 use super::rows::{row_to_stored_entry, row_to_transcript_entry};
 use super::sql::{lock_session_tx, stale_unfinished_actions_for_session};
@@ -25,6 +28,8 @@ use super::PostgresAgentStore;
 
 const DEFAULT_TRANSCRIPT_INDEX_LIMIT: i64 = 1000;
 const MAX_TRANSCRIPT_INDEX_LIMIT: i64 = 5000;
+const DEFAULT_HISTORY_TARGET_LIMIT: i64 = 50;
+const MAX_HISTORY_TARGET_LIMIT: i64 = 200;
 const DEFAULT_TRANSCRIPT_TURN_LIMIT: i64 = 50;
 const MAX_TRANSCRIPT_TURN_LIMIT: i64 = 200;
 
@@ -441,6 +446,124 @@ impl PostgresAgentStore {
         })
     }
 
+    pub async fn history_targets(
+        &self,
+        session_id: &str,
+        before_sequence: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<HistoryTargetsResult> {
+        let limit = limit
+            .unwrap_or(DEFAULT_HISTORY_TARGET_LIMIT)
+            .clamp(1, MAX_HISTORY_TARGET_LIMIT);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read read only")
+            .execute(&mut *tx)
+            .await?;
+        let session = sqlx::query(
+            "select active_leaf_id, session_revision, transcript_revision from sessions where id=$1",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let active_leaf_id: Option<String> = session.get("active_leaf_id");
+        let active_branch_entry_ids =
+            branch_entry_ids_tx(&mut tx, session_id, active_leaf_id.as_deref()).await?;
+        let rows = sqlx::query(
+            r#"
+            with recursive users as materialized (
+                select u.id, u.parent_id, u.item, u.timestamp_ms, u.sequence
+                from transcript_entries u
+                where u.session_id=$1
+                  and u.item->>'type' = 'user_message'
+                  and ($2::bigint is null or u.sequence < $2)
+                order by u.sequence desc, u.id desc
+                limit $3 + 1
+            ),
+            ancestors as (
+                select u.id as source_id, u.id, u.parent_id, u.item, 0 as depth
+                from users u
+
+                union all
+
+                select child.source_id, parent.id, parent.parent_id, parent.item,
+                       child.depth + 1
+                from transcript_entries parent
+                join ancestors child
+                  on parent.session_id=$1 and parent.id=child.parent_id
+                where child.item->>'type' not in ('turn_finished', 'compaction_summary')
+                  and child.depth + 1 < $4
+            ),
+            contexts as (
+                select source_id,
+                       (array_agg(id order by depth)
+                           filter (where item->>'type' in ('turn_finished', 'compaction_summary')))[1]
+                           as target_leaf_id,
+                       (array_agg(nullif(item->>'turn_id', '')::bigint order by depth)
+                           filter (where item->>'type' = 'turn_started'))[1]
+                           as turn_id,
+                       bool_or(parent_id is null)
+                           or bool_or(item->>'type' in ('turn_finished', 'compaction_summary'))
+                           as resolved
+                from ancestors
+                group by source_id
+            )
+            select u.id, u.timestamp_ms, u.sequence,
+                   contexts.target_leaf_id, contexts.turn_id, contexts.resolved,
+                   coalesce((
+                       select left(string_agg(
+                           left(coalesce(block->>'text', '[image]'), 160),
+                           E'\n' order by ordinal
+                       ), 160)
+                       from jsonb_array_elements(u.item->'content') with ordinality
+                            as content(block, ordinal)
+                       where ordinal <= 4
+                   ), '') as preview
+            from users u
+            join contexts on contexts.source_id=u.id
+            order by u.sequence desc, u.id desc
+            "#,
+        )
+        .bind(session_id)
+        .bind(before_sequence)
+        .bind(limit)
+        .bind(HISTORY_TARGET_ANCESTRY_LIMIT)
+        .fetch_all(&mut *tx)
+        .await?;
+        let has_more = rows.len() as i64 > limit;
+        let mut targets = Vec::with_capacity(rows.len().min(limit as usize));
+        let mut next_before_sequence = None;
+        for row in rows.into_iter().take(limit as usize) {
+            next_before_sequence = Some(row.get::<i64, _>("sequence"));
+            if !row.get::<bool, _>("resolved") {
+                continue;
+            }
+            let entry_id = row.get::<String, _>("id");
+            targets.push(HistoryTargetRecord {
+                target_leaf_id: row.get("target_leaf_id"),
+                turn_id: row.get("turn_id"),
+                is_on_active_branch: active_branch_entry_ids.contains(&entry_id),
+                entry_id,
+                timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
+                preview: row.get("preview"),
+            });
+        }
+        let next_before_sequence = has_more.then(|| {
+            next_before_sequence.expect("a page with more history targets scanned at least one row")
+        });
+        tx.commit().await?;
+        Ok(HistoryTargetsResult {
+            session_id: session_id.to_string(),
+            active_leaf_id,
+            session_revision: session.get("session_revision"),
+            transcript_revision: session.get("transcript_revision"),
+            before_sequence,
+            next_before_sequence,
+            has_more,
+            targets,
+        })
+    }
+
     pub async fn transcript_turns(
         &self,
         session_id: &str,
@@ -672,6 +795,7 @@ impl PostgresAgentStore {
                 session_id,
                 target: crate::HistoryTarget {
                     leaf_id,
+                    source_entry_id: None,
                     expected_active_leaf_id: None,
                     expected_transcript_revision: None,
                     expected_active_branch_entry_ids: None,
@@ -1497,6 +1621,7 @@ mod tests {
                 session_id,
                 target: HistoryTarget {
                     leaf_id: Some("entry_finish"),
+                    source_entry_id: None,
                     expected_active_leaf_id: None,
                     expected_transcript_revision: Some(before.transcript_revision),
                     expected_active_branch_entry_ids: Some(&expected_ids),
@@ -1935,6 +2060,7 @@ mod tests {
                 session_id,
                 target: HistoryTarget {
                     leaf_id: Some("entry_a_finish"),
+                    source_entry_id: None,
                     expected_active_leaf_id: None,
                     expected_transcript_revision: None,
                     expected_active_branch_entry_ids: None,
@@ -2020,6 +2146,7 @@ mod tests {
                 session_id,
                 target: HistoryTarget {
                     leaf_id: Some("entry_b_finish"),
+                    source_entry_id: None,
                     expected_active_leaf_id: Some(Some("entry_a_finish")),
                     expected_transcript_revision: None,
                     expected_active_branch_entry_ids: None,
@@ -2147,6 +2274,7 @@ mod tests {
                     session_id: source_session_id,
                     target: HistoryTarget {
                         leaf_id: None,
+                        source_entry_id: None,
                         expected_active_leaf_id: None,
                         expected_transcript_revision: None,
                         expected_active_branch_entry_ids: None,

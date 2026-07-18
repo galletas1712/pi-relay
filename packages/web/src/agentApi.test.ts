@@ -132,6 +132,39 @@ describe("AgentApi MCP wire format", () => {
 		});
 		expect(calls[0]?.params?.workspaces).toEqual([]);
 	});
+
+	it("pages server-projected targets and fences a selected source entry", async () => {
+		const calls: RpcCall[] = [];
+		const api = createAgentApi(fakeClient(calls));
+		await api.getHistoryTargets("source", { beforeSequence: 400, limit: 25 });
+		await api.switchHistory({
+			sessionId: "source",
+			leafId: "finish",
+			sourceEntryId: "user-401",
+			expectedActiveLeafId: "active",
+			expectedTranscriptRevision: 7,
+		});
+		expect(calls).toEqual([
+			{
+				method: "history.targets",
+				params: { session_id: "source", before_sequence: 400, limit: 25 },
+			},
+			{
+				method: "history.switch",
+				params: {
+					session_id: "source",
+					leaf_id: "finish",
+					source_entry_id: "user-401",
+					expected_active_leaf_id: "active",
+					expected_transcript_revision: 7,
+					active_branch_entry_ids: undefined,
+					return_active_branch: undefined,
+					missing_body_ids: undefined,
+				},
+			},
+		]);
+	});
+
 });
 
 describe("AgentApi history fork wire format", () => {

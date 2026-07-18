@@ -88,7 +88,6 @@ export const Composer = memo(function Composer({
 	stopping,
 	queuedInputs,
 	mutationBlockedReason,
-	cachedHistoryAvailable = false,
 	newSessionSetupGeneration = 0,
 	onSubmit,
 	onStop,
@@ -105,7 +104,6 @@ export const Composer = memo(function Composer({
 	stopping: boolean;
 	queuedInputs: QueuedInput[];
 	mutationBlockedReason?: string | null;
-	cachedHistoryAvailable?: boolean;
 	newSessionSetupGeneration?: number;
 	onSubmit: (submission: ComposerSubmission) => Promise<boolean> | boolean;
 	onStop: () => void;
@@ -277,7 +275,7 @@ export const Composer = memo(function Composer({
 		if (
 			!text ||
 			sending ||
-			(mutationBlockedReason && composerTextNeedsConnection(text, { cachedHistoryAvailable }))
+			(mutationBlockedReason && composerTextNeedsConnection(text))
 		) {
 			return;
 		}
@@ -317,7 +315,7 @@ export const Composer = memo(function Composer({
 		} else {
 			restoreSubmittedDraft(submittedSessionId, text, submittedVersion);
 		}
-	}, [cachedHistoryAvailable, clearSubmittedDraft, mutationBlockedReason, newSessionSetupGeneration, onSubmit, restoreSubmittedDraft, sending, storeDraft]);
+	}, [clearSubmittedDraft, mutationBlockedReason, newSessionSetupGeneration, onSubmit, restoreSubmittedDraft, sending, storeDraft]);
 
 	const onKeyDown = useCallback(
 		(event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -362,7 +360,6 @@ export const Composer = memo(function Composer({
 				visible={slashState.visible}
 				selectedIndex={slashIndex}
 				mutationBlockedReason={mutationBlockedReason}
-				cachedHistoryAvailable={cachedHistoryAvailable}
 				onSetIndex={setSlashIndex}
 				onSelect={(command) => setDraftValue(`/${command.name} `)}
 			/>
@@ -410,7 +407,7 @@ export const Composer = memo(function Composer({
 				disabled={
 					sending ||
 					!draft.trim() ||
-					(!!mutationBlockedReason && composerTextNeedsConnection(draft, { cachedHistoryAvailable }))
+					(!!mutationBlockedReason && composerTextNeedsConnection(draft))
 				}
 				aria-busy={sending}
 				title="send (Cmd+Enter)"
@@ -641,7 +638,6 @@ export function SlashMenu({
 	visible,
 	selectedIndex,
 	mutationBlockedReason,
-	cachedHistoryAvailable = false,
 	onSetIndex,
 	onSelect
 }: {
@@ -649,7 +645,6 @@ export function SlashMenu({
 	visible: boolean;
 	selectedIndex: number;
 	mutationBlockedReason?: string | null;
-	cachedHistoryAvailable?: boolean;
 	onSetIndex: (index: number) => void;
 	onSelect: (command: SlashCommandInfo) => void;
 }) {
@@ -657,10 +652,7 @@ export function SlashMenu({
 	return (
 		<div className="slash-menu" role="listbox" aria-label="slash commands">
 			{commands.map((command, index) => {
-				const connectionRequired = composerTextNeedsConnection(
-					`/${command.name}`,
-					{ cachedHistoryAvailable },
-				);
+				const connectionRequired = composerTextNeedsConnection(`/${command.name}`);
 				return (
 				<button
 					type="button"
