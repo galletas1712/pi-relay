@@ -112,6 +112,28 @@ text_enum! {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryTargetRecord {
+    pub entry_id: String,
+    pub target_leaf_id: Option<String>,
+    pub timestamp_ms: u64,
+    pub turn_id: Option<i64>,
+    pub is_on_active_branch: bool,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryTargetsResult {
+    pub session_id: String,
+    pub active_leaf_id: Option<String>,
+    pub session_revision: i64,
+    pub transcript_revision: i64,
+    pub before_sequence: Option<i64>,
+    pub next_before_sequence: Option<i64>,
+    pub has_more: bool,
+    pub targets: Vec<HistoryTargetRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpSessionManifestBinding {
     pub manifest_fingerprint: String,
@@ -871,6 +893,7 @@ pub struct SwitchActiveLeafResult {
 #[derive(Debug, Clone, Copy)]
 pub struct HistoryTarget<'a> {
     pub leaf_id: Option<&'a str>,
+    pub source_entry_id: Option<&'a str>,
     pub expected_active_leaf_id: Option<Option<&'a str>>,
     pub expected_transcript_revision: Option<i64>,
     pub expected_active_branch_entry_ids: Option<&'a [String]>,

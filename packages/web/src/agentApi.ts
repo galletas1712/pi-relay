@@ -11,6 +11,7 @@ import type {
 	ContentBlock,
 	SystemPromptResponse,
 	EventFrame,
+	HistoryTargetsResult,
 	HistoryTree,
 	InputPriority,
 	Project,
@@ -71,6 +72,7 @@ export interface AgentApi {
 	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse>;
 	getTranscriptIndex(sessionId: string, options?: TranscriptIndexOptions): Promise<TranscriptTreeIndex>;
 	getTranscriptEntries(sessionId: string, entryIds: string[]): Promise<TranscriptEntriesResult>;
+	getHistoryTargets(sessionId: string, options?: HistoryTargetsOptions): Promise<HistoryTargetsResult>;
 	getTranscriptTurns(sessionId: string, options?: TranscriptTurnsOptions): Promise<TranscriptTurnsResult>;
 	getTranscriptTurnDetail(sessionId: string, request: TranscriptTurnDetailRequest): Promise<TranscriptTurnDetailResult>;
 	getHistoryTree(sessionId: string): Promise<HistoryTree>;
@@ -93,10 +95,16 @@ export interface AgentApi {
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
 }
 
+export interface HistoryTargetsOptions {
+	beforeSequence?: number | null;
+	limit?: number | null;
+}
+
 function historyTargetPayload(params: HistoryTargetParams) {
 	return {
 		session_id: params.sessionId,
 		leaf_id: params.leafId,
+		source_entry_id: params.sourceEntryId,
 		expected_active_leaf_id: params.expectedActiveLeafId,
 		expected_transcript_revision: params.expectedTranscriptRevision ?? undefined,
 		active_branch_entry_ids: params.activeBranchEntryIds,
@@ -327,6 +335,7 @@ export interface ConfigureSessionResult {
 interface HistoryTargetParams {
 	sessionId: string;
 	leafId: string | null;
+	sourceEntryId?: string;
 	expectedActiveLeafId?: string | null;
 	expectedTranscriptRevision?: number | null;
 	activeBranchEntryIds?: string[];
@@ -365,6 +374,14 @@ class AgentApiClient implements AgentApi {
 
 	connect(): Promise<void> {
 		return this.client.connect();
+	}
+
+	getHistoryTargets(sessionId: string, options: HistoryTargetsOptions = {}): Promise<HistoryTargetsResult> {
+		return this.client.request<HistoryTargetsResult>("history.targets", {
+			session_id: sessionId,
+			before_sequence: options.beforeSequence ?? undefined,
+			limit: options.limit ?? undefined
+		});
 	}
 
 	getMcpInventory(provider: string): Promise<McpInventory> {

@@ -1,262 +1,62 @@
 import { describe, expect, it } from "vitest";
-import {
-	branchEntriesFor,
-	historySwitchOptions,
-	historySwitchOptionsFromNodes,
-	nodeBranchIds,
-	historyTreeRows
-} from "../src/historyTargets.ts";
-import type { TranscriptEntry, TranscriptTreeNode } from "../src/types.ts";
+import { branchEntriesFor } from "../src/historyTargets.ts";
+import type { TranscriptEntry } from "../src/types.ts";
 
-const baseTime = Date.UTC(2026, 0, 1, 12, 0, 0);
-
-function entry(id: string, parent_id: string | null, item: TranscriptEntry["item"], offset = 0): TranscriptEntry {
+function entry(
+	id: string,
+	parent_id: string | null,
+	item: TranscriptEntry["item"],
+): TranscriptEntry {
 	return {
 		id,
 		parent_id,
-		timestamp_ms: baseTime + offset,
-		item
+		timestamp_ms: 1,
+		item,
 	};
-}
-
-function compactedFixtureEntries(): TranscriptEntry[] {
-	return [
-		...fixtureEntries(),
-		entry(
-			"compact1",
-			null,
-			{
-				type: "compaction_summary",
-				source_session_id: "session1",
-				source_leaf_id: "finish2",
-				summary: "first question and second question were answered",
-				tokens_before: 1200,
-				last_turn_id: 2
-			},
-			9
-		),
-		entry("start3", "compact1", { type: "turn_started", turn_id: 3 }, 10),
-		entry("user3", "start3", { type: "user_message", content: [{ type: "text", text: "after compaction" }] }, 11),
-		entry("finish3", "user3", { type: "turn_finished", turn_id: 3, outcome: "Graceful" }, 12)
-	];
 }
 
 function fixtureEntries(): TranscriptEntry[] {
 	return [
 		entry("start1", null, { type: "turn_started", turn_id: 1 }),
-		entry("user1", "start1", { type: "user_message", content: [{ type: "text", text: "first question" }] }, 1),
-		entry("assistant1", "user1", { type: "assistant_message", items: [{ type: "text", text: "first answer" }] }, 2),
-		entry("finish1", "assistant1", { type: "turn_finished", turn_id: 1, outcome: "Graceful" }, 3),
-		entry("start2", "finish1", { type: "turn_started", turn_id: 2 }, 4),
-		entry("user2", "start2", { type: "user_message", content: [{ type: "text", text: "second question" }] }, 5),
-		entry("assistant2", "user2", {
-			type: "assistant_message",
-			items: [{ type: "tool_call", id: "tool1", tool_name: "bash", args_json: "{\"command\":\"echo hi\"}" }]
-		}, 6),
-		entry("finish2", "assistant2", { type: "turn_finished", turn_id: 2, outcome: "Graceful" }, 7),
-		entry("sibling", "finish1", { type: "user_message", content: [{ type: "text", text: "alternate branch" }] }, 8)
+		entry("finish1", "start1", { type: "turn_finished", turn_id: 1, outcome: "Graceful" }),
+		entry("start2", "finish1", { type: "turn_started", turn_id: 2 }),
+		entry("finish2", "start2", { type: "turn_finished", turn_id: 2, outcome: "Graceful" }),
+		entry("sibling", "finish1", { type: "user_message", content: [] }),
+		entry("compact1", null, {
+			type: "compaction_summary",
+			source_session_id: "session1",
+			source_leaf_id: "finish2",
+			summary: "summary",
+			tokens_before: 1200,
+			last_turn_id: 2,
+		}),
+		entry("finish3", "compact1", { type: "turn_finished", turn_id: 3, outcome: "Graceful" }),
 	];
 }
 
 describe("branchEntriesFor", () => {
-	it("returns the ancestry for a selected leaf without siblings", () => {
+	it("returns the selected ancestry without siblings", () => {
 		expect(branchEntriesFor(fixtureEntries(), "finish2").map((item) => item.id)).toEqual([
 			"start1",
-			"user1",
-			"assistant1",
 			"finish1",
 			"start2",
-			"user2",
-			"assistant2",
-			"finish2"
+			"finish2",
 		]);
-	});
-
-	it("returns the ancestry for sibling branch leaves", () => {
 		expect(branchEntriesFor(fixtureEntries(), "sibling").map((item) => item.id)).toEqual([
 			"start1",
-			"user1",
-			"assistant1",
 			"finish1",
-			"sibling"
+			"sibling",
 		]);
 	});
 
 	it("uses compaction source leaves as display parents", () => {
-		expect(branchEntriesFor(compactedFixtureEntries(), "compact1").map((item) => item.id)).toEqual([
+		expect(branchEntriesFor(fixtureEntries(), "finish3").map((item) => item.id)).toEqual([
 			"start1",
-			"user1",
-			"assistant1",
 			"finish1",
 			"start2",
-			"user2",
-			"assistant2",
-			"finish2",
-			"compact1"
-		]);
-		expect(branchEntriesFor(compactedFixtureEntries(), "finish3").map((item) => item.id)).toEqual([
-			"start1",
-			"user1",
-			"assistant1",
-			"finish1",
-			"start2",
-			"user2",
-			"assistant2",
 			"finish2",
 			"compact1",
-			"start3",
-			"user3",
-			"finish3"
-		]);
-	});
-
-});
-
-function node(
-	id: string,
-	parent_id: string | null,
-	sequence: number,
-	item_type: TranscriptTreeNode["item_type"],
-	source_leaf_id: string | null = null
-): TranscriptTreeNode {
-	return {
-		id,
-		parent_id,
-		source_leaf_id,
-		timestamp_ms: baseTime + sequence,
-		sequence,
-		item_type,
-		turn_id: item_type === "turn_finished" || item_type === "compaction_summary" ? sequence : null,
-		outcome: item_type === "turn_finished" ? "Graceful" : null,
-		can_switch_to: item_type === "turn_finished" || item_type === "compaction_summary",
-		edit_target_leaf_id: null,
-		display_hint: id
-	};
-}
-
-describe("nodeBranchIds", () => {
-	it("uses compact tree-node source leaves as display parents", () => {
-		const nodes: TranscriptTreeNode[] = [
-			node("start1", null, 1, "turn_started"),
-			node("finish1", "start1", 2, "turn_finished"),
-			node("compact1", null, 3, "compaction_summary", "finish1"),
-			node("finish2", "compact1", 4, "turn_finished")
-		];
-
-		expect(nodeBranchIds(nodes, "finish2")).toEqual(["start1", "finish1", "compact1", "finish2"]);
-	});
-});
-
-describe("historySwitchOptions", () => {
-	it("offers user edits, completed turns, and compaction roots inside the current session forest", () => {
-		const options = historySwitchOptions(compactedFixtureEntries(), "compact1");
-
-		expect(options.map((option) => option.id)).toEqual([
 			"finish3",
-			"user3",
-			"compact1",
-			"sibling",
-			"finish2",
-			"user2",
-			"finish1",
-			"user1"
-		]);
-		expect(options.find((option) => option.id === "compact1")).toMatchObject({
-			actionLeafId: "compact1",
-			sourceEntryId: "compact1",
-			title: "Compacted history",
-			turnLabel: "c2",
-			isActive: true
-		});
-		expect(options.find((option) => option.id === "user3")).toMatchObject({
-			actionLeafId: "compact1",
-			restoreText: "after compaction",
-			title: "User message",
-			turnLabel: "u3",
-			meta: expect.stringContaining("edit ·"),
-			isActive: false
-		});
-		expect(options.find((option) => option.id === "user1")).toMatchObject({
-			actionLeafId: null,
-			restoreText: "first question",
-			turnLabel: "u1"
-		});
-		expect(options.some((option) => option.id === "assistant2")).toBe(false);
-	});
-
-	it("preserves non-graceful turn outcomes on switch targets", () => {
-		const entries = fixtureEntries().map((item) =>
-			item.id === "finish2"
-				? entry(item.id, item.parent_id, { type: "turn_finished", turn_id: 2, outcome: "Crashed" }, 7)
-				: item
-		);
-		const options = historySwitchOptions(entries, "finish2");
-
-		expect(options.find((option) => option.id === "finish2")).toMatchObject({
-			outcome: "Crashed",
-			isActive: true
-		});
-	});
-});
-
-describe("historySwitchOptionsFromNodes", () => {
-	it("uses compact user-message text only as a display preview, never restore text", () => {
-		const fullText = "x".repeat(180);
-		const nodes: TranscriptTreeNode[] = [
-			node("start1", null, 1, "turn_started"),
-			node("user1", "start1", 2, "user_message"),
-			node("finish1", "user1", 3, "turn_finished")
-		];
-		nodes[1] = { ...nodes[1], display_hint: fullText };
-
-		const options = historySwitchOptionsFromNodes(nodes, "finish1");
-		const userOption = options.find((option) => option.id === "user1");
-
-		expect(userOption).toMatchObject({
-			id: "user1",
-			restoreEntryId: "user1",
-			title: "User message"
-		});
-		expect(userOption?.preview).toHaveLength(96);
-		expect(userOption?.preview).not.toBe(fullText);
-		expect(userOption?.restoreText).toBeUndefined();
-	});
-});
-
-describe("historyTreeRows", () => {
-	it("renders sibling branches with active-path metadata", () => {
-		const rows = historyTreeRows(fixtureEntries(), "finish2");
-
-		expect(rows.map((row) => [row.entry.id, row.depth, row.isOnActivePath])).toEqual([
-			["start1", 0, true],
-			["user1", 0, true],
-			["assistant1", 0, true],
-			["finish1", 0, true],
-			["start2", 0, true],
-			["user2", 0, true],
-			["assistant2", 0, true],
-			["finish2", 0, true],
-			["sibling", 1, false]
-		]);
-	});
-
-	it("renders compaction roots as continuations of their source branch", () => {
-		const rows = historyTreeRows(compactedFixtureEntries(), "finish3");
-
-		expect(rows.map((row) => [row.entry.id, row.depth, row.isOnActivePath])).toEqual([
-			["start1", 0, true],
-			["user1", 0, true],
-			["assistant1", 0, true],
-			["finish1", 0, true],
-			["start2", 0, true],
-			["user2", 0, true],
-			["assistant2", 0, true],
-			["finish2", 0, true],
-			["compact1", 0, true],
-			["start3", 0, true],
-			["user3", 0, true],
-			["finish3", 0, true],
-			["sibling", 1, false]
 		]);
 	});
 });

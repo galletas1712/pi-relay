@@ -30,8 +30,11 @@ import {
 	ConnectionRetryController,
 	remoteActionBlockedReason,
 } from "./connectionRecovery.tsx";
-import { CompactHistoryPickerDialog } from "./historyPickerCompact.tsx";
-import { type HistoryTargetOption } from "./historyTargets.ts";
+import {
+	HistoryTargetPickerDialog,
+	historyTargetOptions,
+	type HistoryTargetOption,
+} from "./historyPickerCompact.tsx";
 import { ExportDialog } from "./exportDialog.tsx";
 import { buildCachedExportBlocks, type ExportBlock } from "./exportTranscript.ts";
 import {
@@ -80,11 +83,9 @@ import {
 	applySelectedSnapshot,
 	applySwitchResultToCache,
 	applyTranscriptAppendedEvent,
-	applyTreeIndex,
 	applyTranscriptTurns,
 	applyTurnDetail,
 	activeBranchEntriesForExport,
-	branchFromTree,
 	emptySelectedSessionCache,
 	hasUsableSelectedSessionCache,
 	mergeSessionActivityEvent,
@@ -94,7 +95,6 @@ import {
 	commitSelectedSessionRefresh,
 	selectedEntries,
 	snapshotWithTranscriptTurnsMetadata,
-	treeNodesInOrder,
 	turnCardsInOrder,
 	turnDetailEntries,
 	type SelectedSessionCache,
@@ -189,7 +189,6 @@ import type {
 	SessionSummary,
 	ToolListing,
 	TranscriptEntry,
-	TranscriptTreeNode,
 	TranscriptTurnsResult,
 } from "./types.ts";
 
@@ -203,7 +202,6 @@ const FOREGROUND_RECONCILE_THROTTLE_MS = 2000;
 const FOREGROUND_RECONNECT_AFTER_MS = 5000;
 const AWAKE_HEARTBEAT_MS = 1000;
 const DELETED_EVENT_UNSUBSCRIBE_RETRY_DELAYS_MS = [250, 750] as const;
-const TRANSCRIPT_INDEX_PAGE_SIZE = 5000;
 const TRANSCRIPT_TURN_PAGE_SIZE = 50;
 const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
 const SIDEBAR_CLOSE_BEFORE_SELECT_MS = 200;
@@ -269,12 +267,15 @@ type ExportDialogState = {
 };
 
 type HistoryDialogState = {
+	generation: number;
 	sessionId: string;
 	mode: "fork" | "switch";
-	nodes: TranscriptTreeNode[];
-	activeLeafId: string | null;
-	loading?: boolean;
-	error?: string | null;
+	targets: HistoryTargetOption[];
+	nextBeforeSequence: number | null;
+	hasMore: boolean;
+	loading: boolean;
+	submitting: boolean;
+	error: string | null;
 };
 
 type DeleteDialogState = {
@@ -442,17 +443,6 @@ function subagentStatusNeedsWarm(status: DelegationSubagent["status"], activity?
 	return activity === "running" || activity === "queued" || status === "running" || status === "queued";
 }
 
-function hasCanonicalCachedHistory(cache: SelectedSessionCache, sessionId: string | null): boolean {
-	return (
-		!!sessionId &&
-		cache.sessionId === sessionId &&
-		!!cache.snapshot &&
-		cache.treeComplete &&
-		cache.treeActiveLeafId === (cache.snapshot.active_leaf_id ?? null) &&
-		cache.treeTranscriptRevision === (cache.snapshot.transcript_revision ?? null)
-	);
-}
-
 function LoadingConversation() {
 	const [dotCount, setDotCount] = useState(1);
 
@@ -547,6 +537,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [showAllDelegations, setShowAllDelegations] = useState(false);
 	const [backgroundWarmRevision, setBackgroundWarmRevision] = useState(0);
 	const [historyDialog, setHistoryDialog] = useState<HistoryDialogState | null>(null);
+	const nextHistoryDialogGenerationRef = useRef(0);
+	const historySubmittingGenerationRef = useRef<number | null>(null);
 	const [exportDialog, setExportDialog] = useState<ExportDialogState | null>(null);
 	const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
 	const [renameValue, setRenameValue] = useState("");
@@ -741,7 +733,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		[api, clearDeletedEventSessionTombstone],
 	);
 	const connectionRemoteActionBlockedReason = remoteActionBlockedReason(connection);
-	const cachedHistoryAvailable = hasCanonicalCachedHistory(selectedCache, selectedId);
 	const assertServerMutationAllowed = useCallback(() => {
 		assertRemoteActionAllowed(remoteActionBlockedReason(connectionRef.current));
 	}, []);
@@ -2876,65 +2867,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		// cursor mismatch as a durable selected-session refresh trigger.
 	}, [loadedSnapshot, mergeSnapshotIntoKnownSessionLists]);
 
-	const ensureTreeIndex = useCallback(
-		async (
-			sessionId: string,
-			options: {
-				forceRestart?: boolean;
-				onPage?: (nodes: TranscriptTreeNode[], complete: boolean) => void;
-			} = {},
-		): Promise<TranscriptTreeNode[]> => {
-			const forceRestart = options.forceRestart ?? false;
-			const initialCache = selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current : emptySelectedSessionCache(sessionId);
-			const snapshotRevision = initialCache.snapshot?.transcript_revision ?? null;
-			const initialNodes = treeNodesInOrder(initialCache);
-			if (
-				!forceRestart &&
-				initialCache.treeComplete &&
-				(snapshotRevision === null || initialCache.treeTranscriptRevision === null || initialCache.treeTranscriptRevision === snapshotRevision)
-			) {
-				return initialNodes;
-			}
-			let afterSequence =
-				!forceRestart && (initialCache.treeTranscriptRevision === snapshotRevision || snapshotRevision === null)
-					? initialCache.treeLoadedPrefixSequence
-					: 0;
-			let complete = false;
-			let nodes = afterSequence > 0 ? initialNodes : [];
-			if (nodes.length > 0) options.onPage?.(nodes, false);
-			while (!complete && selectedRef.current === sessionId) {
-				assertServerReadAllowed();
-				const shouldLogPerf = perfEnabled();
-				const startedAt = perfNow();
-				if (shouldLogPerf) perfLog("transcript.index start", { sessionId, afterSequence });
-				const index = await api.getTranscriptIndex(sessionId, {
-					afterSequence,
-					limit: TRANSCRIPT_INDEX_PAGE_SIZE,
-				});
-				if (shouldLogPerf) {
-					perfLog("transcript.index end", {
-						sessionId,
-						nodes: index.nodes.length,
-						approxBytes: approximateJsonSize(index),
-						rpcMs: Math.round(perfNow() - startedAt),
-						complete: index.complete,
-					});
-				}
-				if (selectedRef.current !== sessionId) break;
-				const nextCache = updateSelectedCache((current) => {
-					const base = current.sessionId === sessionId ? current : emptySelectedSessionCache(sessionId);
-					return applyTreeIndex(base, index);
-				});
-				nodes = treeNodesInOrder(nextCache);
-				afterSequence = nextCache.treeLoadedPrefixSequence;
-				complete = nextCache.treeComplete;
-				options.onPage?.(nodes, complete);
-			}
-			return nodes;
-		},
-		[api, assertServerReadAllowed],
-	);
-
 	useEffect(() => {
 		if (connection !== "open") return;
 		const selectedHasEventCursor =
@@ -3427,11 +3359,23 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 
 	const refreshStaleHistoryTargets = useCallback(
-		async (sessionId: string, mode: "fork" | "switch"): Promise<never> => {
-			await ensureTreeIndex(sessionId, { forceRestart: true });
+		async (sessionId: string, mode: "fork" | "switch", generation: number): Promise<never> => {
+			const page = await api.getHistoryTargets(sessionId);
+			setHistoryDialog((current) => current?.generation === generation ? {
+				...current,
+				targets: historyTargetOptions(page),
+				nextBeforeSequence: page.next_before_sequence,
+				hasMore: page.has_more,
+				loading: false,
+				submitting: false,
+				error: null,
+			} : current);
+			if (historySubmittingGenerationRef.current === generation) {
+				historySubmittingGenerationRef.current = null;
+			}
 			throw new Error(`history changed; refreshed the ${mode} list, please choose again`);
 		},
-		[ensureTreeIndex],
+		[api],
 	);
 
 	const prepareHistoryTarget = useCallback(
@@ -3449,10 +3393,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (snapshot.activity !== "idle") {
 				throw new Error(`stop the active turn before ${mode === "fork" ? "forking" : "switching"} history`);
 			}
-			const activeBranchEntryIds = branchFromTree(targetCache, target.actionLeafId).map((node) => node.id);
-			if (target.actionLeafId && !activeBranchEntryIds.includes(target.actionLeafId)) {
-				throw new Error(`history index is still loading; please wait for the ${mode} list to finish`);
-			}
 			const restoreText = await restoreTextForTarget(
 				api,
 				sessionId,
@@ -3467,10 +3407,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				request: {
 					sessionId,
 					leafId: target.actionLeafId,
-					expectedActiveLeafId: target.expectedActiveLeafId ?? snapshot.active_leaf_id ?? null,
-					expectedTranscriptRevision:
-						targetCache.treeTranscriptRevision ?? snapshot.transcript_revision ?? null,
-					activeBranchEntryIds,
+					sourceEntryId: target.sourceEntryId,
+					expectedActiveLeafId: target.expectedActiveLeafId,
+					expectedTranscriptRevision: target.expectedTranscriptRevision,
 				},
 			};
 		},
@@ -3484,6 +3423,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			snapshot: SessionSnapshot,
 			targetCache: SelectedSessionCache,
 			target: HistoryTargetOption,
+			dialogGeneration: number,
 		) => {
 			const prepared = await prepareHistoryTarget(
 				sessionId,
@@ -3500,9 +3440,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				});
 			} catch (error) {
 				if (isHistoryChangedError(error)) {
-					await refreshStaleHistoryTargets(sessionId, "switch");
+					await refreshStaleHistoryTargets(sessionId, "switch", dialogGeneration);
 				}
 				throw error;
+			}
+			setHistoryDialog((current) => current?.generation === dialogGeneration ? null : current);
+			if (historySubmittingGenerationRef.current === dialogGeneration) {
+				historySubmittingGenerationRef.current = null;
 			}
 			if (selectedRef.current !== sessionId) {
 				invalidateSessionList(projectId);
@@ -3558,6 +3502,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			snapshot: SessionSnapshot,
 			targetCache: SelectedSessionCache,
 			target: HistoryTargetOption,
+			dialogGeneration: number,
 		) => {
 			const prepared = await prepareHistoryTarget(
 				sessionId,
@@ -3571,7 +3516,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				result = await api.forkHistory(prepared.request);
 			} catch (error) {
 				if (isHistoryChangedError(error)) {
-					await refreshStaleHistoryTargets(sessionId, "fork");
+					await refreshStaleHistoryTargets(sessionId, "fork", dialogGeneration);
 				}
 				throw error;
 			}
@@ -3582,6 +3527,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				);
 			}
 			invalidateSessionList(projectId);
+			setHistoryDialog((current) => current?.generation === dialogGeneration ? null : current);
+			if (historySubmittingGenerationRef.current === dialogGeneration) {
+				historySubmittingGenerationRef.current = null;
+			}
 			if (selectedRef.current !== sessionId) return;
 			dropSelectedCache(result.session_id);
 			openRootConversation(projectId, result.session_id);
@@ -3599,7 +3548,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const handleHistoryTarget = useCallback(
 		(target: HistoryTargetOption) => {
 			const dialog = historyDialog;
-			if (!dialog) return;
+			if (!dialog || dialog.submitting || historySubmittingGenerationRef.current !== null) return;
 			try {
 				assertServerMutationAllowed();
 			} catch (error) {
@@ -3614,15 +3563,52 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				return;
 			}
 			const projectId = snapshot.project_id;
-			setHistoryDialog(null);
+			historySubmittingGenerationRef.current = dialog.generation;
+			setHistoryDialog((current) => current?.generation === dialog.generation
+				? { ...current, submitting: true, error: null }
+				: current);
 			const operation = dialog.mode === "fork" ? forkFromTarget : switchToTarget;
-			void operation(sessionId, projectId, snapshot, targetCache, target)
+			void operation(sessionId, projectId, snapshot, targetCache, target, dialog.generation)
 				.catch((error) => {
+					if (historySubmittingGenerationRef.current === dialog.generation) {
+						historySubmittingGenerationRef.current = null;
+					}
+					setHistoryDialog((current) => current?.generation === dialog.generation
+						? { ...current, submitting: false }
+						: current);
 					reportActionError(error);
 				});
 		},
 		[assertServerMutationAllowed, forkFromTarget, getSelectedCache, historyDialog, pushErrorNotice, reportActionError, switchToTarget],
 	);
+
+	const loadOlderHistoryTargets = useCallback(() => {
+		const dialog = historyDialog;
+		if (!dialog?.hasMore || dialog.loading || dialog.submitting || dialog.nextBeforeSequence === null) return;
+		const { generation, nextBeforeSequence } = dialog;
+		setHistoryDialog((current) => current?.generation === generation ? { ...current, loading: true, error: null } : current);
+		void api.getHistoryTargets(dialog.sessionId, { beforeSequence: nextBeforeSequence })
+			.then((page) => {
+				setHistoryDialog((current) => {
+					if (!current || current.generation !== generation || current.nextBeforeSequence !== nextBeforeSequence) return current;
+					return {
+						...current,
+						targets: [
+							...current.targets,
+							...historyTargetOptions(page),
+						],
+						nextBeforeSequence: page.next_before_sequence,
+						hasMore: page.has_more,
+						loading: false,
+					};
+				});
+			})
+			.catch((error) => {
+				setHistoryDialog((current) => current?.generation === generation && current.nextBeforeSequence === nextBeforeSequence
+					? { ...current, loading: false, error: errorMessage(error) }
+					: current);
+			});
+	}, [api, historyDialog]);
 
 	const promoteQueuedInput = useCallback(
 		async (inputId: string) => {
@@ -3750,6 +3736,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 
 	const openHistoryDialog = useCallback(
 		(snapshot: SessionSnapshot, mode: "fork" | "switch") => {
+			if (historySubmittingGenerationRef.current !== null) return;
 			if (snapshot.activity !== "idle") {
 				throw new Error(`stop the active turn before ${mode === "fork" ? "forking" : "switching"} history`);
 			}
@@ -3757,43 +3744,28 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				throw new Error("wait for running delegations to finish before changing history");
 			}
 			const sessionId = snapshot.session_id;
-			const cache = selectedCacheRef.current;
-			const treeRevisionMatches =
-				snapshot.transcript_revision === undefined ||
-				cache.treeTranscriptRevision === null ||
-				cache.treeTranscriptRevision === snapshot.transcript_revision;
-			const cachedNodes = cache.sessionId === sessionId && treeRevisionMatches ? treeNodesInOrder(cache) : [];
-			const treeComplete = cache.sessionId === sessionId && treeRevisionMatches && cache.treeComplete;
+			const generation = ++nextHistoryDialogGenerationRef.current;
 			setHistoryDialog({
+				generation,
 				sessionId,
 				mode,
-				nodes: treeComplete || connectionRef.current !== "open" ? cachedNodes : [],
-				activeLeafId: snapshot.active_leaf_id,
-				loading: !treeComplete && connectionRef.current === "open",
+				targets: [],
+				nextBeforeSequence: null,
+				hasMore: false,
+				loading: connectionRef.current === "open",
+				submitting: false,
 				error: null,
 			});
 			if (connectionRef.current !== "open") return;
-			void ensureTreeIndex(sessionId, {
-				onPage: (nodes, complete) => {
+			void api.getHistoryTargets(sessionId)
+				.then((page) => {
 					setHistoryDialog((current) => {
-						if (!current || current.sessionId !== sessionId) return current;
+						if (!current || current.generation !== generation) return current;
 						return {
 							...current,
-							nodes: complete ? nodes : [],
-							activeLeafId: selectedCacheRef.current.treeActiveLeafId ?? snapshot.active_leaf_id,
-							loading: !complete,
-							error: null,
-						};
-					});
-				},
-			})
-				.then((nodes) => {
-					setHistoryDialog((current) => {
-						if (!current || current.sessionId !== sessionId) return current;
-						return {
-							...current,
-							nodes,
-							activeLeafId: selectedCacheRef.current.treeActiveLeafId ?? current.activeLeafId,
+							targets: historyTargetOptions(page),
+							nextBeforeSequence: page.next_before_sequence,
+							hasMore: page.has_more,
 							loading: false,
 							error: null,
 						};
@@ -3801,7 +3773,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				})
 				.catch((error) => {
 					setHistoryDialog((current) => {
-						if (!current || current.sessionId !== sessionId) return current;
+						if (!current || current.generation !== generation) return current;
 						return {
 							...current,
 							loading: false,
@@ -3810,7 +3782,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					});
 				});
 		},
-		[ensureTreeIndex, hasRunningDelegations],
+		[api, hasRunningDelegations],
 	);
 
 	const executeSlash = useCallback(
@@ -3874,12 +3846,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				if (name === "fork" && submittedSnapshot.project_id === null) {
 					throw new Error("/fork requires a managed project session");
 				}
-				if (
-					connectionRef.current !== "open" &&
-					!hasCanonicalCachedHistory(selectedCacheRef.current, sessionId)
-				) {
-					throw new Error("load session history before inspecting it offline");
-				}
+				assertConnectionReadAllowed();
 				openHistoryDialog(submittedSnapshot, name);
 				return;
 			}
@@ -3912,7 +3879,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[api, assertServerMutationAllowed, assertServerReadAllowed, commitSelectedSnapshot, openHistoryDialog, queryClient],
+		[api, assertConnectionReadAllowed, assertServerMutationAllowed, assertServerReadAllowed, commitSelectedSnapshot, openHistoryDialog, queryClient],
 	);
 
 	const submitComposer = useCallback(
@@ -3920,7 +3887,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (!submission.text.trim() || sending) return false;
 			if (
 				connectionRemoteActionBlockedReason &&
-				composerTextNeedsConnection(submission.text, { cachedHistoryAvailable })
+				composerTextNeedsConnection(submission.text)
 			) {
 				return false;
 			}
@@ -3945,7 +3912,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				setSending(false);
 			}
 		},
-		[api, assertServerMutationAllowed, cachedHistoryAvailable, connectionRemoteActionBlockedReason, executeSlash, getSelectedCache, pushErrorNotice, queueUserInput, sending, startNewSession],
+		[api, assertServerMutationAllowed, connectionRemoteActionBlockedReason, executeSlash, getSelectedCache, pushErrorNotice, queueUserInput, sending, startNewSession],
 	);
 
 	const canStop = !!selectedId && loadedSnapshot?.activity === "running";
@@ -4573,7 +4540,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						stopping={stopping}
 						queuedInputs={queuedInputs}
 						mutationBlockedReason={connectionRemoteActionBlockedReason}
-						cachedHistoryAvailable={cachedHistoryAvailable}
 						newSessionSetupGeneration={newSessionSetupGeneration}
 						onSubmit={submitComposer}
 						onStop={handleStop}
@@ -4695,13 +4661,17 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			) : null}
 
 			{historyDialog ? (
-				<CompactHistoryPickerDialog
-					nodes={historyDialog.nodes}
-					activeLeafId={historyDialog.activeLeafId}
+				<HistoryTargetPickerDialog
+					targets={historyDialog.targets}
 					mode={historyDialog.mode}
 					loading={historyDialog.loading}
+					submitting={historyDialog.submitting}
 					error={historyDialog.error}
-					onClose={() => setHistoryDialog(null)}
+					hasMore={historyDialog.hasMore}
+					onLoadMore={loadOlderHistoryTargets}
+					onClose={() => {
+						if (historySubmittingGenerationRef.current === null) setHistoryDialog(null);
+					}}
 					onSelect={handleHistoryTarget}
 					mutationBlockedReason={connectionRemoteActionBlockedReason}
 					returnFocusFallbackRef={composerDialogReturnFocusRef}
@@ -4808,7 +4778,6 @@ async function restoreTextForTarget(
 	updateSelectedCache: (updater: (current: SelectedSessionCache) => SelectedSessionCache) => SelectedSessionCache,
 	assertServerReadAllowed: () => void,
 ): Promise<string | null> {
-	if (!target.restoreEntryId) return target.restoreText ?? null;
 	const cached = targetCache.entriesById.get(target.restoreEntryId);
 	if (cached?.item.type === "user_message") return contentBlocksToText(cached.item.content);
 	assertServerReadAllowed();

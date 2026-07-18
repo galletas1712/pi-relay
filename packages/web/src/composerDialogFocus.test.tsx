@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { useMemo, useRef, useState, type RefObject } from "react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { Composer, type ComposerHandle } from "./composer.tsx";
-import { CompactHistoryPickerDialog } from "./historyPickerCompact.tsx";
+import { HistoryTargetPickerDialog } from "./historyPickerCompact.tsx";
 
 beforeAll(() => {
 	class ResizeObserver {
@@ -76,9 +76,14 @@ function ComposerDialogHarness() {
 				onMoveQueued={() => undefined}
 			/>
 			{open ? (
-				<CompactHistoryPickerDialog
-					nodes={[]}
-					activeLeafId={null}
+				<HistoryTargetPickerDialog
+					targets={[]}
+					mode="switch"
+					loading={false}
+					submitting={false}
+					error={null}
+					hasMore={false}
+					onLoadMore={() => undefined}
 					onClose={() => setOpen(false)}
 					onSelect={() => undefined}
 					returnFocusFallbackRef={returnFocusFallbackRef}

@@ -114,6 +114,7 @@ async fn create_fork_copies_full_forest_and_replay_without_mutating_source() {
             config: &child_config,
             target: HistoryTarget {
                 leaf_id: Some("compaction"),
+                source_entry_id: None,
                 expected_active_leaf_id: Some(Some("sibling-finish")),
                 expected_transcript_revision: Some(revision),
                 expected_active_branch_entry_ids: Some(&target_branch_ids),
@@ -348,6 +349,188 @@ async fn fork(
 }
 
 #[tokio::test]
+async fn history_targets_page_newest_users_with_safe_bounded_previews() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(project_id, "history targets test", &[], json!({}))
+        .await
+        .expect("project creates");
+    create_session(store, project_id, "target-source", false).await;
+    let huge_text = "x".repeat(50_000);
+    let entries = vec![
+        entry(
+            "start-1",
+            None,
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+        ),
+        entry(
+            "user-root",
+            Some("start-1"),
+            TranscriptItem::UserMessage(UserMessage::text("oldest")),
+        ),
+        entry(
+            "finish-1",
+            Some("user-root"),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+        ),
+        entry(
+            "start-2",
+            Some("finish-1"),
+            TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+        ),
+        entry(
+            "user-ordinary",
+            Some("start-2"),
+            TranscriptItem::UserMessage(UserMessage::text(&huge_text)),
+        ),
+        entry(
+            "assistant-huge",
+            Some("user-ordinary"),
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("y".repeat(100_000))],
+            }),
+        ),
+        entry(
+            "finish-2",
+            Some("assistant-huge"),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(2),
+                outcome: TurnOutcome::Graceful,
+            },
+        ),
+        compaction_summary("compaction", "target-source", "finish-2"),
+        entry(
+            "start-3",
+            Some("compaction"),
+            TranscriptItem::TurnStarted { turn_id: TurnId(3) },
+        ),
+        entry(
+            "user-after-compaction",
+            Some("start-3"),
+            TranscriptItem::UserMessage(UserMessage::text("newest")),
+        ),
+    ];
+    store
+        .persist_outputs(
+            "target-source",
+            OutputBatch::new(&entries, Some("user-after-compaction"), &[], &[]),
+        )
+        .await
+        .expect("history persists");
+
+    let newest = store
+        .history_targets("target-source", None, Some(2))
+        .await
+        .expect("newest page loads");
+    assert!(newest.has_more);
+    assert_eq!(newest.targets.len(), 2);
+    assert_eq!(
+        newest
+            .targets
+            .iter()
+            .map(|target| (
+                target.entry_id.as_str(),
+                target.target_leaf_id.as_deref(),
+                target.preview.len(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("user-after-compaction", Some("compaction"), 6),
+            ("user-ordinary", Some("finish-1"), 160),
+        ]
+    );
+    assert!(newest
+        .targets
+        .iter()
+        .all(|target| !target.preview.contains('y')));
+
+    let older = store
+        .history_targets("target-source", newest.next_before_sequence, Some(2))
+        .await
+        .expect("older page loads");
+    assert!(!older.has_more);
+    assert_eq!(
+        older
+            .targets
+            .iter()
+            .map(|target| (target.entry_id.as_str(), target.target_leaf_id.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![("user-root", None)]
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn capped_history_target_ancestry_is_omitted_and_rejected() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(project_id, "capped history target test", &[], json!({}))
+        .await
+        .expect("project creates");
+    let config = create_session(store, project_id, "capped-source", false).await;
+    sqlx::query(
+        r#"
+        insert into transcript_entries (
+            session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id
+        )
+        select
+            'capped-source',
+            'deep-' || depth,
+            case when depth = 10000 then null else 'deep-' || (depth + 1) end,
+            depth,
+            case
+                when depth = 0 then '{"type":"user_message","content":[{"type":"text","text":"too deep"}]}'::jsonb
+                else '{"type":"daemon_observation","text":"ancestor"}'::jsonb
+            end,
+            '[]'::jsonb,
+            null
+        from generate_series(0, 10000) as ancestry(depth)
+        "#,
+    )
+    .execute(&store.pool)
+    .await
+    .expect("deep ancestry inserts");
+
+    let page = store
+        .history_targets("capped-source", None, None)
+        .await
+        .expect("history targets load");
+    assert!(page.targets.is_empty());
+
+    let target = HistoryTarget {
+        leaf_id: None,
+        source_entry_id: Some("deep-0"),
+        expected_active_leaf_id: None,
+        expected_transcript_revision: None,
+        expected_active_branch_entry_ids: None,
+    };
+    let switch_error = switch(store, "capped-source", target)
+        .await
+        .expect_err("capped ancestry cannot validate as root");
+    let fork_error = fork(store, "capped-source", "capped-child", &config, target)
+        .await
+        .expect_err("capped ancestry cannot fork from root");
+    assert!(switch_error.downcast_ref::<HistoryChanged>().is_some());
+    assert!(fork_error.downcast_ref::<HistoryChanged>().is_some());
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn switch_and_fork_share_history_target_validation() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -368,6 +551,7 @@ async fn switch_and_fork_share_history_target_validation() {
         .transcript_revision;
     let root_target = HistoryTarget {
         leaf_id: None,
+        source_entry_id: None,
         expected_active_leaf_id: Some(None),
         expected_transcript_revision: Some(root_revision),
         expected_active_branch_entry_ids: Some(&[]),
@@ -386,6 +570,37 @@ async fn switch_and_fork_share_history_target_validation() {
         .expect("root switch succeeds");
 
     let boundary_config = create_session(store, project_id, "boundary-source", true).await;
+    store
+        .persist_outputs(
+            "boundary-source",
+            OutputBatch::new(
+                &[
+                    entry(
+                        "start-2",
+                        Some("finish"),
+                        TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+                    ),
+                    entry(
+                        "user-2",
+                        Some("start-2"),
+                        TranscriptItem::UserMessage(UserMessage::text("again")),
+                    ),
+                    entry(
+                        "finish-2",
+                        Some("user-2"),
+                        TranscriptItem::TurnFinished {
+                            turn_id: TurnId(2),
+                            outcome: TurnOutcome::Graceful,
+                        },
+                    ),
+                ],
+                Some("finish-2"),
+                &[],
+                &[],
+            ),
+        )
+        .await
+        .expect("second turn persists");
     let snapshot = store
         .session_snapshot("boundary-source")
         .await
@@ -397,7 +612,8 @@ async fn switch_and_fork_share_history_target_validation() {
     ];
     let boundary_target = HistoryTarget {
         leaf_id: Some("finish"),
-        expected_active_leaf_id: Some(Some("finish")),
+        source_entry_id: Some("user-2"),
+        expected_active_leaf_id: Some(Some("finish-2")),
         expected_transcript_revision: Some(snapshot.transcript_revision),
         expected_active_branch_entry_ids: Some(&branch_ids),
     };
@@ -419,6 +635,7 @@ async fn switch_and_fork_share_history_target_validation() {
             "mid-turn",
             HistoryTarget {
                 leaf_id: Some("user"),
+                source_entry_id: None,
                 expected_active_leaf_id: None,
                 expected_transcript_revision: None,
                 expected_active_branch_entry_ids: None,
@@ -426,9 +643,32 @@ async fn switch_and_fork_share_history_target_validation() {
             "boundary",
         ),
         (
+            "missing-boundary",
+            HistoryTarget {
+                leaf_id: Some("missing"),
+                source_entry_id: None,
+                expected_active_leaf_id: None,
+                expected_transcript_revision: None,
+                expected_active_branch_entry_ids: None,
+            },
+            "boundary",
+        ),
+        (
+            "stale-source-entry",
+            HistoryTarget {
+                leaf_id: Some("finish"),
+                source_entry_id: Some("user"),
+                expected_active_leaf_id: None,
+                expected_transcript_revision: None,
+                expected_active_branch_entry_ids: None,
+            },
+            "history",
+        ),
+        (
             "stale-active",
             HistoryTarget {
                 leaf_id: Some("finish"),
+                source_entry_id: None,
                 expected_active_leaf_id: Some(None),
                 expected_transcript_revision: None,
                 expected_active_branch_entry_ids: None,
@@ -439,6 +679,7 @@ async fn switch_and_fork_share_history_target_validation() {
             "stale-revision",
             HistoryTarget {
                 leaf_id: Some("finish"),
+                source_entry_id: None,
                 expected_active_leaf_id: None,
                 expected_transcript_revision: Some(snapshot.transcript_revision + 1),
                 expected_active_branch_entry_ids: None,
@@ -449,6 +690,7 @@ async fn switch_and_fork_share_history_target_validation() {
             "stale-branch",
             HistoryTarget {
                 leaf_id: Some("finish"),
+                source_entry_id: None,
                 expected_active_leaf_id: None,
                 expected_transcript_revision: None,
                 expected_active_branch_entry_ids: Some(&["start".to_string()]),
@@ -459,6 +701,7 @@ async fn switch_and_fork_share_history_target_validation() {
             "explicit-empty-branch",
             HistoryTarget {
                 leaf_id: Some("finish"),
+                source_entry_id: None,
                 expected_active_leaf_id: None,
                 expected_transcript_revision: None,
                 expected_active_branch_entry_ids: Some(&[]),
@@ -516,6 +759,7 @@ async fn switch_and_fork_share_history_target_validation() {
         .expect("input queues");
     let busy_target = HistoryTarget {
         leaf_id: Some("finish"),
+        source_entry_id: None,
         expected_active_leaf_id: None,
         expected_transcript_revision: None,
         expected_active_branch_entry_ids: None,
@@ -546,6 +790,7 @@ async fn switch_and_fork_share_history_target_validation() {
         .expect("running delegation creates");
     let delegation_target = HistoryTarget {
         leaf_id: None,
+        source_entry_id: None,
         expected_active_leaf_id: None,
         expected_transcript_revision: None,
         expected_active_branch_entry_ids: None,

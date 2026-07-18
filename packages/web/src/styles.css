@@ -2616,12 +2616,7 @@ pre {
 	padding: 8px;
 }
 
-.history-options.tree {
-	padding: 6px;
-}
-
-.history-target-list,
-.history-branch-list {
+.history-target-list {
 	margin: 0;
 	padding: 0;
 	list-style: none;
@@ -2657,95 +2652,6 @@ pre {
 	color: var(--muted-foreground);
 }
 
-.history-tree-item {
-	position: relative;
-}
-
-.history-tree-item.on-active-path .history-option.tree-row {
-	background: color-mix(in oklch, var(--accent) 55%, transparent);
-}
-
-.history-tree-item.collapsed .history-option.tree-row {
-	border: 1px dashed var(--border);
-}
-
-.history-tree-item.turn-crashed .history-option.tree-row,
-.history-tree-item.turn-interrupted .history-option.tree-row {
-	border: 1px solid color-mix(in oklch, var(--destructive) 52%, var(--border));
-	background: color-mix(in oklch, var(--destructive) 10%, transparent);
-}
-
-.history-tree-item.turn-crashed.on-active-path .history-option.tree-row,
-.history-tree-item.turn-interrupted.on-active-path .history-option.tree-row {
-	background: color-mix(in oklch, var(--destructive) 16%, var(--accent));
-}
-
-.history-tree-item.turn-crashed .history-option-icon,
-.history-tree-item.turn-interrupted .history-option-icon {
-	border-color: color-mix(in oklch, var(--destructive) 60%, var(--border));
-	color: var(--destructive);
-}
-
-.branch-toggle {
-	position: absolute;
-	top: 50%;
-	left: calc(var(--tree-depth, 0) * 18px + 2px);
-	z-index: 1;
-	display: inline-flex;
-	width: 20px;
-	height: 20px;
-	align-items: center;
-	justify-content: center;
-	border: 1px solid var(--border);
-	border-radius: 999px;
-	background: var(--card);
-	color: var(--muted-foreground);
-	padding: 0;
-	transform: translateY(-50%) rotate(90deg);
-	cursor: pointer;
-}
-
-.branch-toggle[aria-expanded="false"] {
-	transform: translateY(-50%);
-}
-
-.branch-toggle:hover {
-	background: var(--accent);
-	color: var(--accent-foreground);
-}
-
-.history-option.tree-row {
-	position: relative;
-	grid-template-columns: calc(var(--tree-depth, 0) * 18px + 24px) 42px minmax(0, 1fr) auto;
-	min-height: 54px;
-	padding: 7px 10px 7px 6px;
-}
-
-.tree-guides {
-	position: relative;
-	align-self: stretch;
-}
-
-.tree-guides::before {
-	content: "";
-	position: absolute;
-	top: -8px;
-	bottom: -8px;
-	left: calc(max(var(--tree-depth, 0), 1) * 18px - 16px);
-	border-left: 1px solid var(--border);
-	opacity: calc(min(var(--tree-depth, 0), 1));
-}
-
-.tree-guides::after {
-	content: "";
-	position: absolute;
-	top: 50%;
-	left: calc(max(var(--tree-depth, 0), 1) * 18px - 16px);
-	width: 14px;
-	border-top: 1px solid var(--border);
-	opacity: calc(min(var(--tree-depth, 0), 1));
-}
-
 .history-option-icon {
 	display: inline-flex;
 	width: 42px;
@@ -2756,10 +2662,6 @@ pre {
 	border-radius: var(--radius-sm);
 	font-size: var(--text-xs);
 	color: var(--muted-foreground);
-}
-
-.history-option-icon.root {
-	border-style: dashed;
 }
 
 .history-option-main {
@@ -2779,8 +2681,7 @@ pre {
 }
 
 .history-option-title,
-.history-option-meta,
-.history-badge {
+.history-option-meta {
 	min-width: 0;
 }
 
@@ -2800,25 +2701,6 @@ pre {
 	font-size: var(--text-2xs);
 	white-space: nowrap;
 	font-variant-numeric: tabular-nums;
-}
-
-.history-badge {
-	border: 1px solid var(--border);
-	border-radius: var(--radius-sm);
-	padding: 1px 6px;
-	font-size: var(--text-2xs);
-	font-weight: 400;
-	font-family: var(--font-mono);
-	color: var(--muted-foreground);
-}
-
-.history-badge.muted {
-	border-style: dashed;
-}
-
-.history-badge.danger {
-	border-color: color-mix(in oklch, var(--destructive) 55%, var(--border));
-	color: var(--destructive);
 }
 
 .history-empty {
@@ -4699,49 +4581,6 @@ pre {
 
 	.history-options {
 		padding: 6px;
-	}
-
-	.history-option.tree-row {
-		grid-template-columns: minmax(0, 1fr);
-		gap: 5px;
-		min-height: 0;
-		padding: 9px;
-		padding-left: calc(9px + var(--tree-depth, 0) * 10px);
-	}
-
-	.tree-guides {
-		display: none;
-	}
-
-	.history-tree-item {
-		display: grid;
-		grid-template-columns: 44px minmax(0, 1fr);
-		align-items: center;
-		gap: 6px;
-	}
-
-	.history-tree-item .history-option.tree-row {
-		grid-column: 2;
-	}
-
-	.history-tree-item > .history-branch-list {
-		grid-column: 1 / -1;
-	}
-
-	.branch-toggle {
-		position: static;
-		grid-column: 1;
-		grid-row: 1;
-		display: inline-flex;
-		width: 44px;
-		height: 44px;
-		align-self: center;
-		justify-self: start;
-		transform: rotate(90deg);
-	}
-
-	.branch-toggle[aria-expanded="false"] {
-		transform: none;
 	}
 
 	.history-option-icon {

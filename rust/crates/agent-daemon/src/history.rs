@@ -20,6 +20,31 @@ enum RequiredNullableString {
     Null(()),
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryTargetsParams {
+    pub(crate) session_id: String,
+    pub(crate) before_sequence: Option<i64>,
+    pub(crate) limit: Option<i64>,
+}
+
+pub(crate) fn parse_history_targets(params: Value) -> Result<HistoryTargetsParams, RpcError> {
+    let params: HistoryTargetsParams = from_params(params)?;
+    if matches!(params.before_sequence, Some(..=0)) {
+        return Err(RpcError::new(
+            "invalid_params",
+            "before_sequence must be positive",
+        ));
+    }
+    if !matches!(params.limit, None | Some(1..=200)) {
+        return Err(RpcError::new(
+            "invalid_params",
+            "limit must be between 1 and 200",
+        ));
+    }
+    Ok(params)
+}
+
 impl RequiredNullableString {
     fn into_option(self) -> Option<String> {
         match self {
@@ -33,6 +58,8 @@ impl RequiredNullableString {
 struct HistoryTargetParams {
     session_id: String,
     leaf_id: RequiredNullableString,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    source_entry_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_nullable")]
     expected_active_leaf_id: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_present")]
@@ -53,6 +80,7 @@ struct SwitchOnlyParams {
 pub(crate) struct ParsedHistoryTarget {
     pub(crate) session_id: String,
     pub(crate) leaf_id: Option<String>,
+    pub(crate) source_entry_id: Option<String>,
     pub(crate) expected_active_leaf_id: Option<Option<String>>,
     pub(crate) expected_transcript_revision: Option<i64>,
     pub(crate) active_branch_entry_ids: Option<Vec<String>>,
@@ -62,6 +90,7 @@ impl ParsedHistoryTarget {
     pub(crate) fn as_store_target(&self) -> HistoryTarget<'_> {
         HistoryTarget {
             leaf_id: self.leaf_id.as_deref(),
+            source_entry_id: self.source_entry_id.as_deref(),
             expected_active_leaf_id: self
                 .expected_active_leaf_id
                 .as_ref()
@@ -82,6 +111,7 @@ pub(crate) fn parse_history_target(
     const COMMON_FIELDS: &[&str] = &[
         "session_id",
         "leaf_id",
+        "source_entry_id",
         "expected_active_leaf_id",
         "expected_transcript_revision",
         "active_branch_entry_ids",
@@ -100,6 +130,7 @@ pub(crate) fn parse_history_target(
     Ok(ParsedHistoryTarget {
         session_id: params.session_id,
         leaf_id: params.leaf_id.into_option(),
+        source_entry_id: params.source_entry_id,
         expected_active_leaf_id: params.expected_active_leaf_id,
         expected_transcript_revision: params.expected_transcript_revision,
         active_branch_entry_ids: params.active_branch_entry_ids,

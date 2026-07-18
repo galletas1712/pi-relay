@@ -87,23 +87,21 @@ virtualization):
 
 ### 3. Newest-first `/switch` targets
 
-What exists: `/switch` pages the compact topology via `transcript.index` with an
-`afterSequence` cursor (oldest → newest) and waits for `treeComplete` before
-showing targets, then derives targets client-side. Restore text already comes
-from the full entry body, never the truncated preview.
+What exists: `/switch` and `/fork` page daemon-projected user-message targets via
+`history.targets` newest first. Each target includes its safe preceding boundary,
+and restore text comes from the full entry body rather than the truncated preview.
 
-Gap: recent, most-useful switch/edit rows arrive last because paging runs from
-the oldest entry forward, so the dialog blocks on a full topology load.
+The previous oldest-first `transcript.index` picker blocked on loading the full
+topology before recent messages became available.
 
-Proposed change:
+Landed behavior:
 
 - Add a `history.targets(session_id, limit, before_sequence?)` RPC returning the
   newest switch/edit targets first. Each target carries `restore_entry_id`,
   display-only preview text, and the validation data `history.switch` needs
   (`expected_active_leaf_id`, `transcript_revision`, boundary/edit validity). No
   raw provider replay on the wire.
-- `/switch` opens from a fresh cached target page, otherwise fetches the first
-  newest page and pages older targets on demand.
+- `/switch` fetches the first newest page and pages older targets on demand.
 - `history.switch` stays authoritative for switchability; restore text continues
   to fetch the full user-message body, never the preview.
 

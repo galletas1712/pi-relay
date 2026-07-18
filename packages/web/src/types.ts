@@ -15,6 +15,26 @@ export interface ProviderConfig {
 	prompt_cache?: Record<string, unknown>;
 }
 
+export interface HistoryTarget {
+	entry_id: string;
+	target_leaf_id: string | null;
+	timestamp_ms: number;
+	turn_id: number | null;
+	is_on_active_branch: boolean;
+	preview: string;
+}
+
+export interface HistoryTargetsResult {
+	session_id: string;
+	active_leaf_id: string | null;
+	session_revision: number;
+	transcript_revision: number;
+	before_sequence: number | null;
+	next_before_sequence: number | null;
+	has_more: boolean;
+	targets: HistoryTarget[];
+}
+
 export interface ProjectWorkspace {
 	kind?: "git" | "local";
 	workspace_dir: string;

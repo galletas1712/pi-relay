@@ -1,7 +1,36 @@
 use serde_json::json;
 
-use super::{parse_history_target, SwitchOnlyParams};
+use super::{parse_history_target, parse_history_targets, SwitchOnlyParams};
 use crate::codec::from_params;
+
+#[test]
+fn history_targets_parser_is_strict_and_bounded() {
+    let valid = parse_history_targets(json!({
+        "session_id": "s1",
+        "before_sequence": 42,
+        "limit": 200,
+    }))
+    .expect("valid params");
+    assert_eq!(valid.session_id, "s1");
+    assert_eq!(valid.before_sequence, Some(42));
+    assert_eq!(valid.limit, Some(200));
+
+    for malformed in [
+        json!({"session_id": "s1", "before_sequence": "42"}),
+        json!({"session_id": "s1", "before_sequence": 0}),
+        json!({"session_id": "s1", "limit": "50"}),
+        json!({"session_id": "s1", "limit": 0}),
+        json!({"session_id": "s1", "limit": 201}),
+        json!({"session_id": "s1", "extra": true}),
+    ] {
+        assert_eq!(
+            parse_history_targets(malformed)
+                .expect_err("malformed params must fail")
+                .code,
+            "invalid_params"
+        );
+    }
+}
 
 #[test]
 fn switch_and_fork_reject_malformed_shared_targets() {
@@ -32,6 +61,11 @@ fn switch_and_fork_reject_malformed_shared_targets() {
             "session_id": "s1",
             "leaf_id": null,
             "active_branch_entry_ids": null,
+        }),
+        json!({
+            "session_id": "s1",
+            "leaf_id": null,
+            "source_entry_id": 7,
         }),
         json!({
             "session_id": "s1",
@@ -99,6 +133,7 @@ fn target_parser_preserves_missing_and_explicit_empty_fences() {
         &json!({
             "session_id": "s1",
             "leaf_id": null,
+            "source_entry_id": "user-1",
             "expected_active_leaf_id": null,
             "active_branch_entry_ids": [],
         }),
@@ -109,5 +144,6 @@ fn target_parser_preserves_missing_and_explicit_empty_fences() {
     assert_eq!(omitted.expected_active_leaf_id, None);
     assert_eq!(omitted.active_branch_entry_ids, None);
     assert_eq!(explicit.expected_active_leaf_id, Some(None));
+    assert_eq!(explicit.source_entry_id.as_deref(), Some("user-1"));
     assert_eq!(explicit.active_branch_entry_ids, Some(Vec::new()));
 }

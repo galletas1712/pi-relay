@@ -101,8 +101,8 @@ bounded `transcript.turns` tail page.
 | Load older turns | `transcript.turns` with `before_entry_id` | prepend-paged on demand |
 | Expand a turn | `transcript.turn_detail` | one card's entries, by card id + leaf/sequence bounds |
 | Foreground/focus reconcile | `session.sync_active_branch` | suffix-only sync from the cached base leaf |
-| `/switch` picker | `transcript.index` pages | compact topology only |
-| `/fork` picker | `transcript.index` pages | same targets as switch; managed projects only |
+| `/switch` picker | `history.targets` pages | newest editable user-message targets first |
+| `/fork` picker | `history.targets` pages | same targets as switch; managed projects only |
 | Switch target | `history.switch` | revision-fenced; returns branch ids + sparse missing bodies |
 | Fork target | `history.fork` | revision-fenced; clones the current idle workspace |
 | Restore user message | `transcript.entries` | full body for the picked message, only if missing locally |
@@ -514,8 +514,8 @@ records are added to the database and there is no model-picker RPC.
 
 - Every cache reducer is keyed by `session_id` and no-ops on mismatch; stale async responses for a deselected session are
   safely ignored.
-- Compact topology from events is conservative: an event `tree_node` extends the tree only when it is already complete;
-  otherwise topology recovery is left to `transcript.index` so `/switch` stays correct without re-deriving Rust
+- Compact topology from events is conservative: an event `tree_node` extends the tree only when it is already complete.
+  The `/switch` and `/fork` pickers use daemon-projected `history.targets` rows so they do not re-derive Rust
   turn-boundary logic in TypeScript.
 - The selected cache is tab-lifetime only; there is no IndexedDB or persistent transcript cache.
 - `/switch` previews and compact `display_hint` text may be truncated; mutation/restore content always comes from full
