@@ -27,6 +27,8 @@ describe("MCP picker layout", () => {
 		expect(disclosureFocusRule).toContain("outline: 2px solid var(--ring)");
 		expect(disclosureFocusRule).toContain("outline-offset: -3px");
 		expect(css).toContain(".new-session-setup-section + .new-session-setup-section");
+		expect(css).not.toContain(".setup-disclosure-copy");
+		expect(css).not.toContain(".setup-disclosure-description");
 		expect(css).not.toMatch(/\.mcp-picker-list\s*\{[^}]*max-height/);
 		expect(css).not.toMatch(/\.workspace-scope-list\s*\{[^}]*max-height/);
 		expect(css).toMatch(

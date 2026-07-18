@@ -63,11 +63,7 @@ export function NewSessionSetup({
 		<div className="new-session-setup" data-slot="new-session-setup">
 			<div className="new-session-setup-inner">
 				<header className="new-session-setup-header">
-					<p>New session</p>
-					<h1>Choose what this session can access</h1>
-					<span>
-						Review its local context and optional remote tools. Your first message starts the session.
-					</span>
+					<h1>New session</h1>
 				</header>
 				{showWorkspaceSection || showMcpSection ? (
 					<div className="new-session-setup-manifest">
@@ -85,18 +81,16 @@ export function NewSessionSetup({
 									<>
 										<div className="new-session-setup-static-header">
 											<FolderTree size={18} aria-hidden />
-											<div>
-												<h2>Workspaces</h2>
-												<p>Choose which project folders this session includes as local context.</p>
-											</div>
+											<h2>Workspaces</h2>
 										</div>
 										{workspaceConfiguration.status === "loading" ? (
 											<p className="new-session-setup-status" role="status">
-												Loading project workspaces…
+												Loading workspaces…
 											</p>
 										) : (
 											<p className="new-session-setup-error">
-												Workspace configuration unavailable. Retry from the Projects panel.
+												<span>Workspaces unavailable</span>
+												<span>Retry in Projects</span>
 											</p>
 										)}
 									</>
@@ -135,14 +129,11 @@ export function NewSessionSetup({
 									<>
 										<div className="new-session-setup-static-header">
 											<Plug size={18} aria-hidden />
-											<div>
-												<h2>MCP tools</h2>
-												<p>Choose optional remote capabilities for every agent in this session.</p>
-											</div>
+											<h2>MCP tools</h2>
 										</div>
 										{mcpLoading ? (
 											<p className="new-session-setup-status" role="status">
-												Loading daemon-configured MCP servers…
+												Loading MCP tools…
 											</p>
 										) : null}
 									</>
@@ -154,12 +145,12 @@ export function NewSessionSetup({
 								) : null}
 								{!mcpError && !mcpLoading && !mcpConfigurationReady ? (
 									<p className="new-session-setup-status" role="status">
-										{mcpAuthMutationBlockedReason ?? "Waiting for MCP configuration…"}
+										{mcpAuthMutationBlockedReason ?? "Loading MCP tools…"}
 									</p>
 								) : null}
 								{mcpError ? (
 									<div className="new-session-setup-error" role="alert">
-										<span>MCP tools unavailable. You can start without them.</span>
+										<span>MCP tools unavailable</span>
 										<button type="button" onClick={onRetryMcp} disabled={disabled || mcpLoading}>
 											Retry
 										</button>
@@ -170,8 +161,7 @@ export function NewSessionSetup({
 					</div>
 				) : (
 					<div className="new-session-setup-empty">
-						<h2>No optional context configured</h2>
-						<p>Write your first message below to start a session with only the host environment.</p>
+						<h2>Host context only</h2>
 					</div>
 				)}
 			</div>

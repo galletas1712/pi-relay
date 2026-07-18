@@ -65,15 +65,17 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 		expect(markup).toContain("1 tool selected");
-		expect(markup).toContain("Adds about 12 context tokens");
+		expect(markup).toContain("About 12 context tokens");
 		expect(markup).toContain('aria-expanded="false"');
 		expect(markup).not.toContain("aria-controls");
 		expect(markup).not.toContain("mcp-picker-list");
 		expect(markup).not.toContain('aria-checked="mixed"');
 		expect(markup).not.toContain("workspace");
-		expect(markup).toContain("Every full and read-only subagent inherits these tools");
-		expect(markup).toContain("Read-only limits local files only");
-		expect(markup).toContain("MCP tools can affect remote systems");
+		expect(markup).toContain("<dt>Scope</dt><dd>All agents</dd>");
+		expect(markup).toContain("<dt>Risk</dt><dd>Remote side effects</dd>");
+		expect(markup).not.toContain("Every full and read-only subagent inherits these tools");
+		expect(markup).not.toContain("Choose optional remote capabilities");
+		expect(markup).not.toContain("setup-disclosure-description");
 		expect(markup).not.toContain("·");
 		expect(markup).not.toContain("≈");
 	});
@@ -120,7 +122,7 @@ describe("McpToolPicker", () => {
 		const status = screen.getByRole("status");
 		expect(toggle.querySelector("[aria-live]")).toBeNull();
 		expect(toggle.contains(status)).toBe(false);
-		expect(status.textContent).toBe("MCP tool selection: No remote tools will be added.");
+		expect(status.textContent).toBe("MCP tool selection: No tools selected.");
 
 		rerender(
 			<McpToolPicker
@@ -130,7 +132,7 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 		expect(screen.getByRole("status").textContent).toBe(
-			"MCP tool selection: 1 tool selected. Adds about 12 context tokens.",
+			"MCP tool selection: 1 tool selected. About 12 context tokens.",
 		);
 	});
 
@@ -146,7 +148,7 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 		expect(markup).toContain("1 tool selected");
-		expect(markup).toContain("MCP tools can affect remote systems");
+		expect(markup).toContain("Remote side effects");
 		expect(markup).not.toContain("mcp-picker-list");
 	});
 
@@ -168,14 +170,14 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 		expect(markup).toContain("empty");
-		expect(markup).toContain("No remote tools will be added");
+		expect(markup).toContain("No tools selected");
 		expect(markup).toContain("No tools available");
 		expect(markup).not.toContain("0 selected");
 		expect(markup).not.toContain("0/0");
 		expect(markup).not.toContain("·");
 		expect(markup).not.toContain("≈");
 		expect(markup).not.toContain('type="checkbox"');
-		expect(markup).not.toContain("MCP tools can affect remote systems");
+		expect(markup).not.toContain("Remote side effects");
 	});
 
 	it("cannot interactively select a healthy zero-tool server", async () => {
@@ -240,9 +242,9 @@ describe("McpToolPicker", () => {
 		expect(screen.getByText("1 tool selected")).toBeTruthy();
 		expect(screen.queryByText("All 1 tool selected")).toBeNull();
 		expect(screen.getByText("All 2 tools selected")).toBeTruthy();
-		expect(screen.getAllByText("Adds about 1 context token").length).toBeGreaterThan(0);
+		expect(screen.getAllByText("About 1 context token").length).toBeGreaterThan(0);
 		expect(screen.getByRole("status").textContent).toBe(
-			"MCP tool selection: 3 tools selected. Adds about 6 context tokens.",
+			"MCP tool selection: 3 tools selected. About 6 context tokens.",
 		);
 	});
 
@@ -268,12 +270,12 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 
-		expect(screen.getAllByText("Adds about 1 context token")).toHaveLength(2);
+		expect(screen.getAllByText("About 1 context token")).toHaveLength(2);
 		expect(screen.getByRole("status").textContent).toBe(
-			"MCP tool selection: 1 tool selected. Adds about 1 context token.",
+			"MCP tool selection: 1 tool selected. About 1 context token.",
 		);
 		await userEvent.click(screen.getByRole("button", { name: "expand tokens tools" }));
-		expect(screen.getByText("About 1 context token")).toBeTruthy();
+		expect(screen.getAllByText("About 1 context token")).toHaveLength(3);
 		expect(screen.getByText("About 2 context tokens")).toBeTruthy();
 		expect(screen.queryByText(/1 context tokens/)).toBeNull();
 	});
@@ -328,7 +330,45 @@ describe("McpToolPicker", () => {
 		expect(screen.getByText("OAuth unsupported")).toBeTruthy();
 		expect(screen.getByText("OAuth unknown")).toBeTruthy();
 		expect(screen.getByText("OAuth discovery failed")).toBeTruthy();
-		expect(screen.getByText(/cancel it and start again/)).toBeTruthy();
+		expect(screen.getByText("Authorization pending")).toBeTruthy();
+		expect(screen.getByText("After reload")).toBeTruthy();
+		expect(screen.getByText("Cancel and restart")).toBeTruthy();
+	});
+
+	it("keeps pending authorization metadata native and announces it from a separate hidden status", () => {
+		const { container } = render(
+			<McpToolPicker
+				inventory={{ revision: "", servers: [] }}
+				selection={new Map()}
+				onChange={() => {}}
+				authStatus={[oauthStatus("authorization_pending")]}
+				open
+			/>,
+		);
+
+		const metadata = container.querySelector<HTMLElement>(".mcp-picker-pending");
+		expect(metadata?.tagName).toBe("DL");
+		expect(metadata?.hasAttribute("role")).toBe(false);
+		expect(container.querySelector("dl[role]")).toBeNull();
+		expect([...metadata!.querySelectorAll("dt")].map((term) => term.textContent)).toEqual([
+			"Status",
+			"After reload",
+		]);
+		expect([...metadata!.querySelectorAll("dd")].map((description) => description.textContent)).toEqual([
+			"Authorization pending",
+			"Cancel and restart",
+		]);
+
+		const liveStatus = [...container.querySelectorAll<HTMLElement>(".sr-only[role='status']")]
+			.find((status) =>
+				status.textContent?.trim() ===
+				"MCP authorization pending. After page reload, cancel and restart."
+			);
+		expect(liveStatus).toBeTruthy();
+		expect(liveStatus?.getAttribute("aria-live")).toBe("polite");
+		expect(liveStatus?.getAttribute("aria-atomic")).toBe("true");
+		expect(metadata?.contains(liveStatus!)).toBe(false);
+		expect(metadata?.nextElementSibling).toBe(liveStatus);
 	});
 
 	it("renders daemon-advertised actions, including both recovery actions", () => {

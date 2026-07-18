@@ -22,6 +22,7 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 	if (!scope.length) return null;
 
 	const panelId = `${idPrefix}-workspaces-panel`;
+	const minimumId = `${idPrefix}-workspace-minimum`;
 	const includedCount = scope.filter((entry) => entry.included).length;
 	const summary = workspaceSummary(includedCount, scope.length);
 	const setOpen = (nextOpen: boolean) => {
@@ -43,12 +44,7 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 				disabled={disabled}
 			>
 				<FolderTree className="setup-disclosure-icon" size={18} aria-hidden />
-				<span className="setup-disclosure-copy">
-					<span className="setup-disclosure-title">Workspaces</span>
-					<span className="setup-disclosure-description">
-						Choose which project folders this session includes as local context.
-					</span>
-				</span>
+				<span className="setup-disclosure-title">Workspaces</span>
 				<span className="setup-disclosure-summary">
 					{summary}
 				</span>
@@ -61,7 +57,7 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 			</span>
 			{open ? (
 				<div className="workspace-scope-list" id={panelId}>
-					<p className="workspace-scope-help">At least one workspace must remain included.</p>
+					<p className="workspace-scope-help" id={minimumId}>Minimum 1 workspace</p>
 					{scope.map((entry, index) => (
 						<div className="workspace-scope-item" key={entry.workspaceDir}>
 							<label className="workspace-scope-name">
@@ -71,8 +67,11 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 									disabled={disabled || (entry.included && includedCount === 1)}
 									title={
 										entry.included && includedCount === 1
-											? "At least one workspace must remain included"
+											? "Minimum 1 workspace"
 											: undefined
+									}
+									aria-describedby={
+										entry.included && includedCount === 1 ? minimumId : undefined
 									}
 									onChange={(event) => patch(index, { included: event.target.checked })}
 								/>
@@ -103,7 +102,7 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 
 function workspaceSummary(included: number, total: number): string {
 	if (included === total) {
-		return total === 1 ? "The workspace is included" : `All ${total} workspaces included`;
+		return total === 1 ? "1 workspace included" : `All ${total} workspaces included`;
 	}
 	return `${included} of ${total} workspaces included`;
 }

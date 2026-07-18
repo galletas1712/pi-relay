@@ -87,19 +87,14 @@ export const McpToolPicker = memo(function McpToolPicker({
 				disabled={disabled}
 			>
 				<Plug className="setup-disclosure-icon" size={18} aria-hidden />
-				<span className="setup-disclosure-copy">
-					<span className="setup-disclosure-title">MCP tools</span>
-					<span className="setup-disclosure-description">
-						Choose optional remote capabilities for every agent in this session.
-					</span>
-				</span>
+				<span className="setup-disclosure-title">MCP tools</span>
 				<span className="setup-disclosure-summary">
 					{total.tools === 0 ? (
-						<span>No remote tools will be added</span>
+						<span>No tools selected</span>
 					) : (
 						<>
 							<span>{selectedToolsLabel(total.tools)}</span>
-							<span>{addedContextTokensLabel(total.contextTokens)}</span>
+							<span>{contextBudgetLabel(total.contextTokens)}</span>
 						</>
 					)}
 				</span>
@@ -111,9 +106,16 @@ export const McpToolPicker = memo(function McpToolPicker({
 				{selectionStatus}
 			</span>
 			{total.tools > 0 ? (
-				<p className="mcp-picker-warning">
-					Every full and read-only subagent inherits these tools. Read-only limits local files only; MCP tools can affect remote systems.
-				</p>
+				<dl className="mcp-picker-safety" aria-label="MCP tool access">
+					<div>
+						<dt>Scope</dt>
+						<dd>All agents</dd>
+					</div>
+					<div>
+						<dt>Risk</dt>
+						<dd>Remote side effects</dd>
+					</div>
+				</dl>
 			) : null}
 			{open ? (
 				<div className="mcp-picker-list" id={panelId}>
@@ -198,7 +200,7 @@ export const McpToolPicker = memo(function McpToolPicker({
 										{selectedCount > 0 ? (
 											<>
 												<span>{serverSelectionLabel(selectedCount, server.tools.length)}</span>
-												<span>{addedContextTokensLabel(contextTokens)}</span>
+												<span>{contextBudgetLabel(contextTokens)}</span>
 											</>
 										) : (
 											<span>{availableToolsLabel(server.tools.length)}</span>
@@ -271,9 +273,24 @@ export const McpToolPicker = memo(function McpToolPicker({
 									) : null}
 								</div>
 								{auth?.auth_state === "authorization_pending" ? (
-									<p className="mcp-picker-pending" role="status">
-										Authorization is pending. If this page was reloaded, cancel it and start again.
-									</p>
+									<>
+										<dl
+											className="mcp-picker-pending"
+											aria-label="MCP authorization status"
+										>
+											<div>
+												<dt>Status</dt>
+												<dd>Authorization pending</dd>
+											</div>
+											<div>
+												<dt>After reload</dt>
+												<dd>Cancel and restart</dd>
+											</div>
+										</dl>
+										<span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+											MCP authorization pending. After page reload, cancel and restart.
+										</span>
+									</>
 								) : null}
 								{isExpanded && server.tools.length > 0 ? (
 									<div className="mcp-picker-tools" id={toolsPanelId}>
@@ -323,13 +340,13 @@ function contextTokensLabel(count: number): string {
 	return `${count.toLocaleString()} context ${count === 1 ? "token" : "tokens"}`;
 }
 
-function addedContextTokensLabel(count: number): string {
-	return `Adds about ${contextTokensLabel(count)}`;
+function contextBudgetLabel(count: number): string {
+	return `About ${contextTokensLabel(count)}`;
 }
 
 function mcpSelectionStatus(tools: number, contextTokens: number): string {
-	if (tools === 0) return "MCP tool selection: No remote tools will be added.";
-	return `MCP tool selection: ${selectedToolsLabel(tools)}. ${addedContextTokensLabel(contextTokens)}.`;
+	if (tools === 0) return "MCP tool selection: No tools selected.";
+	return `MCP tool selection: ${selectedToolsLabel(tools)}. ${contextBudgetLabel(contextTokens)}.`;
 }
 
 function availableToolsLabel(count: number): string {

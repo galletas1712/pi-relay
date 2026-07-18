@@ -345,7 +345,8 @@ declared workspaces and lets git workspaces start from a non-default branch. It
 feeds `session.start`'s optional `workspaces` array through
 `startWorkspacesFromScope`. It defaults to every workspace at its default
 branch, so that default remains omission/all. The final included workspace
-cannot be unchecked and has accessible explanatory copy; the UI can therefore
+cannot be unchecked and references the visible **Minimum 1 workspace**
+constraint; the UI can therefore
 never report that no workspace is included and accidentally serialize it as
 omission/all.
 Per-project choices persist under `piRelayWorkspaceScope:v1`; stale workspace
@@ -388,12 +389,15 @@ deselection/reselection. The server checkbox is accessible tri-state
 (`indeterminate` plus `aria-checked="mixed"`), and deselecting every tool omits
 that server.
 
-When tools are selected, the collapsed and per-server summaries use complete
-selected-count phrases and show the approximate **context tokens added** as a
-separate phrase, computed from the exact provider declaration JSON. With no
-selection, the summary states that no remote tools will be added and server
-rows report available tools instead of zero-selection statistics. This is not
-total context.
+The setup surface uses one **New session** heading, terse section labels and
+state/count text, and no explanatory section descriptions. When tools are
+selected, the collapsed and per-server summaries use complete selected-count
+phrases and show **About N context tokens** as a separate phrase, computed from
+the exact provider declaration JSON. The visible **Scope / All agents** and
+**Risk / Remote side effects** metadata preserves inheritance and remote-effect
+safety context without prose. With no selection, the summary reads **No tools
+selected**, and server rows report available tools instead of zero-selection
+statistics. This is not total context.
 
 Pure transforms live in `mcpSelection.ts`: deterministic raw-identity payload,
 none/some/all state, all/one toggles, totals, and revision reconciliation.

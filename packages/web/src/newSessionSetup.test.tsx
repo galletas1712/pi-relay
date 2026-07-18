@@ -17,6 +17,10 @@ const WORKSPACE_SCOPE = [
 	{ workspaceDir: "repo", kind: "git" as const, branch: "", included: true },
 	{ workspaceDir: "docs", kind: "local" as const, branch: "", included: true },
 ];
+const FINAL_WORKSPACE_SCOPE = [
+	WORKSPACE_SCOPE[0],
+	{ ...WORKSPACE_SCOPE[1], included: false },
+];
 
 function expectPresentAriaControlsResolve(container: HTMLElement): string[] {
 	const ids = [...container.querySelectorAll<HTMLElement>("[aria-controls]")]
@@ -59,8 +63,8 @@ function setup(
 }
 
 describe("NewSessionSetup readiness", () => {
-	it("describes the first-message flow and summarizes included workspaces naturally", () => {
-		render(setup(
+	it("uses one concise page heading and prose-free disclosure labels", () => {
+		const { container } = render(setup(
 			{ mcpReady: true, mcpAuthStatusReady: true },
 			{
 				status: "ready",
@@ -68,10 +72,13 @@ describe("NewSessionSetup readiness", () => {
 			},
 		));
 
-		expect(screen.getByRole("heading", { name: "Choose what this session can access" })).toBeTruthy();
-		expect(screen.getByText(/Your first message starts the session/)).toBeTruthy();
+		expect(screen.getByRole("heading", { level: 1, name: "New session" })).toBeTruthy();
+		expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
 		const workspaces = screen.getByRole("button", { name: /Workspaces/ });
 		expect(workspaces.textContent).toContain("All 2 workspaces included");
+		expect(workspaces.textContent).not.toContain("Choose which project folders");
+		expect(container.querySelector(".setup-disclosure-description")).toBeNull();
+		expect(screen.queryByText(/Your first message starts the session/)).toBeNull();
 		expect(workspaces.hasAttribute("aria-controls")).toBe(false);
 		expectPresentAriaControlsResolve(document.body);
 	});
@@ -103,6 +110,32 @@ describe("NewSessionSetup readiness", () => {
 		expectPresentAriaControlsResolve(container);
 	});
 
+	it("uses unique in-component visible descriptions for final disabled workspaces", () => {
+		const { container } = render(
+			<>
+				<WorkspaceScopePicker scope={FINAL_WORKSPACE_SCOPE} onChange={() => {}} open />
+				<WorkspaceScopePicker scope={FINAL_WORKSPACE_SCOPE} onChange={() => {}} open />
+			</>,
+		);
+		const pickers = [...container.querySelectorAll<HTMLElement>(".workspace-scope")];
+		const finalWorkspaces = screen.getAllByRole<HTMLInputElement>("checkbox", { name: /repo/ });
+		const descriptionIds = finalWorkspaces.map((checkbox, index) => {
+			expect(checkbox.disabled).toBe(true);
+			const descriptionId = checkbox.getAttribute("aria-describedby");
+			expect(descriptionId).toBeTruthy();
+			const description = document.getElementById(descriptionId!);
+			expect(description?.textContent).toBe("Minimum 1 workspace");
+			expect(description?.classList.contains("workspace-scope-help")).toBe(true);
+			expect(description?.closest(".sr-only")).toBeNull();
+			expect(description?.hasAttribute("hidden")).toBe(false);
+			expect(description?.getAttribute("aria-hidden")).toBeNull();
+			expect(pickers[index].contains(description)).toBe(true);
+			return descriptionId!;
+		});
+
+		expect(new Set(descriptionIds).size).toBe(descriptionIds.length);
+	});
+
 	it("announces complete workspace selection updates outside the disclosure button", async () => {
 		function WorkspaceHarness() {
 			const [scope, setScope] = React.useState(WORKSPACE_SCOPE);
@@ -126,8 +159,8 @@ describe("NewSessionSetup readiness", () => {
 			{ status: "loading" },
 		));
 
-		expect(screen.getByRole("status").textContent).toBe("Loading project workspaces…");
-		expect(screen.queryByRole("heading", { name: "No optional context configured" })).toBeNull();
+		expect(screen.getByRole("status").textContent).toBe("Loading workspaces…");
+		expect(screen.queryByRole("heading", { name: "Host context only" })).toBeNull();
 	});
 
 	it("reports an unavailable selected-project workspace configuration", () => {
@@ -136,8 +169,9 @@ describe("NewSessionSetup readiness", () => {
 			{ status: "unavailable" },
 		));
 
-		expect(screen.getByText("Workspace configuration unavailable. Retry from the Projects panel.")).toBeTruthy();
-		expect(screen.queryByRole("heading", { name: "No optional context configured" })).toBeNull();
+		expect(screen.getByText("Workspaces unavailable")).toBeTruthy();
+		expect(screen.getByText("Retry in Projects")).toBeTruthy();
+		expect(screen.queryByRole("heading", { name: "Host context only" })).toBeNull();
 	});
 
 	it.each([
@@ -147,8 +181,8 @@ describe("NewSessionSetup readiness", () => {
 	])("does not claim optional context is empty before all MCP data is ready", (readiness) => {
 		render(setup(readiness));
 
-		expect(screen.getByRole("status").textContent).toBe("Waiting for MCP configuration…");
-		expect(screen.queryByRole("heading", { name: "No optional context configured" })).toBeNull();
+		expect(screen.getByRole("status").textContent).toBe("Loading MCP tools…");
+		expect(screen.queryByRole("heading", { name: "Host context only" })).toBeNull();
 	});
 
 	it("reports the connection dependency while MCP readiness is unknown", () => {
@@ -159,16 +193,14 @@ describe("NewSessionSetup readiness", () => {
 		}));
 
 		expect(screen.getByRole("status").textContent).toBe("Waiting for connection");
-		expect(screen.queryByRole("heading", { name: "No optional context configured" })).toBeNull();
+		expect(screen.queryByRole("heading", { name: "Host context only" })).toBeNull();
 	});
 
 	it("shows the definitive host empty state after inventory and auth status are ready", () => {
 		render(setup({ mcpReady: true, mcpAuthStatusReady: true }));
 
-		expect(screen.getByRole("heading", { name: "No optional context configured" })).toBeTruthy();
-		expect(
-			screen.getByText("Write your first message below to start a session with only the host environment."),
-		).toBeTruthy();
+		expect(screen.getByRole("heading", { name: "Host context only" })).toBeTruthy();
+		expect(screen.queryByText(/Write your first message below/)).toBeNull();
 		expect(screen.queryByRole("status")).toBeNull();
 	});
 });
