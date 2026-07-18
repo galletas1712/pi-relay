@@ -314,6 +314,7 @@ export interface RenameSessionResult {
 export interface DeleteSessionResult {
 	session_id: string;
 	deleted: boolean;
+	deleted_child_session_ids?: string[];
 }
 
 export interface ConfigureSessionResult {

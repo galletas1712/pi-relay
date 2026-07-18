@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	AgentRpcClient,
 	RPC_REQUEST_TIMEOUT_MS,
+	RpcRequestError,
 	WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS,
 	resolveWsUrl,
 } from "./rpc.ts";
@@ -42,13 +43,17 @@ class FakeWebSocket {
 		this.emit("open");
 	}
 
-	private emit(type: string): void {
+	message(data: string): void {
+		this.emit("message", new MessageEvent("message", { data }));
+	}
+
+	private emit(type: string, event: Event = { type } as Event): void {
 		const listeners = this.listeners.get(type) ?? [];
 		for (const entry of [...listeners]) {
 			if (typeof entry.listener === "function") {
-				entry.listener.call(this, { type } as Event);
+				entry.listener.call(this, event);
 			} else {
-				entry.listener.handleEvent({ type } as Event);
+				entry.listener.handleEvent(event);
 			}
 			if (entry.once) {
 				this.listeners.set(type, (this.listeners.get(type) ?? []).filter((candidate) => candidate !== entry));
@@ -95,6 +100,34 @@ function localLocation(): Pick<Location, "hostname" | "port" | "protocol"> {
 }
 
 describe("AgentRpcClient reconnect hardening", () => {
+	it("preserves production RPC error codes for structured handling", async () => {
+		const client = new AgentRpcClient("ws://agent.test/ws");
+		const connect = client.connect();
+		const socket = FakeWebSocket.instances[0];
+		socket.open();
+		await connect;
+
+		const request = client.request("session.get", { session_id: "deleted-root" });
+		await Promise.resolve();
+		const frame = JSON.parse(socket.sent[0]) as { id: string };
+		socket.message(JSON.stringify({
+			id: frame.id,
+			ok: false,
+			error: {
+				code: "session_not_found",
+				message: "session not found",
+				data: {},
+			},
+		}));
+
+		await expect(request).rejects.toMatchObject({
+			name: "RpcRequestError",
+			code: "session_not_found",
+			message: "session_not_found: session not found",
+		} satisfies Partial<RpcRequestError>);
+		client.close();
+	});
+
 	it.each([0, Number.POSITIVE_INFINITY])("rejects an invalid request timeout of %s", async (timeoutMs) => {
 		const client = new AgentRpcClient("ws://agent.test/ws");
 

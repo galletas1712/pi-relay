@@ -42,6 +42,21 @@ export interface RpcRequestOptions {
 	timeoutMs?: number;
 }
 
+export class RpcRequestError extends Error {
+	constructor(
+		readonly code: string,
+		readonly detail: string,
+		readonly data?: unknown,
+	) {
+		super(`${code}: ${detail}`);
+		this.name = "RpcRequestError";
+	}
+}
+
+export function isRpcErrorCode(error: unknown, code: string): boolean {
+	return error instanceof RpcRequestError && error.code === code;
+}
+
 export const RPC_REQUEST_TIMEOUT_MS = 15_000;
 export const WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS = 300_000;
 
@@ -217,7 +232,7 @@ export class AgentRpcClient implements RpcClient {
 			} else {
 				const code = data.error?.code ?? "rpc_error";
 				const detail = data.error?.message ?? "request failed";
-				pending.reject(new Error(`${code}: ${detail}`));
+				pending.reject(new RpcRequestError(code, detail, data.error?.data));
 			}
 			return;
 		}

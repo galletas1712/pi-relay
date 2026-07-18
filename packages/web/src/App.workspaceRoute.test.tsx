@@ -6,7 +6,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentApi } from "./agentApi.ts";
 import { App } from "./App.tsx";
-import type { ConnectionStatus } from "./rpc.ts";
+import { RpcRequestError, type ConnectionStatus } from "./rpc.ts";
 import { queryKeys } from "./queryKeys.ts";
 import type {
 	DelegationListResult,
@@ -20,7 +20,15 @@ import type {
 	TranscriptTreeNode,
 	TranscriptTurnsResult,
 } from "./types.ts";
-import { loadUiSelection, rememberUiSelection } from "./uiResume.ts";
+import {
+	loadUiSelection,
+	rememberActiveUiSelection,
+	rememberSelectedSubagent,
+	rememberSelectedSession,
+	rememberUiSelection,
+	selectedSessionForProject,
+	selectedSubagentForSession,
+} from "./uiResume.ts";
 import {
 	WorkspaceRouteHistory,
 	type WorkspaceHistoryLike,
@@ -57,6 +65,7 @@ beforeAll(() => {
 
 afterEach(() => {
 	cleanup();
+	vi.useRealTimers();
 	window.localStorage.clear();
 	window.history.replaceState(null, "", "/");
 });
@@ -270,6 +279,331 @@ describe("App workspace route identity integration", () => {
 			await mounted.dispose();
 		},
 	);
+
+	it("does not let an older deletion acknowledgement clear a newer tombstone for the same ID", async () => {
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const api = createRouteApi();
+		const firstUnsubscribe = deferred<void>();
+		const secondUnsubscribe = deferred<void>();
+		let rootUnsubscribeAttempts = 0;
+		api.unsubscribeEvents.mockImplementation((sessionId: string) => {
+			if (sessionId !== "root-1") return Promise.resolve();
+			rootUnsubscribeAttempts += 1;
+			return rootUnsubscribeAttempts === 1
+				? firstUnsubscribe.promise
+				: secondUnsubscribe.promise;
+		});
+		(api.deleteSession as ApiSpy).mockResolvedValue({
+			session_id: "root-1",
+			deleted: true,
+			deleted_child_session_ids: [],
+		});
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await waitFor(() =>
+			expect(api.subscribeEvents.mock.calls.filter(
+				([sessionId]) => sessionId === "root-1",
+			)).toHaveLength(1),
+		);
+
+		await user.click(
+			screen.getByRole("button", { name: "Open session actions for Root one" }),
+		);
+		await user.click(await screen.findByRole("menuitem", { name: "Delete…" }));
+		await user.click(await screen.findByRole("button", { name: "Delete" }));
+		await waitFor(() =>
+			expect(api.unsubscribeEvents.mock.calls.filter(
+				([sessionId]) => sessionId === "root-1",
+			)).toHaveLength(1),
+		);
+		await act(async () =>
+			browser.navigate("/w/host/run/root-1/conversation/root-1"),
+		);
+		expect(await findSessionButton("Root one")).toBeTruthy();
+
+		await user.click(
+			screen.getByRole("button", { name: "Open session actions for Root one" }),
+		);
+		await user.click(await screen.findByRole("menuitem", { name: "Delete…" }));
+		await user.click(await screen.findByRole("button", { name: "Delete" }));
+		await waitFor(() =>
+			expect(api.unsubscribeEvents.mock.calls.filter(
+				([sessionId]) => sessionId === "root-1",
+			)).toHaveLength(2),
+		);
+		await act(async () =>
+			browser.navigate("/w/host/run/root-1/conversation/root-1"),
+		);
+		await waitFor(() =>
+			expect(document.querySelector(".log-session")?.textContent).toBe("Root one"),
+		);
+
+		await act(async () => {
+			firstUnsubscribe.resolve();
+			await firstUnsubscribe.promise;
+		});
+		await act(async () => {
+			api.emitEvent({
+				event_id: 100,
+				event: "model.error",
+				session_id: "root-1",
+				data: { error: "stale acknowledgement exposed this event" },
+			});
+			await Promise.resolve();
+		});
+		expect(screen.queryByText(
+			"model error: stale acknowledgement exposed this event",
+		)).toBeNull();
+		expect(api.subscribeEvents.mock.calls.filter(
+			([sessionId]) => sessionId === "root-1",
+		)).toHaveLength(1);
+
+		await act(async () => {
+			secondUnsubscribe.resolve();
+			await secondUnsubscribe.promise;
+		});
+		await waitFor(() =>
+			expect(api.subscribeEvents.mock.calls.filter(
+				([sessionId]) => sessionId === "root-1",
+			)).toHaveLength(2),
+		);
+		expect(api.subscribeEvents.mock.calls.filter(
+			([sessionId]) => sessionId === "root-1",
+		).at(-1)).toEqual(["root-1", 1]);
+
+		await mounted.dispose();
+	});
+
+	it("preserves another project's valid subagent focus when a remembered root belongs there", async () => {
+		rememberUiSelection("project-2", "root-other");
+		rememberSelectedSubagent("root-other", "other-child");
+		rememberSelectedSession("project-1", "root-other");
+		rememberActiveUiSelection("project-1", "root-other");
+		const browser = new FakeWorkspaceBrowser("/");
+		const api = createRouteApi();
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		expect(loadUiSelection()).toEqual({
+			projectId: "project-1",
+			sessionId: null,
+		});
+		expect(selectedSessionForProject("project-1")).toBeNull();
+		expect(selectedSubagentForSession("root-other")).toBe("other-child");
+
+		await user.click(projectButton("Project two"));
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe(
+				"/w/project/project-2/run/root-other/conversation/other-child",
+			),
+		);
+		expect(document.querySelector(".log-session")?.textContent).toBe("Other child");
+
+		await mounted.dispose();
+	});
+
+	it("persists a project switch when its remembered root is deleted", async () => {
+		rememberUiSelection("project-1", "project-root-1");
+		rememberSelectedSession("project-2", "deleted-project-2-root");
+		const browser = new FakeWorkspaceBrowser("/");
+		let api = createRouteApi({
+			missingSessionIds: new Set(["deleted-project-2-root"]),
+		});
+		let mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe(
+				"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+			),
+		);
+		await user.click(projectButton("Project two"));
+		await waitFor(() => expect(browser.currentUrl).toBe("/"));
+		expect(loadUiSelection()).toEqual({
+			projectId: "project-2",
+			sessionId: null,
+		});
+		expect(selectedSessionForProject("project-2")).toBeNull();
+		await mounted.dispose();
+
+		api = createRouteApi();
+		mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		await open(api);
+		expect(loadUiSelection()).toEqual({
+			projectId: "project-2",
+			sessionId: null,
+		});
+		expect(await screen.findByRole("heading", { name: "Workspace scope" })).toBeTruthy();
+		expect(document.querySelector(".log-session")).toBeNull();
+
+		await mounted.dispose();
+	});
+
+	it("recovers a reused recursively deleted ID after unsubscribe rejection by resetting only the browser transport", async () => {
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/child-1");
+		const api = createRouteApi();
+		const rootUnsubscribe = deferred<void>();
+		const childUnsubscribe = deferred<void>();
+		let rootUnsubscribeAttempts = 0;
+		api.unsubscribeEvents.mockImplementation((sessionId: string) => {
+			if (sessionId === "root-1") {
+				rootUnsubscribeAttempts += 1;
+				if (rootUnsubscribeAttempts === 1) return rootUnsubscribe.promise;
+				return Promise.reject(new Error("unsubscribe rejected"));
+			}
+			if (sessionId === "child-1") return childUnsubscribe.promise;
+			return Promise.resolve();
+		});
+		api.reconnect.mockImplementation(async () => {
+			api.emitStatus("connecting");
+			api.emitStatus("open");
+		});
+		(api.deleteSession as ApiSpy).mockResolvedValue({
+			session_id: "root-1",
+			deleted: true,
+			deleted_child_session_ids: ["child-1"],
+		});
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await waitFor(() => {
+			expect(api.subscribeEvents.mock.calls.some(([sessionId]) => sessionId === "root-1")).toBe(true);
+			expect(api.subscribeEvents.mock.calls.some(([sessionId]) => sessionId === "child-1")).toBe(true);
+		});
+		api.listSessions.mockImplementation(async (_limit: number, projectId: string | null) =>
+			projectId === null
+				? [
+						summary("legacy-root", null, null, "Legacy root"),
+						summary("legacy-child", "legacy-root", null, "Legacy child"),
+					]
+				: [],
+		);
+		expect(selectedSubagentForSession("root-1")).toBe("child-1");
+		await user.click(
+			screen.getByRole("button", { name: "Open session actions for Root one" }),
+		);
+		await user.click(await screen.findByRole("menuitem", { name: "Delete…" }));
+		await user.click(await screen.findByRole("button", { name: "Delete" }));
+
+		await waitFor(() => expect(browser.currentUrl).toBe("/"));
+		expect(api.deleteSession).toHaveBeenCalledWith("root-1");
+		expect(api.unsubscribeEvents.mock.calls.filter(([id]) => id === "root-1")).toHaveLength(1);
+		expect(api.unsubscribeEvents.mock.calls.filter(([id]) => id === "child-1")).toHaveLength(1);
+		expect(loadUiSelection()).toEqual({ projectId: null, sessionId: null });
+		expect(selectedSessionForProject(null)).toBeNull();
+		expect(selectedSubagentForSession("root-1")).toBeNull();
+		expect(document.querySelector(".log-session")).toBeNull();
+		expect(await screen.findByRole("textbox")).toBeTruthy();
+
+		await act(async () => {
+			api.emitEvent({
+				event_id: 99,
+				event: "session.configured",
+				session_id: "root-1",
+				data: { metadata: { title: "Deleted root restored by a late event" } },
+			});
+			await Promise.resolve();
+		});
+		expect(document.body.textContent).not.toContain("Deleted root restored by a late event");
+		expect(screen.queryByRole("button", { name: "Open session actions for Root one" })).toBeNull();
+
+		const deletedSubscribeCallsBeforeReuse = api.subscribeEvents.mock.calls.filter(
+			([sessionId]) => sessionId === "root-1" || sessionId === "child-1",
+		).length;
+		await act(async () => browser.navigate("/w/host/run/root-1/conversation/root-1"));
+		await waitFor(() =>
+			expect(document.querySelector(".log-session")?.textContent).toBe("Root one"),
+		);
+		expect(api.subscribeEvents.mock.calls.filter(
+			([sessionId]) => sessionId === "root-1" || sessionId === "child-1",
+		)).toHaveLength(deletedSubscribeCallsBeforeReuse);
+
+		vi.useFakeTimers();
+		await act(async () => {
+			rootUnsubscribe.reject(new Error("unsubscribe rejected"));
+			await Promise.resolve();
+		});
+		expect(api.unsubscribeEvents.mock.calls.filter(([id]) => id === "root-1")).toHaveLength(1);
+
+		await act(async () => {
+			api.emitEvent({
+				event_id: 99,
+				event: "model.error",
+				session_id: "root-1",
+				data: { error: "late deleted-session failure" },
+			});
+			await Promise.resolve();
+		});
+		expect(screen.queryByText("model error: late deleted-session failure")).toBeNull();
+		expect(api.subscribeEvents.mock.calls.filter(
+			([sessionId]) => sessionId === "root-1",
+		)).toHaveLength(1);
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(250);
+		});
+		expect(api.unsubscribeEvents.mock.calls.filter(([id]) => id === "root-1")).toHaveLength(2);
+		expect(api.reconnect).not.toHaveBeenCalled();
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(750);
+		});
+		expect(api.unsubscribeEvents.mock.calls.filter(([id]) => id === "root-1")).toHaveLength(3);
+		expect(api.reconnect).toHaveBeenCalledTimes(1);
+		vi.useRealTimers();
+
+		await waitFor(() =>
+			expect(api.subscribeEvents.mock.calls.filter(
+				([sessionId]) => sessionId === "root-1",
+			)).toHaveLength(2),
+		);
+		expect(api.subscribeEvents.mock.calls.filter(
+			([sessionId]) => sessionId === "root-1",
+		).at(-1)).toEqual(["root-1", 1]);
+
+		await mounted.dispose();
+	});
+
+	it("keeps New session active with its draft across remount without forgetting the project's last root", async () => {
+		const browser = new FakeWorkspaceBrowser(
+			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+		);
+		let api = createRouteApi();
+		let mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(screen.getByRole("button", { name: "new session" }));
+		const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
+		await user.type(composer, "keep this new session draft");
+		expect(loadUiSelection()).toEqual({
+			projectId: "project-1",
+			sessionId: null,
+		});
+		expect(selectedSessionForProject("project-1")).toBe("project-root-1");
+		await mounted.dispose();
+
+		api = createRouteApi();
+		mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+		await open(api);
+
+		expect(screen.getByRole<HTMLTextAreaElement>("textbox").value).toBe(
+			"keep this new session draft",
+		);
+		expect(document.querySelector(".log-session")).toBeNull();
+		expect(loadUiSelection()).toEqual({
+			projectId: "project-1",
+			sessionId: null,
+		});
+		expect(selectedSessionForProject("project-1")).toBe("project-root-1");
+
+		await mounted.dispose();
+	});
 
 	it("shows one workspace preparation status while session.start is pending and clears it on rejection", async () => {
 		const start = deferred<never>();
@@ -1332,7 +1666,8 @@ describe("App workspace route identity integration", () => {
 		expect(api.listDelegations).toHaveBeenCalledWith("root-1", 3);
 		expect(api.listDelegations.mock.calls.every(([parent]) => parent === "root-1")).toBe(true);
 		expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1");
-		expect(loadUiSelection()).toEqual({ projectId: null, sessionId: null });
+		expect(loadUiSelection()).toEqual({ projectId: null, sessionId: "root-1" });
+		expect(selectedSubagentForSession("root-1")).toBe("child-1");
 
 		await mounted.dispose();
 	});
@@ -1349,9 +1684,149 @@ describe("App workspace route identity integration", () => {
 		await open(api);
 		await waitFor(() => expect(browser.currentUrl).toBe(expected));
 		expect(browser.replaceCalls).toHaveLength(1);
-		expect(loadUiSelection()).toEqual({ projectId: null, sessionId: null });
+		expect(loadUiSelection()).toEqual({
+			projectId: null,
+			sessionId: "root-1",
+		});
+		expect(selectedSubagentForSession("root-1")).toBe(
+			selected === "child-1" ? "child-1" : null,
+		);
 		const log = document.querySelector(".log-pane");
 		expect(log?.textContent).toContain(selected === "root-1" ? "Root one" : "Child one");
+
+		await mounted.dispose();
+	});
+
+	it("restores the focused root independently when switching projects", async () => {
+		const browser = new FakeWorkspaceBrowser(
+			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+		);
+		const api = createRouteApi();
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(projectButton("Project two"));
+		await user.click(await findSessionButton("Other project root"));
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe(
+				"/w/project/project-2/run/root-other/conversation/root-other",
+			),
+		);
+
+		await user.click(projectButton("Project one"));
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe(
+				"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+			),
+		);
+		await user.click(screen.getByRole("button", { name: "new session" }));
+		await waitFor(() => expect(browser.currentUrl).toBe("/"));
+		await user.click(projectButton("Project two"));
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe(
+				"/w/project/project-2/run/root-other/conversation/root-other",
+			),
+		);
+		expect(selectedSessionForProject("project-1")).toBe("project-root-1");
+		expect(selectedSessionForProject("project-2")).toBe("root-other");
+
+		await mounted.dispose();
+	});
+
+	it("restores each root's focused subagent and hydrates it after a browser restart", async () => {
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/child-1");
+		let api = createRouteApi();
+		let mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await act(async () =>
+			browser.navigate("/w/host/run/legacy-root/conversation/legacy-child"),
+		);
+		await waitFor(() =>
+			expect(document.querySelector(".log-session")?.textContent).toBe("Legacy child"),
+		);
+
+		await user.click(await findSessionButton("Root one"));
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1"),
+		);
+		await user.click(await findSessionButton("Legacy root"));
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe(
+				"/w/host/run/legacy-root/conversation/legacy-child",
+			),
+		);
+		expect(selectedSubagentForSession("root-1")).toBe("child-1");
+		expect(selectedSubagentForSession("legacy-root")).toBe("legacy-child");
+
+		await mounted.dispose();
+
+		api = createRouteApi();
+		const restartedBrowser = new FakeWorkspaceBrowser("/");
+		mounted = renderRouteApp(api, restartedBrowser);
+		await open(api);
+		await waitFor(() =>
+			expect(restartedBrowser.currentUrl).toBe(
+				"/w/host/run/legacy-root/conversation/legacy-child",
+			),
+		);
+		expect(document.querySelector(".log-session")?.textContent).toBe("Legacy child");
+
+		await mounted.dispose();
+	});
+
+	it("falls back to a remembered root and clears a deleted remembered subagent", async () => {
+		rememberUiSelection(null, "root-1");
+		rememberSelectedSubagent("root-1", "deleted-child");
+		const browser = new FakeWorkspaceBrowser("/");
+		const api = createRouteApi({ missingSessionIds: new Set(["deleted-child"]) });
+		const mounted = renderRouteApp(api, browser);
+
+		await open(api);
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1"),
+		);
+		expect(document.querySelector(".log-session")?.textContent).toBe("Root one");
+		expect(loadUiSelection()).toEqual({ projectId: null, sessionId: "root-1" });
+		expect(selectedSubagentForSession("root-1")).toBeNull();
+		expect(screen.queryByRole("heading", { name: "Couldn’t load session" })).toBeNull();
+
+		await mounted.dispose();
+	});
+
+	it("falls back to a remembered root and clears a subagent from another parent", async () => {
+		rememberUiSelection("project-1", "project-root-1");
+		rememberSelectedSubagent("project-root-1", "project-wrong-root-child");
+		const browser = new FakeWorkspaceBrowser("/");
+		const api = createRouteApi();
+		const mounted = renderRouteApp(api, browser);
+
+		await open(api);
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe(
+				"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+			),
+		);
+		expect(document.querySelector(".log-session")?.textContent).toBe("Project root");
+		expect(selectedSubagentForSession("project-root-1")).toBeNull();
+		expect(screen.queryByRole("heading", { name: "Couldn’t load session" })).toBeNull();
+
+		await mounted.dispose();
+	});
+
+	it("falls back to the normal project new-session view for a deleted remembered root", async () => {
+		rememberUiSelection("project-1", "deleted-root");
+		const browser = new FakeWorkspaceBrowser("/");
+		const api = createRouteApi({ missingSessionIds: new Set(["deleted-root"]) });
+		const mounted = renderRouteApp(api, browser);
+
+		await open(api);
+		expect(browser.currentUrl).toBe("/");
+		expect(loadUiSelection()).toEqual({ projectId: "project-1", sessionId: null });
+		expect(await screen.findByRole("heading", { name: "Workspace scope" })).toBeTruthy();
+		expect(screen.queryByRole("heading", { name: "Couldn’t load session" })).toBeNull();
 
 		await mounted.dispose();
 	});
@@ -1747,6 +2222,7 @@ describe("App workspace route identity integration", () => {
 type ApiSpy = ReturnType<typeof vi.fn>;
 
 type RouteApi = AgentApi & {
+	reconnect: ApiSpy;
 	listProjects: ApiSpy;
 	getSession: ApiSpy;
 	getTranscriptEntries: ApiSpy;
@@ -1759,6 +2235,7 @@ type RouteApi = AgentApi & {
 	cancelMcpLogin: ApiSpy;
 	listDelegations: ApiSpy;
 	subscribeEvents: ApiSpy;
+	unsubscribeEvents: ApiSpy;
 	queueFollowUp: ApiSpy;
 	startSession: ApiSpy;
 	switchHistory: ApiSpy;
@@ -1791,9 +2268,11 @@ function createRouteApi(
 	const summaries = [
 		summary("root-1", null, null, "Root one"),
 		summary("legacy-root", null, null, "Legacy root"),
+		summary("legacy-child", "legacy-root", null, "Legacy child"),
 		summary("project-root-1", null, "project-1", "Project root"),
 		summary("project-child-1", "project-root-1", "project-1", "Project child"),
 		summary("root-other", null, "project-2", "Other project root"),
+		summary("other-child", "root-other", "project-2", "Other child"),
 	];
 	const projects: Project[] = [
 		{
@@ -1832,7 +2311,9 @@ function createRouteApi(
 	const getSession = vi.fn(async (sessionId: string) => {
 		const deferred = options.deferredSessions?.get(sessionId);
 		if (deferred) return deferred;
-		if (options.missingSessionIds?.has(sessionId)) throw new Error("session not found");
+		if (options.missingSessionIds?.has(sessionId)) {
+			throw new RpcRequestError("session_not_found", "session not found", {});
+		}
 		if (sessionId === "root-1") {
 			return snapshot(
 				"root-1",
@@ -1849,6 +2330,9 @@ function createRouteApi(
 			return snapshot("fork-child", null, "project-1", "Fork child");
 		}
 		if (sessionId === "legacy-root") return snapshot("legacy-root", null, null, "Legacy root");
+		if (sessionId === "legacy-child") {
+			return snapshot("legacy-child", "legacy-root", null, "Legacy child");
+		}
 		if (sessionId === "project-root-1") {
 			return snapshot("project-root-1", null, "project-1", "Project root");
 		}
@@ -1864,7 +2348,10 @@ function createRouteApi(
 			);
 		}
 		if (sessionId === "root-other") return snapshot("root-other", null, "project-2", "Other project root");
-		throw new Error(`session not found: ${sessionId}`);
+		if (sessionId === "other-child") {
+			return snapshot("other-child", "root-other", "project-2", "Other child");
+		}
+		throw new RpcRequestError("session_not_found", "session not found", {});
 	});
 	const listDelegations = vi.fn(async (parentSessionId: string): Promise<DelegationListResult> => ({
 		parent_session_id: parentSessionId,
@@ -2130,6 +2617,27 @@ function mcpInventory(): McpInventory {
 
 function rememberLegacy(sessionId: string) {
 	rememberUiSelection(null, sessionId);
+}
+
+function projectButton(name: string): HTMLButtonElement {
+	const button = screen
+		.getAllByRole("button", { name: new RegExp(name) })
+		.find((candidate) => candidate.classList.contains("project-row-primary"));
+	if (!button) throw new Error(`missing ${name} selector`);
+	return button as HTMLButtonElement;
+}
+
+function findSessionButton(name: string): Promise<HTMLButtonElement> {
+	return waitFor(() => {
+		const button = screen
+			.getAllByRole("button")
+			.find((candidate) =>
+				candidate.classList.contains("session-row-primary") &&
+				candidate.textContent?.includes(name),
+			);
+		if (!button) throw new Error(`missing ${name} session selector`);
+		return button as HTMLButtonElement;
+	});
 }
 
 function expectSensitiveReads(api: RouteApi, count: number): void {
