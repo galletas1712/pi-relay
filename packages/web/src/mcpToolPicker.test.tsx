@@ -22,6 +22,17 @@ const INVENTORY: McpInventory = {
 	}],
 };
 
+function expectPresentAriaControlsResolve(container: HTMLElement): string[] {
+	const ids = [...container.querySelectorAll<HTMLElement>("[aria-controls]")]
+		.flatMap((control) => control.getAttribute("aria-controls")?.split(/\s+/) ?? []);
+	for (const id of ids) {
+		const target = document.getElementById(id);
+		expect(target, `missing aria-controls target #${id}`).toBeTruthy();
+		expect(container.contains(target)).toBe(true);
+	}
+	return ids;
+}
+
 function oauthStatus(
 	authState: McpAuthServerStatus["auth_state"],
 	patch: Partial<McpAuthServerStatus> = {},
@@ -45,7 +56,7 @@ describe("McpToolPicker", () => {
 		)).toBe("");
 	});
 
-	it("omits closed inventory controls while reporting aria-expanded false", () => {
+	it("omits closed inventory controls and unresolved ID references while reporting aria-expanded false", () => {
 		const markup = renderToStaticMarkup(
 			<McpToolPicker
 				inventory={INVENTORY}
@@ -53,15 +64,76 @@ describe("McpToolPicker", () => {
 				onChange={() => {}}
 			/>,
 		);
-		expect(markup).toContain("1 selected");
-		expect(markup).toContain("MCP context tokens added");
+		expect(markup).toContain("1 tool selected");
+		expect(markup).toContain("About 12 context tokens");
 		expect(markup).toContain('aria-expanded="false"');
+		expect(markup).not.toContain("aria-controls");
 		expect(markup).not.toContain("mcp-picker-list");
 		expect(markup).not.toContain('aria-checked="mixed"');
 		expect(markup).not.toContain("workspace");
-		expect(markup).toContain("All full and read-only subagents inherit these tools");
-		expect(markup).toContain("Read-only restricts local files only");
-		expect(markup).toContain("MCP tools may cause remote side effects");
+		expect(markup).toContain("<dt>Scope</dt><dd>All agents</dd>");
+		expect(markup).toContain("<dt>Risk</dt><dd>Remote side effects</dd>");
+		expect(markup).not.toContain("Every full and read-only subagent inherits these tools");
+		expect(markup).not.toContain("Choose optional remote capabilities");
+		expect(markup).not.toContain("setup-disclosure-description");
+		expect(markup).not.toContain("·");
+		expect(markup).not.toContain("≈");
+	});
+
+	it("uses instance-safe picker and server panel IDs that always resolve when present", async () => {
+		const { container } = render(
+			<>
+				<McpToolPicker inventory={INVENTORY} selection={new Map()} onChange={() => {}} />
+				<McpToolPicker inventory={INVENTORY} selection={new Map()} onChange={() => {}} />
+			</>,
+		);
+		const pickerToggles = screen.getAllByRole("button", { name: /MCP tools/ });
+
+		expectPresentAriaControlsResolve(container);
+		expect(container.querySelectorAll("[aria-controls]")).toHaveLength(0);
+
+		await userEvent.click(pickerToggles[0]);
+		expect(expectPresentAriaControlsResolve(container)).toHaveLength(1);
+		expect(screen.getByRole("button", { name: "expand workspace tools" }).hasAttribute("aria-controls"))
+			.toBe(false);
+
+		await userEvent.click(pickerToggles[1]);
+		const pickerIds = expectPresentAriaControlsResolve(container);
+		expect(pickerIds).toHaveLength(2);
+		expect(new Set(pickerIds).size).toBe(pickerIds.length);
+
+		const expanders = screen.getAllByRole("button", { name: "expand workspace tools" });
+		await userEvent.click(expanders[0]);
+		await userEvent.click(expanders[1]);
+		const allIds = expectPresentAriaControlsResolve(container);
+		expect(allIds).toHaveLength(4);
+		expect(new Set(allIds).size).toBe(allIds.length);
+
+		await userEvent.click(screen.getAllByRole("button", { name: "collapse workspace tools" })[0]);
+		expectPresentAriaControlsResolve(container);
+		expect(container.querySelectorAll("[aria-controls]")).toHaveLength(3);
+	});
+
+	it("announces complete MCP selection updates outside the disclosure button", () => {
+		const { rerender } = render(
+			<McpToolPicker inventory={INVENTORY} selection={new Map()} onChange={() => {}} />,
+		);
+		const toggle = screen.getByRole("button", { name: /MCP tools/ });
+		const status = screen.getByRole("status");
+		expect(toggle.querySelector("[aria-live]")).toBeNull();
+		expect(toggle.contains(status)).toBe(false);
+		expect(status.textContent).toBe("MCP tool selection: No tools selected.");
+
+		rerender(
+			<McpToolPicker
+				inventory={INVENTORY}
+				selection={new Map([["workspace", new Set(["read"])]])}
+				onChange={() => {}}
+			/>,
+		);
+		expect(screen.getByRole("status").textContent).toBe(
+			"MCP tool selection: 1 tool selected. About 12 context tokens.",
+		);
 	});
 
 	it("summarizes a selected unavailable server without rendering closed controls", () => {
@@ -75,12 +147,12 @@ describe("McpToolPicker", () => {
 				onChange={() => {}}
 			/>,
 		);
-		expect(markup).toContain("1 selected");
-		expect(markup).toContain("MCP tools may cause remote side effects");
+		expect(markup).toContain("1 tool selected");
+		expect(markup).toContain("Remote side effects");
 		expect(markup).not.toContain("mcp-picker-list");
 	});
 
-	it("omits selection controls and warnings for a healthy zero-tool server", () => {
+	it("uses plain-language summaries and omits selection controls for a healthy zero-tool server", () => {
 		const markup = renderToStaticMarkup(
 			<McpToolPicker
 				inventory={{
@@ -98,9 +170,14 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 		expect(markup).toContain("empty");
-		expect(markup).toContain("0/0 tools");
+		expect(markup).toContain("No tools selected");
+		expect(markup).toContain("No tools available");
+		expect(markup).not.toContain("0 selected");
+		expect(markup).not.toContain("0/0");
+		expect(markup).not.toContain("·");
+		expect(markup).not.toContain("≈");
 		expect(markup).not.toContain('type="checkbox"');
-		expect(markup).not.toContain("MCP tools may cause remote side effects");
+		expect(markup).not.toContain("Remote side effects");
 	});
 
 	it("cannot interactively select a healthy zero-tool server", async () => {
@@ -122,9 +199,85 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 		expect(screen.queryByRole("checkbox")).toBeNull();
-		await userEvent.click(screen.getByRole("button", { name: "expand empty tools" }));
+		expect(screen.queryByRole("button", { name: /empty tools/ })).toBeNull();
 		expect(screen.queryByRole("checkbox")).toBeNull();
 		expect(onChange).not.toHaveBeenCalled();
+	});
+
+	it("uses natural zero, one, and many server summaries with singular context tokens", () => {
+		const inventory: McpInventory = {
+			revision: "summary",
+			servers: [
+				{ server: "empty", revision: "empty", health: "healthy", tools: [] },
+				{
+					server: "single",
+					revision: "single",
+					health: "healthy",
+					tools: [{ raw_name: "one", description: "One", context_token_estimate: 1 }],
+				},
+				{
+					server: "many",
+					revision: "many",
+					health: "healthy",
+					tools: [
+						{ raw_name: "first", description: "First", context_token_estimate: 2 },
+						{ raw_name: "second", description: "Second", context_token_estimate: 3 },
+					],
+				},
+			],
+		};
+		render(
+			<McpToolPicker
+				inventory={inventory}
+				selection={new Map([
+					["single", new Set(["one"])],
+					["many", new Set(["first", "second"])],
+				])}
+				onChange={() => {}}
+				open
+			/>,
+		);
+
+		expect(screen.getByText("No tools available")).toBeTruthy();
+		expect(screen.getByText("1 tool selected")).toBeTruthy();
+		expect(screen.queryByText("All 1 tool selected")).toBeNull();
+		expect(screen.getByText("All 2 tools selected")).toBeTruthy();
+		expect(screen.getAllByText("About 1 context token").length).toBeGreaterThan(0);
+		expect(screen.getByRole("status").textContent).toBe(
+			"MCP tool selection: 3 tools selected. About 6 context tokens.",
+		);
+	});
+
+	it("uses the same singular and plural context-token grammar everywhere", async () => {
+		const inventory: McpInventory = {
+			revision: "tokens",
+			servers: [{
+				server: "tokens",
+				revision: "tokens",
+				health: "healthy",
+				tools: [
+					{ raw_name: "singular", description: "Singular", context_token_estimate: 1 },
+					{ raw_name: "plural", description: "Plural", context_token_estimate: 2 },
+				],
+			}],
+		};
+		render(
+			<McpToolPicker
+				inventory={inventory}
+				selection={new Map([["tokens", new Set(["singular"])]])}
+				onChange={() => {}}
+				open
+			/>,
+		);
+
+		expect(screen.getAllByText("About 1 context token")).toHaveLength(2);
+		expect(screen.getByRole("status").textContent).toBe(
+			"MCP tool selection: 1 tool selected. About 1 context token.",
+		);
+		await userEvent.click(screen.getByRole("button", { name: "expand tokens tools" }));
+		expect(screen.getAllByText("About 1 context token")).toHaveLength(3);
+		expect(screen.getByText("About 2 context tokens")).toBeTruthy();
+		expect(screen.queryByText(/1 context tokens/)).toBeNull();
 	});
 
 	it("keeps a login-required OAuth server visible without inventory and starts login", async () => {
@@ -175,8 +328,47 @@ describe("McpToolPicker", () => {
 		expect(screen.getByText("login pending")).toBeTruthy();
 		expect(screen.getByText("login expired")).toBeTruthy();
 		expect(screen.getByText("OAuth unsupported")).toBeTruthy();
-		expect(screen.getByText(/OAuth unknown · OAuth discovery failed/)).toBeTruthy();
-		expect(screen.getByText(/cancel it and start again/)).toBeTruthy();
+		expect(screen.getByText("OAuth unknown")).toBeTruthy();
+		expect(screen.getByText("OAuth discovery failed")).toBeTruthy();
+		expect(screen.getByText("Authorization pending")).toBeTruthy();
+		expect(screen.getByText("After reload")).toBeTruthy();
+		expect(screen.getByText("Cancel and restart")).toBeTruthy();
+	});
+
+	it("keeps pending authorization metadata native and announces it from a separate hidden status", () => {
+		const { container } = render(
+			<McpToolPicker
+				inventory={{ revision: "", servers: [] }}
+				selection={new Map()}
+				onChange={() => {}}
+				authStatus={[oauthStatus("authorization_pending")]}
+				open
+			/>,
+		);
+
+		const metadata = container.querySelector<HTMLElement>(".mcp-picker-pending");
+		expect(metadata?.tagName).toBe("DL");
+		expect(metadata?.hasAttribute("role")).toBe(false);
+		expect(container.querySelector("dl[role]")).toBeNull();
+		expect([...metadata!.querySelectorAll("dt")].map((term) => term.textContent)).toEqual([
+			"Status",
+			"After reload",
+		]);
+		expect([...metadata!.querySelectorAll("dd")].map((description) => description.textContent)).toEqual([
+			"Authorization pending",
+			"Cancel and restart",
+		]);
+
+		const liveStatus = [...container.querySelectorAll<HTMLElement>(".sr-only[role='status']")]
+			.find((status) =>
+				status.textContent?.trim() ===
+				"MCP authorization pending. After page reload, cancel and restart."
+			);
+		expect(liveStatus).toBeTruthy();
+		expect(liveStatus?.getAttribute("aria-live")).toBe("polite");
+		expect(liveStatus?.getAttribute("aria-atomic")).toBe("true");
+		expect(metadata?.contains(liveStatus!)).toBe(false);
+		expect(metadata?.nextElementSibling).toBe(liveStatus);
 	});
 
 	it("renders daemon-advertised actions, including both recovery actions", () => {

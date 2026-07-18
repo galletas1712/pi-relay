@@ -77,7 +77,7 @@ describe("App workspace route identity integration", () => {
 		const user = userEvent.setup();
 
 		await open(api);
-		const setup = await screen.findByRole("heading", { name: "Choose the context to bring in" });
+		const setup = await screen.findByRole("heading", { level: 1, name: "New session" });
 		const setupSurface = setup.closest("[data-slot='new-session-setup']");
 		expect(setupSurface?.closest(".message-scroll")).toBeTruthy();
 		expect(setupSurface?.closest(".chat-dock")).toBeNull();
@@ -88,14 +88,16 @@ describe("App workspace route identity integration", () => {
 			.find((button) => button.classList.contains("project-row-primary"));
 		if (!projectButton) throw new Error("missing Project one selector");
 		await user.click(projectButton);
-		expect(await screen.findByRole("heading", { name: "Workspace scope" })).toBeTruthy();
+		expect(await screen.findByRole("button", { name: /Workspaces/ })).toBeTruthy();
 		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
 		await user.click(screen.getByRole("checkbox", { name: /docs/ }));
-		expect(screen.getByRole("button", { name: /Workspaces/ }).textContent).toContain("1 of 2");
+		expect(screen.getByRole("button", { name: /Workspaces/ }).textContent).toContain(
+			"1 of 2 workspaces included",
+		);
 
 		await user.click(screen.getByRole("button", { name: /MCP tools/ }));
 		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
-		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 tools selected");
 
 		await mounted.dispose();
 	});
@@ -697,7 +699,7 @@ describe("App workspace route identity integration", () => {
 		await waitFor(() => expect(api.queueFollowUp).toHaveBeenCalledTimes(1));
 		await user.click(screen.getByRole("button", { name: "new session" }));
 
-		expect(await screen.findByRole("heading", { name: "Workspace scope" })).toBeTruthy();
+		expect(await screen.findByRole("button", { name: /Workspaces/ })).toBeTruthy();
 		expect(screen.queryByRole("status", { name: "Preparing workspaces…" })).toBeNull();
 		expect(api.startSession).not.toHaveBeenCalled();
 
@@ -787,7 +789,7 @@ describe("App workspace route identity integration", () => {
 
 		await open(api);
 		expect(document.querySelector("[data-slot='new-session-setup']")).toBeNull();
-		expect(screen.queryByRole("heading", { name: "Choose the context to bring in" })).toBeNull();
+		expect(screen.queryByRole("heading", { level: 1, name: "New session" })).toBeNull();
 		expect(screen.getByRole("region", { name: "Conversation transcript" })).toBeTruthy();
 
 		await mounted.dispose();
@@ -798,8 +800,8 @@ describe("App workspace route identity integration", () => {
 		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
 
 		await open(api);
-		expect(await screen.findByRole("heading", { name: "No optional context configured" })).toBeTruthy();
-		expect(screen.getByText("Write your first message below to start with the host environment.")).toBeTruthy();
+		expect(await screen.findByRole("heading", { name: "Host context only" })).toBeTruthy();
+		expect(screen.queryByText(/Write your first message below/)).toBeNull();
 		expect(screen.getByRole("textbox")).toBeTruthy();
 		expect(screen.queryByText("No session open")).toBeNull();
 
@@ -814,8 +816,8 @@ describe("App workspace route identity integration", () => {
 		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
 
 		await openStatusOnly(api);
-		expect(await screen.findByText("Loading project workspaces…")).toBeTruthy();
-		expect(screen.queryByRole("heading", { name: "No optional context configured" })).toBeNull();
+		expect(await screen.findByText("Loading workspaces…")).toBeTruthy();
+		expect(screen.queryByRole("heading", { name: "Host context only" })).toBeNull();
 
 		await act(async () => projects.resolve([]));
 		await mounted.dispose();
@@ -829,9 +831,10 @@ describe("App workspace route identity integration", () => {
 
 		await openStatusOnly(api);
 		expect(
-			await screen.findByText("Workspace configuration unavailable. Retry from the Projects panel."),
+			await screen.findByText("Workspaces unavailable"),
 		).toBeTruthy();
-		expect(screen.queryByRole("heading", { name: "No optional context configured" })).toBeNull();
+		expect(screen.getByText("Retry in Projects")).toBeTruthy();
+		expect(screen.queryByRole("heading", { name: "Host context only" })).toBeNull();
 
 		await mounted.dispose();
 	});
@@ -1240,7 +1243,7 @@ describe("App workspace route identity integration", () => {
 			});
 		});
 		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledTimes(2));
-		expect(await screen.findByText("MCP tools · Refreshing…")).toBeTruthy();
+		expect(await screen.findByText("Refreshing MCP tools…")).toBeTruthy();
 		expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /^read/i }).disabled).toBe(false);
 		expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /^write/i }).disabled).toBe(true);
 
@@ -1299,7 +1302,7 @@ describe("App workspace route identity integration", () => {
 			await retry.promise;
 		});
 		await waitFor(() => expect(screen.queryByRole("button", { name: "Retry" })).toBeNull());
-		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 tools selected");
 		await user.click(screen.getByRole("button", { name: "send message" }));
 		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
 		expect(api.startSession.mock.calls[0][0].mcp).toEqual({
@@ -1384,7 +1387,13 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("checkbox", { name: /docs/ }));
 		const lastWorkspace = screen.getByRole<HTMLInputElement>("checkbox", { name: /repo-a/ });
 		expect(lastWorkspace.disabled).toBe(true);
-		expect(lastWorkspace.title).toBe("At least one workspace must remain selected");
+		expect(lastWorkspace.title).toBe("Minimum 1 workspace");
+		const minimumId = lastWorkspace.getAttribute("aria-describedby");
+		expect(minimumId).toBeTruthy();
+		const minimum = document.getElementById(minimumId!);
+		expect(minimum?.textContent).toBe("Minimum 1 workspace");
+		expect(minimum?.classList.contains("workspace-scope-help")).toBe(true);
+		expect(lastWorkspace.closest(".workspace-scope")?.contains(minimum)).toBe(true);
 		await user.type(screen.getByRole("textbox", { name: "branch for repo-a" }), "feature/mcp");
 
 		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
@@ -1426,7 +1435,7 @@ describe("App workspace route identity integration", () => {
 
 		await act(async () => browser.navigate("/"));
 		expect((await screen.findByRole("button", { name: /MCP tools/ })).textContent).toContain(
-			"0 selected",
+			"No tools selected",
 		);
 		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
 		expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /docs/ }).checked).toBe(false);
@@ -1456,15 +1465,15 @@ describe("App workspace route identity integration", () => {
 		await open(api);
 		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
 		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
-		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 tools selected");
 
 		await user.selectOptions(screen.getByRole("combobox", { name: "Reasoning effort" }), "high");
-		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 tools selected");
 
 		await user.selectOptions(screen.getByRole("combobox", { name: "Model" }), "claude:claude-opus-4-8");
 		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledWith("claude"));
 		expect((await screen.findByRole("button", { name: /MCP tools/ })).textContent).toContain(
-			"0 selected",
+			"No tools selected",
 		);
 
 		await mounted.dispose();
@@ -1510,7 +1519,9 @@ describe("App workspace route identity integration", () => {
 
 		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledTimes(2));
 		expect(composer.value).toBe("retry unchanged draft");
-		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("0 selected");
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain(
+			"No tools selected",
+		);
 		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
 		expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /docs/ }).checked).toBe(false);
 		expect(screen.getByRole<HTMLInputElement>("textbox", { name: "branch for repo-a" }).value).toBe(
@@ -1546,7 +1557,7 @@ describe("App workspace route identity integration", () => {
 
 		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
 		expect(composer.value).toBe("retain failed start");
-		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 selected");
+		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 tools selected");
 		await user.click(screen.getByRole("button", { name: /Workspaces/ }));
 		expect(screen.getByRole<HTMLInputElement>("checkbox", { name: /docs/ }).checked).toBe(false);
 
