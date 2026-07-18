@@ -1,5 +1,5 @@
-import { memo, useState } from "react";
-import { ChevronDown, ChevronRight, FolderGit2, Folder } from "lucide-react";
+import { ChevronDown, ChevronRight, Folder, FolderGit2, FolderTree } from "lucide-react";
+import { memo, useId, useState } from "react";
 import type { WorkspaceScopeEntry } from "./workspaceScope.ts";
 
 /** Selects the project workspaces and optional git branches for the next session. */
@@ -16,11 +16,14 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 	open?: boolean;
 	onOpenChange?: (open: boolean) => void;
 }) {
+	const idPrefix = useId();
 	const [internalOpen, setInternalOpen] = useState(false);
 	const open = controlledOpen ?? internalOpen;
 	if (!scope.length) return null;
 
+	const panelId = `${idPrefix}-workspaces-panel`;
 	const includedCount = scope.filter((entry) => entry.included).length;
+	const summary = workspaceSummary(includedCount, scope.length);
 	const setOpen = (nextOpen: boolean) => {
 		if (controlledOpen === undefined) setInternalOpen(nextOpen);
 		onOpenChange?.(nextOpen);
@@ -36,17 +39,29 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 				className="workspace-scope-toggle"
 				onClick={() => setOpen(!open)}
 				aria-expanded={open}
+				aria-controls={open ? panelId : undefined}
 				disabled={disabled}
 			>
-				{open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-				<span>Workspaces</span>
-				<span className="workspace-scope-count">
-					{includedCount} of {scope.length}
+				<FolderTree className="setup-disclosure-icon" size={18} aria-hidden />
+				<span className="setup-disclosure-copy">
+					<span className="setup-disclosure-title">Workspaces</span>
+					<span className="setup-disclosure-description">
+						Choose which project folders this session includes as local context.
+					</span>
 				</span>
+				<span className="setup-disclosure-summary">
+					{summary}
+				</span>
+				{open
+					? <ChevronDown className="setup-disclosure-chevron" size={16} aria-hidden />
+					: <ChevronRight className="setup-disclosure-chevron" size={16} aria-hidden />}
 			</button>
+			<span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+				Workspace selection: {summary}.
+			</span>
 			{open ? (
-				<div className="workspace-scope-list">
-					<p className="workspace-scope-help">At least one workspace must remain selected.</p>
+				<div className="workspace-scope-list" id={panelId}>
+					<p className="workspace-scope-help">At least one workspace must remain included.</p>
 					{scope.map((entry, index) => (
 						<div className="workspace-scope-item" key={entry.workspaceDir}>
 							<label className="workspace-scope-name">
@@ -56,12 +71,14 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 									disabled={disabled || (entry.included && includedCount === 1)}
 									title={
 										entry.included && includedCount === 1
-											? "At least one workspace must remain selected"
+											? "At least one workspace must remain included"
 											: undefined
 									}
 									onChange={(event) => patch(index, { included: event.target.checked })}
 								/>
-								{entry.kind === "git" ? <FolderGit2 size={14} /> : <Folder size={14} />}
+								{entry.kind === "git"
+									? <FolderGit2 size={14} aria-hidden />
+									: <Folder size={14} aria-hidden />}
 								<span>{entry.workspaceDir}</span>
 							</label>
 							<div className="workspace-scope-detail">
@@ -83,3 +100,10 @@ export const WorkspaceScopePicker = memo(function WorkspaceScopePicker({
 		</div>
 	);
 });
+
+function workspaceSummary(included: number, total: number): string {
+	if (included === total) {
+		return total === 1 ? "The workspace is included" : `All ${total} workspaces included`;
+	}
+	return `${included} of ${total} workspaces included`;
+}

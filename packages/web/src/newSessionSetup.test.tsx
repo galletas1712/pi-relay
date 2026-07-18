@@ -1,15 +1,33 @@
 // @vitest-environment jsdom
 
+import React from "react";
 import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	NewSessionSetup,
 	type WorkspaceConfiguration,
 } from "./newSessionSetup.tsx";
+import { WorkspaceScopePicker } from "./workspaceScopePicker.tsx";
 
 afterEach(cleanup);
 
 const EMPTY_INVENTORY = { revision: "empty", servers: [] };
+const WORKSPACE_SCOPE = [
+	{ workspaceDir: "repo", kind: "git" as const, branch: "", included: true },
+	{ workspaceDir: "docs", kind: "local" as const, branch: "", included: true },
+];
+
+function expectPresentAriaControlsResolve(container: HTMLElement): string[] {
+	const ids = [...container.querySelectorAll<HTMLElement>("[aria-controls]")]
+		.flatMap((control) => control.getAttribute("aria-controls")?.split(/\s+/) ?? []);
+	for (const id of ids) {
+		const target = document.getElementById(id);
+		expect(target, `missing aria-controls target #${id}`).toBeTruthy();
+		expect(container.contains(target)).toBe(true);
+	}
+	return ids;
+}
 
 function setup(
 	readiness: {
@@ -41,6 +59,67 @@ function setup(
 }
 
 describe("NewSessionSetup readiness", () => {
+	it("describes the first-message flow and summarizes included workspaces naturally", () => {
+		render(setup(
+			{ mcpReady: true, mcpAuthStatusReady: true },
+			{
+				status: "ready",
+				scope: WORKSPACE_SCOPE,
+			},
+		));
+
+		expect(screen.getByRole("heading", { name: "Choose what this session can access" })).toBeTruthy();
+		expect(screen.getByText(/Your first message starts the session/)).toBeTruthy();
+		const workspaces = screen.getByRole("button", { name: /Workspaces/ });
+		expect(workspaces.textContent).toContain("All 2 workspaces included");
+		expect(workspaces.hasAttribute("aria-controls")).toBe(false);
+		expectPresentAriaControlsResolve(document.body);
+	});
+
+	it("uses instance-safe workspace panel IDs and only references mounted panels", async () => {
+		const { container } = render(
+			<>
+				<WorkspaceScopePicker scope={WORKSPACE_SCOPE} onChange={() => {}} />
+				<WorkspaceScopePicker scope={WORKSPACE_SCOPE} onChange={() => {}} />
+			</>,
+		);
+		const toggles = screen.getAllByRole("button", { name: /Workspaces/ });
+
+		expect(toggles).toHaveLength(2);
+		expectPresentAriaControlsResolve(container);
+		expect(container.querySelectorAll("[aria-controls]")).toHaveLength(0);
+
+		await userEvent.click(toggles[0]);
+		const firstIds = expectPresentAriaControlsResolve(container);
+		expect(firstIds).toHaveLength(1);
+
+		await userEvent.click(toggles[1]);
+		const openIds = expectPresentAriaControlsResolve(container);
+		expect(openIds).toHaveLength(2);
+		expect(new Set(openIds).size).toBe(openIds.length);
+
+		await userEvent.click(toggles[0]);
+		expect(toggles[0].hasAttribute("aria-controls")).toBe(false);
+		expectPresentAriaControlsResolve(container);
+	});
+
+	it("announces complete workspace selection updates outside the disclosure button", async () => {
+		function WorkspaceHarness() {
+			const [scope, setScope] = React.useState(WORKSPACE_SCOPE);
+			return <WorkspaceScopePicker scope={scope} onChange={setScope} open />;
+		}
+		render(<WorkspaceHarness />);
+
+		const toggle = screen.getByRole("button", { name: /Workspaces/ });
+		const status = screen.getByRole("status");
+		expect(toggle.querySelector("[aria-live]")).toBeNull();
+		expect(toggle.contains(status)).toBe(false);
+		expect(status.textContent).toBe("Workspace selection: All 2 workspaces included.");
+
+		await userEvent.click(screen.getByRole("checkbox", { name: /docs/ }));
+		expect(status.textContent).toBe("Workspace selection: 1 of 2 workspaces included.");
+	});
+
 	it("waits for a selected project's workspace configuration", () => {
 		render(setup(
 			{ mcpReady: true, mcpAuthStatusReady: true },
@@ -87,6 +166,9 @@ describe("NewSessionSetup readiness", () => {
 		render(setup({ mcpReady: true, mcpAuthStatusReady: true }));
 
 		expect(screen.getByRole("heading", { name: "No optional context configured" })).toBeTruthy();
+		expect(
+			screen.getByText("Write your first message below to start a session with only the host environment."),
+		).toBeTruthy();
 		expect(screen.queryByRole("status")).toBeNull();
 	});
 });

@@ -333,11 +333,12 @@ non-transactional and cannot be rolled back.
 
 ### New Session setup
 
-When no session is selected, `NewSessionSetup` renders compact disclosures
-above the shared composer and after connection-recovery state. Project sessions
-show **Workspaces** first and **MCP tools** second; host sessions show MCP only.
-The composition owns one disclosure state, so opening either bounded list
-closes the other instead of allowing both to consume the mobile viewport.
+When no session is selected, `NewSessionSetup` renders a compact, stacked
+context manifest above the shared composer and after connection-recovery
+state. Project sessions show **Workspaces** first and **MCP tools** second; host
+sessions show MCP only. The composition owns one disclosure state, so opening
+either bounded list closes the other instead of allowing both to consume the
+mobile viewport.
 
 `WorkspaceScopePicker` scopes the next project session to a subset of its
 declared workspaces and lets git workspaces start from a non-default branch. It
@@ -345,7 +346,8 @@ feeds `session.start`'s optional `workspaces` array through
 `startWorkspacesFromScope`. It defaults to every workspace at its default
 branch, so that default remains omission/all. The final included workspace
 cannot be unchecked and has accessible explanatory copy; the UI can therefore
-never display `0 of N` and accidentally serialize it as omission/all.
+never report that no workspace is included and accidentally serialize it as
+omission/all.
 Per-project choices persist under `piRelayWorkspaceScope:v1`; stale workspace
 entries are dropped when the picker re-derives.
 
@@ -386,9 +388,12 @@ deselection/reselection. The server checkbox is accessible tri-state
 (`indeterminate` plus `aria-checked="mixed"`), and deselecting every tool omits
 that server.
 
-The collapsed and per-server summaries show selected tool counts and the
-approximate **MCP context tokens added**, computed from the exact provider
-declaration JSON. This is not total context.
+When tools are selected, the collapsed and per-server summaries use complete
+selected-count phrases and show the approximate **context tokens added** as a
+separate phrase, computed from the exact provider declaration JSON. With no
+selection, the summary states that no remote tools will be added and server
+rows report available tools instead of zero-selection statistics. This is not
+total context.
 
 Pure transforms live in `mcpSelection.ts`: deterministic raw-identity payload,
 none/some/all state, all/one toggles, totals, and revision reconciliation.

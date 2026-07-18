@@ -1,5 +1,5 @@
-import { memo, useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { memo, useEffect, useId, useRef, useState } from "react";
+import { ChevronDown, ChevronRight, Plug } from "lucide-react";
 import {
 	mcpSelectionTotals,
 	clearMcpServerSelection,
@@ -51,6 +51,7 @@ export const McpToolPicker = memo(function McpToolPicker({
 	authBusyServer?: string | null;
 	authMutationBlockedReason?: string | null;
 }) {
+	const idPrefix = useId();
 	const [internalOpen, setInternalOpen] = useState(false);
 	const open = controlledOpen ?? internalOpen;
 	const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
@@ -61,7 +62,9 @@ export const McpToolPicker = memo(function McpToolPicker({
 		...inventory.servers.map((server) => server.server),
 	])].sort();
 	if (!serverIds.length) return null;
+	const panelId = `${idPrefix}-mcp-panel`;
 	const total = mcpSelectionTotals(inventory, selection);
+	const selectionStatus = mcpSelectionStatus(total.tools, total.contextTokens);
 	const setOpen = (nextOpen: boolean) => {
 		if (controlledOpen === undefined) setInternalOpen(nextOpen);
 		onOpenChange?.(nextOpen);
@@ -80,22 +83,41 @@ export const McpToolPicker = memo(function McpToolPicker({
 				className="mcp-picker-toggle"
 				onClick={() => setOpen(!open)}
 				aria-expanded={open}
+				aria-controls={open ? panelId : undefined}
 				disabled={disabled}
 			>
-				{open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-				<span>MCP tools</span>
-				<span className="mcp-picker-count">
-					{total.tools} selected · ≈{total.contextTokens.toLocaleString()} MCP context tokens added
+				<Plug className="setup-disclosure-icon" size={18} aria-hidden />
+				<span className="setup-disclosure-copy">
+					<span className="setup-disclosure-title">MCP tools</span>
+					<span className="setup-disclosure-description">
+						Choose optional remote capabilities for every agent in this session.
+					</span>
 				</span>
+				<span className="setup-disclosure-summary">
+					{total.tools === 0 ? (
+						<span>No remote tools will be added</span>
+					) : (
+						<>
+							<span>{selectedToolsLabel(total.tools)}</span>
+							<span>{addedContextTokensLabel(total.contextTokens)}</span>
+						</>
+					)}
+				</span>
+				{open
+					? <ChevronDown className="setup-disclosure-chevron" size={16} aria-hidden />
+					: <ChevronRight className="setup-disclosure-chevron" size={16} aria-hidden />}
 			</button>
+			<span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+				{selectionStatus}
+			</span>
 			{total.tools > 0 ? (
 				<p className="mcp-picker-warning">
-					All full and read-only subagents inherit these tools. Read-only restricts local files only; MCP tools may cause remote side effects.
+					Every full and read-only subagent inherits these tools. Read-only limits local files only; MCP tools can affect remote systems.
 				</p>
 			) : null}
 			{open ? (
-				<div className="mcp-picker-list">
-					{serverIds.map((serverId) => {
+				<div className="mcp-picker-list" id={panelId}>
+					{serverIds.map((serverId, serverIndex) => {
 						const server = inventoryByServer.get(serverId) ?? missingInventoryServer(serverId);
 						const auth = authByServer.get(serverId);
 						const state = serverSelectionState(inventory, selection, server.server);
@@ -112,21 +134,30 @@ export const McpToolPicker = memo(function McpToolPicker({
 						const contextTokens = server.tools
 							.filter((tool) => selected?.has(tool.raw_name))
 							.reduce((sum, tool) => sum + tool.context_token_estimate, 0);
+						const selectedCount = server.tools.filter((tool) =>
+							selected?.has(tool.raw_name)
+						).length;
+						const toolsPanelId = `${idPrefix}-mcp-server-${serverIndex}-tools`;
 						return (
 							<div className="mcp-picker-server" key={server.server}>
 								<div className="mcp-picker-server-row">
-									<button
-										type="button"
-										className="mcp-picker-expand"
-										onClick={() => toggleExpanded(server.server)}
-										aria-expanded={isExpanded}
-										aria-label={`${isExpanded ? "collapse" : "expand"} ${server.server} tools`}
-										disabled={disabled}
-									>
-										{isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-									</button>
-									<label className="mcp-picker-server-name">
-										{server.tools.length > 0 ? (
+									{server.tools.length > 0 ? (
+										<button
+											type="button"
+											className="mcp-picker-expand"
+											onClick={() => toggleExpanded(server.server)}
+											aria-expanded={isExpanded}
+											aria-controls={isExpanded ? toolsPanelId : undefined}
+											aria-label={`${isExpanded ? "collapse" : "expand"} ${server.server} tools`}
+											disabled={disabled}
+										>
+											{isExpanded
+												? <ChevronDown size={14} aria-hidden />
+												: <ChevronRight size={14} aria-hidden />}
+										</button>
+									) : null}
+									{server.tools.length > 0 ? (
+										<label className="mcp-picker-server-name">
 											<MixedCheckbox
 												checked={state === "all"}
 												mixed={state === "some"}
@@ -143,20 +174,35 @@ export const McpToolPicker = memo(function McpToolPicker({
 															: clearMcpServerSelection(selection, server.server),
 													)}
 											/>
-										) : null}
-										<span>{server.server}</span>
-									</label>
+											<span>{server.server}</span>
+										</label>
+									) : (
+										<span className="mcp-picker-server-name">
+											<span>{server.server}</span>
+										</span>
+									)}
 									{auth ? (
 										<span
 											className={`mcp-picker-auth ${auth.auth_state}`}
 										>
-											{authLabel(auth)}
-											{auth.failure ? ` · ${authFailureLabel(auth.failure)}` : ""}
+											<span>{authLabel(auth)}</span>
+											{auth.failure
+												? <span>{authFailureLabel(auth.failure)}</span>
+												: null}
 										</span>
 									) : null}
-									<span className={`mcp-picker-health ${server.health}`}>{server.health}</span>
+									<span className={`mcp-picker-health ${server.health}`}>
+										{healthLabel(server.health)}
+									</span>
 									<span className="mcp-picker-meta">
-										{selected?.size ?? 0}/{server.tools.length} tools · ≈{contextTokens.toLocaleString()} tokens
+										{selectedCount > 0 ? (
+											<>
+												<span>{serverSelectionLabel(selectedCount, server.tools.length)}</span>
+												<span>{addedContextTokensLabel(contextTokens)}</span>
+											</>
+										) : (
+											<span>{availableToolsLabel(server.tools.length)}</span>
+										)}
 									</span>
 									{auth?.auth_kind === "oauth" && auth.can_login ? (
 										<button
@@ -229,8 +275,8 @@ export const McpToolPicker = memo(function McpToolPicker({
 										Authorization is pending. If this page was reloaded, cancel it and start again.
 									</p>
 								) : null}
-								{isExpanded ? (
-									<div className="mcp-picker-tools">
+								{isExpanded && server.tools.length > 0 ? (
+									<div className="mcp-picker-tools" id={toolsPanelId}>
 										{server.tools.map((tool) => (
 											<label className="mcp-picker-tool" key={tool.raw_name}>
 												<input
@@ -248,7 +294,7 @@ export const McpToolPicker = memo(function McpToolPicker({
 													<strong>{tool.raw_name}</strong>
 													{tool.description ? <small>{tool.description}</small> : null}
 												</span>
-												<small>≈{tool.context_token_estimate.toLocaleString()} tokens</small>
+												<small>About {contextTokensLabel(tool.context_token_estimate)}</small>
 											</label>
 										))}
 									</div>
@@ -262,8 +308,45 @@ export const McpToolPicker = memo(function McpToolPicker({
 	);
 });
 
+function selectedToolsLabel(count: number): string {
+	return `${count} ${count === 1 ? "tool" : "tools"} selected`;
+}
+
+function serverSelectionLabel(selected: number, available: number): string {
+	if (selected === available) {
+		return selected === 1 ? selectedToolsLabel(selected) : `All ${selected} tools selected`;
+	}
+	return `${selected} of ${available} tools selected`;
+}
+
+function contextTokensLabel(count: number): string {
+	return `${count.toLocaleString()} context ${count === 1 ? "token" : "tokens"}`;
+}
+
+function addedContextTokensLabel(count: number): string {
+	return `Adds about ${contextTokensLabel(count)}`;
+}
+
+function mcpSelectionStatus(tools: number, contextTokens: number): string {
+	if (tools === 0) return "MCP tool selection: No remote tools will be added.";
+	return `MCP tool selection: ${selectedToolsLabel(tools)}. ${addedContextTokensLabel(contextTokens)}.`;
+}
+
+function availableToolsLabel(count: number): string {
+	if (count === 0) return "No tools available";
+	return `${count} ${count === 1 ? "tool" : "tools"} available`;
+}
+
 function missingInventoryServer(server: string): McpInventoryServer {
 	return { server, revision: "", health: "unavailable", tools: [] };
+}
+
+function healthLabel(health: McpInventoryServer["health"]): string {
+	switch (health) {
+		case "healthy": return "Healthy";
+		case "unavailable": return "Unavailable";
+		case "revoked": return "Revoked";
+	}
 }
 
 function authLabel(status: McpAuthServerStatus): string {
