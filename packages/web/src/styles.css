@@ -24,6 +24,7 @@
 	--destructive: #9d0006; /* red (dark) */
 	--success: #5f5a00; /* deep olive — AA text on light surfaces */
 	--warning: #8f4f00; /* warm amber — AA text on light surfaces */
+	--archived-status: #a89984; /* light4 / gray */
 	--sidebar: #f2e5bc; /* light0_soft */
 	--sidebar-accent: #ebdbb2;
 	--ring: rgb(175 58 3 / 0.45);
@@ -197,6 +198,7 @@
 		--destructive: #fb4934; /* bright red */
 		--success: #b8bb26; /* bright green */
 		--warning: #fabd2f; /* bright yellow */
+		--archived-status: #a89984; /* light4 / gray */
 		--sidebar: #1d2021; /* dark0_hard */
 		--sidebar-accent: #3c3836;
 		--ring: rgb(254 128 25 / 0.5);
@@ -219,6 +221,7 @@
 	--destructive: #fb4934; /* bright red */
 	--success: #b8bb26; /* bright green */
 	--warning: #fabd2f; /* bright yellow */
+	--archived-status: #a89984; /* light4 / gray */
 	--sidebar: #1d2021; /* dark0_hard */
 	--sidebar-accent: #3c3836;
 	--ring: rgb(254 128 25 / 0.5);
@@ -4300,7 +4303,7 @@ pre {
 }
 
 .status-rail.archived {
-	background: var(--muted-foreground);
+	background: var(--archived-status);
 }
 
 .session-row.archived {

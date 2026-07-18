@@ -25,6 +25,11 @@ describe("light theme semantic color contrast", () => {
 	}
 });
 
+it("uses a light gray status rail for archived sidebar sessions", () => {
+	expect(hexToken(lightTheme, "archived-status")).toBe("#a89984");
+	expect(styles).toMatch(/\.status-rail\.archived\s*\{\s*background:\s*var\(--archived-status\);/);
+});
+
 function lightThemeBlock(css: string): string {
 	const matches = [...css.matchAll(/^:root\s*\{([^}]*)\}/gm)];
 	if (matches.length !== 1 || !matches[0][1]) {
