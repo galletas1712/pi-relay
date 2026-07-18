@@ -1,5 +1,188 @@
 use super::*;
 
+fn write_mcp_config(suffix: &str, contents: &str) -> tempfile::NamedTempFile {
+    let file = tempfile::Builder::new()
+        .prefix("agent-mcp-config-")
+        .suffix(suffix)
+        .tempfile()
+        .expect("create MCP config");
+    std::fs::write(file.path(), contents).expect("write MCP config");
+    file
+}
+
+#[test]
+fn toml_file_loader_accepts_tagged_and_legacy_stdio_configs() {
+    let tagged = write_mcp_config(
+        ".toml",
+        r#"
+[servers.tagged]
+enabled_tools = ["read"]
+parallel_calls = 2
+
+[servers.tagged.transport]
+type = "stdio"
+command = "example"
+args = ["--flag"]
+cwd = "/tmp"
+inherit_env = ["EXAMPLE_TOKEN"]
+"#,
+    );
+    let tagged = McpConfig::from_path(tagged.path()).expect("tagged TOML config parses");
+    tagged.validate().expect("tagged TOML config validates");
+
+    let legacy = write_mcp_config(
+        ".toml",
+        r#"
+[servers.legacy]
+command = "example"
+args = ["--flag"]
+cwd = "/tmp"
+inherit_env = ["EXAMPLE_TOKEN"]
+enabled_tools = ["read"]
+parallel_calls = 2
+"#,
+    );
+    let legacy = McpConfig::from_path(legacy.path()).expect("legacy TOML config parses");
+    legacy.validate().expect("legacy TOML config validates");
+
+    assert!(matches!(
+        tagged.servers["tagged"].transport,
+        McpTransportConfig::Stdio(_)
+    ));
+    assert!(matches!(
+        legacy.servers["legacy"].transport,
+        McpTransportConfig::Stdio(_)
+    ));
+}
+
+#[test]
+fn toml_file_loader_accepts_streamable_http_bearer_and_oauth_configs() {
+    let config = write_mcp_config(
+        ".toml",
+        r#"
+[servers.bearer]
+enabled_tools = ["search"]
+
+[servers.bearer.transport]
+type = "streamable_http"
+url = "https://mcp.example.test/bearer"
+
+[servers.bearer.transport.auth]
+type = "bearer_env"
+env = "EXAMPLE_MCP_TOKEN"
+
+[servers.oauth]
+allow_all_tools = true
+
+[servers.oauth.transport]
+type = "streamable_http"
+url = "https://mcp.example.test/oauth"
+
+[servers.oauth.transport.auth]
+type = "oauth"
+client_id = "public-client"
+scopes = ["read", "search"]
+resource = "https://api.example.test/audience"
+callback_port = 8765
+callback_timeout_ms = 300000
+"#,
+    );
+
+    let config = McpConfig::from_path(config.path()).expect("HTTP TOML config parses");
+    config.validate().expect("HTTP TOML config validates");
+    assert!(matches!(
+        config.servers["bearer"].transport,
+        McpTransportConfig::StreamableHttp(_)
+    ));
+    assert!(matches!(
+        config.servers["oauth"].transport,
+        McpTransportConfig::StreamableHttp(_)
+    ));
+}
+
+#[test]
+fn toml_file_loader_rejects_malformed_toml_and_json() {
+    let malformed = write_mcp_config(
+        ".toml",
+        r#"
+[servers.example
+command = "example"
+"#,
+    );
+    let error = McpConfig::from_path(malformed.path()).expect_err("malformed TOML is rejected");
+    assert!(format!("{error:#}").contains("parse MCP config"));
+
+    let json = write_mcp_config(
+        ".json",
+        r#"{"servers":{"example":{"command":"example","allow_all_tools":true}}}"#,
+    );
+    let error = McpConfig::from_path(json.path()).expect_err("JSON is rejected by TOML loader");
+    assert!(format!("{error:#}").contains("parse MCP config"));
+}
+
+#[test]
+fn toml_file_loader_is_strict_at_root_transport_and_auth_boundaries() {
+    for contents in [
+        r#"
+unexpected = true
+"#,
+        r#"
+[servers.example]
+allow_all_tools = true
+unexpected = true
+
+[servers.example.transport]
+type = "stdio"
+command = "example"
+"#,
+        r#"
+[servers.example]
+allow_all_tools = true
+
+[servers.example.transport]
+type = "stdio"
+command = "example"
+unexpected = true
+"#,
+        r#"
+[servers.example]
+allow_all_tools = true
+
+[servers.example.transport]
+type = "streamable_http"
+url = "https://mcp.example.test/service"
+
+[servers.example.transport.auth]
+type = "bearer_env"
+env = "EXAMPLE_MCP_TOKEN"
+unexpected = true
+"#,
+    ] {
+        let config = write_mcp_config(".toml", contents);
+        assert!(
+            McpConfig::from_path(config.path()).is_err(),
+            "unknown fields must be rejected: {contents}"
+        );
+    }
+}
+
+#[test]
+fn toml_file_loader_ignores_filename_extension() {
+    let config = write_mcp_config(
+        ".json",
+        r#"
+[servers.example]
+allow_all_tools = true
+
+[servers.example.transport]
+type = "stdio"
+command = "example"
+"#,
+    );
+
+    McpConfig::from_path(config.path()).expect("TOML config parses despite .json extension");
+}
+
 #[test]
 fn allowlist_is_required_without_explicit_allow_all() {
     let config: McpConfig = serde_json::from_value(serde_json::json!({
@@ -516,9 +699,9 @@ fn mixed_legacy_and_tagged_fields_are_rejected() {
 }
 
 #[test]
-fn config_files_are_bounded_before_json_parsing() {
+fn config_files_are_bounded_before_toml_parsing() {
     let path = std::env::temp_dir().join(format!(
-        "agent-mcp-config-{}-{}.json",
+        "agent-mcp-config-{}-{}.toml",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

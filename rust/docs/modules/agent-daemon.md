@@ -57,15 +57,18 @@ handoff.rs         renders per-subagent task_prompt.md / final_message.md /
 
 `config.rs` resolves the general configuration root as
 `$XDG_CONFIG_HOME/pi-relay` or `$HOME/.config/pi-relay`. It parses only the
-strict `config.json` daemon schema, including a default parent provider and
-per-resolved-role subagent providers; invalid configuration fails startup.
-`mcp.json` is a separately owned, manually managed optional fallback and is
-never written by bootstrap. Startup copy-bootstraps bundled role/workflow
-`SKILL.md` files only when absent and then records completion, so later
-deletions remain user-owned. Skill/role resolution is explicit workspace/home
-first, configured catalog second, packaged fallback last; workflow names are
-deduplicated across the latter two sources and roles remain hidden from
-ordinary `LoadSkill`.
+strict `config.toml` daemon schema, including a default parent provider and
+per-resolved-role subagent providers; a legacy `config.json` is never a policy
+fallback, and invalid configuration fails startup.
+This is a breaking TOML-only migration for user-authored XDG daemon
+configuration: legacy `config.json` and `mcp.json` are ignored rather than
+converted or read. `mcp.toml` is a separately owned, manually managed optional
+fallback and is never written by bootstrap. Startup copy-bootstraps bundled
+role/workflow `SKILL.md` files only when absent and then records completion, so
+later deletions remain user-owned. Skill/role resolution is explicit
+workspace/home first, configured catalog second, packaged fallback last;
+workflow names are deduplicated across the latter two sources and roles remain
+hidden from ordinary `LoadSkill`.
 
 Subagent work runs as **delegations** (`delegate_writing_task` /
 `delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation` /

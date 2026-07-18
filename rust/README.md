@@ -64,38 +64,38 @@ to `127.0.0.1:8787`.
 ### Daemon configuration and packaged catalogs
 
 General daemon configuration is read from
-`$XDG_CONFIG_HOME/pi-relay/config.json`; when `XDG_CONFIG_HOME` is unset or
-empty, that is `$HOME/.config/pi-relay/config.json`. In particular, a nonempty
+`$XDG_CONFIG_HOME/pi-relay/config.toml`; when `XDG_CONFIG_HOME` is unset or
+empty, that is `$HOME/.config/pi-relay/config.toml`. In particular, a nonempty
 `XDG_CONFIG_HOME` is used directly and never gains an extra `.config`
 component. `XDG_CONFIG_HOME` and `HOME` must be absolute paths; relative
 values and parent-directory components are rejected rather than being resolved
 against the daemon's working directory. The file is optional: a missing file
 uses the stable default parent model, OpenAI `gpt-5.6-sol` with `xhigh`
-reasoning. Invalid JSON, unknown fields, and blank model names fail daemon
+reasoning. A legacy `config.json` is not read as a daemon-policy fallback.
+Invalid TOML, unknown fields, and blank model names fail daemon
 startup rather than being deferred to a session or subagent.
 
-```json
-{
-  "default_parent_model": {
-    "kind": "openai",
-    "model": "gpt-5.6-sol",
-    "reasoning_effort": "xhigh",
-    "max_tokens": 32768,
-    "prompt_cache": { "key": "my-parent-cache" }
-  },
-  "subagent_models": {
-    "reviewer": {
-      "kind": "claude",
-      "model": "claude-opus-4-8",
-      "reasoning_effort": "high"
-    },
-    "repo/reviewer": {
-      "kind": "openai",
-      "model": "gpt-5.6-sol",
-      "reasoning_effort": "high"
-    }
-  }
-}
+This is a breaking TOML-only migration for user-authored XDG daemon
+configuration: legacy `$XDG_CONFIG_HOME/pi-relay/config.json` and
+`mcp.json` are ignored, never converted, and never read.
+
+```toml
+[default_parent_model]
+kind = "openai"
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+max_tokens = 32768
+prompt_cache = { key = "my-parent-cache" }
+
+[subagent_models.reviewer]
+kind = "claude"
+model = "claude-opus-4-8"
+reasoning_effort = "high"
+
+[subagent_models."repo/reviewer"]
+kind = "openai"
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
 ```
 
 Every provider object keeps the normal `kind`, `model`, `reasoning_effort`,
@@ -127,38 +127,36 @@ created user file.
 
 Optional MCP configuration is selected in this order:
 `--mcp-config PATH`, `PI_AGENTD_MCP_CONFIG`, an already-existing
-`<config-root>/mcp.json`, then disabled. The daemon never creates, edits,
-merges, renames, or chmods that `mcp.json`; it is intentionally separate from
-`config.json`. Its typed JSON shape and trust model are documented in
+`<config-root>/mcp.toml`, then disabled. The daemon never creates, edits,
+merges, renames, or chmods that `mcp.toml`; it is intentionally separate from
+`config.toml`. Every MCP configuration source, including an explicit CLI or
+environment path with a `.json` extension, is parsed as TOML. Its typed TOML
+shape and trust model are documented in
 [`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
 When that configuration contains OAuth routes, the daemon stores their
 credentials in `mcp-oauth-credentials.json` directly beneath its existing
 `$XDG_STATE_HOME/pi-relay` state root (or `~/.local/state/pi-relay` when
-`XDG_STATE_HOME` is unset). This is a plaintext file protected by restrictive
-OS directory/file permissions. A corrupt, empty, oversized, or unreadable file
-is preserved and makes only OAuth credential operations unavailable; unrelated
-stdio/bearer routes and daemon startup continue. The backend intentionally has
-no repair/migration, cross-process locking, keyring, or credential-database
-fallback.
+`XDG_STATE_HOME` is unset). This OAuth credential state remains JSON and is
+distinct from TOML-only XDG configuration. It is a plaintext file protected by
+restrictive OS directory/file permissions. A corrupt, empty, oversized, or
+unreadable file is preserved and makes only OAuth credential operations
+unavailable; unrelated stdio/bearer routes and daemon startup continue. The
+backend intentionally has no repair/migration, cross-process locking, keyring,
+or credential-database fallback.
 For example:
 
-```json
-{
-  "servers": {
-    "workspace": {
-      "transport": {
-        "type": "stdio",
-        "command": "npx",
-        "args": ["-y", "@example/workspace-mcp"],
-        "cwd": "/trusted/workspace",
-        "inherit_env": ["EXAMPLE_TOKEN"]
-      },
-      "enabled_tools": ["read_file", "search"],
-      "call_timeout_ms": 30000,
-      "parallel_calls": 1
-    }
-  }
-}
+```toml
+[servers.workspace]
+enabled_tools = ["read_file", "search"]
+call_timeout_ms = 30000
+parallel_calls = 1
+
+[servers.workspace.transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@example/workspace-mcp"]
+cwd = "/trusted/workspace"
+inherit_env = ["EXAMPLE_TOKEN"]
 ```
 
 Generic remote servers use Streamable HTTP. HTTPS is required except for
@@ -168,44 +166,34 @@ configuration identity. Generic OAuth delegates discovery, public-client
 dynamic registration, S256 PKCE, state validation, and token exchange to the
 pinned rmcp 1.8 state machine:
 
-```json
-{
-  "servers": {
-    "remote": {
-      "transport": {
-        "type": "streamable_http",
-        "url": "https://mcp.example.com/mcp",
-        "auth": {
-          "type": "bearer_env",
-          "env": "EXAMPLE_MCP_TOKEN"
-        }
-      },
-      "enabled_tools": ["search"]
-    }
-  }
-}
+```toml
+[servers.remote]
+enabled_tools = ["search"]
+
+[servers.remote.transport]
+type = "streamable_http"
+url = "https://mcp.example.com/mcp"
+
+[servers.remote.transport.auth]
+type = "bearer_env"
+env = "EXAMPLE_MCP_TOKEN"
 ```
 
-```json
-{
-  "servers": {
-    "oauth_remote": {
-      "transport": {
-        "type": "streamable_http",
-        "url": "https://mcp.example.com/mcp",
-        "auth": {
-          "type": "oauth",
-          "client_id": "operator-configured-public-client",
-          "scopes": ["read", "search"],
-          "resource": "https://api.example.com/audience",
-          "callback_port": 8765,
-          "callback_timeout_ms": 300000
-        }
-      },
-      "enabled_tools": ["search"]
-    }
-  }
-}
+```toml
+[servers.oauth_remote]
+enabled_tools = ["search"]
+
+[servers.oauth_remote.transport]
+type = "streamable_http"
+url = "https://mcp.example.com/mcp"
+
+[servers.oauth_remote.transport.auth]
+type = "oauth"
+client_id = "operator-configured-public-client"
+scopes = ["read", "search"]
+resource = "https://api.example.com/audience"
+callback_port = 8765
+callback_timeout_ms = 300000
 ```
 
 Omit `client_id` to let rmcp perform Dynamic Client Registration. `scopes` and
@@ -222,9 +210,9 @@ The transient, unlanded Stage 1 keys (`registration`, `client_secret_env`,
 `allowed_scopes`, `initial_scopes`, issuer pins, and trusted origins) are not
 accepted. Replace them with optional `client_id`, `scopes`, and `resource`.
 
-The tagged `transport` object is preferred. Earlier flat stdio fields remain
-accepted with the same route fingerprint so existing frozen manifests and
-configuration files remain compatible.
+The tagged `transport` object is preferred. Earlier flat stdio TOML fields
+remain accepted with the same route fingerprint so existing frozen manifests
+and configuration remain compatible.
 Bearer environment authentication remains supported. Successful static-client
 and DCR login is persisted after callback cleanup, restored across daemon
 restart, and refreshed through rmcp with a 30-second skew. Status is

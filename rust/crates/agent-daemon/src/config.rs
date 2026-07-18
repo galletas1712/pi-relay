@@ -16,7 +16,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-const CONFIG_FILE: &str = "config.json";
+const DAEMON_CONFIG_FILE: &str = "config.toml";
+const MCP_CONFIG_FILE: &str = "mcp.toml";
 const BOOTSTRAP_MARKER: &str = ".bootstrap-v1";
 const BOOTSTRAP_STAGING_PREFIX: &str = ".bootstrap-staging-";
 
@@ -29,8 +30,8 @@ pub(crate) struct Config {
     pub(crate) daemon_config: DaemonConfig,
 }
 
-/// General daemon settings stored in `$XDG_CONFIG_HOME/pi-relay/config.json`
-/// (or `$HOME/.config/pi-relay/config.json`).
+/// General daemon settings stored in `$XDG_CONFIG_HOME/pi-relay/config.toml`
+/// (or `$HOME/.config/pi-relay/config.toml`).
 #[derive(Debug, Clone)]
 pub(crate) struct DaemonConfig {
     pub(crate) default_parent_model: ProviderConfig,
@@ -125,9 +126,9 @@ impl Config {
         }
 
         let config_root = config_root_from_env(xdg_config_home.as_deref(), home.as_deref())?;
-        let daemon_config = load_daemon_config(&config_root.join(CONFIG_FILE))?;
+        let daemon_config = load_daemon_config(&config_root.join(DAEMON_CONFIG_FILE))?;
         if mcp_config.is_none() {
-            let fallback = config_root.join("mcp.json");
+            let fallback = config_root.join(MCP_CONFIG_FILE);
             if fallback.is_file() {
                 mcp_config = Some(fallback);
             }
@@ -174,8 +175,11 @@ fn load_daemon_config(path: &Path) -> Result<DaemonConfig> {
             return Err(error).with_context(|| format!("read daemon config {}", path.display()))
         }
     };
-    let parsed: DaemonConfigFile = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse daemon config {}", path.display()))?;
+    let parsed: DaemonConfigFile = toml::from_str(
+        std::str::from_utf8(&bytes)
+            .with_context(|| format!("parse daemon config {}", path.display()))?,
+    )
+    .with_context(|| format!("parse daemon config {}", path.display()))?;
     parsed
         .try_into()
         .with_context(|| format!("validate daemon config {}", path.display()))
@@ -639,29 +643,26 @@ mod tests {
         let root = make_temp_dir("strict-config");
         fs::create_dir_all(&root).expect("config root");
         fs::write(
-            root.join(CONFIG_FILE),
-            r#"{
-                "default_parent_model": {
-                    "kind": "openai",
-                    "model": "parent",
-                    "reasoning_effort": "high",
-                    "max_tokens": 123,
-                    "prompt_cache": { "key": "parent-cache" }
-                },
-                "subagent_models": {
-                    "reviewer": {
-                        "kind": "claude",
-                        "model": "review",
-                        "reasoning_effort": "low",
-                        "max_tokens": 456,
-                        "prompt_cache": { "key": "review-cache" }
-                    }
-                }
-            }"#,
+            root.join(DAEMON_CONFIG_FILE),
+            r#"
+[default_parent_model]
+kind = "openai"
+model = "parent"
+reasoning_effort = "high"
+max_tokens = 123
+prompt_cache = { key = "parent-cache" }
+
+[subagent_models.reviewer]
+kind = "claude"
+model = "review"
+reasoning_effort = "low"
+max_tokens = 456
+prompt_cache = { key = "review-cache" }
+"#,
         )
         .expect("write config");
 
-        let config = load_daemon_config(&root.join(CONFIG_FILE)).expect("parse config");
+        let config = load_daemon_config(&root.join(DAEMON_CONFIG_FILE)).expect("parse config");
         let reviewer = config.subagent_models.get("reviewer").expect("reviewer");
         assert_eq!(config.default_parent_model.model, "parent");
         assert_eq!(config.default_parent_model.max_tokens, Some(123));
@@ -677,12 +678,32 @@ mod tests {
         );
 
         fs::write(
-            root.join(CONFIG_FILE),
-            r#"{"default_parent_model":{"kind":"openai","model":"x","unexpected":true}}"#,
+            root.join(DAEMON_CONFIG_FILE),
+            r#"
+[default_parent_model]
+kind = "openai"
+model = "x"
+unexpected = true
+"#,
         )
         .expect("write invalid config");
-        let error = load_daemon_config(&root.join(CONFIG_FILE))
+        let error = load_daemon_config(&root.join(DAEMON_CONFIG_FILE))
             .expect_err("unknown nested provider field is rejected");
+        assert!(format!("{error:#}").contains("unknown field"));
+
+        fs::write(
+            root.join(DAEMON_CONFIG_FILE),
+            r#"
+[default_parent_model]
+kind = "openai"
+model = "x"
+
+unexpected = true
+"#,
+        )
+        .expect("write invalid config");
+        let error = load_daemon_config(&root.join(DAEMON_CONFIG_FILE))
+            .expect_err("unknown root field is rejected");
         assert!(format!("{error:#}").contains("unknown field"));
         fs::remove_dir_all(root).ok();
     }
@@ -690,7 +711,8 @@ mod tests {
     #[test]
     fn missing_config_uses_stable_default_and_blank_models_fail() {
         let root = make_temp_dir("default-config");
-        let config = load_daemon_config(&root.join(CONFIG_FILE)).expect("missing config defaults");
+        let config =
+            load_daemon_config(&root.join(DAEMON_CONFIG_FILE)).expect("missing config defaults");
         assert_eq!(config.default_parent_model.kind, ProviderKind::OpenAi);
         assert_eq!(config.default_parent_model.model, "gpt-5.6-sol");
         assert_eq!(
@@ -699,12 +721,60 @@ mod tests {
         );
 
         fs::write(
-            root.join(CONFIG_FILE),
-            r#"{"default_parent_model":{"kind":"openai","model":"   "}}"#,
+            root.join(DAEMON_CONFIG_FILE),
+            r#"
+[default_parent_model]
+kind = "openai"
+model = "   "
+"#,
         )
         .expect("write blank config");
-        let error = load_daemon_config(&root.join(CONFIG_FILE)).expect_err("blank model rejected");
+        let error =
+            load_daemon_config(&root.join(DAEMON_CONFIG_FILE)).expect_err("blank model rejected");
         assert!(format!("{error:#}").contains("must not be blank"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn daemon_policy_uses_toml_and_ignores_legacy_json() {
+        let root = make_temp_dir("toml-only-config");
+        let config_root = root.join("pi-relay");
+        fs::create_dir_all(&config_root).expect("config root");
+        fs::write(config_root.join("config.json"), b"not valid JSON").expect("legacy config");
+
+        let absent = config_from_values(&root, None, None).expect("legacy JSON is ignored");
+        assert_eq!(
+            absent.daemon_config.default_parent_model.kind,
+            ProviderKind::OpenAi
+        );
+        assert_eq!(
+            absent.daemon_config.default_parent_model.model,
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            absent.daemon_config.default_parent_model.reasoning_effort,
+            ReasoningEffort::XHigh
+        );
+
+        fs::write(
+            config_root.join(DAEMON_CONFIG_FILE),
+            r#"
+[default_parent_model]
+kind = "claude"
+model = "toml-parent"
+"#,
+        )
+        .expect("TOML config");
+
+        let present = config_from_values(&root, None, None).expect("TOML config wins");
+        assert_eq!(
+            present.daemon_config.default_parent_model.kind,
+            ProviderKind::Claude
+        );
+        assert_eq!(
+            present.daemon_config.default_parent_model.model,
+            "toml-parent"
+        );
         fs::remove_dir_all(root).ok();
     }
 
@@ -713,13 +783,35 @@ mod tests {
         let root = make_temp_dir("mcp-precedence");
         let config_root = root.join("pi-relay");
         fs::create_dir_all(&config_root).expect("config root");
-        let mcp = config_root.join("mcp.json");
-        let bytes = br#"{ "servers": { "manual": {} } }"#;
+        let legacy_mcp = config_root.join("mcp.json");
+        let legacy_bytes = br#"{ "servers": { "legacy": {} } }"#;
+        fs::write(&legacy_mcp, legacy_bytes).expect("legacy MCP config");
+
+        let ignored = config_from_values(&root, None, None).expect("legacy MCP JSON is ignored");
+        assert!(ignored.mcp_config.is_none());
+        assert_eq!(
+            fs::read(&legacy_mcp).expect("legacy MCP unchanged"),
+            legacy_bytes
+        );
+
+        let mcp = config_root.join(MCP_CONFIG_FILE);
+        let bytes = br#"
+[servers.manual]
+allow_all_tools = true
+
+[servers.manual.transport]
+type = "stdio"
+command = "manual"
+"#;
         fs::write(&mcp, bytes).expect("manual MCP config");
 
         let fallback = config_from_values(&root, None, None).expect("fallback config");
         assert_eq!(fallback.mcp_config.as_deref(), Some(mcp.as_path()));
         assert_eq!(fs::read(&mcp).expect("MCP unchanged"), bytes);
+        assert_eq!(
+            fs::read(&legacy_mcp).expect("legacy MCP unchanged"),
+            legacy_bytes
+        );
 
         let env = config_from_values(&root, Some("/tmp/env-mcp.json"), None).expect("env config");
         assert_eq!(env.mcp_config, Some(PathBuf::from("/tmp/env-mcp.json")));
@@ -733,7 +825,7 @@ mod tests {
         fs::remove_dir_all(&absent_root).expect("remove absent root");
         let absent = config_from_values(&absent_root, None, None).expect("no MCP fallback");
         assert!(absent.mcp_config.is_none());
-        assert!(!absent_root.join("pi-relay/mcp.json").exists());
+        assert!(!absent_root.join("pi-relay").join(MCP_CONFIG_FILE).exists());
         fs::remove_dir_all(root).ok();
     }
 
@@ -753,8 +845,8 @@ mod tests {
         );
         let existing = config_root.join("subagent-roles/reviewer/SKILL.md");
         write_skill(&existing, "reviewer", "User reviewer");
-        let manual_mcp = config_root.join("mcp.json");
-        let mcp_bytes = b"{\"manual\":true}";
+        let manual_mcp = config_root.join(MCP_CONFIG_FILE);
+        let mcp_bytes = b"# manually managed MCP configuration\n";
         fs::write(&manual_mcp, mcp_bytes).expect("manual MCP");
 
         bootstrap_catalog(&prompt_root, &config_root).expect("bootstrap");
@@ -775,7 +867,7 @@ mod tests {
 
         let no_mcp_root = make_temp_dir("bootstrap-no-mcp");
         bootstrap_catalog(&prompt_root, &no_mcp_root).expect("bootstrap without MCP");
-        assert!(!no_mcp_root.join("mcp.json").exists());
+        assert!(!no_mcp_root.join(MCP_CONFIG_FILE).exists());
 
         fs::remove_dir_all(prompt_root).ok();
         fs::remove_dir_all(config_root).ok();
@@ -797,8 +889,8 @@ mod tests {
             "Bundled review workflow",
         );
 
-        let config = config_root.join(CONFIG_FILE);
-        let mcp = config_root.join("mcp.json");
+        let config = config_root.join(DAEMON_CONFIG_FILE);
+        let mcp = config_root.join(MCP_CONFIG_FILE);
         let sentinel = config_root.join("unrelated-sentinel");
         let role = config_root.join("subagent-roles/reviewer/SKILL.md");
         let workflow = config_root.join("workflows/review/SKILL.md");
