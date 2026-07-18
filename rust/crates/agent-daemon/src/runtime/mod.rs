@@ -966,8 +966,10 @@ impl SessionDriver {
     async fn try_delegation_barrier(&self, delegation_id: &str) {
         // `recover_if_needed` -> terminal idle -> barrier -> sibling
         // `recover_if_needed` is a recursive async cycle; box it to break the
-        // infinitely-sized future. The cycle terminates because each sibling's
-        // barrier short-circuits once the delegation is no longer `running`.
+        // infinitely-sized future. Runtime depth is bounded by
+        // `complete_delegation_if_ready`'s per-task in-flight guard: a sibling
+        // tail recovery that re-fires this same delegation's barrier is a no-op,
+        // so the sweep stays O(1) stack instead of O(subagents).
         let future = Box::pin(crate::delegation_runner::complete_delegation_if_ready(
             &self.state,
             delegation_id,

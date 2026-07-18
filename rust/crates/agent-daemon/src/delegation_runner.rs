@@ -27,6 +27,9 @@
 //! concurrent terminal children and restart repair wake the parent exactly
 //! once.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
+
 use agent_store::{Delegation, DelegationStatus, QueuedInputStatus};
 
 use crate::delegation_snapshot::{
@@ -36,6 +39,56 @@ use crate::handoff::terminal_subagent_status;
 use crate::runtime::{publish_events, SessionDriver};
 use crate::state::AppState;
 use crate::types::RpcError;
+
+tokio::task_local! {
+    // Delegation ids whose barrier is already running on THIS task's stack.
+    // `run_delegation_barrier` recovers each sibling tail via `recover_if_needed`,
+    // whose terminal-idle hook re-fires the same delegation's barrier. Without
+    // this guard that recursion nests one call frame per subagent, so a wide
+    // delegation overflows the 2 MB tokio worker stack (each frame is a large
+    // async state machine). The outermost barrier is the single authority: a
+    // re-entry for a delegation already in flight is a no-op, so the sibling
+    // sweep costs O(1) stack instead of O(subagents).
+    static IN_FLIGHT_BARRIERS: RefCell<HashSet<String>>;
+}
+
+/// Barrier entry point. Establishes the per-task re-entrancy set on the
+/// outermost call, then runs the guarded barrier; nested calls (a sibling tail
+/// recovery re-firing this delegation's barrier) reuse the existing set.
+pub(crate) async fn complete_delegation_if_ready(
+    state: &AppState,
+    delegation_id: &str,
+) -> std::result::Result<(), RpcError> {
+    if IN_FLIGHT_BARRIERS.try_with(|_| ()).is_ok() {
+        guard_delegation_barrier(state, delegation_id).await
+    } else {
+        IN_FLIGHT_BARRIERS
+            .scope(
+                RefCell::new(HashSet::new()),
+                guard_delegation_barrier(state, delegation_id),
+            )
+            .await
+    }
+}
+
+/// Deduplicate a barrier for a delegation already being completed up the stack.
+/// The outermost call runs the terminality gate after every sibling tail is
+/// recovered, so a nested re-entry only needs to return.
+async fn guard_delegation_barrier(
+    state: &AppState,
+    delegation_id: &str,
+) -> std::result::Result<(), RpcError> {
+    let newly_entered = IN_FLIGHT_BARRIERS
+        .with(|in_flight| in_flight.borrow_mut().insert(delegation_id.to_string()));
+    if !newly_entered {
+        return Ok(());
+    }
+    let result = run_delegation_barrier(state, delegation_id).await;
+    IN_FLIGHT_BARRIERS.with(|in_flight| {
+        in_flight.borrow_mut().remove(delegation_id);
+    });
+    result
+}
 
 /// Complete a delegation iff every subagent is terminal. Called from the live
 /// lifecycle hook (a child's terminal idle, with that child's `SessionDriver`
@@ -57,7 +110,7 @@ use crate::types::RpcError;
 ///   enqueue deterministic wakeup observation     # idempotent; boot repair
 ///                                                # retries after CAS/file gaps
 ///   drive the parent
-pub(crate) async fn complete_delegation_if_ready(
+async fn run_delegation_barrier(
     state: &AppState,
     delegation_id: &str,
 ) -> std::result::Result<(), RpcError> {
