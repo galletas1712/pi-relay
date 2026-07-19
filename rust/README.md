@@ -68,11 +68,11 @@ cargo run --manifest-path rust/Cargo.toml -p agent-daemon
 `pi-agentd` accepts no configuration arguments. The websocket endpoint is
 `ws://127.0.0.1:8787` unless `bind` changes it in `config.toml`.
 
-For the repository’s local stack, `infra/dev.sh` instead creates this minimal
-policy in a fresh temporary XDG config home and uses a matching temporary XDG
-state home. It always targets the compose database at
-`postgres://postgres:postgres@127.0.0.1:55432/pi_relay`, removes the temporary
-directories on exit, and never reads or writes `~/.config/pi-relay`.
+For the repository’s local stack, `infra/dev.sh` uses the caller's normal XDG
+config and state directories. It therefore starts the daemon with the same
+`config.toml`, optional `mcp.toml`, catalog overlay, managed workspaces, and
+OAuth state used outside the script. Configure `database_url` to the compose
+database shown above when using this local stack.
 
 ### Daemon configuration and packaged catalogs
 

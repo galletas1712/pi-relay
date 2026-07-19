@@ -15,19 +15,8 @@ cd "$REPO_ROOT"
 
 WEB_PORT="${WEB_PORT:-8788}"
 TAILNET_HOST="${TAILNET_HOST:-}"
-DEV_XDG_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pi-relay-dev.XXXXXX")"
-export XDG_CONFIG_HOME="$DEV_XDG_ROOT/config"
-export XDG_STATE_HOME="$DEV_XDG_ROOT/state"
-mkdir -p "$XDG_CONFIG_HOME/pi-relay"
-cat >"$XDG_CONFIG_HOME/pi-relay/config.toml" <<'EOF'
-database_url = "postgres://postgres:postgres@127.0.0.1:55432/pi_relay"
-bind = "127.0.0.1:8787"
-EOF
-
-cleanup_dev_xdg() {
-  rm -rf "$DEV_XDG_ROOT"
-}
-trap cleanup_dev_xdg EXIT
+# This is the normal local launcher: pi-agentd uses the caller's XDG
+# config/state, including config.toml, mcp.toml, catalogs, and OAuth state.
 
 bun install
 docker compose -f infra/docker-compose.yml up -d --wait
@@ -51,7 +40,6 @@ shutdown() {
   trap - EXIT INT TERM
   kill "$DAEMON_PID" "$WEB_PID" 2>/dev/null || true
   wait 2>/dev/null || true
-  cleanup_dev_xdg
 }
 trap shutdown EXIT INT TERM
 
