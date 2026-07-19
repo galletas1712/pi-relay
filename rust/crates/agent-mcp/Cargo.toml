@@ -22,6 +22,7 @@ sha2 = { workspace = true }
 sse-stream = { workspace = true }
 thiserror = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 

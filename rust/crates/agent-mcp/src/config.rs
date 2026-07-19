@@ -185,7 +185,9 @@ impl McpConfig {
         if bytes.len() as u64 > MAX_CONFIG_BYTES {
             bail!("MCP config exceeds {MAX_CONFIG_BYTES} bytes");
         }
-        let config: Self = serde_json::from_slice(&bytes)
+        let contents = std::str::from_utf8(&bytes)
+            .with_context(|| format!("parse MCP config {}", path.display()))?;
+        let config: Self = toml::from_str(contents)
             .with_context(|| format!("parse MCP config {}", path.display()))?;
         config.validate()?;
         Ok(config)

@@ -640,7 +640,7 @@ auth.rs:21-35). A fresh empty DB needs NOTHING seeded for auth.
 | rust/crates/agent-daemon/src/auth.rs | refresh_codex_credentials | 141-189 | On Codex 401, refresh via OAuth refresh_token, rewrite auth.json. |
 | rust/crates/agent-daemon/src/provider_runtime/connections.rs | ProviderConnectionRegistry / provider_for_config | 41-157 | In-memory per-session cache (HashMap), NOT a DB connections table. OpenAi needs codex_access_token; Anthropic needs anthropic_api_key. |
 | rust/crates/agent-daemon/src/provider_runtime/requests.rs | complete_model_request | 65-74 | Real dispatch: Credentials::load() then provider_for_config then complete_with_auth_retry (creds re-read every time). |
-| rust/crates/agent-daemon/src/config.rs | Config::from_env_and_args | 11-46 | --database-url (or DATABASE_URL, required), --bind (or PI_AGENTD_BIND, default 127.0.0.1:8787). NO API-key flag. |
+| rust/crates/agent-daemon/src/config.rs | Config::from_env_and_args | startup policy | Reads required XDG `config.toml` root `database_url`, optional `bind` (default `127.0.0.1:8787`), and model policy. The daemon accepts no configuration arguments. |
 | rust/crates/agent-daemon/src/main.rs | main | 55-82 | Boot: Config → connect → migrate → ProviderConnectionRegistry::new → TcpListener::bind. WebSocket RPC server. |
 | rust/crates/agent-provider/src/openai.rs | OpenAiModelCatalogCache / ModelProvider::model_metadata | provider adapter | Authenticated account-scoped private Codex catalog; exact model/effort validation and OpenAI threshold policy. |
 | rust/crates/agent-store/src/postgres/sessions_tests.rs | test_store / TestDb | 14-63 | Integration-test convention: gate PI_RELAY_TEST_DATABASE_URL, create unique DB, migrate, drop. |
@@ -833,11 +833,11 @@ feed desiredSessionIds (App.tsx:1062-1064).
 
 **There is nothing to seed in the database for auth.** Verified directly against `auth.rs:21-35`: `Credentials::load()`
 runs FRESH on every model request and reads creds ENTIRELY from the daemon PROCESS's environment + HOME filesystem. There
-is NO connections table, NO auth/login RPC, NO `--api-key` CLI flag (config.rs:11-46 has only `--database-url`/`--bind`).
+is NO connections table, NO auth/login RPC, and no daemon configuration CLI flags.
 `ProviderConnectionRegistry` (connections.rs) is an in-memory cache, not a DB table.
 
 **To let a brand-new daemon (fresh empty DB) make real GPT + Claude calls:**
-1. **Launch:** `pi-agentd --database-url postgres://.../<fresh_db> [--bind 127.0.0.1:<port>]`. `store.migrate()` fully
+1. **Launch:** create XDG `pi-relay/config.toml` with `database_url` (and optional `bind`), then run `pi-agentd` with no arguments. `store.migrate()` fully
    provisions the empty DB (idempotent create-table-if-not-exists); no auth tables involved. Daemon is a WebSocket RPC
    server (ws://<bind>).
 2. **GPT / OpenAI:** ensure the daemon process sees a Codex ChatGPT OAuth token — either `~/.codex/auth.json` with
