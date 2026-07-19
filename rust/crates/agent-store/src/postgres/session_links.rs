@@ -137,7 +137,8 @@ mod tests {
     fn session_config(project_id: Uuid) -> SessionConfig {
         SessionConfig {
             project_id: Some(project_id),
-            outer_cwd: "/tmp/pi-relay-test".to_string(),
+            runtime_id: "runtime-test".to_string(),
+            workspace_id: "/tmp/pi-relay-test".to_string(),
             workspaces: Vec::new(),
             system_prompt: String::new(),
             provider: ProviderConfig {
@@ -162,7 +163,13 @@ mod tests {
         let parent_session_id = "parent-session";
         let child_session_id = "child-session";
         db.store
-            .create_project(project_id, "session links test", &[], json!({}))
+            .create_project(
+                project_id,
+                "session links test",
+                "runtime-test",
+                &[],
+                json!({}),
+            )
             .await
             .expect("create project");
         db.store
@@ -243,7 +250,13 @@ mod tests {
         let parent_session_id = "idle-parent";
         let child_session_id = "idle-child";
         db.store
-            .create_project(project_id, "session links test", &[], json!({}))
+            .create_project(
+                project_id,
+                "session links test",
+                "runtime-test",
+                &[],
+                json!({}),
+            )
             .await
             .expect("create project");
         db.store

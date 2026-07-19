@@ -88,7 +88,7 @@ pub(super) fn prompt_context(
         .collect();
     Ok(PromptContext {
         profile,
-        cwd: PathBuf::from(&config.outer_cwd),
+        cwd: PathBuf::from(&config.workspace_id),
         has_project: config.project_id.is_some(),
         workspaces: config
             .workspaces
@@ -209,8 +209,10 @@ fn load_prompt_skills(
     config: &SessionConfig,
     profile: PromptProfile,
 ) -> Vec<Skill> {
-    let mut skills =
-        load_skills_for_session_workspaces(&PathBuf::from(&config.outer_cwd), &config.workspaces);
+    let mut skills = load_skills_for_session_workspaces(
+        &PathBuf::from(&config.workspace_id),
+        &config.workspaces,
+    );
     if profile == PromptProfile::Parent {
         extend_with_fallback_skills(
             &mut skills,
@@ -246,21 +248,21 @@ pub(super) struct ParsedSkillFile {
 #[cfg(test)]
 #[allow(dead_code)]
 pub(super) fn load_skills_for_workspace_roots(
-    outer_cwd: &Path,
+    workspace_id: &Path,
     workspace_dirs: &[String],
 ) -> Vec<Skill> {
     let workspaces = workspace_dirs
         .iter()
         .map(|workspace_dir| SessionWorkspace::local(workspace_dir.clone(), String::new()))
         .collect::<Vec<_>>();
-    load_skills_for_session_workspaces_with_home(outer_cwd, &workspaces, home_dir().as_deref())
+    load_skills_for_session_workspaces_with_home(workspace_id, &workspaces, home_dir().as_deref())
 }
 
 pub(super) fn load_skills_for_session_workspaces(
-    outer_cwd: &Path,
+    workspace_id: &Path,
     workspaces: &[SessionWorkspace],
 ) -> Vec<Skill> {
-    load_skills_for_session_workspaces_with_home(outer_cwd, workspaces, home_dir().as_deref())
+    load_skills_for_session_workspaces_with_home(workspace_id, workspaces, home_dir().as_deref())
 }
 
 pub(super) fn load_global_skills_from_dir(dir: &Path) -> Vec<Skill> {
@@ -271,7 +273,7 @@ pub(super) fn load_global_skills_from_dir(dir: &Path) -> Vec<Skill> {
 
 #[cfg(test)]
 pub(super) fn load_skills_for_workspace_roots_with_home(
-    outer_cwd: &Path,
+    workspace_id: &Path,
     workspace_dirs: &[String],
     home: Option<&Path>,
 ) -> Vec<Skill> {
@@ -279,15 +281,15 @@ pub(super) fn load_skills_for_workspace_roots_with_home(
         .iter()
         .map(|workspace_dir| SessionWorkspace::local(workspace_dir.clone(), String::new()))
         .collect::<Vec<_>>();
-    load_skills_for_session_workspaces_with_home(outer_cwd, &workspaces, home)
+    load_skills_for_session_workspaces_with_home(workspace_id, &workspaces, home)
 }
 
 pub(super) fn load_skills_for_session_workspaces_with_home(
-    outer_cwd: &Path,
+    workspace_id: &Path,
     workspaces: &[SessionWorkspace],
     home: Option<&Path>,
 ) -> Vec<Skill> {
-    let outer_cwd = normalize_existing_dir(outer_cwd);
+    let workspace_id = normalize_existing_dir(workspace_id);
     let mut skills = Vec::new();
 
     if let Some(home) = home {
@@ -296,7 +298,7 @@ pub(super) fn load_skills_for_session_workspaces_with_home(
     }
 
     for workspace in workspaces {
-        let workspace_root = outer_cwd.join(&workspace.workspace_dir);
+        let workspace_root = workspace_id.join(&workspace.workspace_dir);
         let skills_dir = workspace_root.join(".agents/skills");
         add_skills_from_agents_dir(
             &skills_dir,
@@ -572,7 +574,8 @@ mod tests {
 
         let config = SessionConfig {
             project_id: None,
-            outer_cwd: outer.to_string_lossy().to_string(),
+            runtime_id: "runtime-test".to_string(),
+            workspace_id: outer.to_string_lossy().to_string(),
             workspaces: vec![SessionWorkspace::local("repo", "")],
             system_prompt: String::new(),
             provider: agent_vocab::ProviderConfig {
@@ -641,7 +644,8 @@ mod tests {
         );
         let config = SessionConfig {
             project_id: None,
-            outer_cwd: outer.to_string_lossy().to_string(),
+            runtime_id: "runtime-test".to_string(),
+            workspace_id: outer.to_string_lossy().to_string(),
             workspaces: Vec::new(),
             system_prompt: String::new(),
             provider: agent_vocab::ProviderConfig {
@@ -732,7 +736,8 @@ mod tests {
     fn prompt_profile_subagent_flag_wins_over_parent_profile() {
         let mut config = SessionConfig {
             project_id: None,
-            outer_cwd: "/tmp".to_string(),
+            runtime_id: "runtime-test".to_string(),
+            workspace_id: "/tmp".to_string(),
             workspaces: Vec::new(),
             system_prompt: String::new(),
             provider: agent_vocab::ProviderConfig {

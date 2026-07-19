@@ -1,0 +1,22 @@
+[package]
+name = "agent-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "pi-runtime"
+path = "src/main.rs"
+
+[dependencies]
+agent-runtime-protocol = { workspace = true }
+agent-tools = { workspace = true }
+agent-vocab = { workspace = true }
+anyhow = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+

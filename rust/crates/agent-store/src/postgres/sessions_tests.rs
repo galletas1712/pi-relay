@@ -113,7 +113,8 @@ fn database_url_with_name(base: &str, name: &str) -> String {
 fn session_config(project_id: Uuid) -> SessionConfig {
     SessionConfig {
         project_id: Some(project_id),
-        outer_cwd: "/tmp".to_string(),
+        runtime_id: "runtime-test".to_string(),
+        workspace_id: "/tmp".to_string(),
         workspaces: Vec::new(),
         system_prompt: "test prompt".to_string(),
         provider: ProviderConfig {
@@ -327,7 +328,13 @@ async fn provider_route_migration_is_nullable_idempotent_and_rollback_compatible
         db.store.migrate().await?;
         let project_id = Uuid::new_v4();
         db.store
-            .create_project(project_id, "route migration", &[], json!({}))
+            .create_project(
+                project_id,
+                "route migration",
+                "runtime-test",
+                &[],
+                json!({}),
+            )
             .await?;
         let config = session_config(project_id);
         db.store.create_session("legacy-route", &config).await?;
@@ -645,7 +652,13 @@ async fn manual_compaction_failure_terminalizes_without_installing_a_checkpoint(
     let project_id = Uuid::new_v4();
     let session_id = "manual_compaction_failure";
     store
-        .create_project(project_id, "manual compaction failure", &[], json!({}))
+        .create_project(
+            project_id,
+            "manual compaction failure",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("project creates");
     create_project_session(store, project_id, session_id).await;
@@ -700,7 +713,13 @@ async fn compaction_provider_replay_round_trips_nullable_and_omitted_encrypted_c
     let store = &db.store;
     let project_id = Uuid::new_v4();
     store
-        .create_project(project_id, "compaction replay test", &[], json!({}))
+        .create_project(
+            project_id,
+            "compaction replay test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("project creates");
 
@@ -769,7 +788,13 @@ async fn subagent_type_round_trips_through_start_session_outputs() {
     let store = &db.store;
     let project_id = Uuid::new_v4();
     store
-        .create_project(project_id, "subagent type test", &[], json!({}))
+        .create_project(
+            project_id,
+            "subagent type test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("project creates");
     create_project_session(store, project_id, "session_parent").await;
@@ -825,7 +850,13 @@ async fn delete_session_rejects_active_queued_input_under_session_lock() {
     let store = &db.store;
     let project_id = Uuid::new_v4();
     store
-        .create_project(project_id, "delete guard test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delete guard test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("project creates");
     create_project_session(store, project_id, "delete_guard").await;
@@ -873,7 +904,13 @@ async fn list_sessions_sorts_by_last_user_message_timestamp() {
     let store = &db.store;
     let project_id = Uuid::new_v4();
     store
-        .create_project(project_id, "session list test", &[], json!({}))
+        .create_project(
+            project_id,
+            "session list test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("project creates");
     create_project_session(store, project_id, "session_older_created").await;

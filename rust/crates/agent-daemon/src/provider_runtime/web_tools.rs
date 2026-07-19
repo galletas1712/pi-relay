@@ -452,7 +452,8 @@ mod tests {
     fn test_session_config(provider_kind: ProviderKind, max_tokens: Option<u32>) -> SessionConfig {
         SessionConfig {
             project_id: None,
-            outer_cwd: "/tmp".to_string(),
+            runtime_id: "runtime-test".to_string(),
+            workspace_id: "/tmp".to_string(),
             workspaces: Vec::new(),
             system_prompt: String::new(),
             provider: ProviderConfig {

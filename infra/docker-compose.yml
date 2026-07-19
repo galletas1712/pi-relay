@@ -17,5 +17,38 @@ services:
       retries: 30
     restart: unless-stopped
 
+  control:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    command: ["pi-agentd"]
+    environment:
+      HOME: /root
+      XDG_CONFIG_HOME: /config
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./config/control.toml:/config/pi-relay/config.toml:ro
+      - control-state:/root/.local/state/pi-relay
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  runtime:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    command: ["pi-runtime", "/config/runtime.toml"]
+    privileged: true
+    volumes:
+      - ./config/runtime.toml:/config/runtime.toml:ro
+      - ${PI_RUNTIME_ROOT:?set PI_RUNTIME_ROOT to a host directory on btrfs}:/var/lib/pi-runtime
+      - ..:/sources/pi-relay:ro
+    depends_on:
+      - control
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  control-state:

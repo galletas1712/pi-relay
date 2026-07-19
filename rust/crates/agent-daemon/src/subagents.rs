@@ -84,20 +84,10 @@ pub(crate) async fn spawn_subagent(
     }
 
     let child_session_id = format!("session_{}", Uuid::new_v4());
-    let workspace_guard = match request.subagent_type {
-        SubagentType::Full => None,
-        SubagentType::ReadOnly => Some(
-            state
-                .workspaces
-                .acquire_cwd_mutation_guard(&parent_config.outer_cwd)
-                .await,
-        ),
-    };
-
     let role = resolve_skill_role(
         &state.prompt_root,
         &state.config_root,
-        &PathBuf::from(&parent_config.outer_cwd),
+        &PathBuf::from(&parent_config.workspace_id),
         &parent_config.workspaces,
         &request.role,
     )
@@ -107,25 +97,24 @@ pub(crate) async fn spawn_subagent(
     // A full subagent is the durable workspace's single writer for its
     // delegation: it runs against the parent's dirs in place (no fork). A
     // read-only subagent forks the parent into its own disposable snapshot.
-    let (outer_cwd, workspaces) = match request.subagent_type {
+    let (workspace_id, workspaces) = match request.subagent_type {
         SubagentType::Full => (
-            parent_config.outer_cwd.clone(),
+            parent_config.workspace_id.clone(),
             parent_config.workspaces.clone(),
         ),
         SubagentType::ReadOnly => {
+            let child_workspace_id = format!("workspace_{}", Uuid::new_v4());
             state
-                .workspaces
+                .runtime_hosts
                 .fork_session_from_parent(
                     &request.parent_session_id,
-                    &parent_config.outer_cwd,
+                    &parent_config.workspace_id,
                     &parent_config.workspaces,
-                    &child_session_id,
+                    &child_workspace_id,
                 )
                 .await?
         }
     };
-    drop(workspace_guard);
-
     let child_metadata = subagent_metadata(
         request.metadata,
         &resolved_role_name,
@@ -136,7 +125,8 @@ pub(crate) async fn spawn_subagent(
     );
     let mut child_config = SessionConfig {
         project_id: parent_config.project_id,
-        outer_cwd: outer_cwd.clone(),
+        runtime_id: parent_config.runtime_id.clone(),
+        workspace_id: workspace_id.clone(),
         workspaces,
         system_prompt: String::new(),
         provider: select_subagent_provider(
@@ -402,7 +392,7 @@ async fn cleanup_failed_spawn(
         SubagentType::Full => {}
         SubagentType::ReadOnly => {
             if let Err(workspace_error) = state
-                .workspaces
+                .runtime_hosts
                 .destroy_session_workspaces(child_session_id)
                 .await
             {

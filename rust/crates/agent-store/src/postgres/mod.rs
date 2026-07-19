@@ -10,6 +10,7 @@ mod outputs;
 mod projects;
 mod queue;
 mod rows;
+mod runtimes;
 mod schema;
 mod session_links;
 mod sessions;

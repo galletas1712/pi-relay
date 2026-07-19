@@ -14,11 +14,12 @@ mod mcp_auth;
 mod provider_runtime;
 mod rpc_views;
 mod runtime;
+mod runtime_hosts;
 mod session_start;
 mod state;
 mod subagents;
 mod types;
-mod workspaces;
+mod workspace_selection;
 
 use crate::codec::{
     from_params, parse_assistant_message, parse_user_message, required_string, required_uuid,
@@ -30,9 +31,9 @@ use crate::provider_runtime::{
     provider_tools_for_session, PromptProfile, ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::*;
+use crate::runtime_hosts::RuntimeRegistry;
 use crate::state::AppState;
 use crate::types::*;
-use crate::workspaces::{validate_remote_branch, validate_workspace_dir, WorkspaceManager};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -45,7 +46,7 @@ use agent_session::SessionInput;
 use agent_store::{
     ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventType, InputPriority,
     PostgresAgentStore, ProjectWorkspace, QueuedInputStatus, SessionConfig, SubagentType,
-    TranscriptEntryBodyMode, TranscriptEntryScope, WorkspaceKind,
+    TranscriptEntryBodyMode, TranscriptEntryScope,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -68,17 +69,18 @@ async fn main() -> Result<()> {
     repo.migrate().await?;
 
     let (events, _) = broadcast::channel(1024);
-    let workspaces = WorkspaceManager::from_default_state_dir()?;
+    let runtime_hosts = RuntimeRegistry::new(repo.clone());
     let mcp = match config.mcp_config.as_deref() {
         Some(path) => {
             McpManager::start_with_credential_file(
                 McpConfig::from_path(path)?,
-                workspaces.mcp_oauth_credentials_path(),
+                config.state_root.join("mcp-oauth-credentials.json"),
             )
             .await?
         }
         None => McpManager::disabled(),
     };
+    tokio::spawn(runtime_hosts.clone().listen(config.runtime_bind.clone()));
     let state = AppState {
         repo,
         active: Arc::new(Mutex::new(HashMap::new())),
@@ -95,7 +97,7 @@ async fn main() -> Result<()> {
         mcp,
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
-        workspaces,
+        runtime_hosts: runtime_hosts.clone(),
         prompt_root,
         config_root: config.config_root,
         daemon_config: config.daemon_config,
@@ -485,6 +487,7 @@ async fn dispatch_request(
         RpcMethod::ProjectCreate => project_create(state, params).await,
         RpcMethod::ProjectUpdate => project_update(state, params).await,
         RpcMethod::ProjectDelete => project_delete(state, params).await,
+        RpcMethod::RuntimeList => runtime_list(state).await,
         RpcMethod::SystemPrompt => system_prompt(state, params).await,
         RpcMethod::EventsSubscribe => {
             events_subscribe(state, subscriptions, event_high_water, params).await
@@ -802,7 +805,7 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
             return Err(RpcError::new("session_not_found", "session not found"));
         }
         if let Err(error) = state
-            .workspaces
+            .runtime_hosts
             .destroy_session_workspaces(candidate_session_id)
             .await
         {
@@ -891,7 +894,8 @@ async fn session_configure(
     }
     let config = SessionConfig {
         project_id: current.project_id,
-        outer_cwd: current.outer_cwd.clone(),
+        runtime_id: current.runtime_id.clone(),
+        workspace_id: current.workspace_id.clone(),
         workspaces: current.workspaces.clone(),
         system_prompt: current.system_prompt.clone(),
         provider,
@@ -956,6 +960,10 @@ async fn project_list(state: &AppState) -> std::result::Result<Value, RpcError> 
     }))
 }
 
+async fn runtime_list(state: &AppState) -> std::result::Result<Value, RpcError> {
+    Ok(json!({ "runtimes": state.runtime_hosts.list().await? }))
+}
+
 async fn project_create(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let params: ProjectWriteParams = from_params(params)?;
     let project_id = params.project_id.unwrap_or_else(Uuid::new_v4);
@@ -963,11 +971,25 @@ async fn project_create(state: &AppState, params: Value) -> std::result::Result<
     if name.is_empty() {
         return Err(RpcError::new("invalid_params", "project name is required"));
     }
-    let workspaces = validate_project_workspaces(&params.workspaces).await?;
+    state
+        .runtime_hosts
+        .require_available(&params.runtime_id)
+        .await?;
+    state
+        .runtime_hosts
+        .execute(
+            &params.runtime_id,
+            agent_runtime_protocol::RuntimeCommand::ValidateProject {
+                workspaces: params.workspaces.clone(),
+            },
+        )
+        .await?;
+    let workspaces = params.workspaces;
     let project = state
         .repo
         .create_project(
             project_id,
+            &params.runtime_id,
             name,
             &workspaces,
             params.metadata.unwrap_or_else(|| json!({})),
@@ -995,7 +1017,16 @@ async fn project_update(state: &AppState, params: Value) -> std::result::Result<
             .transpose()
             .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
             .unwrap_or_default();
-        validate_project_workspaces(&workspaces).await?
+        state
+            .runtime_hosts
+            .execute(
+                &current.runtime_id,
+                agent_runtime_protocol::RuntimeCommand::ValidateProject {
+                    workspaces: workspaces.clone(),
+                },
+            )
+            .await?;
+        workspaces
     } else {
         current.workspaces
     };
@@ -1004,7 +1035,7 @@ async fn project_update(state: &AppState, params: Value) -> std::result::Result<
         .update_project(project_id, name, &workspaces)
         .await?;
     if let Err(error) = state
-        .workspaces
+        .runtime_hosts
         .reconcile_project_bases(project_id, &project.workspaces)
         .await
     {
@@ -1015,6 +1046,7 @@ async fn project_update(state: &AppState, params: Value) -> std::result::Result<
 
 async fn project_delete(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let project_id = required_uuid(&params, "project_id")?;
+    let project = state.repo.get_project(project_id).await?;
     let deleted = state.repo.delete_empty_project(project_id).await?;
     if !deleted {
         return Err(RpcError::new(
@@ -1022,7 +1054,11 @@ async fn project_delete(state: &AppState, params: Value) -> std::result::Result<
             "project was not found or still has sessions",
         ));
     }
-    if let Err(error) = state.workspaces.remove_project_bases(project_id).await {
+    if let Err(error) = state
+        .runtime_hosts
+        .remove_project_bases(&project.runtime_id, project_id)
+        .await
+    {
         eprintln!("failed to remove workspace bases for project {project_id}: {error:#}");
     }
     Ok(json!({ "project_id": project_id, "deleted": true }))
@@ -1032,71 +1068,10 @@ async fn project_delete(state: &AppState, params: Value) -> std::result::Result<
 struct ProjectWriteParams {
     project_id: Option<Uuid>,
     name: String,
+    runtime_id: String,
     #[serde(default)]
     workspaces: Vec<ProjectWorkspace>,
     metadata: Option<Value>,
-}
-
-async fn validate_project_workspaces(
-    workspaces: &[ProjectWorkspace],
-) -> std::result::Result<Vec<ProjectWorkspace>, RpcError> {
-    if workspaces.is_empty() {
-        return Err(RpcError::new(
-            "invalid_workspace",
-            "projects require at least one workspace",
-        ));
-    }
-    let mut seen_dirs = BTreeSet::new();
-    let mut checked_workspaces = Vec::new();
-    for workspace in workspaces {
-        let workspace_dir = workspace.workspace_dir.trim();
-        validate_workspace_dir(workspace_dir)
-            .map_err(|error| RpcError::new("invalid_workspace", error.to_string()))?;
-        if !seen_dirs.insert(workspace_dir.to_string()) {
-            return Err(RpcError::new(
-                "invalid_workspace",
-                format!("duplicate workspace_dir: {workspace_dir}"),
-            ));
-        }
-        match workspace.kind {
-            WorkspaceKind::Git => {
-                let remote_url = workspace.remote_url.as_deref().unwrap_or("").trim();
-                let remote_branch = workspace.remote_branch.as_deref().unwrap_or("").trim();
-                validate_remote_branch(remote_url, remote_branch)
-                    .await
-                    .map_err(|error| RpcError::new("invalid_workspace", error.to_string()))?;
-                checked_workspaces.push(ProjectWorkspace::git(
-                    workspace_dir,
-                    remote_url,
-                    remote_branch,
-                ));
-            }
-            WorkspaceKind::Local => {
-                let source_path = workspace.source_path.as_deref().unwrap_or("").trim();
-                if source_path.is_empty() {
-                    return Err(RpcError::new(
-                        "invalid_workspace",
-                        "local workspace source_path is required",
-                    ));
-                }
-                let source_path = PathBuf::from(source_path);
-                if !source_path.is_dir() {
-                    return Err(RpcError::new(
-                        "invalid_workspace",
-                        format!(
-                            "local workspace source_path is not a directory: {}",
-                            source_path.display()
-                        ),
-                    ));
-                }
-                checked_workspaces.push(ProjectWorkspace::local(
-                    workspace_dir,
-                    source_path.to_string_lossy().into_owned(),
-                ));
-            }
-        }
-    }
-    Ok(checked_workspaces)
 }
 
 async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
@@ -1106,8 +1081,8 @@ async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<V
         .ok_or_else(|| RpcError::new("session_required", "system.prompt requires session_id"))?;
     let config = state.repo.load_session_config(session_id).await?;
     state
-        .workspaces
-        .ensure_session(session_id, &config.outer_cwd, &config.workspaces)
+        .runtime_hosts
+        .ensure_session(session_id, &config.workspace_id, &config.workspaces)
         .await?;
     Ok(json!({
         "template": current_pi_template(state)?,
@@ -1901,8 +1876,8 @@ async fn compaction_request(
     driver.ensure_idle_for_source_mutation().await?;
     let config = state.repo.load_session_config(&session_id).await?;
     state
-        .workspaces
-        .ensure_session(&session_id, &config.outer_cwd, &config.workspaces)
+        .runtime_hosts
+        .ensure_session(&session_id, &config.workspace_id, &config.workspaces)
         .await?;
     let created = state
         .repo

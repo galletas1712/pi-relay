@@ -36,6 +36,7 @@ import type {
 	TranscriptTurnDetailResult,
 	TranscriptTurnsResult,
 	ProjectWorkspace,
+	Runtime,
 } from "./types.ts";
 import type { EntryScope } from "./queryKeys.ts";
 
@@ -50,6 +51,7 @@ export interface AgentApi {
 	onEvent(handler: EventHandler): () => void;
 	onStatus(handler: StatusHandler): () => void;
 	listProjects(): Promise<Project[]>;
+	listRuntimes(): Promise<Runtime[]>;
 	createProject(params: CreateProjectParams): Promise<Project>;
 	updateProject(params: UpdateProjectParams): Promise<Project>;
 	deleteProject(projectId: string): Promise<DeleteProjectResult>;
@@ -113,6 +115,7 @@ function historyTargetPayload(params: HistoryTargetParams) {
 
 export interface CreateProjectParams {
 	name: string;
+	runtimeId: string;
 	workspaces: ProjectWorkspace[];
 	metadata?: Record<string, unknown>;
 }
@@ -158,6 +161,7 @@ export interface StartSessionWorkspace {
 export interface StartSessionParams {
 	sessionId: string;
 	projectId?: string | null;
+	runtimeId?: string | null;
 	/** Omit for a new session to use the daemon's configured parent default. */
 	provider?: ProviderConfig;
 	metadata: Record<string, unknown>;
@@ -376,6 +380,11 @@ class AgentApiClient implements AgentApi {
 		return this.client.connect();
 	}
 
+	async listRuntimes(): Promise<Runtime[]> {
+		const result = await this.client.request<{ runtimes: Runtime[] }>("runtime.list");
+		return result.runtimes;
+	}
+
 	getHistoryTargets(sessionId: string, options: HistoryTargetsOptions = {}): Promise<HistoryTargetsResult> {
 		return this.client.request<HistoryTargetsResult>("history.targets", {
 			session_id: sessionId,
@@ -447,6 +456,7 @@ class AgentApiClient implements AgentApi {
 	createProject(params: CreateProjectParams): Promise<Project> {
 		return this.client.request<Project>("project.create", {
 			name: params.name,
+			runtime_id: params.runtimeId,
 			workspaces: params.workspaces,
 			metadata: params.metadata
 		});
@@ -610,6 +620,7 @@ class AgentApiClient implements AgentApi {
 			{
 				session_id: params.sessionId,
 				project_id: params.projectId || undefined,
+				runtime_id: params.runtimeId || undefined,
 				...(params.provider ? { provider: params.provider } : {}),
 				metadata: params.metadata,
 				client_input_id: params.clientInputId,

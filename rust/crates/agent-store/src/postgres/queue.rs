@@ -1105,7 +1105,8 @@ mod tests {
     fn session_config(project_id: Uuid) -> SessionConfig {
         SessionConfig {
             project_id: Some(project_id),
-            outer_cwd: "/tmp".to_string(),
+            runtime_id: "runtime-test".to_string(),
+            workspace_id: "/tmp".to_string(),
             workspaces: Vec::new(),
             system_prompt: "test prompt".to_string(),
             provider: ProviderConfig {
@@ -1123,7 +1124,13 @@ mod tests {
     async fn create_session(store: &PostgresAgentStore, session_id: &str) -> SessionConfig {
         let project_id = Uuid::new_v4();
         store
-            .create_project(project_id, "queue mutation test", &[], json!({}))
+            .create_project(
+                project_id,
+                "queue mutation test",
+                "runtime-test",
+                &[],
+                json!({}),
+            )
             .await
             .expect("project creates");
         let config = session_config(project_id);
@@ -1528,7 +1535,13 @@ mod tests {
         let store = &db.store;
         let project_id = Uuid::new_v4();
         store
-            .create_project(project_id, "boot queue sweep test", &[], json!({}))
+            .create_project(
+                project_id,
+                "boot queue sweep test",
+                "runtime-test",
+                &[],
+                json!({}),
+            )
             .await
             .expect("project creates");
         let config = session_config(project_id);

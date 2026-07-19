@@ -11,56 +11,38 @@ use std::{
     sync::Arc,
 };
 
-use agent_store::{ProjectWorkspace, SessionWorkspace, WorkspaceKind};
-use anyhow::{anyhow, bail, Context, Result};
+use agent_runtime_protocol::{ProjectWorkspace, SessionWorkspace, WorkspaceKind};
+use anyhow::{bail, Context, Result};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
-pub(crate) use self::config::validate_workspace_dir;
+pub use self::config::validate_workspace_dir;
 use self::config::{
     branch_component, path_component, read_workspace_base_config, required_git_field,
     required_local_field, workspace_base_config, write_workspace_base_config, WorkspaceBaseConfig,
     WORKSPACE_BASE_DIR, WORKSPACE_BASE_METADATA,
 };
-pub(crate) use self::git::validate_remote_branch;
+pub use self::git::validate_remote_branch;
 use self::git::{fetch_session_branch_head, git_output, refresh_git_workspace_base, run_git};
 use self::instantiate::{
-    create_workspace_dir, destroy_workspace_tree, instantiate_workspace_from_base,
-    materialize_tree_from_source_exact_excluding,
+    create_session_subvolume, destroy_session_subvolume, populate_workspace, snapshot_session,
 };
 use self::local::refresh_local_workspace_base;
-use self::selection::SelectedWorkspace;
-pub(crate) use self::selection::{RequestedWorkspace, WorkspaceSelection};
-
-use crate::handoff::HANDOFF_DIR;
+pub use self::selection::SelectedWorkspace;
 
 // `.pi-handoff` is a sibling of the workspace dirs under the cwd root. It is
 // owned by the daemon for delegation artifact files; it is never a workspace,
 // never snapshotted into an RO fork.
 
 #[derive(Clone)]
-pub(crate) struct WorkspaceManager {
+pub struct WorkspaceManager {
     state_root: PathBuf,
     workspace_base_lock: Arc<Mutex<()>>,
     cwd_mutation_guards: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
 impl WorkspaceManager {
-    pub(crate) fn from_default_state_dir() -> Result<Self> {
-        let state_home = match std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty())
-        {
-            Some(value) => PathBuf::from(value),
-            None => {
-                let home = std::env::var_os("HOME")
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow!("HOME is required when XDG_STATE_HOME is unset"))?;
-                PathBuf::from(home).join(".local/state")
-            }
-        };
-        Ok(Self::new(state_home.join("pi-relay")))
-    }
-
-    fn new(state_root: PathBuf) -> Self {
+    pub fn new(state_root: PathBuf) -> Self {
         Self {
             state_root,
             workspace_base_lock: Arc::new(Mutex::new(())),
@@ -68,13 +50,17 @@ impl WorkspaceManager {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_tests(state_root: PathBuf) -> Self {
-        Self::new(state_root)
+    pub fn resolve(&self, workspace_id: &str) -> PathBuf {
+        self.session_root(workspace_id).join("cwd")
     }
 
-    pub(crate) fn mcp_oauth_credentials_path(&self) -> PathBuf {
-        self.state_root.join("mcp-oauth-credentials.json")
+    pub async fn validate_root(&self) -> Result<()> {
+        tokio::fs::create_dir_all(self.state_root.join("sessions")).await?;
+        let probe = self
+            .state_root
+            .join(format!(".btrfs-probe-{}", Uuid::new_v4()));
+        create_session_subvolume(&probe).await?;
+        destroy_session_subvolume(&probe).await
     }
 
     /// Serialize daemon-managed workspace-mutating tool futures and snapshots
@@ -83,12 +69,12 @@ impl WorkspaceManager {
     /// This is an in-process future-lifetime guard. It intentionally does not
     /// claim to track independently running background processes after their
     /// daemon-managed tool future has returned or been dropped.
-    pub(crate) async fn acquire_cwd_mutation_guard(&self, outer_cwd: &str) -> OwnedMutexGuard<()> {
+    pub async fn acquire_cwd_mutation_guard(&self, workspace_id: &str) -> OwnedMutexGuard<()> {
         let guard = {
             let mut guards = self.cwd_mutation_guards.lock().await;
             guards.retain(|_, guard| Arc::strong_count(guard) > 1);
             guards
-                .entry(PathBuf::from(outer_cwd))
+                .entry(PathBuf::from(workspace_id))
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
@@ -104,56 +90,61 @@ impl WorkspaceManager {
     /// each paired with an optional git branch override; the workspaces must be a
     /// subset of `project_workspaces` (callers resolve this via
     /// [`WorkspaceSelection::resolve`]).
-    pub(crate) async fn materialize_session(
+    pub async fn materialize_session(
         &self,
         project_id: Uuid,
-        session_id: &str,
+        workspace_id: &str,
         project_workspaces: &[ProjectWorkspace],
         selected_workspaces: &[SelectedWorkspace],
     ) -> Result<(String, Vec<SessionWorkspace>)> {
-        let root = self.session_root(session_id);
+        let root = self.session_root(workspace_id);
         if root.exists() {
-            tokio::fs::remove_dir_all(&root).await?;
+            bail!("session workspace already exists: {}", root.display());
         }
+        tokio::fs::create_dir_all(&root).await?;
         let cwd = root.join("cwd");
-        tokio::fs::create_dir_all(&cwd).await?;
-        let _workspace_base_guard = self.workspace_base_lock.lock().await;
-        self.remove_stale_workspace_bases(project_id, project_workspaces)
-            .await?;
-        let mut workspaces = Vec::with_capacity(selected_workspaces.len());
-        for selected in selected_workspaces {
-            workspaces.push(
-                self.materialize_workspace(
-                    project_id,
-                    session_id,
-                    &cwd,
-                    &selected.workspace,
-                    selected.branch_override.as_deref(),
-                )
-                .await?,
-            );
+        create_session_subvolume(&cwd).await?;
+        // Any failure after the cwd subvolume exists must tear the whole session
+        // tree down; otherwise a partial materialize leaks a btrfs subvolume that
+        // no later call reclaims (every session uses a fresh workspace_id).
+        let materialized = async {
+            let _workspace_base_guard = self.workspace_base_lock.lock().await;
+            self.remove_stale_workspace_bases(project_id, project_workspaces)
+                .await?;
+            let mut workspaces = Vec::with_capacity(selected_workspaces.len());
+            for selected in selected_workspaces {
+                workspaces.push(
+                    self.materialize_workspace(
+                        project_id,
+                        workspace_id,
+                        &cwd,
+                        &selected.workspace,
+                        selected.branch_override.as_deref(),
+                    )
+                    .await?,
+                );
+            }
+            Ok::<_, anyhow::Error>(workspaces)
         }
-        Ok((cwd.to_string_lossy().into_owned(), workspaces))
+        .await;
+        match materialized {
+            Ok(workspaces) => Ok((workspace_id.to_string(), workspaces)),
+            Err(error) => {
+                let _ = self.destroy_session_workspaces(workspace_id).await;
+                Err(error)
+            }
+        }
     }
 
-    pub(crate) async fn ensure_session(
+    pub async fn ensure_session(
         &self,
-        session_id: &str,
-        outer_cwd: &str,
+        workspace_id: &str,
         workspaces: &[SessionWorkspace],
     ) -> Result<()> {
         if workspaces.is_empty() {
             return Ok(());
         }
-        let own_cwd = self.session_root(session_id).join("cwd");
-        let cwd = PathBuf::from(outer_cwd);
-        // A `full` subagent runs against its parent's workspace dirs in place, so
-        // its configured outer_cwd lives under the parent's session root, not its
-        // own. Those dirs already exist; only materialize the tree for a session
-        // that owns its cwd. The workspaces below are validated either way.
-        if cwd == own_cwd {
-            tokio::fs::create_dir_all(&cwd).await?;
-        }
+        let cwd = self.resolve(workspace_id);
         for workspace in workspaces {
             validate_workspace_dir(&workspace.workspace_dir)?;
             let target = cwd.join(&workspace.workspace_dir);
@@ -170,21 +161,9 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    pub(crate) async fn ensure_session_owns_cwd(
-        &self,
-        session_id: &str,
-        outer_cwd: &str,
-    ) -> Result<()> {
-        let session_root = self.session_root(session_id);
+    pub async fn ensure_session_owns_cwd(&self, workspace_id: &str) -> Result<()> {
+        let session_root = self.session_root(workspace_id);
         let expected = session_root.join("cwd");
-        let actual = Path::new(outer_cwd);
-        if actual != expected {
-            bail!(
-                "session cwd is not managed by this session: expected {}, got {}",
-                expected.display(),
-                actual.display()
-            );
-        }
         let root_metadata = tokio::fs::symlink_metadata(&session_root)
             .await
             .with_context(|| format!("inspect managed session root {}", session_root.display()))?;
@@ -206,21 +185,20 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    pub(crate) async fn fork_session_from_parent(
+    pub async fn fork_session_from_parent(
         &self,
-        parent_session_id: &str,
-        parent_outer_cwd: &str,
+        parent_workspace_id: &str,
         parent_workspaces: &[SessionWorkspace],
-        child_session_id: &str,
+        child_workspace_id: &str,
     ) -> Result<(String, Vec<SessionWorkspace>)> {
-        if parent_session_id == child_session_id {
+        if parent_workspace_id == child_workspace_id {
             bail!("child session id must differ from parent session id");
         }
-        self.ensure_session(parent_session_id, parent_outer_cwd, parent_workspaces)
+        self.ensure_session(parent_workspace_id, parent_workspaces)
             .await?;
 
-        let child_root = self.session_root(child_session_id);
-        let parent_cwd = PathBuf::from(parent_outer_cwd);
+        let child_root = self.session_root(child_workspace_id);
+        let parent_cwd = self.resolve(parent_workspace_id);
         if child_root.starts_with(&parent_cwd) {
             bail!(
                 "child session root {} must not be inside parent cwd {}",
@@ -239,22 +217,17 @@ impl WorkspaceManager {
             .with_context(|| format!("create child session root {}", child_root.display()))?;
 
         let result = async {
-            self.ensure_session_owns_cwd(parent_session_id, parent_outer_cwd)
-                .await?;
+            self.ensure_session_owns_cwd(parent_workspace_id).await?;
             let child_cwd = child_root.join("cwd");
-            materialize_tree_from_source_exact_excluding(
-                &parent_cwd,
-                &child_cwd,
-                HANDOFF_DIR.as_ref(),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "fork parent session cwd {} to child cwd {}",
-                    parent_cwd.display(),
-                    child_cwd.display()
-                )
-            })?;
+            snapshot_session(&parent_cwd, &child_cwd)
+                .await
+                .with_context(|| {
+                    format!(
+                        "fork parent session cwd {} to child cwd {}",
+                        parent_cwd.display(),
+                        child_cwd.display()
+                    )
+                })?;
 
             let mut child_workspaces = Vec::with_capacity(parent_workspaces.len());
             for workspace in parent_workspaces {
@@ -263,7 +236,7 @@ impl WorkspaceManager {
                 let mut child_workspace = workspace.clone();
                 if workspace.kind == WorkspaceKind::Git {
                     validate_git_workspace_isolated(&child_workspace_root).await?;
-                    let local_branch = local_branch(child_session_id, &workspace.workspace_dir);
+                    let local_branch = local_branch(child_workspace_id, &workspace.workspace_dir);
                     let head = git_output(&child_workspace_root, ["rev-parse", "HEAD"]).await?;
                     run_git(
                         &child_workspace_root,
@@ -275,12 +248,12 @@ impl WorkspaceManager {
                 child_workspaces.push(child_workspace);
             }
 
-            Ok((child_cwd.to_string_lossy().into_owned(), child_workspaces))
+            Ok((child_workspace_id.to_string(), child_workspaces))
         }
         .await;
         match result {
             Ok(result) => Ok(result),
-            Err(error) => match destroy_workspace_tree(&child_root).await {
+            Err(error) => match self.destroy_session_workspaces(child_workspace_id).await {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => {
                     Err(error.context(format!("clean up failed fork: {cleanup_error:#}")))
@@ -293,13 +266,19 @@ impl WorkspaceManager {
     /// subvolumes created while instantiating or forking it. This is the single
     /// teardown primitive; callers that only want directory removal still route
     /// through it so subvolume metadata is never leaked.
-    pub(crate) async fn destroy_session_workspaces(&self, session_id: &str) -> Result<()> {
-        let root = self.session_root(session_id);
-        destroy_workspace_tree(&root).await?;
-        Ok(())
+    pub async fn destroy_session_workspaces(&self, workspace_id: &str) -> Result<()> {
+        let root = self.session_root(workspace_id);
+        destroy_session_subvolume(&root.join("cwd")).await?;
+        // Idempotent: a re-issued teardown (or the materialize cleanup path
+        // above) may find the root already gone.
+        match tokio::fs::remove_dir(&root).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
-    pub(crate) async fn reconcile_project_bases(
+    pub async fn reconcile_project_bases(
         &self,
         project_id: Uuid,
         project_workspaces: &[ProjectWorkspace],
@@ -311,7 +290,7 @@ impl WorkspaceManager {
             .await
     }
 
-    pub(crate) async fn remove_project_bases(&self, project_id: Uuid) -> Result<()> {
+    pub async fn remove_project_bases(&self, project_id: Uuid) -> Result<()> {
         let _workspace_base_guard = self.workspace_base_lock.lock().await;
         let root = self.workspace_bases_root(project_id);
         if root.exists() {
@@ -412,7 +391,7 @@ impl WorkspaceManager {
             .await
             .with_context(|| format!("create workspace base slot {}", slot.display()))?;
         if !base_path.exists() {
-            create_workspace_dir(&base_path).await?;
+            tokio::fs::create_dir_all(&base_path).await?;
         }
 
         match config.kind {
@@ -472,7 +451,7 @@ impl WorkspaceManager {
         }
         let local_branch = local_branch(session_id, workspace_dir);
 
-        instantiate_workspace_from_base(&base.path, &target).await?;
+        populate_workspace(&base.path, &target).await?;
         // The session copy inherits the base's branch by default; an override fetches
         // the requested branch into this session's copy only, leaving the shared base
         // on the project's configured branch.
@@ -510,7 +489,7 @@ impl WorkspaceManager {
         if target.exists() {
             bail!("session workspace already exists: {}", target.display());
         }
-        instantiate_workspace_from_base(&base.path, &target).await?;
+        populate_workspace(&base.path, &target).await?;
         Ok(SessionWorkspace::local(workspace_dir, source_path))
     }
 }
@@ -571,7 +550,3 @@ async fn canonicalize_git_path(workspace_root: &Path, git_path: &str) -> Result<
         .await
         .with_context(|| format!("canonicalize git path {}", path.display()))
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

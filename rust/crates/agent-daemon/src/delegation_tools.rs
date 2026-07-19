@@ -770,7 +770,7 @@ async fn cancel_subagent_without_reactivation(
     state.active.lock().await.remove(session_id);
     if subagent_type == Some(SubagentType::ReadOnly) {
         if let Err(error) = state
-            .workspaces
+            .runtime_hosts
             .destroy_session_workspaces(session_id)
             .await
         {
@@ -1010,7 +1010,7 @@ async fn write_cancelled_subagent_transcripts(
         .load_session_config(&delegation.parent_session_id)
         .await?;
     let delegation_segment = safe_path_segment(&delegation.id, "delegation_id")?;
-    let handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation_segment);
+    let handoff_dir = delegation_dir(&parent_config.workspace_id, &delegation_segment);
     let dir = handoff_dir.join("cancelled");
     let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
     let mut transcript_refs = Vec::with_capacity(subagents.len());
@@ -1220,17 +1220,17 @@ fn safe_path_segment(segment: &str, field: &str) -> std::result::Result<String, 
 }
 
 /// Resolve a handoff file request to an absolute path strictly under
-/// `<parent_outer_cwd>/.pi-handoff/<delegation_id>/`. The request was already
+/// `<parent_workspace_id>/.pi-handoff/<delegation_id>/`. The request was already
 /// parsed into a closed vocabulary; every dynamic segment (`delegation_id` and
 /// `subagent_id`) is validated as a single safe path component, so the result
 /// can never traverse out of the handoff subtree.
 fn resolve_handoff_file_path(
-    parent_outer_cwd: &str,
+    parent_workspace_id: &str,
     delegation_id: &str,
     request: HandoffFileRequest<'_>,
 ) -> std::result::Result<PathBuf, RpcError> {
     let delegation_segment = safe_path_segment(delegation_id, "delegation_id")?;
-    let mut path = delegation_dir(parent_outer_cwd, &delegation_segment);
+    let mut path = delegation_dir(parent_workspace_id, &delegation_segment);
     match request {
         HandoffFileRequest::Normal { subagent_id, file } => {
             path.push(safe_path_segment(subagent_id, "subagent_id")?);
@@ -1278,7 +1278,7 @@ pub(crate) async fn read_handoff_file_core(
             }
         ) {
             let parent_config = state.repo.load_session_config(parent_session_id).await?;
-            let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+            let dir = delegation_dir(&parent_config.workspace_id, &delegation.id);
             let subagent_id = request.subagent_id();
             let member = members
                 .iter()
@@ -1328,11 +1328,11 @@ pub(crate) async fn read_handoff_file_core(
         return Err(unavailable_handoff_file_error(delegation.status));
     }
     let parent_config = state.repo.load_session_config(parent_session_id).await?;
-    let path = resolve_handoff_file_path(&parent_config.outer_cwd, &delegation.id, request)?;
+    let path = resolve_handoff_file_path(&parent_config.workspace_id, &delegation.id, request)?;
     // Defense in depth: confine the symlink-resolved target under the parent's
     // handoff dir so a symlink planted inside it cannot escape to an arbitrary
     // host file. Segment validation above already blocks `..`/abs paths.
-    let handoff_root_path = handoff_root(&parent_config.outer_cwd);
+    let handoff_root_path = handoff_root(&parent_config.workspace_id);
     let canonical = match tokio::fs::canonicalize(&path).await {
         Ok(canonical) => canonical,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

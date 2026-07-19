@@ -29,7 +29,7 @@ async fn inspectable_handoff_artifacts(
         .repo
         .load_session_config(&delegation.parent_session_id)
         .await?;
-    let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+    let dir = delegation_dir(&parent_config.workspace_id, &delegation.id);
     let include_final_messages = matches!(
         delegation.status,
         DelegationStatus::Running | DelegationStatus::Done | DelegationStatus::DoneWithFailures

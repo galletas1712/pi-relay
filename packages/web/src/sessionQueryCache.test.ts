@@ -193,7 +193,8 @@ function summary(
 	return {
 		session_id: options.sessionId ?? sessionId,
 		project_id: projectId,
-		outer_cwd: "/repo",
+		runtime_id: "runtime-test",
+	workspace_id: "workspace-test",
 		workspaces: [],
 		activity: "idle",
 		active_leaf_id: null,
@@ -219,7 +220,8 @@ function snapshotFixture(): SessionSnapshot {
 	return {
 		session_id: sessionId,
 		project_id: projectId,
-		outer_cwd: "/repo",
+		runtime_id: "runtime-test",
+	workspace_id: "workspace-test",
 		workspaces: [],
 		activity: "idle",
 		active_leaf_id: null,

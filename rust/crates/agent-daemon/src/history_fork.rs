@@ -29,27 +29,17 @@ pub(crate) async fn fork(state: &AppState, params: Value) -> Result<Value, RpcEr
         }
     };
 
-    let (outer_cwd, workspaces) = {
-        let _workspace_guard = state
-            .workspaces
-            .acquire_cwd_mutation_guard(&config.outer_cwd)
-            .await;
-        state
-            .workspaces
-            .ensure_session_owns_cwd(&target.session_id, &config.outer_cwd)
-            .await
-            .map_err(|error| RpcError::new("workspace_unmanaged", error.to_string()))?;
-        state
-            .workspaces
-            .fork_session_from_parent(
-                &target.session_id,
-                &config.outer_cwd,
-                &config.workspaces,
-                &child_session_id,
-            )
-            .await?
-    };
-    config.outer_cwd = outer_cwd;
+    let child_workspace_id = format!("workspace_{}", Uuid::new_v4());
+    let (workspace_id, workspaces) = state
+        .runtime_hosts
+        .fork_session_from_parent(
+            &target.session_id,
+            &config.workspace_id,
+            &config.workspaces,
+            &child_workspace_id,
+        )
+        .await?;
+    config.workspace_id = workspace_id;
     config.workspaces = workspaces;
     config.metadata = fork_metadata(
         config.metadata,
@@ -76,8 +66,13 @@ pub(crate) async fn fork(state: &AppState, params: Value) -> Result<Value, RpcEr
         Ok(result) => result,
         Err(error) => {
             if let Err(cleanup_error) = state
-                .workspaces
-                .destroy_session_workspaces(&child_session_id)
+                .runtime_hosts
+                .execute(
+                    &config.runtime_id,
+                    agent_runtime_protocol::RuntimeCommand::DestroySession {
+                        workspace_id: child_workspace_id,
+                    },
+                )
                 .await
             {
                 eprintln!(

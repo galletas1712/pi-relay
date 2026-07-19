@@ -137,7 +137,8 @@ fn session_config_with_task(
     }
     SessionConfig {
         project_id: Some(project_id),
-        outer_cwd: "/tmp/pi-relay-test".to_string(),
+        runtime_id: "runtime-test".to_string(),
+        workspace_id: "/tmp/pi-relay-test".to_string(),
         workspaces: Vec::new(),
         system_prompt: String::new(),
         provider: ProviderConfig {
@@ -242,7 +243,13 @@ async fn create_delegation_persists_kind_status_and_attempt() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -294,7 +301,13 @@ async fn concurrent_delegation_creation_allows_only_one_running_row() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegation creation race", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegation creation race",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -382,7 +395,13 @@ async fn list_delegation_subagents_for_context_is_bounded_and_ordered() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -436,7 +455,13 @@ async fn parent_has_running_delegation_tracks_status() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -479,7 +504,13 @@ async fn parent_delegations_include_complete_parent_set_across_statuses() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -581,7 +612,13 @@ async fn delegation_progress_is_lightweight_and_counts_terminal_failures() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -676,7 +713,13 @@ async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact()
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations newest list test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations newest list test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -800,7 +843,13 @@ async fn list_delegation_subagents_returns_only_its_members() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -885,7 +934,13 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -986,7 +1041,13 @@ async fn completion_and_scoped_steer_have_one_invariant_safe_winner() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "completion steer race", &[], json!({}))
+        .create_project(
+            project_id,
+            "completion steer race",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -1063,7 +1124,13 @@ async fn combined_control_phases_block_mailbox_and_fence_newer_action_generation
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "combined control phases", &[], json!({}))
+        .create_project(
+            project_id,
+            "combined control phases",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -1350,7 +1417,13 @@ async fn atomic_cancel_is_attempt_fenced_and_terminal_safe() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -1509,7 +1582,13 @@ async fn cancel_running_delegation_atomically_cancels_queued_partial_wakeup() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -1652,7 +1731,13 @@ async fn cancellation_and_boundary_control_reconciliation_do_not_deadlock() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "cancellation lock order", &[], json!({}))
+        .create_project(
+            project_id,
+            "cancellation lock order",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
 
@@ -1804,7 +1889,13 @@ async fn all_terminal_predicate_and_boot_sweep() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -1904,6 +1995,7 @@ async fn queued_input_on_boundary_subagent_blocks_delegation_terminality() {
     db.store
         .create_project(
             project_id,
+            "runtime-test",
             "delegations queued terminality test",
             &[],
             json!({}),
@@ -2004,7 +2096,13 @@ async fn enqueue_delegation_observation_event_uses_minimal_payload_and_queue_pro
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
@@ -2069,7 +2167,13 @@ async fn partial_delegation_observation_suppresses_duplicate_active_wakeups_tran
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "delegations test", &[], json!({}))
+        .create_project(
+            project_id,
+            "delegations test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;

@@ -2,54 +2,6 @@ use std::path::{Component, Path};
 
 use anyhow::{Context, Result};
 
-pub(super) fn copy_symlink_target(source_path: &Path, target_path: &Path) -> Result<()> {
-    let target = std::fs::read_link(source_path)
-        .with_context(|| format!("read symlink {}", source_path.display()))?;
-    if !is_safe_relative_symlink(&target) {
-        write_skipped_symlink_marker(target_path, &target)?;
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&target, target_path).with_context(|| {
-            format!(
-                "copy symlink {} to {}",
-                source_path.display(),
-                target_path.display()
-            )
-        })?;
-    }
-    #[cfg(windows)]
-    {
-        let resolved = if target.is_absolute() {
-            target
-        } else {
-            source_path
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .join(target)
-        };
-        if resolved.is_dir() {
-            std::os::windows::fs::symlink_dir(&resolved, target_path).with_context(|| {
-                format!(
-                    "copy directory symlink {} to {}",
-                    source_path.display(),
-                    target_path.display()
-                )
-            })?;
-        } else {
-            std::os::windows::fs::symlink_file(&resolved, target_path).with_context(|| {
-                format!(
-                    "copy file symlink {} to {}",
-                    source_path.display(),
-                    target_path.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
 pub(super) async fn sanitize_copied_tree(target: &Path) -> Result<()> {
     let target = target.to_path_buf();
     tokio::task::spawn_blocking(move || sanitize_copied_tree_blocking(&target))

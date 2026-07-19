@@ -783,6 +783,16 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		enabled: connection === "open",
 	});
 	const projects = projectsQuery.data ?? [];
+	const runtimesQuery = useQuery({
+		queryKey: queryKeys.runtimes,
+		queryFn: () => {
+			assertConnectionReadAllowed();
+			return api.listRuntimes();
+		},
+		enabled: connection === "open",
+		refetchInterval: 10_000,
+	});
+	const runtimes = runtimesQuery.data ?? [];
 	const retainedProjectsErrorRef = useRef<unknown>(null);
 	if (projectsQuery.error) {
 		retainedProjectsErrorRef.current = projectsQuery.error;
@@ -3295,6 +3305,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const params = {
 				sessionId,
 				projectId,
+				runtimeId: projectId
+					? undefined
+					: runtimes.find((runtime) => runtime.online)?.runtime_id,
 				provider: newSessionProviderWasExplicit ? newSessionProvider : undefined,
 				metadata: {
 					title,
@@ -3937,15 +3950,17 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		setProjectDialog({
 			mode: "create",
 			name: "",
+			runtimeId: runtimes.find((runtime) => runtime.online)?.runtime_id ?? "",
 			workspaces: selectedProject ? selectedProject.workspaces.map(workspaceDraftFromProject) : [newWorkspaceDraft()],
 			saving: false,
 		});
-	}, [selectedProject]);
+	}, [runtimes, selectedProject]);
 	const openEditProjectDialog = useCallback((project: Project) => {
 		setProjectDialog({
 			mode: "edit",
 			projectId: project.project_id,
 			name: projectTitle(project),
+			runtimeId: project.runtime_id ?? "",
 			workspaces: project.workspaces.map(workspaceDraftFromProject),
 			saving: false,
 		});
@@ -3966,6 +3981,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				projectDialog.mode === "create"
 					? await api.createProject({
 							name,
+							runtimeId: projectDialog.runtimeId ?? "",
 							workspaces,
 							metadata: { created_by: "web" },
 						})
@@ -4628,6 +4644,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			{projectDialog ? (
 				<ProjectDialog
 					state={projectDialog}
+					runtimes={runtimes}
 					onChange={(patch) => setProjectDialog((current) => (current ? { ...current, ...patch } : current))}
 					returnFocusFallbackRef={sidebarDialogReturnFocusRef}
 					onClose={closeProjectDialog}

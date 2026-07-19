@@ -22,6 +22,19 @@ const TITLE_SIDECAR_TIMEOUT_SECS: u64 = 45;
 #[derive(Clone, Default)]
 pub(crate) struct SessionTitleScheduler {
     pending: Arc<StdMutex<HashMap<String, PendingTitleRefresh>>>,
+    disabled: bool,
+}
+
+impl SessionTitleScheduler {
+    /// A scheduler that never spawns title-refresh workers, so tests stay
+    /// hermetic and never make provider catalog network calls.
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self {
+            pending: Default::default(),
+            disabled: true,
+        }
+    }
 }
 
 fn pending_generation_matches(state: &AppState, session_id: &str, generation: u64) -> bool {
@@ -52,7 +65,7 @@ pub(crate) fn schedule_session_title_refresh_for_model_turn(
     model_context: &ModelContext,
     mcp_snapshot: &McpSessionSnapshot,
 ) {
-    if session_title_disabled(config) {
+    if state.session_titles.disabled || session_title_disabled(config) {
         return;
     }
     let Some(prompt) = title_prompt_for_model_turn(turn_id, model_context) else {

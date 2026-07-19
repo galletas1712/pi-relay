@@ -15,7 +15,7 @@ use super::prompt::{
 pub(crate) fn load_skill_result(
     prompt_root: &Path,
     config_root: &Path,
-    outer_cwd: &Path,
+    workspace_id: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
@@ -24,7 +24,7 @@ pub(crate) fn load_skill_result(
     match load_skill_output(
         prompt_root,
         config_root,
-        outer_cwd,
+        workspace_id,
         workspaces,
         loaded_skills,
         call,
@@ -51,7 +51,7 @@ fn is_packaged_workflow_skill(
 fn load_skill_output(
     prompt_root: &Path,
     config_root: &Path,
-    outer_cwd: &Path,
+    workspace_id: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
@@ -60,7 +60,7 @@ fn load_skill_output(
     load_skill_output_with_home(
         prompt_root,
         config_root,
-        outer_cwd,
+        workspace_id,
         workspaces,
         loaded_skills,
         call,
@@ -69,10 +69,11 @@ fn load_skill_output(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_skill_output_with_home(
     prompt_root: &Path,
     config_root: &Path,
-    outer_cwd: &Path,
+    workspace_id: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
@@ -86,9 +87,9 @@ fn load_skill_output_with_home(
     }
     let mut skills = match home {
         Some(home) => {
-            load_skills_for_session_workspaces_with_home(outer_cwd, workspaces, Some(home))
+            load_skills_for_session_workspaces_with_home(workspace_id, workspaces, Some(home))
         }
-        None => load_skills_for_session_workspaces(outer_cwd, workspaces),
+        None => load_skills_for_session_workspaces(workspace_id, workspaces),
     };
     if profile == PromptProfile::Parent {
         extend_with_fallback_skills(
@@ -174,7 +175,7 @@ pub(crate) struct ResolvedSkillRole {
 pub(crate) fn resolve_skill_role(
     prompt_root: &Path,
     config_root: &Path,
-    outer_cwd: &Path,
+    workspace_id: &Path,
     workspaces: &[SessionWorkspace],
     name: &str,
 ) -> Result<ResolvedSkillRole> {
@@ -182,7 +183,7 @@ pub(crate) fn resolve_skill_role(
     if name.is_empty() {
         return Err(anyhow!("role name cannot be empty"));
     }
-    let skills = load_skills_for_session_workspaces(outer_cwd, workspaces);
+    let skills = load_skills_for_session_workspaces(workspace_id, workspaces);
 
     let mut exposed_matches = skills
         .iter()
@@ -238,8 +239,8 @@ mod tests {
 
     #[test]
     fn load_skill_result_loads_content_once() {
-        let outer_cwd = make_temp_dir("load-skill");
-        let workspace = outer_cwd.join("repo");
+        let workspace_id = make_temp_dir("load-skill");
+        let workspace = workspace_id.join("repo");
         let skill_dir = workspace.join(".agents/skills/rust-refactor");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
@@ -257,9 +258,9 @@ mod tests {
         let workspaces = vec![SessionWorkspace::local("repo", "")];
 
         let first = load_skill_result(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &workspaces,
             &loaded,
             &call,
@@ -276,9 +277,9 @@ mod tests {
 
         loaded.insert(skill_identifier(Some("repo"), "rust-refactor"));
         let second = load_skill_result(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &workspaces,
             &loaded,
             &call,
@@ -290,13 +291,13 @@ mod tests {
         assert_eq!(second_json["name"], "repo/rust-refactor");
         assert!(second_json.get("content").is_none());
 
-        std::fs::remove_dir_all(outer_cwd).ok();
+        std::fs::remove_dir_all(workspace_id).ok();
     }
 
     #[test]
     fn load_skill_result_rejects_workspace_argument() {
-        let outer_cwd = make_temp_dir("load-skill-workspace-arg-rejected");
-        let workspace = outer_cwd.join("repo");
+        let workspace_id = make_temp_dir("load-skill-workspace-arg-rejected");
+        let workspace = workspace_id.join("repo");
         let skill_dir = workspace.join(".agents/skills/rust-refactor");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
@@ -314,9 +315,9 @@ mod tests {
         let workspaces = vec![SessionWorkspace::local("repo", "")];
 
         let result = load_skill_result(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &workspaces,
             &loaded,
             &call,
@@ -325,13 +326,13 @@ mod tests {
         assert_eq!(result.status, agent_vocab::ToolResultStatus::Error);
         assert!(result.output.contains("unknown field `workspace`"));
 
-        std::fs::remove_dir_all(outer_cwd).ok();
+        std::fs::remove_dir_all(workspace_id).ok();
     }
 
     #[test]
     fn load_skill_result_rejects_unprefixed_workspace_skill() {
-        let outer_cwd = make_temp_dir("load-skill-unprefixed-workspace-rejected");
-        let workspace = outer_cwd.join("repo");
+        let workspace_id = make_temp_dir("load-skill-unprefixed-workspace-rejected");
+        let workspace = workspace_id.join("repo");
         let skill_dir = workspace.join(".agents/skills/rust-refactor");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
@@ -349,9 +350,9 @@ mod tests {
         let workspaces = vec![SessionWorkspace::local("repo", "")];
 
         let result = load_skill_result(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &workspaces,
             &loaded,
             &call,
@@ -360,14 +361,14 @@ mod tests {
         assert_eq!(result.status, agent_vocab::ToolResultStatus::Error);
         assert!(result.output.contains("skill not found: rust-refactor"));
 
-        std::fs::remove_dir_all(outer_cwd).ok();
+        std::fs::remove_dir_all(workspace_id).ok();
     }
 
     #[test]
     fn workflow_skills_load_but_do_not_resolve_as_packaged_roles() {
         let prompt_root = make_temp_dir("load-workflow-skill");
-        let outer_cwd = prompt_root.join("outer");
-        std::fs::create_dir_all(&outer_cwd).expect("outer cwd");
+        let workspace_id = prompt_root.join("outer");
+        std::fs::create_dir_all(&workspace_id).expect("outer cwd");
         let skill_dir = prompt_root.join("workflows/workflow-only-test-role");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
@@ -386,7 +387,7 @@ mod tests {
         let result = load_skill_result(
             &prompt_root,
             &prompt_root,
-            &outer_cwd,
+            &workspace_id,
             &[],
             &loaded,
             &call,
@@ -405,7 +406,7 @@ mod tests {
         let error = resolve_skill_role(
             &prompt_root,
             &prompt_root,
-            &outer_cwd,
+            &workspace_id,
             &[],
             "workflow-only-test-role",
         )
@@ -421,8 +422,8 @@ mod tests {
     fn config_catalog_overrides_bundled_workflows_and_roles_without_duplicates() {
         let prompt_root = make_temp_dir("bundled-catalog");
         let config_root = make_temp_dir("config-catalog");
-        let outer_cwd = prompt_root.join("outer");
-        std::fs::create_dir_all(&outer_cwd).expect("outer cwd");
+        let workspace_id = prompt_root.join("outer");
+        std::fs::create_dir_all(&workspace_id).expect("outer cwd");
         write_role(
             &prompt_root.join("workflows/review/SKILL.md"),
             "review",
@@ -462,7 +463,7 @@ mod tests {
         let result = load_skill_result(
             &prompt_root,
             &config_root,
-            &outer_cwd,
+            &workspace_id,
             &[],
             &std::collections::BTreeSet::new(),
             &call,
@@ -478,7 +479,7 @@ mod tests {
         let fallback = load_skill_result(
             &prompt_root,
             &config_root,
-            &outer_cwd,
+            &workspace_id,
             &[],
             &std::collections::BTreeSet::new(),
             &fallback_call,
@@ -487,12 +488,12 @@ mod tests {
         assert_eq!(fallback.status, agent_vocab::ToolResultStatus::Success);
         assert!(fallback.output.contains("Fallback workflow body."));
 
-        let role = resolve_skill_role(&prompt_root, &config_root, &outer_cwd, &[], "reviewer")
+        let role = resolve_skill_role(&prompt_root, &config_root, &workspace_id, &[], "reviewer")
             .expect("configured role resolves");
         assert_eq!(role.description, "Configured reviewer");
         assert!(role.content.contains("Configured reviewer body."));
 
-        let workspace_role = outer_cwd.join("repo/.agents/skills/reviewer/SKILL.md");
+        let workspace_role = workspace_id.join("repo/.agents/skills/reviewer/SKILL.md");
         write_role(
             &workspace_role,
             "reviewer",
@@ -502,7 +503,7 @@ mod tests {
         let role = resolve_skill_role(
             &prompt_root,
             &config_root,
-            &outer_cwd,
+            &workspace_id,
             &[SessionWorkspace::local("repo", "")],
             "repo/reviewer",
         )
@@ -516,8 +517,8 @@ mod tests {
     #[test]
     fn subagent_profile_rejects_workflow_skills() {
         let prompt_root = make_temp_dir("subagent-load-workflow-rejected");
-        let outer_cwd = prompt_root.join("outer");
-        std::fs::create_dir_all(&outer_cwd).expect("outer cwd");
+        let workspace_id = prompt_root.join("outer");
+        std::fs::create_dir_all(&workspace_id).expect("outer cwd");
         let skill_dir = prompt_root.join("workflows/workflow-implement-review");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
@@ -536,7 +537,7 @@ mod tests {
         let result = load_skill_result(
             &prompt_root,
             &prompt_root,
-            &outer_cwd,
+            &workspace_id,
             &[],
             &loaded,
             &call,
@@ -552,8 +553,8 @@ mod tests {
 
     #[test]
     fn resolves_skill_role_content_without_tool_xml() {
-        let outer_cwd = make_temp_dir("resolve-skill-role");
-        let workspace = outer_cwd.join("repo");
+        let workspace_id = make_temp_dir("resolve-skill-role");
+        let workspace = workspace_id.join("repo");
         let skill_dir = workspace.join(".agents/skills/reviewer");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
@@ -563,9 +564,9 @@ mod tests {
         .expect("skill file");
 
         let role = resolve_skill_role(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &[SessionWorkspace::local("repo", "")],
             "repo/reviewer",
         )
@@ -575,13 +576,13 @@ mod tests {
         assert_eq!(role.description, "Review code.");
         assert_eq!(role.content, "Review carefully.");
 
-        std::fs::remove_dir_all(outer_cwd).ok();
+        std::fs::remove_dir_all(workspace_id).ok();
     }
 
     #[test]
     fn rejects_unprefixed_workspace_role_even_when_unique() {
-        let outer_cwd = make_temp_dir("resolve-unambiguous-workspace-role");
-        let workspace = outer_cwd.join("repo");
+        let workspace_id = make_temp_dir("resolve-unambiguous-workspace-role");
+        let workspace = workspace_id.join("repo");
         let skill_dir = workspace.join(".agents/skills/context-inspector");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
@@ -591,9 +592,9 @@ mod tests {
         .expect("skill file");
 
         let error = resolve_skill_role(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &[SessionWorkspace::local("repo", "")],
             "context-inspector",
         )
@@ -602,14 +603,14 @@ mod tests {
             .to_string()
             .contains("role skill not found: context-inspector"));
 
-        std::fs::remove_dir_all(outer_cwd).ok();
+        std::fs::remove_dir_all(workspace_id).ok();
     }
 
     #[test]
     fn unprefixed_workspace_role_does_not_suggest_legacy_workspace_arg() {
-        let outer_cwd = make_temp_dir("resolve-ambiguous-workspace-role");
+        let workspace_id = make_temp_dir("resolve-ambiguous-workspace-role");
         for workspace in ["repo-a", "repo-b"] {
-            let skill_dir = outer_cwd
+            let skill_dir = workspace_id
                 .join(workspace)
                 .join(".agents/skills/context-inspector");
             std::fs::create_dir_all(&skill_dir).expect("skill dir");
@@ -621,9 +622,9 @@ mod tests {
         }
 
         let error = resolve_skill_role(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &[
                 SessionWorkspace::local("repo-a", ""),
                 SessionWorkspace::local("repo-b", ""),
@@ -636,13 +637,13 @@ mod tests {
             .contains("role skill not found: context-inspector"));
         assert!(!error.to_string().contains("role_workspace"));
 
-        std::fs::remove_dir_all(outer_cwd).ok();
+        std::fs::remove_dir_all(workspace_id).ok();
     }
 
     #[test]
     fn resolves_workspace_role_with_prefixed_name() {
-        let outer_cwd = make_temp_dir("resolve-prefixed-workspace-role");
-        let workspace = outer_cwd.join("repo");
+        let workspace_id = make_temp_dir("resolve-prefixed-workspace-role");
+        let workspace = workspace_id.join("repo");
         let skill_dir = workspace.join(".agents/skills/context-inspector");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
@@ -652,9 +653,9 @@ mod tests {
         .expect("skill file");
 
         let role = resolve_skill_role(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &[SessionWorkspace::local("repo", "")],
             "repo/context-inspector",
         )
@@ -662,22 +663,22 @@ mod tests {
         assert_eq!(role.name, "context-inspector");
         assert_eq!(role.workspace.as_deref(), Some("repo"));
 
-        std::fs::remove_dir_all(outer_cwd).ok();
+        std::fs::remove_dir_all(workspace_id).ok();
     }
 
     #[test]
     fn resolves_packaged_worker_role_when_skill_is_absent() {
-        let outer_cwd = make_temp_dir("resolve-packaged-role");
+        let workspace_id = make_temp_dir("resolve-packaged-role");
         write_role(
-            &outer_cwd.join("subagent-roles/worker/SKILL.md"),
+            &workspace_id.join("subagent-roles/worker/SKILL.md"),
             "worker",
             "Perform delegated implementation, research, or artifact work.",
             "You are a delegated worker subagent.\n\nReport clearly.",
         );
         let role = resolve_skill_role(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &[SessionWorkspace::local("repo", "")],
             "worker",
         )
@@ -694,25 +695,25 @@ mod tests {
         );
         assert_eq!(
             role.file_path,
-            outer_cwd.join("subagent-roles/worker/SKILL.md")
+            workspace_id.join("subagent-roles/worker/SKILL.md")
         );
 
-        std::fs::remove_dir_all(outer_cwd).ok();
+        std::fs::remove_dir_all(workspace_id).ok();
     }
 
     #[test]
     fn prefixed_workspace_role_still_requires_a_skill_file() {
-        let outer_cwd = make_temp_dir("resolve-missing-workspace-role");
+        let workspace_id = make_temp_dir("resolve-missing-workspace-role");
         write_role(
-            &outer_cwd.join("subagent-roles/worker/SKILL.md"),
+            &workspace_id.join("subagent-roles/worker/SKILL.md"),
             "worker",
             "Perform delegated implementation, research, or artifact work.",
             "You are a delegated worker subagent.",
         );
         let error = resolve_skill_role(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &[SessionWorkspace::local("repo", "")],
             "repo/worker",
         )
@@ -721,13 +722,13 @@ mod tests {
             .to_string()
             .contains("role skill not found: repo/worker"));
 
-        std::fs::remove_dir_all(outer_cwd).ok();
+        std::fs::remove_dir_all(workspace_id).ok();
     }
 
     #[test]
     fn global_skill_omits_workspace() {
-        let outer_cwd = make_temp_dir("load-global-skill");
-        let home = outer_cwd.join("home");
+        let workspace_id = make_temp_dir("load-global-skill");
+        let home = workspace_id.join("home");
         let skill_dir = home.join(".agents/skills/global");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
@@ -744,9 +745,9 @@ mod tests {
         let loaded = std::collections::BTreeSet::new();
 
         let result = load_skill_output_with_home(
-            &outer_cwd,
-            &outer_cwd,
-            &outer_cwd,
+            &workspace_id,
+            &workspace_id,
+            &workspace_id,
             &[],
             &loaded,
             &call,
@@ -762,7 +763,7 @@ mod tests {
         assert!(output.get("workspace").is_none());
         assert!(!result.output.contains("<base_dir>"));
 
-        std::fs::remove_dir_all(outer_cwd).ok();
+        std::fs::remove_dir_all(workspace_id).ok();
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {

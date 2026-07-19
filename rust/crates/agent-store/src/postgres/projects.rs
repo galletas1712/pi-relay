@@ -11,16 +11,18 @@ impl PostgresAgentStore {
     pub async fn create_project(
         &self,
         project_id: Uuid,
+        runtime_id: &str,
         name: &str,
         workspaces: &[ProjectWorkspace],
         metadata: Value,
     ) -> Result<Project> {
         let row = sqlx::query(
             r#"
-            insert into projects (id, name, workspaces, metadata)
-            values ($1, $2, $3, $4)
+            insert into projects (id, runtime_id, name, workspaces, metadata)
+            values ($1, $2, $3, $4, $5)
             returning
                 id,
+                runtime_id,
                 name,
                 workspaces,
                 metadata,
@@ -29,6 +31,7 @@ impl PostgresAgentStore {
             "#,
         )
         .bind(project_id)
+        .bind(runtime_id)
         .bind(name)
         .bind(serde_json::to_value(workspaces)?)
         .bind(metadata)
@@ -42,6 +45,7 @@ impl PostgresAgentStore {
             r#"
             select
                 id,
+                runtime_id,
                 name,
                 workspaces,
                 metadata,
@@ -64,6 +68,7 @@ impl PostgresAgentStore {
             r#"
             select
                 id,
+                runtime_id,
                 name,
                 workspaces,
                 metadata,
@@ -93,6 +98,7 @@ impl PostgresAgentStore {
             where id=$1
             returning
                 id,
+                runtime_id,
                 name,
                 workspaces,
                 metadata,
@@ -128,6 +134,7 @@ pub(super) fn project_from_row(row: sqlx::postgres::PgRow) -> Result<Project> {
     let project_id = row.get("id");
     Ok(Project {
         project_id,
+        runtime_id: row.get("runtime_id"),
         name: row.get("name"),
         workspaces: serde_json::from_value::<Vec<ProjectWorkspace>>(
             row.get::<Value, _>("workspaces"),

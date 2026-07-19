@@ -1,0 +1,4 @@
+database_url = "postgres://postgres:postgres@postgres:5432/pi_relay"
+bind = "0.0.0.0:8787"
+runtime_bind = "0.0.0.0:8786"
+

@@ -198,8 +198,8 @@ impl SessionDriver {
             .load_session_config(&self.session_id)
             .await?;
         self.state
-            .workspaces
-            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
+            .runtime_hosts
+            .ensure_session(&self.session_id, &config.workspace_id, &config.workspaces)
             .await?;
         let stored = self
             .state
@@ -295,8 +295,8 @@ impl SessionDriver {
             .load_session_config(&self.session_id)
             .await?;
         self.state
-            .workspaces
-            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
+            .runtime_hosts
+            .ensure_session(&self.session_id, &config.workspace_id, &config.workspaces)
             .await?;
         let stored = self
             .state
@@ -494,8 +494,8 @@ impl SessionDriver {
             .await?;
         route.apply_to(&mut config);
         self.state
-            .workspaces
-            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
+            .runtime_hosts
+            .ensure_session(&self.session_id, &config.workspace_id, &config.workspaces)
             .await?;
         let mut session = AgentSession::from_stored_session_preserving_open_turn(stored)
             .map_err(history_error_to_rpc)?;
@@ -691,8 +691,8 @@ impl SessionDriver {
             .load_session_config(&self.session_id)
             .await?;
         self.state
-            .workspaces
-            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
+            .runtime_hosts
+            .ensure_session(&self.session_id, &config.workspace_id, &config.workspaces)
             .await?;
         let stored = self
             .state
@@ -861,7 +861,7 @@ impl SessionDriver {
             Ok(Some(SubagentType::ReadOnly)) => {
                 if let Err(error) = self
                     .state
-                    .workspaces
+                    .runtime_hosts
                     .destroy_session_workspaces(&self.session_id)
                     .await
                 {
@@ -1136,8 +1136,8 @@ impl SessionDriver {
             .load_session_config(&self.session_id)
             .await?;
         self.state
-            .workspaces
-            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
+            .runtime_hosts
+            .ensure_session(&self.session_id, &config.workspace_id, &config.workspaces)
             .await?;
         let stored = self
             .state
@@ -1287,8 +1287,8 @@ impl SessionDriver {
             .load_session_config(&self.session_id)
             .await?;
         self.state
-            .workspaces
-            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
+            .runtime_hosts
+            .ensure_session(&self.session_id, &config.workspace_id, &config.workspaces)
             .await?;
         let route = pending[0].route.clone();
         if pending.iter().any(|action| action.route != route) {

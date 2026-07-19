@@ -57,7 +57,8 @@ mod tests {
     fn missing_session_binding_is_explicitly_mcp_free() {
         let config = SessionConfig {
             project_id: None,
-            outer_cwd: "/tmp".to_string(),
+            runtime_id: "runtime-test".to_string(),
+            workspace_id: "/tmp".to_string(),
             workspaces: Vec::new(),
             system_prompt: "prompt".to_string(),
             provider: ProviderConfig {

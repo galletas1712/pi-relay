@@ -24,7 +24,8 @@ function session(sessionId: string): SessionSummary {
 	return {
 		session_id: sessionId,
 		project_id: "project-a",
-		outer_cwd: "/workspace",
+		runtime_id: "runtime-test",
+	workspace_id: "workspace-test",
 		workspaces: [],
 		activity: "idle",
 		active_leaf_id: null,

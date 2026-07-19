@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use agent_core::AgentInput;
+use agent_runtime_protocol::{RuntimeCommand, RuntimeCommandResult};
 use agent_session::SessionAction;
 use agent_store::{ActionStatus, ActionUpdate};
 use agent_tools::{limit_tool_output, ToolContext};
@@ -35,34 +36,16 @@ pub(super) async fn run_tool_turn(
         .manifest()
         .tool(&tool_call.tool_name)
         .is_some();
-    // MCP and ordinary tools may mutate the cwd, so snapshots wait for them.
-    // Delegation controls are excluded because read-only child creation takes
-    // this same guard internally and would otherwise self-deadlock.
-    let workspace_guard = if is_mcp_tool
-        || (tool_call.tool_name != "LoadSkill"
-            && !is_web_tool_name(&tool_call.tool_name)
-            && !is_delegation_tool_name(&tool_call.tool_name))
-    {
-        Some(
-            state
-                .workspaces
-                .acquire_cwd_mutation_guard(&dispatch.config.outer_cwd)
-                .await,
-        )
-    } else {
-        None
-    };
     state
-        .workspaces
+        .runtime_hosts
         .ensure_session(
             &session_id,
-            &dispatch.config.outer_cwd,
+            &dispatch.config.workspace_id,
             &dispatch.config.workspaces,
         )
         .await?;
 
-    let tool_context =
-        ToolContext::new(std::path::PathBuf::from(dispatch.config.outer_cwd.clone()));
+    let tool_context = ToolContext::new(std::path::PathBuf::from("/"));
     let snapshot = &dispatch.mcp_snapshot;
     let mut result = if is_mcp_tool {
         let arguments = serde_json::from_str(&tool_call.args_json).unwrap_or(Value::Null);
@@ -111,21 +94,32 @@ pub(super) async fn run_tool_turn(
         run_delegation_tool(&state, &session_id, &tool_call).await
     } else {
         match state
-            .tools
-            .execute(dispatch.config.provider.kind, &tool_call, &tool_context)
+            .runtime_hosts
+            .execute(
+                &dispatch.config.runtime_id,
+                RuntimeCommand::ExecuteTool {
+                    workspace_id: dispatch.config.workspace_id.clone(),
+                    provider: dispatch.config.provider.kind,
+                    tool_call: tool_call.clone(),
+                },
+            )
             .await
         {
-            Ok(result) => result,
+            Ok(RuntimeCommandResult::Tool { result }) => result,
+            Ok(_) => ToolResultMessage::error(
+                tool_call.id.clone(),
+                tool_call.tool_name.clone(),
+                "runtime returned the wrong tool result",
+            ),
             Err(error) => ToolResultMessage::error(
                 tool_call.id.clone(),
                 tool_call.tool_name.clone(),
-                format!("tool execution failed: {error}"),
+                format!("runtime tool execution failed: {error:#}"),
             ),
         }
     };
     // Completion persistence acquires the SessionDriver. Release the cwd guard
     // first so cancellation and source mutation never depend on both locks.
-    drop(workspace_guard);
     finalize_tool_result(&mut result);
     let status = if matches!(result.status, ToolResultStatus::Success) {
         ActionStatus::Completed

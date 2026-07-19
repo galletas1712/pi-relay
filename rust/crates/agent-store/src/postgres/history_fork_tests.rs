@@ -31,7 +31,7 @@ async fn create_fork_copies_full_forest_and_replay_without_mutating_source() {
     let store = &db.store;
     let project_id = Uuid::new_v4();
     store
-        .create_project(project_id, "fork copy test", &[], json!({}))
+        .create_project(project_id, "fork copy test", "runtime-test", &[], json!({}))
         .await
         .expect("project creates");
     let source_session_id = "fork-source";
@@ -92,7 +92,7 @@ async fn create_fork_copies_full_forest_and_replay_without_mutating_source() {
         .await
         .expect("source snapshot loads")
         .transcript_revision;
-    child_config.outer_cwd = "/tmp/fork-child".to_string();
+    child_config.workspace_id = "/tmp/fork-child".to_string();
     child_config.metadata = json!({
         "fork": {
             "source_session_id": source_session_id,
@@ -242,7 +242,8 @@ fn database_url_with_name(base: &str, name: &str) -> String {
 fn session_config(project_id: Uuid) -> SessionConfig {
     SessionConfig {
         project_id: Some(project_id),
-        outer_cwd: "/tmp".to_string(),
+        runtime_id: "runtime-test".to_string(),
+        workspace_id: "/tmp".to_string(),
         workspaces: Vec::new(),
         system_prompt: "test prompt".to_string(),
         provider: ProviderConfig {
@@ -357,7 +358,13 @@ async fn history_targets_page_newest_users_with_safe_bounded_previews() {
     let store = &db.store;
     let project_id = Uuid::new_v4();
     store
-        .create_project(project_id, "history targets test", &[], json!({}))
+        .create_project(
+            project_id,
+            "history targets test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("project creates");
     create_session(store, project_id, "target-source", false).await;
@@ -478,7 +485,13 @@ async fn capped_history_target_ancestry_is_omitted_and_rejected() {
     let store = &db.store;
     let project_id = Uuid::new_v4();
     store
-        .create_project(project_id, "capped history target test", &[], json!({}))
+        .create_project(
+            project_id,
+            "capped history target test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("project creates");
     let config = create_session(store, project_id, "capped-source", false).await;
@@ -539,7 +552,13 @@ async fn switch_and_fork_share_history_target_validation() {
     let store = &db.store;
     let project_id = Uuid::new_v4();
     store
-        .create_project(project_id, "history target test", &[], json!({}))
+        .create_project(
+            project_id,
+            "history target test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("project creates");
 

@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use agent_store::{ProjectWorkspace, WorkspaceKind};
+use agent_runtime_protocol::{ProjectWorkspace, WorkspaceKind};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +81,7 @@ pub(super) async fn write_workspace_base_config(
     Ok(())
 }
 
-pub(crate) fn validate_workspace_dir(workspace_dir: &str) -> Result<()> {
+pub fn validate_workspace_dir(workspace_dir: &str) -> Result<()> {
     let workspace_dir = workspace_dir.trim();
     if workspace_dir.is_empty() {
         bail!("workspace_dir is required");

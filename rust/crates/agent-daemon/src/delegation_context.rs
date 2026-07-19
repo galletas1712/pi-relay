@@ -48,7 +48,7 @@ pub(crate) async fn compaction_delegation_ledger(
 
     for delegation in &delegations {
         let progress = state.repo.delegation_progress(delegation).await?;
-        let handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+        let handoff_dir = delegation_dir(&parent_config.workspace_id, &delegation.id);
         out.push_str(&format!(
             "\n- delegation_id: `{}`; kind: {}; status: {}; progress: expected {}, spawned {}, terminal {}, running {}, failed {}",
             inline_code(&delegation.id),
@@ -280,11 +280,11 @@ pub(crate) fn test_ledger_from_snapshots(
         agent_store::DelegationProgress,
         Vec<TestSubagent>,
     )>,
-    parent_outer_cwd: &str,
+    parent_workspace_id: &str,
 ) -> anyhow::Result<String> {
     let mut out = ledger_header();
     for (delegation, progress, subagents) in delegations {
-        let handoff_dir = delegation_dir(parent_outer_cwd, &delegation.id);
+        let handoff_dir = delegation_dir(parent_workspace_id, &delegation.id);
         out.push_str(&format!(
             "\n- delegation_id: `{}`; kind: {}; status: {}; progress: expected {}, spawned {}, terminal {}, running {}, failed {}",
             inline_code(&delegation.id),

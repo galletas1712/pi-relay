@@ -1,6 +1,7 @@
 export type EntryScope = "full_tree" | "active_branch";
 
 export const queryKeys = {
+	runtimes: ["runtimes"] as const,
 	systemPromptRoot: ["system-prompt"] as const,
 	systemPrompt: (sessionId: string) => ["system-prompt", sessionId] as const,
 	projects: ["projects"] as const,

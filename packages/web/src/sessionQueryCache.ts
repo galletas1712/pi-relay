@@ -91,7 +91,8 @@ export function mergeSnapshotIntoSessionList(
 		return {
 			...session,
 			project_id: snapshot.project_id,
-			outer_cwd: snapshot.outer_cwd,
+			runtime_id: snapshot.runtime_id,
+			workspace_id: snapshot.workspace_id,
 			workspaces: snapshot.workspaces,
 			activity: snapshot.activity,
 			active_leaf_id: snapshot.active_leaf_id,

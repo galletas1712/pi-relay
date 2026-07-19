@@ -3,7 +3,7 @@
 //! On the delegation barrier, for every subagent (success or failure) the daemon
 //! renders two files from the durable Postgres transcript — `final_message.md`
 //! and an exhaustive, greppable `transcript.md` — under
-//! `<parent.outer_cwd>/.pi-handoff/<delegation_id>/`. `inspect_delegation` is the
+//! `<parent.workspace_id>/.pi-handoff/<delegation_id>/`. `inspect_delegation` is the
 //! structured control-flow snapshot; the files remain transcript/detail
 //! artifacts only. Postgres transcript history is the durable source of truth:
 //! these artifact files are derived from `active_branch` (Ui body mode) and can
@@ -325,12 +325,12 @@ pub(crate) async fn refresh_task_prompt_artifact_if_present(
         .map(Some)
 }
 
-pub(crate) fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
-    handoff_root(parent_outer_cwd).join(delegation_id)
+pub(crate) fn delegation_dir(parent_workspace_id: &str, delegation_id: &str) -> PathBuf {
+    handoff_root(parent_workspace_id).join(delegation_id)
 }
 
-pub(crate) fn handoff_root(parent_outer_cwd: &str) -> PathBuf {
-    Path::new(parent_outer_cwd).join(HANDOFF_DIR)
+pub(crate) fn handoff_root(parent_workspace_id: &str) -> PathBuf {
+    Path::new(parent_workspace_id).join(HANDOFF_DIR)
 }
 
 /// Refresh per-subagent handoff artifacts from durable Postgres transcripts.
@@ -353,7 +353,7 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         .repo
         .load_session_config(&delegation.parent_session_id)
         .await?;
-    let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+    let dir = delegation_dir(&parent_config.workspace_id, &delegation.id);
 
     if matches!(
         delegation.status,

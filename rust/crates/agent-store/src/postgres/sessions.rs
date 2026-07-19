@@ -113,15 +113,16 @@ impl PostgresAgentStore {
         sqlx::query(
             r#"
             insert into sessions (
-                id, project_id, outer_cwd, workspaces, system_prompt,
+                id, project_id, runtime_id, workspace_id, workspaces, system_prompt,
                 provider_config, metadata, mcp_manifest_fingerprint
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8::text)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9::text)
             "#,
         )
         .bind(session_id)
         .bind(config.project_id)
-        .bind(&config.outer_cwd)
+        .bind(&config.runtime_id)
+        .bind(&config.workspace_id)
         .bind(serde_json::to_value(&config.workspaces)?)
         .bind(&config.system_prompt)
         .bind(serde_json::to_value(&config.provider)?)
@@ -284,13 +285,13 @@ impl PostgresAgentStore {
         let inserted = sqlx::query(
             r#"
                 insert into sessions (
-                    id, project_id, outer_cwd, workspaces, active_leaf_id,
+                    id, project_id, runtime_id, workspace_id, workspaces, active_leaf_id,
                     system_prompt, provider_config, metadata, parent_session_id,
                     subagent_type, delegation_id, mcp_manifest_fingerprint
                 )
                 values (
-                    $1, $2, $3, $4, $5::text, $6, $7, $8, $9::text,
-                    $10::text, $11::text, $12::text
+                    $1, $2, $3, $4, $5, $6::text, $7, $8, $9, $10::text,
+                    $11::text, $12::text, $13::text
                 )
                 on conflict (id) do nothing
                 returning id
@@ -298,7 +299,8 @@ impl PostgresAgentStore {
         )
         .bind(session_id)
         .bind(config.project_id)
-        .bind(&config.outer_cwd)
+        .bind(&config.runtime_id)
+        .bind(&config.workspace_id)
         .bind(serde_json::to_value(&config.workspaces)?)
         .bind(active_leaf_id)
         .bind(&config.system_prompt)
@@ -489,7 +491,8 @@ impl PostgresAgentStore {
                     s.id,
                     s.project_id,
                     s.parent_session_id,
-                    s.outer_cwd,
+                    s.runtime_id,
+                    s.workspace_id,
                     s.workspaces,
                     s.active_leaf_id,
                     s.provider_config,
@@ -539,7 +542,8 @@ impl PostgresAgentStore {
                     session_id: id,
                     project_id: row.get("project_id"),
                     parent_session_id: row.get("parent_session_id"),
-                    outer_cwd: row.get("outer_cwd"),
+                    runtime_id: row.get("runtime_id"),
+                    workspace_id: row.get("workspace_id"),
                     workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
                         row.get::<Value, _>("workspaces"),
                     )?,
@@ -562,7 +566,8 @@ impl PostgresAgentStore {
             r#"
             select
                 s.project_id,
-                s.outer_cwd,
+                s.runtime_id,
+                s.workspace_id,
                 s.workspaces,
                 s.system_prompt,
                 s.provider_config,
@@ -581,7 +586,8 @@ impl PostgresAgentStore {
         .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         Ok(SessionConfig {
             project_id: row.get("project_id"),
-            outer_cwd: row.get("outer_cwd"),
+            runtime_id: row.get("runtime_id"),
+            workspace_id: row.get("workspace_id"),
             workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
                 row.get::<Value, _>("workspaces"),
             )?,
