@@ -50,16 +50,29 @@ docker run -d --name pi-relay-pg \
   -p 55432:5432 postgres:16-alpine
 ```
 
-Run `pi-agentd` (the websocket endpoint is `ws://127.0.0.1:8787`):
+Create the required daemon policy at
+`$XDG_CONFIG_HOME/pi-relay/config.toml` (or
+`$HOME/.config/pi-relay/config.toml` when `XDG_CONFIG_HOME` is unset):
 
 ```sh
-cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
-  --database-url postgres://postgres:postgres@127.0.0.1:55432/pi_relay \
-  --bind 127.0.0.1:8787
+CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay"
+mkdir -p "$CONFIG_HOME"
+cat >"$CONFIG_HOME/config.toml" <<'EOF'
+database_url = "postgres://postgres:postgres@127.0.0.1:55432/pi_relay"
+bind = "127.0.0.1:8787"
+EOF
+
+cargo run --manifest-path rust/Cargo.toml -p agent-daemon
 ```
 
-`--database-url`/`DATABASE_URL` is required; `--bind`/`PI_AGENTD_BIND` defaults
-to `127.0.0.1:8787`.
+`pi-agentd` accepts no configuration arguments. The websocket endpoint is
+`ws://127.0.0.1:8787` unless `bind` changes it in `config.toml`.
+
+For the repository’s local stack, `infra/dev.sh` instead creates this minimal
+policy in a fresh temporary XDG config home and uses a matching temporary XDG
+state home. It always targets the compose database at
+`postgres://postgres:postgres@127.0.0.1:55432/pi_relay`, removes the temporary
+directories on exit, and never reads or writes `~/.config/pi-relay`.
 
 ### Daemon configuration and packaged catalogs
 
@@ -69,21 +82,25 @@ empty, that is `$HOME/.config/pi-relay/config.toml`. In particular, a nonempty
 `XDG_CONFIG_HOME` is used directly and never gains an extra `.config`
 component. `XDG_CONFIG_HOME` and `HOME` must be absolute paths; relative
 values and parent-directory components are rejected rather than being resolved
-against the daemon's working directory. The file is optional: a missing file
-uses the stable default parent model, OpenAI `gpt-5.6-sol` with `xhigh`
-reasoning. A legacy `config.json` is not read as a daemon-policy fallback.
-Invalid TOML, unknown fields, and blank model names fail daemon
-startup rather than being deferred to a session or subagent.
+against the daemon's working directory. The file is required, and its required
+root `database_url` must not be blank. The optional root `bind` defaults to
+`127.0.0.1:8787`. A legacy `config.json` is not read as a daemon-policy
+fallback. Invalid TOML, unknown fields (including provider fields), blank
+database URLs, blank binds, and blank model names fail daemon startup rather
+than being deferred to a session or subagent.
 
 This is a breaking TOML-only migration for user-authored XDG daemon
 configuration: legacy `$XDG_CONFIG_HOME/pi-relay/config.json` and
 `mcp.json` are ignored, never converted, and never read.
 
 ```toml
+database_url = "postgres://postgres:postgres@127.0.0.1:55432/pi_relay"
+bind = "127.0.0.1:8787" # optional; this is the default
+
 [default_parent_model]
 kind = "openai"
 model = "gpt-5.6-sol"
-reasoning_effort = "xhigh"
+reasoning_effort = "high"
 max_tokens = 32768
 prompt_cache = { key = "my-parent-cache" }
 
@@ -98,11 +115,15 @@ model = "gpt-5.6-sol"
 reasoning_effort = "high"
 ```
 
-Every provider object keeps the normal `kind`, `model`, `reasoning_effort`,
-optional `max_tokens`, and optional `prompt_cache` fields. A new parent session
-uses an explicit `session.start.provider`, otherwise `default_parent_model`,
-otherwise the static default above. A child uses its explicit override, then
-the matching resolved exposed role name in `subagent_models` (for example
+The root schema is exactly `database_url`, optional `bind`, optional
+`default_parent_model`, and optional `subagent_models`. Every provider object
+keeps the normal `kind`, `model`, `reasoning_effort`, optional `max_tokens`, and
+optional `prompt_cache` fields. If `default_parent_model` is omitted, the
+built-in parent policy is OpenAI `gpt-5.6-sol` with `high` reasoning. A new
+parent session uses an explicit `session.start.provider`, otherwise
+`default_parent_model`, otherwise that built-in policy. A child uses its
+explicit override, then the matching resolved exposed role name in
+`subagent_models` (for example
 `reviewer` or `repo/reviewer`), then its persisted parent provider. Existing
 or replayed sessions retain their persisted provider and are never retargeted
 by changed defaults.
@@ -125,14 +146,12 @@ hard link. The hidden staging leaves are intentionally retained: after a
 failure their names cannot safely be deleted without risking a concurrently
 created user file.
 
-Optional MCP configuration is selected in this order:
-`--mcp-config PATH`, `PI_AGENTD_MCP_CONFIG`, an already-existing
-`<config-root>/mcp.toml`, then disabled. The daemon never creates, edits,
-merges, renames, or chmods that `mcp.toml`; it is intentionally separate from
-`config.toml`. Every MCP configuration source, including an explicit CLI or
-environment path with a `.json` extension, is parsed as TOML. Its typed TOML
-shape and trust model are documented in
-[`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
+Optional MCP configuration is read only from an already-existing
+`<config-root>/mcp.toml`; when it is absent, MCP is disabled. The daemon never
+creates, edits, merges, renames, or chmods that file; it is intentionally
+separate from `config.toml`. It is parsed as strict TOML. Its typed TOML shape
+and trust model are documented in [`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
+Legacy `mcp.json` is ignored and never modified.
 When that configuration contains OAuth routes, the daemon stores their
 credentials in `mcp-oauth-credentials.json` directly beneath its existing
 `$XDG_STATE_HOME/pi-relay` state root (or `~/.local/state/pi-relay` when
@@ -146,6 +165,7 @@ or credential-database fallback.
 For example:
 
 ```toml
+# $XDG_CONFIG_HOME/pi-relay/mcp.toml
 [servers.workspace]
 enabled_tools = ["read_file", "search"]
 call_timeout_ms = 30000

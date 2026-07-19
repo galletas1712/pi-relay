@@ -507,9 +507,9 @@ the normal frontend path for a brand-new draft.
 ```
 
 `provider` is optional for a new session. When omitted, the daemon selects its
-configured `default_parent_model` (or the static OpenAI `gpt-5.6-sol`/`xhigh`
-fallback if `config.toml` is absent) and persists that selected provider in the
-new session. An explicit value always wins. A replay with the same
+configured `default_parent_model` (or the static OpenAI `gpt-5.6-sol`/`high`
+fallback when that optional policy is omitted) and persists that selected
+provider in the new session. An explicit value always wins. A replay with the same
 `session_id` returns the persisted session before applying defaults, so
 configuration changes do not retarget existing sessions, queued work, or
 existing action routes.

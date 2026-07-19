@@ -24,8 +24,8 @@ main.rs            websocket accept + JSON-RPC routing + most RPC handlers
 session_start.rs   explicit session-start pipeline: workspace materialization,
                    MCP selection validation, prompt render, atomic
                    session/manifest/output persist, initial dispatch
-config.rs          CLI/environment parsing plus strict XDG daemon config,
-                   model defaults, MCP fallback precedence, and one-time
+config.rs          strict XDG daemon startup policy, model defaults,
+                   mcp.toml selection, and one-time
                    non-overwriting packaged role/workflow bootstrap
 types.rs           RpcRequest/Response/Error, RpcMethod parse table, DispatchAction, RuntimeSession
 state.rs           AppState: repo handle, active sessions, driver locks, task registry,
@@ -57,13 +57,15 @@ handoff.rs         renders per-subagent task_prompt.md / final_message.md /
 
 `config.rs` resolves the general configuration root as
 `$XDG_CONFIG_HOME/pi-relay` or `$HOME/.config/pi-relay`. It parses only the
-strict `config.toml` daemon schema, including a default parent provider and
-per-resolved-role subagent providers; a legacy `config.json` is never a policy
-fallback, and invalid configuration fails startup.
+required strict `config.toml` startup-policy schema: root `database_url`,
+optional `bind`, an optional default parent provider, and per-resolved-role
+subagent providers. `pi-agentd` accepts no configuration arguments. A legacy
+`config.json` is never a policy fallback, and invalid configuration fails
+startup.
 This is a breaking TOML-only migration for user-authored XDG daemon
 configuration: legacy `config.json` and `mcp.json` are ignored rather than
-converted or read. `mcp.toml` is a separately owned, manually managed optional
-fallback and is never written by bootstrap. Startup copy-bootstraps bundled
+converted or read. `mcp.toml` is the separately owned, manually managed
+optional MCP source and is never written by bootstrap. Startup copy-bootstraps bundled
 role/workflow `SKILL.md` files only when absent and then records completion, so
 later deletions remain user-owned. Skill/role resolution is explicit
 workspace/home first, configured catalog second, packaged fallback last;

@@ -13,10 +13,21 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-DAEMON_BIND="${DAEMON_BIND:-127.0.0.1:8787}"
 WEB_PORT="${WEB_PORT:-8788}"
-DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@127.0.0.1:55432/pi_relay}"
 TAILNET_HOST="${TAILNET_HOST:-}"
+DEV_XDG_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/pi-relay-dev.XXXXXX")"
+export XDG_CONFIG_HOME="$DEV_XDG_ROOT/config"
+export XDG_STATE_HOME="$DEV_XDG_ROOT/state"
+mkdir -p "$XDG_CONFIG_HOME/pi-relay"
+cat >"$XDG_CONFIG_HOME/pi-relay/config.toml" <<'EOF'
+database_url = "postgres://postgres:postgres@127.0.0.1:55432/pi_relay"
+bind = "127.0.0.1:8787"
+EOF
+
+cleanup_dev_xdg() {
+  rm -rf "$DEV_XDG_ROOT"
+}
+trap cleanup_dev_xdg EXIT
 
 bun install
 docker compose -f infra/docker-compose.yml up -d --wait
@@ -28,9 +39,7 @@ docker compose -f infra/docker-compose.yml up -d --wait
     VITE_PI_ALLOWED_HOSTS="$TAILNET_HOST" \
     bun run build )
 
-cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
-  --database-url "$DATABASE_URL" \
-  --bind "$DAEMON_BIND" &
+cargo run --manifest-path rust/Cargo.toml -p agent-daemon &
 DAEMON_PID=$!
 
 ( cd packages/web && \
@@ -42,6 +51,7 @@ shutdown() {
   trap - EXIT INT TERM
   kill "$DAEMON_PID" "$WEB_PID" 2>/dev/null || true
   wait 2>/dev/null || true
+  cleanup_dev_xdg
 }
 trap shutdown EXIT INT TERM
 

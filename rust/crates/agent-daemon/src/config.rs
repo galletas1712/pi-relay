@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -18,6 +17,7 @@ use uuid::Uuid;
 
 const DAEMON_CONFIG_FILE: &str = "config.toml";
 const MCP_CONFIG_FILE: &str = "mcp.toml";
+const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const BOOTSTRAP_MARKER: &str = ".bootstrap-v1";
 const BOOTSTRAP_STAGING_PREFIX: &str = ".bootstrap-staging-";
 
@@ -51,7 +51,7 @@ pub(crate) fn stable_default_provider() -> ProviderConfig {
     ProviderConfig {
         kind: ProviderKind::OpenAi,
         model: "gpt-5.6-sol".to_string(),
-        reasoning_effort: ReasoningEffort::XHigh,
+        reasoning_effort: ReasoningEffort::High,
         max_tokens: None,
         prompt_cache: None,
     }
@@ -60,9 +60,6 @@ pub(crate) fn stable_default_provider() -> ProviderConfig {
 impl Config {
     pub(crate) fn from_env_and_args() -> Result<Self> {
         Self::from_values(
-            env::var_os("DATABASE_URL"),
-            env::var_os("PI_AGENTD_BIND"),
-            env::var_os("PI_AGENTD_MCP_CONFIG"),
             env::var_os("XDG_CONFIG_HOME"),
             env::var_os("HOME"),
             env::args().skip(1).collect(),
@@ -74,72 +71,27 @@ impl Config {
     }
 
     fn from_values(
-        database_url: Option<OsString>,
-        bind: Option<OsString>,
-        env_mcp_config: Option<OsString>,
-        xdg_config_home: Option<OsString>,
-        home: Option<OsString>,
+        xdg_config_home: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
         args: Vec<String>,
     ) -> Result<Self> {
-        let mut database_url = database_url
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let mut bind = bind
-            .map(|value| value.to_string_lossy().into_owned())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "127.0.0.1:8787".into());
-        let mut mcp_config = env_mcp_config.map(PathBuf::from);
-
-        let mut args = args.into_iter();
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--database-url" => {
-                    database_url = args
-                        .next()
-                        .ok_or_else(|| anyhow!("--database-url requires a value"))?;
-                }
-                "--mcp-config" => {
-                    mcp_config = Some(PathBuf::from(
-                        args.next()
-                            .ok_or_else(|| anyhow!("--mcp-config requires a value"))?,
-                    ));
-                }
-                "--bind" => {
-                    bind = args
-                        .next()
-                        .ok_or_else(|| anyhow!("--bind requires a value"))?;
-                }
-                "--help" | "-h" => {
-                    println!(
-                        "usage: pi-agentd --database-url postgres://... [--bind 127.0.0.1:8787] [--mcp-config PATH]"
-                    );
-                    std::process::exit(0);
-                }
-                other => return Err(anyhow!("unknown argument: {other}")),
-            }
-        }
-
-        if database_url.trim().is_empty() {
+        if let Some(argument) = args.first() {
             return Err(anyhow!(
-                "DATABASE_URL or --database-url is required for pi-agentd"
+                "pi-agentd accepts no arguments; configure it in {DAEMON_CONFIG_FILE} (unknown argument: {argument})"
             ));
         }
 
         let config_root = config_root_from_env(xdg_config_home.as_deref(), home.as_deref())?;
-        let daemon_config = load_daemon_config(&config_root.join(DAEMON_CONFIG_FILE))?;
-        if mcp_config.is_none() {
-            let fallback = config_root.join(MCP_CONFIG_FILE);
-            if fallback.is_file() {
-                mcp_config = Some(fallback);
-            }
-        }
+        let policy = load_daemon_config(&config_root.join(DAEMON_CONFIG_FILE))?;
+        let mcp_path = config_root.join(MCP_CONFIG_FILE);
+        let mcp_config = mcp_path.is_file().then_some(mcp_path);
 
         Ok(Self {
-            database_url,
-            bind,
+            database_url: policy.database_url,
+            bind: policy.bind,
             mcp_config,
             config_root,
-            daemon_config,
+            daemon_config: policy.daemon_config,
         })
     }
 }
@@ -165,11 +117,14 @@ fn config_root_from_env(
     Ok(home.join(".config").join("pi-relay"))
 }
 
-fn load_daemon_config(path: &Path) -> Result<DaemonConfig> {
+fn load_daemon_config(path: &Path) -> Result<DaemonStartupPolicy> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DaemonConfig::default())
+            return Err(anyhow!(
+                "daemon configuration {} is required",
+                path.display()
+            ))
         }
         Err(error) => {
             return Err(error).with_context(|| format!("read daemon config {}", path.display()))
@@ -188,9 +143,20 @@ fn load_daemon_config(path: &Path) -> Result<DaemonConfig> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DaemonConfigFile {
-    default_parent_model: StrictProviderConfig,
+    database_url: Option<String>,
+    #[serde(default)]
+    bind: Option<String>,
+    #[serde(default)]
+    default_parent_model: Option<StrictProviderConfig>,
     #[serde(default)]
     subagent_models: BTreeMap<String, StrictProviderConfig>,
+}
+
+#[derive(Debug)]
+struct DaemonStartupPolicy {
+    database_url: String,
+    bind: String,
+    daemon_config: DaemonConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,20 +172,41 @@ struct StrictProviderConfig {
     prompt_cache: Option<Value>,
 }
 
-impl TryFrom<DaemonConfigFile> for DaemonConfig {
+impl TryFrom<DaemonConfigFile> for DaemonStartupPolicy {
     type Error = anyhow::Error;
 
     fn try_from(value: DaemonConfigFile) -> Result<Self> {
-        validate_model("default_parent_model", &value.default_parent_model.model)?;
-        let default_parent_model = provider_from_strict(value.default_parent_model);
+        let database_url = value
+            .database_url
+            .ok_or_else(|| anyhow!("database_url is required"))?;
+        if database_url.trim().is_empty() {
+            return Err(anyhow!("database_url must not be blank"));
+        }
+
+        let bind = value.bind.unwrap_or_else(|| DEFAULT_BIND.to_string());
+        if bind.trim().is_empty() {
+            return Err(anyhow!("bind must not be blank"));
+        }
+
+        let default_parent_model = match value.default_parent_model {
+            Some(provider) => {
+                validate_model("default_parent_model", &provider.model)?;
+                provider_from_strict(provider)
+            }
+            None => stable_default_provider(),
+        };
         let mut subagent_models = BTreeMap::new();
         for (role, provider) in value.subagent_models {
             validate_model(&format!("subagent_models.{role}"), &provider.model)?;
             subagent_models.insert(role, provider_from_strict(provider));
         }
         Ok(Self {
-            default_parent_model,
-            subagent_models,
+            database_url,
+            bind,
+            daemon_config: DaemonConfig {
+                default_parent_model,
+                subagent_models,
+            },
         })
     }
 }
@@ -645,6 +632,9 @@ mod tests {
         fs::write(
             root.join(DAEMON_CONFIG_FILE),
             r#"
+database_url = "postgres://example"
+bind = "127.0.0.1:9999"
+
 [default_parent_model]
 kind = "openai"
 model = "parent"
@@ -663,11 +653,20 @@ prompt_cache = { key = "review-cache" }
         .expect("write config");
 
         let config = load_daemon_config(&root.join(DAEMON_CONFIG_FILE)).expect("parse config");
-        let reviewer = config.subagent_models.get("reviewer").expect("reviewer");
-        assert_eq!(config.default_parent_model.model, "parent");
-        assert_eq!(config.default_parent_model.max_tokens, Some(123));
+        let reviewer = config
+            .daemon_config
+            .subagent_models
+            .get("reviewer")
+            .expect("reviewer");
+        assert_eq!(config.database_url, "postgres://example");
+        assert_eq!(config.bind, "127.0.0.1:9999");
+        assert_eq!(config.daemon_config.default_parent_model.model, "parent");
         assert_eq!(
-            config.default_parent_model.prompt_cache,
+            config.daemon_config.default_parent_model.max_tokens,
+            Some(123)
+        );
+        assert_eq!(
+            config.daemon_config.default_parent_model.prompt_cache,
             Some(serde_json::json!({"key": "parent-cache"}))
         );
         assert_eq!(reviewer.kind, ProviderKind::Claude);
@@ -680,6 +679,8 @@ prompt_cache = { key = "review-cache" }
         fs::write(
             root.join(DAEMON_CONFIG_FILE),
             r#"
+database_url = "postgres://example"
+
 [default_parent_model]
 kind = "openai"
 model = "x"
@@ -694,6 +695,8 @@ unexpected = true
         fs::write(
             root.join(DAEMON_CONFIG_FILE),
             r#"
+database_url = "postgres://example"
+
 [default_parent_model]
 kind = "openai"
 model = "x"
@@ -709,20 +712,68 @@ unexpected = true
     }
 
     #[test]
-    fn missing_config_uses_stable_default_and_blank_models_fail() {
+    fn config_requires_database_url_defaults_bind_and_defaults_parent_model() {
         let root = make_temp_dir("default-config");
-        let config =
-            load_daemon_config(&root.join(DAEMON_CONFIG_FILE)).expect("missing config defaults");
-        assert_eq!(config.default_parent_model.kind, ProviderKind::OpenAi);
-        assert_eq!(config.default_parent_model.model, "gpt-5.6-sol");
+        let error = load_daemon_config(&root.join(DAEMON_CONFIG_FILE))
+            .expect_err("missing config is rejected");
+        assert!(format!("{error:#}").contains("is required"));
+
+        fs::write(root.join(DAEMON_CONFIG_FILE), "").expect("write missing database URL config");
+        let error = load_daemon_config(&root.join(DAEMON_CONFIG_FILE))
+            .expect_err("missing database URL is rejected");
+        assert!(format!("{error:#}").contains("database_url is required"));
+
+        fs::write(
+            root.join(DAEMON_CONFIG_FILE),
+            r#"
+database_url = "postgres://example"
+"#,
+        )
+        .expect("write default policy");
+        let config = load_daemon_config(&root.join(DAEMON_CONFIG_FILE)).expect("default policy");
+        assert_eq!(config.database_url, "postgres://example");
+        assert_eq!(config.bind, DEFAULT_BIND);
         assert_eq!(
-            config.default_parent_model.reasoning_effort,
-            ReasoningEffort::XHigh
+            config.daemon_config.default_parent_model.kind,
+            ProviderKind::OpenAi
+        );
+        assert_eq!(
+            config.daemon_config.default_parent_model.model,
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            config.daemon_config.default_parent_model.reasoning_effort,
+            ReasoningEffort::High
         );
 
         fs::write(
             root.join(DAEMON_CONFIG_FILE),
             r#"
+database_url = "   "
+"#,
+        )
+        .expect("write blank database URL config");
+        let error = load_daemon_config(&root.join(DAEMON_CONFIG_FILE))
+            .expect_err("blank database URL rejected");
+        assert!(format!("{error:#}").contains("database_url must not be blank"));
+
+        fs::write(
+            root.join(DAEMON_CONFIG_FILE),
+            r#"
+database_url = "postgres://example"
+bind = "   "
+"#,
+        )
+        .expect("write blank bind config");
+        let error =
+            load_daemon_config(&root.join(DAEMON_CONFIG_FILE)).expect_err("blank bind rejected");
+        assert!(format!("{error:#}").contains("bind must not be blank"));
+
+        fs::write(
+            root.join(DAEMON_CONFIG_FILE),
+            r#"
+database_url = "postgres://example"
+
 [default_parent_model]
 kind = "openai"
 model = "   "
@@ -742,23 +793,15 @@ model = "   "
         fs::create_dir_all(&config_root).expect("config root");
         fs::write(config_root.join("config.json"), b"not valid JSON").expect("legacy config");
 
-        let absent = config_from_values(&root, None, None).expect("legacy JSON is ignored");
-        assert_eq!(
-            absent.daemon_config.default_parent_model.kind,
-            ProviderKind::OpenAi
-        );
-        assert_eq!(
-            absent.daemon_config.default_parent_model.model,
-            "gpt-5.6-sol"
-        );
-        assert_eq!(
-            absent.daemon_config.default_parent_model.reasoning_effort,
-            ReasoningEffort::XHigh
-        );
+        let error = config_from_values(&root, Vec::new())
+            .expect_err("legacy JSON is ignored and cannot satisfy required TOML policy");
+        assert!(format!("{error:#}").contains("is required"));
 
         fs::write(
             config_root.join(DAEMON_CONFIG_FILE),
             r#"
+database_url = "postgres://toml"
+
 [default_parent_model]
 kind = "claude"
 model = "toml-parent"
@@ -766,7 +809,8 @@ model = "toml-parent"
         )
         .expect("TOML config");
 
-        let present = config_from_values(&root, None, None).expect("TOML config wins");
+        let present = config_from_values(&root, Vec::new()).expect("TOML config wins");
+        assert_eq!(present.database_url, "postgres://toml");
         assert_eq!(
             present.daemon_config.default_parent_model.kind,
             ProviderKind::Claude
@@ -779,15 +823,20 @@ model = "toml-parent"
     }
 
     #[test]
-    fn mcp_path_precedence_uses_existing_config_fallback_without_touching_it() {
+    fn mcp_path_uses_only_existing_toml_without_touching_legacy_json() {
         let root = make_temp_dir("mcp-precedence");
         let config_root = root.join("pi-relay");
         fs::create_dir_all(&config_root).expect("config root");
+        fs::write(
+            config_root.join(DAEMON_CONFIG_FILE),
+            r#"database_url = "postgres://test""#,
+        )
+        .expect("daemon config");
         let legacy_mcp = config_root.join("mcp.json");
         let legacy_bytes = br#"{ "servers": { "legacy": {} } }"#;
         fs::write(&legacy_mcp, legacy_bytes).expect("legacy MCP config");
 
-        let ignored = config_from_values(&root, None, None).expect("legacy MCP JSON is ignored");
+        let ignored = config_from_values(&root, Vec::new()).expect("legacy MCP JSON is ignored");
         assert!(ignored.mcp_config.is_none());
         assert_eq!(
             fs::read(&legacy_mcp).expect("legacy MCP unchanged"),
@@ -805,7 +854,7 @@ command = "manual"
 "#;
         fs::write(&mcp, bytes).expect("manual MCP config");
 
-        let fallback = config_from_values(&root, None, None).expect("fallback config");
+        let fallback = config_from_values(&root, Vec::new()).expect("mcp TOML config");
         assert_eq!(fallback.mcp_config.as_deref(), Some(mcp.as_path()));
         assert_eq!(fs::read(&mcp).expect("MCP unchanged"), bytes);
         assert_eq!(
@@ -813,19 +862,43 @@ command = "manual"
             legacy_bytes
         );
 
-        let env = config_from_values(&root, Some("/tmp/env-mcp.json"), None).expect("env config");
-        assert_eq!(env.mcp_config, Some(PathBuf::from("/tmp/env-mcp.json")));
-
-        let cli = config_from_values(&root, Some("/tmp/env-mcp.json"), Some("/tmp/cli-mcp.json"))
-            .expect("cli config");
-        assert_eq!(cli.mcp_config, Some(PathBuf::from("/tmp/cli-mcp.json")));
-        assert_eq!(fs::read(&mcp).expect("MCP unchanged"), bytes);
-
         let absent_root = make_temp_dir("mcp-absent");
-        fs::remove_dir_all(&absent_root).expect("remove absent root");
-        let absent = config_from_values(&absent_root, None, None).expect("no MCP fallback");
+        let absent_config_root = absent_root.join("pi-relay");
+        fs::create_dir_all(&absent_config_root).expect("absent MCP config root");
+        fs::write(
+            absent_config_root.join(DAEMON_CONFIG_FILE),
+            r#"database_url = "postgres://test""#,
+        )
+        .expect("daemon config");
+        let absent = config_from_values(&absent_root, Vec::new()).expect("no MCP config");
         assert!(absent.mcp_config.is_none());
         assert!(!absent_root.join("pi-relay").join(MCP_CONFIG_FILE).exists());
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(absent_root).ok();
+    }
+
+    #[test]
+    fn daemon_accepts_no_configuration_arguments() {
+        let root = make_temp_dir("no-arguments");
+        let config_root = root.join("pi-relay");
+        fs::create_dir_all(&config_root).expect("config root");
+        fs::write(
+            config_root.join(DAEMON_CONFIG_FILE),
+            r#"database_url = "postgres://test""#,
+        )
+        .expect("daemon config");
+
+        for argument in ["--database-url", "--bind", "--mcp-config"] {
+            let error = config_from_values(&root, vec![argument.to_string()])
+                .expect_err("former configuration argument is rejected");
+            let message = format!("{error:#}");
+            assert!(message.contains("accepts no arguments"), "{message}");
+            assert!(message.contains(argument), "{message}");
+        }
+
+        let error = config_from_values(&root, vec!["unexpected".to_string()])
+            .expect_err("unknown argument is rejected");
+        assert!(format!("{error:#}").contains("unknown argument: unexpected"));
         fs::remove_dir_all(root).ok();
     }
 
@@ -1350,19 +1423,8 @@ command = "manual"
         fs::remove_dir_all(config_root).ok();
     }
 
-    fn config_from_values(
-        root: &Path,
-        env_mcp: Option<&str>,
-        cli_mcp: Option<&str>,
-    ) -> Result<Config> {
-        let mut args = Vec::new();
-        if let Some(cli_mcp) = cli_mcp {
-            args.extend(["--mcp-config".to_string(), cli_mcp.to_string()]);
-        }
+    fn config_from_values(root: &Path, args: Vec<String>) -> Result<Config> {
         Config::from_values(
-            Some("postgres://test".into()),
-            None,
-            env_mcp.map(Into::into),
             Some(root.as_os_str().to_os_string()),
             Some("/unused-home".into()),
             args,
