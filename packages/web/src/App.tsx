@@ -2115,9 +2115,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				}
 				rememberedRouteRestoreRef.current = null;
 				rememberUiSelection(routeScopeProjectId(route), route.rootSessionId);
-				if (conversation.session_id !== route.rootSessionId) {
-					rememberSelectedSubagent(route.rootSessionId, conversation.session_id);
-				}
+				rememberSelectedSubagent(
+					route.rootSessionId,
+					conversation.session_id === route.rootSessionId ? null : conversation.session_id,
+				);
 				setRouteValidation({
 					kind: "valid",
 					revision: routeRevision,

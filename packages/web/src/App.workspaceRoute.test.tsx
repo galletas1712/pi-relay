@@ -529,7 +529,7 @@ describe("App workspace route identity integration", () => {
 			projectId: "project-2",
 			sessionId: null,
 		});
-		expect(await screen.findByRole("heading", { name: "Workspace scope" })).toBeTruthy();
+		expect(await screen.findByRole("heading", { name: "New session" })).toBeTruthy();
 		expect(document.querySelector(".log-session")).toBeNull();
 
 		await mounted.dispose();
@@ -1878,6 +1878,50 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
+	it("remembers an explicitly focused parent across root switches and a browser restart", async () => {
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/child-1");
+		let api = createRouteApi();
+		let mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		rememberSelectedSubagent("legacy-root", "legacy-child");
+		await user.click(screen.getAllByRole("button", { name: "Open parent conversation" })[0]);
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1"),
+		);
+		expect(selectedSubagentForSession("root-1")).toBeNull();
+
+		await user.click(await findSessionButton("Legacy root"));
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe(
+				"/w/host/run/legacy-root/conversation/legacy-child",
+			),
+		);
+		await user.click(await findSessionButton("Root one"));
+		await waitFor(() =>
+			expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1"),
+		);
+		expect(document.querySelector(".log-session")?.textContent).toBe("Root one");
+		expect(selectedSubagentForSession("legacy-root")).toBe("legacy-child");
+
+		await mounted.dispose();
+
+		api = createRouteApi();
+		const restartedBrowser = new FakeWorkspaceBrowser("/");
+		mounted = renderRouteApp(api, restartedBrowser);
+		await open(api);
+		await waitFor(() =>
+			expect(restartedBrowser.currentUrl).toBe(
+				"/w/host/run/root-1/conversation/root-1",
+			),
+		);
+		expect(document.querySelector(".log-session")?.textContent).toBe("Root one");
+		expect(selectedSubagentForSession("legacy-root")).toBe("legacy-child");
+
+		await mounted.dispose();
+	});
+
 	it("falls back to a remembered root and clears a deleted remembered subagent", async () => {
 		rememberUiSelection(null, "root-1");
 		rememberSelectedSubagent("root-1", "deleted-child");
@@ -1926,7 +1970,7 @@ describe("App workspace route identity integration", () => {
 		await open(api);
 		expect(browser.currentUrl).toBe("/");
 		expect(loadUiSelection()).toEqual({ projectId: "project-1", sessionId: null });
-		expect(await screen.findByRole("heading", { name: "Workspace scope" })).toBeTruthy();
+		expect(await screen.findByRole("heading", { name: "New session" })).toBeTruthy();
 		expect(screen.queryByRole("heading", { name: "Couldn’t load session" })).toBeNull();
 
 		await mounted.dispose();
