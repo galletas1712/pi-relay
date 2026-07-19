@@ -100,6 +100,49 @@ export interface SessionSnapshot {
 	entries?: TranscriptEntry[];
 }
 
+export type GitWorkspaceStatus = "ready" | "not_git" | "unavailable";
+export type PullRequestLookup = "found" | "none" | "unavailable" | "not_applicable";
+
+export interface GitPullRequest {
+	number: number;
+	title: string;
+	url: string;
+	state: string;
+	is_draft: boolean;
+	head_ref_name: string;
+}
+
+export interface GitCommit {
+	sha: string;
+	parents: string[];
+	author_name: string;
+	authored_at: string;
+	summary: string;
+}
+
+export interface GitWorkspace {
+	workspace_dir: string;
+	kind: "git" | "local";
+	status: GitWorkspaceStatus;
+	error?: string;
+	branch?: string;
+	detached: boolean;
+	unborn: boolean;
+	head_sha?: string;
+	remote_url?: string;
+	pull_request: GitPullRequest | null;
+	pull_request_lookup: PullRequestLookup;
+	commits: GitCommit[];
+	has_more: boolean;
+}
+
+export interface GitStatusResponse {
+	session_id: string;
+	limit: number;
+	workspaces: GitWorkspace[];
+	workspaces_truncated: boolean;
+}
+
 export interface SystemPromptResponse {
 	template: string;
 	rendered: string | null;

@@ -25,8 +25,14 @@ covers the mechanics.
 - Provide the recovery invariants the daemon relies on after a crash.
 - Serve cheap metadata / active-leaf / turn-boundary queries and bounded
   turn-card pages so selected-session load does not scale with transcript size.
+- Serve the narrow session outer-directory/workspace projection used by the
+  trusted `pi-web` Git endpoint without loading provider, prompt, transcript,
+  or MCP state.
 
 ## Schema
+
+`pi-agentd` is the sole production migration owner. Read-only consumers such as
+`pi-web` connect only after daemon schema readiness and do not call `migrate()`.
 
 Tables (created idempotently by `migrate`; see `postgres/schema.rs`):
 

@@ -29,6 +29,7 @@ hierarchical subagent machinery from the TypeScript fork.
 | `agent-mcp` | Session-scoped stdio and generic Streamable HTTP MCP clients, New Session inventory/selection, deterministic frozen manifests, and result normalization. | [docs/plans/mcp-client.md](docs/plans/mcp-client.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch. | [docs/modules/agent-daemon.md](docs/modules/agent-daemon.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt. | [docs/modules/agent-prompt.md](docs/modules/agent-prompt.md) |
+| `pi-web` | Loopback-first production frontend server and read-only host control API. | [docs/modules/pi-web.md](docs/modules/pi-web.md) |
 
 ## Build And Test
 
@@ -60,6 +61,27 @@ cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
 
 `--database-url`/`DATABASE_URL` is required; `--bind`/`PI_AGENTD_BIND` defaults
 to `127.0.0.1:8787`.
+
+## Run The Web Service
+
+Build the frontend, then run the production web/control service:
+
+```sh
+npm run build --workspace @pi-relay/web
+cargo run --manifest-path rust/Cargo.toml -p pi-web -- \
+  --database-url postgres://postgres:postgres@127.0.0.1:55432/pi_relay \
+  --bind 127.0.0.1:8788 \
+  --web-root packages/web/dist \
+  --git-bin /absolute/operator-trusted/git
+```
+
+Start `pi-agentd` first and wait for it to listen. The daemon is the sole
+database schema migration owner; `pi-web` performs only a schema-readiness
+`SELECT` and supports a least-privilege read-only database role.
+
+See [`docs/modules/pi-web.md`](docs/modules/pi-web.md) for its endpoint,
+configuration, repository-confinement policy, and loopback/Tailscale trust
+model.
 
 ### Daemon configuration and packaged catalogs
 

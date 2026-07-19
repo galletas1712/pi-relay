@@ -5,7 +5,8 @@ use sqlx::Row;
 
 use crate::{
     AcceptedInput, EventFrame, EventType, InputPriority, OutputBatch, PersistedAction,
-    SessionActivity, SessionConfig, SessionSummary, SessionWorkspace, SubagentType,
+    SessionActivity, SessionConfig, SessionGitConfig, SessionSummary, SessionWorkspace,
+    SubagentType,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 
@@ -147,6 +148,25 @@ impl PostgresAgentStore {
         .await?;
         tx.commit().await?;
         Ok(vec![event])
+    }
+
+    pub async fn load_session_git_config(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionGitConfig>> {
+        let row = sqlx::query("select outer_cwd, workspaces from sessions where id=$1")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            Ok(SessionGitConfig {
+                outer_cwd: row.get("outer_cwd"),
+                workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
+                    row.get::<Value, _>("workspaces"),
+                )?,
+            })
+        })
+        .transpose()
     }
 
     pub async fn update_session_metadata(

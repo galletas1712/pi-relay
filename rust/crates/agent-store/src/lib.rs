@@ -131,6 +131,16 @@ pub struct SessionConfig {
     pub mcp_manifest: Option<McpSessionManifestBinding>,
 }
 
+/// Narrow, read-only session filesystem view for trusted host-side controls.
+///
+/// Consumers must treat these durable path names as untrusted hints and use
+/// race-safe filesystem capabilities or an equivalent sandbox before reading.
+#[derive(Debug, Clone)]
+pub struct SessionGitConfig {
+    pub outer_cwd: String,
+    pub workspaces: Vec<SessionWorkspace>,
+}
+
 /// Complete provider request-shaping state captured for accepted or recoverable work.
 ///
 /// This is internal routing metadata, not a session default and not part of queue RPC

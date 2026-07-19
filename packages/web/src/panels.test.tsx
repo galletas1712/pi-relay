@@ -215,6 +215,8 @@ describe("Inspector tabs", () => {
 		expect(html).toContain(`aria-label="inspector tabs"`);
 		expect(html).toContain(`aria-selected="true"`);
 		expect(html).toContain("Agents");
+		expect(html.indexOf("Agents")).toBeLessThan(html.indexOf("Git"));
+		expect(html.indexOf("Git")).toBeLessThan(html.indexOf("Inspector"));
 		expect(html).toContain("fan-out");
 		expect(html).not.toContain("Session panel");
 		expect(html).not.toContain("<h2>Session</h2>");

@@ -13,6 +13,12 @@ import {
 } from "react";
 import { ArrowUp, Bot, Menu, PanelRightOpen } from "lucide-react";
 import { createAgentApi, type AgentApi } from "./agentApi.ts";
+import { createGitHttpApi, type GitHttpApi } from "./gitApi.ts";
+import {
+	DEFAULT_GIT_HISTORY_LIMIT,
+	expandGitHistory,
+	gitHistoryForSession,
+} from "./gitQueryState.ts";
 import { ChatPane } from "./chatPane.tsx";
 import { clearAcknowledgedTranscriptDestination } from "./transcript.tsx";
 import type {
@@ -50,6 +56,7 @@ import {
 	RUN_BOARD_DEFAULT_DELEGATION_COUNT,
 	RUN_BOARD_EXPANDED_DELEGATION_COUNT,
 	Sidebar,
+	type InspectorTab,
 } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
@@ -175,6 +182,7 @@ import type {
 	DelegationSubagent,
 	EventFrame,
 	ErrorNotice,
+	GitStatusResponse,
 	McpInventory,
 	McpLoginResult,
 	Project,
@@ -278,6 +286,7 @@ type DeleteDialogState = {
 
 export interface AppProps {
 	api?: AgentApi;
+	gitApi?: GitHttpApi;
 	routeHistory?: WorkspaceRouteHistory | null;
 }
 
@@ -460,8 +469,13 @@ function LoadingConversation() {
 	);
 }
 
-export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: AppProps = {}) {
+export function App({
+	api: injectedApi,
+	gitApi: injectedGitApi,
+	routeHistory: injectedRouteHistory,
+}: AppProps = {}) {
 	const api = useMemo(() => injectedApi ?? createAgentApi(), [injectedApi]);
+	const gitApi = useMemo(() => injectedGitApi ?? createGitHttpApi(), [injectedGitApi]);
 	const routeHistory = useMemo(
 		() => injectedRouteHistory === undefined ? browserWorkspaceRouteHistory() : injectedRouteHistory,
 		[injectedRouteHistory],
@@ -525,6 +539,12 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [sidebarResizing, setSidebarResizing] = useState(false);
 	const [showArchived, setShowArchived] = useState(false);
 	const [showAllDelegations, setShowAllDelegations] = useState(false);
+	const [inspectorTab, setInspectorTab] = useState<InspectorTab>("run-board");
+	const [gitHistory, setGitHistory] = useState<{ sessionId: string | null; limit: number }>({
+		sessionId: null,
+		limit: DEFAULT_GIT_HISTORY_LIMIT,
+	});
+	const [lastGitStatus, setLastGitStatus] = useState<GitStatusResponse | null>(null);
 	const [backgroundWarmRevision, setBackgroundWarmRevision] = useState(0);
 	const [historyDialog, setHistoryDialog] = useState<HistoryDialogState | null>(null);
 	const [exportDialog, setExportDialog] = useState<ExportDialogState | null>(null);
@@ -970,6 +990,42 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		enabled: connection === "open" && routeRemoteReadsEnabled,
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
+	const gitSessionId =
+		workspaceRouteResult.kind === "route"
+			? routeConversationSessionId(workspaceRouteResult.route)
+			: workspaceRouteResult.kind === "none" && routeValidation.kind === "idle"
+				? selectedId
+				: null;
+	const gitHistoryLimit = gitHistoryForSession(gitHistory, gitSessionId).limit;
+	const gitReadEnabled =
+		!!gitSessionId &&
+		rightOpen &&
+		inspectorTab === "git";
+	const gitStatusQuery = useQuery({
+		queryKey: queryKeys.gitStatus(gitSessionId, gitHistoryLimit),
+		queryFn: () => {
+			if (!gitSessionId) throw new Error("select a session first");
+			return gitApi.getStatus(gitSessionId, gitHistoryLimit);
+		},
+		enabled: gitReadEnabled,
+		placeholderData: (previous) =>
+			previous?.session_id === gitSessionId ? previous : undefined,
+	});
+	const displayedGitStatus =
+		gitStatusQuery.data ??
+		(lastGitStatus?.session_id === gitSessionId ? lastGitStatus : null);
+	useEffect(() => {
+		setGitHistory({
+			sessionId: gitSessionId,
+			limit: DEFAULT_GIT_HISTORY_LIMIT,
+		});
+		setLastGitStatus(null);
+	}, [gitSessionId]);
+	useEffect(() => {
+		if (gitStatusQuery.data?.session_id === gitSessionId) {
+			setLastGitStatus(gitStatusQuery.data);
+		}
+	}, [gitSessionId, gitStatusQuery.data]);
 	const mcpInventoryQuery = useQuery({
 		queryKey: queryKeys.mcpInventory(newSessionProvider.kind),
 		queryFn: async () => {
@@ -4319,6 +4375,25 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					mutationBlockedReason={connectionRemoteActionBlockedReason}
 					remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 					tools={tools}
+					activeTab={inspectorTab}
+					onActiveTabChange={setInspectorTab}
+					git={{
+						status: displayedGitStatus,
+						loading: gitReadEnabled && gitStatusQuery.isPending && gitStatusQuery.isFetching,
+						fetching: gitStatusQuery.isFetching,
+						error: errorMessageOrNull(gitStatusQuery.error),
+						unavailableReason: !gitSessionId
+							? "Select a session to browse its repositories."
+							: null,
+						onRetry: gitReadEnabled
+							? () => {
+									if (!gitStatusQuery.isFetching) void gitStatusQuery.refetch();
+								}
+							: undefined,
+						onLoadMore: () => {
+							setGitHistory((current) => expandGitHistory(current, gitSessionId));
+						},
+					}}
 					onSelectSession={(sessionId) => {
 						openConversation(sessionId);
 						if (inspectorIsOverlay) setRightOpen(false);

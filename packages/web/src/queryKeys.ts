@@ -10,5 +10,6 @@ export const queryKeys = {
 	sessions: (projectId: string | null) => ["sessions", projectId] as const,
 	delegations: (parentSessionId: string | null, limit?: number) => ["delegations", parentSessionId, limit ?? null] as const,
 	session: (sessionId: string, scope: EntryScope = "full_tree") => ["session", sessionId, scope] as const,
+	gitStatus: (sessionId: string | null, limit: number) => ["git-status", sessionId, limit] as const,
 	historyTree: (sessionId: string, lastEventId: number) => ["history-tree", sessionId, lastEventId] as const,
 };

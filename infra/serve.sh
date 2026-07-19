@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Publish the pi-relay UI + websocket on the tailnet:
-#   https://<this-node>.<tailnet>.ts.net/      -> vite preview (web)
+#   https://<this-node>.<tailnet>.ts.net/      -> pi-web (UI + /api)
 #   https://<this-node>.<tailnet>.ts.net/ws    -> agent-daemon (websocket)
 # Requires `tailscale serve` privileges — usually root or tailscale operator.
 set -euo pipefail

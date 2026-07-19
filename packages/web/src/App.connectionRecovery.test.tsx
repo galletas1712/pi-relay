@@ -5,10 +5,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentApi } from "./agentApi.ts";
+import type { GitHttpApi } from "./gitApi.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import type {
 	Delegation,
 	EventFrame,
+	GitStatusResponse,
 	Project,
 	SessionSnapshot,
 	SessionSummary,
@@ -67,6 +69,62 @@ afterEach(() => {
 });
 
 describe("App connection recovery integration", () => {
+	it("loads Git from a valid local route when websocket never opens", async () => {
+		window.history.replaceState(
+			null,
+			"",
+			`/w/host/run/${SESSION_ID}/conversation/${SESSION_ID}`,
+		);
+		const api = createControllableApi();
+		const getStatus = vi.fn().mockResolvedValue(gitResponse());
+		const { client, unmount } = renderApp(api, { getStatus });
+		const user = userEvent.setup();
+
+		expect(api.connect).toHaveBeenCalledTimes(1);
+		expect(api.getSession).not.toHaveBeenCalled();
+		await user.click(screen.getByRole("tab", { name: "Git" }));
+		await waitFor(() => expect(getStatus).toHaveBeenCalledWith(SESSION_ID, 12));
+		expect(await screen.findByText("Initial Git commit")).toBeTruthy();
+		expect(api.getSession).not.toHaveBeenCalled();
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
+	it("keeps Git HTTP reads independent from websocket state and preserves stale data", async () => {
+		const api = createControllableApi();
+		const gitStatus = gitResponse();
+		const getStatus = vi.fn()
+			.mockResolvedValueOnce(gitStatus)
+			.mockRejectedValueOnce(new Error("Git HTTP refresh failed"))
+			.mockResolvedValueOnce({ ...gitStatus, limit: 50 });
+		const { client, unmount } = renderApp(api, { getStatus });
+		const user = userEvent.setup();
+
+		await openAndLoad(api);
+		await emitStatus(api, "closed");
+		await user.click(screen.getByRole("tab", { name: "Git" }));
+		await waitFor(() =>
+			expect(getStatus).toHaveBeenCalledWith(SESSION_ID, 12),
+		);
+		expect(await screen.findByText("Initial Git commit")).toBeTruthy();
+
+		await user.click(screen.getByRole("button", { name: "Refresh Git status" }));
+		expect(await screen.findByText(/Showing saved Git data/)).toBeTruthy();
+		expect(screen.getByText("Initial Git commit")).toBeTruthy();
+		expect(document.body.textContent).toContain("Git HTTP refresh failed");
+
+		await user.click(screen.getByRole("button", { name: "Load more history" }));
+		await waitFor(() =>
+			expect(getStatus).toHaveBeenCalledWith(SESSION_ID, 50),
+		);
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
 	it("owns an initial project failure through deduplicated Retry, offline state, and reconnect recovery", async () => {
 		const api = createControllableApi();
 		const retry = deferred<Project[]>();
@@ -682,6 +740,33 @@ describe("App connection recovery integration", () => {
 const SESSION_ID = "session-1";
 const SESSION_TITLE = "Cached session";
 
+function gitResponse(): GitStatusResponse {
+	return {
+		session_id: SESSION_ID,
+		limit: 12,
+		workspaces_truncated: false,
+		workspaces: [{
+			workspace_dir: "repo",
+			kind: "git",
+			status: "ready",
+			branch: "main",
+			detached: false,
+			unborn: false,
+			head_sha: "a".repeat(40),
+			pull_request: null,
+			pull_request_lookup: "not_applicable",
+			commits: [{
+				sha: "a".repeat(40),
+				parents: [],
+				author_name: "Test Author",
+				authored_at: "2026-01-01T00:00:00Z",
+				summary: "Initial Git commit",
+			}],
+			has_more: true,
+		}],
+	};
+}
+
 type ApiSpy = ReturnType<typeof vi.fn>;
 
 type ControllableApi = AgentApi & {
@@ -722,7 +807,7 @@ type ControllableApi = AgentApi & {
 	eventListenerCount(): number;
 };
 
-function renderApp(api: ControllableApi) {
+function renderApp(api: ControllableApi, gitApi?: GitHttpApi) {
 	window.localStorage.setItem(
 		UI_RESUME_STORAGE_KEY,
 		JSON.stringify({
@@ -744,7 +829,7 @@ function renderApp(api: ControllableApi) {
 	});
 	const result = render(
 		<QueryClientProvider client={client}>
-			<App />
+			<App gitApi={gitApi} />
 		</QueryClientProvider>,
 	);
 	return { ...result, client };

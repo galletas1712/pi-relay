@@ -21,9 +21,18 @@ import {
 	Trash2,
 	X
 } from "lucide-react";
-import { memo, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import {
+	memo,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+	type KeyboardEvent as ReactKeyboardEvent,
+	type RefObject,
+} from "react";
 import { ActionMenu, type ActionMenuItem } from "./actionMenu.tsx";
 import { ConnectionBlockedReason, firstDisabledReason } from "./connectionRecovery.tsx";
+import { GitPanel, type GitPanelProps } from "./gitPanel.tsx";
 import { COMMANDS } from "./slash.ts";
 import {
 	isArchivedSession,
@@ -400,10 +409,11 @@ function RunBoard({
 	);
 }
 
-type InspectorTab = "run-board" | "debug";
+export type InspectorTab = "run-board" | "git" | "debug";
 
 const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
 	{ id: "run-board", label: "Agents" },
+	{ id: "git", label: "Git" },
 	{ id: "debug", label: "Inspector" },
 ];
 
@@ -1051,6 +1061,9 @@ export function Inspector({
 	mutationBlockedReason,
 	remoteReadBlockedReason,
 	tools,
+	git,
+	activeTab: controlledActiveTab,
+	onActiveTabChange,
 	onSelectSession,
 	onClose
 }: {
@@ -1072,10 +1085,42 @@ export function Inspector({
 	mutationBlockedReason?: string | null;
 	remoteReadBlockedReason?: string | null;
 	tools: ToolListing[];
+	git?: GitPanelProps;
+	activeTab?: InspectorTab;
+	onActiveTabChange?: (tab: InspectorTab) => void;
 	onSelectSession?: (sessionId: string) => void;
 	onClose?: () => void;
 }) {
-	const [activeTab, setActiveTab] = useState<InspectorTab>("run-board");
+	const [internalActiveTab, setInternalActiveTab] = useState<InspectorTab>("run-board");
+	const activeTab = controlledActiveTab ?? internalActiveTab;
+	const tabRefs = useRef(new Map<InspectorTab, HTMLButtonElement>());
+	const selectTab = (tab: InspectorTab) => {
+		setInternalActiveTab(tab);
+		onActiveTabChange?.(tab);
+	};
+	const onTabKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, tab: InspectorTab) => {
+		const currentIndex = INSPECTOR_TABS.findIndex((candidate) => candidate.id === tab);
+		let nextIndex: number | null = null;
+		switch (event.key) {
+			case "ArrowLeft":
+				nextIndex = (currentIndex - 1 + INSPECTOR_TABS.length) % INSPECTOR_TABS.length;
+				break;
+			case "ArrowRight":
+				nextIndex = (currentIndex + 1) % INSPECTOR_TABS.length;
+				break;
+			case "Home":
+				nextIndex = 0;
+				break;
+			case "End":
+				nextIndex = INSPECTOR_TABS.length - 1;
+				break;
+		}
+		if (nextIndex === null) return;
+		event.preventDefault();
+		const next = INSPECTOR_TABS[nextIndex].id;
+		selectTab(next);
+		tabRefs.current.get(next)?.focus();
+	};
 	return (
 		<div className="inspector-inner">
 			<div className="inspector-tabs" role="tablist" aria-label="inspector tabs">
@@ -1088,7 +1133,13 @@ export function Inspector({
 						id={`inspector-tab-${tab.id}`}
 						aria-selected={activeTab === tab.id}
 						aria-controls={`inspector-panel-${tab.id}`}
-						onClick={() => setActiveTab(tab.id)}
+						tabIndex={activeTab === tab.id ? 0 : -1}
+						ref={(element) => {
+							if (element) tabRefs.current.set(tab.id, element);
+							else tabRefs.current.delete(tab.id);
+						}}
+						onClick={() => selectTab(tab.id)}
+						onKeyDown={(event) => onTabKeyDown(event, tab.id)}
 					>
 						{tab.label}
 					</button>
@@ -1122,6 +1173,23 @@ export function Inspector({
 						onCancelDelegation={onCancelDelegation}
 						mutationBlockedReason={mutationBlockedReason}
 						remoteReadBlockedReason={remoteReadBlockedReason}
+					/>
+				</div>
+			) : activeTab === "git" ? (
+				<div
+					className="inspector-tab-panel"
+					role="tabpanel"
+					id="inspector-panel-git"
+					aria-labelledby="inspector-tab-git"
+				>
+					<GitPanel
+						status={git?.status ?? null}
+						loading={git?.loading ?? false}
+						fetching={git?.fetching}
+						error={git?.error ?? null}
+						unavailableReason={git?.unavailableReason}
+						onRetry={git?.onRetry}
+						onLoadMore={git?.onLoadMore}
 					/>
 				</div>
 			) : (

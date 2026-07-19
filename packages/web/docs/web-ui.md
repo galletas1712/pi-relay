@@ -1,9 +1,13 @@
 # Web UI
 
-The React/Vite client in `packages/web`. It talks to the `pi-agentd` daemon over a single websocket
-([websocket-rpc](../../../rust/docs/websocket-rpc.md)) and renders a session's transcript turn-by-turn.
+The React/Vite client in `packages/web`. It talks to the `pi-agentd` daemon over
+the `/ws` websocket ([websocket-rpc](../../../rust/docs/websocket-rpc.md)) and
+uses the separate, same-origin `pi-web` HTTP API for trusted host reads such as
+the Git sidebar. It renders a session's transcript turn-by-turn.
 See the [Rust Agent Stack](../../../rust/docs/architecture.md) overview and [design decisions](../../../rust/docs/design-decisions.md)
-for the runtime it drives, and [agent-daemon](../../../rust/docs/modules/agent-daemon.md) for the RPC server.
+for the runtime it drives, [agent-daemon](../../../rust/docs/modules/agent-daemon.md)
+for the RPC server, and [pi-web](../../../rust/docs/modules/pi-web.md) for the
+HTTP/static service.
 
 The UI is operational, not marketing-shaped: a dense three-pane layout, compact rows, small controls,
 and transcript-first interaction.
@@ -24,6 +28,10 @@ Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar
 ## Responsibilities
 
 - Own the websocket connection, reconnection, and event fan-out (`rpc.ts`), with a typed RPC facade (`agentApi.ts`).
+- Use the independently enabled `gitApi.ts` HTTP client for the same-origin Git
+  query. A syntactically valid locally parsed conversation route can read Git
+  before (or without) WebSocket route validation; `pi-web` owns 404/unavailable
+  responses.
 - Keep project and session-list server state in TanStack Query.
 - Keep the *selected* session's head, queue, active branch, compact transcript tree, and turn cards/details in a
   separate normalized per-session cache.
@@ -43,6 +51,7 @@ tools           queryKeys.tools(kind)   tree* (compact topology for /switch)
 mcp auth status queryKeys.mcpStatus
 mcp inventory   queryKeys.mcpInventory
 system prompt   queryKeys.systemPrompt  turnCardsById/turnOrder/turnDetailsById
+git status      queryKeys.gitStatus
 ```
 
 ### TanStack Query owns server lists

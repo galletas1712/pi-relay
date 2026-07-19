@@ -1,0 +1,30 @@
+[package]
+name = "pi-web"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "pi-web"
+path = "src/main.rs"
+
+[dependencies]
+agent-store = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+cap-fs-ext = { workspace = true }
+cap-std = { workspace = true }
+mime_guess = { workspace = true }
+process-wrap = { workspace = true }
+reflink-copy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }

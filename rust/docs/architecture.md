@@ -4,7 +4,8 @@ This is the Rust rewrite of the core pi-style runtime in this repo. It is not a
 literal port of the local TypeScript fork's hierarchical subagent work. The Rust
 stack keeps the semantics that are useful for personal agent work: branch-aware
 transcript history, switch, compaction, automatic local tools, and a
-Postgres-backed websocket control plane.
+Postgres-backed websocket control plane plus a loopback-first HTTP/static
+service for trusted host reads.
 
 This document is the overview and map. Each crate has its own reference under
 [`modules/`](modules/); the cross-cutting product/engineering rationale lives in
@@ -51,6 +52,10 @@ agent-session    transcript forest, model-context materialization,
             v
 agent-vocab      shared ids, message blocks, tool calls/results,
                  transcript items, provider config (no behavior, no I/O)
+
+pi-web          built frontend + same-origin read-only host API
+   |
+   +-- agent-store     narrow durable session/workspace lookup
 ```
 
 | Crate | What it owns | Reference |
@@ -64,6 +69,7 @@ agent-vocab      shared ids, message blocks, tool calls/results,
 | `agent-mcp` | Operator-configured stdio/Streamable HTTP MCP clients, Codex-parity rmcp-backed OAuth with daemon-owned permission-protected file credentials, restart restoration/refresh, bounded bearer injection, sanitized public status/login/manual-completion/cancel/local-logout, New Session auth plus inventory selection, and deterministic MCP-only session manifests kept separate from `ToolRegistry`. | [plans/mcp-client.md](plans/mcp-client.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. | [modules/agent-daemon.md](modules/agent-daemon.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt from session/workspace/tool/skill context. | [modules/agent-prompt.md](modules/agent-prompt.md) |
+| `pi-web` | `pi-web` production static/SPA server and loopback-first read-only host control API; Git inspection is isolated here rather than in daemon RPC. | [modules/pi-web.md](modules/pi-web.md) |
 
 `agent-vocab` stays at the bottom of the graph so providers, tools, storage,
 session code, and the daemon can all talk about messages without depending on
