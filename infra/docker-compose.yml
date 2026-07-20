@@ -32,10 +32,6 @@ services:
       - "127.0.0.1:8786:8786"
     volumes:
       - ./config/control.toml:/config/pi-relay/config.toml:ro
-      # Daemon state on the host, not an ephemeral volume. The control plane's
-      # only persisted state here is mcp-oauth-credentials.json, so prior MCP
-      # logins carry over and token refreshes (atomic rename) persist to host.
-      - ${HOME}/.local/state/pi-relay:/root/.local/state/pi-relay
       # Host LLM credentials (read-only). The daemon reads ~/.codex/auth.json
       # (+installation_id) and ~/.claude*/config for the sk-ant- key. Read-only
       # so the container never rewrites auth.json as root and locks out the host
@@ -43,10 +39,9 @@ services:
       - ${HOME}/.codex:/root/.codex:ro
       - ${HOME}/.claude/config.json:/root/.claude/config.json:ro
       - ${HOME}/.claude.json:/root/.claude.json:ro
-      # MCP server definitions. The daemon enables MCP only when
-      # <config_root>/mcp.toml exists; without this the inventory (new-session
-      # selection menu) is empty. Servers live in the host's real config.
-      - ${HOME}/.config/pi-relay/mcp.toml:/config/pi-relay/mcp.toml:ro
+      # No mcp.toml or state mount: MCP (server inventory + OAuth credential
+      # store) now runs on the host-side pi-runtime next to tool execution, so
+      # the control plane's only persisted state is Postgres.
     depends_on:
       postgres:
         condition: service_healthy

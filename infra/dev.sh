@@ -45,6 +45,13 @@ name = "Local runtime"
 control_addr = "127.0.0.1:8786"
 workspace_root = "$PI_RUNTIME_ROOT"
 EOF
+# MCP servers run on the runtime now, next to tool execution. Point it at the
+# host's mcp.toml so the new-session inventory is populated (skip the line when
+# absent — the runtime treats a missing mcp_config as MCP disabled rather than
+# failing to start). OAuth credentials land in <workspace_root>/mcp-oauth-
+# credentials.json on the host, so prior control-plane logins carry over.
+MCP_CONFIG="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay/mcp.toml"
+[ -f "$MCP_CONFIG" ] && echo "mcp_config = \"$MCP_CONFIG\"" >> "$RUNTIME_CFG"
 sudo -n env HOME="$HOME" PATH="$PATH" "$RUNTIME_BIN" "$RUNTIME_CFG" &
 
 # ${VAR:+...} expands to empty when VAR is unset/empty, so local mode passes
