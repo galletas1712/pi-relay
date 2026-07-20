@@ -1,0 +1,11 @@
+# Build context is the repo root (see infra/docker-compose.yml). Keep it small:
+# the image builds Rust from source inside, and the host now also builds
+# rust/target/ (~18G) which must never enter the Docker context.
+rust/target
+target
+node_modules
+**/node_modules
+.git
+packages/web/dist
+.claude
+*.log
