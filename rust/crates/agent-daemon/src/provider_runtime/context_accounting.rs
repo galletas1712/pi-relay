@@ -1,4 +1,4 @@
-use agent_mcp::McpSessionSnapshot;
+use agent_mcp_types::McpSessionSnapshot;
 use agent_provider::{ProviderTokenCountRequest, ProviderToolProfile};
 use agent_session::{ModelContext, ModelContextEntry, TranscriptStorageNode};
 use agent_store::SessionConfig;

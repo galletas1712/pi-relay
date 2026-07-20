@@ -6,7 +6,7 @@ use agent_session::SessionAction;
 use agent_store::{ActionStatus, ActionUpdate};
 use agent_tools::{limit_tool_output, ToolContext};
 use agent_vocab::{ToolResultMessage, ToolResultStatus, TranscriptItem};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::delegation_tools::{is_delegation_tool_name, run_delegation_tool};
 use crate::provider_runtime::{
@@ -46,28 +46,23 @@ pub(super) async fn run_tool_turn(
         .await?;
 
     let tool_context = ToolContext::new(std::path::PathBuf::from("/"));
-    let snapshot = &dispatch.mcp_snapshot;
     let mut result = if is_mcp_tool {
-        let arguments = serde_json::from_str(&tool_call.args_json).unwrap_or(Value::Null);
+        // MCP servers run on the session's runtime; ship the manifest + call and
+        // let the runtime resolve/execute it into a ToolResultMessage.
         match state
-            .mcp
-            .call(snapshot, &tool_call.tool_name, arguments)
+            .runtime_hosts
+            .execute_mcp_tool(
+                &dispatch.config.runtime_id,
+                dispatch.mcp_snapshot.manifest().clone(),
+                tool_call.clone(),
+            )
             .await
         {
-            Ok(output) if output.is_error => ToolResultMessage::error(
-                tool_call.id.clone(),
-                tool_call.tool_name.clone(),
-                output.output,
-            ),
-            Ok(output) => ToolResultMessage::success(
-                tool_call.id.clone(),
-                tool_call.tool_name.clone(),
-                output.output,
-            ),
+            Ok(result) => result,
             Err(error) => ToolResultMessage::error(
                 tool_call.id.clone(),
                 tool_call.tool_name.clone(),
-                error.to_string(),
+                format!("MCP tool execution failed: {error:#}"),
             ),
         }
     } else if tool_call.tool_name == "LoadSkill" {

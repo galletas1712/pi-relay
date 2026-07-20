@@ -1,4 +1,4 @@
-use agent_mcp::McpSessionSnapshot;
+use agent_mcp_types::McpSessionSnapshot;
 use agent_provider::{
     ModelTranscriptEntry, PromptSections, ProviderCompactionRequest, ProviderCompactionResponse,
     ProviderModelMetadata, ProviderToolProfile,

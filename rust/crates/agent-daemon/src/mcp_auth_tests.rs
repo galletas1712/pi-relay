@@ -5,10 +5,12 @@ use pretty_assertions::assert_eq;
 fn public_oauth_errors_are_fixed_and_secret_free() {
     let reflected = "code-state-verifier-token-client-secret";
     for error in [
-        map_login_error(McpOAuthLoginError::InvalidCallback),
-        map_login_error(McpOAuthLoginError::Provider),
-        map_login_error(McpOAuthLoginError::TokenEndpoint),
-        map_store_error(OAuthCredentialStoreError::Corrupt),
+        map_runtime_mcp_error(anyhow::anyhow!("runtime_error: oauth_callback_invalid")),
+        map_runtime_mcp_error(anyhow::anyhow!("runtime_error: oauth_provider_error")),
+        map_runtime_mcp_error(anyhow::anyhow!("runtime_error: oauth_token_endpoint_error")),
+        map_runtime_mcp_error(anyhow::anyhow!(
+            "runtime_error: oauth_credential_store_corrupt"
+        )),
     ] {
         let debug = format!("{error:?}");
         assert!(!debug.contains(reflected));
@@ -22,7 +24,7 @@ fn public_oauth_errors_are_fixed_and_secret_free() {
 fn malformed_params_use_fixed_per_method_errors() {
     let reflected = "secret-code-state-field";
     let errors = [
-        decode_params::<EmptyParams>(
+        decode_params::<RuntimeParams>(
             serde_json::json!({"unexpected": reflected}),
             "Invalid parameters for mcp.status",
         )

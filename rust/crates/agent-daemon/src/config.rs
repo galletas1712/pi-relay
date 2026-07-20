@@ -16,7 +16,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 const DAEMON_CONFIG_FILE: &str = "config.toml";
-const MCP_CONFIG_FILE: &str = "mcp.toml";
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_RUNTIME_BIND: &str = "127.0.0.1:8786";
 const BOOTSTRAP_MARKER: &str = ".bootstrap-v1";
@@ -27,8 +26,6 @@ pub(crate) struct Config {
     pub(crate) database_url: String,
     pub(crate) bind: String,
     pub(crate) runtime_bind: String,
-    pub(crate) state_root: PathBuf,
-    pub(crate) mcp_config: Option<PathBuf>,
     pub(crate) config_root: PathBuf,
     pub(crate) daemon_config: DaemonConfig,
 }
@@ -85,21 +82,12 @@ impl Config {
         }
 
         let config_root = config_root_from_env(xdg_config_home.as_deref(), home.as_deref())?;
-        let state_root = home
-            .as_deref()
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow!("HOME is required"))?
-            .join(".local/state/pi-relay");
         let policy = load_daemon_config(&config_root.join(DAEMON_CONFIG_FILE))?;
-        let mcp_path = config_root.join(MCP_CONFIG_FILE);
-        let mcp_config = mcp_path.is_file().then_some(mcp_path);
 
         Ok(Self {
             database_url: policy.database_url,
             bind: policy.bind,
             runtime_bind: policy.runtime_bind,
-            state_root,
-            mcp_config,
             config_root,
             daemon_config: policy.daemon_config,
         })
@@ -844,61 +832,6 @@ model = "toml-parent"
     }
 
     #[test]
-    fn mcp_path_uses_only_existing_toml_without_touching_legacy_json() {
-        let root = make_temp_dir("mcp-precedence");
-        let config_root = root.join("pi-relay");
-        fs::create_dir_all(&config_root).expect("config root");
-        fs::write(
-            config_root.join(DAEMON_CONFIG_FILE),
-            r#"database_url = "postgres://test""#,
-        )
-        .expect("daemon config");
-        let legacy_mcp = config_root.join("mcp.json");
-        let legacy_bytes = br#"{ "servers": { "legacy": {} } }"#;
-        fs::write(&legacy_mcp, legacy_bytes).expect("legacy MCP config");
-
-        let ignored = config_from_values(&root, Vec::new()).expect("legacy MCP JSON is ignored");
-        assert!(ignored.mcp_config.is_none());
-        assert_eq!(
-            fs::read(&legacy_mcp).expect("legacy MCP unchanged"),
-            legacy_bytes
-        );
-
-        let mcp = config_root.join(MCP_CONFIG_FILE);
-        let bytes = br#"
-[servers.manual]
-allow_all_tools = true
-
-[servers.manual.transport]
-type = "stdio"
-command = "manual"
-"#;
-        fs::write(&mcp, bytes).expect("manual MCP config");
-
-        let fallback = config_from_values(&root, Vec::new()).expect("mcp TOML config");
-        assert_eq!(fallback.mcp_config.as_deref(), Some(mcp.as_path()));
-        assert_eq!(fs::read(&mcp).expect("MCP unchanged"), bytes);
-        assert_eq!(
-            fs::read(&legacy_mcp).expect("legacy MCP unchanged"),
-            legacy_bytes
-        );
-
-        let absent_root = make_temp_dir("mcp-absent");
-        let absent_config_root = absent_root.join("pi-relay");
-        fs::create_dir_all(&absent_config_root).expect("absent MCP config root");
-        fs::write(
-            absent_config_root.join(DAEMON_CONFIG_FILE),
-            r#"database_url = "postgres://test""#,
-        )
-        .expect("daemon config");
-        let absent = config_from_values(&absent_root, Vec::new()).expect("no MCP config");
-        assert!(absent.mcp_config.is_none());
-        assert!(!absent_root.join("pi-relay").join(MCP_CONFIG_FILE).exists());
-        fs::remove_dir_all(root).ok();
-        fs::remove_dir_all(absent_root).ok();
-    }
-
-    #[test]
     fn daemon_accepts_no_configuration_arguments() {
         let root = make_temp_dir("no-arguments");
         let config_root = root.join("pi-relay");
@@ -939,7 +872,7 @@ command = "manual"
         );
         let existing = config_root.join("subagent-roles/reviewer/SKILL.md");
         write_skill(&existing, "reviewer", "User reviewer");
-        let manual_mcp = config_root.join(MCP_CONFIG_FILE);
+        let manual_mcp = config_root.join("mcp.toml");
         let mcp_bytes = b"# manually managed MCP configuration\n";
         fs::write(&manual_mcp, mcp_bytes).expect("manual MCP");
 
@@ -961,7 +894,7 @@ command = "manual"
 
         let no_mcp_root = make_temp_dir("bootstrap-no-mcp");
         bootstrap_catalog(&prompt_root, &no_mcp_root).expect("bootstrap without MCP");
-        assert!(!no_mcp_root.join(MCP_CONFIG_FILE).exists());
+        assert!(!no_mcp_root.join("mcp.toml").exists());
 
         fs::remove_dir_all(prompt_root).ok();
         fs::remove_dir_all(config_root).ok();
@@ -984,7 +917,7 @@ command = "manual"
         );
 
         let config = config_root.join(DAEMON_CONFIG_FILE);
-        let mcp = config_root.join(MCP_CONFIG_FILE);
+        let mcp = config_root.join("mcp.toml");
         let sentinel = config_root.join("unrelated-sentinel");
         let role = config_root.join("subagent-roles/reviewer/SKILL.md");
         let workflow = config_root.join("workflows/review/SKILL.md");

@@ -1,6 +1,4 @@
-use agent_mcp::{
-    McpAuthFailure, McpAuthStatus, McpLogoutResult, McpOAuthLoginError, OAuthCredentialStoreError,
-};
+use agent_mcp_types::{McpAuthFailure, McpAuthStatus, McpLogoutResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -11,10 +9,6 @@ const MAX_SERVER_ID_BYTES: usize = 128;
 const LOGIN_ID_BYTES: usize = 16;
 const MAX_CALLBACK_URL_BYTES: usize = 16 * 1024;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EmptyParams {}
-
 fn decode_params<T: for<'de> Deserialize<'de>>(
     params: Value,
     message: &'static str,
@@ -22,15 +16,26 @@ fn decode_params<T: for<'de> Deserialize<'de>>(
     serde_json::from_value(params).map_err(|_| RpcError::new("invalid_params", message))
 }
 
+// MCP servers live on a runtime host, so every MCP RPC is scoped to a runtime.
+// The new-session panel already resolves the runtime it will start the session
+// on and threads its id in.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeParams {
+    runtime_id: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServerParams {
+    runtime_id: String,
     server: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoginParams {
+    runtime_id: String,
     server: String,
     login_id: String,
 }
@@ -38,6 +43,7 @@ struct LoginParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompleteParams {
+    runtime_id: String,
     server: String,
     login_id: String,
     callback_url: String,
@@ -47,11 +53,12 @@ pub(crate) async fn status(
     state: &AppState,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
-    let EmptyParams {} = decode_params(params, "Invalid parameters for mcp.status")?;
+    let RuntimeParams { runtime_id } = decode_params(params, "Invalid parameters for mcp.status")?;
     let servers = state
-        .mcp
-        .auth_statuses()
+        .runtime_hosts
+        .mcp_auth_statuses(&runtime_id)
         .await
+        .map_err(map_runtime_mcp_error)?
         .into_iter()
         .map(|status| {
             let auth_state = match status.auth_state {
@@ -84,13 +91,14 @@ pub(crate) async fn status(
 }
 
 pub(crate) async fn login(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
-    let ServerParams { server } = decode_params(params, "Invalid parameters for mcp.login")?;
+    let ServerParams { runtime_id, server } =
+        decode_params(params, "Invalid parameters for mcp.login")?;
     validate_server_id(&server)?;
     let start = state
-        .mcp
-        .begin_oauth_login(&server)
+        .runtime_hosts
+        .mcp_begin_login(&runtime_id, server)
         .await
-        .map_err(map_login_error)?;
+        .map_err(map_runtime_mcp_error)?;
     Ok(json!({
         "login_id": start.login_id,
         "authorization_url": start.authorization_url,
@@ -103,6 +111,7 @@ pub(crate) async fn complete(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let CompleteParams {
+        runtime_id,
         server,
         login_id,
         callback_url,
@@ -116,10 +125,10 @@ pub(crate) async fn complete(
         ));
     }
     state
-        .mcp
-        .complete_oauth_login(&server, &login_id, &callback_url)
+        .runtime_hosts
+        .mcp_complete_login(&runtime_id, server, login_id, callback_url)
         .await
-        .map_err(map_login_error)?;
+        .map_err(map_runtime_mcp_error)?;
     Ok(json!({ "completed": true }))
 }
 
@@ -127,15 +136,18 @@ pub(crate) async fn cancel(
     state: &AppState,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
-    let LoginParams { server, login_id } =
-        decode_params(params, "Invalid parameters for mcp.cancel")?;
+    let LoginParams {
+        runtime_id,
+        server,
+        login_id,
+    } = decode_params(params, "Invalid parameters for mcp.cancel")?;
     validate_server_id(&server)?;
     validate_login_id(&login_id)?;
     state
-        .mcp
-        .cancel_oauth_login(&server, &login_id)
+        .runtime_hosts
+        .mcp_cancel_login(&runtime_id, server, login_id)
         .await
-        .map_err(map_login_error)?;
+        .map_err(map_runtime_mcp_error)?;
     Ok(json!({ "cancelled": true }))
 }
 
@@ -143,13 +155,14 @@ pub(crate) async fn logout(
     state: &AppState,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
-    let ServerParams { server } = decode_params(params, "Invalid parameters for mcp.logout")?;
+    let ServerParams { runtime_id, server } =
+        decode_params(params, "Invalid parameters for mcp.logout")?;
     validate_server_id(&server)?;
     let result = state
-        .mcp
-        .logout_oauth(&server)
+        .runtime_hosts
+        .mcp_logout(&runtime_id, server)
         .await
-        .map_err(map_store_error)?;
+        .map_err(map_runtime_mcp_error)?;
     Ok(json!({
         "result": match result {
             McpLogoutResult::Removed => "removed",
@@ -185,67 +198,95 @@ fn validate_login_id(login_id: &str) -> std::result::Result<(), RpcError> {
     Ok(())
 }
 
-fn map_store_error(_error: OAuthCredentialStoreError) -> RpcError {
-    RpcError::new(
-        "mcp_oauth_credential_store_failed",
-        "MCP OAuth credential storage is unavailable",
-    )
-}
-
-fn map_login_error(error: McpOAuthLoginError) -> RpcError {
-    match error {
-        McpOAuthLoginError::NotConfigured => RpcError::new(
+/// Map a runtime MCP error back to the frontend's stable RpcError codes. The
+/// runtime tags each error with the Mcp*Error / OAuthCredentialStoreError /
+/// McpManagerError Display, whose slug prefix we match here. Messages are the
+/// error's own fixed strings (no provider/credential text), so surfacing them is
+/// safe.
+pub(crate) fn map_runtime_mcp_error(error: anyhow::Error) -> RpcError {
+    let message = format!("{error:#}");
+    let has = |slug: &str| message.contains(slug);
+    // Credential store (also McpOAuthLoginError::Persistence).
+    if has("oauth_credential_store") || has("mcp_oauth_credential_store_failed") {
+        return RpcError::new(
+            "mcp_oauth_credential_store_failed",
+            "MCP OAuth credential storage is unavailable",
+        );
+    }
+    // OAuth login flow.
+    if has("oauth_login_not_configured") {
+        return RpcError::new(
             "mcp_oauth_not_configured",
             "OAuth login is not configured for this MCP server",
-        ),
-        McpOAuthLoginError::AlreadyPending => RpcError::new(
+        );
+    }
+    if has("oauth_login_already_pending") {
+        return RpcError::new(
             "mcp_oauth_login_already_pending",
             "An OAuth login is already pending for this MCP server",
-        ),
-        McpOAuthLoginError::NotFound => RpcError::new(
+        );
+    }
+    if has("oauth_login_not_found") {
+        return RpcError::new(
             "mcp_oauth_login_not_found",
             "The MCP OAuth login was not found",
-        ),
-        McpOAuthLoginError::AlreadyCompleted => RpcError::new(
+        );
+    }
+    if has("oauth_login_already_completed") {
+        return RpcError::new(
             "mcp_oauth_login_finished",
             "The MCP OAuth login is no longer pending",
-        ),
-        McpOAuthLoginError::Cancelled => RpcError::new(
+        );
+    }
+    if has("oauth_login_cancelled") {
+        return RpcError::new(
             "mcp_oauth_login_cancelled",
             "The MCP OAuth login was cancelled",
-        ),
-        McpOAuthLoginError::Expired => {
-            RpcError::new("mcp_oauth_login_expired", "The MCP OAuth login expired")
-        }
-        McpOAuthLoginError::CallbackBind => RpcError::new(
+        );
+    }
+    if has("oauth_login_expired") {
+        return RpcError::new("mcp_oauth_login_expired", "The MCP OAuth login expired");
+    }
+    if has("oauth_callback_bind_failed") {
+        return RpcError::new(
             "mcp_oauth_callback_unavailable",
-            "The daemon could not start the loopback OAuth callback listener",
-        ),
-        McpOAuthLoginError::InvalidCallback => RpcError::new(
+            "The runtime could not start the loopback OAuth callback listener",
+        );
+    }
+    if has("oauth_callback_invalid") {
+        return RpcError::new(
             "mcp_oauth_callback_invalid",
             "The OAuth callback URL is invalid for this login",
-        ),
-        McpOAuthLoginError::Provider => RpcError::new(
+        );
+    }
+    if has("oauth_provider_error") {
+        return RpcError::new(
             "mcp_oauth_provider_error",
             "The authorization server rejected the OAuth login",
-        ),
-        McpOAuthLoginError::Persistence => map_store_error(OAuthCredentialStoreError::Io),
-        McpOAuthLoginError::Discovery
-        | McpOAuthLoginError::Registration
-        | McpOAuthLoginError::TokenEndpoint
-        | McpOAuthLoginError::Network
-        | McpOAuthLoginError::Unavailable
-        | McpOAuthLoginError::AuthorizationUrlTooLong => RpcError::new(
+        );
+    }
+    if message.contains("oauth_") {
+        return RpcError::new(
             "mcp_oauth_login_failed",
             "The MCP OAuth login could not be completed",
-        ),
+        );
     }
+    // Manager (inventory / selection).
+    if has("mcp_inventory_changed") {
+        return RpcError::new(
+            "mcp_inventory_changed",
+            "The MCP inventory changed; refresh and try again",
+        );
+    }
+    if has("mcp_unavailable") {
+        return RpcError::new("mcp_unavailable", "A selected MCP server is unavailable");
+    }
+    if has("mcp_selection_invalid") || has("invalid MCP catalog") {
+        return RpcError::new("mcp_selection_invalid", "The MCP selection is invalid");
+    }
+    RpcError::new("mcp_error", message)
 }
 
 #[cfg(test)]
 #[path = "mcp_auth_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "mcp_auth_integration_tests.rs"]
-mod integration_tests;

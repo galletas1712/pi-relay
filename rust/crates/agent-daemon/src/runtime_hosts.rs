@@ -2,12 +2,18 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use agent_mcp_types::{
+    McpAuthServerStatus, McpInventory, McpLogoutResult, McpOAuthLoginStart, McpSessionManifest,
+    McpSessionSelection, McpToolView,
+};
 use agent_runtime_protocol::{
     read_frame, write_frame, ControlToRuntime, RuntimeCommand, RuntimeCommandError,
     RuntimeCommandResult, RuntimeHello, RuntimeRecord, RuntimeToControl, SelectedWorkspace,
     COMMAND_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
 };
 use agent_store::PostgresAgentStore;
+use agent_tools::ProviderTool;
+use agent_vocab::{ProviderKind, ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -454,6 +460,171 @@ impl RuntimeRegistry {
             _ => Err(anyhow!("runtime returned the wrong runtime-skills result")),
         }
     }
+
+    // --- MCP: the servers, tool calls, and OAuth run on the runtime host; these
+    // forward each control-plane MCP RPC over the existing conduit. Errors carry
+    // the runtime's stable slug ("<code>: <message>") for the caller to map. ---
+
+    pub(crate) async fn mcp_inventory(
+        &self,
+        runtime_id: &str,
+        provider: ProviderKind,
+        first_party: HashMap<ProviderKind, Vec<ProviderTool>>,
+    ) -> Result<McpInventory> {
+        match self
+            .execute(
+                runtime_id,
+                RuntimeCommand::McpInventory {
+                    provider,
+                    first_party,
+                },
+            )
+            .await?
+        {
+            RuntimeCommandResult::McpInventory { inventory } => Ok(inventory),
+            _ => Err(anyhow!("runtime returned the wrong mcp-inventory result")),
+        }
+    }
+
+    pub(crate) async fn mcp_select(
+        &self,
+        runtime_id: &str,
+        selection: McpSessionSelection,
+        first_party: HashMap<ProviderKind, Vec<ProviderTool>>,
+    ) -> Result<McpSessionManifest> {
+        match self
+            .execute(
+                runtime_id,
+                RuntimeCommand::McpSelect {
+                    selection,
+                    first_party,
+                },
+            )
+            .await?
+        {
+            RuntimeCommandResult::McpManifest { manifest } => Ok(manifest),
+            _ => Err(anyhow!("runtime returned the wrong mcp-select result")),
+        }
+    }
+
+    pub(crate) async fn execute_mcp_tool(
+        &self,
+        runtime_id: &str,
+        manifest: McpSessionManifest,
+        tool_call: ToolCall,
+    ) -> Result<ToolResultMessage> {
+        match self
+            .execute(
+                runtime_id,
+                RuntimeCommand::ExecuteMcpTool {
+                    manifest,
+                    tool_call,
+                },
+            )
+            .await?
+        {
+            RuntimeCommandResult::Tool { result } => Ok(result),
+            _ => Err(anyhow!("runtime returned the wrong mcp-tool result")),
+        }
+    }
+
+    pub(crate) async fn mcp_tool_views(
+        &self,
+        runtime_id: &str,
+        manifest: McpSessionManifest,
+    ) -> Result<Vec<McpToolView>> {
+        match self
+            .execute(runtime_id, RuntimeCommand::McpToolViews { manifest })
+            .await?
+        {
+            RuntimeCommandResult::McpToolViews { views } => Ok(views),
+            _ => Err(anyhow!("runtime returned the wrong mcp-tool-views result")),
+        }
+    }
+
+    pub(crate) async fn mcp_auth_statuses(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Vec<McpAuthServerStatus>> {
+        match self
+            .execute(runtime_id, RuntimeCommand::McpAuthStatuses {})
+            .await?
+        {
+            RuntimeCommandResult::McpAuthStatuses { servers } => Ok(servers),
+            _ => Err(anyhow!(
+                "runtime returned the wrong mcp-auth-statuses result"
+            )),
+        }
+    }
+
+    pub(crate) async fn mcp_begin_login(
+        &self,
+        runtime_id: &str,
+        server: String,
+    ) -> Result<McpOAuthLoginStart> {
+        match self
+            .execute(runtime_id, RuntimeCommand::McpBeginLogin { server })
+            .await?
+        {
+            RuntimeCommandResult::McpLoginStart { start } => Ok(start),
+            _ => Err(anyhow!("runtime returned the wrong mcp-login result")),
+        }
+    }
+
+    pub(crate) async fn mcp_complete_login(
+        &self,
+        runtime_id: &str,
+        server: String,
+        login_id: String,
+        callback_url: String,
+    ) -> Result<()> {
+        match self
+            .execute(
+                runtime_id,
+                RuntimeCommand::McpCompleteLogin {
+                    server,
+                    login_id,
+                    callback_url,
+                },
+            )
+            .await?
+        {
+            RuntimeCommandResult::Ack => Ok(()),
+            _ => Err(anyhow!("runtime returned the wrong mcp-complete result")),
+        }
+    }
+
+    pub(crate) async fn mcp_cancel_login(
+        &self,
+        runtime_id: &str,
+        server: String,
+        login_id: String,
+    ) -> Result<()> {
+        match self
+            .execute(
+                runtime_id,
+                RuntimeCommand::McpCancelLogin { server, login_id },
+            )
+            .await?
+        {
+            RuntimeCommandResult::Ack => Ok(()),
+            _ => Err(anyhow!("runtime returned the wrong mcp-cancel result")),
+        }
+    }
+
+    pub(crate) async fn mcp_logout(
+        &self,
+        runtime_id: &str,
+        server: String,
+    ) -> Result<McpLogoutResult> {
+        match self
+            .execute(runtime_id, RuntimeCommand::McpLogout { server })
+            .await?
+        {
+            RuntimeCommandResult::McpLogout { result } => Ok(result),
+            _ => Err(anyhow!("runtime returned the wrong mcp-logout result")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -501,6 +672,7 @@ pub(crate) mod test_support {
             &RuntimeToControl::Hello(RuntimeHello {
                 runtime_id,
                 name: "fake test runtime".to_string(),
+                mcp_enabled: false,
             }),
         )
         .await?;
@@ -616,6 +788,20 @@ pub(crate) mod test_support {
                 files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
                 Ok(RuntimeCommandResult::RuntimeSkills { files })
             }
+            // The fake runtime does not simulate MCP; MCP is exercised in
+            // agent-mcp's own tests.
+            RuntimeCommand::McpInventory { .. }
+            | RuntimeCommand::McpSelect { .. }
+            | RuntimeCommand::ExecuteMcpTool { .. }
+            | RuntimeCommand::McpToolViews { .. }
+            | RuntimeCommand::McpAuthStatuses { .. }
+            | RuntimeCommand::McpBeginLogin { .. }
+            | RuntimeCommand::McpCompleteLogin { .. }
+            | RuntimeCommand::McpCancelLogin { .. }
+            | RuntimeCommand::McpLogout { .. } => Err(RuntimeCommandError::new(
+                "mcp_unsupported",
+                "fake runtime does not implement MCP",
+            )),
         }
     }
 

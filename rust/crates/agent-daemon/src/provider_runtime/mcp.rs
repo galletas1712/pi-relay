@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use agent_mcp::{McpSessionManifest, McpSessionSnapshot};
+use agent_mcp_types::{McpSessionManifest, McpSessionSnapshot};
 use agent_prompt::PromptProfile;
 use agent_store::SessionConfig;
 use agent_vocab::ProviderKind;
@@ -39,7 +39,7 @@ pub(crate) fn first_party_toolsets(
 }
 
 pub(crate) fn provider_toolset_fingerprint(tools: &[agent_tools::ProviderTool]) -> String {
-    agent_mcp::fingerprint_json(&Value::Array(
+    agent_mcp_types::fingerprint_json(&Value::Array(
         tools.iter().map(|tool| tool.declaration.clone()).collect(),
     ))
 }

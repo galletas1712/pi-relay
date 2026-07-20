@@ -4,7 +4,6 @@ use std::{
     sync::{atomic::AtomicBool, Arc, Mutex as StdMutex},
 };
 
-use agent_mcp::McpManager;
 use agent_store::{ActionKind, EventFrame, PostCompactionDispatchLease, PostgresAgentStore};
 use agent_tools::ToolRegistry;
 use tokio::sync::{broadcast, Mutex};
@@ -48,7 +47,6 @@ pub(crate) struct AppState {
     pub(crate) shutting_down: Arc<AtomicBool>,
     pub(crate) events: broadcast::Sender<EventFrame>,
     pub(crate) tools: Arc<ToolRegistry>,
-    pub(crate) mcp: Arc<McpManager>,
     pub(crate) provider_connections: ProviderConnectionRegistry,
     pub(crate) session_titles: SessionTitleScheduler,
     pub(crate) runtime_hosts: RuntimeRegistry,

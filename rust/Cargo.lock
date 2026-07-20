@@ -14,7 +14,7 @@ name = "agent-daemon"
 version = "0.1.0"
 dependencies = [
  "agent-core",
- "agent-mcp",
+ "agent-mcp-types",
  "agent-prompt",
  "agent-provider",
  "agent-runtime-protocol",
