@@ -40,8 +40,8 @@ TanStack Query                          SelectedSessionCache (per sessionId)
 projects        queryKeys.projects      snapshot (head/revisions/queue/metadata)
 session lists   queryKeys.sessions(pid) activeBranchEntryIds + entriesById
 tools           queryKeys.tools(kind)   tree* (compact topology for /switch)
-mcp auth status queryKeys.mcpStatus
-mcp inventory   queryKeys.mcpInventory
+mcp auth status queryKeys.mcpStatus(runtimeId)
+mcp inventory   queryKeys.mcpInventory(provider, runtimeId)
 system prompt   queryKeys.systemPrompt  turnCardsById/turnOrder/turnDetailsById
 ```
 

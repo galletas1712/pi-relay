@@ -64,12 +64,12 @@ export interface AgentApi {
 	steerSubagent(params: SteerSubagentParams): Promise<SteerSubagentResult>;
 	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse>;
 	listTools(provider: string, sessionId?: string | null): Promise<ToolListing[]>;
-	getMcpInventory(provider: string): Promise<McpInventory>;
-	getMcpStatus(): Promise<McpStatus>;
-	loginMcp(server: string): Promise<McpLoginResult>;
-	completeMcpLogin(server: string, loginId: string, callbackUrl: string): Promise<{ completed: true }>;
-	cancelMcpLogin(server: string, loginId: string): Promise<{ cancelled: true }>;
-	logoutMcp(server: string): Promise<McpLogoutResult>;
+	getMcpInventory(provider: string, runtimeId: string): Promise<McpInventory>;
+	getMcpStatus(runtimeId: string): Promise<McpStatus>;
+	loginMcp(server: string, runtimeId: string): Promise<McpLoginResult>;
+	completeMcpLogin(server: string, loginId: string, callbackUrl: string, runtimeId: string): Promise<{ completed: true }>;
+	cancelMcpLogin(server: string, loginId: string, runtimeId: string): Promise<{ cancelled: true }>;
+	logoutMcp(server: string, runtimeId: string): Promise<McpLogoutResult>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
 	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse>;
 	getTranscriptIndex(sessionId: string, options?: TranscriptIndexOptions): Promise<TranscriptTreeIndex>;
@@ -393,39 +393,55 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	getMcpInventory(provider: string): Promise<McpInventory> {
-		return this.client.request<McpInventory>("mcp.inventory", { provider });
+	getMcpInventory(provider: string, runtimeId: string): Promise<McpInventory> {
+		return this.client.request<McpInventory>("mcp.inventory", {
+			provider,
+			runtime_id: runtimeId,
+		});
 	}
 
-	getMcpStatus(): Promise<McpStatus> {
-		return this.client.request<McpStatus>("mcp.status");
+	getMcpStatus(runtimeId: string): Promise<McpStatus> {
+		return this.client.request<McpStatus>("mcp.status", { runtime_id: runtimeId });
 	}
 
-	loginMcp(server: string): Promise<McpLoginResult> {
-		return this.client.request<McpLoginResult>("mcp.login", { server });
+	loginMcp(server: string, runtimeId: string): Promise<McpLoginResult> {
+		return this.client.request<McpLoginResult>("mcp.login", {
+			server,
+			runtime_id: runtimeId,
+		});
 	}
 
 	completeMcpLogin(
 		server: string,
 		loginId: string,
 		callbackUrl: string,
+		runtimeId: string,
 	): Promise<{ completed: true }> {
 		return this.client.request<{ completed: true }>("mcp.complete", {
 			server,
 			login_id: loginId,
 			callback_url: callbackUrl,
+			runtime_id: runtimeId,
 		});
 	}
 
-	cancelMcpLogin(server: string, loginId: string): Promise<{ cancelled: true }> {
+	cancelMcpLogin(
+		server: string,
+		loginId: string,
+		runtimeId: string,
+	): Promise<{ cancelled: true }> {
 		return this.client.request<{ cancelled: true }>("mcp.cancel", {
 			server,
 			login_id: loginId,
+			runtime_id: runtimeId,
 		});
 	}
 
-	logoutMcp(server: string): Promise<McpLogoutResult> {
-		return this.client.request<McpLogoutResult>("mcp.logout", { server });
+	logoutMcp(server: string, runtimeId: string): Promise<McpLogoutResult> {
+		return this.client.request<McpLogoutResult>("mcp.logout", {
+			server,
+			runtime_id: runtimeId,
+		});
 	}
 
 	reconnect(): Promise<void> {

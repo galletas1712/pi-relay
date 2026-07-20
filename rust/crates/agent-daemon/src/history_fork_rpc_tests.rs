@@ -65,7 +65,7 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
     );
     config.workspace_id = workspace_id;
     config.workspaces = workspaces;
-    let mcp_snapshot = agent_mcp::McpSessionSnapshot::empty();
+    let mcp_snapshot = agent_mcp_types::McpSessionSnapshot::empty();
     config.mcp_manifest = Some(McpSessionManifestBinding {
         manifest_fingerprint: mcp_snapshot.manifest_fingerprint().to_string(),
         manifest: serde_json::to_value(mcp_snapshot.manifest()).expect("MCP manifest serializes"),

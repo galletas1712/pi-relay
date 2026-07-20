@@ -1,14 +1,32 @@
 use super::*;
+use crate::runtime_hosts::RuntimeHostError;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 
 #[test]
 fn public_oauth_errors_are_fixed_and_secret_free() {
     let reflected = "code-state-verifier-token-client-secret";
     for error in [
-        map_login_error(McpOAuthLoginError::InvalidCallback),
-        map_login_error(McpOAuthLoginError::Provider),
-        map_login_error(McpOAuthLoginError::TokenEndpoint),
-        map_store_error(OAuthCredentialStoreError::Corrupt),
+        map_runtime_mcp_error(anyhow::Error::new(RuntimeHostError {
+            code: "mcp_oauth_callback_invalid".to_string(),
+            message: "The OAuth callback URL is invalid for this login".to_string(),
+            data: json!({}),
+        })),
+        map_runtime_mcp_error(anyhow::Error::new(RuntimeHostError {
+            code: "mcp_oauth_provider_error".to_string(),
+            message: "The authorization server rejected the OAuth login".to_string(),
+            data: json!({}),
+        })),
+        map_runtime_mcp_error(anyhow::Error::new(RuntimeHostError {
+            code: "mcp_oauth_login_failed".to_string(),
+            message: "The MCP OAuth login could not be completed".to_string(),
+            data: json!({}),
+        })),
+        map_runtime_mcp_error(anyhow::Error::new(RuntimeHostError {
+            code: "mcp_oauth_credential_store_failed".to_string(),
+            message: "MCP OAuth credential storage is unavailable".to_string(),
+            data: json!({}),
+        })),
     ] {
         let debug = format!("{error:?}");
         assert!(!debug.contains(reflected));
@@ -19,10 +37,21 @@ fn public_oauth_errors_are_fixed_and_secret_free() {
 }
 
 #[test]
+fn inventory_changed_preserves_current_revision() {
+    let error = map_runtime_mcp_error(anyhow::Error::new(RuntimeHostError {
+        code: "mcp_inventory_changed".to_string(),
+        message: "MCP inventory changed; refresh and review the selection".to_string(),
+        data: json!({ "current_revision": "rev-42" }),
+    }));
+    assert_eq!(error.code, "mcp_inventory_changed");
+    assert_eq!(error.data, json!({ "current_revision": "rev-42" }));
+}
+
+#[test]
 fn malformed_params_use_fixed_per_method_errors() {
     let reflected = "secret-code-state-field";
     let errors = [
-        decode_params::<EmptyParams>(
+        decode_params::<RuntimeParams>(
             serde_json::json!({"unexpected": reflected}),
             "Invalid parameters for mcp.status",
         )

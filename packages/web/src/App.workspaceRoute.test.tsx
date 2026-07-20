@@ -1042,7 +1042,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
 		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
 		await act(async () => {
-			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus });
+			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus("runtime-test") });
 		});
 		const composer = screen.getByRole<HTMLTextAreaElement>("textbox");
 		await user.type(composer, "do not send with stale OAuth");
@@ -1100,7 +1100,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("button", { name: "Login" }));
 		expect(await screen.findByRole("heading", { name: "Log in to workspace" })).toBeTruthy();
 		await act(async () => {
-			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus });
+			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus("runtime-test") });
 		});
 		await waitFor(() =>
 			expect(screen.queryByRole("heading", { name: "Log in to workspace" })).toBeNull(),
@@ -1154,7 +1154,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("button", { name: "Login" }));
 		expect(await screen.findByRole("heading", { name: "Log in to workspace" })).toBeTruthy();
 		await act(async () => {
-			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus });
+			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus("runtime-test") });
 		});
 
 		await waitFor(() =>
@@ -1189,7 +1189,7 @@ describe("App workspace route identity integration", () => {
 		await open(api);
 		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
 		await user.click(screen.getByRole("button", { name: "Login" }));
-		await waitFor(() => expect(api.loginMcp).toHaveBeenCalledWith("workspace"));
+		await waitFor(() => expect(api.loginMcp).toHaveBeenCalledWith("workspace", "runtime-test"));
 		await act(async () => browser.navigate("/w/host/run/root-1/conversation/root-1"));
 		await act(async () => {
 			login.resolve({
@@ -1204,6 +1204,7 @@ describe("App workspace route identity integration", () => {
 			expect(api.cancelMcpLogin).toHaveBeenCalledWith(
 				"workspace",
 				"0000000000000001",
+				"runtime-test",
 			),
 		);
 		expect(screen.queryByRole("heading", { name: "Log in to workspace" })).toBeNull();
@@ -1329,7 +1330,7 @@ describe("App workspace route identity integration", () => {
 		api.getMcpInventory.mockImplementationOnce(() => refresh.promise);
 		act(() => {
 			void mounted.client.invalidateQueries({
-				queryKey: queryKeys.mcpInventory("openai"),
+				queryKey: queryKeys.mcpInventory("openai", "runtime-test"),
 			});
 		});
 		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledTimes(2));
@@ -1367,7 +1368,7 @@ describe("App workspace route identity integration", () => {
 		api.getMcpInventory.mockRejectedValueOnce(new Error("refresh failed"));
 		await act(async () => {
 			await mounted.client.invalidateQueries({
-				queryKey: queryKeys.mcpInventory("openai"),
+				queryKey: queryKeys.mcpInventory("openai", "runtime-test"),
 			});
 		});
 		const retryButton = await screen.findByRole<HTMLButtonElement>("button", { name: "Retry" });
@@ -1561,7 +1562,7 @@ describe("App workspace route identity integration", () => {
 		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 tools selected");
 
 		await user.selectOptions(screen.getByRole("combobox", { name: "Model" }), "claude:claude-opus-4-8");
-		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledWith("claude"));
+		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledWith("claude", "runtime-test"));
 		expect((await screen.findByRole("button", { name: /MCP tools/ })).textContent).toContain(
 			"No tools selected",
 		);
@@ -2422,6 +2423,7 @@ function createRouteApi(
 	const projects: Project[] = [
 		{
 			project_id: "project-1",
+			runtime_id: "runtime-test",
 			name: "Project one",
 			workspaces: [
 				{
@@ -2442,6 +2444,7 @@ function createRouteApi(
 		},
 		{
 			project_id: "project-2",
+			runtime_id: "runtime-test",
 			name: "Project two",
 			workspaces: [{
 				kind: "local",
@@ -2537,6 +2540,9 @@ function createRouteApi(
 			return () => eventListeners.delete(listener);
 		},
 		listProjects: vi.fn(async () => projects),
+		listRuntimes: vi.fn(async () => [
+			{ runtime_id: "runtime-test", name: "Test runtime", online: true, last_seen_at: null },
+		]),
 		listSessions: vi.fn(async (_limit: number, projectId: string | null) =>
 			summaries.filter((session) => session.project_id === projectId)),
 		listDelegations,

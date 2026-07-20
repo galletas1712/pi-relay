@@ -9,6 +9,8 @@ name = "pi-runtime"
 path = "src/main.rs"
 
 [dependencies]
+agent-mcp = { workspace = true }
+agent-mcp-types = { workspace = true }
 agent-runtime-protocol = { workspace = true }
 agent-tools = { workspace = true }
 agent-vocab = { workspace = true }

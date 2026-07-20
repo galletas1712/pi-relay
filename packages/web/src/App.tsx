@@ -550,6 +550,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		login: McpLoginResult;
 		context: string;
 		terminalArmed: boolean;
+		runtimeId: string;
 	} | null>(null);
 	const [mcpAuthBusyServer, setMcpAuthBusyServer] = useState<string | null>(null);
 	const mcpLoginContextRef = useRef("");
@@ -1098,24 +1099,38 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		enabled: connection === "open" && routeRemoteReadsEnabled,
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
+	// MCP servers live on the session's runtime, so scope the picker to the
+	// runtime the new session will use: the project's runtime, or an online host
+	// runtime.
+	const newSessionRuntimeId = selectedProjectId
+		? projects.find((project) => project.project_id === selectedProjectId)?.runtime_id ?? null
+		: runtimes.find((runtime) => runtime.online)?.runtime_id ?? null;
 	const mcpInventoryQuery = useQuery({
-		queryKey: queryKeys.mcpInventory(newSessionProvider.kind),
+		queryKey: queryKeys.mcpInventory(newSessionProvider.kind, newSessionRuntimeId ?? ""),
 		queryFn: async () => {
 			assertServerReadAllowed();
 			return {
 				provider: newSessionProvider.kind,
-				inventory: await api.getMcpInventory(newSessionProvider.kind),
+				inventory: await api.getMcpInventory(newSessionProvider.kind, newSessionRuntimeId!),
 			};
 		},
-		enabled: connection === "open" && routeRemoteReadsEnabled && !selectedId,
+		enabled:
+			connection === "open" &&
+			routeRemoteReadsEnabled &&
+			!selectedId &&
+			!!newSessionRuntimeId,
 	});
 	const mcpStatusQuery = useQuery({
-		queryKey: queryKeys.mcpStatus,
+		queryKey: queryKeys.mcpStatus(newSessionRuntimeId ?? ""),
 		queryFn: () => {
 			assertServerReadAllowed();
-			return api.getMcpStatus();
+			return api.getMcpStatus(newSessionRuntimeId!);
 		},
-		enabled: connection === "open" && routeRemoteReadsEnabled && !selectedId,
+		enabled:
+			connection === "open" &&
+			routeRemoteReadsEnabled &&
+			!selectedId &&
+			!!newSessionRuntimeId,
 		refetchInterval: (query) =>
 			query.state.data?.servers.some(
 				(server) => server.auth_state === "authorization_pending",
@@ -1190,24 +1205,25 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			mcpInventoryQuery.refetch(),
 		]);
 	}, [mcpInventoryQuery.refetch, mcpStatusQuery.refetch]);
-	const mcpLoginContext = `${selectedId ?? "new"}\u0000${selectedProjectId ?? "host"}\u0000${newSessionProvider.kind}\u0000${newSessionSetupGeneration}`;
+	const mcpLoginContext = `${selectedId ?? "new"}\u0000${selectedProjectId ?? "host"}\u0000${newSessionProvider.kind}\u0000${newSessionRuntimeId ?? ""}\u0000${newSessionSetupGeneration}`;
 	mcpLoginContextRef.current = mcpLoginContext;
 	const loginMcp = useCallback(async (server: string) => {
-		if (mcpAuthBusyServer) return;
+		if (mcpAuthBusyServer || !newSessionRuntimeId) return;
+		const runtimeId = newSessionRuntimeId;
 		setMcpAuthBusyServer(server);
 		try {
 			assertServerMutationAllowed();
 			const context = mcpLoginContext;
-			const login = await api.loginMcp(server);
+			const login = await api.loginMcp(server, runtimeId);
 			if (context !== mcpLoginContextRef.current || selectedRef.current !== null) {
-				void api.cancelMcpLogin(server, login.login_id).catch(() => undefined);
+				void api.cancelMcpLogin(server, login.login_id, runtimeId).catch(() => undefined);
 				return;
 			}
-			setMcpLoginDialog({ server, login, context, terminalArmed: false });
+			setMcpLoginDialog({ server, login, context, terminalArmed: false, runtimeId });
 			const statusResult = await mcpStatusQuery.refetch();
 			if (statusResult.error) {
 				setMcpLoginDialog(null);
-				void api.cancelMcpLogin(server, login.login_id).catch(() => undefined);
+				void api.cancelMcpLogin(server, login.login_id, runtimeId).catch(() => undefined);
 				pushErrorNotice("Could not verify MCP login status");
 				return;
 			}
@@ -1227,6 +1243,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		mcpAuthBusyServer,
 		mcpLoginContext,
 		mcpStatusQuery.refetch,
+		newSessionRuntimeId,
 		pushErrorNotice,
 	]);
 	const completeMcpLogin = useCallback(async (callbackUrl: string) => {
@@ -1236,6 +1253,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			mcpLoginDialog.server,
 			mcpLoginDialog.login.login_id,
 			callbackUrl,
+			mcpLoginDialog.runtimeId,
 		);
 		setMcpLoginDialog(null);
 		await refreshMcpAfterAuthChange();
@@ -1259,6 +1277,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			await api.cancelMcpLogin(
 				mcpLoginDialog.server,
 				mcpLoginDialog.login.login_id,
+				mcpLoginDialog.runtimeId,
 			);
 		} catch (error) {
 			const message = errorMessage(error);
@@ -1295,11 +1314,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		pushErrorNotice,
 	]);
 	const logoutMcp = useCallback(async (server: string) => {
-		if (mcpAuthBusyServer) return;
+		if (mcpAuthBusyServer || !newSessionRuntimeId) return;
 		setMcpAuthBusyServer(server);
 		try {
 			assertServerMutationAllowed();
-			await api.logoutMcp(server);
+			await api.logoutMcp(server, newSessionRuntimeId);
 			const next = clearMcpServerSelection(mcpSelectionRef.current, server);
 			mcpSelectionRef.current = next;
 			setMcpSelection(next);
@@ -1314,6 +1333,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		api,
 		assertServerMutationAllowed,
 		mcpAuthBusyServer,
+		newSessionRuntimeId,
 		pushErrorNotice,
 		refreshMcpAfterAuthChange,
 	]);
@@ -1329,7 +1349,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		const stale = mcpLoginDialog;
 		setMcpLoginDialog(null);
 		void api
-			.cancelMcpLogin(stale.server, stale.login.login_id)
+			.cancelMcpLogin(stale.server, stale.login.login_id, stale.runtimeId)
 			.catch(() => undefined);
 	}, [api, mcpLoginContext, mcpLoginDialog]);
 	useEffect(() => {
@@ -1338,7 +1358,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const stale = mcpLoginDialog;
 			setMcpLoginDialog(null);
 			void api
-				.cancelMcpLogin(stale.server, stale.login.login_id)
+				.cancelMcpLogin(stale.server, stale.login.login_id, stale.runtimeId)
 				.catch(() => undefined);
 			pushErrorNotice("Could not verify MCP login status");
 			return;
@@ -3343,9 +3363,12 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				}
 			} catch (error) {
 				if (errorMessage(error).startsWith("mcp_inventory_changed:")) {
-					await queryClient.refetchQueries({
-						queryKey: queryKeys.mcpInventory(newSessionProvider.kind),
-					});
+					const runtimeId = newSessionRuntimeId;
+					if (runtimeId) {
+						await queryClient.refetchQueries({
+							queryKey: queryKeys.mcpInventory(newSessionProvider.kind, runtimeId),
+						});
+					}
 				}
 				throw error;
 			}
@@ -3367,6 +3390,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			mcpAuthStatusReady,
 			newSessionProvider,
 			newSessionProviderWasExplicit,
+			newSessionRuntimeId,
 			openRootConversation,
 			queryClient,
 		],

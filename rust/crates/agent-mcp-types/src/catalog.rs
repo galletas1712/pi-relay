@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 const MANIFEST_VERSION: u32 = 2;
-pub(crate) const MAX_TOOLS: usize = 512;
+pub const MAX_TOOLS: usize = 512;
 const MAX_DESCRIPTION_BYTES: usize = 8 * 1024;
 const MAX_SCHEMA_BYTES: usize = 24 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 32;
@@ -20,12 +20,12 @@ const MAX_PROVIDER_NAME_BYTES: usize = 64;
 const HASH_SUFFIX_HEX_BYTES: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DiscoveredTool {
-    pub(crate) server_id: String,
-    pub(crate) server_config_fingerprint: String,
-    pub(crate) raw_name: String,
-    pub(crate) description: String,
-    pub(crate) input_schema: Value,
+pub struct DiscoveredTool {
+    pub server_id: String,
+    pub server_config_fingerprint: String,
+    pub raw_name: String,
+    pub description: String,
+    pub input_schema: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,7 +76,7 @@ pub struct McpSessionSnapshot {
 }
 
 impl McpSessionSnapshot {
-    pub(crate) fn new(mut manifest: McpSessionManifest) -> Result<Self> {
+    pub fn new(mut manifest: McpSessionManifest) -> Result<Self> {
         validate_persisted_manifest(&manifest, /*check_fingerprint*/ false)?;
         manifest.manifest_fingerprint = manifest_fingerprint(&manifest);
         Ok(Self {
@@ -125,7 +125,7 @@ impl McpSessionSnapshot {
     }
 }
 
-pub(crate) fn build_inventory_catalog(
+pub fn build_inventory_catalog(
     server_config_fingerprints: &BTreeMap<String, String>,
     discovered: Vec<DiscoveredTool>,
     builtin_names: &BTreeSet<String>,
@@ -239,7 +239,7 @@ pub(crate) fn build_inventory_catalog(
     Ok(manifest)
 }
 
-pub(crate) fn select_manifest(
+pub fn select_manifest(
     inventory: &McpSessionManifest,
     selection: &BTreeMap<String, BTreeSet<String>>,
 ) -> Result<McpSessionManifest> {
@@ -293,7 +293,7 @@ pub(crate) fn select_manifest(
     })
 }
 
-pub(crate) fn declaration_token_estimate(tool: &ProviderTool) -> Result<usize> {
+pub fn declaration_token_estimate(tool: &ProviderTool) -> Result<usize> {
     let bytes = serde_json::to_vec(&canonical_json(&tool.declaration))?.len();
     Ok(bytes.div_ceil(4))
 }

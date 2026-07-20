@@ -1,4 +1,4 @@
-use agent_mcp::McpSessionSnapshot;
+use agent_mcp_types::McpSessionSnapshot;
 use agent_session::{AgentSession, SessionAction};
 use agent_store::{PostCompactionDispatchLease, SessionConfig};
 use serde::{Deserialize, Serialize};
@@ -10,33 +10,6 @@ pub(crate) struct RpcRequest {
     pub(crate) method: String,
     #[serde(default)]
     pub(crate) params: Value,
-}
-
-impl From<agent_mcp::McpManagerError> for RpcError {
-    fn from(error: agent_mcp::McpManagerError) -> Self {
-        match error {
-            agent_mcp::McpManagerError::InventoryChanged { current_revision } => Self {
-                code: "mcp_inventory_changed".to_string(),
-                message: "MCP inventory changed; refresh and review the selection".to_string(),
-                data: json!({ "current_revision": current_revision }),
-            },
-            agent_mcp::McpManagerError::SelectionInvalid { message } => {
-                Self::new("mcp_selection_invalid", message)
-            }
-            agent_mcp::McpManagerError::Unavailable { server } => Self::new(
-                "mcp_unavailable",
-                format!("selected MCP server {server} is unavailable"),
-            ),
-            agent_mcp::McpManagerError::CredentialStore(_) => Self::new(
-                "mcp_oauth_credential_store_failed",
-                "MCP OAuth credential storage is unavailable".to_string(),
-            ),
-            agent_mcp::McpManagerError::Catalog(error) => Self::new(
-                "mcp_selection_invalid",
-                format!("invalid MCP catalog: {error:#}"),
-            ),
-        }
-    }
 }
 
 #[derive(Serialize)]

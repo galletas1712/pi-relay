@@ -25,20 +25,21 @@ session_start.rs   explicit session-start pipeline: workspace materialization,
                    MCP selection validation, prompt render, atomic
                    session/manifest/output persist, initial dispatch
 config.rs          strict XDG daemon startup policy, model defaults,
-                   mcp.toml selection, and one-time
-                   non-overwriting packaged role/workflow bootstrap
+                   and one-time non-overwriting packaged role/workflow
+                   bootstrap
 types.rs           RpcRequest/Response/Error, RpcMethod parse table, DispatchAction, RuntimeSession
 state.rs           AppState: repo handle, active sessions, driver locks, task registry,
-                   event broadcaster, tool registry, provider connections, workspaces
+                   event broadcaster, tool registry, provider connections, runtime hosts
 codec.rs           JSON <-> vocab parsing + transcript-store reconstruction helpers
 auth.rs            credential loading (Codex/Anthropic) + Codex 401 token refresh
 runtime/           SessionDriver facade plus concrete lifecycle phases:
                    events, outputs, task registry, dispatch, model, tool, compaction
-workspaces/        workspace base refresh, local/git source handling, sanitization,
-                   and session instantiation (btrfs/reflink/copy fallback)
+runtime_hosts.rs   framed-JSON TCP registry for connected runtimes; proxies workspace
+                   and MCP commands to the session's runtime host
 rpc_views.rs       response shaping (snapshots, queue state, transcript views, server_time_ms)
 provider_runtime/  provider selection, model metadata scheduling, model/web-tool
                    execution, compaction, token accounting
+                   (MCP snapshot reconstruction from the persisted session manifest)
 subagents.rs       delegation subagent spawn core: role resolution, full vs
                    read-only workspace handling, configured role-model selection,
                    child prompt + lifecycle events
@@ -64,8 +65,9 @@ subagent providers. `pi-agentd` accepts no configuration arguments. A legacy
 startup.
 This is a breaking TOML-only migration for user-authored XDG daemon
 configuration: legacy `config.json` and `mcp.json` are ignored rather than
-converted or read. `mcp.toml` is the separately owned, manually managed
-optional MCP source and is never written by bootstrap. Startup copy-bootstraps bundled
+converted or read. MCP server definitions (`mcp.toml`) and OAuth credentials
+live on each runtime host (see `agent-runtime`), not in the control plane.
+Startup copy-bootstraps bundled
 role/workflow `SKILL.md` files only when absent and then records completion, so
 later deletions remain user-owned. Skill/role resolution is explicit
 workspace/home first, configured catalog second, packaged fallback last;

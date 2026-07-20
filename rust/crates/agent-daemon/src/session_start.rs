@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent_mcp::McpSessionSelection;
+use agent_mcp_types::McpSessionSelection;
 use agent_session::AgentSession;
 use agent_store::{
     InputPriority, McpSessionManifestBinding, QueuedInputContent, SessionActivity, SessionConfig,
@@ -53,28 +53,6 @@ pub(crate) async fn session_start(
         }));
     }
 
-    let mcp_manifest = if let Some(selection) = params
-        .mcp
-        .as_ref()
-        .filter(|selection| !selection.servers.is_empty())
-    {
-        let snapshot = state
-            .mcp
-            .select(
-                selection,
-                &first_party_toolsets(state, PromptProfile::Parent),
-            )
-            .await
-            .map_err(RpcError::from)?;
-        Some(McpSessionManifestBinding {
-            manifest_fingerprint: snapshot.manifest_fingerprint().to_string(),
-            manifest: serde_json::to_value(snapshot.manifest())
-                .map_err(anyhow::Error::from)
-                .map_err(RpcError::from)?,
-        })
-    } else {
-        None
-    };
     let (runtime_id, workspace_id, workspaces) = if let Some(project_id) = project_id {
         let project = state.repo.get_project(project_id).await?;
         let selection = WorkspaceSelection::from_requested(
@@ -106,6 +84,29 @@ pub(crate) async fn session_start(
             .await?;
         (runtime_id, workspace_id, workspaces)
     };
+    // MCP servers run on the session's runtime, so author the manifest against
+    // that runtime's live servers (health-check + inventory-revision guard),
+    // then persist it; every later prompt/turn reads it locally.
+    let mcp_manifest =
+        if let Some(selection) = params.mcp.filter(|selection| !selection.servers.is_empty()) {
+            let manifest = state
+                .runtime_hosts
+                .mcp_select(
+                    &runtime_id,
+                    selection,
+                    first_party_toolsets(state, PromptProfile::Parent),
+                )
+                .await
+                .map_err(crate::mcp_auth::map_runtime_mcp_error)?;
+            Some(McpSessionManifestBinding {
+                manifest_fingerprint: manifest.manifest_fingerprint.clone(),
+                manifest: serde_json::to_value(&manifest)
+                    .map_err(anyhow::Error::from)
+                    .map_err(RpcError::from)?,
+            })
+        } else {
+            None
+        };
     let mut config = SessionConfig {
         project_id,
         runtime_id,

@@ -41,7 +41,6 @@ use std::sync::{atomic::AtomicBool, Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use agent_core::AgentInput;
-use agent_mcp::{McpConfig, McpManager};
 use agent_session::SessionInput;
 use agent_store::{
     ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventType, InputPriority,
@@ -70,16 +69,6 @@ async fn main() -> Result<()> {
 
     let (events, _) = broadcast::channel(1024);
     let runtime_hosts = RuntimeRegistry::new(repo.clone());
-    let mcp = match config.mcp_config.as_deref() {
-        Some(path) => {
-            McpManager::start_with_credential_file(
-                McpConfig::from_path(path)?,
-                config.state_root.join("mcp-oauth-credentials.json"),
-            )
-            .await?
-        }
-        None => McpManager::disabled(),
-    };
     tokio::spawn(runtime_hosts.clone().listen(config.runtime_bind.clone()));
     let state = AppState {
         repo,
@@ -94,7 +83,6 @@ async fn main() -> Result<()> {
         shutting_down: Arc::new(AtomicBool::new(false)),
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
-        mcp,
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         runtime_hosts: runtime_hosts.clone(),
@@ -212,7 +200,6 @@ async fn main() -> Result<()> {
     }
 
     drain_dispatch_tasks(&state).await;
-    state.mcp.shutdown().await;
     state.repo.close().await;
     Ok(())
 }
@@ -570,7 +557,16 @@ async fn tools_list(state: &AppState, params: Value) -> std::result::Result<Valu
             format!("stored MCP manifest failed validation: {error:#}"),
         )
     })?;
-    let views = state.mcp.tool_views(&snapshot).await;
+    // Per-tool rows are built from the runtime's live views (server, raw_name,
+    // health, contract_fingerprint). If the runtime is offline the view map is
+    // empty, so the MCP tools drop out of this listing entirely rather than
+    // failing tools.list — an unreachable runtime can't execute them anyway, and
+    // the non-MCP (first-party) rows still list normally.
+    let views = state
+        .runtime_hosts
+        .mcp_tool_views(&config.runtime_id, snapshot.manifest().clone())
+        .await
+        .unwrap_or_default();
     let views = views
         .into_iter()
         .map(|view| (view.exposed_name.clone(), view))
@@ -604,6 +600,7 @@ async fn tools_list(state: &AppState, params: Value) -> std::result::Result<Valu
 }
 
 async fn mcp_inventory(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let runtime_id = required_string(&params, "runtime_id")?;
     let provider = required_string(&params, "provider")?;
     let provider = provider.parse::<ProviderKind>().map_err(|error| {
         RpcError::new(
@@ -612,13 +609,14 @@ async fn mcp_inventory(state: &AppState, params: Value) -> std::result::Result<V
         )
     })?;
     let inventory = state
-        .mcp
-        .inventory(
+        .runtime_hosts
+        .mcp_inventory(
+            &runtime_id,
             provider,
-            &crate::provider_runtime::first_party_toolsets(state, PromptProfile::Parent),
+            crate::provider_runtime::first_party_toolsets(state, PromptProfile::Parent),
         )
         .await
-        .map_err(RpcError::from)?;
+        .map_err(crate::mcp_auth::map_runtime_mcp_error)?;
     serde_json::to_value(inventory)
         .map_err(anyhow::Error::from)
         .map_err(RpcError::from)
