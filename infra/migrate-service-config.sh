@@ -20,17 +20,17 @@ for home in "$CONFIG_HOME" "$STATE_HOME"; do
       ;;
   esac
 done
-OLD_ROOT="$CONFIG_HOME/pi-relay"
-AGENTD_ROOT="$CONFIG_HOME/pi-agentd"
-RUNTIME_ROOT="$CONFIG_HOME/pi-runtime"
+PRODUCT_ROOT="$CONFIG_HOME/pi-relay"
+AGENTD_ROOT="$PRODUCT_ROOT/agentd"
+RUNTIME_ROOT="$PRODUCT_ROOT/runtime"
 WORKSPACE_ROOT="${PI_RUNTIME_ROOT:-"$STATE_HOME/pi-relay"}"
 
-if [ -L "$OLD_ROOT" ]; then
-  echo "source configuration root must not be a symlink: $OLD_ROOT" >&2
+if [ -L "$PRODUCT_ROOT" ]; then
+  echo "source configuration root must not be a symlink: $PRODUCT_ROOT" >&2
   exit 1
 fi
-if [ ! -f "$OLD_ROOT/config.toml" ]; then
-  echo "missing source configuration: $OLD_ROOT/config.toml" >&2
+if [ ! -f "$PRODUCT_ROOT/config.toml" ]; then
+  echo "missing source configuration: $PRODUCT_ROOT/config.toml" >&2
   exit 1
 fi
 for destination in "$AGENTD_ROOT" "$RUNTIME_ROOT"; do
@@ -47,11 +47,14 @@ case "$WORKSPACE_ROOT" in
     ;;
 esac
 
+AGENTD_STAGING="$CONFIG_HOME/.pi-relay-agentd-migration-$$"
 RUNTIME_STAGING="$CONFIG_HOME/.pi-runtime-migration-$$"
-if [ -e "$RUNTIME_STAGING" ]; then
-  echo "staging path already exists: $RUNTIME_STAGING" >&2
-  exit 1
-fi
+for staging in "$AGENTD_STAGING" "$RUNTIME_STAGING"; do
+  if [ -e "$staging" ]; then
+    echo "staging path already exists: $staging" >&2
+    exit 1
+  fi
+done
 cleanup_staging() {
   rm -f "$RUNTIME_STAGING/config.toml"
   rmdir "$RUNTIME_STAGING" 2>/dev/null || true
@@ -66,8 +69,10 @@ workspace_root = "$WORKSPACE_ROOT"
 EOF
 chmod 600 "$RUNTIME_STAGING/config.toml"
 
-mv "$OLD_ROOT" "$AGENTD_ROOT"
+mv "$PRODUCT_ROOT" "$AGENTD_STAGING"
 trap - EXIT
+mkdir -m 700 "$PRODUCT_ROOT"
+mv "$AGENTD_STAGING" "$AGENTD_ROOT"
 if [ -f "$AGENTD_ROOT/mcp.toml" ]; then
   mv "$AGENTD_ROOT/mcp.toml" "$RUNTIME_STAGING/mcp.toml"
 fi

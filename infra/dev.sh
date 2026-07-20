@@ -29,13 +29,14 @@ bun install
 docker compose -f infra/docker-compose.yml up -d --build --wait --remove-orphans
 
 # Build + launch pi-runtime as a host process. Its required policy lives at
-# $XDG_CONFIG_HOME/pi-runtime/config.toml (or ~/.config/pi-runtime/config.toml)
+# $XDG_CONFIG_HOME/pi-relay/runtime/config.toml (or
+# ~/.config/pi-relay/runtime/config.toml)
 # and optional MCP policy is the sibling mcp.toml. Root is required for btrfs
 # subvolume operations; HOME, PATH, and XDG_CONFIG_HOME are preserved so the
 # runtime resolves the host's policy, binaries, venvs, and ~/.agents/skills.
 ( cd rust && cargo build --release -p agent-runtime )
 RUNTIME_BIN="$REPO_ROOT/rust/target/release/pi-runtime"
-RUNTIME_CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-runtime"
+RUNTIME_CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay/runtime"
 if [ ! -f "$RUNTIME_CONFIG_HOME/config.toml" ]; then
   echo "missing runtime configuration: $RUNTIME_CONFIG_HOME/config.toml" >&2
   exit 1

@@ -52,11 +52,11 @@ docker run -d --name pi-relay-pg \
 ```
 
 Create the required daemon policy at
-`$XDG_CONFIG_HOME/pi-agentd/config.toml` (or
-`$HOME/.config/pi-agentd/config.toml` when `XDG_CONFIG_HOME` is unset):
+`$XDG_CONFIG_HOME/pi-relay/agentd/config.toml` (or
+`$HOME/.config/pi-relay/agentd/config.toml` when `XDG_CONFIG_HOME` is unset):
 
 ```sh
-CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-agentd"
+CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay/agentd"
 mkdir -p "$CONFIG_HOME"
 cat >"$CONFIG_HOME/config.toml" <<'EOF'
 database_url = "postgres://postgres:postgres@127.0.0.1:55432/pi_relay"
@@ -70,8 +70,8 @@ cargo run --manifest-path rust/Cargo.toml -p agent-daemon
 `ws://127.0.0.1:8787` unless `bind` changes it in `config.toml`.
 
 Each runtime host has independent policy at
-`$XDG_CONFIG_HOME/pi-runtime/config.toml` (or
-`$HOME/.config/pi-runtime/config.toml`):
+`$XDG_CONFIG_HOME/pi-relay/runtime/config.toml` (or
+`$HOME/.config/pi-relay/runtime/config.toml`):
 
 ```toml
 runtime_id = "runtime-local"
@@ -81,7 +81,7 @@ workspace_root = "/home/me/.local/state/pi-runtime"
 ```
 
 `pi-runtime` accepts no configuration arguments. It reads optional MCP policy
-from the sibling `pi-runtime/mcp.toml`; when that file is absent, MCP is
+from the sibling `pi-relay/runtime/mcp.toml`; when that file is absent, MCP is
 disabled. `workspace_root` is explicit and may point at existing managed
 workspace state.
 
@@ -98,20 +98,20 @@ The service boundary is explicit:
   plane.
 
 For the repository's local stack, `infra/dev.sh` mounts
-`infra/config/control.toml` into the control container's `pi-agentd`
+`infra/config/control.toml` into the control container's `pi-relay/agentd`
 configuration root and launches the host runtime with the caller's
-`pi-runtime` XDG configuration. The one-time
+`pi-relay/runtime` XDG configuration. The one-time
 `infra/migrate-service-config.sh --apply` command splits the former shared
 configuration root; stop both processes before running it.
 
 ### Daemon configuration and packaged catalogs
 
 General daemon configuration is read from
-`$XDG_CONFIG_HOME/pi-agentd/config.toml`; when `XDG_CONFIG_HOME` is unset or
-empty, that is `$HOME/.config/pi-agentd/config.toml`. In particular, a nonempty
-`XDG_CONFIG_HOME` is used directly and never gains an extra `.config`
-component. `XDG_CONFIG_HOME` and `HOME` must be absolute paths; relative
-values and parent-directory components are rejected rather than being resolved
+`$XDG_CONFIG_HOME/pi-relay/agentd/config.toml`; when `XDG_CONFIG_HOME` is unset
+or empty, that is `$HOME/.config/pi-relay/agentd/config.toml`. In particular, a
+nonempty `XDG_CONFIG_HOME` is used directly and never gains an extra `.config`
+component. `XDG_CONFIG_HOME` and `HOME` must be absolute paths; relative values
+and parent-directory components are rejected rather than being resolved
 against the daemon's working directory. The file is required, and its required
 root `database_url` must not be blank. The optional root `bind` defaults to
 `127.0.0.1:8787`. A legacy `config.json` is not read as a daemon-policy
@@ -147,9 +147,10 @@ If `default_parent_model` is omitted, the built-in parent policy is OpenAI
 built-in policy. A child uses its explicit override, then the matching resolved
 role name in `subagent_models`, then its persisted parent provider. Every
 `subagent_models` key must match a global role in
-`pi-agentd/subagent-roles`; startup rejects missing roles. Runtime-global and
-workspace-specific roles are resolved from the selected runtime when used and
-inherit the parent provider unless the spawn request explicitly overrides it.
+`pi-relay/agentd/subagent-roles`; startup rejects missing roles. Runtime-global
+and workspace-specific roles are resolved from the selected runtime when used
+and inherit the parent provider unless the spawn request explicitly overrides
+it.
 Existing or replayed sessions retain their persisted provider and are never
 retargeted by changed defaults.
 
@@ -172,10 +173,10 @@ failure their names cannot safely be deleted without risking a concurrently
 created user file.
 
 Optional MCP configuration is read only from an already-existing
-`$XDG_CONFIG_HOME/pi-runtime/mcp.toml` on each runtime host; when it is absent,
-MCP is disabled on that runtime. The runtime never creates, edits, merges,
-renames, or chmods that file. It is parsed as strict TOML. Its typed TOML shape
-and trust model are documented in
+`$XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml` on each runtime host; when it is
+absent, MCP is disabled on that runtime. The runtime never creates, edits,
+merges, renames, or chmods that file. It is parsed as strict TOML. Its typed
+TOML shape and trust model are documented in
 [`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
 When that configuration contains OAuth routes, the runtime stores their
 credentials in `mcp-oauth-credentials.json` directly beneath that runtime's
@@ -189,7 +190,7 @@ credential-database fallback.
 For example:
 
 ```toml
-# $XDG_CONFIG_HOME/pi-runtime/mcp.toml
+# $XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml
 [servers.workspace]
 enabled_tools = ["read_file", "search"]
 call_timeout_ms = 30000

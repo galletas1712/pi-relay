@@ -57,16 +57,16 @@ handoff.rs         renders per-subagent task_prompt.md / final_message.md /
 ```
 
 `config.rs` resolves the general configuration root as
-`$XDG_CONFIG_HOME/pi-agentd` or `$HOME/.config/pi-agentd`. It parses only the
-required strict `config.toml` startup-policy schema: root `database_url`,
-optional frontend `bind`, optional `runtime_bind`, an optional default parent
-provider, and per-global-role subagent providers. `pi-agentd` accepts no
-configuration arguments. Invalid configuration fails startup.
+`$XDG_CONFIG_HOME/pi-relay/agentd` or `$HOME/.config/pi-relay/agentd`. It
+parses only the required strict `config.toml` startup-policy schema: root
+`database_url`, optional frontend `bind`, optional `runtime_bind`, an optional
+default parent provider, and per-global-role subagent providers. `pi-agentd`
+accepts no configuration arguments. Invalid configuration fails startup.
 Every configured subagent-provider key must match a global role skill after
 catalog bootstrap; runtime and workspace roles instead inherit their parent's
 provider unless explicitly overridden when spawned. MCP server definitions
-(`$XDG_CONFIG_HOME/pi-runtime/mcp.toml`) and OAuth credentials live on each
-runtime host (see `agent-runtime`), not in the control plane.
+(`$XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml`) and OAuth credentials live on
+each runtime host (see `agent-runtime`), not in the control plane.
 Startup copy-bootstraps bundled
 role/workflow `SKILL.md` files only when absent and then records completion, so
 later deletions remain user-owned. Skill/role resolution is explicit

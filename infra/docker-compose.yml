@@ -31,7 +31,7 @@ services:
       # it needs full host filesystem + toolchain access) can dial in.
       - "127.0.0.1:8786:8786"
     volumes:
-      - ./config/control.toml:/config/pi-agentd/config.toml:ro
+      - ./config/control.toml:/config/pi-relay/agentd/config.toml:ro
       # Host LLM credentials (read-only). The daemon reads ~/.codex/auth.json
       # (+installation_id) and ~/.claude*/config for the sk-ant- key. Read-only
       # so the container never rewrites auth.json as root and locks out the host

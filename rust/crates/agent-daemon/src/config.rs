@@ -16,7 +16,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 const DAEMON_CONFIG_FILE: &str = "config.toml";
-const DAEMON_CONFIG_DIR: &str = "pi-agentd";
+const PRODUCT_CONFIG_DIR: &str = "pi-relay";
+const DAEMON_CONFIG_DIR: &str = "agentd";
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_RUNTIME_BIND: &str = "127.0.0.1:8786";
 const BOOTSTRAP_MARKER: &str = ".bootstrap-v1";
@@ -31,8 +32,9 @@ pub(crate) struct Config {
     pub(crate) daemon_config: DaemonConfig,
 }
 
-/// General daemon settings stored in `$XDG_CONFIG_HOME/pi-agentd/config.toml`
-/// (or `$HOME/.config/pi-agentd/config.toml`).
+/// General daemon settings stored in
+/// `$XDG_CONFIG_HOME/pi-relay/agentd/config.toml` (or
+/// `$HOME/.config/pi-relay/agentd/config.toml`).
 #[derive(Debug, Clone)]
 pub(crate) struct DaemonConfig {
     pub(crate) default_parent_model: ProviderConfig,
@@ -104,7 +106,7 @@ fn config_root_from_env(
         if !config_home.is_absolute() {
             return Err(anyhow!("XDG_CONFIG_HOME must be an absolute path"));
         }
-        return Ok(config_home.join(DAEMON_CONFIG_DIR));
+        return Ok(config_home.join(PRODUCT_CONFIG_DIR).join(DAEMON_CONFIG_DIR));
     }
     let home = home
         .filter(|value| !value.is_empty())
@@ -113,7 +115,10 @@ fn config_root_from_env(
     if !home.is_absolute() {
         return Err(anyhow!("HOME must be an absolute path"));
     }
-    Ok(home.join(".config").join(DAEMON_CONFIG_DIR))
+    Ok(home
+        .join(".config")
+        .join(PRODUCT_CONFIG_DIR)
+        .join(DAEMON_CONFIG_DIR))
 }
 
 fn load_daemon_config(path: &Path) -> Result<DaemonStartupPolicy> {
@@ -573,13 +578,13 @@ mod tests {
     fn xdg_config_root_does_not_nest_dot_config() {
         let root = config_root_from_env(Some("/tmp/xdg".as_ref()), Some("/home/test".as_ref()))
             .expect("config root");
-        assert_eq!(root, PathBuf::from("/tmp/xdg/pi-agentd"));
+        assert_eq!(root, PathBuf::from("/tmp/xdg/pi-relay/agentd"));
     }
 
     #[test]
     fn config_root_falls_back_to_home_dot_config() {
         let root = config_root_from_env(None, Some("/home/test".as_ref())).expect("config root");
-        assert_eq!(root, PathBuf::from("/home/test/.config/pi-agentd"));
+        assert_eq!(root, PathBuf::from("/home/test/.config/pi-relay/agentd"));
     }
 
     #[test]
@@ -610,7 +615,7 @@ mod tests {
     #[test]
     fn bootstrap_creates_missing_xdg_config_home_components() {
         let temp = make_temp_dir("missing-xdg-home");
-        let config_root = temp.join("missing/xdg/pi-agentd");
+        let config_root = temp.join("missing/xdg/pi-relay/agentd");
         let prompt_root = make_temp_dir("missing-xdg-source");
         write_catalog_fixture(&prompt_root);
 
@@ -624,7 +629,7 @@ mod tests {
     #[test]
     fn bootstrap_creates_missing_home_dot_config_components() {
         let temp = make_temp_dir("missing-home-config");
-        let config_root = temp.join("missing-home/.config/pi-agentd");
+        let config_root = temp.join("missing-home/.config/pi-relay/agentd");
         let prompt_root = make_temp_dir("missing-home-source");
         write_catalog_fixture(&prompt_root);
 
@@ -799,7 +804,7 @@ model = "   "
     #[test]
     fn daemon_policy_uses_toml_and_ignores_legacy_json() {
         let root = make_temp_dir("toml-only-config");
-        let config_root = root.join(DAEMON_CONFIG_DIR);
+        let config_root = root.join(PRODUCT_CONFIG_DIR).join(DAEMON_CONFIG_DIR);
         fs::create_dir_all(&config_root).expect("config root");
         fs::write(config_root.join("config.json"), b"not valid JSON").expect("legacy config");
 
@@ -835,7 +840,7 @@ model = "toml-parent"
     #[test]
     fn daemon_accepts_no_configuration_arguments() {
         let root = make_temp_dir("no-arguments");
-        let config_root = root.join(DAEMON_CONFIG_DIR);
+        let config_root = root.join(PRODUCT_CONFIG_DIR).join(DAEMON_CONFIG_DIR);
         fs::create_dir_all(&config_root).expect("config root");
         fs::write(
             config_root.join(DAEMON_CONFIG_FILE),

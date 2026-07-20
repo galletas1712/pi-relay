@@ -29,7 +29,8 @@ use uuid::Uuid;
 
 use workspaces::{validate_remote_branch, validate_workspace_dir, WorkspaceManager};
 
-const RUNTIME_CONFIG_DIR: &str = "pi-runtime";
+const PRODUCT_CONFIG_DIR: &str = "pi-relay";
+const RUNTIME_CONFIG_DIR: &str = "runtime";
 const RUNTIME_CONFIG_FILE: &str = "config.toml";
 const MCP_CONFIG_FILE: &str = "mcp.toml";
 
@@ -251,7 +252,9 @@ fn config_root_from_env(
         if !config_home.is_absolute() {
             return Err(anyhow!("XDG_CONFIG_HOME must be an absolute path"));
         }
-        return Ok(config_home.join(RUNTIME_CONFIG_DIR));
+        return Ok(config_home
+            .join(PRODUCT_CONFIG_DIR)
+            .join(RUNTIME_CONFIG_DIR));
     }
     let home = home
         .filter(|value| !value.is_empty())
@@ -260,7 +263,10 @@ fn config_root_from_env(
     if !home.is_absolute() {
         return Err(anyhow!("HOME must be an absolute path"));
     }
-    Ok(home.join(".config").join(RUNTIME_CONFIG_DIR))
+    Ok(home
+        .join(".config")
+        .join(PRODUCT_CONFIG_DIR)
+        .join(RUNTIME_CONFIG_DIR))
 }
 
 async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
@@ -600,7 +606,7 @@ mod config_tests {
     #[test]
     fn loads_strict_runtime_config_from_its_xdg_root() {
         let xdg = make_temp_dir("xdg");
-        let config_root = xdg.join(RUNTIME_CONFIG_DIR);
+        let config_root = xdg.join(PRODUCT_CONFIG_DIR).join(RUNTIME_CONFIG_DIR);
         fs::create_dir_all(&config_root).expect("config root");
         fs::write(
             config_root.join(RUNTIME_CONFIG_FILE),
@@ -640,7 +646,7 @@ mcp_config = "/tmp/mcp.toml"
     fn runtime_config_root_falls_back_to_home_and_rejects_arguments() {
         assert_eq!(
             config_root_from_env(None, Some("/home/test".as_ref())).expect("config root"),
-            PathBuf::from("/home/test/.config/pi-runtime")
+            PathBuf::from("/home/test/.config/pi-relay/runtime")
         );
         let error = load_config_from_values(
             None,
