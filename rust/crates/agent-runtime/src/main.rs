@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_mcp::{McpConfig, McpManager};
-use agent_mcp_types::{McpSessionManifest, McpSessionSnapshot};
+use agent_mcp_types::{
+    McpManagerError, McpOAuthLoginError, McpSessionManifest, McpSessionSnapshot,
+    OAuthCredentialStoreError,
+};
 use agent_runtime_protocol::{
     read_frame, write_frame, ControlToRuntime, ProjectWorkspace, RuntimeCommand,
     RuntimeCommandError, RuntimeCommandResult, RuntimeHello, RuntimeToControl, SelectedWorkspace,
@@ -17,7 +20,7 @@ use agent_tools::{ToolContext, ToolRegistry};
 use agent_vocab::{ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
@@ -25,6 +28,117 @@ use tokio::time::Duration;
 use uuid::Uuid;
 
 use workspaces::{validate_remote_branch, validate_workspace_dir, WorkspaceManager};
+
+/// Carries a pre-shaped RuntimeCommandError through anyhow so the connection
+/// loop can put the stable slug on the wire instead of a generic runtime_error.
+#[derive(Debug, Clone)]
+struct McpWireError(RuntimeCommandError);
+
+impl std::fmt::Display for McpWireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.0.code, self.0.message)
+    }
+}
+
+impl std::error::Error for McpWireError {}
+
+fn into_runtime_command_error(error: anyhow::Error) -> RuntimeCommandError {
+    if let Some(wire) = error.downcast_ref::<McpWireError>() {
+        return wire.0.clone();
+    }
+    RuntimeCommandError::new("runtime_error", format!("{error:#}"))
+}
+
+fn mcp_manager_wire_error(error: McpManagerError) -> anyhow::Error {
+    anyhow::Error::new(McpWireError(match error {
+        McpManagerError::InventoryChanged { current_revision } => RuntimeCommandError::with_data(
+            "mcp_inventory_changed",
+            "MCP inventory changed; refresh and review the selection",
+            json!({ "current_revision": current_revision }),
+        ),
+        McpManagerError::SelectionInvalid { message } => {
+            RuntimeCommandError::new("mcp_selection_invalid", message)
+        }
+        McpManagerError::Unavailable { server } => RuntimeCommandError::new(
+            "mcp_unavailable",
+            format!("A selected MCP server is unavailable: {server}"),
+        ),
+        McpManagerError::CredentialStore(_) => RuntimeCommandError::new(
+            "mcp_oauth_credential_store_failed",
+            "MCP OAuth credential storage is unavailable",
+        ),
+        McpManagerError::Catalog(error) => RuntimeCommandError::new(
+            "mcp_selection_invalid",
+            format!("invalid MCP catalog: {error:#}"),
+        ),
+    }))
+}
+
+fn mcp_catalog_wire_error(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(McpWireError(RuntimeCommandError::new(
+        "mcp_selection_invalid",
+        format!("invalid MCP catalog: {error:#}"),
+    )))
+}
+
+fn mcp_credential_store_wire_error(_error: OAuthCredentialStoreError) -> anyhow::Error {
+    anyhow::Error::new(McpWireError(RuntimeCommandError::new(
+        "mcp_oauth_credential_store_failed",
+        "MCP OAuth credential storage is unavailable",
+    )))
+}
+
+fn mcp_oauth_wire_error(error: McpOAuthLoginError) -> anyhow::Error {
+    let (code, message) = match error {
+        McpOAuthLoginError::NotConfigured => (
+            "mcp_oauth_not_configured",
+            "OAuth login is not configured for this MCP server",
+        ),
+        McpOAuthLoginError::AlreadyPending => (
+            "mcp_oauth_login_already_pending",
+            "An OAuth login is already pending for this MCP server",
+        ),
+        McpOAuthLoginError::NotFound => (
+            "mcp_oauth_login_not_found",
+            "The MCP OAuth login was not found",
+        ),
+        McpOAuthLoginError::AlreadyCompleted => (
+            "mcp_oauth_login_finished",
+            "The MCP OAuth login is no longer pending",
+        ),
+        McpOAuthLoginError::Cancelled => (
+            "mcp_oauth_login_cancelled",
+            "The MCP OAuth login was cancelled",
+        ),
+        McpOAuthLoginError::Expired => ("mcp_oauth_login_expired", "The MCP OAuth login expired"),
+        McpOAuthLoginError::CallbackBind => (
+            "mcp_oauth_callback_unavailable",
+            "The runtime could not start the loopback OAuth callback listener",
+        ),
+        McpOAuthLoginError::InvalidCallback => (
+            "mcp_oauth_callback_invalid",
+            "The OAuth callback URL is invalid for this login",
+        ),
+        McpOAuthLoginError::Provider => (
+            "mcp_oauth_provider_error",
+            "The authorization server rejected the OAuth login",
+        ),
+        McpOAuthLoginError::Persistence => (
+            "mcp_oauth_credential_store_failed",
+            "MCP OAuth credential storage is unavailable",
+        ),
+        McpOAuthLoginError::Discovery
+        | McpOAuthLoginError::Registration
+        | McpOAuthLoginError::TokenEndpoint
+        | McpOAuthLoginError::Network
+        | McpOAuthLoginError::Unavailable
+        | McpOAuthLoginError::AuthorizationUrlTooLong => (
+            "mcp_oauth_login_failed",
+            "The MCP OAuth login could not be completed",
+        ),
+    };
+    anyhow::Error::new(McpWireError(RuntimeCommandError::new(code, message)))
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,13 +253,17 @@ async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
                         // would leak a stale abort handle).
                         let mut running = runtime.running.lock().await;
                         let handle = tokio::spawn(async move {
-                            let result = task_runtime.execute(command).await
-                                .map_err(|error| RuntimeCommandError::new("runtime_error", format!("{error:#}")));
+                            let result = task_runtime
+                                .execute(command)
+                                .await
+                                .map_err(into_runtime_command_error);
                             task_runtime.running.lock().await.remove(&task_id);
-                            let _ = sender.send(RuntimeToControl::Result {
-                                command_id: task_id,
-                                result,
-                            }).await;
+                            let _ = sender
+                                .send(RuntimeToControl::Result {
+                                    command_id: task_id,
+                                    result,
+                                })
+                                .await;
                         });
                         running.insert(command_id, handle.abort_handle());
                     }
@@ -281,13 +399,21 @@ impl Runtime {
                 provider,
                 first_party,
             } => Ok(RuntimeCommandResult::McpInventory {
-                inventory: self.mcp.inventory(provider, &first_party).await?,
+                inventory: self
+                    .mcp
+                    .inventory(provider, &first_party)
+                    .await
+                    .map_err(mcp_manager_wire_error)?,
             }),
             RuntimeCommand::McpSelect {
                 selection,
                 first_party,
             } => {
-                let snapshot = self.mcp.select(&selection, &first_party).await?;
+                let snapshot = self
+                    .mcp
+                    .select(&selection, &first_party)
+                    .await
+                    .map_err(mcp_manager_wire_error)?;
                 Ok(RuntimeCommandResult::McpManifest {
                     manifest: snapshot.manifest().clone(),
                 })
@@ -301,14 +427,20 @@ impl Runtime {
             RuntimeCommand::McpToolViews { manifest } => Ok(RuntimeCommandResult::McpToolViews {
                 views: self
                     .mcp
-                    .tool_views(&McpSessionSnapshot::new(manifest)?)
+                    .tool_views(
+                        &McpSessionSnapshot::new(manifest).map_err(mcp_catalog_wire_error)?,
+                    )
                     .await,
             }),
             RuntimeCommand::McpAuthStatuses {} => Ok(RuntimeCommandResult::McpAuthStatuses {
                 servers: self.mcp.auth_statuses().await,
             }),
             RuntimeCommand::McpBeginLogin { server } => Ok(RuntimeCommandResult::McpLoginStart {
-                start: self.mcp.begin_oauth_login(&server).await?,
+                start: self
+                    .mcp
+                    .begin_oauth_login(&server)
+                    .await
+                    .map_err(mcp_oauth_wire_error)?,
             }),
             RuntimeCommand::McpCompleteLogin {
                 server,
@@ -317,15 +449,23 @@ impl Runtime {
             } => {
                 self.mcp
                     .complete_oauth_login(&server, &login_id, &callback_url)
-                    .await?;
+                    .await
+                    .map_err(mcp_oauth_wire_error)?;
                 Ok(RuntimeCommandResult::Ack)
             }
             RuntimeCommand::McpCancelLogin { server, login_id } => {
-                self.mcp.cancel_oauth_login(&server, &login_id).await?;
+                self.mcp
+                    .cancel_oauth_login(&server, &login_id)
+                    .await
+                    .map_err(mcp_oauth_wire_error)?;
                 Ok(RuntimeCommandResult::Ack)
             }
             RuntimeCommand::McpLogout { server } => Ok(RuntimeCommandResult::McpLogout {
-                result: self.mcp.logout_oauth(&server).await?,
+                result: self
+                    .mcp
+                    .logout_oauth(&server)
+                    .await
+                    .map_err(mcp_credential_store_wire_error)?,
             }),
         }
     }

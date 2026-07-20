@@ -1815,9 +1815,13 @@ child session lifetime.
 
 The daemon exposes five user-only MCP authentication methods. They are
 independent of `mcp.inventory`, so a configured login-required server remains
-visible even when it has no coherent tool inventory.
+visible even when it has no coherent tool inventory. Every method is scoped to
+the runtime that hosts the MCP servers (`runtime_id`); the control plane proxies
+to that runtime over the framed-JSON conduit. OAuth credentials live on the
+runtime host (under its `workspace_root`), not in the control plane.
 
-`mcp.status` accepts `{}` and returns every configured server:
+`mcp.status` accepts `{ "runtime_id": "runtime-local" }` and returns every
+configured server on that runtime:
 
 ```json
 {
@@ -1837,22 +1841,23 @@ visible even when it has no coherent tool inventory.
 is one of the fixed categories `credential_store_unavailable` or
 `discovery_failed`; provider bodies and credential details are never returned.
 
-- `mcp.login` takes `{ "server": "remote" }` and, only after an explicit user
-  action, returns `login_id`, `authorization_url`, and
+- `mcp.login` takes `{ "server": "remote", "runtime_id": "…" }` and, only after
+  an explicit user action, returns `login_id`, `authorization_url`, and
   `expires_at_unix_seconds`. A second login for the same server fails with the
-  fixed `mcp_oauth_login_already_pending` error.
-- `mcp.complete` takes `server`, `login_id`, and the **entire**
+  fixed `mcp_oauth_login_already_pending` error. The loopback OAuth callback
+  binds on the runtime host.
+- `mcp.complete` takes `server`, `login_id`, `runtime_id`, and the **entire**
   `callback_url`. The coordinator validates the exact transaction redirect and
   state, including the stable Codex-compatible callback path; a bare code or
   state is not accepted. Success returns
   `{ "completed": true }`.
-- `mcp.cancel` takes `server` and `login_id` and returns
+- `mcp.cancel` takes `server`, `login_id`, and `runtime_id` and returns
   `{ "cancelled": true }` only after the listener and transaction are cleaned
   up.
-- `mcp.logout` takes `{ "server": "remote" }` and returns
+- `mcp.logout` takes `{ "server": "remote", "runtime_id": "…" }` and returns
   `{ "result": "removed" }` or `{ "result": "not_found" }`. It deletes only
-  local daemon credentials and does not call a provider revocation endpoint,
-  matching Codex CLI logout.
+  local runtime-host credentials and does not call a provider revocation
+  endpoint, matching Codex CLI logout.
 
 Server IDs, login IDs, and callback URLs are bounded. Errors use fixed local
 codes/messages and contain no provider response, token, client ID, scope,
@@ -1862,8 +1867,8 @@ completion is only through `mcp.complete`.
 
 ### `mcp.inventory`
 
-Requires `provider: "openai" | "claude"` and returns the bounded configured
-New Session inventory:
+Requires `provider: "openai" | "claude"` and `runtime_id`, and returns the
+bounded configured New Session inventory for that runtime:
 
 ```json
 {

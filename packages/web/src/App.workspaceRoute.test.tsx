@@ -1042,7 +1042,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(await screen.findByRole("button", { name: /MCP tools/ }));
 		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
 		await act(async () => {
-			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus });
+			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus("runtime-test") });
 		});
 		const composer = screen.getByRole<HTMLTextAreaElement>("textbox");
 		await user.type(composer, "do not send with stale OAuth");
@@ -1100,7 +1100,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("button", { name: "Login" }));
 		expect(await screen.findByRole("heading", { name: "Log in to workspace" })).toBeTruthy();
 		await act(async () => {
-			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus });
+			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus("runtime-test") });
 		});
 		await waitFor(() =>
 			expect(screen.queryByRole("heading", { name: "Log in to workspace" })).toBeNull(),
@@ -1154,7 +1154,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(screen.getByRole("button", { name: "Login" }));
 		expect(await screen.findByRole("heading", { name: "Log in to workspace" })).toBeTruthy();
 		await act(async () => {
-			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus });
+			await mounted.client.refetchQueries({ queryKey: queryKeys.mcpStatus("runtime-test") });
 		});
 
 		await waitFor(() =>
@@ -1330,7 +1330,7 @@ describe("App workspace route identity integration", () => {
 		api.getMcpInventory.mockImplementationOnce(() => refresh.promise);
 		act(() => {
 			void mounted.client.invalidateQueries({
-				queryKey: queryKeys.mcpInventory("openai"),
+				queryKey: queryKeys.mcpInventory("openai", "runtime-test"),
 			});
 		});
 		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledTimes(2));
@@ -1368,7 +1368,7 @@ describe("App workspace route identity integration", () => {
 		api.getMcpInventory.mockRejectedValueOnce(new Error("refresh failed"));
 		await act(async () => {
 			await mounted.client.invalidateQueries({
-				queryKey: queryKeys.mcpInventory("openai"),
+				queryKey: queryKeys.mcpInventory("openai", "runtime-test"),
 			});
 		});
 		const retryButton = await screen.findByRole<HTMLButtonElement>("button", { name: "Retry" });

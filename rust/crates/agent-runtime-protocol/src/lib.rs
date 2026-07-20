@@ -209,10 +209,20 @@ pub struct RawSkillFile {
     pub contents: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeCommandError {
     pub code: String,
     pub message: String,
+    #[serde(default = "empty_error_data", skip_serializing_if = "is_empty_error_data")]
+    pub data: serde_json::Value,
+}
+
+fn empty_error_data() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn is_empty_error_data(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| object.is_empty())
 }
 
 #[cfg(test)]
@@ -244,6 +254,19 @@ impl RuntimeCommandError {
         Self {
             code: code.into(),
             message: message.into(),
+            data: empty_error_data(),
+        }
+    }
+
+    pub fn with_data(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            data,
         }
     }
 }

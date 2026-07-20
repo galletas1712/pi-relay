@@ -199,92 +199,34 @@ fn validate_login_id(login_id: &str) -> std::result::Result<(), RpcError> {
 }
 
 /// Map a runtime MCP error back to the frontend's stable RpcError codes. The
-/// runtime tags each error with the Mcp*Error / OAuthCredentialStoreError /
-/// McpManagerError Display, whose slug prefix we match here. Messages are the
-/// error's own fixed strings (no provider/credential text), so surfacing them is
-/// safe.
+/// runtime puts those codes on RuntimeCommandError.code (preserved as
+/// RuntimeHostError through the conduit); messages and data are already
+/// secret-free.
 pub(crate) fn map_runtime_mcp_error(error: anyhow::Error) -> RpcError {
-    let message = format!("{error:#}");
-    let has = |slug: &str| message.contains(slug);
-    // Credential store (also McpOAuthLoginError::Persistence).
-    if has("oauth_credential_store") || has("mcp_oauth_credential_store_failed") {
-        return RpcError::new(
-            "mcp_oauth_credential_store_failed",
-            "MCP OAuth credential storage is unavailable",
-        );
+    if let Some(host) = error.downcast_ref::<crate::runtime_hosts::RuntimeHostError>() {
+        return match host.code.as_str() {
+            "mcp_inventory_changed" => RpcError {
+                code: "mcp_inventory_changed".to_string(),
+                message: host.message.clone(),
+                data: host.data.clone(),
+            },
+            "mcp_selection_invalid"
+            | "mcp_unavailable"
+            | "mcp_oauth_credential_store_failed"
+            | "mcp_oauth_not_configured"
+            | "mcp_oauth_login_already_pending"
+            | "mcp_oauth_login_not_found"
+            | "mcp_oauth_login_finished"
+            | "mcp_oauth_login_cancelled"
+            | "mcp_oauth_login_expired"
+            | "mcp_oauth_callback_unavailable"
+            | "mcp_oauth_callback_invalid"
+            | "mcp_oauth_provider_error"
+            | "mcp_oauth_login_failed" => RpcError::new(host.code.clone(), host.message.clone()),
+            _ => RpcError::new("mcp_error", format!("{}: {}", host.code, host.message)),
+        };
     }
-    // OAuth login flow.
-    if has("oauth_login_not_configured") {
-        return RpcError::new(
-            "mcp_oauth_not_configured",
-            "OAuth login is not configured for this MCP server",
-        );
-    }
-    if has("oauth_login_already_pending") {
-        return RpcError::new(
-            "mcp_oauth_login_already_pending",
-            "An OAuth login is already pending for this MCP server",
-        );
-    }
-    if has("oauth_login_not_found") {
-        return RpcError::new(
-            "mcp_oauth_login_not_found",
-            "The MCP OAuth login was not found",
-        );
-    }
-    if has("oauth_login_already_completed") {
-        return RpcError::new(
-            "mcp_oauth_login_finished",
-            "The MCP OAuth login is no longer pending",
-        );
-    }
-    if has("oauth_login_cancelled") {
-        return RpcError::new(
-            "mcp_oauth_login_cancelled",
-            "The MCP OAuth login was cancelled",
-        );
-    }
-    if has("oauth_login_expired") {
-        return RpcError::new("mcp_oauth_login_expired", "The MCP OAuth login expired");
-    }
-    if has("oauth_callback_bind_failed") {
-        return RpcError::new(
-            "mcp_oauth_callback_unavailable",
-            "The runtime could not start the loopback OAuth callback listener",
-        );
-    }
-    if has("oauth_callback_invalid") {
-        return RpcError::new(
-            "mcp_oauth_callback_invalid",
-            "The OAuth callback URL is invalid for this login",
-        );
-    }
-    if has("oauth_provider_error") {
-        return RpcError::new(
-            "mcp_oauth_provider_error",
-            "The authorization server rejected the OAuth login",
-        );
-    }
-    if message.contains("oauth_") {
-        return RpcError::new(
-            "mcp_oauth_login_failed",
-            "The MCP OAuth login could not be completed",
-        );
-    }
-    // Manager (inventory / selection).
-    if has("mcp_inventory_changed") {
-        return RpcError::new(
-            "mcp_inventory_changed",
-            "The MCP inventory changed; refresh and try again",
-        );
-    }
-    if has("mcp_unavailable") {
-        return RpcError::new("mcp_unavailable", "A selected MCP server is unavailable");
-    }
-    if has("mcp_selection_invalid") || has("invalid MCP catalog") {
-        return RpcError::new("mcp_selection_invalid", "The MCP selection is invalid");
-    }
-    RpcError::new("mcp_error", message)
+    RpcError::new("mcp_error", format!("{error:#}"))
 }
 
 #[cfg(test)]

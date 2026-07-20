@@ -5,8 +5,9 @@ export const queryKeys = {
 	systemPromptRoot: ["system-prompt"] as const,
 	systemPrompt: (sessionId: string) => ["system-prompt", sessionId] as const,
 	projects: ["projects"] as const,
-	mcpStatus: ["mcp-status"] as const,
-	mcpInventory: (provider: string) => ["mcp-inventory", provider] as const,
+	mcpStatus: (runtimeId: string) => ["mcp-status", runtimeId] as const,
+	mcpInventory: (provider: string, runtimeId: string) =>
+		["mcp-inventory", provider, runtimeId] as const,
 	tools: (provider: string, sessionId: string | null = null) => ["tools", provider, sessionId] as const,
 	sessions: (projectId: string | null) => ["sessions", projectId] as const,
 	delegations: (parentSessionId: string | null, limit?: number) => ["delegations", parentSessionId, limit ?? null] as const,

@@ -1106,7 +1106,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		? projects.find((project) => project.project_id === selectedProjectId)?.runtime_id ?? null
 		: runtimes.find((runtime) => runtime.online)?.runtime_id ?? null;
 	const mcpInventoryQuery = useQuery({
-		queryKey: [...queryKeys.mcpInventory(newSessionProvider.kind), newSessionRuntimeId],
+		queryKey: queryKeys.mcpInventory(newSessionProvider.kind, newSessionRuntimeId ?? ""),
 		queryFn: async () => {
 			assertServerReadAllowed();
 			return {
@@ -1121,7 +1121,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			!!newSessionRuntimeId,
 	});
 	const mcpStatusQuery = useQuery({
-		queryKey: [...queryKeys.mcpStatus, newSessionRuntimeId],
+		queryKey: queryKeys.mcpStatus(newSessionRuntimeId ?? ""),
 		queryFn: () => {
 			assertServerReadAllowed();
 			return api.getMcpStatus(newSessionRuntimeId!);
@@ -1205,7 +1205,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			mcpInventoryQuery.refetch(),
 		]);
 	}, [mcpInventoryQuery.refetch, mcpStatusQuery.refetch]);
-	const mcpLoginContext = `${selectedId ?? "new"}\u0000${selectedProjectId ?? "host"}\u0000${newSessionProvider.kind}\u0000${newSessionSetupGeneration}`;
+	const mcpLoginContext = `${selectedId ?? "new"}\u0000${selectedProjectId ?? "host"}\u0000${newSessionProvider.kind}\u0000${newSessionRuntimeId ?? ""}\u0000${newSessionSetupGeneration}`;
 	mcpLoginContextRef.current = mcpLoginContext;
 	const loginMcp = useCallback(async (server: string) => {
 		if (mcpAuthBusyServer || !newSessionRuntimeId) return;
@@ -3363,9 +3363,12 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				}
 			} catch (error) {
 				if (errorMessage(error).startsWith("mcp_inventory_changed:")) {
-					await queryClient.refetchQueries({
-						queryKey: queryKeys.mcpInventory(newSessionProvider.kind),
-					});
+					const runtimeId = newSessionRuntimeId;
+					if (runtimeId) {
+						await queryClient.refetchQueries({
+							queryKey: queryKeys.mcpInventory(newSessionProvider.kind, runtimeId),
+						});
+					}
 				}
 				throw error;
 			}
@@ -3387,6 +3390,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			mcpAuthStatusReady,
 			newSessionProvider,
 			newSessionProviderWasExplicit,
+			newSessionRuntimeId,
 			openRootConversation,
 			queryClient,
 		],

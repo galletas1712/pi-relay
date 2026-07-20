@@ -15,11 +15,39 @@ use agent_store::PostgresAgentStore;
 use agent_tools::ProviderTool;
 use agent_vocab::{ProviderKind, ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Context, Result};
+use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration, Instant};
 use uuid::Uuid;
+
+/// Structured runtime failure preserved through anyhow so MCP handlers can map
+/// by stable `code` (and optional `data`) instead of scraping Display text.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeHostError {
+    pub(crate) code: String,
+    pub(crate) message: String,
+    pub(crate) data: Value,
+}
+
+impl std::fmt::Display for RuntimeHostError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RuntimeHostError {}
+
+impl From<RuntimeCommandError> for RuntimeHostError {
+    fn from(error: RuntimeCommandError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            data: error.data,
+        }
+    }
+}
 
 /// Monotonic per-process connection generation. A runtime that drops and
 /// reconnects gets a fresh id, so a stale connection's teardown can never evict
@@ -236,7 +264,7 @@ impl RuntimeRegistry {
             return Err(anyhow!("runtime unavailable: {runtime_id}"));
         }
         match timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), rx).await {
-            Ok(Ok(result)) => result.map_err(|error| anyhow!("{}: {}", error.code, error.message)),
+            Ok(Ok(result)) => result.map_err(|error| anyhow::Error::new(RuntimeHostError::from(error))),
             Ok(Err(_)) => Err(anyhow!("runtime disconnected while command was running")),
             Err(_) => {
                 self.waiters.lock().await.remove(&command_id);
@@ -459,7 +487,17 @@ impl RuntimeRegistry {
 
     // --- MCP: the servers, tool calls, and OAuth run on the runtime host; these
     // forward each control-plane MCP RPC over the existing conduit. Errors carry
-    // the runtime's stable slug ("<code>: <message>") for the caller to map. ---
+    // the runtime's stable slug in RuntimeHostError.code for the caller to map. ---
+
+    async fn mcp_result<T>(
+        &self,
+        runtime_id: &str,
+        command: RuntimeCommand,
+        extract: impl FnOnce(RuntimeCommandResult) -> Option<T>,
+        wrong: &'static str,
+    ) -> Result<T> {
+        extract(self.execute(runtime_id, command).await?).ok_or_else(|| anyhow!(wrong))
+    }
 
     pub(crate) async fn mcp_inventory(
         &self,
@@ -467,19 +505,19 @@ impl RuntimeRegistry {
         provider: ProviderKind,
         first_party: HashMap<ProviderKind, Vec<ProviderTool>>,
     ) -> Result<McpInventory> {
-        match self
-            .execute(
-                runtime_id,
-                RuntimeCommand::McpInventory {
-                    provider,
-                    first_party,
-                },
-            )
-            .await?
-        {
-            RuntimeCommandResult::McpInventory { inventory } => Ok(inventory),
-            _ => Err(anyhow!("runtime returned the wrong mcp-inventory result")),
-        }
+        self.mcp_result(
+            runtime_id,
+            RuntimeCommand::McpInventory {
+                provider,
+                first_party,
+            },
+            |result| match result {
+                RuntimeCommandResult::McpInventory { inventory } => Some(inventory),
+                _ => None,
+            },
+            "runtime returned the wrong mcp-inventory result",
+        )
+        .await
     }
 
     pub(crate) async fn mcp_select(
@@ -488,19 +526,19 @@ impl RuntimeRegistry {
         selection: McpSessionSelection,
         first_party: HashMap<ProviderKind, Vec<ProviderTool>>,
     ) -> Result<McpSessionManifest> {
-        match self
-            .execute(
-                runtime_id,
-                RuntimeCommand::McpSelect {
-                    selection,
-                    first_party,
-                },
-            )
-            .await?
-        {
-            RuntimeCommandResult::McpManifest { manifest } => Ok(manifest),
-            _ => Err(anyhow!("runtime returned the wrong mcp-select result")),
-        }
+        self.mcp_result(
+            runtime_id,
+            RuntimeCommand::McpSelect {
+                selection,
+                first_party,
+            },
+            |result| match result {
+                RuntimeCommandResult::McpManifest { manifest } => Some(manifest),
+                _ => None,
+            },
+            "runtime returned the wrong mcp-select result",
+        )
+        .await
     }
 
     pub(crate) async fn execute_mcp_tool(
@@ -509,19 +547,19 @@ impl RuntimeRegistry {
         manifest: McpSessionManifest,
         tool_call: ToolCall,
     ) -> Result<ToolResultMessage> {
-        match self
-            .execute(
-                runtime_id,
-                RuntimeCommand::ExecuteMcpTool {
-                    manifest,
-                    tool_call,
-                },
-            )
-            .await?
-        {
-            RuntimeCommandResult::Tool { result } => Ok(result),
-            _ => Err(anyhow!("runtime returned the wrong mcp-tool result")),
-        }
+        self.mcp_result(
+            runtime_id,
+            RuntimeCommand::ExecuteMcpTool {
+                manifest,
+                tool_call,
+            },
+            |result| match result {
+                RuntimeCommandResult::Tool { result } => Some(result),
+                _ => None,
+            },
+            "runtime returned the wrong mcp-tool result",
+        )
+        .await
     }
 
     pub(crate) async fn mcp_tool_views(
@@ -529,28 +567,32 @@ impl RuntimeRegistry {
         runtime_id: &str,
         manifest: McpSessionManifest,
     ) -> Result<Vec<McpToolView>> {
-        match self
-            .execute(runtime_id, RuntimeCommand::McpToolViews { manifest })
-            .await?
-        {
-            RuntimeCommandResult::McpToolViews { views } => Ok(views),
-            _ => Err(anyhow!("runtime returned the wrong mcp-tool-views result")),
-        }
+        self.mcp_result(
+            runtime_id,
+            RuntimeCommand::McpToolViews { manifest },
+            |result| match result {
+                RuntimeCommandResult::McpToolViews { views } => Some(views),
+                _ => None,
+            },
+            "runtime returned the wrong mcp-tool-views result",
+        )
+        .await
     }
 
     pub(crate) async fn mcp_auth_statuses(
         &self,
         runtime_id: &str,
     ) -> Result<Vec<McpAuthServerStatus>> {
-        match self
-            .execute(runtime_id, RuntimeCommand::McpAuthStatuses {})
-            .await?
-        {
-            RuntimeCommandResult::McpAuthStatuses { servers } => Ok(servers),
-            _ => Err(anyhow!(
-                "runtime returned the wrong mcp-auth-statuses result"
-            )),
-        }
+        self.mcp_result(
+            runtime_id,
+            RuntimeCommand::McpAuthStatuses {},
+            |result| match result {
+                RuntimeCommandResult::McpAuthStatuses { servers } => Some(servers),
+                _ => None,
+            },
+            "runtime returned the wrong mcp-auth-statuses result",
+        )
+        .await
     }
 
     pub(crate) async fn mcp_begin_login(
@@ -558,13 +600,16 @@ impl RuntimeRegistry {
         runtime_id: &str,
         server: String,
     ) -> Result<McpOAuthLoginStart> {
-        match self
-            .execute(runtime_id, RuntimeCommand::McpBeginLogin { server })
-            .await?
-        {
-            RuntimeCommandResult::McpLoginStart { start } => Ok(start),
-            _ => Err(anyhow!("runtime returned the wrong mcp-login result")),
-        }
+        self.mcp_result(
+            runtime_id,
+            RuntimeCommand::McpBeginLogin { server },
+            |result| match result {
+                RuntimeCommandResult::McpLoginStart { start } => Some(start),
+                _ => None,
+            },
+            "runtime returned the wrong mcp-login result",
+        )
+        .await
     }
 
     pub(crate) async fn mcp_complete_login(
@@ -574,20 +619,20 @@ impl RuntimeRegistry {
         login_id: String,
         callback_url: String,
     ) -> Result<()> {
-        match self
-            .execute(
-                runtime_id,
-                RuntimeCommand::McpCompleteLogin {
-                    server,
-                    login_id,
-                    callback_url,
-                },
-            )
-            .await?
-        {
-            RuntimeCommandResult::Ack => Ok(()),
-            _ => Err(anyhow!("runtime returned the wrong mcp-complete result")),
-        }
+        self.mcp_result(
+            runtime_id,
+            RuntimeCommand::McpCompleteLogin {
+                server,
+                login_id,
+                callback_url,
+            },
+            |result| match result {
+                RuntimeCommandResult::Ack => Some(()),
+                _ => None,
+            },
+            "runtime returned the wrong mcp-complete result",
+        )
+        .await
     }
 
     pub(crate) async fn mcp_cancel_login(
@@ -596,16 +641,16 @@ impl RuntimeRegistry {
         server: String,
         login_id: String,
     ) -> Result<()> {
-        match self
-            .execute(
-                runtime_id,
-                RuntimeCommand::McpCancelLogin { server, login_id },
-            )
-            .await?
-        {
-            RuntimeCommandResult::Ack => Ok(()),
-            _ => Err(anyhow!("runtime returned the wrong mcp-cancel result")),
-        }
+        self.mcp_result(
+            runtime_id,
+            RuntimeCommand::McpCancelLogin { server, login_id },
+            |result| match result {
+                RuntimeCommandResult::Ack => Some(()),
+                _ => None,
+            },
+            "runtime returned the wrong mcp-cancel result",
+        )
+        .await
     }
 
     pub(crate) async fn mcp_logout(
@@ -613,13 +658,16 @@ impl RuntimeRegistry {
         runtime_id: &str,
         server: String,
     ) -> Result<McpLogoutResult> {
-        match self
-            .execute(runtime_id, RuntimeCommand::McpLogout { server })
-            .await?
-        {
-            RuntimeCommandResult::McpLogout { result } => Ok(result),
-            _ => Err(anyhow!("runtime returned the wrong mcp-logout result")),
-        }
+        self.mcp_result(
+            runtime_id,
+            RuntimeCommand::McpLogout { server },
+            |result| match result {
+                RuntimeCommandResult::McpLogout { result } => Some(result),
+                _ => None,
+            },
+            "runtime returned the wrong mcp-logout result",
+        )
+        .await
     }
 }
 

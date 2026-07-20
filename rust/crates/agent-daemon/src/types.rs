@@ -12,33 +12,6 @@ pub(crate) struct RpcRequest {
     pub(crate) params: Value,
 }
 
-impl From<agent_mcp_types::McpManagerError> for RpcError {
-    fn from(error: agent_mcp_types::McpManagerError) -> Self {
-        match error {
-            agent_mcp_types::McpManagerError::InventoryChanged { current_revision } => Self {
-                code: "mcp_inventory_changed".to_string(),
-                message: "MCP inventory changed; refresh and review the selection".to_string(),
-                data: json!({ "current_revision": current_revision }),
-            },
-            agent_mcp_types::McpManagerError::SelectionInvalid { message } => {
-                Self::new("mcp_selection_invalid", message)
-            }
-            agent_mcp_types::McpManagerError::Unavailable { server } => Self::new(
-                "mcp_unavailable",
-                format!("selected MCP server {server} is unavailable"),
-            ),
-            agent_mcp_types::McpManagerError::CredentialStore(_) => Self::new(
-                "mcp_oauth_credential_store_failed",
-                "MCP OAuth credential storage is unavailable".to_string(),
-            ),
-            agent_mcp_types::McpManagerError::Catalog(error) => Self::new(
-                "mcp_selection_invalid",
-                format!("invalid MCP catalog: {error:#}"),
-            ),
-        }
-    }
-}
-
 #[derive(Serialize)]
 pub(crate) struct RpcResponse {
     pub(crate) id: Value,
