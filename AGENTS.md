@@ -2,4 +2,5 @@
 - Abstractions should be clean so that instead of handling different cases separately, the abstractions are generic enough to cover all cases
 - Avoid unnecessary fallbacks and guards
 - Make sure to clean up dead code
+- Make sure to clean up dead documentation, and keep documentation up to date with new changes, especially architectural/high level ones. Documentation should explain the *current* state only, not compared to past state.
 - I am the only user of all components of this repo, so it is fine to break things in the name of simplicity without caring for forward/backward compatibility
