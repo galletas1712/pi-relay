@@ -1,6 +1,9 @@
 - Aim to have the cleanest design possible while not sacrificing performance
 - Abstractions should be clean so that instead of handling different cases separately, the abstractions are generic enough to cover all cases
 - Avoid unnecessary fallbacks and guards
+- Avoid vacuous layers of indirection like structs that only have one element, one-liner helper functions, generic helper functions that aren't key to the product (i.e. could just be imported from a standard lib)
 - Make sure to clean up dead code
 - Make sure to clean up dead documentation, and keep documentation up to date with new changes, especially architectural/high level ones. Documentation should explain the *current* state only, not compared to past state.
 - I am the only user of all components of this repo, so it is fine to break things in the name of simplicity without caring for forward/backward compatibility
+- Be careful of mangling an existing deployment and be very careful of data loss from postgres/workspace directories.
+- We need to always make sure old sessions can still work, but *not* by building in conditional backwards compatibility paths. The way to ensure old sessions work is to come up with migration scripts that I can run *once* and delete after that, to migrate my sessions over to the layout/format/schema/locations required by the new code.
