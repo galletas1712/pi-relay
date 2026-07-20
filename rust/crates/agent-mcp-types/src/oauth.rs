@@ -1,5 +1,7 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OAuthCredentialStoreError {
     #[error("oauth_credential_store_empty")]
@@ -16,7 +18,7 @@ pub enum OAuthCredentialStoreError {
     Io,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpOAuthLoginStart {
     pub login_id: String,
     pub authorization_url: String,

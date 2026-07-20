@@ -5,6 +5,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
+agent-mcp-types = { workspace = true }
+agent-tools = { workspace = true }
 agent-vocab = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

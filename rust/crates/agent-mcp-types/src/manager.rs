@@ -9,7 +9,7 @@ pub enum McpHealth {
     Revoked,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum McpAuthStatus {
     NonOauth,
@@ -22,7 +22,7 @@ pub enum McpAuthStatus {
     AuthorizationPending,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum McpAuthKind {
     None,
@@ -30,14 +30,14 @@ pub enum McpAuthKind {
     Oauth,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum McpAuthFailure {
     CredentialStoreUnavailable,
     DiscoveryFailed,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpAuthServerStatus {
     pub server: String,
     pub auth_kind: McpAuthKind,
@@ -48,20 +48,20 @@ pub struct McpAuthServerStatus {
     pub failure: Option<McpAuthFailure>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum McpLogoutResult {
     Removed,
     NotFound,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpInventoryTool {
     pub raw_name: String,
     pub description: String,
     pub context_token_estimate: usize,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpInventoryServer {
     pub server: String,
     pub revision: String,
@@ -69,27 +69,27 @@ pub struct McpInventoryServer {
     pub tools: Vec<McpInventoryTool>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpInventory {
     pub revision: String,
     pub servers: Vec<McpInventoryServer>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct McpSessionSelection {
     pub inventory_revision: String,
     pub servers: Vec<McpServerSelection>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerSelection {
     pub server: String,
     pub tools: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpToolView {
     pub server: String,
     pub raw_name: String,

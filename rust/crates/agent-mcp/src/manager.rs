@@ -7,8 +7,9 @@ use std::time::Duration;
 use agent_mcp_types::{
     build_inventory_catalog, declaration_token_estimate, select_manifest, DiscoveredTool,
     McpAuthFailure, McpAuthKind, McpAuthServerStatus, McpAuthStatus, McpCallError, McpCallOutput,
-    McpHealth, McpInventory, McpInventoryServer, McpInventoryTool, McpLogoutResult, McpManagerError,
-    McpSessionManifest, McpSessionSelection, McpSessionSnapshot, McpToolView, MAX_TOOLS,
+    McpHealth, McpInventory, McpInventoryServer, McpInventoryTool, McpLogoutResult,
+    McpManagerError, McpSessionManifest, McpSessionSelection, McpSessionSnapshot, McpToolView,
+    MAX_TOOLS,
 };
 use agent_tools::ProviderTool;
 use agent_vocab::ProviderKind;

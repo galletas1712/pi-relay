@@ -1,5 +1,12 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+
+use agent_mcp_types::{
+    McpAuthServerStatus, McpInventory, McpLogoutResult, McpOAuthLoginStart, McpSessionManifest,
+    McpSessionSelection, McpToolView,
+};
+use agent_tools::ProviderTool;
 use agent_vocab::{ProviderKind, ToolCall, ToolResultMessage};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -12,6 +19,10 @@ pub const COMMAND_TIMEOUT_SECS: u64 = 120;
 pub struct RuntimeHello {
     pub runtime_id: String,
     pub name: String,
+    /// Whether this runtime has any MCP servers configured. Lets the control
+    /// plane answer inventory/status as empty (and reject MCP selection) for
+    /// MCP-less runtimes without a round-trip.
+    pub mcp_enabled: bool,
 }
 
 pub async fn read_frame<T: for<'de> Deserialize<'de>>(
@@ -59,6 +70,9 @@ pub enum RuntimeToControl {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Command wraps RuntimeCommand, whose MCP variants carry a session manifest;
+// the frame is matched once off the wire, so the size spread is acceptable.
+#[allow(clippy::large_enum_variant)]
 pub enum ControlToRuntime {
     Command {
         command_id: String,
@@ -125,6 +139,51 @@ pub enum RuntimeCommand {
         workspace_id: String,
         workspace_dirs: Vec<String>,
     },
+    /// Enumerate live MCP servers + tools for the new-session picker. The
+    /// control-computed first-party toolsets ride along for name-collision and
+    /// token-budget checks.
+    McpInventory {
+        provider: ProviderKind,
+        first_party: HashMap<ProviderKind, Vec<ProviderTool>>,
+    },
+    /// Author the session's MCP manifest against live servers at session.start.
+    McpSelect {
+        selection: McpSessionSelection,
+        first_party: HashMap<ProviderKind, Vec<ProviderTool>>,
+    },
+    /// Execute one MCP tool call. Ships the session manifest so the runtime can
+    /// resolve the tool by exposed name and re-validate its contract fingerprint;
+    /// the tool_call carries the id/args used to build the result.
+    ExecuteMcpTool {
+        manifest: McpSessionManifest,
+        tool_call: ToolCall,
+    },
+    /// Per-tool live health for tools.list.
+    McpToolViews {
+        manifest: McpSessionManifest,
+    },
+    /// Per-server auth status; backs the mcp.status poll.
+    McpAuthStatuses {},
+    /// Begin an OAuth login. The loopback callback binds on the runtime host,
+    /// which (de-dockerized) is the user's machine and browser-reachable.
+    McpBeginLogin {
+        server: String,
+    },
+    /// Complete a login from a browser-delivered callback URL (paste-box fallback).
+    McpCompleteLogin {
+        server: String,
+        login_id: String,
+        callback_url: String,
+    },
+    /// Cancel a pending OAuth login.
+    McpCancelLogin {
+        server: String,
+        login_id: String,
+    },
+    /// Clear a server's stored OAuth credential.
+    McpLogout {
+        server: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +194,12 @@ pub enum RuntimeCommandResult {
     Tool { result: ToolResultMessage },
     FileContents { contents: Option<String> },
     RuntimeSkills { files: Vec<RawSkillFile> },
+    McpInventory { inventory: McpInventory },
+    McpManifest { manifest: McpSessionManifest },
+    McpToolViews { views: Vec<McpToolView> },
+    McpAuthStatuses { servers: Vec<McpAuthServerStatus> },
+    McpLoginStart { start: McpOAuthLoginStart },
+    McpLogout { result: McpLogoutResult },
 }
 
 /// A raw `SKILL.md` found on the session's runtime, returned to the control

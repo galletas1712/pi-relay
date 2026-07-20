@@ -6,14 +6,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_mcp::{McpConfig, McpManager};
+use agent_mcp_types::{McpSessionManifest, McpSessionSnapshot};
 use agent_runtime_protocol::{
     read_frame, write_frame, ControlToRuntime, ProjectWorkspace, RuntimeCommand,
     RuntimeCommandError, RuntimeCommandResult, RuntimeHello, RuntimeToControl, SelectedWorkspace,
     HEARTBEAT_INTERVAL_SECS,
 };
 use agent_tools::{ToolContext, ToolRegistry};
+use agent_vocab::{ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
@@ -29,6 +33,9 @@ struct Config {
     name: String,
     control_addr: String,
     workspace_root: PathBuf,
+    /// Path to this host's MCP server config (mcp.toml). Absent → no MCP.
+    #[serde(default)]
+    mcp_config: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -36,15 +43,33 @@ struct Runtime {
     workspaces: WorkspaceManager,
     tools: Arc<ToolRegistry>,
     running: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    mcp: Arc<McpManager>,
+    mcp_enabled: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = load_config()?;
+    // MCP servers run on the runtime host next to tool execution. The OAuth
+    // credential store lives alongside the workspaces (workspace_root), which on
+    // a local runtime is the user's ~/.local/state/pi-relay — reusing their
+    // existing logins.
+    let mcp = match config.mcp_config.as_deref() {
+        Some(path) => {
+            McpManager::start_with_credential_file(
+                McpConfig::from_path(path)?,
+                config.workspace_root.join("mcp-oauth-credentials.json"),
+            )
+            .await?
+        }
+        None => McpManager::disabled(),
+    };
     let runtime = Runtime {
         workspaces: WorkspaceManager::new(config.workspace_root.clone()),
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         running: Default::default(),
+        mcp,
+        mcp_enabled: config.mcp_config.is_some(),
     };
     runtime.workspaces.validate_root().await.with_context(|| {
         format!(
@@ -88,6 +113,7 @@ async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
         &RuntimeToControl::Hello(RuntimeHello {
             runtime_id: config.runtime_id.clone(),
             name: config.name.clone(),
+            mcp_enabled: runtime.mcp_enabled,
         }),
     )
     .await?;
@@ -254,6 +280,83 @@ impl Runtime {
                     .await?;
                 Ok(RuntimeCommandResult::RuntimeSkills { files })
             }
+            RuntimeCommand::McpInventory {
+                provider,
+                first_party,
+            } => Ok(RuntimeCommandResult::McpInventory {
+                inventory: self.mcp.inventory(provider, &first_party).await?,
+            }),
+            RuntimeCommand::McpSelect {
+                selection,
+                first_party,
+            } => {
+                let snapshot = self.mcp.select(&selection, &first_party).await?;
+                Ok(RuntimeCommandResult::McpManifest {
+                    manifest: snapshot.manifest().clone(),
+                })
+            }
+            RuntimeCommand::ExecuteMcpTool {
+                manifest,
+                tool_call,
+            } => Ok(RuntimeCommandResult::Tool {
+                result: self.execute_mcp_tool(manifest, tool_call).await,
+            }),
+            RuntimeCommand::McpToolViews { manifest } => Ok(RuntimeCommandResult::McpToolViews {
+                views: self
+                    .mcp
+                    .tool_views(&McpSessionSnapshot::new(manifest)?)
+                    .await,
+            }),
+            RuntimeCommand::McpAuthStatuses {} => Ok(RuntimeCommandResult::McpAuthStatuses {
+                servers: self.mcp.auth_statuses().await,
+            }),
+            RuntimeCommand::McpBeginLogin { server } => Ok(RuntimeCommandResult::McpLoginStart {
+                start: self.mcp.begin_oauth_login(&server).await?,
+            }),
+            RuntimeCommand::McpCompleteLogin {
+                server,
+                login_id,
+                callback_url,
+            } => {
+                self.mcp
+                    .complete_oauth_login(&server, &login_id, &callback_url)
+                    .await?;
+                Ok(RuntimeCommandResult::Ack)
+            }
+            RuntimeCommand::McpCancelLogin { server, login_id } => {
+                self.mcp.cancel_oauth_login(&server, &login_id).await?;
+                Ok(RuntimeCommandResult::Ack)
+            }
+            RuntimeCommand::McpLogout { server } => Ok(RuntimeCommandResult::McpLogout {
+                result: self.mcp.logout_oauth(&server).await?,
+            }),
+        }
+    }
+
+    /// Run one MCP tool call and shape it into a ToolResultMessage, mirroring the
+    /// former in-process control-plane path (success unless the server reports an
+    /// error or dispatch fails).
+    async fn execute_mcp_tool(
+        &self,
+        manifest: McpSessionManifest,
+        tool_call: ToolCall,
+    ) -> ToolResultMessage {
+        let snapshot = match McpSessionSnapshot::new(manifest) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return ToolResultMessage::error(
+                    tool_call.id,
+                    tool_call.tool_name,
+                    format!("invalid MCP manifest: {error:#}"),
+                )
+            }
+        };
+        let arguments = serde_json::from_str(&tool_call.args_json).unwrap_or(Value::Null);
+        let ToolCall { id, tool_name, .. } = tool_call;
+        match self.mcp.call(&snapshot, &tool_name, arguments).await {
+            Ok(output) if output.is_error => ToolResultMessage::error(id, tool_name, output.output),
+            Ok(output) => ToolResultMessage::success(id, tool_name, output.output),
+            Err(error) => ToolResultMessage::error(id, tool_name, error.to_string()),
         }
     }
 }

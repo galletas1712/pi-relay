@@ -78,7 +78,11 @@ impl RuntimeRegistry {
         .await
         .context("runtime hello timeout")??
         .ok_or_else(|| anyhow!("runtime disconnected before hello"))?;
-        let RuntimeToControl::Hello(RuntimeHello { runtime_id, name }) = hello else {
+        // `mcp_enabled` is consumed when MCP RPCs move to the runtime; ignore for now.
+        let RuntimeToControl::Hello(RuntimeHello {
+            runtime_id, name, ..
+        }) = hello
+        else {
             return Err(anyhow!("first runtime frame must be hello"));
         };
         if runtime_id.trim().is_empty() || name.trim().is_empty() {
