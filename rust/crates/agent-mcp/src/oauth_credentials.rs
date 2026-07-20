@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agent_mcp_types::OAuthCredentialStoreError;
 use oauth2::basic::BasicTokenType;
 use oauth2::{AccessToken, RefreshToken, Scope, TokenResponse};
 use rmcp::transport::auth::{OAuthTokenResponse, VendorExtraTokenFields};
@@ -18,22 +19,6 @@ const MAX_IDENTITY_BYTES: usize = 16 * 1024;
 const MAX_TOKEN_BYTES: usize = 256 * 1024;
 const MAX_SCOPES: usize = 256;
 const MAX_SCOPE_BYTES: usize = 4 * 1024;
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum OAuthCredentialStoreError {
-    #[error("oauth_credential_store_empty")]
-    Empty,
-    #[error("oauth_credential_store_oversized")]
-    Oversized,
-    #[error("oauth_credential_store_corrupt")]
-    Corrupt,
-    #[error("oauth_credential_store_version_unsupported")]
-    UnsupportedVersion,
-    #[error("oauth_credential_store_bounds_exceeded")]
-    Bounds,
-    #[error("oauth_credential_store_io_failed")]
-    Io,
-}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

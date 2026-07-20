@@ -6,6 +6,7 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+agent-mcp-types = { workspace = true }
 agent-tools = { workspace = true }
 agent-vocab = { workspace = true }
 anyhow = { workspace = true }

@@ -9,6 +9,7 @@ members = [
     "crates/agent-prompt",
     "crates/agent-provider",
     "crates/agent-tools",
+    "crates/agent-mcp-types",
     "crates/agent-mcp",
     "crates/agent-daemon",
 ]
@@ -27,6 +28,7 @@ agent-store = { path = "crates/agent-store" }
 agent-prompt = { path = "crates/agent-prompt" }
 agent-provider = { path = "crates/agent-provider" }
 agent-tools = { path = "crates/agent-tools" }
+agent-mcp-types = { path = "crates/agent-mcp-types" }
 agent-mcp = { path = "crates/agent-mcp" }
 anyhow = "1"
 async-trait = "0.1"

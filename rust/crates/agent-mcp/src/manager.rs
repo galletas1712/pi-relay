@@ -4,21 +4,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_mcp_types::{
+    build_inventory_catalog, declaration_token_estimate, select_manifest, DiscoveredTool,
+    McpAuthFailure, McpAuthKind, McpAuthServerStatus, McpAuthStatus, McpCallError, McpCallOutput,
+    McpHealth, McpInventory, McpInventoryServer, McpInventoryTool, McpLogoutResult, McpManagerError,
+    McpSessionManifest, McpSessionSelection, McpSessionSnapshot, McpToolView, MAX_TOOLS,
+};
 use agent_tools::ProviderTool;
 use agent_vocab::ProviderKind;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use thiserror::Error;
 use tokio::sync::{Mutex, Notify, RwLock};
 
-use crate::catalog::{
-    build_inventory_catalog, declaration_token_estimate, select_manifest, DiscoveredTool, MAX_TOOLS,
-};
 use crate::client::{McpClient, McpClientCallError, McpClientStart};
 use crate::config::{McpConfig, McpServerConfig};
 use crate::result::normalize_call_result;
-use crate::{McpSessionManifest, McpSessionSnapshot};
+
+#[cfg(test)]
+use agent_mcp_types::McpServerSelection;
 
 const MAX_SELECTED_SERVERS: usize = 64;
 const MAX_REVISION_BYTES: usize = 128;
@@ -64,137 +67,6 @@ fn discovered_tools(
         BTreeMap::from([(server_id.to_string(), config.semantic_fingerprint())]);
     build_inventory_catalog(&config_fingerprints, tools.clone(), &BTreeSet::new())?;
     Ok(tools)
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum McpHealth {
-    Healthy,
-    Unavailable,
-    Revoked,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum McpAuthStatus {
-    NonOauth,
-    Unsupported,
-    Unknown,
-    Bearer,
-    LoginRequired,
-    ReauthenticationRequired,
-    OauthReady,
-    AuthorizationPending,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum McpAuthKind {
-    None,
-    Bearer,
-    Oauth,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum McpAuthFailure {
-    CredentialStoreUnavailable,
-    DiscoveryFailed,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct McpAuthServerStatus {
-    pub server: String,
-    pub auth_kind: McpAuthKind,
-    pub auth_state: McpAuthStatus,
-    pub can_login: bool,
-    pub can_logout: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure: Option<McpAuthFailure>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum McpLogoutResult {
-    Removed,
-    NotFound,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct McpInventoryTool {
-    pub raw_name: String,
-    pub description: String,
-    pub context_token_estimate: usize,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct McpInventoryServer {
-    pub server: String,
-    pub revision: String,
-    pub health: McpHealth,
-    pub tools: Vec<McpInventoryTool>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct McpInventory {
-    pub revision: String,
-    pub servers: Vec<McpInventoryServer>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct McpSessionSelection {
-    pub inventory_revision: String,
-    pub servers: Vec<McpServerSelection>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct McpServerSelection {
-    pub server: String,
-    pub tools: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct McpToolView {
-    pub server: String,
-    pub raw_name: String,
-    pub exposed_name: String,
-    pub contract_fingerprint: String,
-    pub health: McpHealth,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpCallOutput {
-    pub output: String,
-    pub is_error: bool,
-}
-
-#[derive(Debug, Error)]
-pub enum McpManagerError {
-    #[error("mcp_inventory_changed: MCP inventory changed")]
-    InventoryChanged { current_revision: String },
-    #[error("mcp_selection_invalid: {message}")]
-    SelectionInvalid { message: String },
-    #[error("mcp_unavailable: selected MCP server {server} is unavailable")]
-    Unavailable { server: String },
-    #[error("mcp_oauth_credential_store_failed")]
-    CredentialStore(#[from] crate::OAuthCredentialStoreError),
-    #[error("invalid MCP catalog: {0}")]
-    Catalog(#[from] anyhow::Error),
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum McpCallError {
-    #[error("mcp_tool_revoked: MCP tool {tool} is no longer allowed")]
-    Revoked { tool: String },
-    #[error("mcp_server_unavailable: MCP server {server} is unavailable")]
-    ServerUnavailable { server: String },
-    #[error("mcp_tool_contract_changed: MCP tool {tool} no longer has the advertised contract")]
-    ContractChanged { tool: String },
-    #[error("mcp_call_timeout: MCP tool {tool} exceeded its total call deadline")]
-    Timeout { tool: String },
-    #[error("mcp_protocol_error: {message}")]
-    Protocol { message: String },
 }
 
 struct ServerState {

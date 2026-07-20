@@ -373,9 +373,9 @@ fn oauth_fingerprint_contains_semantic_config_and_no_operational_state() {
     }
 
     let server = &first.servers["remote"];
-    let catalog = crate::catalog::build_inventory_catalog(
+    let catalog = agent_mcp_types::build_inventory_catalog(
         &BTreeMap::from([("remote".to_string(), server.semantic_fingerprint())]),
-        vec![crate::catalog::DiscoveredTool {
+        vec![agent_mcp_types::DiscoveredTool {
             server_id: "remote".to_string(),
             server_config_fingerprint: server.semantic_fingerprint(),
             raw_name: "read".to_string(),

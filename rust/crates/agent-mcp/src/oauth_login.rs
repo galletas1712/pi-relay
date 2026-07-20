@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
-use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agent_mcp_types::{McpOAuthLoginError, McpOAuthLoginStart};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rmcp::transport::auth::{AuthError, OAuthClientConfig, OAuthHttpClient, OAuthState};
@@ -33,13 +33,6 @@ type ResponseSender = oneshot::Sender<Result<(), McpOAuthLoginError>>;
 #[cfg(test)]
 type FinalizationBarriers = (Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>);
 
-#[derive(PartialEq, Eq)]
-pub struct McpOAuthLoginStart {
-    pub login_id: String,
-    pub authorization_url: String,
-    pub expires_at_unix_seconds: u64,
-}
-
 fn map_callback_error(error: AuthError) -> McpOAuthLoginError {
     match error {
         AuthError::InternalError(_)
@@ -48,53 +41,6 @@ fn map_callback_error(error: AuthError) -> McpOAuthLoginError {
         | AuthError::AuthorizationServerMissingIssuer { .. } => McpOAuthLoginError::InvalidCallback,
         error => map_auth_error(error),
     }
-}
-
-impl fmt::Debug for McpOAuthLoginStart {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("McpOAuthLoginStart")
-            .field("login_id", &self.login_id)
-            .field("authorization_url", &"<redacted>")
-            .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum McpOAuthLoginError {
-    #[error("oauth_login_not_configured")]
-    NotConfigured,
-    #[error("oauth_login_already_pending")]
-    AlreadyPending,
-    #[error("oauth_login_not_found")]
-    NotFound,
-    #[error("oauth_login_already_completed")]
-    AlreadyCompleted,
-    #[error("oauth_login_cancelled")]
-    Cancelled,
-    #[error("oauth_login_expired")]
-    Expired,
-    #[error("oauth_discovery_failed")]
-    Discovery,
-    #[error("oauth_registration_failed")]
-    Registration,
-    #[error("oauth_callback_bind_failed")]
-    CallbackBind,
-    #[error("oauth_callback_invalid")]
-    InvalidCallback,
-    #[error("oauth_provider_error")]
-    Provider,
-    #[error("oauth_token_endpoint_error")]
-    TokenEndpoint,
-    #[error("oauth_credential_store_failed")]
-    Persistence,
-    #[error("oauth_network_failed")]
-    Network,
-    #[error("oauth_login_unavailable")]
-    Unavailable,
-    #[error("oauth_authorization_url_too_long")]
-    AuthorizationUrlTooLong,
 }
 
 pub(crate) struct OAuthCoordinator {

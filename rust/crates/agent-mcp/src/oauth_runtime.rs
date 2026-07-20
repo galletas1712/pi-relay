@@ -2,14 +2,13 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use agent_mcp_types::OAuthCredentialStoreError;
 use rmcp::transport::auth::{AuthError, OAuthState, OAuthTokenResponse};
 use rmcp::transport::AuthorizationManager;
 use tokio::sync::Mutex;
 
 use crate::config::{McpHttpAuthConfig, McpStreamableHttpTransportConfig};
-use crate::oauth_credentials::{
-    unix_millis, OAuthCredentialRepository, OAuthCredentialStoreError, StoredOAuthCredential,
-};
+use crate::oauth_credentials::{unix_millis, OAuthCredentialRepository, StoredOAuthCredential};
 use crate::oauth_http::DirectOAuthClient;
 
 const REFRESH_SKEW_MILLIS: u64 = 30_000;

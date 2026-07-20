@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-mod catalog;
 mod client;
 mod config;
 mod http_transport;
@@ -13,17 +12,15 @@ mod oauth_login;
 mod oauth_runtime;
 mod result;
 
-pub use catalog::{
-    canonical_json, fingerprint_json, McpManifestTool, McpSessionManifest, McpSessionSnapshot,
+pub use agent_mcp_types::{
+    canonical_json, fingerprint_json, McpAuthFailure, McpAuthKind, McpAuthServerStatus,
+    McpAuthStatus, McpCallError, McpCallOutput, McpHealth, McpInventory, McpInventoryServer,
+    McpInventoryTool, McpLogoutResult, McpManagerError, McpManifestTool, McpOAuthLoginError,
+    McpOAuthLoginStart, McpServerSelection, McpSessionManifest, McpSessionSelection,
+    McpSessionSnapshot, McpToolView, OAuthCredentialStoreError,
 };
 pub use config::{
     McpConfig, McpHttpAuthConfig, McpServerConfig, McpStdioTransportConfig,
     McpStreamableHttpTransportConfig, McpTransportConfig,
 };
-pub use manager::{
-    McpAuthFailure, McpAuthKind, McpAuthServerStatus, McpAuthStatus, McpCallError, McpCallOutput,
-    McpHealth, McpInventory, McpInventoryServer, McpInventoryTool, McpLogoutResult, McpManager,
-    McpManagerError, McpServerSelection, McpSessionSelection, McpToolView,
-};
-pub use oauth_credentials::OAuthCredentialStoreError;
-pub use oauth_login::{McpOAuthLoginError, McpOAuthLoginStart};
+pub use manager::McpManager;

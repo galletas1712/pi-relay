@@ -45,6 +45,7 @@ dependencies = [
 name = "agent-mcp"
 version = "0.1.0"
 dependencies = [
+ "agent-mcp-types",
  "agent-prompt",
  "agent-tools",
  "agent-vocab",
@@ -66,6 +67,20 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+]
+
+[[package]]
+name = "agent-mcp-types"
+version = "0.1.0"
+dependencies = [
+ "agent-tools",
+ "agent-vocab",
+ "anyhow",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
