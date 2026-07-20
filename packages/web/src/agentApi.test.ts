@@ -17,7 +17,7 @@ describe("AgentApi MCP wire format", () => {
 		const calls: RpcCall[] = [];
 		const client = fakeClient(calls);
 		const api = createAgentApi(client);
-		await api.getMcpInventory("openai");
+		await api.getMcpInventory("openai", "runtime-local");
 		await api.startSession({
 			sessionId: "session-1",
 			provider: { kind: "openai", model: "gpt-test" },
@@ -35,7 +35,10 @@ describe("AgentApi MCP wire format", () => {
 				],
 			},
 		});
-		expect(calls[0]).toEqual({ method: "mcp.inventory", params: { provider: "openai" } });
+		expect(calls[0]).toEqual({
+			method: "mcp.inventory",
+			params: { provider: "openai", runtime_id: "runtime-local" },
+		});
 		expect(calls[1]).toEqual({
 			method: "session.start",
 			params: {
@@ -63,18 +66,19 @@ describe("AgentApi MCP wire format", () => {
 		const calls: RpcCall[] = [];
 		const storageSet = globalThis.localStorage?.setItem;
 		const api = createAgentApi(fakeClient(calls));
-		await api.getMcpStatus();
-		await api.loginMcp("remote");
+		await api.getMcpStatus("runtime-local");
+		await api.loginMcp("remote", "runtime-local");
 		await api.completeMcpLogin(
 			"remote",
 			"0000000000000001",
 			"http://127.0.0.1:43123/oauth/callback/0000000000000001?code=code&state=state",
+			"runtime-local",
 		);
-		await api.cancelMcpLogin("remote", "0000000000000001");
-		await api.logoutMcp("remote");
+		await api.cancelMcpLogin("remote", "0000000000000001", "runtime-local");
+		await api.logoutMcp("remote", "runtime-local");
 		expect(calls).toEqual([
-			{ method: "mcp.status", params: undefined },
-			{ method: "mcp.login", params: { server: "remote" } },
+			{ method: "mcp.status", params: { runtime_id: "runtime-local" } },
+			{ method: "mcp.login", params: { server: "remote", runtime_id: "runtime-local" } },
 			{
 				method: "mcp.complete",
 				params: {
@@ -82,13 +86,14 @@ describe("AgentApi MCP wire format", () => {
 					login_id: "0000000000000001",
 					callback_url:
 						"http://127.0.0.1:43123/oauth/callback/0000000000000001?code=code&state=state",
+					runtime_id: "runtime-local",
 				},
 			},
 			{
 				method: "mcp.cancel",
-				params: { server: "remote", login_id: "0000000000000001" },
+				params: { server: "remote", login_id: "0000000000000001", runtime_id: "runtime-local" },
 			},
-			{ method: "mcp.logout", params: { server: "remote" } },
+			{ method: "mcp.logout", params: { server: "remote", runtime_id: "runtime-local" } },
 		]);
 		expect(globalThis.localStorage?.setItem).toBe(storageSet);
 	});
