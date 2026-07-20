@@ -27,6 +27,9 @@ services:
       XDG_CONFIG_HOME: /config
     ports:
       - "127.0.0.1:8787:8787"
+      # Runtime listener, published so the host-side pi-runtime (not dockerized;
+      # it needs full host filesystem + toolchain access) can dial in.
+      - "127.0.0.1:8786:8786"
     volumes:
       - ./config/control.toml:/config/pi-relay/config.toml:ro
       # Daemon state on the host, not an ephemeral volume. The control plane's
@@ -49,19 +52,11 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  runtime:
-    build:
-      context: ..
-      dockerfile: infra/Dockerfile
-    command: ["pi-runtime", "/config/runtime.toml"]
-    privileged: true
-    volumes:
-      - ./config/runtime.toml:/config/runtime.toml:ro
-      - ${PI_RUNTIME_ROOT:?set PI_RUNTIME_ROOT to a host directory on btrfs}:/var/lib/pi-runtime
-      - ..:/sources/pi-relay:ro
-    depends_on:
-      - control
-    restart: unless-stopped
+  # NOTE: pi-runtime is intentionally NOT a service here. It executes the
+  # session's tools in your real host environment (arbitrary local-workspace
+  # source_paths, your toolchain/venvs) and needs root for btrfs subvolumes,
+  # so it runs as a host process launched by infra/dev.sh, dialing the control
+  # runtime listener published above on 127.0.0.1:8786.
 
 volumes:
   pgdata:

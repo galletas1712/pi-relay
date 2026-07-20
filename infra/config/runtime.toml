@@ -1,5 +1,0 @@
-runtime_id = "runtime-local"
-name = "Local btrfs runtime"
-control_addr = "control:8786"
-workspace_root = "/var/lib/pi-runtime"
-
