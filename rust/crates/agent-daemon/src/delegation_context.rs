@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use agent_store::{Delegation, DelegationStatus, SessionActivity, SubagentType};
 
 use crate::delegation_tools::load_subagent_work_state;
@@ -48,7 +46,7 @@ pub(crate) async fn compaction_delegation_ledger(
 
     for delegation in &delegations {
         let progress = state.repo.delegation_progress(delegation).await?;
-        let handoff_dir = delegation_dir(&parent_config.workspace_id, &delegation.id);
+        let handoff_dir = delegation_dir(&delegation.id);
         out.push_str(&format!(
             "\n- delegation_id: `{}`; kind: {}; status: {}; progress: expected {}, spawned {}, terminal {}, running {}, failed {}",
             inline_code(&delegation.id),
@@ -75,12 +73,18 @@ pub(crate) async fn compaction_delegation_ledger(
         {
             out.push_str(&format!("; label: `{}`", inline_code(label)));
         }
-        out.push_str(&format!(
-            "; handoff_dir: `{}`",
-            inline_code(&handoff_dir.to_string_lossy())
-        ));
+        out.push_str(&format!("; handoff_dir: `{}`", inline_code(&handoff_dir)));
         out.push('\n');
-        append_subagents(state, &mut out, delegation, progress.spawned, &handoff_dir).await?;
+        append_subagents(
+            state,
+            &mut out,
+            delegation,
+            progress.spawned,
+            &parent_config.runtime_id,
+            &parent_config.workspace_id,
+            &handoff_dir,
+        )
+        .await?;
     }
 
     Ok(Some(out.trim_end().to_string()))
@@ -121,7 +125,9 @@ async fn append_subagents(
     out: &mut String,
     delegation: &Delegation,
     spawned_count: i32,
-    handoff_dir: &Path,
+    runtime_id: &str,
+    workspace_id: &str,
+    handoff_dir: &str,
 ) -> anyhow::Result<()> {
     let subagents = state
         .repo
@@ -156,14 +162,15 @@ async fn append_subagents(
             optional_transcript_file(delegation.status, &subagent.session_id),
         ));
         if final_message_relevant(delegation.status) {
-            let final_message_path = handoff_dir
-                .join(&subagent.session_id)
-                .join("final_message.md");
+            let final_message_rel =
+                format!("{handoff_dir}/{}/final_message.md", subagent.session_id);
             out.push_str(&format!(
                 "; final_message_file: `{}/final_message.md`",
                 inline_code(&subagent.session_id)
             ));
-            if let Some(outcome) = read_outcome(&final_message_path).await {
+            if let Some(outcome) =
+                read_outcome(state, runtime_id, workspace_id, &final_message_rel).await
+            {
                 out.push_str(&format!("; outcome: {}", serde_json::to_string(&outcome)?));
             }
         }
@@ -220,8 +227,17 @@ fn final_message_relevant(status: DelegationStatus) -> bool {
     )
 }
 
-async fn read_outcome(path: &Path) -> Option<String> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
+async fn read_outcome(
+    state: &AppState,
+    runtime_id: &str,
+    workspace_id: &str,
+    rel_path: &str,
+) -> Option<String> {
+    let content = state
+        .runtime_hosts
+        .read_workspace_file(runtime_id, workspace_id, rel_path)
+        .await
+        .ok()??;
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
@@ -280,11 +296,11 @@ pub(crate) fn test_ledger_from_snapshots(
         agent_store::DelegationProgress,
         Vec<TestSubagent>,
     )>,
-    parent_workspace_id: &str,
+    _parent_workspace_id: &str,
 ) -> anyhow::Result<String> {
     let mut out = ledger_header();
     for (delegation, progress, subagents) in delegations {
-        let handoff_dir = delegation_dir(parent_workspace_id, &delegation.id);
+        let handoff_dir = delegation_dir(&delegation.id);
         out.push_str(&format!(
             "\n- delegation_id: `{}`; kind: {}; status: {}; progress: expected {}, spawned {}, terminal {}, running {}, failed {}",
             inline_code(&delegation.id),
@@ -297,10 +313,7 @@ pub(crate) fn test_ledger_from_snapshots(
             progress.failed,
         ));
         append_compaction_status_note(&mut out, delegation.status);
-        out.push_str(&format!(
-            "; handoff_dir: `{}`\n",
-            inline_code(&handoff_dir.to_string_lossy())
-        ));
+        out.push_str(&format!("; handoff_dir: `{}`\n", inline_code(&handoff_dir)));
         let shown = subagents.len().min(MAX_SUBAGENTS_PER_DELEGATION);
         for subagent in subagents.iter().take(shown) {
             out.push_str(&format!(

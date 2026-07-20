@@ -46,7 +46,7 @@ pub(crate) async fn fork(state: &AppState, params: Value) -> Result<Value, RpcEr
         &target.session_id,
         target.leaf_id.as_deref(),
     );
-    let result = match render_pi_prompt(state, &config) {
+    let result = match render_pi_prompt(state, &config).await {
         Ok(system_prompt) => {
             config.system_prompt = system_prompt;
             state

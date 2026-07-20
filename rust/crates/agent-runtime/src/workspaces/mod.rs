@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use agent_runtime_protocol::{ProjectWorkspace, SessionWorkspace, WorkspaceKind};
+use agent_runtime_protocol::{ProjectWorkspace, RawSkillFile, SessionWorkspace, WorkspaceKind};
 use anyhow::{bail, Context, Result};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
@@ -52,6 +52,71 @@ impl WorkspaceManager {
 
     pub fn resolve(&self, workspace_id: &str) -> PathBuf {
         self.session_root(workspace_id).join("cwd")
+    }
+
+    /// Resolve a cwd-relative path, rejecting anything that is absolute or
+    /// escapes the session cwd.
+    fn safe_workspace_path(&self, workspace_id: &str, rel_path: &str) -> Result<PathBuf> {
+        let cwd = self.resolve(workspace_id);
+        let mut path = cwd.clone();
+        for component in Path::new(rel_path).components() {
+            match component {
+                std::path::Component::Normal(part) => path.push(part),
+                _ => bail!("workspace file path must be relative and normal: {rel_path}"),
+            }
+        }
+        Ok(path)
+    }
+
+    /// Write a control-generated file (e.g. a delegation handoff artifact) into
+    /// the session cwd so runtime-side tools can read it.
+    pub async fn write_workspace_file(
+        &self,
+        workspace_id: &str,
+        rel_path: &str,
+        contents: &str,
+    ) -> Result<()> {
+        let path = self.safe_workspace_path(workspace_id, rel_path)?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&path, contents.as_bytes()).await?;
+        Ok(())
+    }
+
+    pub async fn read_workspace_file(
+        &self,
+        workspace_id: &str,
+        rel_path: &str,
+    ) -> Result<Option<String>> {
+        let path = self.safe_workspace_path(workspace_id, rel_path)?;
+        match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Enumerate every runtime-side authored skill — the runtime host's
+    /// `~/.agents/skills` (global) plus each workspace's `.agents/skills` — and
+    /// return the raw `SKILL.md` contents for control-plane frontmatter parsing.
+    pub async fn read_runtime_skills(
+        &self,
+        workspace_id: &str,
+        workspace_dirs: &[String],
+    ) -> Result<Vec<RawSkillFile>> {
+        let mut files = Vec::new();
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            let home_skills = PathBuf::from(home).join(".agents/skills");
+            collect_skill_dir(&home_skills, None, &mut files).await?;
+        }
+        let cwd = self.resolve(workspace_id);
+        for workspace_dir in workspace_dirs {
+            let skills_dir = cwd.join(workspace_dir).join(".agents/skills");
+            collect_skill_dir(&skills_dir, Some(workspace_dir.as_str()), &mut files).await?;
+        }
+        files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        Ok(files)
     }
 
     pub async fn validate_root(&self) -> Result<()> {
@@ -500,6 +565,41 @@ struct WorkspaceBase {
     config: WorkspaceBaseConfig,
 }
 
+/// Read every `<dir>/<name>/SKILL.md` into a `RawSkillFile`. A missing directory
+/// is not an error. `workspace` labels the source: the owning workspace dir, or
+/// `None` for the runtime host's global `~/.agents/skills`.
+async fn collect_skill_dir(
+    dir: &Path,
+    workspace: Option<&str>,
+    files: &mut Vec<RawSkillFile>,
+) -> Result<()> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let Ok(contents) = tokio::fs::read_to_string(entry.path().join("SKILL.md")).await else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let rel_path = match workspace {
+            Some(workspace) => format!("{workspace}/.agents/skills/{name}/SKILL.md"),
+            None => format!("~/.agents/skills/{name}/SKILL.md"),
+        };
+        files.push(RawSkillFile {
+            workspace: workspace.map(str::to_string),
+            rel_path,
+            contents,
+        });
+    }
+    Ok(())
+}
+
 fn local_branch(session_id: &str, workspace_dir: &str) -> String {
     format!(
         "pi/session/{}/{}",
@@ -549,4 +649,63 @@ async fn canonicalize_git_path(workspace_root: &Path, git_path: &str) -> Result<
     tokio::fs::canonicalize(&path)
         .await
         .with_context(|| format!("canonicalize git path {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "pi-runtime-{prefix}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, contents).expect("write");
+    }
+
+    #[tokio::test]
+    async fn collect_skill_dir_loads_immediate_children_only() {
+        let root = temp_dir("collect-skill");
+        let skills = root.join(".agents/skills");
+        write_file(
+            &skills.join("reviewer/SKILL.md"),
+            "---\nname: reviewer\ndescription: review\n---\nbody",
+        );
+        // A loose file directly under `.agents/skills` is not a skill package.
+        write_file(&skills.join("loose.md"), "not a package");
+        // A `SKILL.md` nested deeper than an immediate child is not discovered.
+        write_file(
+            &skills.join("group/deep/SKILL.md"),
+            "---\nname: deep\ndescription: deep\n---\nbody",
+        );
+
+        let mut files = Vec::new();
+        collect_skill_dir(&skills, Some("repo"), &mut files)
+            .await
+            .expect("collect");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].workspace.as_deref(), Some("repo"));
+        assert_eq!(files[0].rel_path, "repo/.agents/skills/reviewer/SKILL.md");
+        assert!(files[0].contents.contains("name: reviewer"));
+
+        // A missing directory is not an error and yields nothing.
+        let mut none = Vec::new();
+        collect_skill_dir(&root.join("absent"), None, &mut none)
+            .await
+            .expect("missing dir is ok");
+        assert!(none.is_empty());
+
+        std::fs::remove_dir_all(root).ok();
+    }
 }

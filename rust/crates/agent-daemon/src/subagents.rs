@@ -84,11 +84,24 @@ pub(crate) async fn spawn_subagent(
     }
 
     let child_session_id = format!("session_{}", Uuid::new_v4());
+    let parent_workspace_dirs = parent_config
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.workspace_dir.clone())
+        .collect::<Vec<_>>();
+    let runtime_raw = state
+        .runtime_hosts
+        .read_runtime_skills(
+            &parent_config.runtime_id,
+            &parent_config.workspace_id,
+            &parent_workspace_dirs,
+        )
+        .await
+        .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
     let role = resolve_skill_role(
         &state.prompt_root,
         &state.config_root,
-        &PathBuf::from(&parent_config.workspace_id),
-        &parent_config.workspaces,
+        &runtime_raw,
         &request.role,
     )
     .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
@@ -149,7 +162,8 @@ pub(crate) async fn spawn_subagent(
             parent_session_id: &request.parent_session_id,
             subagent_type: request.subagent_type,
         },
-    )?;
+    )
+    .await?;
     let task = request.task;
     let initial_task = child_initial_task_message(&request.parent_session_id, &task);
     let subagent_type = request.subagent_type;
@@ -498,12 +512,12 @@ struct ChildPromptRole<'a> {
     subagent_type: SubagentType,
 }
 
-fn child_system_prompt(
+async fn child_system_prompt(
     state: &AppState,
     config: &SessionConfig,
     role: ChildPromptRole<'_>,
 ) -> std::result::Result<String, RpcError> {
-    let base = render_pi_prompt(state, config)?;
+    let base = render_pi_prompt(state, config).await?;
     let workspace = role
         .workspace
         .map(|workspace| format!("workspace `{workspace}`"))

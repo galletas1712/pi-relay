@@ -388,6 +388,68 @@ impl RuntimeRegistry {
         .await
         .map(|_| ())
     }
+
+    /// Write a control-generated file into the session workspace on its runtime.
+    pub(crate) async fn write_workspace_file(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        rel_path: &str,
+        contents: &str,
+    ) -> Result<()> {
+        self.execute(
+            runtime_id,
+            RuntimeCommand::WriteWorkspaceFile {
+                workspace_id: workspace_id.to_string(),
+                rel_path: rel_path.to_string(),
+                contents: contents.to_string(),
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn read_workspace_file(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        rel_path: &str,
+    ) -> Result<Option<String>> {
+        match self
+            .execute(
+                runtime_id,
+                RuntimeCommand::ReadWorkspaceFile {
+                    workspace_id: workspace_id.to_string(),
+                    rel_path: rel_path.to_string(),
+                },
+            )
+            .await?
+        {
+            RuntimeCommandResult::FileContents { contents } => Ok(contents),
+            _ => Err(anyhow!("runtime returned the wrong file-read result")),
+        }
+    }
+
+    pub(crate) async fn read_runtime_skills(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        workspace_dirs: &[String],
+    ) -> Result<Vec<agent_runtime_protocol::RawSkillFile>> {
+        match self
+            .execute(
+                runtime_id,
+                RuntimeCommand::ReadRuntimeSkills {
+                    workspace_id: workspace_id.to_string(),
+                    workspace_dirs: workspace_dirs.to_vec(),
+                },
+            )
+            .await?
+        {
+            RuntimeCommandResult::RuntimeSkills { files } => Ok(files),
+            _ => Err(anyhow!("runtime returned the wrong runtime-skills result")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -483,24 +545,88 @@ pub(crate) mod test_support {
                 provider,
                 tool_call,
             } => {
-                let dir = {
-                    let mut dirs = dirs.lock().await;
-                    dirs.entry(workspace_id)
-                        .or_insert_with(|| {
-                            let path =
-                                std::env::temp_dir().join(format!("pi-fake-ws-{}", Uuid::new_v4()));
-                            std::fs::create_dir_all(&path).expect("fake workspace dir");
-                            path
-                        })
-                        .clone()
-                };
-                let context = ToolContext::new(dir);
+                let context = ToolContext::new(fake_workspace_dir(dirs, &workspace_id).await);
                 match tools.execute(provider, &tool_call, &context).await {
                     Ok(result) => Ok(RuntimeCommandResult::Tool { result }),
                     Err(error) => Err(RuntimeCommandError::new("tool_error", format!("{error:#}"))),
                 }
             }
+            RuntimeCommand::WriteWorkspaceFile {
+                workspace_id,
+                rel_path,
+                contents,
+            } => {
+                let path = fake_workspace_dir(dirs, &workspace_id)
+                    .await
+                    .join(&rel_path);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("fake handoff dir");
+                }
+                std::fs::write(&path, contents).expect("fake workspace write");
+                Ok(RuntimeCommandResult::Ack)
+            }
+            RuntimeCommand::ReadWorkspaceFile {
+                workspace_id,
+                rel_path,
+            } => {
+                let path = fake_workspace_dir(dirs, &workspace_id)
+                    .await
+                    .join(&rel_path);
+                Ok(RuntimeCommandResult::FileContents {
+                    contents: std::fs::read_to_string(&path).ok(),
+                })
+            }
+            RuntimeCommand::ReadRuntimeSkills {
+                workspace_id,
+                workspace_dirs,
+            } => {
+                // The fake runtime serves only workspace skills; home skills are
+                // exercised by pure parse tests to keep results host-independent.
+                let base = fake_workspace_dir(dirs, &workspace_id).await;
+                let mut files = Vec::new();
+                for workspace_dir in workspace_dirs {
+                    let skills_dir = base.join(&workspace_dir).join(".agents/skills");
+                    let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        if !entry.path().is_dir() {
+                            continue;
+                        }
+                        let name = entry.file_name();
+                        let Ok(contents) = std::fs::read_to_string(entry.path().join("SKILL.md"))
+                        else {
+                            continue;
+                        };
+                        files.push(agent_runtime_protocol::RawSkillFile {
+                            workspace: Some(workspace_dir.clone()),
+                            rel_path: format!(
+                                "{}/.agents/skills/{}/SKILL.md",
+                                workspace_dir,
+                                name.to_string_lossy()
+                            ),
+                            contents,
+                        });
+                    }
+                }
+                files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+                Ok(RuntimeCommandResult::RuntimeSkills { files })
+            }
         }
+    }
+
+    async fn fake_workspace_dir(
+        dirs: &Arc<TokioMutex<HashMap<String, std::path::PathBuf>>>,
+        workspace_id: &str,
+    ) -> std::path::PathBuf {
+        let mut dirs = dirs.lock().await;
+        dirs.entry(workspace_id.to_string())
+            .or_insert_with(|| {
+                let path = std::env::temp_dir().join(format!("pi-fake-ws-{}", Uuid::new_v4()));
+                std::fs::create_dir_all(&path).expect("fake workspace dir");
+                path
+            })
+            .clone()
     }
 
     fn session_workspace_from(workspace: ProjectWorkspace) -> SessionWorkspace {

@@ -24,12 +24,8 @@ pub(crate) fn progress_view(progress: DelegationProgress) -> Value {
 async fn inspectable_handoff_artifacts(
     state: &AppState,
     delegation: &Delegation,
-) -> std::result::Result<(std::path::PathBuf, Vec<SubagentArtifact>), RpcError> {
-    let parent_config = state
-        .repo
-        .load_session_config(&delegation.parent_session_id)
-        .await?;
-    let dir = delegation_dir(&parent_config.workspace_id, &delegation.id);
+) -> std::result::Result<(String, Vec<SubagentArtifact>), RpcError> {
+    let dir = delegation_dir(&delegation.id);
     let include_final_messages = matches!(
         delegation.status,
         DelegationStatus::Running | DelegationStatus::Done | DelegationStatus::DoneWithFailures
@@ -90,6 +86,12 @@ pub(crate) async fn build_delegation_snapshot(
     delegation: &Delegation,
 ) -> std::result::Result<Value, RpcError> {
     let (handoff_dir_path, artifacts) = inspectable_handoff_artifacts(state, delegation).await?;
+    let parent_config = state
+        .repo
+        .load_session_config(&delegation.parent_session_id)
+        .await?;
+    let runtime_id = parent_config.runtime_id.as_str();
+    let workspace_id = parent_config.workspace_id.as_str();
     let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
     let spawned_count = subagents.len();
     let mut terminal_count = 0usize;
@@ -127,8 +129,16 @@ pub(crate) async fn build_delegation_snapshot(
         let final_message_file = if delegation.status == DelegationStatus::Cancelled {
             let subagent_segment = safe_handoff_path_segment(&subagent.session_id, "subagent_id")?;
             let relative = format!("{subagent_segment}/final_message.md");
-            let path = handoff_dir_path.join(&relative);
-            path.exists().then_some(relative)
+            let exists = state
+                .runtime_hosts
+                .read_workspace_file(
+                    runtime_id,
+                    workspace_id,
+                    &format!("{handoff_dir_path}/{relative}"),
+                )
+                .await?
+                .is_some();
+            exists.then_some(relative)
         } else {
             completion_terminal_status
                 .and_then(|_| artifact.and_then(SubagentArtifact::final_message_rel))
@@ -137,25 +147,29 @@ pub(crate) async fn build_delegation_snapshot(
         let task_prompt_file = if let Some(artifact) = artifact {
             artifact.task_prompt_rel()
         } else {
-            let task_prompt = refresh_task_prompt_artifact_if_present(
+            let has_task_prompt = refresh_task_prompt_artifact_if_present(
+                state,
+                runtime_id,
+                workspace_id,
                 &handoff_dir_path,
                 &subagent.session_id,
                 subagent.task.as_deref(),
             )
             .await?;
-            task_prompt
-                .as_ref()
-                .map(|_| task_prompt_rel(&subagent.session_id))
+            has_task_prompt.then(|| task_prompt_rel(&subagent.session_id))
         };
         let transcript_file = if delegation.status == DelegationStatus::Cancelled {
             let subagent_segment = safe_handoff_path_segment(&subagent.session_id, "subagent_id")?;
             let relative = format!("cancelled/{subagent_segment}.transcript.md");
-            let path = handoff_dir_path.join(&relative);
-            if path.exists() {
-                Some(relative)
-            } else {
-                None
-            }
+            state
+                .runtime_hosts
+                .read_workspace_file(
+                    runtime_id,
+                    workspace_id,
+                    &format!("{handoff_dir_path}/{relative}"),
+                )
+                .await?
+                .map(|_| relative)
         } else {
             normal_transcript_file
         };
@@ -204,7 +218,7 @@ pub(crate) async fn build_delegation_snapshot(
     Ok(delegation_view(
         delegation,
         json!(subagent_views),
-        handoff_dir_path.to_string_lossy().into_owned(),
+        handoff_dir_path,
         terminal_count,
         running_count,
         failed_count,

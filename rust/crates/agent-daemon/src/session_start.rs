@@ -119,7 +119,7 @@ pub(crate) async fn session_start(
         metadata: parent_session_metadata(params.metadata.unwrap_or_else(|| json!({}))),
         mcp_manifest,
     };
-    config.system_prompt = render_pi_prompt(state, &config)?;
+    config.system_prompt = render_pi_prompt(state, &config).await?;
 
     let started = start_prepared_session_with_driver(
         state,

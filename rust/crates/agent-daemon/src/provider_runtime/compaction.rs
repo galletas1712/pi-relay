@@ -315,7 +315,7 @@ pub(crate) async fn native_compaction_request(
     let compaction_instructions = if config.provider.kind == ProviderKind::Claude {
         Some(format!(
             "{}\n\nDo not call any tools while writing this summary. Respond with summary text only.",
-            render_pi_compaction_prompt(state, config)?
+            render_pi_compaction_prompt(state, config).await?
         ))
     } else {
         None

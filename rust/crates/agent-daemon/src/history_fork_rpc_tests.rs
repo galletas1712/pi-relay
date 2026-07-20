@@ -208,6 +208,7 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
     assert_eq!(
         child_config.system_prompt,
         crate::provider_runtime::render_pi_prompt(&env.state, &child_config)
+            .await
             .expect("child prompt rerenders")
     );
     env.cleanup().await;

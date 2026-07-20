@@ -112,6 +112,26 @@ pub enum RuntimeCommand {
         provider: ProviderKind,
         tool_call: ToolCall,
     },
+    /// Write a control-plane-generated file into the session workspace (e.g.
+    /// delegation handoff artifacts) so runtime-side tools can read it.
+    /// `rel_path` is relative to the session cwd.
+    WriteWorkspaceFile {
+        workspace_id: String,
+        rel_path: String,
+        contents: String,
+    },
+    /// Read a file from the session workspace back to the control plane.
+    ReadWorkspaceFile {
+        workspace_id: String,
+        rel_path: String,
+    },
+    /// Enumerate every runtime-side authored skill — the runtime host's
+    /// `~/.agents/skills` plus each `<workspace_dir>/.agents/skills` — and return
+    /// the raw `SKILL.md` contents for the control plane to parse.
+    ReadRuntimeSkills {
+        workspace_id: String,
+        workspace_dirs: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +140,19 @@ pub enum RuntimeCommandResult {
     Ack,
     Materialized { workspaces: Vec<SessionWorkspace> },
     Tool { result: ToolResultMessage },
+    FileContents { contents: Option<String> },
+    RuntimeSkills { files: Vec<RawSkillFile> },
+}
+
+/// A raw `SKILL.md` found on the session's runtime, returned to the control
+/// plane for frontmatter parsing. `workspace` is the owning workspace dir, or
+/// `None` for a global home (`~/.agents/skills`) skill. `rel_path` identifies
+/// the file for display only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RawSkillFile {
+    pub workspace: Option<String>,
+    pub rel_path: String,
+    pub contents: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use agent_prompt::{PromptProfile, Skill};
-use agent_store::SessionWorkspace;
+use agent_runtime_protocol::RawSkillFile;
 use agent_vocab::{ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -9,14 +9,13 @@ use serde_json::{json, Value};
 
 use super::prompt::{
     extend_with_fallback_skills, load_global_skills_from_dirs, load_parsed_skill_file,
-    load_skills_for_session_workspaces, load_skills_for_session_workspaces_with_home,
+    parse_runtime_skills, parse_skill_contents,
 };
 
 pub(crate) fn load_skill_result(
     prompt_root: &Path,
     config_root: &Path,
-    workspace_id: &Path,
-    workspaces: &[SessionWorkspace],
+    runtime_raw: &[RawSkillFile],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
     profile: PromptProfile,
@@ -24,8 +23,7 @@ pub(crate) fn load_skill_result(
     match load_skill_output(
         prompt_root,
         config_root,
-        workspace_id,
-        workspaces,
+        runtime_raw,
         loaded_skills,
         call,
         profile,
@@ -51,33 +49,9 @@ fn is_packaged_workflow_skill(
 fn load_skill_output(
     prompt_root: &Path,
     config_root: &Path,
-    workspace_id: &Path,
-    workspaces: &[SessionWorkspace],
+    runtime_raw: &[RawSkillFile],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
-    profile: PromptProfile,
-) -> Result<String> {
-    load_skill_output_with_home(
-        prompt_root,
-        config_root,
-        workspace_id,
-        workspaces,
-        loaded_skills,
-        call,
-        None,
-        profile,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn load_skill_output_with_home(
-    prompt_root: &Path,
-    config_root: &Path,
-    workspace_id: &Path,
-    workspaces: &[SessionWorkspace],
-    loaded_skills: &std::collections::BTreeSet<String>,
-    call: &ToolCall,
-    home: Option<&Path>,
     profile: PromptProfile,
 ) -> Result<String> {
     let args: LoadSkillArgs = serde_json::from_str(&call.args_json)?;
@@ -85,12 +59,7 @@ fn load_skill_output_with_home(
     if name.is_empty() {
         return Err(anyhow!("skill name cannot be empty"));
     }
-    let mut skills = match home {
-        Some(home) => {
-            load_skills_for_session_workspaces_with_home(workspace_id, workspaces, Some(home))
-        }
-        None => load_skills_for_session_workspaces(workspace_id, workspaces),
-    };
+    let mut skills = parse_runtime_skills(runtime_raw);
     if profile == PromptProfile::Parent {
         extend_with_fallback_skills(
             &mut skills,
@@ -116,8 +85,20 @@ fn load_skill_output_with_home(
     if loaded_skills.contains(&skill_id) {
         return loaded_skill_json("already_loaded", skill, None);
     }
-    let content = std::fs::read_to_string(&skill.file_path)?;
+    let content = skill_body(skill, runtime_raw)?;
     loaded_skill_json("loaded", skill, Some(content.trim()))
+}
+
+/// Return a skill's full `SKILL.md` body. Runtime skills (home + workspace)
+/// reuse the already-fetched contents; packaged workflow skills read from disk.
+fn skill_body(skill: &Skill, runtime_raw: &[RawSkillFile]) -> Result<String> {
+    match runtime_raw
+        .iter()
+        .find(|file| skill.file_path.to_str() == Some(file.rel_path.as_str()))
+    {
+        Some(file) => Ok(file.contents.clone()),
+        None => Ok(std::fs::read_to_string(&skill.file_path)?),
+    }
 }
 
 fn resolve_load_skill<'a>(skills: &'a [Skill], requested_name: &str) -> Result<&'a Skill> {
@@ -175,15 +156,14 @@ pub(crate) struct ResolvedSkillRole {
 pub(crate) fn resolve_skill_role(
     prompt_root: &Path,
     config_root: &Path,
-    workspace_id: &Path,
-    workspaces: &[SessionWorkspace],
+    runtime_raw: &[RawSkillFile],
     name: &str,
 ) -> Result<ResolvedSkillRole> {
     let name = name.trim();
     if name.is_empty() {
         return Err(anyhow!("role name cannot be empty"));
     }
-    let skills = load_skills_for_session_workspaces(workspace_id, workspaces);
+    let skills = parse_runtime_skills(runtime_raw);
 
     let mut exposed_matches = skills
         .iter()
@@ -191,7 +171,7 @@ pub(crate) fn resolve_skill_role(
         .cloned()
         .collect::<Vec<_>>();
     match exposed_matches.len() {
-        1 => return role_from_skill(exposed_matches.remove(0)),
+        1 => return role_from_skill(exposed_matches.remove(0), runtime_raw),
         0 => {}
         _ => {
             return Err(anyhow!(
@@ -202,7 +182,7 @@ pub(crate) fn resolve_skill_role(
 
     packaged_role(config_root, prompt_root, name)
         .ok_or_else(|| anyhow!("role skill not found: {name}"))
-        .and_then(role_from_skill)
+        .and_then(|skill| role_from_skill(skill, runtime_raw))
 }
 
 fn load_packaged_role_skills(config_root: &Path, prompt_root: &Path) -> Vec<Skill> {
@@ -218,15 +198,26 @@ fn packaged_role(config_root: &Path, prompt_root: &Path, name: &str) -> Option<S
         .find(|skill| skill.name == name)
 }
 
-fn role_from_skill(skill: Skill) -> Result<ResolvedSkillRole> {
-    let parsed = load_parsed_skill_file(&skill.file_path)
-        .with_context(|| format!("read role skill {}", skill.file_path.display()))?;
+fn role_from_skill(skill: Skill, runtime_raw: &[RawSkillFile]) -> Result<ResolvedSkillRole> {
+    let body = match runtime_raw
+        .iter()
+        .find(|file| skill.file_path.to_str() == Some(file.rel_path.as_str()))
+    {
+        Some(file) => parse_skill_contents(&file.contents)
+            .map(|parsed| parsed.body)
+            .ok_or_else(|| anyhow!("role skill {} missing frontmatter", skill.exposed_name()))?,
+        None => {
+            load_parsed_skill_file(&skill.file_path)
+                .with_context(|| format!("read role skill {}", skill.file_path.display()))?
+                .body
+        }
+    };
     Ok(ResolvedSkillRole {
         name: skill.name,
         workspace: skill.workspace,
         description: skill.description,
         file_path: skill.file_path,
-        content: parsed.body,
+        content: body,
     })
 }
 
@@ -255,13 +246,12 @@ mod tests {
             args_json: r#"{"name":"repo/rust-refactor"}"#.to_string(),
         };
         let mut loaded = std::collections::BTreeSet::new();
-        let workspaces = vec![SessionWorkspace::local("repo", "")];
+        let runtime_raw = discover_raw(&workspace_id, &["repo"]);
 
         let first = load_skill_result(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &workspaces,
+            &runtime_raw,
             &loaded,
             &call,
             PromptProfile::Parent,
@@ -279,8 +269,7 @@ mod tests {
         let second = load_skill_result(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &workspaces,
+            &runtime_raw,
             &loaded,
             &call,
             PromptProfile::Parent,
@@ -312,13 +301,12 @@ mod tests {
             args_json: r#"{"workspace":"repo","name":"rust-refactor"}"#.to_string(),
         };
         let loaded = std::collections::BTreeSet::new();
-        let workspaces = vec![SessionWorkspace::local("repo", "")];
+        let runtime_raw = discover_raw(&workspace_id, &["repo"]);
 
         let result = load_skill_result(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &workspaces,
+            &runtime_raw,
             &loaded,
             &call,
             PromptProfile::Parent,
@@ -347,13 +335,12 @@ mod tests {
             args_json: r#"{"name":"rust-refactor"}"#.to_string(),
         };
         let loaded = std::collections::BTreeSet::new();
-        let workspaces = vec![SessionWorkspace::local("repo", "")];
+        let runtime_raw = discover_raw(&workspace_id, &["repo"]);
 
         let result = load_skill_result(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &workspaces,
+            &runtime_raw,
             &loaded,
             &call,
             PromptProfile::Parent,
@@ -387,7 +374,6 @@ mod tests {
         let result = load_skill_result(
             &prompt_root,
             &prompt_root,
-            &workspace_id,
             &[],
             &loaded,
             &call,
@@ -403,14 +389,8 @@ mod tests {
             .expect("content string")
             .contains("delegate_readonly_tasks"));
 
-        let error = resolve_skill_role(
-            &prompt_root,
-            &prompt_root,
-            &workspace_id,
-            &[],
-            "workflow-only-test-role",
-        )
-        .expect_err("workflow skills are not packaged subagent roles");
+        let error = resolve_skill_role(&prompt_root, &prompt_root, &[], "workflow-only-test-role")
+            .expect_err("workflow skills are not packaged subagent roles");
         assert!(error
             .to_string()
             .contains("role skill not found: workflow-only-test-role"));
@@ -463,7 +443,6 @@ mod tests {
         let result = load_skill_result(
             &prompt_root,
             &config_root,
-            &workspace_id,
             &[],
             &std::collections::BTreeSet::new(),
             &call,
@@ -479,7 +458,6 @@ mod tests {
         let fallback = load_skill_result(
             &prompt_root,
             &config_root,
-            &workspace_id,
             &[],
             &std::collections::BTreeSet::new(),
             &fallback_call,
@@ -488,7 +466,7 @@ mod tests {
         assert_eq!(fallback.status, agent_vocab::ToolResultStatus::Success);
         assert!(fallback.output.contains("Fallback workflow body."));
 
-        let role = resolve_skill_role(&prompt_root, &config_root, &workspace_id, &[], "reviewer")
+        let role = resolve_skill_role(&prompt_root, &config_root, &[], "reviewer")
             .expect("configured role resolves");
         assert_eq!(role.description, "Configured reviewer");
         assert!(role.content.contains("Configured reviewer body."));
@@ -500,14 +478,9 @@ mod tests {
             "Workspace reviewer",
             "Workspace reviewer body.",
         );
-        let role = resolve_skill_role(
-            &prompt_root,
-            &config_root,
-            &workspace_id,
-            &[SessionWorkspace::local("repo", "")],
-            "repo/reviewer",
-        )
-        .expect("workspace role resolves first");
+        let workspace_raw = discover_raw(&workspace_id, &["repo"]);
+        let role = resolve_skill_role(&prompt_root, &config_root, &workspace_raw, "repo/reviewer")
+            .expect("workspace role resolves first");
         assert_eq!(role.description, "Workspace reviewer");
 
         std::fs::remove_dir_all(prompt_root).ok();
@@ -537,7 +510,6 @@ mod tests {
         let result = load_skill_result(
             &prompt_root,
             &prompt_root,
-            &workspace_id,
             &[],
             &loaded,
             &call,
@@ -566,8 +538,7 @@ mod tests {
         let role = resolve_skill_role(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &[SessionWorkspace::local("repo", "")],
+            &discover_raw(&workspace_id, &["repo"]),
             "repo/reviewer",
         )
         .expect("role resolves");
@@ -594,8 +565,7 @@ mod tests {
         let error = resolve_skill_role(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &[SessionWorkspace::local("repo", "")],
+            &discover_raw(&workspace_id, &["repo"]),
             "context-inspector",
         )
         .expect_err("unprefixed workspace role is rejected");
@@ -624,11 +594,7 @@ mod tests {
         let error = resolve_skill_role(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &[
-                SessionWorkspace::local("repo-a", ""),
-                SessionWorkspace::local("repo-b", ""),
-            ],
+            &discover_raw(&workspace_id, &["repo-a", "repo-b"]),
             "context-inspector",
         )
         .expect_err("unprefixed workspace role is rejected");
@@ -655,8 +621,7 @@ mod tests {
         let role = resolve_skill_role(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &[SessionWorkspace::local("repo", "")],
+            &discover_raw(&workspace_id, &["repo"]),
             "repo/context-inspector",
         )
         .expect("role resolves");
@@ -678,8 +643,7 @@ mod tests {
         let role = resolve_skill_role(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &[SessionWorkspace::local("repo", "")],
+            &discover_raw(&workspace_id, &["repo"]),
             "worker",
         )
         .expect("role resolves");
@@ -713,8 +677,7 @@ mod tests {
         let error = resolve_skill_role(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &[SessionWorkspace::local("repo", "")],
+            &discover_raw(&workspace_id, &["repo"]),
             "repo/worker",
         )
         .expect_err("workspace-scoped role should not fall back to builtin");
@@ -744,18 +707,15 @@ mod tests {
         };
         let loaded = std::collections::BTreeSet::new();
 
-        let result = load_skill_output_with_home(
+        let runtime_raw = discover_raw_with_home(&workspace_id, &[], &home);
+        let result = load_skill_result(
             &workspace_id,
             &workspace_id,
-            &workspace_id,
-            &[],
+            &runtime_raw,
             &loaded,
             &call,
-            Some(&home),
             PromptProfile::Parent,
-        )
-        .expect("loads global skill");
-        let result = ToolResultMessage::success(call.id.clone(), "LoadSkill", result);
+        );
         assert_eq!(result.status, agent_vocab::ToolResultStatus::Success);
         let output: Value = serde_json::from_str(&result.output).expect("json output");
         assert_eq!(output["name"], "global");
@@ -764,6 +724,66 @@ mod tests {
         assert!(!result.output.contains("<base_dir>"));
 
         std::fs::remove_dir_all(workspace_id).ok();
+    }
+
+    /// Reproduce what the runtime returns for a temp workspace tree: every
+    /// `<workspace_id>/<dir>/.agents/skills/<name>/SKILL.md`.
+    fn discover_raw(workspace_id: &Path, workspace_dirs: &[&str]) -> Vec<RawSkillFile> {
+        let mut files = Vec::new();
+        for dir in workspace_dirs {
+            collect_raw(
+                &workspace_id.join(dir).join(".agents/skills"),
+                Some(dir),
+                &mut files,
+            );
+        }
+        files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        files
+    }
+
+    /// Like `discover_raw` but also includes the runtime host's global
+    /// `<home>/.agents/skills` as `None`-workspace (home) skills.
+    fn discover_raw_with_home(
+        workspace_id: &Path,
+        workspace_dirs: &[&str],
+        home: &Path,
+    ) -> Vec<RawSkillFile> {
+        let mut files = Vec::new();
+        collect_raw(&home.join(".agents/skills"), None, &mut files);
+        for dir in workspace_dirs {
+            collect_raw(
+                &workspace_id.join(dir).join(".agents/skills"),
+                Some(dir),
+                &mut files,
+            );
+        }
+        files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        files
+    }
+
+    fn collect_raw(skills_dir: &Path, workspace: Option<&str>, files: &mut Vec<RawSkillFile>) {
+        let Ok(entries) = std::fs::read_dir(skills_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(entry.path().join("SKILL.md")) else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let rel_path = match workspace {
+                Some(workspace) => format!("{workspace}/.agents/skills/{name}/SKILL.md"),
+                None => format!("~/.agents/skills/{name}/SKILL.md"),
+            };
+            files.push(RawSkillFile {
+                workspace: workspace.map(str::to_string),
+                rel_path,
+                contents,
+            });
+        }
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {

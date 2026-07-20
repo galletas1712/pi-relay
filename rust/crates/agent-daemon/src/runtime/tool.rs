@@ -72,15 +72,36 @@ pub(super) async fn run_tool_turn(
         }
     } else if tool_call.tool_name == "LoadSkill" {
         let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
-        load_skill_result(
-            &state.prompt_root,
-            &state.config_root,
-            &tool_context.cwd,
-            &dispatch.config.workspaces,
-            &loaded_skills,
-            &tool_call,
-            effective_prompt_profile(&state, &dispatch.config, &session_id).await?,
-        )
+        let profile = effective_prompt_profile(&state, &dispatch.config, &session_id).await?;
+        let workspace_dirs = dispatch
+            .config
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.workspace_dir.clone())
+            .collect::<Vec<_>>();
+        match state
+            .runtime_hosts
+            .read_runtime_skills(
+                &dispatch.config.runtime_id,
+                &dispatch.config.workspace_id,
+                &workspace_dirs,
+            )
+            .await
+        {
+            Ok(runtime_raw) => load_skill_result(
+                &state.prompt_root,
+                &state.config_root,
+                &runtime_raw,
+                &loaded_skills,
+                &tool_call,
+                profile,
+            ),
+            Err(error) => ToolResultMessage::error(
+                tool_call.id.clone(),
+                tool_call.tool_name.clone(),
+                format!("failed to read runtime skills: {error:#}"),
+            ),
+        }
     } else if is_web_tool_name(&tool_call.tool_name) {
         run_web_tool(
             &state,

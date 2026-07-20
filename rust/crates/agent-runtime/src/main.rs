@@ -224,6 +224,36 @@ impl Runtime {
                 let result = self.tools.execute(provider, &tool_call, &context).await?;
                 Ok(RuntimeCommandResult::Tool { result })
             }
+            RuntimeCommand::WriteWorkspaceFile {
+                workspace_id,
+                rel_path,
+                contents,
+            } => {
+                self.workspaces
+                    .write_workspace_file(&workspace_id, &rel_path, &contents)
+                    .await?;
+                Ok(RuntimeCommandResult::Ack)
+            }
+            RuntimeCommand::ReadWorkspaceFile {
+                workspace_id,
+                rel_path,
+            } => {
+                let contents = self
+                    .workspaces
+                    .read_workspace_file(&workspace_id, &rel_path)
+                    .await?;
+                Ok(RuntimeCommandResult::FileContents { contents })
+            }
+            RuntimeCommand::ReadRuntimeSkills {
+                workspace_id,
+                workspace_dirs,
+            } => {
+                let files = self
+                    .workspaces
+                    .read_runtime_skills(&workspace_id, &workspace_dirs)
+                    .await?;
+                Ok(RuntimeCommandResult::RuntimeSkills { files })
+            }
         }
     }
 }
