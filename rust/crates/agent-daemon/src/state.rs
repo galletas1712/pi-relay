@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use crate::config::DaemonConfig;
 use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
+use crate::runtime_hosts::RuntimeRegistry;
 use crate::types::RuntimeSession;
-use crate::workspaces::WorkspaceManager;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskRegistrationId(Uuid);
@@ -51,7 +51,7 @@ pub(crate) struct AppState {
     pub(crate) mcp: Arc<McpManager>,
     pub(crate) provider_connections: ProviderConnectionRegistry,
     pub(crate) session_titles: SessionTitleScheduler,
-    pub(crate) workspaces: WorkspaceManager,
+    pub(crate) runtime_hosts: RuntimeRegistry,
     pub(crate) prompt_root: PathBuf,
     pub(crate) config_root: PathBuf,
     pub(crate) daemon_config: DaemonConfig,

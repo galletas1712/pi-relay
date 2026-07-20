@@ -51,7 +51,13 @@ async fn ordinary_tool_dispatch_claims_starts_and_completes_exactly_once() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "ordinary tool claim", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "ordinary tool claim",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let marker = env.cwd.path().join("ordinary-tool-runs");
@@ -163,7 +169,13 @@ async fn history_switch_and_fork_rpc_reject_running_delegation_identically() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "history delegation guard", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "history delegation guard",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -246,7 +258,13 @@ async fn proactive_compaction_blocks_pending_selected_mcp_action_without_model_e
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "proactive pending compaction", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "proactive pending compaction",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "proactive_pending_selected_mcp";
@@ -387,7 +405,7 @@ async fn public_rpc_mcp_selection_is_fenced_frozen_and_inherited() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "public RPC MCP", &[], json!({}))
+        .create_project(project_id, "runtime-test", "public RPC MCP", &[], json!({}))
         .await
         .expect("create project");
     let provider = json!({
@@ -542,7 +560,7 @@ async fn public_rpc_mcp_selection_is_fenced_frozen_and_inherited() {
         .expect("rendered prompt")
         .to_string();
     let selected_section = prompt
-        .split("### Selected MCP tools")
+        .split("### MCP")
         .nth(1)
         .and_then(|section| section.split("\n## ").next())
         .expect("selected MCP section exists");
@@ -755,7 +773,13 @@ async fn harness_post_compaction_boot_recovery_keeps_legacy_session_mcp_free() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "legacy harness MCP recovery", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "legacy harness MCP recovery",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "legacy_harness_post_compaction";
@@ -837,12 +861,13 @@ use crate::provider_runtime::{
 use crate::runtime::{
     apply_model_response, recover_post_compaction_dispatches_on_boot, take_tasks, SessionDriver,
 };
+use crate::runtime_hosts::test_support::{connect_test_runtime, TEST_RUNTIME_ID};
+use crate::runtime_hosts::RuntimeRegistry;
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart,
 };
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
 use crate::types::{DispatchAction, RuntimeSession};
-use crate::workspaces::WorkspaceManager;
 
 use super::{
     complete_delegation_if_ready, publish_next_partial_after_parent_decision,
@@ -898,7 +923,7 @@ impl TestEnv {
         }
     }
 
-    fn outer_cwd(&self) -> String {
+    fn workspace_id(&self) -> String {
         self.cwd.path().to_string_lossy().into_owned()
     }
 }
@@ -930,8 +955,11 @@ async fn test_env() -> Option<TestEnv> {
     let state_dir = TempDir::new("state");
     let cwd = TempDir::new("cwd");
     let (events, _rx) = broadcast::channel(1024);
+    let repo = Arc::new(store);
+    let runtime_hosts = RuntimeRegistry::new(repo.clone());
+    connect_test_runtime(&runtime_hosts, TEST_RUNTIME_ID).await;
     let state = AppState {
-        repo: Arc::new(store),
+        repo,
         active: Arc::new(Mutex::new(HashMap::new())),
         session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
         tasks: Arc::new(StdMutex::new(HashMap::new())),
@@ -945,8 +973,8 @@ async fn test_env() -> Option<TestEnv> {
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         mcp: agent_mcp::McpManager::disabled(),
         provider_connections: ProviderConnectionRegistry::new(),
-        session_titles: SessionTitleScheduler::default(),
-        workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
+        session_titles: SessionTitleScheduler::disabled(),
+        runtime_hosts,
         prompt_root: cwd.path().to_path_buf(),
         config_root: cwd.path().to_path_buf(),
         daemon_config: crate::config::DaemonConfig::default(),
@@ -1017,14 +1045,17 @@ fn database_url_with_name(base: &str, name: &str) -> String {
     format!("{root}/{name}{query}")
 }
 
-fn test_app_state(
+async fn test_app_state(
     store: PostgresAgentStore,
-    state_dir: &TempDir,
+    _state_dir: &TempDir,
     prompt_root: PathBuf,
 ) -> AppState {
     let (events, _rx) = broadcast::channel(1024);
+    let repo = Arc::new(store);
+    let runtime_hosts = RuntimeRegistry::new(repo.clone());
+    connect_test_runtime(&runtime_hosts, TEST_RUNTIME_ID).await;
     AppState {
-        repo: Arc::new(store),
+        repo,
         active: Arc::new(Mutex::new(HashMap::new())),
         session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
         tasks: Arc::new(StdMutex::new(HashMap::new())),
@@ -1038,8 +1069,8 @@ fn test_app_state(
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         mcp: agent_mcp::McpManager::disabled(),
         provider_connections: ProviderConnectionRegistry::new(),
-        session_titles: SessionTitleScheduler::default(),
-        workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
+        session_titles: SessionTitleScheduler::disabled(),
+        runtime_hosts,
         config_root: prompt_root.clone(),
         prompt_root,
         daemon_config: crate::config::DaemonConfig::default(),
@@ -1120,7 +1151,8 @@ async fn remove_compaction_metadata_fault(pool: &sqlx::PgPool) {
 fn session_config(env: &TestEnv, project_id: Uuid, metadata: serde_json::Value) -> SessionConfig {
     SessionConfig {
         project_id: Some(project_id),
-        outer_cwd: env.outer_cwd(),
+        runtime_id: "runtime-test".to_string(),
+        workspace_id: env.workspace_id(),
         workspaces: Vec::new(),
         system_prompt: String::new(),
         provider: ProviderConfig {
@@ -1197,7 +1229,13 @@ async fn nonempty_dispatch_uses_session_fallback_for_legacy_null_route() {
     let session_id = "legacy-null-dispatch";
     env.state
         .repo
-        .create_project(project_id, "legacy null dispatch", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "legacy null dispatch",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let entries = vec![
@@ -1274,7 +1312,7 @@ async fn provider_retry_keeps_recovered_route_after_default_changes() {
     let session_id = "retry-route";
     env.state
         .repo
-        .create_project(project_id, "retry route", &[], json!({}))
+        .create_project(project_id, "runtime-test", "retry route", &[], json!({}))
         .await
         .expect("create project");
     let entries = vec![
@@ -1447,7 +1485,13 @@ async fn create_active_leaf_test_session(
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "active leaf persistence test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "active leaf persistence test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create active-leaf test project");
     let config = session_config(env, project_id, json!({}));
@@ -1727,7 +1771,13 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "post-compaction boot recovery", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "post-compaction boot recovery",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "post_compaction_boot_recovery";
@@ -1796,10 +1846,13 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
         .await
         .expect("restart opens a new store");
     restarted_store.migrate().await.expect("restart migrates");
-    let restarted_state_dir = TempDir::new("restart-state");
+    let _restarted_state_dir = TempDir::new("restart-state");
     let (events, _rx) = broadcast::channel(1024);
+    let repo = Arc::new(restarted_store);
+    let runtime_hosts = RuntimeRegistry::new(repo.clone());
+    connect_test_runtime(&runtime_hosts, TEST_RUNTIME_ID).await;
     let restarted_state = AppState {
-        repo: Arc::new(restarted_store),
+        repo,
         active: Arc::new(Mutex::new(HashMap::new())),
         session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
         tasks: Arc::new(StdMutex::new(HashMap::new())),
@@ -1813,8 +1866,8 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         mcp: agent_mcp::McpManager::disabled(),
         provider_connections: ProviderConnectionRegistry::new(),
-        session_titles: SessionTitleScheduler::default(),
-        workspaces: WorkspaceManager::for_tests(restarted_state_dir.path().to_path_buf()),
+        session_titles: SessionTitleScheduler::disabled(),
+        runtime_hosts,
         prompt_root: env.cwd.path().to_path_buf(),
         config_root: env.cwd.path().to_path_buf(),
         daemon_config: crate::config::DaemonConfig::default(),
@@ -2029,7 +2082,13 @@ async fn overlapping_boot_recovery_claims_one_runner_across_independent_states()
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "overlapping boot recovery", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "overlapping boot recovery",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "overlapping_post_compaction_boot_recovery";
@@ -2067,8 +2126,8 @@ async fn overlapping_boot_recovery_claims_one_runner_across_independent_states()
         .expect("second daemon store connects");
     let state_dir_a = TempDir::new("overlap-a");
     let state_dir_b = TempDir::new("overlap-b");
-    let state_a = test_app_state(store_a, &state_dir_a, env.cwd.path().to_path_buf());
-    let state_b = test_app_state(store_b, &state_dir_b, env.cwd.path().to_path_buf());
+    let state_a = test_app_state(store_a, &state_dir_a, env.cwd.path().to_path_buf()).await;
+    let state_b = test_app_state(store_b, &state_dir_b, env.cwd.path().to_path_buf()).await;
     state_a
         .repo
         .mark_all_unfinished_actions_stale()
@@ -2156,7 +2215,13 @@ async fn lost_lease_runner_exit_rearms_recovery_without_process_restart() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "same-process lease recovery", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "same-process lease recovery",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "same_process_post_compaction_recovery";
@@ -2226,7 +2291,13 @@ async fn heartbeat_loss_after_terminal_commit_still_registers_persisted_successo
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "heartbeat terminal handoff", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "heartbeat terminal handoff",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "heartbeat_terminal_handoff";
@@ -2318,7 +2389,13 @@ async fn unknown_model_explicit_auto_recovers_overflow_across_heartbeat_loss() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "heartbeat compaction handoff", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "heartbeat compaction handoff",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "heartbeat_compaction_handoff";
@@ -2391,7 +2468,13 @@ async fn shutdown_rejects_recovery_runner_between_claim_and_register() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "shutdown recovery registration", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "shutdown recovery registration",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "shutdown_recovery_registration";
@@ -2490,6 +2573,7 @@ async fn shutdown_rejects_successor_runner_from_existing_task() {
         .repo
         .create_project(
             project_id,
+            "runtime-test",
             "shutdown successor registration",
             &[],
             json!({}),
@@ -2584,7 +2668,13 @@ async fn watchdog_retries_after_transient_recovery_database_error() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "transient recovery error", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "transient recovery error",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "transient_post_compaction_recovery_error";
@@ -2662,7 +2752,13 @@ async fn watchdog_retries_transient_per_intent_claim_failure_without_compensatio
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "transient intent load failure", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "transient intent load failure",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "transient_intent_load_failure";
@@ -2733,7 +2829,13 @@ async fn stale_corruption_compensation_cannot_fail_newer_generation() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "stale corruption fence", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "stale corruption fence",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let session_id = "stale_corruption_fence";
@@ -2858,6 +2960,7 @@ async fn corrupt_post_compaction_dispatch_is_terminally_observable_on_boot() {
         .repo
         .create_project(
             project_id,
+            "runtime-test",
             "corrupt post-compaction boot recovery",
             &[],
             json!({}),
@@ -2951,7 +3054,13 @@ async fn immediate_post_compaction_overflow_never_strands_blocked_model_action()
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "post-compaction overflow", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "post-compaction overflow",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
 
@@ -3323,7 +3432,13 @@ async fn unexpected_ordinary_turn_stops_discard_partial_content_and_replay() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "unexpected ordinary stops", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "unexpected ordinary stops",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
@@ -3546,7 +3661,13 @@ async fn follow_up_to_idle_session_is_durably_queued_before_drive() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "durable follow-up test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "durable follow-up test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     env.state
@@ -3622,7 +3743,13 @@ async fn exact_child_interrupt_and_combined_control_preserve_parent_and_sibling_
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "exact child control test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "exact child control test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -3813,7 +3940,13 @@ async fn interrupt_only_replay_never_interrupts_newer_generation_or_queues_text(
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "durable interrupt-only", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "durable interrupt-only",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "interrupt_parent").await;
@@ -4082,7 +4215,13 @@ async fn parent_control_task_aborted_after_commit_is_reconciled_by_detached_chil
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "detached combined control", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "detached combined control",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -4220,6 +4359,7 @@ async fn restart_from_interrupt_applied_phase_does_not_repeat_interrupt() {
         .repo
         .create_project(
             project_id,
+            "runtime-test",
             "combined control crash recovery",
             &[],
             json!({}),
@@ -4403,7 +4543,13 @@ async fn combined_control_interrupts_complete_parallel_tool_generation_once() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "parallel control generation", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "parallel control generation",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parallel_parent").await;
@@ -4988,7 +5134,13 @@ async fn tools_list_filters_delegation_tools_for_subagent_session() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "tools list profile test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "tools list profile test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -5060,6 +5212,7 @@ async fn structural_subagent_stays_subagent_profile_after_session_configure() {
         .repo
         .create_project(
             project_id,
+            "runtime-test",
             "subagent configure profile test",
             &[],
             json!({}),
@@ -5444,7 +5597,13 @@ async fn parent_model_context_does_not_inject_current_delegations() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "delegation context test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "delegation context test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -5563,7 +5722,13 @@ async fn configure_and_rename_refresh_non_provider_state_without_retargeting_act
     let session_id = "active-route-refresh";
     env.state
         .repo
-        .create_project(project_id, "active route refresh", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "active route refresh",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     let original = session_config(&env, project_id, json!({ "title": "Before" }));
@@ -5630,7 +5795,13 @@ async fn subagent_model_context_does_not_get_parent_delegation_summary() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "subagent context test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "subagent context test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -5702,7 +5873,13 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "parent compaction ledger test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "parent compaction ledger test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -5973,6 +6150,7 @@ async fn subagent_compaction_excludes_parent_delegation_ledger_and_sibling_state
         .repo
         .create_project(
             project_id,
+            "runtime-test",
             "subagent compaction ledger test",
             &[],
             json!({}),
@@ -6078,7 +6256,13 @@ async fn parent_compaction_ledger_bounds_large_fanout_subagents() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "delegation context bound test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "delegation context bound test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -6153,7 +6337,13 @@ async fn parent_compaction_ledger_marks_failed_transcripts_unavailable() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "failed delegation context test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "failed delegation context test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -6211,7 +6401,7 @@ async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "steer test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "steer test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -6297,7 +6487,13 @@ async fn raw_session_input_steer_rejects_direct_subagent_target() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "raw steer rejection", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "raw steer rejection",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -6344,7 +6540,13 @@ async fn websocket_delegation_steer_subagent_uses_parent_scope() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "websocket steer test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "websocket steer test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -6398,7 +6600,13 @@ async fn model_and_websocket_steers_share_one_durable_subagent_mailbox() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "shared steer mailbox test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "shared steer mailbox test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -6479,6 +6687,7 @@ async fn model_facing_delegation_tools_reject_subagent_sessions() {
         .repo
         .create_project(
             project_id,
+            "runtime-test",
             "subagent delegation tool rejection",
             &[],
             json!({}),
@@ -6521,7 +6730,7 @@ async fn model_facing_steer_subagent_queues_steer_for_running_read_only_subagent
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "steer test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "steer test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -6590,7 +6799,13 @@ async fn running_read_only_snapshot_reports_steerable_only_when_accepted() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "steerable snapshot test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "steerable snapshot test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -6690,7 +6905,13 @@ async fn queued_work_on_boundary_subagent_reports_running_and_steerable() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "queued boundary snapshot test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "queued boundary snapshot test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -6777,7 +6998,13 @@ async fn boundary_controls_settle_without_double_boundary_and_keep_mailbox_live(
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "boundary control matrix", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "boundary control matrix",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -7002,7 +7229,13 @@ async fn aborted_ready_steer_tool_future_is_recovered_by_live_control_sweep() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "ready steer live recovery", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "ready steer live recovery",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -7152,7 +7385,13 @@ async fn interrupt_only_status_reload_failure_returns_accepted_fallback() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "interrupt accepted fallback", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "interrupt accepted fallback",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -7215,7 +7454,7 @@ async fn steer_subagent_rejects_idle_terminal_subagent_without_reactivating_it()
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "steer test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "steer test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -7314,7 +7553,7 @@ async fn steer_subagent_rejects_terminal_or_cancelled_delegations() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "steer test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "steer test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -7394,7 +7633,13 @@ async fn terminal_historical_control_replays_without_recovering_child() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "terminal control replay", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "terminal control replay",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -7476,7 +7721,7 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "cancel test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "cancel test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -7667,115 +7912,6 @@ async fn cancel_delegation_returns_transcript_only_paths() {
 }
 
 #[tokio::test]
-async fn readonly_delegation_snapshot_waits_for_parent_cwd_guard() {
-    let Some(env) = test_env().await else {
-        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    std::fs::copy(source_root.join("PI.md"), env.cwd.path().join("PI.md"))
-        .expect("copy PI template");
-    let role_dir = env.cwd.path().join("subagent-roles/implementer");
-    std::fs::create_dir_all(&role_dir).expect("create role dir");
-    std::fs::copy(
-        source_root.join("subagent-roles/implementer/SKILL.md"),
-        role_dir.join("SKILL.md"),
-    )
-    .expect("copy implementer role");
-    let project_id = Uuid::new_v4();
-    env.state
-        .repo
-        .create_project(project_id, "readonly snapshot guard", &[], json!({}))
-        .await
-        .expect("create project");
-    let (outer_cwd, workspaces) = env
-        .state
-        .workspaces
-        .materialize_session(project_id, "parent", &[], &[])
-        .await
-        .expect("materialize parent cwd");
-    std::fs::write(PathBuf::from(&outer_cwd).join("guarded.txt"), "stable")
-        .expect("write parent file");
-    let mut config = session_config(&env, project_id, json!({ "harness": true }));
-    config.outer_cwd = outer_cwd.clone();
-    config.workspaces = workspaces;
-    env.state
-        .repo
-        .start_session_outputs(
-            "parent",
-            &config,
-            &[],
-            None,
-            &[],
-            &[],
-            InputPriority::FollowUp,
-            &UserMessage::text("go"),
-            None,
-        )
-        .await
-        .expect("create parent");
-
-    let held = env
-        .state
-        .workspaces
-        .acquire_cwd_mutation_guard(&outer_cwd)
-        .await;
-    let state = env.state.clone();
-    let mut start = tokio::spawn(async move {
-        crate::delegation_tools::start_readonly_fanout_core(
-            &state,
-            "parent",
-            json!({ "tasks": [{ "role": "implementer", "prompt": "inspect" }] }),
-        )
-        .await
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            if env
-                .state
-                .repo
-                .parent_has_running_delegation("parent")
-                .await
-                .expect("running delegation check")
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("delegation reaches guarded snapshot");
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(20), &mut start)
-            .await
-            .is_err()
-    );
-
-    drop(held);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), start)
-        .await
-        .expect("snapshot resumes after guard release")
-        .expect("spawn task joins")
-        .expect("read-only delegation starts");
-    let child_id = result["subagent_session_ids"][0]
-        .as_str()
-        .expect("child session id");
-    let child_config = env
-        .state
-        .repo
-        .load_session_config(child_id)
-        .await
-        .expect("child config loads");
-    assert_eq!(
-        std::fs::read_to_string(PathBuf::from(child_config.outer_cwd).join("guarded.txt"))
-            .expect("child snapshot file"),
-        "stable"
-    );
-
-    env.cleanup().await;
-}
-
-#[tokio::test]
 async fn cancel_delegation_does_not_clobber_completed_delegation_or_write_artifacts() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -7784,7 +7920,13 @@ async fn cancel_delegation_does_not_clobber_completed_delegation_or_write_artifa
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "cancel race test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "cancel race test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -7857,7 +7999,13 @@ async fn terminal_subagent_wakes_parent_before_fanout_barrier_and_allows_scoped_
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "partial wakeup test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "partial wakeup test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -7998,7 +8146,13 @@ async fn partial_wakeup_waits_until_expected_fanout_members_have_spawned() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "partial spawn wakeup test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "partial spawn wakeup test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -8072,7 +8226,13 @@ async fn partial_wakeup_queues_only_one_terminal_child_per_parent_decision_point
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "partial wakeup queue test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "partial wakeup queue test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -8179,7 +8339,13 @@ async fn final_completion_cancels_stale_queued_partial_wakeup() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "partial completion race test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "partial completion race test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -8277,7 +8443,13 @@ async fn consumed_partial_wakeup_triggers_next_already_terminal_sibling() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "partial next sibling test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "partial next sibling test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -8389,7 +8561,13 @@ async fn boot_sweep_repairs_partial_subagent_wakeup_for_still_running_delegation
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "partial boot repair test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "partial boot repair test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -8460,7 +8638,13 @@ async fn cancelling_after_partial_wakeup_preserves_completed_child_handoff_only(
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "partial cancel test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "partial cancel test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -8568,7 +8752,7 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "barrier test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -8762,7 +8946,13 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "inspect refresh test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "inspect refresh test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -8927,6 +9117,7 @@ async fn delegation_list_treats_empty_active_branch_as_terminal_non_failed() {
         .repo
         .create_project(
             project_id,
+            "runtime-test",
             "delegation empty child list test",
             &[],
             json!({}),
@@ -9020,7 +9211,13 @@ async fn failed_delegation_does_not_publish_normal_handoff_on_inspect_or_read() 
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "failed inspect test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "failed inspect test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -9079,7 +9276,13 @@ async fn completion_loser_after_cancellation_does_not_write_normal_handoff() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "completion cancel race test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "completion cancel race test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -9154,7 +9357,13 @@ async fn missing_task_metadata_omits_task_prompt_handoff_metadata() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "missing task prompt test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "missing task prompt test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -9214,6 +9423,7 @@ async fn read_task_prompt_validates_subagent_segment_before_refreshing_artifact(
         .repo
         .create_project(
             project_id,
+            "runtime-test",
             "task prompt path validation test",
             &[],
             json!({}),
@@ -9271,7 +9481,7 @@ async fn out_of_set_outcome_is_recorded_verbatim() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "barrier test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -9313,7 +9523,7 @@ async fn stale_attempt_id_cannot_finish_delegation() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "barrier test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -9394,7 +9604,7 @@ async fn boot_sweep_completes_a_crash_mid_barrier_delegation_exactly_once() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "barrier test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -9456,7 +9666,7 @@ async fn one_delegation_per_parent_is_rejected() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "guard test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "guard test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -9488,7 +9698,7 @@ async fn subagent_cannot_start_a_nested_delegation() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "guard test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "guard test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -9539,6 +9749,7 @@ async fn spawn_failure_leaves_no_running_delegation() {
             "parent",
             &SessionConfig {
                 project_id: None,
+                runtime_id: "runtime-test".to_string(),
                 ..session_config(&env, Uuid::new_v4(), json!({ "created_by": "test" }))
             },
             &[],
@@ -9747,7 +9958,7 @@ async fn partial_spawn_does_not_complete_delegation() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "barrier test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -9839,7 +10050,7 @@ async fn boot_repair_publishes_handoff_and_wakeup_observation_after_finish_claim
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "barrier test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -9985,7 +10196,7 @@ async fn boot_sweep_does_not_complete_mid_turn_subagent() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "barrier test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -10050,7 +10261,7 @@ async fn terminal_delegation_member_yields_zero_parent_idle_rows() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "barrier test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -10112,7 +10323,13 @@ async fn raw_session_input_steer_to_any_subagent_is_rejected_server_side() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "steer guard test", &[], json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "steer guard test",
+            &[],
+            json!({}),
+        )
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -10212,7 +10429,7 @@ async fn dispatch_failure_for_delegation_member_emits_no_parent_idle() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "barrier test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
@@ -10263,7 +10480,7 @@ async fn two_siblings_wake_parent_exactly_once_via_live_seam() {
     let project_id = Uuid::new_v4();
     env.state
         .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
+        .create_project(project_id, "runtime-test", "barrier test", &[], json!({}))
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;

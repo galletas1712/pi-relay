@@ -1455,7 +1455,8 @@ function snapshot(
 	return {
 		session_id: sessionId,
 		project_id: "project_1",
-		outer_cwd: "/repo",
+		runtime_id: "runtime-test",
+	workspace_id: "workspace-test",
 		workspaces: [],
 		activity: "idle",
 		active_leaf_id: "activeLeafId" in options ? options.activeLeafId ?? null : entries.at(-1)?.id ?? null,

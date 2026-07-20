@@ -15,6 +15,13 @@ export interface ProviderConfig {
 	prompt_cache?: Record<string, unknown>;
 }
 
+export interface Runtime {
+	runtime_id: string;
+	name: string;
+	online: boolean;
+	last_seen_at: string | null;
+}
+
 export interface HistoryTarget {
 	entry_id: string;
 	target_leaf_id: string | null;
@@ -54,7 +61,8 @@ export interface SessionSummary {
 	parent_session_id?: string | null;
 	delegation_id?: string | null;
 	subagent_type?: SubagentType | null;
-	outer_cwd: string;
+	runtime_id: string;
+	workspace_id: string;
 	workspaces: SessionWorkspace[];
 	activity: Activity;
 	active_leaf_id: string | null;
@@ -102,7 +110,8 @@ export interface SessionSnapshot {
 	parent_session_id?: string | null;
 	delegation_id?: string | null;
 	subagent_type?: SubagentType | null;
-	outer_cwd: string;
+	runtime_id: string;
+	workspace_id: string;
 	workspaces: SessionWorkspace[];
 	activity: Activity;
 	active_leaf_id: string | null;
@@ -127,6 +136,7 @@ export interface SystemPromptResponse {
 
 export interface Project {
 	project_id: string;
+	runtime_id?: string;
 	name: string;
 	workspaces: ProjectWorkspace[];
 	metadata: Record<string, unknown>;

@@ -63,7 +63,8 @@ function snapshot(): SessionSnapshot {
 	return {
 		session_id: "parent-1",
 		project_id: null,
-		outer_cwd: "/workspace",
+		runtime_id: "runtime-test",
+	workspace_id: "workspace-test",
 		workspaces: [],
 		activity: "idle",
 		active_leaf_id: null,
@@ -272,7 +273,8 @@ describe("Sidebar session list loading states", () => {
 		const session: SessionSummary = {
 			session_id: "session-1",
 			project_id: project.project_id,
-			outer_cwd: "/workspace",
+			runtime_id: "runtime-test",
+	workspace_id: "workspace-test",
 			workspaces: [],
 			activity: "idle",
 			active_leaf_id: "leaf-123",
@@ -426,7 +428,8 @@ describe("SessionRow sidebar delegating state", () => {
 		return {
 			session_id: "parent-1",
 			project_id: null,
-			outer_cwd: "/workspace",
+			runtime_id: "runtime-test",
+	workspace_id: "workspace-test",
 			workspaces: [],
 			activity: "idle",
 			active_leaf_id: null,

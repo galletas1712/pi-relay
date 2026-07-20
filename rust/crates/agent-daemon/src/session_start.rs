@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_mcp::McpSessionSelection;
@@ -21,7 +20,7 @@ use crate::runtime::{
 };
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
-use crate::workspaces::{RequestedWorkspace, WorkspaceSelection};
+use crate::workspace_selection::{RequestedWorkspace, WorkspaceSelection};
 
 pub(crate) async fn session_start(
     state: &AppState,
@@ -39,8 +38,12 @@ pub(crate) async fn session_start(
     if state.repo.session_exists(&session_id).await? {
         let current = state.repo.load_session_config(&session_id).await?;
         state
-            .workspaces
-            .ensure_session(&session_id, &current.outer_cwd, &current.workspaces)
+            .runtime_hosts
+            .ensure_for_runtime(
+                &current.runtime_id,
+                &current.workspace_id,
+                &current.workspaces,
+            )
             .await?;
         return Ok(json!({
             "session_id": session_id,
@@ -72,7 +75,7 @@ pub(crate) async fn session_start(
     } else {
         None
     };
-    let (outer_cwd, workspaces) = if let Some(project_id) = project_id {
+    let (runtime_id, workspace_id, workspaces) = if let Some(project_id) = project_id {
         let project = state.repo.get_project(project_id).await?;
         let selection = WorkspaceSelection::from_requested(
             params
@@ -82,19 +85,31 @@ pub(crate) async fn session_start(
         let selected = selection
             .resolve(&project.workspaces)
             .map_err(|error| RpcError::new("invalid_params", error.to_string()))?;
-        state
-            .workspaces
-            .materialize_session(project_id, &session_id, &project.workspaces, &selected)
-            .await?
+        let (workspace_id, workspaces) = state
+            .runtime_hosts
+            .materialize_session(
+                &project.runtime_id,
+                project_id,
+                &project.workspaces,
+                &selected,
+            )
+            .await?;
+        (project.runtime_id, workspace_id, workspaces)
     } else {
-        let cwd = home_dir_for_ephemeral_session()?
-            .to_string_lossy()
-            .into_owned();
-        (cwd, Vec::new())
+        let runtime_id = params
+            .runtime_id
+            .ok_or_else(|| RpcError::new("runtime_required", "host sessions require runtime_id"))?;
+        state.runtime_hosts.require_available(&runtime_id).await?;
+        let (workspace_id, workspaces) = state
+            .runtime_hosts
+            .materialize_session(&runtime_id, Uuid::nil(), &[], &[])
+            .await?;
+        (runtime_id, workspace_id, workspaces)
     };
     let mut config = SessionConfig {
         project_id,
-        outer_cwd,
+        runtime_id,
+        workspace_id,
         workspaces,
         system_prompt: String::new(),
         provider: select_parent_provider(
@@ -104,7 +119,7 @@ pub(crate) async fn session_start(
         metadata: parent_session_metadata(params.metadata.unwrap_or_else(|| json!({}))),
         mcp_manifest,
     };
-    config.system_prompt = render_pi_prompt(state, &config)?;
+    config.system_prompt = render_pi_prompt(state, &config).await?;
 
     let started = start_prepared_session_with_driver(
         state,
@@ -203,8 +218,12 @@ async fn start_prepared_session_with_driver(
     if state.repo.session_exists(&session_id).await? {
         let current = state.repo.load_session_config(&session_id).await?;
         state
-            .workspaces
-            .ensure_session(&session_id, &current.outer_cwd, &current.workspaces)
+            .runtime_hosts
+            .ensure_for_runtime(
+                &current.runtime_id,
+                &current.workspace_id,
+                &current.workspaces,
+            )
             .await?;
         return Ok(StartedSession {
             session_id: session_id.clone(),
@@ -216,8 +235,8 @@ async fn start_prepared_session_with_driver(
     }
 
     state
-        .workspaces
-        .ensure_session(&session_id, &config.outer_cwd, &config.workspaces)
+        .runtime_hosts
+        .ensure_for_runtime(&config.runtime_id, &config.workspace_id, &config.workspaces)
         .await?;
 
     let mut session = AgentSession::new();
@@ -288,6 +307,7 @@ async fn start_prepared_session_with_driver(
 struct StartSessionParams {
     session_id: Option<String>,
     project_id: Option<Uuid>,
+    runtime_id: Option<String>,
     provider: Option<ProviderConfig>,
     metadata: Option<Value>,
     client_input_id: Option<String>,
@@ -318,23 +338,6 @@ impl From<StartSessionWorkspace> for RequestedWorkspace {
             branch,
         }
     }
-}
-
-fn home_dir_for_ephemeral_session() -> std::result::Result<PathBuf, RpcError> {
-    let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) else {
-        return Err(RpcError::new(
-            "home_unavailable",
-            "HOME is required for ephemeral sessions",
-        ));
-    };
-    let home = PathBuf::from(home);
-    if !home.is_dir() {
-        return Err(RpcError::new(
-            "home_unavailable",
-            format!("HOME is not a directory: {}", home.display()),
-        ));
-    }
-    Ok(home)
 }
 
 #[cfg(test)]

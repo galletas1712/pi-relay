@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 pub(crate) fn project(project: Project) -> Value {
     json!({
         "project_id": project.project_id,
+        "runtime_id": project.runtime_id,
         "name": project.name,
         "workspaces": project.workspaces,
         "metadata": project.metadata,
@@ -37,7 +38,8 @@ pub(crate) fn session_summary(summary: SessionSummary) -> Value {
         "session_id": summary.session_id,
         "project_id": summary.project_id,
         "parent_session_id": summary.parent_session_id,
-        "outer_cwd": summary.outer_cwd,
+        "runtime_id": summary.runtime_id,
+        "workspace_id": summary.workspace_id,
         "workspaces": summary.workspaces,
         "activity": summary.activity,
         "active_leaf_id": summary.active_leaf_id,
@@ -77,7 +79,8 @@ pub(crate) fn session_snapshot(
         "session_id": snapshot.session_id,
         "project_id": snapshot.project_id,
         "parent_session_id": snapshot.parent_session_id,
-        "outer_cwd": snapshot.outer_cwd,
+        "runtime_id": snapshot.runtime_id,
+        "workspace_id": snapshot.workspace_id,
         "workspaces": snapshot.workspaces,
         "activity": snapshot.activity,
         "active_leaf_id": snapshot.active_leaf_id,

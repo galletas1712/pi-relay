@@ -463,7 +463,7 @@ mod tests {
             TEST_PI_MD,
             &ctx(PromptProfile::Parent, vec!["Bash"], Vec::new()),
         );
-        assert!(!empty.contains("Selected MCP tools"));
+        assert!(!empty.contains("### MCP"));
 
         let mut selected = ctx(PromptProfile::Parent, vec!["Bash"], Vec::new());
         selected.mcp_servers = vec![PromptMcpServer {
@@ -474,10 +474,10 @@ mod tests {
             ],
         }];
         let rendered = render_prompt(TEST_PI_MD, &selected);
-        assert!(rendered.contains("### Selected MCP tools"));
+        assert!(rendered.contains("### MCP"));
         assert!(rendered.contains("- workspace: `mcp__workspace__read`, `mcp__workspace__search`"));
         let mcp_section = rendered
-            .split_once("### Selected MCP tools")
+            .split_once("### MCP")
             .expect("selected MCP heading")
             .1
             .split_once("## Subagent delegation")

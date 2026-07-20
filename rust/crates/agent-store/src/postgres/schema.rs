@@ -9,7 +9,7 @@ use sqlx::PgPool;
 /// - `sessions`: one row per durable session, including active transcript leaf
 ///   and the rendered system prompt. Sessions snapshot the project workspace
 ///   source metadata; project sessions get their own private workspace
-///   directories under `outer_cwd`.
+///   directories addressed by their runtime-scoped `workspace_id`.
 /// - `daemon_config`: reserved daemon key-value config.
 /// - `transcript_entries`: append-only transcript forest. `parent_id` points
 ///   within the same session, while `sequence` preserves insertion order.
@@ -23,6 +23,7 @@ use sqlx::PgPool;
 const SCHEMA_SQL: &str = r#"
 create table if not exists projects (
     id uuid primary key,
+    runtime_id text not null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     name text not null,
@@ -30,10 +31,19 @@ create table if not exists projects (
     metadata jsonb not null default '{}'::jsonb
 );
 
+create table if not exists runtimes (
+    id text primary key,
+    name text not null,
+    last_seen_at timestamptz null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
 create table if not exists sessions (
     id text primary key,
     project_id uuid null references projects(id),
-    outer_cwd text not null,
+    runtime_id text not null,
+    workspace_id text not null,
     workspaces jsonb not null default '[]'::jsonb,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),

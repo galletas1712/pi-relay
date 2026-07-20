@@ -2,6 +2,7 @@
 
 mod postgres;
 
+pub use agent_runtime_protocol::{ProjectWorkspace, SessionWorkspace, WorkspaceKind};
 use std::{fmt, time::Duration};
 
 use agent_session::{
@@ -143,7 +144,8 @@ pub struct McpSessionManifestBinding {
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub project_id: Option<Uuid>,
-    pub outer_cwd: String,
+    pub runtime_id: String,
+    pub workspace_id: String,
     pub workspaces: Vec<SessionWorkspace>,
     pub system_prompt: String,
     pub provider: ProviderConfig,
@@ -186,105 +188,10 @@ impl PartialEq for ProviderRouteSnapshot {
 
 impl Eq for ProviderRouteSnapshot {}
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceKind {
-    #[default]
-    Git,
-    Local,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProjectWorkspace {
-    #[serde(default)]
-    pub kind: WorkspaceKind,
-    pub workspace_dir: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_path: Option<String>,
-}
-
-impl ProjectWorkspace {
-    pub fn git(
-        workspace_dir: impl Into<String>,
-        remote_url: impl Into<String>,
-        remote_branch: impl Into<String>,
-    ) -> Self {
-        Self {
-            kind: WorkspaceKind::Git,
-            workspace_dir: workspace_dir.into(),
-            remote_url: Some(remote_url.into()),
-            remote_branch: Some(remote_branch.into()),
-            source_path: None,
-        }
-    }
-
-    pub fn local(workspace_dir: impl Into<String>, source_path: impl Into<String>) -> Self {
-        Self {
-            kind: WorkspaceKind::Local,
-            workspace_dir: workspace_dir.into(),
-            remote_url: None,
-            remote_branch: None,
-            source_path: Some(source_path.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionWorkspace {
-    #[serde(default)]
-    pub kind: WorkspaceKind,
-    pub workspace_dir: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_sha: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_branch: Option<String>,
-}
-
-impl SessionWorkspace {
-    pub fn git(
-        workspace_dir: impl Into<String>,
-        remote_url: impl Into<String>,
-        remote_branch: impl Into<String>,
-        base_sha: impl Into<String>,
-        local_branch: impl Into<String>,
-    ) -> Self {
-        Self {
-            kind: WorkspaceKind::Git,
-            workspace_dir: workspace_dir.into(),
-            remote_url: Some(remote_url.into()),
-            remote_branch: Some(remote_branch.into()),
-            source_path: None,
-            base_sha: Some(base_sha.into()),
-            local_branch: Some(local_branch.into()),
-        }
-    }
-
-    pub fn local(workspace_dir: impl Into<String>, source_path: impl Into<String>) -> Self {
-        Self {
-            kind: WorkspaceKind::Local,
-            workspace_dir: workspace_dir.into(),
-            remote_url: None,
-            remote_branch: None,
-            source_path: Some(source_path.into()),
-            base_sha: None,
-            local_branch: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Project {
     pub project_id: Uuid,
+    pub runtime_id: String,
     pub name: String,
     pub workspaces: Vec<ProjectWorkspace>,
     pub metadata: Value,
@@ -590,7 +497,8 @@ pub struct SessionSummary {
     pub session_id: String,
     pub project_id: Option<Uuid>,
     pub parent_session_id: Option<String>,
-    pub outer_cwd: String,
+    pub runtime_id: String,
+    pub workspace_id: String,
     pub workspaces: Vec<SessionWorkspace>,
     pub activity: SessionActivity,
     pub active_leaf_id: Option<String>,
@@ -731,7 +639,8 @@ pub struct SessionSnapshot {
     pub session_id: String,
     pub project_id: Option<Uuid>,
     pub parent_session_id: Option<String>,
-    pub outer_cwd: String,
+    pub runtime_id: String,
+    pub workspace_id: String,
     pub workspaces: Vec<SessionWorkspace>,
     pub activity: SessionActivity,
     pub active_leaf_id: Option<String>,

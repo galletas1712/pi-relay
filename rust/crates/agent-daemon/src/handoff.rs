@@ -3,7 +3,7 @@
 //! On the delegation barrier, for every subagent (success or failure) the daemon
 //! renders two files from the durable Postgres transcript — `final_message.md`
 //! and an exhaustive, greppable `transcript.md` — under
-//! `<parent.outer_cwd>/.pi-handoff/<delegation_id>/`. `inspect_delegation` is the
+//! `<parent.workspace_id>/.pi-handoff/<delegation_id>/`. `inspect_delegation` is the
 //! structured control-flow snapshot; the files remain transcript/detail
 //! artifacts only. Postgres transcript history is the durable source of truth:
 //! these artifact files are derived from `active_branch` (Ui body mode) and can
@@ -16,7 +16,7 @@
 //! repair may re-render the same files for already-completed delegations if the
 //! daemon crashed after the status CAS but before publication.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use agent_store::{Delegation, DelegationStatus, HistoryTree};
 use agent_vocab::{
@@ -234,15 +234,14 @@ pub(crate) struct SubagentArtifact {
     pub(crate) session_id: String,
     pub(crate) terminal_status: Option<&'static str>,
     pub(crate) outcome: Option<String>,
-    pub(crate) final_message_path: Option<PathBuf>,
-    pub(crate) task_prompt_path: Option<PathBuf>,
+    pub(crate) has_final_message: bool,
+    pub(crate) has_task_prompt: bool,
 }
 
 impl SubagentArtifact {
     pub(crate) fn final_message_rel(&self) -> Option<String> {
-        self.final_message_path
-            .as_ref()
-            .map(|_| format!("{}/final_message.md", self.session_id))
+        self.has_final_message
+            .then(|| format!("{}/final_message.md", self.session_id))
     }
 
     pub(crate) fn transcript_rel(&self) -> String {
@@ -250,15 +249,9 @@ impl SubagentArtifact {
     }
 
     pub(crate) fn task_prompt_rel(&self) -> Option<String> {
-        self.task_prompt_path
-            .as_ref()
-            .map(|_| task_prompt_rel(&self.session_id))
+        self.has_task_prompt
+            .then(|| task_prompt_rel(&self.session_id))
     }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct TaskPromptArtifact {
-    pub(crate) path: PathBuf,
 }
 
 pub(crate) fn task_prompt_rel(session_id: &str) -> String {
@@ -292,45 +285,51 @@ pub(crate) fn safe_handoff_path_segment(
 }
 
 pub(crate) async fn refresh_task_prompt_artifact(
-    delegation_dir: &Path,
+    state: &AppState,
+    runtime_id: &str,
+    workspace_id: &str,
+    delegation_rel_dir: &str,
     session_id: &str,
     task: &str,
-) -> std::result::Result<TaskPromptArtifact, RpcError> {
+) -> std::result::Result<(), RpcError> {
     let session_segment = safe_handoff_path_segment(session_id, "subagent_id")?;
-    let subagent_dir = delegation_dir.join(session_segment);
-    tokio::fs::create_dir_all(&subagent_dir)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let path = subagent_dir.join(TASK_PROMPT_FILE);
-    tokio::fs::write(&path, task.as_bytes())
-        .await
-        .map_err(anyhow::Error::from)?;
-    Ok(TaskPromptArtifact { path })
+    let rel_path = format!("{delegation_rel_dir}/{session_segment}/{TASK_PROMPT_FILE}");
+    state
+        .runtime_hosts
+        .write_workspace_file(runtime_id, workspace_id, &rel_path, task)
+        .await?;
+    Ok(())
 }
 
 pub(crate) async fn refresh_task_prompt_artifact_if_present(
-    delegation_dir: &Path,
+    state: &AppState,
+    runtime_id: &str,
+    workspace_id: &str,
+    delegation_rel_dir: &str,
     session_id: &str,
     task: Option<&str>,
-) -> std::result::Result<Option<TaskPromptArtifact>, RpcError> {
+) -> std::result::Result<bool, RpcError> {
     safe_handoff_path_segment(session_id, "subagent_id")?;
-    let Some(task) = task else {
-        return Ok(None);
+    let Some(task) = task.filter(|task| !task.trim().is_empty()) else {
+        return Ok(false);
     };
-    if task.trim().is_empty() {
-        return Ok(None);
-    }
-    refresh_task_prompt_artifact(delegation_dir, session_id, task)
-        .await
-        .map(Some)
+    refresh_task_prompt_artifact(
+        state,
+        runtime_id,
+        workspace_id,
+        delegation_rel_dir,
+        session_id,
+        task,
+    )
+    .await?;
+    Ok(true)
 }
 
-pub(crate) fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
-    handoff_root(parent_outer_cwd).join(delegation_id)
-}
-
-pub(crate) fn handoff_root(parent_outer_cwd: &str) -> PathBuf {
-    Path::new(parent_outer_cwd).join(HANDOFF_DIR)
+/// The cwd-relative directory (on the session's runtime) that holds a
+/// delegation's handoff artifacts: `.pi-handoff/<delegation_id>`. It is
+/// relative to the session cwd so runtime-side file tools can read it.
+pub(crate) fn delegation_dir(delegation_id: &str) -> String {
+    format!("{HANDOFF_DIR}/{delegation_id}")
 }
 
 /// Refresh per-subagent handoff artifacts from durable Postgres transcripts.
@@ -348,12 +347,14 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
     state: &AppState,
     delegation: &Delegation,
     include_final_messages: bool,
-) -> std::result::Result<(PathBuf, Vec<SubagentArtifact>), RpcError> {
+) -> std::result::Result<(String, Vec<SubagentArtifact>), RpcError> {
     let parent_config = state
         .repo
         .load_session_config(&delegation.parent_session_id)
         .await?;
-    let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+    let runtime_id = parent_config.runtime_id.as_str();
+    let workspace_id = parent_config.workspace_id.as_str();
+    let dir = delegation_dir(&delegation.id);
 
     if matches!(
         delegation.status,
@@ -363,10 +364,6 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
     }
 
     let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
-
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(anyhow::Error::from)?;
 
     let mut artifacts = Vec::with_capacity(subagents.len());
     for subagent in &subagents {
@@ -386,37 +383,43 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
             DelegationStatus::Cancelled | DelegationStatus::Failed => false,
         };
 
-        let subagent_dir = dir.join(&subagent.session_id);
-        tokio::fs::create_dir_all(&subagent_dir)
-            .await
-            .map_err(anyhow::Error::from)?;
-        let task_prompt = refresh_task_prompt_artifact_if_present(
+        let has_task_prompt = refresh_task_prompt_artifact_if_present(
+            state,
+            runtime_id,
+            workspace_id,
             &dir,
             &subagent.session_id,
             subagent.task.as_deref(),
         )
         .await?;
         let should_write_final_message = include_final_messages && include_final_content;
-        let final_message_path = if should_write_final_message {
-            let path = subagent_dir.join("final_message.md");
-            tokio::fs::write(&path, final_message.as_bytes())
-                .await
-                .map_err(anyhow::Error::from)?;
-            Some(path)
-        } else {
-            None
-        };
-        let transcript_path = subagent_dir.join("transcript.md");
-        tokio::fs::write(&transcript_path, transcript.as_bytes())
-            .await
-            .map_err(anyhow::Error::from)?;
+        if should_write_final_message {
+            state
+                .runtime_hosts
+                .write_workspace_file(
+                    runtime_id,
+                    workspace_id,
+                    &format!("{dir}/{}/final_message.md", subagent.session_id),
+                    &final_message,
+                )
+                .await?;
+        }
+        state
+            .runtime_hosts
+            .write_workspace_file(
+                runtime_id,
+                workspace_id,
+                &format!("{dir}/{}/transcript.md", subagent.session_id),
+                &transcript,
+            )
+            .await?;
 
         artifacts.push(SubagentArtifact {
             session_id: subagent.session_id.clone(),
             terminal_status: is_terminal.then_some(status).flatten(),
             outcome: include_final_content.then_some(outcome).flatten(),
-            final_message_path,
-            task_prompt_path: task_prompt.as_ref().map(|artifact| artifact.path.clone()),
+            has_final_message: should_write_final_message,
+            has_task_prompt,
         });
     }
 

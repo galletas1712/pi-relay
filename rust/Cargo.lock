@@ -17,6 +17,7 @@ dependencies = [
  "agent-mcp",
  "agent-prompt",
  "agent-provider",
+ "agent-runtime-protocol",
  "agent-session",
  "agent-store",
  "agent-tools",
@@ -27,7 +28,6 @@ dependencies = [
  "cap-std",
  "futures-util",
  "pretty_assertions",
- "reflink-copy",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -95,6 +95,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "agent-runtime-protocol",
+ "agent-tools",
+ "agent-vocab",
+ "anyhow",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "uuid",
+]
+
+[[package]]
+name = "agent-runtime-protocol"
+version = "0.1.0"
+dependencies = [
+ "agent-vocab",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "agent-session"
 version = "0.1.0"
 dependencies = [
@@ -110,6 +137,7 @@ name = "agent-store"
 version = "0.1.0"
 dependencies = [
  "agent-mcp",
+ "agent-runtime-protocol",
  "agent-session",
  "agent-tools",
  "agent-vocab",
@@ -1791,18 +1819,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4666a1a60d8412eab19d94f6d13dcc9cea0a5ef4fdf6a5db306537413c661b1b"
 dependencies = [
  "bitflags",
-]
-
-[[package]]
-name = "reflink-copy"
-version = "0.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13362233b147e57674c37b802d216b7c5e3dcccbed8967c84f0d8d223868ae27"
-dependencies = [
- "cfg-if",
- "libc",
- "rustix",
- "windows",
 ]
 
 [[package]]

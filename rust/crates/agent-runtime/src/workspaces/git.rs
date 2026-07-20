@@ -69,7 +69,7 @@ pub(super) async fn fetch_session_branch_head(workspace: &Path, branch: &str) ->
     git_output(workspace, ["rev-parse", &origin_ref]).await
 }
 
-pub(crate) async fn validate_remote_branch(remote_url: &str, remote_branch: &str) -> Result<()> {
+pub async fn validate_remote_branch(remote_url: &str, remote_branch: &str) -> Result<()> {
     let remote_url = remote_url.trim();
     let remote_branch = remote_branch.trim();
     if remote_url.is_empty() {

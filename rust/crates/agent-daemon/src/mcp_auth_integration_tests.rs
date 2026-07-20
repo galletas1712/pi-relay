@@ -11,8 +11,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
+use crate::runtime_hosts::test_support::{connect_test_runtime, TEST_RUNTIME_ID};
+use crate::runtime_hosts::RuntimeRegistry;
 use crate::state::AppState;
-use crate::workspaces::WorkspaceManager;
 
 #[tokio::test]
 async fn public_rpc_oauth_lifecycle_is_sanitized_and_manifest_neutral() {
@@ -239,8 +240,11 @@ async fn test_state() -> Option<(AppState, String, String, String, PathBuf)> {
     let state_dir = std::env::temp_dir().join(&database_name);
     std::fs::create_dir_all(&state_dir).expect("create state directory");
     let (events, _) = broadcast::channel(16);
+    let repo = Arc::new(store);
+    let runtime_hosts = RuntimeRegistry::new(repo.clone());
+    connect_test_runtime(&runtime_hosts, TEST_RUNTIME_ID).await;
     let state = AppState {
-        repo: Arc::new(store),
+        repo,
         active: Arc::new(Mutex::new(HashMap::new())),
         session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
         tasks: Arc::new(StdMutex::new(HashMap::new())),
@@ -254,8 +258,8 @@ async fn test_state() -> Option<(AppState, String, String, String, PathBuf)> {
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         mcp: agent_mcp::McpManager::disabled(),
         provider_connections: ProviderConnectionRegistry::new(),
-        session_titles: SessionTitleScheduler::default(),
-        workspaces: WorkspaceManager::for_tests(state_dir.clone()),
+        session_titles: SessionTitleScheduler::disabled(),
+        runtime_hosts,
         prompt_root: state_dir.clone(),
         config_root: state_dir.clone(),
         daemon_config: crate::config::DaemonConfig::default(),

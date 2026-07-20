@@ -51,7 +51,8 @@ function snapshot(): SessionSnapshot {
 	return {
 		session_id: "parent-1",
 		project_id: null,
-		outer_cwd: "/workspace",
+		runtime_id: "runtime-test",
+	workspace_id: "workspace-test",
 		workspaces: [],
 		activity: "idle",
 		active_leaf_id: null,

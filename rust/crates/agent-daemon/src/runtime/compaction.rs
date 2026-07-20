@@ -572,8 +572,8 @@ async fn install_runtime_compaction_checkpoint(
     let mut config = state.repo.load_session_config(session_id).await?;
     route.apply_to(&mut config);
     state
-        .workspaces
-        .ensure_session(session_id, &config.outer_cwd, &config.workspaces)
+        .runtime_hosts
+        .ensure_session(session_id, &config.workspace_id, &config.workspaces)
         .await?;
     let mut session = AgentSession::from_stored_session_preserving_open_turn(stored)
         .map_err(history_error_to_rpc)?;

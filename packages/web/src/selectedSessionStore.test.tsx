@@ -25,7 +25,8 @@ function snapshot(sessionId: string, title: string): SessionSnapshot {
 	return {
 		session_id: sessionId,
 		project_id: null,
-		outer_cwd: "/workspace",
+		runtime_id: "runtime-test",
+	workspace_id: "workspace-test",
 		workspaces: [],
 		activity: "idle",
 		active_leaf_id: null,

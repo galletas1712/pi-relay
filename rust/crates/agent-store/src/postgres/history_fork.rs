@@ -27,16 +27,17 @@ impl PostgresAgentStore {
         sqlx::query(
             r#"
             insert into sessions (
-                id, project_id, outer_cwd, workspaces, active_leaf_id,
+                id, project_id, runtime_id, workspace_id, workspaces, active_leaf_id,
                 system_prompt, provider_config, metadata, mcp_manifest_fingerprint,
                 session_revision, transcript_revision
             )
-            values ($1, $2, $3, $4, $5::text, $6, $7, $8, $9::text, 1, 1)
+            values ($1, $2, $3, $4, $5, $6::text, $7, $8, $9, $10::text, 1, 1)
             "#,
         )
         .bind(child_session_id)
         .bind(config.project_id)
-        .bind(&config.outer_cwd)
+        .bind(&config.runtime_id)
+        .bind(&config.workspace_id)
         .bind(serde_json::to_value(&config.workspaces)?)
         .bind(target.leaf_id)
         .bind(&config.system_prompt)

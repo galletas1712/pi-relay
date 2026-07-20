@@ -33,7 +33,8 @@ afterEach(() => {
 const session: SessionSummary = {
 	session_id: "session-1",
 	project_id: null,
-	outer_cwd: "/workspace",
+	runtime_id: "runtime-test",
+	workspace_id: "workspace-test",
 	workspaces: [],
 	activity: "idle",
 	active_leaf_id: null,
@@ -48,6 +49,7 @@ function gitProjectState(mode: "create" | "edit" = "create"): ProjectDialogState
 		mode,
 		projectId: mode === "edit" ? "project-1" : undefined,
 		name: mode === "edit" ? "Existing project" : "",
+		runtimeId: "runtime-test",
 		workspaces: [
 			{
 				kind: "git",
@@ -400,6 +402,9 @@ function ProjectHarness({
 	return (
 		<ProjectDialog
 			state={state}
+			runtimes={[
+				{ runtime_id: "runtime-test", name: "Test runtime", online: true, last_seen_at: null },
+			]}
 			onChange={(patch) => setState((current) => ({ ...current, ...patch }))}
 			onClose={onClose}
 			onSubmit={() => {

@@ -18,6 +18,7 @@ use uuid::Uuid;
 const DAEMON_CONFIG_FILE: &str = "config.toml";
 const MCP_CONFIG_FILE: &str = "mcp.toml";
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
+const DEFAULT_RUNTIME_BIND: &str = "127.0.0.1:8786";
 const BOOTSTRAP_MARKER: &str = ".bootstrap-v1";
 const BOOTSTRAP_STAGING_PREFIX: &str = ".bootstrap-staging-";
 
@@ -25,6 +26,8 @@ const BOOTSTRAP_STAGING_PREFIX: &str = ".bootstrap-staging-";
 pub(crate) struct Config {
     pub(crate) database_url: String,
     pub(crate) bind: String,
+    pub(crate) runtime_bind: String,
+    pub(crate) state_root: PathBuf,
     pub(crate) mcp_config: Option<PathBuf>,
     pub(crate) config_root: PathBuf,
     pub(crate) daemon_config: DaemonConfig,
@@ -82,6 +85,11 @@ impl Config {
         }
 
         let config_root = config_root_from_env(xdg_config_home.as_deref(), home.as_deref())?;
+        let state_root = home
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is required"))?
+            .join(".local/state/pi-relay");
         let policy = load_daemon_config(&config_root.join(DAEMON_CONFIG_FILE))?;
         let mcp_path = config_root.join(MCP_CONFIG_FILE);
         let mcp_config = mcp_path.is_file().then_some(mcp_path);
@@ -89,6 +97,8 @@ impl Config {
         Ok(Self {
             database_url: policy.database_url,
             bind: policy.bind,
+            runtime_bind: policy.runtime_bind,
+            state_root,
             mcp_config,
             config_root,
             daemon_config: policy.daemon_config,
@@ -147,6 +157,8 @@ struct DaemonConfigFile {
     #[serde(default)]
     bind: Option<String>,
     #[serde(default)]
+    runtime_bind: Option<String>,
+    #[serde(default)]
     default_parent_model: Option<StrictProviderConfig>,
     #[serde(default)]
     subagent_models: BTreeMap<String, StrictProviderConfig>,
@@ -156,6 +168,7 @@ struct DaemonConfigFile {
 struct DaemonStartupPolicy {
     database_url: String,
     bind: String,
+    runtime_bind: String,
     daemon_config: DaemonConfig,
 }
 
@@ -187,6 +200,12 @@ impl TryFrom<DaemonConfigFile> for DaemonStartupPolicy {
         if bind.trim().is_empty() {
             return Err(anyhow!("bind must not be blank"));
         }
+        let runtime_bind = value
+            .runtime_bind
+            .unwrap_or_else(|| DEFAULT_RUNTIME_BIND.to_string());
+        if runtime_bind.trim().is_empty() {
+            return Err(anyhow!("runtime_bind must not be blank"));
+        }
 
         let default_parent_model = match value.default_parent_model {
             Some(provider) => {
@@ -203,6 +222,7 @@ impl TryFrom<DaemonConfigFile> for DaemonStartupPolicy {
         Ok(Self {
             database_url,
             bind,
+            runtime_bind,
             daemon_config: DaemonConfig {
                 default_parent_model,
                 subagent_models,
@@ -253,6 +273,7 @@ enum BootstrapWrite {
     Marker,
 }
 
+#[cfg(test)]
 fn bootstrap_catalog_with_hook(
     prompt_root: &Path,
     config_root: &Path,
@@ -1307,10 +1328,7 @@ command = "manual"
             &mut |write| {
                 if write == BootstrapWrite::Asset && !failed {
                     failed = true;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "injected asset staging failure",
-                    ));
+                    return Err(std::io::Error::other("injected asset staging failure"));
                 }
                 Ok(())
             },
@@ -1355,10 +1373,7 @@ command = "manual"
             &mut |write| {
                 if write == BootstrapWrite::Marker && !failed {
                     failed = true;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "injected marker staging failure",
-                    ));
+                    return Err(std::io::Error::other("injected marker staging failure"));
                 }
                 Ok(())
             },

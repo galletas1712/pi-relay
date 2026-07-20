@@ -86,7 +86,8 @@ fn empty_binding() -> McpSessionManifestBinding {
 fn config(binding: Option<McpSessionManifestBinding>) -> SessionConfig {
     SessionConfig {
         project_id: None,
-        outer_cwd: "/tmp".to_string(),
+        runtime_id: "runtime-test".to_string(),
+        workspace_id: "/tmp".to_string(),
         workspaces: Vec::new(),
         system_prompt: "prompt".to_string(),
         provider: ProviderConfig {

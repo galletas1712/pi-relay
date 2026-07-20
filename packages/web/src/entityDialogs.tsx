@@ -14,7 +14,7 @@ import {
 } from "./dialog.tsx";
 import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { sessionTitle, type SessionListItem } from "./sessionList.ts";
-import type { ProjectWorkspace } from "./types.ts";
+import type { ProjectWorkspace, Runtime } from "./types.ts";
 
 export type WorkspaceDraft =
 	| {
@@ -41,6 +41,7 @@ export type ProjectDialogState = {
 	mode: "create" | "edit";
 	projectId?: string;
 	name: string;
+	runtimeId?: string;
 	workspaces: WorkspaceDraft[];
 	saving: boolean;
 };
@@ -279,6 +280,7 @@ export function ProjectDialog({
 	onSubmit,
 	mutationBlockedReason,
 	returnFocusFallbackRef,
+	runtimes = [],
 }: {
 	state: ProjectDialogState;
 	onChange: (patch: Partial<ProjectDialogState>) => void;
@@ -286,6 +288,7 @@ export function ProjectDialog({
 	onSubmit: () => void | Promise<void>;
 	mutationBlockedReason?: string | null;
 	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
+	runtimes?: Runtime[];
 }) {
 	const inputRef = useRef<HTMLInputElement>(null);
 	const submitRef = useRef<HTMLButtonElement>(null);
@@ -339,6 +342,22 @@ export function ProjectDialog({
 							required
 							disabled={busy}
 						/>
+					</label>
+					<label className="rename-field">
+						<span>Runtime</span>
+						<select
+							value={state.runtimeId ?? ""}
+							onChange={(event) => onChange({ runtimeId: event.target.value })}
+							required
+							disabled={busy || state.mode === "edit"}
+						>
+							<option value="">Select a runtime</option>
+							{runtimes.map((runtime) => (
+								<option key={runtime.runtime_id} value={runtime.runtime_id} disabled={!runtime.online}>
+									{runtime.name} ({runtime.runtime_id}){runtime.online ? "" : " — offline"}
+								</option>
+							))}
+						</select>
 					</label>
 					<div className="workspace-editor">
 						<div className="workspace-editor-head">

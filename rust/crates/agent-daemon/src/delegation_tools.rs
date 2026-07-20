@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use agent_core::AgentInput;
 use agent_store::{
     Delegation, DelegationKind, DelegationProgress, DelegationStatus, DelegationSubagent,
@@ -13,9 +11,8 @@ use serde_json::{json, Value};
 use crate::codec::from_params;
 use crate::delegation_snapshot::{build_delegation_snapshot, progress_view};
 use crate::handoff::{
-    delegation_dir, handoff_root, refresh_delegation_handoff_artifacts,
-    refresh_task_prompt_artifact_if_present, render_transcript_markdown, safe_handoff_path_segment,
-    task_prompt_rel, TASK_PROMPT_FILE,
+    delegation_dir, refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
+    render_transcript_markdown, safe_handoff_path_segment, task_prompt_rel, TASK_PROMPT_FILE,
 };
 use crate::runtime::{abort_session_tasks, publish_events, SessionDriver};
 use crate::state::AppState;
@@ -770,7 +767,7 @@ async fn cancel_subagent_without_reactivation(
     state.active.lock().await.remove(session_id);
     if subagent_type == Some(SubagentType::ReadOnly) {
         if let Err(error) = state
-            .workspaces
+            .runtime_hosts
             .destroy_session_workspaces(session_id)
             .await
         {
@@ -1010,28 +1007,29 @@ async fn write_cancelled_subagent_transcripts(
         .load_session_config(&delegation.parent_session_id)
         .await?;
     let delegation_segment = safe_path_segment(&delegation.id, "delegation_id")?;
-    let handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation_segment);
-    let dir = handoff_dir.join("cancelled");
+    let handoff_dir = delegation_dir(&delegation_segment);
     let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
     let mut transcript_refs = Vec::with_capacity(subagents.len());
     for subagent in &subagents {
         let subagent_segment = safe_path_segment(&subagent.session_id, "subagent_id")?;
         let history = state.repo.active_branch(&subagent.session_id).await?;
         let transcript = render_transcript_markdown(&history);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(anyhow::Error::from)?;
         let transcript_file = format!("cancelled/{subagent_segment}.transcript.md");
-        let path = dir.join(format!("{subagent_segment}.transcript.md"));
-        tokio::fs::write(&path, transcript.as_bytes())
-            .await
-            .map_err(anyhow::Error::from)?;
+        state
+            .runtime_hosts
+            .write_workspace_file(
+                &parent_config.runtime_id,
+                &parent_config.workspace_id,
+                &format!("{handoff_dir}/{transcript_file}"),
+                &transcript,
+            )
+            .await?;
         transcript_refs.push(json!({
             "subagent_id": subagent.session_id,
             "transcript_file": transcript_file,
         }));
     }
-    Ok((handoff_dir.to_string_lossy().into_owned(), transcript_refs))
+    Ok((handoff_dir, transcript_refs))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1220,32 +1218,32 @@ fn safe_path_segment(segment: &str, field: &str) -> std::result::Result<String, 
 }
 
 /// Resolve a handoff file request to an absolute path strictly under
-/// `<parent_outer_cwd>/.pi-handoff/<delegation_id>/`. The request was already
+/// `<parent_workspace_id>/.pi-handoff/<delegation_id>/`. The request was already
 /// parsed into a closed vocabulary; every dynamic segment (`delegation_id` and
 /// `subagent_id`) is validated as a single safe path component, so the result
 /// can never traverse out of the handoff subtree.
 fn resolve_handoff_file_path(
-    parent_outer_cwd: &str,
     delegation_id: &str,
     request: HandoffFileRequest<'_>,
-) -> std::result::Result<PathBuf, RpcError> {
+) -> std::result::Result<String, RpcError> {
     let delegation_segment = safe_path_segment(delegation_id, "delegation_id")?;
-    let mut path = delegation_dir(parent_outer_cwd, &delegation_segment);
-    match request {
+    let dir = delegation_dir(&delegation_segment);
+    let rel = match request {
         HandoffFileRequest::Normal { subagent_id, file } => {
-            path.push(safe_path_segment(subagent_id, "subagent_id")?);
             // `file` is already constrained to the known literals above.
-            path.push(file);
+            format!(
+                "{dir}/{}/{file}",
+                safe_path_segment(subagent_id, "subagent_id")?
+            )
         }
         HandoffFileRequest::CancelledTranscript { subagent_id } => {
-            path.push("cancelled");
-            path.push(format!(
-                "{}.transcript.md",
+            format!(
+                "{dir}/cancelled/{}.transcript.md",
                 safe_path_segment(subagent_id, "subagent_id")?
-            ));
+            )
         }
-    }
-    Ok(path)
+    };
+    Ok(rel)
 }
 
 /// Read one handoff file for product inspection. The web client cannot read
@@ -1278,7 +1276,7 @@ pub(crate) async fn read_handoff_file_core(
             }
         ) {
             let parent_config = state.repo.load_session_config(parent_session_id).await?;
-            let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+            let dir = delegation_dir(&delegation.id);
             let subagent_id = request.subagent_id();
             let member = members
                 .iter()
@@ -1289,10 +1287,16 @@ pub(crate) async fn read_handoff_file_core(
                         "subagent does not belong to this delegation",
                     )
                 })?;
-            let task_prompt =
-                refresh_task_prompt_artifact_if_present(&dir, subagent_id, member.task.as_deref())
-                    .await?;
-            if task_prompt.is_none() {
+            let has_task_prompt = refresh_task_prompt_artifact_if_present(
+                state,
+                &parent_config.runtime_id,
+                &parent_config.workspace_id,
+                &dir,
+                subagent_id,
+                member.task.as_deref(),
+            )
+            .await?;
+            if !has_task_prompt {
                 return Err(RpcError::new(
                     "handoff_file_not_found",
                     "task prompt is unavailable for this subagent",
@@ -1328,70 +1332,23 @@ pub(crate) async fn read_handoff_file_core(
         return Err(unavailable_handoff_file_error(delegation.status));
     }
     let parent_config = state.repo.load_session_config(parent_session_id).await?;
-    let path = resolve_handoff_file_path(&parent_config.outer_cwd, &delegation.id, request)?;
-    // Defense in depth: confine the symlink-resolved target under the parent's
-    // handoff dir so a symlink planted inside it cannot escape to an arbitrary
-    // host file. Segment validation above already blocks `..`/abs paths.
-    let handoff_root_path = handoff_root(&parent_config.outer_cwd);
-    let canonical = match tokio::fs::canonicalize(&path).await {
-        Ok(canonical) => canonical,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(RpcError::new(
+    let rel_path = resolve_handoff_file_path(&delegation.id, request)?;
+    // Traversal is prevented by the segment validation above plus the runtime's
+    // own workspace-relative path check; the file lives on the session's runtime.
+    let content = state
+        .runtime_hosts
+        .read_workspace_file(
+            &parent_config.runtime_id,
+            &parent_config.workspace_id,
+            &rel_path,
+        )
+        .await?
+        .ok_or_else(|| {
+            RpcError::new(
                 "handoff_file_not_found",
                 "handoff file not found; the delegation may not have finished yet",
-            ))
-        }
-        Err(error) => {
-            // Never leak the absolute host handoff path to the client.
-            eprintln!(
-                "failed to resolve handoff file {}: {error:#}",
-                path.display()
-            );
-            return Err(RpcError::new(
-                "handoff_file_read_failed",
-                "failed to read handoff file",
-            ));
-        }
-    };
-    let canonical_root = match tokio::fs::canonicalize(&handoff_root_path).await {
-        Ok(root) => root,
-        Err(error) => {
-            eprintln!(
-                "failed to resolve handoff root {}: {error:#}",
-                handoff_root_path.display()
-            );
-            return Err(RpcError::new(
-                "handoff_file_read_failed",
-                "failed to read handoff file",
-            ));
-        }
-    };
-    if !canonical.starts_with(&canonical_root) {
-        return Err(RpcError::new(
-            "invalid_params",
-            "resolved handoff path escapes the handoff directory",
-        ));
-    }
-    let content = match tokio::fs::read_to_string(&canonical).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(RpcError::new(
-                "handoff_file_not_found",
-                "handoff file not found; the delegation may not have finished yet",
-            ))
-        }
-        Err(error) => {
-            // Never leak the absolute host handoff path to the client.
-            eprintln!(
-                "failed to read handoff file {}: {error:#}",
-                canonical.display()
-            );
-            return Err(RpcError::new(
-                "handoff_file_read_failed",
-                "failed to read handoff file",
-            ));
-        }
-    };
+            )
+        })?;
     Ok(json!({
         "delegation_id": delegation.id,
         "subagent_id": request.subagent_id(),
@@ -1672,11 +1629,7 @@ pub(crate) async fn run_delegation_tool(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
-
-    const CWD: &str = "/home/u/.local/state/pi-relay/sessions/parent/cwd";
 
     #[test]
     fn delegation_tool_interception_accepts_only_canonical_names() {
@@ -1768,7 +1721,6 @@ mod tests {
     #[test]
     fn resolves_subagent_file_under_subagent_dir() {
         let path = resolve_handoff_file_path(
-            CWD,
             "delegation-1",
             HandoffFileRequest::Normal {
                 subagent_id: "child-9",
@@ -1776,27 +1728,16 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            path,
-            Path::new(CWD)
-                .join(".pi-handoff")
-                .join("delegation-1")
-                .join("child-9")
-                .join("final_message.md")
-        );
+        assert_eq!(path, ".pi-handoff/delegation-1/child-9/final_message.md");
     }
 
     #[test]
     fn resolves_cancelled_transcript_under_cancelled_dir() {
         let request = parse_handoff_file_request(None, "cancelled/child-9.transcript.md").unwrap();
-        let path = resolve_handoff_file_path(CWD, "delegation-1", request).unwrap();
+        let path = resolve_handoff_file_path("delegation-1", request).unwrap();
         assert_eq!(
             path,
-            Path::new(CWD)
-                .join(".pi-handoff")
-                .join("delegation-1")
-                .join("cancelled")
-                .join("child-9.transcript.md")
+            ".pi-handoff/delegation-1/cancelled/child-9.transcript.md"
         );
     }
 
@@ -1816,7 +1757,6 @@ mod tests {
     fn rejects_traversal_in_delegation_id() {
         for evil in ["..", "../other", "a/b", "/etc", "delegation/../..", "."] {
             let error = resolve_handoff_file_path(
-                CWD,
                 evil,
                 HandoffFileRequest::Normal {
                     subagent_id: "child",
@@ -1835,7 +1775,6 @@ mod tests {
     fn rejects_traversal_in_subagent_id() {
         for evil in ["..", "../x", "a/b", "/abs"] {
             let error = resolve_handoff_file_path(
-                CWD,
                 "delegation-1",
                 HandoffFileRequest::Normal {
                     subagent_id: evil,

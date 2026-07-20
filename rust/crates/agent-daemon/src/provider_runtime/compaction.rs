@@ -315,7 +315,7 @@ pub(crate) async fn native_compaction_request(
     let compaction_instructions = if config.provider.kind == ProviderKind::Claude {
         Some(format!(
             "{}\n\nDo not call any tools while writing this summary. Respond with summary text only.",
-            render_pi_compaction_prompt(state, config)?
+            render_pi_compaction_prompt(state, config).await?
         ))
     } else {
         None
@@ -370,7 +370,8 @@ mod tests {
     fn test_config(kind: ProviderKind, model: &str, metadata: Value) -> SessionConfig {
         SessionConfig {
             project_id: None,
-            outer_cwd: "/tmp".to_string(),
+            runtime_id: "runtime-test".to_string(),
+            workspace_id: "/tmp".to_string(),
             workspaces: Vec::new(),
             system_prompt: "test prompt".to_string(),
             provider: agent_vocab::ProviderConfig {

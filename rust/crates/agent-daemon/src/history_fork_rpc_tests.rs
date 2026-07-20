@@ -24,25 +24,29 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
     )];
     env.state
         .repo
-        .create_project(project_id, "fork RPC", &project_workspaces, json!({}))
+        .create_project(
+            project_id,
+            "runtime-test",
+            "fork RPC",
+            &project_workspaces,
+            json!({}),
+        )
         .await
         .expect("create project");
-    let selected_workspaces = crate::workspaces::WorkspaceSelection::All
+    let selected_workspaces = crate::workspace_selection::WorkspaceSelection::All
         .resolve(&project_workspaces)
         .expect("select project workspaces");
-    let (outer_cwd, workspaces) = env
+    let (workspace_id, workspaces) = env
         .state
-        .workspaces
+        .runtime_hosts
         .materialize_session(
+            TEST_RUNTIME_ID,
             project_id,
-            "fork-rpc-source",
             &project_workspaces,
             &selected_workspaces,
         )
         .await
         .expect("materialize managed source cwd");
-    std::fs::write(PathBuf::from(&outer_cwd).join("current.txt"), "current")
-        .expect("write current source file");
     let mut config = session_config(
         &env,
         project_id,
@@ -59,7 +63,7 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
             },
         }),
     );
-    config.outer_cwd = outer_cwd;
+    config.workspace_id = workspace_id;
     config.workspaces = workspaces;
     let mcp_snapshot = agent_mcp::McpSessionSnapshot::empty();
     config.mcp_manifest = Some(McpSessionManifestBinding {
@@ -185,17 +189,6 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
     assert_eq!(child["pending_actions"], json!([]));
     assert_eq!(child["queued_inputs"], json!([]));
     assert_eq!(child["entries"].as_array().expect("child entries").len(), 3);
-    assert_eq!(
-        std::fs::read_to_string(
-            child["outer_cwd"]
-                .as_str()
-                .map(PathBuf::from)
-                .expect("child cwd")
-                .join("current.txt")
-        )
-        .expect("child current file"),
-        "current"
-    );
     let child_config = env
         .state
         .repo
@@ -208,20 +201,15 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
         serde_json::to_value(&config.provider).expect("source provider serializes")
     );
     assert_eq!(child_config.workspaces, config.workspaces);
-    assert_ne!(child_config.outer_cwd, config.outer_cwd);
+    assert_ne!(child_config.workspace_id, config.workspace_id);
     assert_eq!(child_config.mcp_manifest, config.mcp_manifest);
     assert!(!child_config.system_prompt.is_empty());
     assert_ne!(child_config.system_prompt, config.system_prompt);
     assert_eq!(
         child_config.system_prompt,
         crate::provider_runtime::render_pi_prompt(&env.state, &child_config)
+            .await
             .expect("child prompt rerenders")
     );
-    assert_eq!(
-        std::fs::read_to_string(PathBuf::from(&child_config.outer_cwd).join("docs/tracked.txt"))
-            .expect("child local workspace file"),
-        "workspace"
-    );
-
     env.cleanup().await;
 }

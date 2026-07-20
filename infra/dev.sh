@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run Postgres (compose) + agent-daemon + web (vite preview) in foreground.
+# Run Postgres + control + pi-runtime (compose) and web preview.
 #
 # Local mode  (TAILNET_HOST unset): browse http://127.0.0.1:8788/.
 # Tailnet mode (TAILNET_HOST set):  pair with infra/serve.sh and browse
@@ -15,11 +15,15 @@ cd "$REPO_ROOT"
 
 WEB_PORT="${WEB_PORT:-8788}"
 TAILNET_HOST="${TAILNET_HOST:-}"
-# This is the normal local launcher: pi-agentd uses the caller's XDG
-# config/state, including config.toml, mcp.toml, catalogs, and OAuth state.
+# Default to the pre-split state dir whose sessions/ btrfs subvolume already
+# holds every migrated session cwd, so <root>/sessions/<workspace_id>/cwd
+# resolves to the existing working dirs (not an empty pi-runtime dir).
+PI_RUNTIME_ROOT="${PI_RUNTIME_ROOT:-"${XDG_STATE_HOME:-"$HOME/.local/state"}/pi-relay"}"
+mkdir -p "$PI_RUNTIME_ROOT"
+export PI_RUNTIME_ROOT
 
 bun install
-docker compose -f infra/docker-compose.yml up -d --wait
+docker compose -f infra/docker-compose.yml up -d --build --wait
 
 # ${VAR:+...} expands to empty when VAR is unset/empty, so local mode passes
 # through the rpc.ts default (ws://127.0.0.1:8787) and skips allowed-host gating.
@@ -28,9 +32,6 @@ docker compose -f infra/docker-compose.yml up -d --wait
     VITE_PI_ALLOWED_HOSTS="$TAILNET_HOST" \
     bun run build )
 
-cargo run --manifest-path rust/Cargo.toml -p agent-daemon &
-DAEMON_PID=$!
-
 ( cd packages/web && \
     VITE_PI_ALLOWED_HOSTS="$TAILNET_HOST" \
     bun run preview -- --port "$WEB_PORT" ) &
@@ -38,9 +39,9 @@ WEB_PID=$!
 
 shutdown() {
   trap - EXIT INT TERM
-  kill "$DAEMON_PID" "$WEB_PID" 2>/dev/null || true
+  kill "$WEB_PID" 2>/dev/null || true
   wait 2>/dev/null || true
 }
 trap shutdown EXIT INT TERM
 
-wait -n "$DAEMON_PID" "$WEB_PID"
+wait "$WEB_PID"

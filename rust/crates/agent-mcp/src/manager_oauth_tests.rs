@@ -145,7 +145,7 @@ async fn oauth_route_is_immediately_login_required_without_blocking_healthy_rout
         },
     );
     let selected_prompt_section = prompt
-        .split_once("### Selected MCP tools")
+        .split_once("### MCP")
         .expect("selected MCP prompt section exists")
         .1
         .split_once("## Subagent delegation")
