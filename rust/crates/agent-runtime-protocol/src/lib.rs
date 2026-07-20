@@ -4,7 +4,6 @@ use agent_vocab::{ProviderKind, ToolCall, ToolResultMessage};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 pub const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
 pub const COMMAND_TIMEOUT_SECS: u64 = 120;
@@ -23,12 +22,6 @@ pub async fn read_frame<T: for<'de> Deserialize<'de>>(
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     };
-    if length > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "runtime protocol frame exceeds limit",
-        ));
-    }
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes).await?;
     serde_json::from_slice(&bytes)
@@ -42,13 +35,13 @@ pub async fn write_frame<T: Serialize>(
 ) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if bytes.len() > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "runtime protocol frame exceeds limit",
-        ));
-    }
-    writer.write_u32(bytes.len() as u32).await?;
+    let length = u32::try_from(bytes.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "runtime protocol frame exceeds the u32 framing range",
+        )
+    })?;
+    writer.write_u32(length).await?;
     writer.write_all(&bytes).await?;
     writer.flush().await
 }
@@ -159,6 +152,30 @@ pub struct RawSkillFile {
 pub struct RuntimeCommandError {
     pub code: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_frame, write_frame};
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn round_trips_frames_larger_than_eight_megabytes() {
+        let payload = "x".repeat(8 * 1024 * 1024 + 1);
+        let (mut writer, mut reader) = duplex(payload.len() + 1024);
+        let write_task = tokio::spawn(async move { write_frame(&mut writer, &payload).await });
+
+        let received = read_frame::<String>(&mut reader)
+            .await
+            .expect("large frame should be readable")
+            .expect("writer should send a frame");
+        write_task
+            .await
+            .expect("writer task should finish")
+            .expect("large frame should be writable");
+
+        assert_eq!(received.len(), 8 * 1024 * 1024 + 1);
+    }
 }
 
 impl RuntimeCommandError {
