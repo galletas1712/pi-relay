@@ -15,7 +15,10 @@ cd "$REPO_ROOT"
 
 WEB_PORT="${WEB_PORT:-8788}"
 TAILNET_HOST="${TAILNET_HOST:-}"
-PI_RUNTIME_ROOT="${PI_RUNTIME_ROOT:-"${XDG_STATE_HOME:-"$HOME/.local/state"}/pi-runtime"}"
+# Default to the pre-split state dir whose sessions/ btrfs subvolume already
+# holds every migrated session cwd, so <root>/sessions/<workspace_id>/cwd
+# resolves to the existing working dirs (not an empty pi-runtime dir).
+PI_RUNTIME_ROOT="${PI_RUNTIME_ROOT:-"${XDG_STATE_HOME:-"$HOME/.local/state"}/pi-relay"}"
 mkdir -p "$PI_RUNTIME_ROOT"
 export PI_RUNTIME_ROOT
 
