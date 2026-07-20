@@ -44,7 +44,6 @@ struct Runtime {
     tools: Arc<ToolRegistry>,
     running: Arc<Mutex<HashMap<String, AbortHandle>>>,
     mcp: Arc<McpManager>,
-    mcp_enabled: bool,
 }
 
 #[tokio::main]
@@ -69,7 +68,6 @@ async fn main() -> Result<()> {
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         running: Default::default(),
         mcp,
-        mcp_enabled: config.mcp_config.is_some(),
     };
     runtime.workspaces.validate_root().await.with_context(|| {
         format!(
@@ -113,7 +111,6 @@ async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
         &RuntimeToControl::Hello(RuntimeHello {
             runtime_id: config.runtime_id.clone(),
             name: config.name.clone(),
-            mcp_enabled: runtime.mcp_enabled,
         }),
     )
     .await?;

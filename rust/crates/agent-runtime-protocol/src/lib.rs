@@ -19,10 +19,6 @@ pub const COMMAND_TIMEOUT_SECS: u64 = 120;
 pub struct RuntimeHello {
     pub runtime_id: String,
     pub name: String,
-    /// Whether this runtime has any MCP servers configured. Lets the control
-    /// plane answer inventory/status as empty (and reject MCP selection) for
-    /// MCP-less runtimes without a round-trip.
-    pub mcp_enabled: bool,
 }
 
 pub async fn read_frame<T: for<'de> Deserialize<'de>>(

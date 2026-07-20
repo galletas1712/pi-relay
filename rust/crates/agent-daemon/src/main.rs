@@ -557,9 +557,11 @@ async fn tools_list(state: &AppState, params: Value) -> std::result::Result<Valu
             format!("stored MCP manifest failed validation: {error:#}"),
         )
     })?;
-    // Live per-tool health comes from the runtime; if it is offline, degrade to
-    // manifest-only rows (the MCP tools are simply omitted from the live-health
-    // columns) rather than failing tools.list.
+    // Per-tool rows are built from the runtime's live views (server, raw_name,
+    // health, contract_fingerprint). If the runtime is offline the view map is
+    // empty, so the MCP tools drop out of this listing entirely rather than
+    // failing tools.list — an unreachable runtime can't execute them anyway, and
+    // the non-MCP (first-party) rows still list normally.
     let views = state
         .runtime_hosts
         .mcp_tool_views(&config.runtime_id, snapshot.manifest().clone())
