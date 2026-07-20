@@ -232,17 +232,36 @@ async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
         "pi-runtime {} connected to {}",
         config.runtime_id, config.control_addr
     );
+    let (incoming_tx, mut incoming_rx) = mpsc::channel(32);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            match read_frame::<ControlToRuntime>(&mut reader).await {
+                Ok(Some(frame)) => {
+                    if incoming_tx.send(Ok(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = incoming_tx.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
     let (results_tx, mut results_rx) = mpsc::channel(32);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
-    loop {
+    let connected = async {
+        loop {
         tokio::select! {
             _ = heartbeat.tick() => write_frame(&mut writer, &RuntimeToControl::Heartbeat).await?,
             result = results_rx.recv() => {
                 let Some(result) = result else { break };
                 write_frame(&mut writer, &result).await?;
             }
-            frame = read_frame::<ControlToRuntime>(&mut reader) => {
-                let Some(frame) = frame? else { break };
+            frame = incoming_rx.recv() => {
+                let Some(frame) = frame else { break };
+                let frame = frame?;
                 match frame {
                     ControlToRuntime::Command { command_id, command } => {
                         let task_runtime = runtime.clone();
@@ -270,13 +289,26 @@ async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
                     ControlToRuntime::Cancel { command_id } => {
                         if let Some(handle) = runtime.running.lock().await.remove(&command_id) {
                             handle.abort();
+                            let _ = results_tx
+                                .send(RuntimeToControl::Result {
+                                    command_id,
+                                    result: Err(RuntimeCommandError::new(
+                                        "runtime_cancelled",
+                                        "runtime command cancelled",
+                                    )),
+                                })
+                                .await;
                         }
                     }
                 }
             }
         }
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    reader_task.abort();
+    connected
 }
 
 impl Runtime {

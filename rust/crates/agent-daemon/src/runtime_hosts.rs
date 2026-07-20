@@ -74,6 +74,36 @@ struct Waiter {
     sender: oneshot::Sender<Result<RuntimeCommandResult, RuntimeCommandError>>,
 }
 
+struct RuntimeCommandCancellation {
+    command_id: String,
+    sender: mpsc::Sender<ControlToRuntime>,
+    armed: bool,
+}
+
+impl RuntimeCommandCancellation {
+    fn new(command_id: String, sender: mpsc::Sender<ControlToRuntime>) -> Self {
+        Self {
+            command_id,
+            sender,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RuntimeCommandCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.sender.try_send(ControlToRuntime::Cancel {
+                command_id: self.command_id.clone(),
+            });
+        }
+    }
+}
+
 impl RuntimeRegistry {
     pub(crate) fn new(repo: Arc<PostgresAgentStore>) -> Self {
         Self {
@@ -104,7 +134,7 @@ impl RuntimeRegistry {
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
-        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (mut reader, writer) = tokio::io::split(stream);
         let hello = timeout(
             Duration::from_secs(10),
             read_frame::<RuntimeToControl>(&mut reader),
@@ -120,7 +150,7 @@ impl RuntimeRegistry {
         }
         let connection_id = CONNECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         self.repo.register_runtime(&runtime_id, &name).await?;
-        let (sender, mut receiver) = mpsc::channel(32);
+        let (sender, receiver) = mpsc::channel(32);
         self.connections.lock().await.insert(
             runtime_id.clone(),
             RuntimeConnection {
@@ -132,13 +162,7 @@ impl RuntimeRegistry {
         );
 
         let served = self
-            .serve_connection(
-                connection_id,
-                &runtime_id,
-                &mut reader,
-                &mut writer,
-                &mut receiver,
-            )
+            .serve_connection(connection_id, &runtime_id, reader, writer, receiver)
             .await;
         self.teardown_connection(connection_id, &runtime_id).await;
         served
@@ -148,22 +172,41 @@ impl RuntimeRegistry {
         &self,
         connection_id: u64,
         runtime_id: &str,
-        reader: &mut R,
-        writer: &mut W,
-        receiver: &mut mpsc::Receiver<ControlToRuntime>,
+        mut reader: R,
+        mut writer: W,
+        mut receiver: mpsc::Receiver<ControlToRuntime>,
     ) -> Result<()>
     where
-        R: AsyncRead + Unpin,
+        R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin,
     {
-        loop {
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<std::io::Result<RuntimeToControl>>(32);
+        let reader_task = tokio::spawn(async move {
+            loop {
+                match read_frame::<RuntimeToControl>(&mut reader).await {
+                    Ok(Some(frame)) => {
+                        if incoming_tx.send(Ok(frame)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = incoming_tx.send(Err(error)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        let served = async {
+            loop {
             tokio::select! {
                 outgoing = receiver.recv() => {
                     let Some(outgoing) = outgoing else { break };
-                    write_frame(writer, &outgoing).await?;
+                    write_frame(&mut writer, &outgoing).await?;
                 }
-                incoming = read_frame::<RuntimeToControl>(reader) => {
-                    let Some(incoming) = incoming? else { break };
+                incoming = incoming_rx.recv() => {
+                    let Some(incoming) = incoming else { break };
+                    let incoming = incoming?;
                     match incoming {
                         RuntimeToControl::Heartbeat => {
                             let mut connections = self.connections.lock().await;
@@ -194,8 +237,12 @@ impl RuntimeRegistry {
                     }
                 }
             }
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        reader_task.abort();
+        served
     }
 
     /// Remove this connection only if it is still the registered one (a newer
@@ -263,9 +310,17 @@ impl RuntimeRegistry {
             self.waiters.lock().await.remove(&command_id);
             return Err(anyhow!("runtime unavailable: {runtime_id}"));
         }
-        match timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), rx).await {
-            Ok(Ok(result)) => result.map_err(|error| anyhow::Error::new(RuntimeHostError::from(error))),
-            Ok(Err(_)) => Err(anyhow!("runtime disconnected while command was running")),
+        let mut cancellation = RuntimeCommandCancellation::new(command_id.clone(), sender);
+        let outcome = timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), rx).await;
+        match outcome {
+            Ok(Ok(result)) => {
+                cancellation.disarm();
+                result.map_err(|error| anyhow::Error::new(RuntimeHostError::from(error)))
+            }
+            Ok(Err(_)) => {
+                cancellation.disarm();
+                Err(anyhow!("runtime disconnected while command was running"))
+            }
             Err(_) => {
                 self.waiters.lock().await.remove(&command_id);
                 Err(anyhow!("runtime command timed out"))
@@ -668,6 +723,29 @@ impl RuntimeRegistry {
             "runtime returned the wrong mcp-logout result",
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_runtime_command_sends_cancel() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let cancellation = RuntimeCommandCancellation::new("command-1".to_string(), sender.clone());
+        drop(cancellation);
+
+        let message = receiver.recv().await.expect("cancel message");
+        assert!(matches!(
+            message,
+            ControlToRuntime::Cancel { command_id } if command_id == "command-1"
+        ));
+
+        let mut cancellation = RuntimeCommandCancellation::new("command-2".to_string(), sender);
+        cancellation.disarm();
+        drop(cancellation);
+        assert!(receiver.try_recv().is_err());
     }
 }
 
