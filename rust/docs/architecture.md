@@ -36,6 +36,12 @@ lives under [`plans/`](plans/).
 ```text
 agent-daemon     websocket RPC + provider/tool dispatch, recovery, events
    |
+   +-- agent-runtime-protocol -- framed control/runtime commands
+   |                               |
+   |                               v
+   |                            agent-runtime
+   |                            workspaces, local tools, runtime skills, MCP
+   |
    |  drives
    v
 agent-session    transcript forest, model-context materialization,
@@ -65,6 +71,8 @@ agent-vocab      shared ids, message blocks, tool calls/results,
 | `agent-mcp` | Operator-configured stdio/Streamable HTTP MCP clients and Codex-parity rmcp-backed OAuth. Runs on the runtime host next to tool execution; OAuth credentials live under that host's `workspace_root`. | [plans/mcp-client.md](plans/mcp-client.md) |
 | `agent-mcp-types` | Pure catalog / manager / OAuth DTOs used on the wire between control and runtime without pulling in the `rmcp` engine. | — |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. Proxies MCP RPCs to the session's runtime. | [modules/agent-daemon.md](modules/agent-daemon.md) |
+| `agent-runtime-protocol` | Framed JSON control/runtime commands and results, including workspace, tool, skill, and MCP operations. | — |
+| `agent-runtime` | `pi-runtime` host worker that owns managed workspaces, executes local tools, publishes runtime skills, and hosts MCP. Its policy lives under the runtime host's XDG `pi-runtime` configuration root. | — |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt from session/workspace/tool/skill context. | [modules/agent-prompt.md](modules/agent-prompt.md) |
 
 `agent-vocab` stays at the bottom of the graph so providers, tools, storage,

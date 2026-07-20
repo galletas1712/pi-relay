@@ -3,8 +3,8 @@
 Status: the session-scoped MCP client, generic Streamable HTTP transport, and
 generic OAuth Stages 1-4 are implemented. Public sanitized RPCs and the React
 New Session login/logout UI use the pinned rmcp OAuth state machine and the
-daemon-owned loopback/manual-completion boundary.
-Daemon-owned file credentials, restart restoration, refresh, bounded
+runtime-owned loopback/manual-completion boundary.
+Runtime-owned file credentials, restart restoration, refresh, bounded
 authenticated transport, sanitized public auth RPCs, local logout, and the web
 New Session OAuth UI are also implemented. Windows and macOS validation remain
 follow-up work. This is the live checklist and durable design record.
@@ -127,9 +127,9 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
   bounded lifetime, one completion, exact state, exact method/path, bounded
   query, and fail-closed OAuth error handling. The authorization URL is returned
   for explicit opening; browser launch remains a caller concern.
-- [x] The loopback listener runs on the daemon host. Therefore automatic
+- [x] The loopback listener runs on the runtime host. Therefore automatic
   browser callback works only when the browser can reach loopback on that same
-  host. For a remote/headless daemon, the user completes authorization in
+  host. For a remote/headless runtime, the user completes authorization in
   their browser, then pastes the **entire callback URL** (not only `code`) into
   the web dialog, which submits it to the bounded public completion RPC and
   existing manager completion boundary.
@@ -140,18 +140,18 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
   `OAuthState` in memory. Public errors are local categories and authorization
   URLs are redacted from Debug.
 
-#### OAuth Stage 3: daemon credentials, refresh, and transport injection (implemented)
+#### OAuth Stage 3: runtime credentials, refresh, and transport injection (implemented)
 
-- [x] Make the daemon the sole owner of DCR and token records. The versioned,
+- [x] Make the runtime the sole owner of DCR and token records. The versioned,
   bounded aggregate JSON file is keyed by configured server ID plus exact MCP
   URL, with static-client/resource compatibility checks, restrictive
   permissions, sibling temporary writes, and atomic replacement. It lives
-  directly under the daemon state root, never in Postgres or a session
-  workspace. Missing means empty; empty, corrupt, oversized, and I/O failures
-  are sanitized explicit store errors. An unreadable store is preserved and
-  fail-closed for OAuth status/login/logout while unrelated routes and the
-  daemon continue; the file backend has no repair, migration, cross-process
-  locking, keyring, or database fallback.
+  directly under the runtime's configured `workspace_root`, never in Postgres
+  or a session workspace. Missing means empty; empty, corrupt, oversized, and
+  I/O failures are sanitized explicit store errors. An unreadable store is
+  preserved and fail-closed for OAuth status/login/logout while unrelated
+  routes and the runtime continue; the file backend has no repair, migration,
+  cross-process locking, keyring, or database fallback.
 - [x] Persist the public client ID, access token, optional refresh token,
   absolute expiry, granted scopes, and minimal configured resource/client
   identity. Save only after callback/listener cleanup and before acknowledging
@@ -181,15 +181,16 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
 
 #### OAuth Stage 4: sanitized RPC and New Session UX
 
-- [x] Add sanitized `status`, `login`, `complete`, `cancel`, and `logout`
-  daemon RPCs with bounded server IDs and transaction IDs. Responses expose
+- [x] Add sanitized, runtime-scoped `status`, `login`, `complete`, `cancel`, and
+  `logout` control RPCs with bounded server IDs and transaction IDs. The
+  control plane proxies them to the selected runtime. Responses expose
   only stable states and bounded operator-safe categories; never tokens,
   client secrets, verifier/state, codes, raw response bodies, full callback
   URLs, or server-provided instructions. `login` may return the generated
   authorization URL exactly once to the requesting trusted client; ordinary
   status never does.
 - [x] Make completion/cancellation transaction-owned, expiring, and
-  idempotently fail closed. Logout deletes daemon credentials and cancels
+  idempotently fail closed. Logout deletes runtime credentials and cancels
   outstanding login state, but does not rewrite existing session manifests.
 - [x] Add New Session OAuth status and login controls before MCP tool
   selection. Sanitized status is independent from inventory, so
@@ -214,11 +215,11 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
 3. PI.md and provider/model context remain credential- and OAuth-policy-free.
    They continue to contain only selected server IDs and exposed tool names.
 4. Full/read-only subagents inherit the exact parent MCP manifest, not a copy
-   of credentials. Calls resolve through the daemon-owned route and credential
+   of credentials. Calls resolve through the runtime-owned route and credential
    repository under the same no-replay and exact-contract checks.
-5. Discovery and login are bounded control-plane operations. They cannot
-   mutate a frozen manifest, replay an MCP operation, or inject server-provided
-   text into model context.
+5. Discovery and login are bounded runtime operations proxied by the control
+   plane. They cannot mutate a frozen manifest, replay an MCP operation, or
+   inject server-provided text into model context.
 
 ### MCP inventory and frozen manifests
 
@@ -512,7 +513,7 @@ No result is automatically replayed.
 - MCP sampling, elicitation, or server-initiated model work.
 - Dynamic `ToolRegistry` mutation or prompt rewriting.
 - Automatic replay after timeout/disconnect.
-- Cross-daemon distributed MCP connection ownership.
+- Cross-runtime MCP credential or connection sharing.
 
 ## Implementation notes
 

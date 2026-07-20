@@ -264,7 +264,9 @@ impl RuntimeRegistry {
             return Err(anyhow!("runtime unavailable: {runtime_id}"));
         }
         match timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), rx).await {
-            Ok(Ok(result)) => result.map_err(|error| anyhow::Error::new(RuntimeHostError::from(error))),
+            Ok(Ok(result)) => {
+                result.map_err(|error| anyhow::Error::new(RuntimeHostError::from(error)))
+            }
             Ok(Err(_)) => Err(anyhow!("runtime disconnected while command was running")),
             Err(_) => {
                 self.waiters.lock().await.remove(&command_id);

@@ -21,11 +21,6 @@ cd "$REPO_ROOT"
 
 WEB_PORT="${WEB_PORT:-8788}"
 TAILNET_HOST="${TAILNET_HOST:-}"
-# The runtime's workspace_root: the state dir whose sessions/ btrfs subvolume
-# already holds every session cwd, so <root>/sessions/<workspace_id>/cwd
-# resolves to the existing working dirs referenced throughout each transcript.
-PI_RUNTIME_ROOT="${PI_RUNTIME_ROOT:-"${XDG_STATE_HOME:-"$HOME/.local/state"}/pi-relay"}"
-mkdir -p "$PI_RUNTIME_ROOT"
 
 bun install
 
@@ -33,26 +28,23 @@ bun install
 # --remove-orphans clears a previously-dockerized runtime container.
 docker compose -f infra/docker-compose.yml up -d --build --wait --remove-orphans
 
-# Build + launch pi-runtime as a host process. Root is required for btrfs
-# subvolume operations; HOME and PATH are preserved so session tools resolve
-# your real environment (binaries, venvs, ~/.agents/skills, ~/.config).
+# Build + launch pi-runtime as a host process. Its required policy lives at
+# $XDG_CONFIG_HOME/pi-runtime/config.toml (or ~/.config/pi-runtime/config.toml)
+# and optional MCP policy is the sibling mcp.toml. Root is required for btrfs
+# subvolume operations; HOME, PATH, and XDG_CONFIG_HOME are preserved so the
+# runtime resolves the host's policy, binaries, venvs, and ~/.agents/skills.
 ( cd rust && cargo build --release -p agent-runtime )
 RUNTIME_BIN="$REPO_ROOT/rust/target/release/pi-runtime"
-RUNTIME_CFG="$REPO_ROOT/infra/config/runtime.local.toml"
-cat > "$RUNTIME_CFG" <<EOF
-runtime_id = "runtime-local"
-name = "Local runtime"
-control_addr = "127.0.0.1:8786"
-workspace_root = "$PI_RUNTIME_ROOT"
-EOF
-# MCP servers run on the runtime now, next to tool execution. Point it at the
-# host's mcp.toml so the new-session inventory is populated (skip the line when
-# absent — the runtime treats a missing mcp_config as MCP disabled rather than
-# failing to start). OAuth credentials land in <workspace_root>/mcp-oauth-
-# credentials.json on the host, so prior control-plane logins carry over.
-MCP_CONFIG="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay/mcp.toml"
-[ -f "$MCP_CONFIG" ] && echo "mcp_config = \"$MCP_CONFIG\"" >> "$RUNTIME_CFG"
-sudo -n env HOME="$HOME" PATH="$PATH" "$RUNTIME_BIN" "$RUNTIME_CFG" &
+RUNTIME_CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-runtime"
+if [ ! -f "$RUNTIME_CONFIG_HOME/config.toml" ]; then
+  echo "missing runtime configuration: $RUNTIME_CONFIG_HOME/config.toml" >&2
+  exit 1
+fi
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+  sudo -n env HOME="$HOME" PATH="$PATH" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" "$RUNTIME_BIN" &
+else
+  sudo -n env HOME="$HOME" PATH="$PATH" "$RUNTIME_BIN" &
+fi
 
 # ${VAR:+...} expands to empty when VAR is unset/empty, so local mode passes
 # through the rpc.ts default (ws://127.0.0.1:8787) and skips allowed-host gating.

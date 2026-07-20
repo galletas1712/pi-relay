@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use agent_prompt::{PromptProfile, Skill};
@@ -183,6 +184,28 @@ pub(crate) fn resolve_skill_role(
     packaged_role(config_root, prompt_root, name)
         .ok_or_else(|| anyhow!("role skill not found: {name}"))
         .and_then(|skill| role_from_skill(skill, runtime_raw))
+}
+
+pub(crate) fn validate_subagent_model_roles<'a>(
+    prompt_root: &Path,
+    config_root: &Path,
+    configured_roles: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    let available = load_packaged_role_skills(config_root, prompt_root)
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect::<BTreeSet<_>>();
+    let missing = configured_roles
+        .into_iter()
+        .filter(|role| !available.contains(*role))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "subagent_models entries require matching global role skills: {}",
+        missing.join(", ")
+    ))
 }
 
 fn load_packaged_role_skills(config_root: &Path, prompt_root: &Path) -> Vec<Skill> {
@@ -482,6 +505,32 @@ mod tests {
         let role = resolve_skill_role(&prompt_root, &config_root, &workspace_raw, "repo/reviewer")
             .expect("workspace role resolves first");
         assert_eq!(role.description, "Workspace reviewer");
+
+        std::fs::remove_dir_all(prompt_root).ok();
+        std::fs::remove_dir_all(config_root).ok();
+    }
+
+    #[test]
+    fn subagent_model_roles_must_match_global_role_skills() {
+        let prompt_root = make_temp_dir("model-role-source");
+        let config_root = make_temp_dir("model-role-config");
+        write_role(
+            &prompt_root.join("subagent-roles/reviewer/SKILL.md"),
+            "reviewer",
+            "Reviewer",
+            "Review the work.",
+        );
+
+        validate_subagent_model_roles(&prompt_root, &config_root, ["reviewer"])
+            .expect("global role is valid");
+
+        let error =
+            validate_subagent_model_roles(&prompt_root, &config_root, ["repo/reviewer", "missing"])
+                .expect_err("runtime and missing roles are not global model-policy keys");
+        assert_eq!(
+            error.to_string(),
+            "subagent_models entries require matching global role skills: repo/reviewer, missing"
+        );
 
         std::fs::remove_dir_all(prompt_root).ok();
         std::fs::remove_dir_all(config_root).ok();

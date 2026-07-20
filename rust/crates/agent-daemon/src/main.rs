@@ -28,7 +28,8 @@ use crate::codec::{
 use crate::config::Config;
 use crate::provider_runtime::{
     current_pi_template, effective_prompt_profile, mcp_snapshot_for_session,
-    provider_tools_for_session, PromptProfile, ProviderConnectionRegistry, SessionTitleScheduler,
+    provider_tools_for_session, validate_subagent_model_roles, PromptProfile,
+    ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::*;
 use crate::runtime_hosts::RuntimeRegistry;
@@ -64,6 +65,15 @@ async fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
     let prompt_root = find_prompt_root(std::env::current_dir()?)?;
     config.bootstrap_catalog(&prompt_root)?;
+    validate_subagent_model_roles(
+        &prompt_root,
+        &config.config_root,
+        config
+            .daemon_config
+            .subagent_models
+            .keys()
+            .map(String::as_str),
+    )?;
     let repo = Arc::new(PostgresAgentStore::connect(&config.database_url).await?);
     repo.migrate().await?;
 
