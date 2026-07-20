@@ -1,4 +1,5 @@
 - Aim to have the cleanest design possible while not sacrificing performance
 - Abstractions should be clean so that instead of handling different cases separately, the abstractions are generic enough to cover all cases
 - Avoid unnecessary fallbacks and guards
+- Make sure to clean up dead code
 - I am the only user of all components of this repo, so it is fine to break things in the name of simplicity without caring for forward/backward compatibility
