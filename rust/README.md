@@ -102,9 +102,11 @@ For the repository's local stack, `infra/dev.sh` mounts
 configuration root and launches the host runtime with the caller's
 `pi-relay/runtime` XDG configuration. The one-time
 `infra/migrate-service-config.sh --apply` command splits the former shared
-configuration root; stop both processes before running it.
+configuration root, converts `subagent_models` entries into role-local
+`SKILL.md` frontmatter, and removes obsolete bootstrap artifacts; stop both
+processes before running it.
 
-### Daemon configuration and packaged catalogs
+### Daemon configuration and host catalogs
 
 General daemon configuration is read from
 `$XDG_CONFIG_HOME/pi-relay/agentd/config.toml`; when `XDG_CONFIG_HOME` is unset
@@ -130,47 +132,51 @@ model = "gpt-5.6-sol"
 reasoning_effort = "high"
 max_tokens = 32768
 prompt_cache = { key = "my-parent-cache" }
-
-[subagent_models.reviewer]
-kind = "claude"
-model = "claude-opus-4-8"
-reasoning_effort = "high"
 ```
 
 The root schema is exactly `database_url`, optional `bind`, optional
-`runtime_bind`, optional `default_parent_model`, and optional
-`subagent_models`. Every provider object keeps the normal `kind`, `model`,
-`reasoning_effort`, optional `max_tokens`, and optional `prompt_cache` fields.
-If `default_parent_model` is omitted, the built-in parent policy is OpenAI
-`gpt-5.6-sol` with `high` reasoning. A new parent session uses an explicit
-`session.start.provider`, otherwise `default_parent_model`, otherwise that
-built-in policy. A child uses its explicit override, then the matching resolved
-role name in `subagent_models`, then its persisted parent provider. Every
-`subagent_models` key must match a global role in
-`pi-relay/agentd/subagent-roles`; startup rejects missing roles. Runtime-global
-and workspace-specific roles are resolved from the selected runtime when used
-and inherit the parent provider unless the spawn request explicitly overrides
-it.
+`runtime_bind`, and optional `default_parent_model`. The provider object keeps
+the normal `kind`, `model`, `reasoning_effort`, optional `max_tokens`, and
+optional `prompt_cache` fields. If `default_parent_model` is omitted, the
+built-in parent policy is OpenAI `gpt-5.6-sol` with `high` reasoning. A new
+parent session uses an explicit `session.start.provider`, otherwise
+`default_parent_model`, otherwise that built-in policy.
 Existing or replayed sessions retain their persisted provider and are never
 retargeted by changed defaults.
 
-On first startup, the daemon bootstrap-copies its packaged
-`subagent-roles/*/SKILL.md` and `workflows/*/SKILL.md` into this configuration
-directory. It creates only absent files, never changes permissions or contents
-of existing files, and writes a completion marker so deliberately deleted
-catalog entries stay deleted on future starts. Workspace/home explicit skills
-and roles retain their current precedence. For parent workflow skills and
-subagent-role catalog entries, configured catalog files override same-named
-packaged files, while missing configured entries fall back to the package.
-Roles remain out of ordinary `LoadSkill` discovery; subagents cannot load
-workflow skills. Bootstrap opens each owned configuration component through
-no-follow directory handles, rejecting symlinked roots, catalogs, entries, and
-leaves rather than writing outside the configured configuration home. Each new
-leaf is fully written and synced to a unique hidden staging leaf in the
-already-open configuration root, then capability-published with a no-replace
-hard link. The hidden staging leaves are intentionally retained: after a
-failure their names cannot safely be deleted without risking a concurrently
-created user file.
+Global workflows and subagent roles are host configuration only:
+
+```text
+$XDG_CONFIG_HOME/pi-relay/agentd/
+├── workflows/<workflow>/SKILL.md
+└── subagent-roles/<role>/SKILL.md
+```
+
+A role-local provider policy uses optional flat frontmatter fields:
+
+```yaml
+---
+name: reviewer
+description: Review artifacts and handoffs against the objective.
+kind: claude
+model: claude-opus-4-8
+reasoning_effort: high
+---
+```
+
+Each immediate role directory must contain a valid `SKILL.md` whose frontmatter
+name exactly matches the directory name. Role model fields are validated at
+agentd startup; `kind` and `model` must appear together, while
+`reasoning_effort` and `max_tokens` are optional. A child uses an explicit
+spawn override, then its available global role provider, then OpenAI
+`gpt-5.6-sol` with `high` reasoning when that role provider is unavailable.
+Runtime-global and workspace-specific roles have no agentd-local provider file
+and therefore inherit the parent unless explicitly overridden.
+
+The daemon ships no workflow or role catalog and never creates one. Configured
+workflows are parent-only `LoadSkill` entries; configured roles remain hidden
+from ordinary `LoadSkill` discovery. Runtime home/workspace skills retain
+precedence over same-named configured workflows.
 
 Optional MCP configuration is read only from an already-existing
 `$XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml` on each runtime host; when it is

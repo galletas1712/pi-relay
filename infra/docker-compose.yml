@@ -31,6 +31,9 @@ services:
       # it needs full host filesystem + toolchain access) can dial in.
       - "127.0.0.1:8786:8786"
     volumes:
+      # Host-owned workflows, subagent roles, and role model frontmatter.
+      - ${PI_AGENTD_CONFIG_HOME:-${HOME}/.config/pi-relay/agentd}:/config/pi-relay/agentd:ro
+      # Container-specific database/bind policy overrides the host config file.
       - ./config/control.toml:/config/pi-relay/agentd/config.toml:ro
       # Host LLM credentials (read-only). The daemon reads ~/.codex/auth.json
       # (+installation_id) and ~/.claude*/config for the sk-ant- key. Read-only

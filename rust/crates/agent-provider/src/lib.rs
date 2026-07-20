@@ -497,6 +497,11 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 pub trait ModelProvider: Send + Sync {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse>;
 
+    async fn model_available(&self, model: &str) -> ProviderResult<bool> {
+        self.model_metadata(model).await?;
+        Ok(true)
+    }
+
     async fn model_metadata(&self, _model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
         Ok(None)
     }

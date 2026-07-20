@@ -21,6 +21,12 @@ cd "$REPO_ROOT"
 
 WEB_PORT="${WEB_PORT:-8788}"
 TAILNET_HOST="${TAILNET_HOST:-}"
+PI_AGENTD_CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay/agentd"
+if [ ! -d "$PI_AGENTD_CONFIG_HOME" ]; then
+  echo "missing agentd configuration: $PI_AGENTD_CONFIG_HOME" >&2
+  exit 1
+fi
+export PI_AGENTD_CONFIG_HOME
 
 bun install
 
