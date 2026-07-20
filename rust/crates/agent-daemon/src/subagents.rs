@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agent_store::{EventFrame, EventType, InputPriority, SessionConfig, SubagentType};
@@ -6,7 +5,8 @@ use agent_vocab::{ProviderConfig, UserMessage};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::provider_runtime::{render_pi_prompt, resolve_skill_role};
+use crate::config::stable_default_provider;
+use crate::provider_runtime::{model_available_for_config, render_pi_prompt, resolve_skill_role};
 use crate::runtime::{publish_events, SessionDriver};
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart, StartedSession,
@@ -27,13 +27,10 @@ pub(crate) struct DelegationSubagentSpawn {
 
 fn select_subagent_provider(
     explicit: Option<ProviderConfig>,
-    subagent_models: &BTreeMap<String, ProviderConfig>,
-    resolved_role_name: &str,
+    role_provider: Option<ProviderConfig>,
     parent: ProviderConfig,
 ) -> ProviderConfig {
-    explicit
-        .or_else(|| subagent_models.get(resolved_role_name).cloned())
-        .unwrap_or(parent)
+    explicit.or(role_provider).unwrap_or(parent)
 }
 
 impl From<DelegationSubagentSpawn> for SubagentSpawnRequest {
@@ -98,13 +95,8 @@ pub(crate) async fn spawn_subagent(
         )
         .await
         .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
-    let role = resolve_skill_role(
-        &state.prompt_root,
-        &state.config_root,
-        &runtime_raw,
-        &request.role,
-    )
-    .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
+    let role = resolve_skill_role(&state.config_root, &runtime_raw, &request.role)
+        .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
     let resolved_role_name = resolved_role_name(&role.name, role.workspace.as_deref());
 
     // A full subagent is the durable workspace's single writer for its
@@ -136,6 +128,7 @@ pub(crate) async fn spawn_subagent(
         &parent_config.metadata,
         request.subagent_type,
     );
+    let selected_role_provider = request.provider.is_none() && role.provider.is_some();
     let mut child_config = SessionConfig {
         project_id: parent_config.project_id,
         runtime_id: parent_config.runtime_id.clone(),
@@ -144,13 +137,34 @@ pub(crate) async fn spawn_subagent(
         system_prompt: String::new(),
         provider: select_subagent_provider(
             request.provider,
-            &state.daemon_config.subagent_models,
-            &resolved_role_name,
+            role.provider.clone(),
             parent_config.provider,
         ),
         metadata: child_metadata,
         mcp_manifest: parent_config.mcp_manifest.clone(),
     };
+    if selected_role_provider {
+        let availability =
+            model_available_for_config(state, &child_config, &child_session_id).await;
+        if !matches!(availability, Ok(true)) {
+            match availability {
+                Ok(false) => eprintln!(
+                    "subagent role model {}/{} is unavailable; falling back to OpenAI gpt-5.6-sol/high",
+                    child_config.provider.kind, child_config.provider.model
+                ),
+                Err(error) => eprintln!(
+                    "could not verify subagent role model {}/{}: {error:#}; falling back to OpenAI gpt-5.6-sol/high",
+                    child_config.provider.kind, child_config.provider.model
+                ),
+                Ok(true) => unreachable!(),
+            }
+            state
+                .provider_connections
+                .remove_session(&child_session_id)
+                .await;
+            child_config.provider = stable_default_provider();
+        }
+    }
     child_config.system_prompt = child_system_prompt(
         state,
         &child_config,
@@ -637,12 +651,9 @@ mod tests {
             max_tokens: Some(30),
             prompt_cache: Some(json!({"key": "parent"})),
         };
-        let configured_models = BTreeMap::from([("reviewer".to_string(), configured.clone())]);
-
         let selected = select_subagent_provider(
             Some(explicit.clone()),
-            &configured_models,
-            "reviewer",
+            Some(configured.clone()),
             parent.clone(),
         );
         assert_eq!(
@@ -650,14 +661,13 @@ mod tests {
             serde_json::to_value(explicit).expect("serialize")
         );
 
-        let selected =
-            select_subagent_provider(None, &configured_models, "reviewer", parent.clone());
+        let selected = select_subagent_provider(None, Some(configured.clone()), parent.clone());
         assert_eq!(
             serde_json::to_value(selected).expect("serialize"),
             serde_json::to_value(configured).expect("serialize")
         );
 
-        let selected = select_subagent_provider(None, &configured_models, "worker", parent.clone());
+        let selected = select_subagent_provider(None, None, parent.clone());
         assert_eq!(
             serde_json::to_value(selected).expect("serialize"),
             serde_json::to_value(parent).expect("serialize")

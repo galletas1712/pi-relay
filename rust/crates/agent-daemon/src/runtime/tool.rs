@@ -84,7 +84,6 @@ pub(super) async fn run_tool_turn(
             .await
         {
             Ok(runtime_raw) => load_skill_result(
-                &state.prompt_root,
                 &state.config_root,
                 &runtime_raw,
                 &loaded_skills,

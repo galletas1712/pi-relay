@@ -357,7 +357,7 @@ fn subagent_role_catalog_json(roles: &[SubagentRole]) -> String {
         })
         .collect::<Vec<_>>();
     serde_json::to_string_pretty(&json!({
-        "packaged_subagent_roles": roles,
+        "subagent_roles": roles,
     }))
     .expect("subagent role catalog JSON must serialize")
 }

@@ -61,6 +61,24 @@ pub(super) async fn model_metadata_with_auth_retry(
     .await
 }
 
+pub(super) async fn model_available_with_auth_retry(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+    provider: ProviderHandle,
+    model: String,
+) -> std::result::Result<bool, ProviderError> {
+    with_codex_auth_retry(
+        state,
+        config,
+        session_id,
+        provider,
+        model,
+        |provider, model| async move { provider.provider.model_available(&model).await },
+    )
+    .await
+}
+
 pub(super) async fn count_tokens_with_auth_retry(
     state: &AppState,
     config: &SessionConfig,

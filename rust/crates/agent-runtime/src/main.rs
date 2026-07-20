@@ -29,6 +29,11 @@ use uuid::Uuid;
 
 use workspaces::{validate_remote_branch, validate_workspace_dir, WorkspaceManager};
 
+const PRODUCT_CONFIG_DIR: &str = "pi-relay";
+const RUNTIME_CONFIG_DIR: &str = "runtime";
+const RUNTIME_CONFIG_FILE: &str = "config.toml";
+const MCP_CONFIG_FILE: &str = "mcp.toml";
+
 /// Carries a pre-shaped RuntimeCommandError through anyhow so the connection
 /// loop can put the stable slug on the wire instead of a generic runtime_error.
 #[derive(Debug, Clone)]
@@ -147,9 +152,8 @@ struct Config {
     name: String,
     control_addr: String,
     workspace_root: PathBuf,
-    /// Path to this host's MCP server config (mcp.toml). Absent → no MCP.
-    #[serde(default)]
-    mcp_config: Option<PathBuf>,
+    #[serde(skip)]
+    config_root: PathBuf,
 }
 
 #[derive(Clone)]
@@ -164,18 +168,21 @@ struct Runtime {
 async fn main() -> Result<()> {
     let config = load_config()?;
     // MCP servers run on the runtime host next to tool execution. The OAuth
-    // credential store lives alongside the workspaces (workspace_root), which on
-    // a local runtime is the user's ~/.local/state/pi-relay — reusing their
-    // existing logins.
-    let mcp = match config.mcp_config.as_deref() {
-        Some(path) => {
+    // credential store lives alongside the managed workspaces under the
+    // configured workspace_root.
+    let mcp_path = config.config_root.join(MCP_CONFIG_FILE);
+    let mcp = match std::fs::metadata(&mcp_path) {
+        Ok(_) => {
             McpManager::start_with_credential_file(
-                McpConfig::from_path(path)?,
+                McpConfig::from_path(&mcp_path)?,
                 config.workspace_root.join("mcp-oauth-credentials.json"),
             )
             .await?
         }
-        None => McpManager::disabled(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => McpManager::disabled(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read MCP config {}", mcp_path.display()))
+        }
     };
     let runtime = Runtime {
         workspaces: WorkspaceManager::new(config.workspace_root.clone()),
@@ -199,12 +206,30 @@ async fn main() -> Result<()> {
 }
 
 fn load_config() -> Result<Config> {
-    let path = std::env::args()
-        .nth(1)
-        .ok_or_else(|| anyhow!("usage: pi-runtime <config.toml>"))?;
-    let config: Config =
-        toml::from_str(&std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?)
-            .with_context(|| format!("parse {path}"))?;
+    load_config_from_values(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+        std::env::args().skip(1).collect(),
+    )
+}
+
+fn load_config_from_values(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    args: Vec<String>,
+) -> Result<Config> {
+    if let Some(argument) = args.first() {
+        return Err(anyhow!(
+            "pi-runtime accepts no arguments; configure it in {RUNTIME_CONFIG_FILE} (unknown argument: {argument})"
+        ));
+    }
+    let config_root = config_root_from_env(xdg_config_home.as_deref(), home.as_deref())?;
+    let path = config_root.join(RUNTIME_CONFIG_FILE);
+    let mut config: Config = toml::from_str(
+        &std::fs::read_to_string(&path)
+            .with_context(|| format!("read runtime config {}", path.display()))?,
+    )
+    .with_context(|| format!("parse runtime config {}", path.display()))?;
     if config.runtime_id.trim().is_empty()
         || config.name.trim().is_empty()
         || config.control_addr.trim().is_empty()
@@ -214,7 +239,34 @@ fn load_config() -> Result<Config> {
             "runtime_id, name, control_addr, and absolute workspace_root are required"
         ));
     }
+    config.config_root = config_root;
     Ok(config)
+}
+
+fn config_root_from_env(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    if let Some(xdg_config_home) = xdg_config_home.filter(|value| !value.is_empty()) {
+        let config_home = PathBuf::from(xdg_config_home);
+        if !config_home.is_absolute() {
+            return Err(anyhow!("XDG_CONFIG_HOME must be an absolute path"));
+        }
+        return Ok(config_home
+            .join(PRODUCT_CONFIG_DIR)
+            .join(RUNTIME_CONFIG_DIR));
+    }
+    let home = home
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("HOME is required when XDG_CONFIG_HOME is unset"))?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err(anyhow!("HOME must be an absolute path"));
+    }
+    Ok(home
+        .join(".config")
+        .join(PRODUCT_CONFIG_DIR)
+        .join(RUNTIME_CONFIG_DIR))
 }
 
 async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
@@ -459,9 +511,7 @@ impl Runtime {
             RuntimeCommand::McpToolViews { manifest } => Ok(RuntimeCommandResult::McpToolViews {
                 views: self
                     .mcp
-                    .tool_views(
-                        &McpSessionSnapshot::new(manifest).map_err(mcp_catalog_wire_error)?,
-                    )
+                    .tool_views(&McpSessionSnapshot::new(manifest).map_err(mcp_catalog_wire_error)?)
                     .await,
             }),
             RuntimeCommand::McpAuthStatuses {} => Ok(RuntimeCommandResult::McpAuthStatuses {
@@ -576,5 +626,79 @@ impl From<SelectedWorkspace> for workspaces::SelectedWorkspace {
             workspace: value.workspace,
             branch_override: value.branch_override,
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn loads_strict_runtime_config_from_its_xdg_root() {
+        let xdg = make_temp_dir("xdg");
+        let config_root = xdg.join(PRODUCT_CONFIG_DIR).join(RUNTIME_CONFIG_DIR);
+        fs::create_dir_all(&config_root).expect("config root");
+        fs::write(
+            config_root.join(RUNTIME_CONFIG_FILE),
+            r#"
+runtime_id = "runtime-test"
+name = "Test runtime"
+control_addr = "127.0.0.1:8786"
+workspace_root = "/tmp/pi-runtime-test"
+"#,
+        )
+        .expect("runtime config");
+
+        let config = load_config_from_values(Some(xdg.as_os_str().to_owned()), None, Vec::new())
+            .expect("load runtime config");
+        assert_eq!(config.runtime_id, "runtime-test");
+        assert_eq!(config.config_root, config_root);
+
+        fs::write(
+            config.config_root.join(RUNTIME_CONFIG_FILE),
+            r#"
+runtime_id = "runtime-test"
+name = "Test runtime"
+control_addr = "127.0.0.1:8786"
+workspace_root = "/tmp/pi-runtime-test"
+mcp_config = "/tmp/mcp.toml"
+"#,
+        )
+        .expect("runtime config with removed field");
+        let error = load_config_from_values(Some(xdg.as_os_str().to_owned()), None, Vec::new())
+            .expect_err("mcp_config is no longer part of runtime config");
+        assert!(format!("{error:#}").contains("unknown field"));
+
+        fs::remove_dir_all(xdg).ok();
+    }
+
+    #[test]
+    fn runtime_config_root_falls_back_to_home_and_rejects_arguments() {
+        assert_eq!(
+            config_root_from_env(None, Some("/home/test".as_ref())).expect("config root"),
+            PathBuf::from("/home/test/.config/pi-relay/runtime")
+        );
+        let error = load_config_from_values(
+            None,
+            Some("/home/test".into()),
+            vec!["old-config.toml".to_string()],
+        )
+        .expect_err("runtime rejects configuration arguments");
+        assert!(format!("{error:#}").contains("pi-runtime accepts no arguments"));
+    }
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "pi-runtime-config-{prefix}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("temp directory");
+        path
     }
 }

@@ -1550,11 +1550,11 @@ Result:
 ```
 
 Roles supplied to `delegation.start_full` and
-`delegation.start_readonly_fanout` must be either packaged subagent role skills
-(`explore`, `implementer`, `reviewer`, `tester`, etc.) or exact skill names from
-the available skills JSON. Workspace-scoped skills must use their prefixed names,
-for example `repo/reviewer`; unprefixed names resolve only packaged/global role
-skills. Workflow skills such as `workflow-explore` are loadable global
+`delegation.start_readonly_fanout` must be either agentd-configured global
+subagent role skills or exact skill names from the available skills JSON.
+Workspace-scoped skills must use their prefixed names, for example
+`repo/reviewer`; unprefixed names resolve only configured global role skills.
+Workflow skills such as `workflow-explore` are loadable global
 `LoadSkill` skills and may label delegation orchestration, but they do not
 become subagent roles unless separately present under `subagent-roles` or a
 workspace skill package.

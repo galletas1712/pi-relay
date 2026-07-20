@@ -1058,6 +1058,14 @@ impl ModelProvider for AnthropicProvider {
         parse_anthropic_stream(response).await
     }
 
+    async fn model_available(&self, model: &str) -> ProviderResult<bool> {
+        match self.retrieve_model(model).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.status_code() == Some(404) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn model_metadata(&self, model: &str) -> ProviderResult<Option<ProviderModelMetadata>> {
         let metadata = self.resolved_model_metadata(model).await;
         Ok(Some(ProviderModelMetadata {
@@ -3769,6 +3777,43 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[tokio::test]
+    async fn model_availability_uses_exact_models_api_lookup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("model request accepted");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.expect("model request reads");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(String::from_utf8(request)
+                .expect("request is utf8")
+                .starts_with("GET /v1/models/claude-missing HTTP/1.1\r\n"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                )
+                .await
+                .expect("response writes");
+        });
+        let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
+        provider.base_url = base_url;
+
+        assert!(!provider
+            .model_available("claude-missing")
+            .await
+            .expect("404 means unavailable"));
+        server.await.expect("server task");
     }
 
     #[tokio::test]

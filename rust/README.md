@@ -28,6 +28,7 @@ hierarchical subagent machinery from the TypeScript fork.
 | `agent-tools` | `AgentTool`, `ToolRegistry`, and builtins: `apply_patch` / `str_replace_based_edit_tool`, `Bash`, `web_search`, `web_fetch`, `LoadSkill`, and delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). | [docs/modules/agent-tools.md](docs/modules/agent-tools.md) |
 | `agent-mcp` | Session-scoped stdio and generic Streamable HTTP MCP clients, New Session inventory/selection, deterministic frozen manifests, and result normalization. | [docs/plans/mcp-client.md](docs/plans/mcp-client.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch. | [docs/modules/agent-daemon.md](docs/modules/agent-daemon.md) |
+| `agent-runtime` | `pi-runtime` host worker for managed workspaces, local tools, runtime skills, and MCP. | — |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt. | [docs/modules/agent-prompt.md](docs/modules/agent-prompt.md) |
 
 ## Build And Test
@@ -38,7 +39,7 @@ cargo test  --manifest-path rust/Cargo.toml --all
 cargo fmt   --manifest-path rust/Cargo.toml --all --check
 ```
 
-## Run The Daemon
+## Run The Services
 
 Start Postgres (any Postgres 16 works):
 
@@ -51,11 +52,11 @@ docker run -d --name pi-relay-pg \
 ```
 
 Create the required daemon policy at
-`$XDG_CONFIG_HOME/pi-relay/config.toml` (or
-`$HOME/.config/pi-relay/config.toml` when `XDG_CONFIG_HOME` is unset):
+`$XDG_CONFIG_HOME/pi-relay/agentd/config.toml` (or
+`$HOME/.config/pi-relay/agentd/config.toml` when `XDG_CONFIG_HOME` is unset):
 
 ```sh
-CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay"
+CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay/agentd"
 mkdir -p "$CONFIG_HOME"
 cat >"$CONFIG_HOME/config.toml" <<'EOF'
 database_url = "postgres://postgres:postgres@127.0.0.1:55432/pi_relay"
@@ -68,20 +69,51 @@ cargo run --manifest-path rust/Cargo.toml -p agent-daemon
 `pi-agentd` accepts no configuration arguments. The websocket endpoint is
 `ws://127.0.0.1:8787` unless `bind` changes it in `config.toml`.
 
-For the repository’s local stack, `infra/dev.sh` uses the caller's normal XDG
-config and state directories. It therefore starts the daemon with the same
-`config.toml`, optional `mcp.toml`, catalog overlay, managed workspaces, and
-OAuth state used outside the script. Configure `database_url` to the compose
-database shown above when using this local stack.
+Each runtime host has independent policy at
+`$XDG_CONFIG_HOME/pi-relay/runtime/config.toml` (or
+`$HOME/.config/pi-relay/runtime/config.toml`):
 
-### Daemon configuration and packaged catalogs
+```toml
+runtime_id = "runtime-local"
+name = "Local runtime"
+control_addr = "127.0.0.1:8786"
+workspace_root = "/home/me/.local/state/pi-runtime"
+```
+
+`pi-runtime` accepts no configuration arguments. It reads optional MCP policy
+from the sibling `pi-relay/runtime/mcp.toml`; when that file is absent, MCP is
+disabled. `workspace_root` is explicit and may point at existing managed
+workspace state.
+
+```sh
+cargo run --manifest-path rust/Cargo.toml -p agent-runtime
+```
+
+The service boundary is explicit:
+
+- `pi-agentd` owns database/frontend/runtime-listener settings, provider policy,
+  global workflows, and global subagent roles.
+- `pi-runtime` owns its identity, control address, workspace root, MCP routes,
+  MCP OAuth state, and the host/workspace skills it publishes to the control
+  plane.
+
+For the repository's local stack, `infra/dev.sh` mounts
+`infra/config/control.toml` into the control container's `pi-relay/agentd`
+configuration root and launches the host runtime with the caller's
+`pi-relay/runtime` XDG configuration. The one-time
+`infra/migrate-service-config.sh --apply` command splits the former shared
+configuration root, converts `subagent_models` entries into role-local
+`SKILL.md` frontmatter, and removes obsolete bootstrap artifacts; stop both
+processes before running it.
+
+### Daemon configuration and host catalogs
 
 General daemon configuration is read from
-`$XDG_CONFIG_HOME/pi-relay/config.toml`; when `XDG_CONFIG_HOME` is unset or
-empty, that is `$HOME/.config/pi-relay/config.toml`. In particular, a nonempty
-`XDG_CONFIG_HOME` is used directly and never gains an extra `.config`
-component. `XDG_CONFIG_HOME` and `HOME` must be absolute paths; relative
-values and parent-directory components are rejected rather than being resolved
+`$XDG_CONFIG_HOME/pi-relay/agentd/config.toml`; when `XDG_CONFIG_HOME` is unset
+or empty, that is `$HOME/.config/pi-relay/agentd/config.toml`. In particular, a
+nonempty `XDG_CONFIG_HOME` is used directly and never gains an extra `.config`
+component. `XDG_CONFIG_HOME` and `HOME` must be absolute paths; relative values
+and parent-directory components are rejected rather than being resolved
 against the daemon's working directory. The file is required, and its required
 root `database_url` must not be blank. The optional root `bind` defaults to
 `127.0.0.1:8787`. A legacy `config.json` is not read as a daemon-policy
@@ -89,13 +121,10 @@ fallback. Invalid TOML, unknown fields (including provider fields), blank
 database URLs, blank binds, and blank model names fail daemon startup rather
 than being deferred to a session or subagent.
 
-This is a breaking TOML-only migration for user-authored XDG daemon
-configuration: legacy `$XDG_CONFIG_HOME/pi-relay/config.json` and
-`mcp.json` are ignored, never converted, and never read.
-
 ```toml
 database_url = "postgres://postgres:postgres@127.0.0.1:55432/pi_relay"
 bind = "127.0.0.1:8787" # optional; this is the default
+runtime_bind = "127.0.0.1:8786" # optional; this is the default
 
 [default_parent_model]
 kind = "openai"
@@ -103,69 +132,71 @@ model = "gpt-5.6-sol"
 reasoning_effort = "high"
 max_tokens = 32768
 prompt_cache = { key = "my-parent-cache" }
-
-[subagent_models.reviewer]
-kind = "claude"
-model = "claude-opus-4-8"
-reasoning_effort = "high"
-
-[subagent_models."repo/reviewer"]
-kind = "openai"
-model = "gpt-5.6-sol"
-reasoning_effort = "high"
 ```
 
 The root schema is exactly `database_url`, optional `bind`, optional
-`default_parent_model`, and optional `subagent_models`. Every provider object
-keeps the normal `kind`, `model`, `reasoning_effort`, optional `max_tokens`, and
+`runtime_bind`, and optional `default_parent_model`. The provider object keeps
+the normal `kind`, `model`, `reasoning_effort`, optional `max_tokens`, and
 optional `prompt_cache` fields. If `default_parent_model` is omitted, the
 built-in parent policy is OpenAI `gpt-5.6-sol` with `high` reasoning. A new
 parent session uses an explicit `session.start.provider`, otherwise
-`default_parent_model`, otherwise that built-in policy. A child uses its
-explicit override, then the matching resolved exposed role name in
-`subagent_models` (for example
-`reviewer` or `repo/reviewer`), then its persisted parent provider. Existing
-or replayed sessions retain their persisted provider and are never retargeted
-by changed defaults.
+`default_parent_model`, otherwise that built-in policy.
+Existing or replayed sessions retain their persisted provider and are never
+retargeted by changed defaults.
 
-On first startup, the daemon bootstrap-copies its packaged
-`subagent-roles/*/SKILL.md` and `workflows/*/SKILL.md` into this configuration
-directory. It creates only absent files, never changes permissions or contents
-of existing files, and writes a completion marker so deliberately deleted
-catalog entries stay deleted on future starts. Workspace/home explicit skills
-and roles retain their current precedence. For parent workflow skills and
-subagent-role catalog entries, configured catalog files override same-named
-packaged files, while missing configured entries fall back to the package.
-Roles remain out of ordinary `LoadSkill` discovery; subagents cannot load
-workflow skills. Bootstrap opens each owned configuration component through
-no-follow directory handles, rejecting symlinked roots, catalogs, entries, and
-leaves rather than writing outside the configured configuration home. Each new
-leaf is fully written and synced to a unique hidden staging leaf in the
-already-open configuration root, then capability-published with a no-replace
-hard link. The hidden staging leaves are intentionally retained: after a
-failure their names cannot safely be deleted without risking a concurrently
-created user file.
+Global workflows and subagent roles are host configuration only:
+
+```text
+$XDG_CONFIG_HOME/pi-relay/agentd/
+├── workflows/<workflow>/SKILL.md
+└── subagent-roles/<role>/SKILL.md
+```
+
+A role-local provider policy uses optional flat frontmatter fields:
+
+```yaml
+---
+name: reviewer
+description: Review artifacts and handoffs against the objective.
+kind: claude
+model: claude-opus-4-8
+reasoning_effort: high
+---
+```
+
+Each immediate role directory must contain a valid `SKILL.md` whose frontmatter
+name exactly matches the directory name. Role model fields are validated at
+agentd startup; `kind` and `model` must appear together, while
+`reasoning_effort` and `max_tokens` are optional. A child uses an explicit
+spawn override, then its available global role provider, then OpenAI
+`gpt-5.6-sol` with `high` reasoning when that role provider is unavailable.
+Runtime-global and workspace-specific roles have no agentd-local provider file
+and therefore inherit the parent unless explicitly overridden.
+
+The daemon ships no workflow or role catalog and never creates one. Configured
+workflows are parent-only `LoadSkill` entries; configured roles remain hidden
+from ordinary `LoadSkill` discovery. Runtime home/workspace skills retain
+precedence over same-named configured workflows.
 
 Optional MCP configuration is read only from an already-existing
-`<config-root>/mcp.toml`; when it is absent, MCP is disabled. The daemon never
-creates, edits, merges, renames, or chmods that file; it is intentionally
-separate from `config.toml`. It is parsed as strict TOML. Its typed TOML shape
-and trust model are documented in [`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
-Legacy `mcp.json` is ignored and never modified.
-When that configuration contains OAuth routes, the daemon stores their
-credentials in `mcp-oauth-credentials.json` directly beneath its existing
-`$XDG_STATE_HOME/pi-relay` state root (or `~/.local/state/pi-relay` when
-`XDG_STATE_HOME` is unset). This OAuth credential state remains JSON and is
+`$XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml` on each runtime host; when it is
+absent, MCP is disabled on that runtime. The runtime never creates, edits,
+merges, renames, or chmods that file. It is parsed as strict TOML. Its typed
+TOML shape and trust model are documented in
+[`docs/plans/mcp-client.md`](docs/plans/mcp-client.md).
+When that configuration contains OAuth routes, the runtime stores their
+credentials in `mcp-oauth-credentials.json` directly beneath that runtime's
+configured `workspace_root`. This OAuth credential state remains JSON and is
 distinct from TOML-only XDG configuration. It is a plaintext file protected by
 restrictive OS directory/file permissions. A corrupt, empty, oversized, or
 unreadable file is preserved and makes only OAuth credential operations
-unavailable; unrelated stdio/bearer routes and daemon startup continue. The
-backend intentionally has no repair/migration, cross-process locking, keyring,
-or credential-database fallback.
+unavailable; unrelated stdio/bearer routes and runtime startup continue. The
+backend intentionally has no repair, cross-process locking, keyring, or
+credential-database fallback.
 For example:
 
 ```toml
-# $XDG_CONFIG_HOME/pi-relay/mcp.toml
+# $XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml
 [servers.workspace]
 enabled_tools = ["read_file", "search"]
 call_timeout_ms = 30000
@@ -234,7 +265,7 @@ The tagged `transport` object is preferred. Earlier flat stdio TOML fields
 remain accepted with the same route fingerprint so existing frozen manifests
 and configuration remain compatible.
 Bearer environment authentication remains supported. Successful static-client
-and DCR login is persisted after callback cleanup, restored across daemon
+and DCR login is persisted after callback cleanup, restored across runtime
 restart, and refreshed through rmcp with a 30-second skew. Status is
 observational:
 expired credentials with a refresh token remain OAuth-ready without consuming
@@ -252,8 +283,8 @@ one authorization URL returned by an explicit login action. The New Session
 MCP picker shows OAuth state separately from inventory, disables tools until a
 route is ready, and opens an accessible login dialog with an explicit
 authorization link, URL-copy fallback, and full-callback-URL completion.
-Automatic callback works when the browser can reach loopback on the daemon
-host. For a remote daemon, complete authorization in the browser, copy its
+Automatic callback works when the browser can reach loopback on the runtime
+host. For a remote runtime, complete authorization in the browser, copy its
 entire failed/unreachable loopback callback URL from the address bar, and paste
 that URL into the dialog. Login IDs and authorization URLs remain in memory
 only and are never written to browser storage. Logout removes only local

@@ -575,13 +575,9 @@ busy-wait/poll loop.
 
 ### Phase 4 — workflow skills
 
-- Install the drafted skills in `workflow-skills/` (see its `README.md`): add a
-  `load_global_skills_from_dir(&prompt_root.join("workflows"))` call next to the
-  existing `subagent-roles` scan in
-  `agent-daemon/src/provider_runtime/skills.rs`, and copy each
-  `workflow-skills/<name>/SKILL.md` to `workflows/<name>/SKILL.md` at the prompt
-  root. Ships: `workflow-explore`, `workflow-implement-review`,
-  `workflow-implement-review-test`, `workflow-kubernetes-e2e`.
+- Load operator-authored workflow skills from
+  `$XDG_CONFIG_HOME/pi-relay/agentd/workflows`; pi-relay ships no workflow
+  catalog.
 - Replace the `PI.md` "Subagent delegation" section with Appendix B.
 
 ### Phase 5 — UI

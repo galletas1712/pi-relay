@@ -10,7 +10,5 @@ RUN apt-get update \
 COPY --from=builder /src/rust/target/release/pi-agentd /usr/local/bin/pi-agentd
 COPY --from=builder /src/rust/target/release/pi-runtime /usr/local/bin/pi-runtime
 COPY PI.md PI.compaction.md /opt/pi-relay/
-COPY subagent-roles /opt/pi-relay/subagent-roles
-COPY workflows /opt/pi-relay/workflows
 WORKDIR /opt/pi-relay
 

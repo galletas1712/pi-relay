@@ -325,7 +325,7 @@ fn delegate_writing_task_definition() -> ToolDefinition {
             "properties": {
                 "role": {
                     "type": "string",
-                    "description": "The subagent role skill name. Use prefixed workspace role names like \"repo/reviewer\" for workspace-scoped skills; unprefixed names resolve packaged/global roles such as \"implementer\"."
+                    "description": "The subagent role skill name. Use prefixed workspace role names like \"repo/reviewer\" for workspace-scoped skills; unprefixed names resolve configured global roles such as \"implementer\"."
                 },
                 "prompt": {
                     "type": "string",
@@ -361,7 +361,7 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
                         "properties": {
                             "role": {
                                 "type": "string",
-                                "description": "The subagent role skill name. Use prefixed workspace role names like \"repo/reviewer\" for workspace-scoped skills; unprefixed names resolve packaged/global roles such as \"reviewer\"."
+                                "description": "The subagent role skill name. Use prefixed workspace role names like \"repo/reviewer\" for workspace-scoped skills; unprefixed names resolve configured global roles such as \"reviewer\"."
                             },
                             "prompt": {
                                 "type": "string",

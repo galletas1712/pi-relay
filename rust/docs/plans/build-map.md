@@ -50,7 +50,7 @@ or `stage_id` column.
 | rust/crates/agent-daemon/src/subagents.rs | subagent_list | 20-67 | Only subagent control RPC (RpcMethod::SubagentList, main.rs:290). Reads role from metadata. |
 | rust/crates/agent-daemon/src/subagents.rs | require_known_subagent | 541-559 | Scope check: child.parent_session_id matches. Reuse for stage.* scoping. |
 | rust/crates/agent-daemon/src/subagents.rs | cleanup_failed_spawn | 561-577 | Teardown on spawn failure. Model for RO snapshot GC (#2). |
-| rust/crates/agent-daemon/src/provider_runtime/skills.rs | resolve_skill_role | 107-151 | Resolves role name(+workspace)→ResolvedSkillRole; falls back to packaged subagent-roles. |
+| rust/crates/agent-daemon/src/provider_runtime/skills.rs | resolve_skill_role | 107-151 | Resolves runtime roles first, then agentd-configured global roles with optional role-local provider policy. |
 | rust/crates/agent-daemon/src/repl.rs | subagents_list/read/steer/interrupt_host | 646-712 | Control surface — Python REPL host fns, NOT RPCs. steer enqueues InputPriority::Steer. |
 | rust/crates/agent-daemon/src/repl.rs | wait_for_children_idle | 480-516 | The busy-wait `subagents.wait`; spec replaces with park+steer barrier. |
 | rust/crates/agent-daemon/src/repl.rs | parent_context_block | 580 | Spec's handoff-render example (NOT directly reusable; see transcript-render). |
@@ -90,8 +90,7 @@ read-only with respect to the parent filesystem because it runs in a disposable 
 - list() reads role_name from metadata (45-56). If subagent_type→column, list/status must read the column.
 - source-refs / fork_context / initial_context are spec-REJECTED for stages (fresh context). Full stages never receive
   sources; do not extend that path.
-- `resolve_skill_role` falls back to packaged `subagent-roles`; workflows go under `workflows/` via a SEPARATE
-  `load_global_skills_from_dir` (NOT resolved by resolve_skill_role).
+- `resolve_skill_role` falls back to agentd-configured `subagent-roles`; configured `workflows` are a separate parent-only LoadSkill catalog.
 - `require_known_subagent` gates every control path on parent match — reuse for stage.*.
 
 ### spec-drift
@@ -542,81 +541,6 @@ and `extract_final_message(&HistoryTree)->String` (unit-testable with synthetic 
 
 ---
 
-## 1.9 skills-prompt
-
-Skills = `SKILL.md` (frontmatter name/description + body) scanned under specific dirs. TWO loading paths, NOT unified.
-**(1) PROMPT INDEX:** `prompt_context` → `load_prompt_skills` → `load_skills_for_session_workspaces` scans ONLY
-`$HOME/.agents/skills/*/SKILL.md` (global) + `<outer_cwd>/<workspace_dir>/.agents/skills/*/SKILL.md` (tagged) →
-`PromptContext.skills` → `skills_index_xml` → `{{ skills.index }}` in PI.md. **(2) PACKAGED-ROLE:** `resolve_skill_role`
-falls back to `load_packaged_role_skills` → `load_global_skills_from_dir(prompt_root.join("subagent-roles"))` ONLY when no
-workspace skill matches. `subagent-roles/*` are DELIBERATELY EXCLUDED from the index (test prompt.rs:367) and from
-LoadSkill. `prompt_root` computed once at startup by `find_prompt_root` (main.rs:107) walking ancestors for PI.md =
-repo root `/home/schwinns/pi-relay-wf`.
-
-### key_locations
-| path | symbol | lines | role |
-|---|---|---|---|
-| rust/crates/agent-daemon/src/provider_runtime/skills.rs | load_packaged_role_skills / packaged_role / resolve_skill_role | 107-161 | Packaged-role loader. load_packaged_role_skills(153-155) = scan call site to add workflows next to. |
-| rust/crates/agent-daemon/src/provider_runtime/skills.rs | load_skill_output_with_home | 35-83 | LoadSkill resolution. NO packaged/workflows fallback today. Must extend for LoadSkill to load workflow-*. |
-| rust/crates/agent-daemon/src/provider_runtime/prompt.rs | load_prompt_skills / load_skills_for_session_workspaces / load_global_skills_from_dir | 81-83, 105-116 | Prompt-index loader. load_prompt_skills(81-83)=call site to extend for index visibility. |
-| rust/crates/agent-daemon/src/provider_runtime/prompt.rs | prompt_context | 39-62 | skills: load_prompt_skills(config) at 60. Does NOT receive prompt_root today (gotcha). |
-| rust/crates/agent-daemon/src/provider_runtime/prompt.rs | subagent_role_defaults_are_not_prompt_skills (test) | 367-394 | Asserts roles NOT in index. Add analogous test asserting workflows ARE. |
-| rust/crates/agent-prompt/src/lib.rs | skills_index_xml | 236-264 | Renders <available_skills> XML; workflow-* render as untagged global. |
-| rust/crates/agent-prompt/src/lib.rs | Skill::global / Skill::workspace / struct Skill | 36-80 | {workspace:Option,name,description,file_path}. |
-| rust/crates/agent-daemon/src/main.rs | find_prompt_root | 66, 107-117 | Computes prompt_root = /home/schwinns/pi-relay-wf. Stored in AppState.prompt_root (state.rs:36). |
-| /home/schwinns/pi-relay-wf/PI.md | ## Subagent delegation | 40-64 | REPLACE wholesale with Appendix B (spec 660-697). |
-| /home/schwinns/pi-relay-wf/PI.md | ## Skills ({{ skills.index }}) | 66-79 | Workflow-* surface here once index wired. |
-| /home/schwinns/pi-relay-wf/subagent-roles/ | explore..worker | n/a | Packaged roles at repo root. New workflows/ sits alongside. |
-| /home/schwinns/pi-relay-wf/rust/docs/plans/workflow-skills/ | workflow-{explore,implement-review,implement-review-test,kubernetes-e2e} | n/a | Source drafts to copy to <prompt_root>/workflows/<name>/SKILL.md. |
-
-### build_seams
-**1. Install (data move):** copy each draft to `/home/schwinns/pi-relay-wf/workflows/<name>/SKILL.md` (repo root, NOT
-under rust/). Frontmatter already valid.
-
-**2. Wire loader — TWO call sites (README understates as one):**
-- Role-spawn fallback (the README's single line) in load_packaged_role_skills (skills.rs:153): add
-  `load_global_skills_from_dir(&prompt_root.join("workflows"))`. This alone does NOT make them index-visible/LoadSkill-able.
-- **(a) Index:** extend load_prompt_skills (prompt.rs:81), thread prompt_root (available via AppState.prompt_root):
-  ```rust
-  fn load_prompt_skills(prompt_root: &Path, config: &SessionConfig) -> Vec<Skill> {
-      let mut skills = load_skills_for_session_workspaces(&PathBuf::from(&config.outer_cwd), &config.workspaces);
-      skills.extend(load_global_skills_from_dir(&prompt_root.join("workflows")));
-      skills
-  }
-  ```
-  call at line 60 as `load_prompt_skills(&state.prompt_root, config)`.
-- **(b) LoadSkill:** extend load_skill_output_with_home (skills.rs:62) — when no workspace/home skill matches and
-  `workspace` arg is None, also search `load_global_skills_from_dir(prompt_root.join("workflows"))`. This fn does NOT
-  receive prompt_root today — thread it from the LoadSkill dispatch call site (search runtime dispatch for
-  `load_skill_result`).
-Keep `subagent-roles` index-hidden (only add `workflows/`).
-
-**3. Rewrite PI.md** lines 40-64 (entire `## Subagent delegation`, ending before `{% if skills.index %}` at 66) verbatim
-with Appendix B body (spec 665-696, drop fences). Leave the `## Skills` block intact.
-
-**4. Tests:** mirror subagent_role_defaults_are_not_prompt_skills but asserting workflows/<name> DOES appear; LoadSkill
-test follows load_skill_result_loads_content_once (skills.rs:191).
-
-### gotchas
-- README/spec line 284 claim a SINGLE loader line makes workflows index-visible + LoadSkill-able — FALSE. The single
-  line only touches role-spawn fallback. Index (prompt.rs:81) and LoadSkill (skills.rs:35) have NO packaged fallback.
-- load_skill_output_with_home AND load_prompt_skills do NOT receive prompt_root — both must be threaded it.
-- workflows/ must live at the actual repo root /home/schwinns/pi-relay-wf/workflows/, NOT under rust/. Drafts at
-  rust/docs/plans/workflow-skills/ are deliberately outside any scanned dir.
-- `workflow-` prefix avoids shadowing role skills (explore vs workflow-explore). Keep the prefix.
-- load_global_skills_from_dir scans one level: <dir>/<child>/SKILL.md. Flat workflows/SKILL.md ignored.
-- Workflow skills render as GLOBAL (untagged) skills.
-- Appendix B references delegation tools — do NOT apply PI.md rewrite before
-  Phases 1-3 land (spec line 662).
-
-### spec-drift
-- Spec line 477 locates resolve_skill_role in agent-daemon/src/subagents.rs — it's actually in
-  provider_runtime/skills.rs:107 (MOVED/misattributed).
-- README/spec single-loader-line claim is FALSE (see gotchas).
-- workflows/ dir does not yet exist at repo root.
-
----
-
 ## 1.10 harness-and-creds
 
 The "dev harness" is NOT a fake provider — it's a per-session flag + two RPCs. A session opts in via metadata
@@ -640,7 +564,7 @@ auth.rs:21-35). A fresh empty DB needs NOTHING seeded for auth.
 | rust/crates/agent-daemon/src/auth.rs | refresh_codex_credentials | 141-189 | On Codex 401, refresh via OAuth refresh_token, rewrite auth.json. |
 | rust/crates/agent-daemon/src/provider_runtime/connections.rs | ProviderConnectionRegistry / provider_for_config | 41-157 | In-memory per-session cache (HashMap), NOT a DB connections table. OpenAi needs codex_access_token; Anthropic needs anthropic_api_key. |
 | rust/crates/agent-daemon/src/provider_runtime/requests.rs | complete_model_request | 65-74 | Real dispatch: Credentials::load() then provider_for_config then complete_with_auth_retry (creds re-read every time). |
-| rust/crates/agent-daemon/src/config.rs | Config::from_env_and_args | startup policy | Reads required XDG `config.toml` root `database_url`, optional `bind` (default `127.0.0.1:8787`), and model policy. The daemon accepts no configuration arguments. |
+| rust/crates/agent-daemon/src/config.rs | Config::from_env_and_args | startup policy | Reads required XDG `pi-relay/agentd/config.toml` root `database_url`, optional `bind` (default `127.0.0.1:8787`), and parent-model policy. Role-model policy is loaded from each global role skill's frontmatter. The daemon accepts no configuration arguments. |
 | rust/crates/agent-daemon/src/main.rs | main | 55-82 | Boot: Config → connect → migrate → ProviderConnectionRegistry::new → TcpListener::bind. WebSocket RPC server. |
 | rust/crates/agent-provider/src/openai.rs | OpenAiModelCatalogCache / ModelProvider::model_metadata | provider adapter | Authenticated account-scoped private Codex catalog; exact model/effort validation and OpenAI threshold policy. |
 | rust/crates/agent-store/src/postgres/sessions_tests.rs | test_store / TestDb | 14-63 | Integration-test convention: gate PI_RELAY_TEST_DATABASE_URL, create unique DB, migrate, drop. |
@@ -767,7 +691,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 
 ---
 
-# 2. Net-new pieces #1–#7 → seam mapping
+# 2. Net-new pieces #1–#6 → seam mapping
 
 | # | Net-new item | Exact seam(s) / files |
 |---|---|---|
@@ -777,7 +701,6 @@ feed desiredSessionIds (App.tsx:1062-1064).
 | **#4** | Delegation model-facing tools + dispatch + 3 guards | Declare in `agent-tools/src/registry.rs:335-376` (register_runtime_tool, 4 `*_definition()` fns). Intercept by name in `runtime/tool.rs:58-90` (is_stage_tool_name/run_stage_tool). Engine reuses spawn_subagent (subagents.rs:191). Guards in run_stage_tool: homogeneity/single-full (structural), one-stage-per-parent (`parent_has_running_stage`), reject terminal/out-of-scope steer targets while permitting running read-only subagents. Update broken registry tests (476,516). Optionally register stage.* web RPCs in RpcMethod (types.rs:82-121) for UI/tests. |
 | **#5** | Handoff writer (transcript.md + final_message.md; inspect_delegation snapshot) | New module (e.g. `agent-daemon/src/handoff.rs`): `render_transcript_markdown(&HistoryTree)` + `extract_final_message(&HistoryTree)`, reading `active_branch(child)` (transcript.rs:328, Ui mode). Path `<parent.outer_cwd>/.pi-handoff/<stage_id>/<subagent>/` via load_session_config(parent).outer_cwd. Run inside the barrier (Section #6). `inspect_delegation` carries role/status/outcome/paths per subagent. |
 | **#6** | Barrier → typed daemon wakeup hook in subagent-lifecycle path | Stage runner `on_subagent_terminal`/`try_stage_barrier` on SessionDriver, called at the three try_subagent_parent_idle_event call sites (`runtime/mod.rs:211,359,420`). Barrier: lock stage row (stages.rs CAS, FOR UPDATE) → all-subagents-terminal predicate → finish_stage CAS (running→done|done_with_failures from TurnOutcome) → render handoff (#5) → ONE typed daemon observation queued at `InputPriority::Steer` to parent. SUPPRESS per-child idle notification for stage members. Wire stage_runner into AppState (state.rs:30). |
-| **#7** | Workflow skills installed + discoverable + PI.md rewrite | Copy 4 drafts to `/home/schwinns/pi-relay-wf/workflows/<name>/SKILL.md`. THREE loader edits: load_packaged_role_skills (skills.rs:153, role fallback), load_prompt_skills (prompt.rs:81, index — thread prompt_root), load_skill_output_with_home (skills.rs:62, LoadSkill — thread prompt_root). Rewrite PI.md:40-64 with Appendix B (AFTER Phases 1-3). |
 
 ---
 
@@ -811,14 +734,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 - `agent-daemon/src/main.rs:59` — sweep_running_stages on boot.
 - Deterministic harness tests scripting harness.model.complete sequences.
 
-**Phase 4 — workflow skills + PI.md**
-- Copy drafts → `/home/schwinns/pi-relay-wf/workflows/<name>/SKILL.md`.
-- `agent-daemon/src/provider_runtime/skills.rs` — load_packaged_role_skills (153) + load_skill_output_with_home (62, thread prompt_root).
-- `agent-daemon/src/provider_runtime/prompt.rs` — load_prompt_skills (81, thread prompt_root) + call site (60).
-- `PI.md` — rewrite lines 40-64 with Appendix B (ONLY after Phases 1-3).
-- Tests: index visibility + LoadSkill.
-
-**Phase 5 — web Agents outline (supersedes the run-board presentation above)**
+**Phase 4 — web Agents outline (supersedes the run-board presentation above)**
 - `packages/web/src/types.ts` — Stage types + stage_id/subagent_type on SessionSummary/Snapshot.
 - `packages/web/src/agentApi.ts` — stage facade methods.
 - `packages/web/src/queryKeys.ts` — stages/stage keys.
@@ -837,7 +753,7 @@ is NO connections table, NO auth/login RPC, and no daemon configuration CLI flag
 `ProviderConnectionRegistry` (connections.rs) is an in-memory cache, not a DB table.
 
 **To let a brand-new daemon (fresh empty DB) make real GPT + Claude calls:**
-1. **Launch:** create XDG `pi-relay/config.toml` with `database_url` (and optional `bind`), then run `pi-agentd` with no arguments. `store.migrate()` fully
+1. **Launch:** create XDG `pi-relay/agentd/config.toml` with `database_url` (and optional `bind`), then run `pi-agentd` with no arguments. `store.migrate()` fully
    provisions the empty DB (idempotent create-table-if-not-exists); no auth tables involved. Daemon is a WebSocket RPC
    server (ws://<bind>).
 2. **GPT / OpenAI:** ensure the daemon process sees a Codex ChatGPT OAuth token — either `~/.codex/auth.json` with

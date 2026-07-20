@@ -28,7 +28,8 @@ use crate::codec::{
 use crate::config::Config;
 use crate::provider_runtime::{
     current_pi_template, effective_prompt_profile, mcp_snapshot_for_session,
-    provider_tools_for_session, PromptProfile, ProviderConnectionRegistry, SessionTitleScheduler,
+    provider_tools_for_session, validate_global_role_catalog, PromptProfile,
+    ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::*;
 use crate::runtime_hosts::RuntimeRegistry;
@@ -62,8 +63,8 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
+    validate_global_role_catalog(&config.config_root)?;
     let prompt_root = find_prompt_root(std::env::current_dir()?)?;
-    config.bootstrap_catalog(&prompt_root)?;
     let repo = Arc::new(PostgresAgentStore::connect(&config.database_url).await?);
     repo.migrate().await?;
 

@@ -24,9 +24,7 @@ main.rs            websocket accept + JSON-RPC routing + most RPC handlers
 session_start.rs   explicit session-start pipeline: workspace materialization,
                    MCP selection validation, prompt render, atomic
                    session/manifest/output persist, initial dispatch
-config.rs          strict XDG daemon startup policy, model defaults,
-                   and one-time non-overwriting packaged role/workflow
-                   bootstrap
+config.rs          strict XDG daemon startup policy and parent-model default
 types.rs           RpcRequest/Response/Error, RpcMethod parse table, DispatchAction, RuntimeSession
 state.rs           AppState: repo handle, active sessions, driver locks, task registry,
                    event broadcaster, tool registry, provider connections, runtime hosts
@@ -41,7 +39,7 @@ provider_runtime/  provider selection, model metadata scheduling, model/web-tool
                    execution, compaction, token accounting
                    (MCP snapshot reconstruction from the persisted session manifest)
 subagents.rs       delegation subagent spawn core: role resolution, full vs
-                   read-only workspace handling, configured role-model selection,
+                   read-only workspace handling, role-local model selection,
                    child prompt + lifecycle events
 delegation_tools.rs     delegation tool surface (delegate_writing_task /
                    delegate_readonly_tasks / inspect_delegation /
@@ -57,22 +55,21 @@ handoff.rs         renders per-subagent task_prompt.md / final_message.md /
 ```
 
 `config.rs` resolves the general configuration root as
-`$XDG_CONFIG_HOME/pi-relay` or `$HOME/.config/pi-relay`. It parses only the
-required strict `config.toml` startup-policy schema: root `database_url`,
-optional `bind`, an optional default parent provider, and per-resolved-role
-subagent providers. `pi-agentd` accepts no configuration arguments. A legacy
-`config.json` is never a policy fallback, and invalid configuration fails
-startup.
-This is a breaking TOML-only migration for user-authored XDG daemon
-configuration: legacy `config.json` and `mcp.json` are ignored rather than
-converted or read. MCP server definitions (`mcp.toml`) and OAuth credentials
+`$XDG_CONFIG_HOME/pi-relay/agentd` or `$HOME/.config/pi-relay/agentd`. It
+parses only the required strict `config.toml` startup-policy schema: root
+`database_url`, optional frontend `bind`, optional `runtime_bind`, an optional
+default parent provider. `pi-agentd` accepts no configuration arguments.
+Invalid configuration fails startup. Global roles live only under
+`agentd/subagent-roles/<role>/`; each directory requires a same-named
+`SKILL.md`, whose optional provider frontmatter selects that role's model.
+Unavailable role providers fall back to OpenAI `gpt-5.6-sol` with high
+reasoning. Runtime and workspace roles instead inherit their parent's provider
+unless explicitly overridden when spawned. Global workflows likewise live only under
+`agentd/workflows`; the repository packages no workflow or role fallback.
+Runtime home/workspace skills take precedence over same-named configured
+workflows, and roles remain hidden from ordinary `LoadSkill`. MCP server
+definitions (`$XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml`) and OAuth credentials
 live on each runtime host (see `agent-runtime`), not in the control plane.
-Startup copy-bootstraps bundled
-role/workflow `SKILL.md` files only when absent and then records completion, so
-later deletions remain user-owned. Skill/role resolution is explicit
-workspace/home first, configured catalog second, packaged fallback last;
-workflow names are deduplicated across the latter two sources and roles remain
-hidden from ordinary `LoadSkill`.
 
 Subagent work runs as **delegations** (`delegate_writing_task` /
 `delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation` /

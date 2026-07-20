@@ -213,7 +213,10 @@ pub struct RawSkillFile {
 pub struct RuntimeCommandError {
     pub code: String,
     pub message: String,
-    #[serde(default = "empty_error_data", skip_serializing_if = "is_empty_error_data")]
+    #[serde(
+        default = "empty_error_data",
+        skip_serializing_if = "is_empty_error_data"
+    )]
     pub data: serde_json::Value,
 }
 
