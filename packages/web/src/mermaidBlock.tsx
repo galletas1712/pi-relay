@@ -1,4 +1,10 @@
 import { memo, useEffect, useRef, useState } from "react";
+import {
+	AppDialog,
+	DialogCloseButton,
+	DialogDescription,
+	DialogTitle,
+} from "./dialog.tsx";
 
 // Mermaid is large (>1MB gzipped). Load it on first use only, and share a
 // single promise across all blocks on the page.
@@ -81,7 +87,9 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
 	const [error, setError] = useState<string | null>(null);
 	const [isDark, setIsDark] = useState<boolean>(prefersDark);
 	const [shouldRender, setShouldRender] = useState(false);
+	const [expanded, setExpanded] = useState(false);
 	const sourceRef = useRef<HTMLPreElement>(null);
+	const titleRef = useRef<HTMLHeadingElement>(null);
 	const renderIdRef = useRef(0);
 
 	// Render shortly before the source scrolls into view. Once activated, keep
@@ -186,7 +194,42 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
 		);
 	}
 
+	// Only one SVG copy in the DOM at a time — Mermaid embeds gradient/marker
+	// ids that break if duplicated.
 	return (
-		<div className="mermaid-diagram" role="img" aria-label="Mermaid diagram" dangerouslySetInnerHTML={{ __html: svg }} />
+		<>
+			<button
+				type="button"
+				className="mermaid-diagram"
+				aria-label="Expand Mermaid diagram"
+				onClick={() => setExpanded(true)}
+			>
+				{!expanded ? (
+					<span className="mermaid-diagram-svg" dangerouslySetInnerHTML={{ __html: svg }} />
+				) : (
+					<span className="mermaid-diagram-placeholder" aria-hidden="true" />
+				)}
+			</button>
+			{expanded ? (
+				<AppDialog
+					className="mermaid-dialog"
+					initialFocusRef={titleRef}
+					onDismiss={() => setExpanded(false)}
+				>
+					<div className="history-dialog-head">
+						<div className="history-dialog-copy">
+							<DialogTitle ref={titleRef} tabIndex={-1}>Mermaid diagram</DialogTitle>
+							<DialogDescription className="sr-only">
+								Expanded view. Press Escape to close.
+							</DialogDescription>
+						</div>
+						<DialogCloseButton label="close Mermaid diagram" />
+					</div>
+					<div className="mermaid-dialog-body">
+						<div className="mermaid-dialog-svg" dangerouslySetInnerHTML={{ __html: svg }} />
+					</div>
+				</AppDialog>
+			) : null}
+		</>
 	);
 });

@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MermaidBlock } from "./mermaidBlock.tsx";
 
@@ -96,7 +97,7 @@ describe("MermaidBlock viewport rendering", () => {
 		expect(observer?.root).toBe(container.firstElementChild);
 		act(() => observer?.intersect(source!));
 
-		await waitFor(() => expect(screen.getByRole("img", { name: "Mermaid diagram" })).toBeTruthy());
+		await waitFor(() => expect(screen.getByRole("button", { name: "Expand Mermaid diagram" })).toBeTruthy());
 		expect(mermaid.parse).toHaveBeenCalledWith("flowchart LR; A --> B", { suppressErrors: true });
 		expect(mermaid.render).toHaveBeenCalledWith(expect.stringMatching(/^mermaid-svg-\d+$/), "flowchart LR; A --> B");
 		expect(observer?.disconnect).toHaveBeenCalledTimes(1);
@@ -135,7 +136,7 @@ describe("MermaidBlock viewport rendering", () => {
 
 		render(<MermaidBlock code="flowchart LR; A --> B" />);
 
-		await waitFor(() => expect(screen.getByRole("img", { name: "Mermaid diagram" })).toBeTruthy());
+		await waitFor(() => expect(screen.getByRole("button", { name: "Expand Mermaid diagram" })).toBeTruthy());
 		expect(mermaid.render).toHaveBeenCalledWith(expect.any(String), "flowchart LR; A --> B");
 	});
 
@@ -327,7 +328,7 @@ describe("MermaidBlock viewport rendering", () => {
 		await waitFor(() => expect(view.container.querySelector(".mermaid-source-error")).toBeTruthy());
 
 		view.rerender(<MermaidBlock code="flowchart LR; succeeding --> B" />);
-		await waitFor(() => expect(screen.getByRole("img", { name: "Mermaid diagram" })).toBeTruthy());
+		await waitFor(() => expect(screen.getByRole("button", { name: "Expand Mermaid diagram" })).toBeTruthy());
 
 		expect(view.container.querySelector(".mermaid-source-error")).toBeNull();
 		expect(mermaid.parse).toHaveBeenCalledTimes(2);
@@ -416,5 +417,50 @@ describe("MermaidBlock viewport rendering", () => {
 		resolveRender({ svg: '<svg data-source="unmounted"></svg>' });
 		await act(async () => {});
 		expect(renderView.container.innerHTML).toBe("");
+	});
+});
+
+async function renderExpandedDiagram() {
+	const user = userEvent.setup();
+	const view = render(<MermaidBlock code="flowchart LR; A --> B" />);
+	const source = view.container.querySelector(".mermaid-source");
+	const observer = MockIntersectionObserver.instances[0];
+	act(() => observer?.intersect(source!));
+	const trigger = await screen.findByRole("button", { name: "Expand Mermaid diagram" });
+	await user.click(trigger);
+	await screen.findByRole("dialog", { name: "Mermaid diagram" });
+	return { user, view, trigger };
+}
+
+describe("MermaidBlock expanded view", () => {
+	it("opens a fullscreen dialog on click with a single SVG in the DOM", async () => {
+		const { trigger } = await renderExpandedDiagram();
+
+		expect(screen.getByRole("dialog", { name: "Mermaid diagram" })).toBeTruthy();
+		expect(document.querySelectorAll(".mermaid-dialog-svg svg")).toHaveLength(1);
+		expect(document.querySelectorAll(".mermaid-diagram-svg svg")).toHaveLength(0);
+		expect(trigger.querySelector(".mermaid-diagram-placeholder")).toBeTruthy();
+	});
+
+	it("closes on Escape and restores the inline diagram", async () => {
+		const { user, trigger } = await renderExpandedDiagram();
+
+		await user.keyboard("{Escape}");
+		await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+		expect(trigger.querySelector(".mermaid-diagram-svg svg")).toBeTruthy();
+	});
+
+	it("closes on the close button", async () => {
+		const { user } = await renderExpandedDiagram();
+
+		await user.click(screen.getByRole("button", { name: "close Mermaid diagram" }));
+		await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	});
+
+	it("closes on overlay click", async () => {
+		const { user } = await renderExpandedDiagram();
+
+		await user.click(document.querySelector(".dialog-overlay") as HTMLElement);
+		await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 	});
 });

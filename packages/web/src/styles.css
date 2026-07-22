@@ -1703,6 +1703,7 @@ pre {
 
 .assistant-markdown .mermaid-diagram {
 	display: block;
+	width: 100%;
 	margin: 0.5em 0;
 	padding: 12px;
 	border: 1px solid var(--border);
@@ -1710,6 +1711,23 @@ pre {
 	background: var(--card);
 	overflow-x: auto;
 	text-align: center;
+	color: inherit;
+	font: inherit;
+	cursor: zoom-in;
+}
+
+.assistant-markdown .mermaid-diagram:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
+}
+
+.assistant-markdown .mermaid-diagram-svg,
+.assistant-markdown .mermaid-diagram-placeholder {
+	display: block;
+}
+
+.assistant-markdown .mermaid-diagram-placeholder {
+	min-height: 120px;
 }
 
 .assistant-markdown .mermaid-diagram svg {
@@ -1723,6 +1741,38 @@ pre {
 
 .assistant-markdown .mermaid-source-error {
 	border-color: color-mix(in oklch, var(--destructive) 50%, var(--border));
+}
+
+.mermaid-dialog {
+	display: flex;
+	width: calc(100vw - 48px);
+	height: calc(100vh - 48px);
+	max-height: calc(100vh - 48px);
+	flex-direction: column;
+	overflow: hidden;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-lg);
+	background: var(--card);
+	box-shadow: var(--elev-modal);
+}
+
+.mermaid-dialog-body {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow: auto;
+	padding: 16px;
+	text-align: center;
+	background: var(--background);
+}
+
+.mermaid-dialog-svg {
+	display: inline-block;
+	max-width: none;
+}
+
+.mermaid-dialog-svg svg {
+	max-width: none;
+	height: auto;
 }
 
 .thinking {
@@ -4546,15 +4596,21 @@ pre {
 
 	.history-dialog,
 	.export-dialog,
-	.rename-dialog {
+	.rename-dialog,
+	.mermaid-dialog {
 		width: 100%;
 		max-height: min(92dvh, calc(100dvh - 20px));
 		border-radius: 14px;
 	}
 
+	.mermaid-dialog {
+		height: min(92dvh, calc(100dvh - 20px));
+	}
+
 	.dialog-content.history-dialog,
 	.dialog-content.export-dialog,
-	.dialog-content.rename-dialog {
+	.dialog-content.rename-dialog,
+	.dialog-content.mermaid-dialog {
 		width: auto;
 	}
 
