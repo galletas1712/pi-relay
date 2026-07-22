@@ -247,16 +247,15 @@ async fn unavailable_credential_stores_preserve_files_and_do_not_block_stdio_rou
 #[cfg(unix)]
 #[tokio::test]
 async fn unreadable_credential_store_does_not_block_stdio_route() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = TempDir::new();
-    let path = temp.path.join("unreadable.json");
+    // Use a file as the parent rather than chmod(0): chmod-based unreadability
+    // is bypassed when the test process runs as root (for example in Docker).
+    let parent = temp.path.join("unreadable-parent");
     let bytes = br#"{"version":1,"credentials":{}}"#;
-    fs::write(&path, bytes).expect("write store");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("make store unreadable");
+    fs::write(&parent, bytes).expect("write unreadable store parent");
+    let path = parent.join("credentials.json");
     assert_unavailable_store(&path, OAuthCredentialStoreError::Io).await;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("restore permissions");
-    assert_eq!(fs::read(path).expect("unreadable store remains"), bytes);
+    assert_eq!(fs::read(parent).expect("unreadable store remains"), bytes);
 }
 
 #[tokio::test]

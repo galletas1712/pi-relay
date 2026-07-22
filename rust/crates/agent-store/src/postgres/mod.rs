@@ -9,6 +9,8 @@ mod mcp;
 mod outputs;
 mod projects;
 mod queue;
+mod queue_mutations;
+mod queue_projection;
 mod rows;
 mod runtimes;
 mod schema;
@@ -19,6 +21,11 @@ mod sql;
 mod token_usage;
 mod transcript;
 mod turn_cards;
+
+/// Maximum transcript ancestry depth accepted by recursive reads. Recursive
+/// queries fetch one sentinel row beyond this budget so malformed/cyclic data
+/// is reported instead of silently truncated.
+pub(super) const TRANSCRIPT_RECURSION_LIMIT: i64 = 10_000;
 
 pub use delegations::{
     Delegation, DelegationProgress, DelegationSubagent, DelegationSubagentOverview,

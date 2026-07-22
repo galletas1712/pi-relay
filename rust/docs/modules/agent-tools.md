@@ -120,7 +120,12 @@ table.
 - `WebFetchTool` performs a real `reqwest` GET (5-redirect limit, `ToolContext`
   timeout, `pi-relay-web-fetch/*` UA), HTML-to-text strips `script`/`style`,
   tags, and basic entities, and returns bounded text with URL/status/content-type
-  headers; an optional `prompt` is echoed for the caller's intent.
+  headers; an optional `prompt` is echoed for the caller's intent. The response
+  body is streamed into a fixed 2 MiB buffer before token/output limiting, so
+  chunked responses cannot grow memory without bound. The tool currently builds
+  a per-call reqwest client because its timeout is supplied by `ToolContext`;
+  client injection/sharing is deferred rather than changing the public context
+  and registry APIs in this cleanup batch.
 - `WebSearchTool` currently has no configured backend: it validates the query
   and returns an error `ToolResult` explaining that no web-search backend is
   wired. The provider-neutral wrapper shape lets a real backend (or a

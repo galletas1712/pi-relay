@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use agent_session::{
     ModelContext, ModelContextEntry, StoredSession, StoredTranscriptEntry, TranscriptStorageNode,
@@ -24,7 +24,7 @@ use super::queue::bump_revisions_tx;
 use super::rows::{row_to_stored_entry, row_to_transcript_entry};
 use super::sql::{lock_session_tx, stale_unfinished_actions_for_session};
 use super::turn_cards::{active_branch_turn_card_page_tx, TurnCardPage};
-use super::PostgresAgentStore;
+use super::{PostgresAgentStore, TRANSCRIPT_RECURSION_LIMIT};
 
 const DEFAULT_TRANSCRIPT_INDEX_LIMIT: i64 = 1000;
 const MAX_TRANSCRIPT_INDEX_LIMIT: i64 = 5000;
@@ -99,14 +99,14 @@ async fn active_branch_entry_records_tx(
     let query = format!(
         r#"
         with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence
+            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence, 0::bigint as depth
             from transcript_entries t
             join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
             where t.session_id = $1
 
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence, child.depth + 1
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
@@ -117,8 +117,9 @@ async fn active_branch_entry_records_tx(
                 end,
                 child.parent_id
              )
+            where child.depth <= {TRANSCRIPT_RECURSION_LIMIT}
         )
-        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}
+        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}, depth
         from branch
         order by sequence
         "#
@@ -127,7 +128,16 @@ async fn active_branch_entry_records_tx(
         .bind(session_id)
         .fetch_all(&mut **tx)
         .await?;
+    if rows
+        .iter()
+        .any(|row| row.get::<i64, _>("depth") > TRANSCRIPT_RECURSION_LIMIT)
+    {
+        return Err(anyhow!(
+            "transcript ancestry exceeds maximum depth {TRANSCRIPT_RECURSION_LIMIT}; possible cycle"
+        ));
+    }
     rows.into_iter()
+        .filter(|row| row.get::<i64, _>("depth") <= TRANSCRIPT_RECURSION_LIMIT)
         .map(|row| row_to_transcript_entry(&row))
         .collect()
 }
@@ -146,7 +156,7 @@ async fn active_branch_entry_records_between_tx(
     let query = format!(
         r#"
         with recursive card_path as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence
+            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence, 0::bigint as depth
             from transcript_entries t
             where t.session_id = $1
               and t.id = $2::text
@@ -154,7 +164,7 @@ async fn active_branch_entry_records_between_tx(
 
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence, child.depth + 1
             from transcript_entries parent
             join card_path child
               on parent.session_id = $1
@@ -166,10 +176,12 @@ async fn active_branch_entry_records_between_tx(
                 child.parent_id
              )
             where child.sequence > $3
+              and child.depth <= {TRANSCRIPT_RECURSION_LIMIT}
         )
-        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}
+        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}, depth
         from card_path
         where sequence between $3 and $4
+           or depth > {TRANSCRIPT_RECURSION_LIMIT}
         order by sequence
         "#
     );
@@ -180,19 +192,49 @@ async fn active_branch_entry_records_between_tx(
         .bind(end_sequence)
         .fetch_all(&mut **tx)
         .await?;
+    if rows
+        .iter()
+        .any(|row| row.get::<i64, _>("depth") > TRANSCRIPT_RECURSION_LIMIT)
+    {
+        return Err(anyhow!(
+            "transcript ancestry exceeds maximum depth {TRANSCRIPT_RECURSION_LIMIT}; possible cycle"
+        ));
+    }
     rows.into_iter()
+        .filter(|row| row.get::<i64, _>("depth") <= TRANSCRIPT_RECURSION_LIMIT)
         .map(|row| row_to_transcript_entry(&row))
         .collect()
 }
 
 impl PostgresAgentStore {
     pub async fn load_stored_session(&self, session_id: &str) -> Result<StoredSession> {
+        self.load_stored_session_with_body_mode(session_id, TranscriptEntryBodyMode::Full)
+            .await
+    }
+
+    pub async fn load_stored_session_ui(&self, session_id: &str) -> Result<StoredSession> {
+        self.load_stored_session_with_body_mode(session_id, TranscriptEntryBodyMode::Ui)
+            .await
+    }
+
+    async fn load_stored_session_with_body_mode(
+        &self,
+        session_id: &str,
+        body_mode: TranscriptEntryBodyMode,
+    ) -> Result<StoredSession> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read read only")
+            .execute(&mut *tx)
+            .await?;
         let session_row = sqlx::query("select active_leaf_id, metadata from sessions where id=$1")
             .bind(session_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-        let entries = self.stored_transcript_entries(session_id).await?;
+        let entries = self
+            .stored_transcript_entries(&mut tx, session_id, body_mode)
+            .await?;
+        tx.commit().await?;
         let mut metadata = BTreeMap::new();
         if let Value::Object(map) = session_row.get::<Value, _>("metadata") {
             for (key, value) in map {
@@ -468,7 +510,10 @@ impl PostgresAgentStore {
         .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         let active_leaf_id: Option<String> = session.get("active_leaf_id");
         let active_branch_entry_ids =
-            branch_entry_ids_tx(&mut tx, session_id, active_leaf_id.as_deref()).await?;
+            branch_entry_ids_tx(&mut tx, session_id, active_leaf_id.as_deref())
+                .await?
+                .into_iter()
+                .collect::<HashSet<_>>();
         let rows = sqlx::query(
             r#"
             with recursive users as materialized (
@@ -481,7 +526,7 @@ impl PostgresAgentStore {
                 limit $3 + 1
             ),
             ancestors as (
-                select u.id as source_id, u.id, u.parent_id, u.item, 0 as depth
+                select u.id as source_id, u.id, u.parent_id, u.item, 0::bigint as depth
                 from users u
 
                 union all
@@ -492,7 +537,7 @@ impl PostgresAgentStore {
                 join ancestors child
                   on parent.session_id=$1 and parent.id=child.parent_id
                 where child.item->>'type' not in ('turn_finished', 'compaction_summary')
-                  and child.depth + 1 < $4
+                  and child.depth <= $4
             ),
             contexts as (
                 select source_id,
@@ -504,12 +549,14 @@ impl PostgresAgentStore {
                            as turn_id,
                        bool_or(parent_id is null)
                            or bool_or(item->>'type' in ('turn_finished', 'compaction_summary'))
-                           as resolved
+                           as resolved,
+                       max(depth) as max_depth
                 from ancestors
                 group by source_id
             )
             select u.id, u.timestamp_ms, u.sequence,
                    contexts.target_leaf_id, contexts.turn_id, contexts.resolved,
+                   contexts.max_depth,
                    coalesce((
                        select left(string_agg(
                            left(coalesce(block->>'text', '[image]'), 160),
@@ -535,6 +582,11 @@ impl PostgresAgentStore {
         let mut next_before_sequence = None;
         for row in rows.into_iter().take(limit as usize) {
             next_before_sequence = Some(row.get::<i64, _>("sequence"));
+            if row.get::<i64, _>("max_depth") > HISTORY_TARGET_ANCESTRY_LIMIT {
+                return Err(anyhow!(
+                    "transcript ancestry exceeds maximum depth {HISTORY_TARGET_ANCESTRY_LIMIT}; possible cycle"
+                ));
+            }
             if !row.get::<bool, _>("resolved") {
                 continue;
             }
@@ -692,14 +744,18 @@ impl PostgresAgentStore {
 
     async fn stored_transcript_entries(
         &self,
+        tx: &mut Transaction<'_, Postgres>,
         session_id: &str,
+        body_mode: TranscriptEntryBodyMode,
     ) -> Result<Vec<StoredTranscriptEntry>> {
-        let rows = sqlx::query(
-            "select id, parent_id, timestamp_ms, item, provider_replay from transcript_entries where session_id=$1 order by sequence",
-        )
-        .bind(session_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let provider_replay_select = provider_replay_select(body_mode);
+        let query = format!(
+            "select id, parent_id, timestamp_ms, item, {provider_replay_select} from transcript_entries where session_id=$1 order by sequence",
+        );
+        let rows = sqlx::query(&query)
+            .bind(session_id)
+            .fetch_all(&mut **tx)
+            .await?;
         rows.into_iter()
             .map(|row| row_to_stored_entry(&row))
             .collect()
@@ -735,7 +791,7 @@ impl PostgresAgentStore {
         let query = format!(
             r#"
             with recursive branch as (
-                select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence, 0 as depth
+                select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence, 0::bigint as depth
                 from transcript_entries t
                 join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
                 where t.session_id = $1
@@ -754,13 +810,15 @@ impl PostgresAgentStore {
                     child.parent_id
                  )
                 where child.id <> $2::text
+                  and child.depth <= {TRANSCRIPT_RECURSION_LIMIT}
             ),
             base as (
-                select depth from branch where id = $2::text
+                select min(depth) as depth from branch where id = $2::text
             )
-            select branch.id, branch.parent_id, branch.timestamp_ms, branch.sequence, branch.item, {provider_replay_select}
+            select branch.id, branch.parent_id, branch.timestamp_ms, branch.sequence, branch.item, {provider_replay_select}, branch.depth
             from branch, base
             where branch.depth < base.depth
+               or branch.depth > {TRANSCRIPT_RECURSION_LIMIT}
             order by branch.depth desc
             "#
         );
@@ -769,7 +827,16 @@ impl PostgresAgentStore {
             .bind(base_leaf_id)
             .fetch_all(&self.pool)
             .await?;
+        if rows
+            .iter()
+            .any(|row| row.get::<i64, _>("depth") > TRANSCRIPT_RECURSION_LIMIT)
+        {
+            return Err(anyhow!(
+                "transcript ancestry exceeds maximum depth {TRANSCRIPT_RECURSION_LIMIT}; possible cycle"
+            ));
+        }
         rows.into_iter()
+            .filter(|row| row.get::<i64, _>("depth") <= TRANSCRIPT_RECURSION_LIMIT)
             .map(|row| row_to_transcript_entry(&row))
             .collect()
     }
@@ -973,29 +1040,40 @@ where
     let rows = sqlx::query(
         r#"
         with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence
+            select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence, 0::bigint as depth
             from transcript_entries t
             where t.session_id = $1
               and t.id = $2::text
 
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence, child.depth + 1
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
              and parent.id = child.parent_id
+            where child.depth <= $3
         )
-        select id, parent_id, timestamp_ms, item, provider_replay
+        select id, parent_id, timestamp_ms, item, provider_replay, depth
         from branch
         order by sequence
         "#,
     )
     .bind(session_id)
     .bind(leaf_id)
+    .bind(TRANSCRIPT_RECURSION_LIMIT)
     .fetch_all(executor)
     .await?;
+    if rows
+        .iter()
+        .any(|row| row.get::<i64, _>("depth") > TRANSCRIPT_RECURSION_LIMIT)
+    {
+        return Err(anyhow!(
+            "transcript ancestry exceeds maximum depth {TRANSCRIPT_RECURSION_LIMIT}; possible cycle"
+        ));
+    }
     rows.into_iter()
+        .filter(|row| row.get::<i64, _>("depth") <= TRANSCRIPT_RECURSION_LIMIT)
         .map(|row| row_to_stored_entry(&row))
         .collect()
 }
@@ -1523,10 +1601,11 @@ mod tests {
         }
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn transcript_tree_index_paginates_and_entries_include_sequence() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -1591,10 +1670,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn switch_active_leaf_can_return_branch_ids_and_sparse_bodies() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -1656,10 +1736,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn ui_transcript_projection_omits_provider_replay() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -1694,17 +1775,28 @@ mod tests {
             )
             .await
             .expect("full entries load");
+        let ui_stored = store
+            .load_stored_session_ui(session_id)
+            .await
+            .expect("ui session restore load");
+        let full_stored = store
+            .load_stored_session(session_id)
+            .await
+            .expect("full session restore load");
 
         assert!(ui_entries.entries[0].provider_replay.is_empty());
         assert_eq!(full_entries.entries[0].provider_replay.len(), 1);
+        assert!(ui_stored.entries[1].provider_replay.is_empty());
+        assert_eq!(full_stored.entries[1].provider_replay.len(), 1);
 
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn active_branch_full_projection_preserves_provider_replay() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -1770,10 +1862,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn transcript_turns_returns_full_user_and_final_assistant_entries() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -1839,10 +1932,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn transcript_turns_preserves_compaction_resume_metadata() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -1890,10 +1984,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn transcript_turns_includes_daemon_observations_in_turn_cards() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -1952,10 +2047,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn transcript_turns_pages_from_tail_and_detail_uses_card_bounds() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -2028,10 +2124,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn switch_active_leaf_returns_revisions_and_active_branch() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -2108,10 +2205,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn switch_active_leaf_rejects_queued_input_under_session_lock() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -2188,10 +2286,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn transcript_appended_event_uses_bumped_revision_and_sequence() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -2237,10 +2336,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn delegation_creation_waits_for_history_source_row_lock() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let source_session_id = "history-delegation-lock-race";

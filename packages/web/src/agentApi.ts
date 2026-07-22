@@ -619,11 +619,24 @@ class AgentApiClient implements AgentApi {
 	}
 
 	async subscribeEvents(sessionId: string, afterEventId: number | null): Promise<EventFrame[]> {
-		const result = await this.client.request<{ replayed: EventFrame[] }>("events.subscribe", {
-			session_id: sessionId,
-			after_event_id: afterEventId
-		});
-		return result.replayed;
+		const replayed: EventFrame[] = [];
+		let cursor = afterEventId;
+		while (true) {
+			const result = await this.client.request<{
+				replayed: EventFrame[];
+				has_more?: boolean;
+				next_after_event_id?: number | null;
+			}>("events.subscribe", {
+				session_id: sessionId,
+				after_event_id: cursor
+			});
+			replayed.push(...result.replayed);
+			if (!result.has_more) return replayed;
+			if (result.next_after_event_id === undefined || result.next_after_event_id === null) {
+				throw new Error("events.subscribe returned an incomplete replay without a continuation cursor");
+			}
+			cursor = result.next_after_event_id;
+		}
 	}
 
 	async unsubscribeEvents(sessionId: string): Promise<void> {

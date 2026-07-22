@@ -86,10 +86,11 @@ fn accepted_input() -> AcceptedInput {
     }
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn only_a_batch_with_no_durable_obligations_skips_the_transaction() {
     let Ok(admin_url) = std::env::var("PI_RELAY_TEST_DATABASE_URL") else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let name = format!(

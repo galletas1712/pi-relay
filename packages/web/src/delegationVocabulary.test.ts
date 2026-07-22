@@ -7,6 +7,8 @@ const activeFrontendSources = [
 	"types.ts",
 	"queryKeys.ts",
 	"delegationBoard.ts",
+	"runBoard.tsx",
+	"inspector.tsx",
 	"App.tsx",
 	"panels.tsx",
 	"styles.css",

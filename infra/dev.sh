@@ -28,7 +28,8 @@ if [ ! -d "$PI_AGENTD_CONFIG_HOME" ]; then
 fi
 export PI_AGENTD_CONFIG_HOME
 
-bun install
+# npm/package-lock.json is the canonical reproducible frontend workflow.
+npm ci
 
 # Control plane + Postgres in Docker. The runtime is a host process (below);
 # --remove-orphans clears a previously-dockerized runtime container.
@@ -58,11 +59,11 @@ fi
 ( cd packages/web && \
     VITE_PI_AGENT_WS="${TAILNET_HOST:+wss://${TAILNET_HOST}/ws}" \
     VITE_PI_ALLOWED_HOSTS="$TAILNET_HOST" \
-    bun run build )
+    npm run build --workspace @pi-relay/web )
 
 ( cd packages/web && \
     VITE_PI_ALLOWED_HOSTS="$TAILNET_HOST" \
-    bun run preview -- --port "$WEB_PORT" ) &
+    npm run preview --workspace @pi-relay/web -- --port "$WEB_PORT" ) &
 WEB_PID=$!
 
 shutdown() {

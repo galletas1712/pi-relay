@@ -22,10 +22,11 @@ struct TestDb {
     name: String,
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn create_fork_copies_full_forest_and_replay_without_mutating_source() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let store = &db.store;
@@ -349,10 +350,11 @@ async fn fork(
         .map(|_| ())
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn history_targets_page_newest_users_with_safe_bounded_previews() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let store = &db.store;
@@ -476,10 +478,11 @@ async fn history_targets_page_newest_users_with_safe_bounded_previews() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn capped_history_target_ancestry_is_omitted_and_rejected() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let store = &db.store;
@@ -543,10 +546,11 @@ async fn capped_history_target_ancestry_is_omitted_and_rejected() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn switch_and_fork_share_history_target_validation() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let store = &db.store;

@@ -1,7 +1,9 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 
-const DEFAULT_ALLOWED_HOSTS = ["odin.smelt-anaconda.ts.net"];
+// Host validation is opt-in. Deployment/tailnet hosts must be supplied via
+// VITE_PI_ALLOWED_HOSTS rather than being embedded in the repository.
+const DEFAULT_ALLOWED_HOSTS: string[] = [];
 
 export default defineConfig(({ mode }) => {
 	const env = loadEnv(mode, process.cwd(), "");

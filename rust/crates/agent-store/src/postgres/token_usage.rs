@@ -3,7 +3,7 @@ use sqlx::Row;
 
 use crate::{TokenUsageEstimate, TranscriptStorageNode};
 
-use super::PostgresAgentStore;
+use super::{PostgresAgentStore, TRANSCRIPT_RECURSION_LIMIT};
 
 impl PostgresAgentStore {
     pub async fn latest_model_token_usage_estimate(
@@ -12,17 +12,42 @@ impl PostgresAgentStore {
         leaf_id: &str,
         toolset_fingerprint: &str,
     ) -> Result<Option<TokenUsageEstimate>> {
-        let row = sqlx::query(
+        let max_path_depth: Option<i64> = sqlx::query_scalar(
             r#"
             with recursive path as (
-                select id, parent_id, 0 as depth
+                select id, parent_id, 0::bigint as depth
                 from transcript_entries
                 where session_id=$1 and id=$2::text
                 union all
                 select parent.id, parent.parent_id, path.depth + 1
                 from transcript_entries parent
                 join path on path.parent_id = parent.id
-                where parent.session_id=$1
+                where parent.session_id=$1 and path.depth <= $3
+            )
+            select max(depth) from path
+            "#,
+        )
+        .bind(session_id)
+        .bind(leaf_id)
+        .bind(TRANSCRIPT_RECURSION_LIMIT)
+        .fetch_one(&self.pool)
+        .await?;
+        if max_path_depth.is_some_and(|depth| depth > TRANSCRIPT_RECURSION_LIMIT) {
+            return Err(anyhow::anyhow!(
+                "transcript ancestry exceeds maximum depth {TRANSCRIPT_RECURSION_LIMIT}; possible cycle"
+            ));
+        }
+        let row = sqlx::query(
+            r#"
+            with recursive path as (
+                select id, parent_id, 0::bigint as depth
+                from transcript_entries
+                where session_id=$1 and id=$2::text
+                union all
+                select parent.id, parent.parent_id, path.depth + 1
+                from transcript_entries parent
+                join path on path.parent_id = parent.id
+                where parent.session_id=$1 and path.depth <= $4
             ), latest_usage as (
                 select a.result->'usage' as usage,
                     a.payload->>'context_leaf_id' as context_leaf_id,
@@ -48,7 +73,7 @@ impl PostgresAgentStore {
             join transcript_entries entry
                 on entry.session_id=$1 and entry.id = path.id
             union all
-            select null::text as id, null::text as parent_id, null::integer as depth,
+            select null::text as id, null::text as parent_id, null::bigint as depth,
                 null::jsonb as item, null::jsonb as provider_replay,
                 latest_usage.usage, latest_usage.context_leaf_id
             from latest_usage
@@ -59,6 +84,7 @@ impl PostgresAgentStore {
         .bind(session_id)
         .bind(leaf_id)
         .bind(toolset_fingerprint)
+        .bind(TRANSCRIPT_RECURSION_LIMIT)
         .fetch_all(&self.pool)
         .await?;
         let Some(first) = row.first() else {
@@ -211,10 +237,11 @@ mod tests {
             mcp_manifest: None,
         }
     }
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn latest_model_token_usage_estimate_uses_server_total_plus_suffix_after_model_item() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;

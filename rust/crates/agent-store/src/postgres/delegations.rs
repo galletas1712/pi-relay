@@ -2,6 +2,7 @@ use agent_vocab::{DaemonToolObservation, TranscriptItem, UserMessage};
 use anyhow::Result;
 use serde_json::{json, Value};
 use sqlx::{postgres::PgRow, Postgres, Row, Transaction};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::events::insert_event_tx;
@@ -34,6 +35,24 @@ pub struct Delegation {
     /// `tasks.len()` for a fan-out). The barrier never completes until exactly
     /// this many subagents exist and are all terminal.
     pub expected_subagents: i32,
+}
+
+/// Group the rows returned by the set-based child queue cancellation once.
+///
+/// Keep the database's `returning` order within each child so event payloads
+/// remain stable, while avoiding a scan of every cancelled input for every
+/// child (`O(children * cancelled_inputs)`).
+fn group_input_ids_by_session(
+    rows: impl IntoIterator<Item = (String, String)>,
+) -> HashMap<String, Vec<String>> {
+    let mut grouped = HashMap::new();
+    for (session_id, input_id) in rows {
+        grouped
+            .entry(session_id)
+            .or_insert_with(Vec::new)
+            .push(input_id);
+    }
+    grouped
 }
 
 /// A subagent session belonging to a delegation, with the fields
@@ -551,12 +570,17 @@ impl PostgresAgentStore {
         .fetch_all(&mut *tx)
         .await?;
         if !child_input_rows.is_empty() {
+            let input_ids_by_child =
+                group_input_ids_by_session(child_input_rows.into_iter().map(|row| {
+                    (
+                        row.get::<String, _>("session_id"),
+                        row.get::<String, _>("id"),
+                    )
+                }));
             for child_id in child_ids {
-                let child_input_ids = child_input_rows
-                    .iter()
-                    .filter(|row| row.get::<String, _>("session_id") == child_id)
-                    .map(|row| row.get::<String, _>("id"))
-                    .collect::<Vec<_>>();
+                let Some(child_input_ids) = input_ids_by_child.get(&child_id) else {
+                    continue;
+                };
                 if child_input_ids.is_empty() {
                     continue;
                 }

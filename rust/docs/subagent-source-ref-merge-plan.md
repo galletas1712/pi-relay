@@ -1,7 +1,7 @@
 # Subagent source-ref merge plan
 
 > **Superseded (2026-06-16).** Cross-task git source refs / daemon-side merge are
-> removed. The current design (`plans/workflow-orchestration.md`) has one durable
+> removed. The current design (`plans/archive/workflow-orchestration.md`) has one durable
 > workspace with a single writer in time: the lone *full* subagent writes the
 > parent's dirs **in place** (no merge, no adoption, no rollback in v1), while
 > *read-only (RO)* subagents run in **disposable btrfs snapshots** destroyed on

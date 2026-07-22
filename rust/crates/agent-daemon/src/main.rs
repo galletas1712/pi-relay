@@ -51,7 +51,7 @@ use agent_store::{
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream, SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
@@ -59,6 +59,8 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
+
+const BOOT_RECOVERY_CONCURRENCY: usize = 4;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -117,15 +119,26 @@ async fn main() -> Result<()> {
                     session_ids.len()
                 );
             }
-            for session_id in session_ids {
-                let driver = SessionDriver::acquire(&state, &session_id).await;
-                if let Err(error) = driver.reconcile_pending_subagent_controls().await {
+            stream::iter(session_ids.into_iter().map(|session_id| {
+                let state = state.clone();
+                async move {
+                    let driver = SessionDriver::acquire(&state, &session_id).await;
+                    (
+                        session_id,
+                        driver.reconcile_pending_subagent_controls().await,
+                    )
+                }
+            }))
+            .buffer_unordered(BOOT_RECOVERY_CONCURRENCY)
+            .for_each(|(session_id, result)| async move {
+                if let Err(error) = result {
                     eprintln!(
                         "boot combined-control reconciliation failed session={session_id}: {}: {}",
                         error.code, error.message
                     );
                 }
-            }
+            })
+            .await;
         }
         Err(error) => eprintln!("failed to sweep recoverable subagent controls on boot: {error:#}"),
     }
@@ -391,13 +404,36 @@ async fn handle_socket(state: AppState, stream: TcpStream) -> Result<()> {
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         for session_id in subscriptions.clone() {
                             let after = event_high_water.get(&session_id).copied();
-                            let missed = state.repo.events_after(&session_id, after).await?;
-                            for event in missed {
-                                if event.event_id <= event_high_water.get(&session_id).copied().unwrap_or_default() {
-                                    continue;
+                            let mut cursor = after;
+                            loop {
+                                let page = state
+                                    .repo
+                                    .events_after_page(&session_id, cursor, None)
+                                    .await?;
+                                let next_cursor = page.next_after_event_id;
+                                for event in page.events {
+                                    if event.event_id
+                                        <= event_high_water
+                                            .get(&session_id)
+                                            .copied()
+                                            .unwrap_or_default()
+                                    {
+                                        continue;
+                                    }
+                                    event_high_water.insert(session_id.clone(), event.event_id);
+                                    writer
+                                        .send(Message::Text(
+                                            serde_json::to_string(&event)?.into(),
+                                        ))
+                                        .await?;
                                 }
-                                event_high_water.insert(session_id.clone(), event.event_id);
-                                writer.send(Message::Text(serde_json::to_string(&event)?.into())).await?;
+                                if !page.has_more {
+                                    break;
+                                }
+                                cursor = Some(
+                                    next_cursor
+                                        .expect("event replay page with more rows has a cursor"),
+                                );
                             }
                         }
                         continue;
@@ -1114,22 +1150,39 @@ async fn events_subscribe(
                 loaded_ms.saturating_sub(recovered_ms),
             );
         }
-        return Ok(json!({ "replayed": [] }));
+        return Ok(json!({
+            "replayed": [],
+            "has_more": false,
+            "next_after_event_id": null,
+        }));
     };
-    event_high_water.insert(session_id.clone(), after_event_id);
-    let events = state
+    let current_high_water = event_high_water
+        .get(&session_id)
+        .copied()
+        .unwrap_or_default();
+    event_high_water.insert(session_id.clone(), current_high_water.max(after_event_id));
+    let page = state
         .repo
-        .events_after(&session_id, Some(after_event_id))
+        .events_after_page(&session_id, Some(after_event_id), None)
         .await?;
     let loaded_ms = started_at.elapsed().as_millis();
-    let replayed_count = events.len();
-    let replayed_max = events
+    let replayed_count = page.events.len();
+    let replayed_max = page
+        .events
         .iter()
         .map(|event| event.event_id)
         .max()
         .unwrap_or(after_event_id);
-    event_high_water.insert(session_id.clone(), replayed_max);
-    let value = json!({ "replayed": events });
+    let current_high_water = event_high_water
+        .get(&session_id)
+        .copied()
+        .unwrap_or_default();
+    event_high_water.insert(session_id.clone(), current_high_water.max(replayed_max));
+    let value = json!({
+        "replayed": page.events,
+        "has_more": page.has_more,
+        "next_after_event_id": page.next_after_event_id,
+    });
     let total_ms = started_at.elapsed().as_millis();
     if perf_logging_enabled() {
         eprintln!(
@@ -1759,7 +1812,7 @@ async fn history_context(state: &AppState, params: Value) -> std::result::Result
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.recover_if_needed().await?;
     let leaf_id = params.get("leaf_id").and_then(Value::as_str);
-    let stored = state.repo.load_stored_session(&session_id).await?;
+    let stored = state.repo.load_stored_session_ui(&session_id).await?;
     let store = transcript_store_from_stored(&stored)?;
     let items = leaf_id
         .map(|leaf_id| {
