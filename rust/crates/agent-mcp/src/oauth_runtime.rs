@@ -151,6 +151,10 @@ impl OAuthRuntimeManager {
             .as_ref()
             .and_then(McpHttpAuthConfig::oauth)
             .ok_or(OAuthRouteFailure::Unsupported)?;
+        // An unavailable credential backend is an operational failure, not an
+        // empty store. Do not perform discovery or report LoginRequired while
+        // persisted OAuth state cannot be read.
+        self.store_available()?;
         let key = format!("{server_id}\u{0}{}", config.url);
         if let Some(slot) = self.slots.lock().await.get(&key).cloned() {
             let slot = slot.lock().await;

@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 use sqlx::{Executor, Postgres, Row, Transaction};
 
 use crate::{
-    EventFrame, EventType, SessionActivity, TranscriptEntryBodyMode, TranscriptEntryRecord,
+    EventFrame, EventReplayPage, EventType, SessionActivity, TranscriptEntryBodyMode,
+    TranscriptEntryRecord,
 };
 
 use super::action_records::{action_payload, ActionKey};
@@ -16,6 +17,9 @@ use super::transcript::{
     session_state_for_event_tx, transcript_entry_record_tx, tree_node_from_entry, SessionEventState,
 };
 use super::PostgresAgentStore;
+
+pub const DEFAULT_EVENT_REPLAY_PAGE_LIMIT: i64 = 500;
+pub const MAX_EVENT_REPLAY_PAGE_LIMIT: i64 = 1000;
 
 impl PostgresAgentStore {
     pub async fn last_event_id(&self, session_id: &str) -> Result<i64> {
@@ -148,15 +152,110 @@ impl PostgresAgentStore {
         session_id: &str,
         after: Option<i64>,
     ) -> Result<Vec<EventFrame>> {
+        let mut after = after.unwrap_or(0);
+        let mut events = Vec::new();
+        loop {
+            let page = self
+                .events_after_page(session_id, Some(after), None)
+                .await?;
+            let Some(last) = page.events.last() else {
+                break;
+            };
+            after = last.event_id;
+            events.extend(page.events);
+            if !page.has_more {
+                break;
+            }
+        }
+        Ok(events)
+    }
+
+    /// Read one bounded replay page. The extra row detects continuation
+    /// without loading an unbounded reconnect response into memory.
+    pub async fn events_after_page(
+        &self,
+        session_id: &str,
+        after: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<EventReplayPage> {
         let after = after.unwrap_or(0);
+        let limit = limit
+            .unwrap_or(DEFAULT_EVENT_REPLAY_PAGE_LIMIT)
+            .clamp(1, MAX_EVENT_REPLAY_PAGE_LIMIT);
         let rows = sqlx::query(
-            "select id, session_id, type, payload from events where session_id=$1 and id>$2 order by id",
+            r#"
+            select id, session_id, type, payload
+            from events
+            where session_id=$1 and id>$2
+            order by id
+            limit $3
+            "#,
         )
         .bind(session_id)
         .bind(after)
+        .bind(limit.saturating_add(1))
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(row_to_event).collect()
+        let events = rows
+            .into_iter()
+            .map(row_to_event)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(bounded_event_page(events, limit as usize))
+    }
+}
+
+fn bounded_event_page(mut events: Vec<EventFrame>, limit: usize) -> EventReplayPage {
+    let has_more = events.len() > limit;
+    events.truncate(limit);
+    let next_after_event_id = has_more.then(|| {
+        events
+            .last()
+            .expect("a page with more rows contains at least one event")
+            .event_id
+    });
+    EventReplayPage {
+        events,
+        next_after_event_id,
+        has_more,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_event_page_reports_a_continuation_without_dropping_order() {
+        let frames = (1..=3)
+            .map(|event_id| EventFrame {
+                event_id,
+                event: EventType::SessionIdle,
+                session_id: "session".to_string(),
+                data: Value::Null,
+            })
+            .collect();
+        let page = bounded_event_page(frames, 2);
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_after_event_id, Some(2));
+
+        let final_page = bounded_event_page(
+            vec![EventFrame {
+                event_id: 3,
+                event: EventType::SessionIdle,
+                session_id: "session".to_string(),
+                data: Value::Null,
+            }],
+            2,
+        );
+        assert!(!final_page.has_more);
+        assert_eq!(final_page.next_after_event_id, None);
     }
 }
 

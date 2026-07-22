@@ -10,11 +10,12 @@ type MermaidApi = {
 
 let mermaidPromise: Promise<MermaidApi> | null = null;
 let currentTheme: "default" | "dark" | null = null;
+let mermaidOperationQueue: Promise<void> = Promise.resolve();
 const MERMAID_VIEWPORT_MARGIN = "600px 0px";
 
 function loadMermaid(theme: "default" | "dark"): Promise<MermaidApi> {
 	if (!mermaidPromise) {
-		mermaidPromise = import("mermaid").then((mod) => {
+		const importedPromise = import("mermaid").then((mod) => {
 			const api = (mod.default ?? mod) as unknown as MermaidApi;
 			api.initialize({
 				startOnLoad: false,
@@ -25,7 +26,18 @@ function loadMermaid(theme: "default" | "dark"): Promise<MermaidApi> {
 			currentTheme = theme;
 			return api;
 		});
-		return mermaidPromise;
+		const loadingPromise = importedPromise.catch((error: unknown) => {
+			// A failed import must not poison every later Mermaid block. Only
+			// clear state if this is still the active load; a later retry may
+			// already have replaced it.
+			if (mermaidPromise === loadingPromise) {
+				mermaidPromise = null;
+				currentTheme = null;
+			}
+			throw error;
+		});
+		mermaidPromise = loadingPromise;
+		return loadingPromise;
 	}
 	return mermaidPromise.then((api) => {
 		if (currentTheme !== theme) {
@@ -39,6 +51,16 @@ function loadMermaid(theme: "default" | "dark"): Promise<MermaidApi> {
 		}
 		return api;
 	});
+}
+
+function enqueueMermaidOperation<T>(operation: () => Promise<T>): Promise<T> {
+	const result = mermaidOperationQueue.then(operation);
+	// Keep the queue usable after either a successful or failed operation.
+	mermaidOperationQueue = result.then(
+		() => undefined,
+		() => undefined,
+	);
+	return result;
 }
 
 function prefersDark(): boolean {
@@ -113,15 +135,17 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
 		const theme = isDark ? "dark" : "default";
 		let cancelled = false;
 
-		loadMermaid(theme)
-			.then(async (api) => {
-				// parse() in suppressErrors mode resolves to a falsy value when
-				// the input isn't a valid diagram yet (common while streaming).
-				const ok = await api.parse(trimmed, { suppressErrors: true });
-				if (cancelled || runId !== renderIdRef.current) return null;
-				if (!ok) return null;
-				return api.render(domId, trimmed);
-			})
+		enqueueMermaidOperation(async () => {
+			const api = await loadMermaid(theme);
+			if (cancelled || runId !== renderIdRef.current) return null;
+
+			// parse() in suppressErrors mode resolves to a falsy value when
+			// the input isn't a valid diagram yet (common while streaming).
+			const ok = await api.parse(trimmed, { suppressErrors: true });
+			if (cancelled || runId !== renderIdRef.current) return null;
+			if (!ok) return null;
+			return api.render(domId, trimmed);
+		})
 			.then((result) => {
 				if (cancelled || runId !== renderIdRef.current) return;
 				if (!result) {

@@ -128,10 +128,11 @@ async fn create_session(
         .expect("session creates");
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn session_manifest_persists_atomically_reloads_and_children_reuse_it() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let binding = empty_binding();
@@ -231,10 +232,11 @@ async fn session_manifest_persists_atomically_reloads_and_children_reuse_it() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn child_manifest_mismatch_rolls_back_session_and_manifest_install() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     create_session(&db.store, "mcp-free-parent", &config(None), None, None).await;
@@ -272,10 +274,11 @@ async fn child_manifest_mismatch_rolls_back_session_and_manifest_install() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn legacy_null_is_explicitly_mcp_free_and_session_delete_releases_reference() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     create_session(&db.store, "legacy", &config(None), None, None).await;
@@ -311,10 +314,11 @@ async fn legacy_null_is_explicitly_mcp_free_and_session_delete_releases_referenc
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn content_address_collision_rolls_back_session_creation() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let binding = empty_binding();

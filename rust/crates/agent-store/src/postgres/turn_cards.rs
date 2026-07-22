@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use sqlx::{Postgres, Row, Transaction};
 
+use super::TRANSCRIPT_RECURSION_LIMIT;
 use crate::{TranscriptEntryRecord, TurnCardRecord, TurnCardStatus};
 
 #[derive(Debug, Default)]
@@ -42,6 +43,7 @@ async fn active_branch_turn_card_rows_tx(
                    t.timestamp_ms,
                    t.item,
                    t.sequence,
+                   0::bigint as depth,
                    case
                      when t.item->>'type' = 'turn_started' then 1
                      else 0
@@ -58,6 +60,7 @@ async fn active_branch_turn_card_rows_tx(
                    parent.timestamp_ms,
                    parent.item,
                    parent.sequence,
+                   child.depth + 1,
                    child.boundary_count
                      + case
                          when parent.item->>'type' = 'turn_started' then 1
@@ -74,6 +77,7 @@ async fn active_branch_turn_card_rows_tx(
                 child.parent_id
              )
             where child.boundary_count < $3
+              and child.depth <= $4
         ),
         card_rows as (
             select id,
@@ -81,6 +85,7 @@ async fn active_branch_turn_card_rows_tx(
                    timestamp_ms,
                    item,
                    sequence,
+                   depth,
                    sum(
                      case
                        when item->>'type' = 'turn_started' then 1
@@ -88,7 +93,8 @@ async fn active_branch_turn_card_rows_tx(
                      end
                    ) over (order by sequence rows between unbounded preceding and current row) as card_ordinal
             from branch
-            where item->>'type' in ('turn_started', 'user_message', 'assistant_message', 'tool_call_started', 'tool_result', 'turn_finished', 'compaction_summary', 'daemon_tool_observation')
+            where depth > $4
+               or item->>'type' in ('turn_started', 'user_message', 'assistant_message', 'tool_call_started', 'tool_result', 'turn_finished', 'compaction_summary', 'daemon_tool_observation')
         ),
         terminal_assistant as (
             select card_ordinal, max(sequence) as sequence
@@ -110,7 +116,8 @@ async fn active_branch_turn_card_rows_tx(
                card_rows.item->'outcome' as outcome,
                card_rows.item->>'source_leaf_id' as compaction_source_leaf_id,
                card_rows.item #>> '{last_turn_id}' as compaction_last_turn_id,
-               card_rows.item #>> '{turn_started_at_ms}' as compaction_turn_started_at_ms
+               card_rows.item #>> '{turn_started_at_ms}' as compaction_turn_started_at_ms,
+               card_rows.depth
         from card_rows
         left join terminal_assistant
           on terminal_assistant.card_ordinal = card_rows.card_ordinal
@@ -120,8 +127,18 @@ async fn active_branch_turn_card_rows_tx(
     .bind(session_id)
     .bind(before_entry_id)
     .bind(limit)
+    .bind(TRANSCRIPT_RECURSION_LIMIT)
     .fetch_all(&mut **tx)
     .await?;
+    if rows
+        .iter()
+        .any(|row| row.get::<i64, _>("depth") > TRANSCRIPT_RECURSION_LIMIT)
+    {
+        return Err(anyhow!(
+            "transcript ancestry exceeds maximum depth {}; possible cycle",
+            TRANSCRIPT_RECURSION_LIMIT
+        ));
+    }
     rows.into_iter().map(|row| turn_card_row(&row)).collect()
 }
 

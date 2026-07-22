@@ -1092,10 +1092,11 @@ mod tests {
         config
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn tool_claim_is_a_single_pending_to_running_transition_with_one_start_event() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -1162,10 +1163,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn cancel_unfinished_session_work_marks_compaction_idle_without_active_runtime() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -1202,10 +1204,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn cancel_unfinished_session_work_marks_model_and_tool_interrupted() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;
@@ -1251,10 +1254,11 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn cancel_unfinished_session_work_is_idempotent_after_first_cancel() {
         let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
             return;
         };
         let store = &db.store;

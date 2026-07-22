@@ -48,6 +48,39 @@ import {
 } from "./entityDialogs.tsx";
 import { randomId } from "./ids.ts";
 import {
+	backgroundSessionNeedsWarm,
+	canWarmBackgroundSession,
+	firstKnownProjectId,
+	projectIdFromEventData,
+	sessionListRefreshKey,
+	subagentStatusNeedsWarm,
+} from "./sessionInventory.ts";
+import {
+	clampSidebarWidth,
+	DEFAULT_SIDEBAR_WIDTH,
+	defaultPanelState,
+	MAX_SIDEBAR_WIDTH,
+	MEDIUM_PANEL_QUERY,
+	MIN_SIDEBAR_WIDTH,
+	panelModeForViewport,
+	saveSidebarWidth,
+	SIDEBAR_KEYBOARD_STEP,
+	WIDE_PANEL_QUERY,
+	loadSidebarWidth,
+	type PanelMode,
+} from "./panelLayout.ts";
+import {
+	initialRouteResult,
+	projectMismatchUnavailable,
+	routeConversationSessionId,
+	routeInitialSelection,
+	routeReadsEnabled,
+	routeRootUnavailable,
+	routeScope,
+	routeScopeProjectId,
+	type RouteValidationState,
+} from "./appRouting.ts";
+import {
 	Inspector,
 	NoticeStack,
 	RUN_BOARD_DEFAULT_DELEGATION_COUNT,
@@ -159,12 +192,9 @@ import {
 import {
 	browserWorkspaceRouteHistory,
 	fallbackExecutionConversation,
-	hostRouteScope,
 	legacyWorkspaceResume,
-	messageRecipient,
 	openAgentConversation,
 	parseWorkspaceRoute,
-	projectRouteScope,
 	selectRootRun,
 	showConversation,
 	unavailableConversationRoute,
@@ -173,11 +203,8 @@ import {
 	type RouteNavigation,
 	type WorkspaceRoute,
 	type WorkspaceRouteParseResult,
-	type WorkspaceRouteUnavailable,
 } from "./workspaceRoute.ts";
 import type {
-	Activity,
-	DelegationSubagent,
 	EventFrame,
 	ErrorNotice,
 	McpInventory,
@@ -205,60 +232,8 @@ const DELETED_EVENT_UNSUBSCRIBE_RETRY_DELAYS_MS = [250, 750] as const;
 const TRANSCRIPT_TURN_PAGE_SIZE = 50;
 const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
 const SIDEBAR_CLOSE_BEFORE_SELECT_MS = 200;
-const MEDIUM_PANEL_QUERY = "(min-width: 900px)";
-const WIDE_PANEL_QUERY = "(min-width: 1280px)";
-const SIDEBAR_WIDTH_STORAGE_KEY = "piRelaySidebarWidth:v1";
-const DEFAULT_SIDEBAR_WIDTH = 320;
-const MIN_SIDEBAR_WIDTH = 240;
-const MAX_SIDEBAR_WIDTH = 480;
-const SIDEBAR_KEYBOARD_STEP = 16;
-
-function clampSidebarWidth(width: number): number {
-	return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(width)));
-}
-
-function loadSidebarWidth(): number {
-	if (typeof window === "undefined") return DEFAULT_SIDEBAR_WIDTH;
-	try {
-		const stored = Number(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
-		return Number.isFinite(stored) && stored > 0
-			? clampSidebarWidth(stored)
-			: DEFAULT_SIDEBAR_WIDTH;
-	} catch {
-		return DEFAULT_SIDEBAR_WIDTH;
-	}
-}
-
-function saveSidebarWidth(width: number): void {
-	try {
-		window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(clampSidebarWidth(width)));
-	} catch {
-		// localStorage persistence is best-effort.
-	}
-}
-
 function delegationQueryPrefix(parentSessionId: string) {
 	return ["delegations", parentSessionId] as const;
-}
-
-type PanelMode = "compact" | "medium" | "wide";
-
-function panelModeForViewport(): PanelMode {
-	if (typeof window === "undefined" || typeof window.matchMedia !== "function") return "wide";
-	if (window.matchMedia(WIDE_PANEL_QUERY).matches) return "wide";
-	if (window.matchMedia(MEDIUM_PANEL_QUERY).matches) return "medium";
-	return "compact";
-}
-
-function defaultPanelState(mode: PanelMode): { sidebarOpen: boolean; rightOpen: boolean } {
-	return {
-		sidebarOpen: mode === "wide",
-		rightOpen: mode !== "compact",
-	};
-}
-
-function routeScope(projectId: string | null) {
-	return projectId === null ? hostRouteScope() : projectRouteScope(projectId);
 }
 
 type ExportDialogState = {
@@ -288,22 +263,6 @@ export interface AppProps {
 	routeHistory?: WorkspaceRouteHistory | null;
 }
 
-type RouteValidationState =
-	| { kind: "idle" }
-	| { kind: "pending" }
-	| {
-			kind: "valid";
-			revision: number;
-			canonicalUrl: string;
-			projectId: string | null;
-			conversationSessionId: string;
-		}
-	| {
-			kind: "unavailable";
-			state: WorkspaceRouteUnavailable;
-			retryable: boolean;
-		};
-
 type RememberedRouteRestore = {
 	canonicalUrl: string;
 	projectId: string | null;
@@ -317,95 +276,6 @@ type DeletedEventSessionTombstone = {
 	retryTimer: number | null;
 };
 
-function routeScopeProjectId(route: WorkspaceRoute): string | null {
-	return route.scope.kind === "project" ? route.scope.projectId : null;
-}
-
-function routeConversationSessionId(route: WorkspaceRoute): string {
-	return messageRecipient(route).sessionId;
-}
-
-function routeReadsEnabled(
-	result: WorkspaceRouteParseResult,
-	validation: RouteValidationState,
-	revision: number,
-): boolean {
-	if (result.kind === "none") return validation.kind === "idle";
-	if (result.kind !== "route" || validation.kind !== "valid") return false;
-	return (
-		validation.revision === revision &&
-		validation.canonicalUrl === result.canonicalUrl &&
-		validation.projectId === routeScopeProjectId(result.route) &&
-		validation.conversationSessionId === routeConversationSessionId(result.route)
-	);
-}
-
-function initialRouteResult(history: WorkspaceRouteHistory | null): WorkspaceRouteParseResult {
-	return history?.current() ?? { kind: "none" };
-}
-
-function routeInitialSelection(
-	result: WorkspaceRouteParseResult,
-	legacy: ReturnType<typeof loadUiSelection>,
-): { projectId: string | null; conversationSessionId: string | null } {
-	if (result.kind === "route") {
-		return {
-			projectId: routeScopeProjectId(result.route),
-			conversationSessionId: routeConversationSessionId(result.route),
-		};
-	}
-	if (result.kind === "unavailable") {
-		return { projectId: null, conversationSessionId: null };
-	}
-	return {
-		projectId: legacy.projectId,
-		// Legacy identity is not trusted until the selected session's canonical
-		// direct parent/root has been resolved.
-		conversationSessionId: null,
-	};
-}
-
-function projectMismatchUnavailable(route: WorkspaceRoute, actualProjectId: string | null): WorkspaceRouteUnavailable {
-	const requestedProject =
-		route.scope.kind === "project" ? `project ${route.scope.projectId}` : "Host";
-	const actualProject = actualProjectId ? `project ${actualProjectId}` : "Host";
-	return {
-		kind: "unavailable",
-		issue: "project-mismatch",
-		message: `This run belongs to ${actualProject}, not ${requestedProject}.`,
-		requestedUrl: "",
-		backTo: null,
-	};
-}
-
-function routeRootUnavailable(message: string): WorkspaceRouteUnavailable {
-	return {
-		kind: "unavailable",
-		issue: "invalid-conversation",
-		message,
-		requestedUrl: "",
-		backTo: null,
-	};
-}
-
-function sessionListRefreshKey(projectId: string | null): string {
-	return projectId ?? "__host__";
-}
-
-function projectIdFromEventData(event: EventFrame): string | null | undefined {
-	const value = event.data.project_id;
-	if (typeof value === "string") return value;
-	if (value === null) return null;
-	return undefined;
-}
-
-function firstKnownProjectId(...projectIds: (string | null | undefined)[]): string | null | undefined {
-	for (const projectId of projectIds) {
-		if (projectId !== undefined) return projectId;
-	}
-	return undefined;
-}
-
 function sessionListProjectTargets(projectId: string | null): (string | null)[] {
 	return [projectId];
 }
@@ -416,31 +286,6 @@ function cachedProjectIdForSession(queryClient: QueryClient, sessionId: string):
 		if (session) return session.project_id;
 	}
 	return undefined;
-}
-
-function backgroundSessionNeedsWarm(
-	session: SessionListItem,
-	cache: SelectedSessionCache | null,
-	warmedUpdatedAt: string | undefined,
-): boolean {
-	if (!cache?.snapshot) return true;
-	if (warmedUpdatedAt !== session.updated_at) return true;
-	if (cache.snapshot.activity !== session.activity) return true;
-	if (cache.snapshot.active_leaf_id !== session.active_leaf_id) return true;
-	if (session.has_transcript_entries && cache.turnOrder.length === 0) return true;
-	return false;
-}
-
-function canWarmBackgroundSession(session: SessionListItem): boolean {
-	if (session.parent_session_id) return false;
-	if (session.metadata?.hidden === true) return false;
-	if (session.metadata?.archived === true) return false;
-	if (session.metadata?.subagent === true) return false;
-	return true;
-}
-
-function subagentStatusNeedsWarm(status: DelegationSubagent["status"], activity?: Activity): boolean {
-	return activity === "running" || activity === "queued" || status === "running" || status === "queued";
 }
 
 function LoadingConversation() {

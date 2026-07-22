@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	adjacentTurnJumpTargetId,
 	assistantRenderParts,
+	deriveTranscriptDisplayNodes,
 	editToolPreview,
 	formatElapsed,
 	isScrolledAtBottom,
@@ -13,6 +14,7 @@ import {
 	ToolOutput,
 } from "./transcript.tsx";
 import type { AssistantItem, PendingAction, TranscriptEntry, TurnCard } from "./types.ts";
+import { buildTurnViews } from "./turnView.ts";
 
 describe("assistantRenderParts", () => {
 	it("keeps assistant text and tool-call parts in transcript order", () => {
@@ -69,6 +71,40 @@ describe("assistantRenderParts", () => {
 				{ kind: "add", text: "beta" }
 			]
 		});
+	});
+});
+
+describe("transcript display model", () => {
+	it("keeps tool-result association equivalent when the indexed call IDs are reused", () => {
+		const call = toolCall("call_1", "Bash");
+		const entries = [
+			assistantToolEntry("assistant", null, [call]),
+			toolResultEntry("result", "assistant", "call_1", "Bash", "ok"),
+			toolResultEntry("orphan", "result", "call_missing", "Bash", "not associated"),
+		];
+		const turns = buildTurnViews(entries);
+		const toolResults = new Map([["call_1", entries[1].item as Extract<TranscriptEntry["item"], { type: "tool_result" }>]]);
+		const expected = deriveTranscriptDisplayNodes(entries, turns);
+		const optimized = deriveTranscriptDisplayNodes(entries, turns, toolResults, [], new Set(["call_1"]));
+
+		expect(optimized).toEqual(expected);
+	});
+
+	it("copies the complete assistant entry for each separated text part", () => {
+		const entries = [
+			assistantToolEntry("assistant", null, [
+				{ type: "text", text: "before " },
+				toolCall("call_1", "Bash"),
+				{ type: "text", text: "after" },
+			]),
+		];
+
+		expect(deriveTranscriptDisplayNodes(entries)).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ type: "assistant_text", text: "before ", copyText: "before after" }),
+				expect.objectContaining({ type: "assistant_text", text: "after", copyText: "before after" }),
+			]),
+		);
 	});
 });
 

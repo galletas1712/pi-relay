@@ -207,6 +207,16 @@ pub struct EventFrame {
     pub data: Value,
 }
 
+/// A bounded page of persisted events. `next_after_event_id` is present when
+/// the page is incomplete; callers must request the next page rather than
+/// treating the returned events as a complete replay.
+#[derive(Debug, Clone)]
+pub struct EventReplayPage {
+    pub events: Vec<EventFrame>,
+    pub next_after_event_id: Option<i64>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActionUpdate {
     pub row_id: String,

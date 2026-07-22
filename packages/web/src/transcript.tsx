@@ -28,6 +28,10 @@ import type { AssistantItem, NoticeTone, PendingAction, TranscriptEntry, Transcr
 type ToolResultItem = Extract<TranscriptItem, { type: "tool_result" }>;
 type AssistantMessageEntry = TranscriptEntry & { item: Extract<TranscriptItem, { type: "assistant_message" }> };
 type ToolRunStatusKind = "success" | "error" | "running";
+type ToolIndex = {
+	results: Map<string, ToolResultItem>;
+	calls: Set<string>;
+};
 
 type ToolRunItem =
 	| {
@@ -79,6 +83,9 @@ const TURN_JUMP_EPSILON_PX = 2;
 const ACTIVE_SESSION_SCROLL_KEY = "__active_session__";
 const TRANSCRIPT_SCROLL_STORAGE_KEY = "piRelayTranscriptScroll:v1";
 const RECENT_TOOL_ROW_COUNT = 3;
+const EMPTY_TOOL_INDEX: ToolIndex = { results: new Map(), calls: new Set() };
+const EMPTY_TURN_VIEWS: TurnView[] = [];
+const EMPTY_DISPLAY_NODES: TranscriptDisplayNode[] = [];
 
 export interface TurnJumpTargetPosition {
 	id: string;
@@ -600,9 +607,21 @@ export const MessageList = memo(function MessageList({
 		observer.observe(content);
 		return () => observer.disconnect();
 	}, [destination, hasSession, scrollToBottom, transcriptContentReady]);
-	const toolIndex = useMemo(() => indexToolEntries(visibleEntries), [visibleEntries]);
-	const turnViews = useMemo(() => buildTurnViews(visibleEntries), [visibleEntries]);
-	const displayNodes = useMemo(() => deriveTranscriptDisplayNodes(visibleEntries, turnViews, toolIndex.results, pendingActions), [pendingActions, toolIndex.results, turnViews, visibleEntries]);
+	const shouldUseTurnCards = !!turnCards && turnCards.length > 0;
+	const toolIndex = useMemo(
+		() => shouldUseTurnCards ? EMPTY_TOOL_INDEX : indexToolEntries(visibleEntries),
+		[shouldUseTurnCards, visibleEntries],
+	);
+	const turnViews = useMemo(
+		() => shouldUseTurnCards ? EMPTY_TURN_VIEWS : buildTurnViews(visibleEntries),
+		[shouldUseTurnCards, visibleEntries],
+	);
+	const displayNodes = useMemo(
+		() => shouldUseTurnCards
+			? EMPTY_DISPLAY_NODES
+			: deriveTranscriptDisplayNodes(visibleEntries, turnViews, toolIndex.results, pendingActions, toolIndex.calls),
+		[pendingActions, shouldUseTurnCards, toolIndex.calls, toolIndex.results, turnViews, visibleEntries],
+	);
 	const resumeEntryIdByNode = useMemo(() => {
 		const ids = new Map<string, string>();
 		for (const node of displayNodes) ids.set(node.key, nodeLeafId(node));
@@ -661,7 +680,6 @@ export const MessageList = memo(function MessageList({
 		() => (isRunning ? turnCards?.find((turn) => turn.isCurrent)?.card.start_timestamp_ms ?? runningTurnStartMs(visibleEntries) : null),
 		[isRunning, turnCards, visibleEntries],
 	);
-	const shouldUseTurnCards = !!turnCards && turnCards.length > 0;
 	const fallbackTurnJumpTargets = useMemo(
 		() => buildFallbackTurnJumpTargets(turnViews, visibleDisplayNodes),
 		[turnViews, visibleDisplayNodes],
@@ -885,11 +903,19 @@ export const MessageList = memo(function MessageList({
 });
 
 function buildFallbackTurnJumpTargets(turns: TurnView[], displayNodes: TranscriptDisplayNode[]): TurnJumpTarget[] {
+	const firstDisplayNodeByEntryId = new Map<string, { node: TranscriptDisplayNode; index: number }>();
+	for (const [index, node] of displayNodes.entries()) {
+		const entryId = nodeLeafId(node);
+		if (!firstDisplayNodeByEntryId.has(entryId)) firstDisplayNodeByEntryId.set(entryId, { node, index });
+	}
 	const targets: TurnJumpTarget[] = [];
 	for (const [index, turn] of turns.entries()) {
-		const entryIds = new Set(turn.entries.map((entry) => entry.id));
-		const displayNode = displayNodes.find((node) => entryIds.has(nodeLeafId(node)));
-		if (displayNode) targets.push({ id: `turn-${index}-${displayNode.key}`, nodeKey: displayNode.key });
+		let firstDisplayNode: { node: TranscriptDisplayNode; index: number } | undefined;
+		for (const entry of turn.entries) {
+			const displayNode = firstDisplayNodeByEntryId.get(entry.id);
+			if (displayNode && (!firstDisplayNode || displayNode.index < firstDisplayNode.index)) firstDisplayNode = displayNode;
+		}
+		if (firstDisplayNode) targets.push({ id: `turn-${index}-${firstDisplayNode.node.key}`, nodeKey: firstDisplayNode.node.key });
 	}
 	return targets;
 }
@@ -1266,7 +1292,10 @@ const TurnCardRow = memo(function TurnCardRow({
 	if (detailEntries) {
 		const toolIndex = indexToolEntries(detailEntries);
 		const turnViews = buildTurnViews(detailEntries);
-		const displayNodes = turnDetailDisplayNodesBeforeLatestAssistant(deriveTranscriptDisplayNodes(detailEntries, turnViews, toolIndex.results, pendingActions), turn.card);
+		const displayNodes = turnDetailDisplayNodesBeforeLatestAssistant(
+			deriveTranscriptDisplayNodes(detailEntries, turnViews, toolIndex.results, pendingActions, toolIndex.calls),
+			turn.card,
+		);
 		const resumeEntryIdByNode = new Map(displayNodes.map((node) => [node.key, nodeLeafId(node)]));
 		detailRows = displayNodes.map((node) => (
 			<TranscriptDisplayNodeView
@@ -1358,14 +1387,15 @@ const TurnSummaryAssistant = memo(function TurnSummaryAssistant({ turn }: { turn
 		return <div className="turn-card-assistant">{card.summary}</div>;
 	}
 	if (card.assistant_message?.item.type !== "assistant_message") return null;
+	const text = assistantMessageText(card.assistant_message.item);
 	return (
 		<AssistantTextBlock
 			node={{
 				type: "assistant_text",
 				key: `${card.assistant_message.id}-turn-card`,
 				entry: card.assistant_message as AssistantMessageEntry,
-				text: assistantMessageText(card.assistant_message.item),
-				copyText: assistantMessageText(card.assistant_message.item),
+				text,
+				copyText: text,
 				phase: card.status === "completed" && card.outcome === "Graceful" ? "final_answer" : turn.isCurrent ? "running" : "unknown",
 			}}
 		/>
@@ -1422,16 +1452,23 @@ function coalesceAdjacentTextItems(items: AssistantItem[]): AssistantItem[] {
 export function deriveTranscriptDisplayNodes(
 	entries: TranscriptEntry[],
 	turns: TurnView[] = buildTurnViews(entries),
-	toolResults: Map<string, ToolResultItem> = indexToolEntries(entries).results,
-	pendingActions: PendingAction[] = []
+	toolResults?: Map<string, ToolResultItem>,
+	pendingActions: PendingAction[] = [],
+	toolCallIds?: ReadonlySet<string>,
 ): TranscriptDisplayNode[] {
-	const builder = new TranscriptDisplayBuilder(entries, turns, toolResults, pendingActions);
+	const index = toolResults === undefined || toolCallIds === undefined ? indexToolEntries(entries) : null;
+	const builder = new TranscriptDisplayBuilder(
+		entries,
+		turns,
+		toolResults ?? index?.results ?? EMPTY_TOOL_INDEX.results,
+		pendingActions,
+		toolCallIds ?? index?.calls ?? EMPTY_TOOL_INDEX.calls,
+	);
 	return builder.build();
 }
 
 class TranscriptDisplayBuilder {
 	private readonly turnByEntryId = new Map<string, TurnView>();
-	private readonly toolCallIds = new Set<string>();
 	private readonly nodes: TranscriptDisplayNode[] = [];
 	private pendingGroup: Extract<TranscriptDisplayNode, { type: "tool_group" }> | null = null;
 
@@ -1439,16 +1476,11 @@ class TranscriptDisplayBuilder {
 		private readonly entries: TranscriptEntry[],
 		turns: TurnView[],
 		private readonly toolResults: Map<string, ToolResultItem>,
-		private readonly pendingActions: PendingAction[]
+		private readonly pendingActions: PendingAction[],
+		private readonly toolCallIds: ReadonlySet<string>,
 	) {
 		for (const turn of turns) {
 			for (const entry of turn.entries) this.turnByEntryId.set(entry.id, turn);
-		}
-		for (const entry of entries) {
-			if (entry.item.type !== "assistant_message") continue;
-			for (const assistantItem of entry.item.items) {
-				if (assistantItem.type === "tool_call") this.toolCallIds.add(assistantItem.id);
-			}
 		}
 	}
 
@@ -1501,12 +1533,13 @@ class TranscriptDisplayBuilder {
 	}
 
 	private appendAssistantMessage(entry: AssistantMessageEntry) {
+		const copyText = assistantMessageText(entry.item);
 		const parts = assistantRenderParts(entry.item.items);
 		for (const part of parts) {
 			if (part.type === "text") {
 				if (!part.item.text) continue;
 				this.flushGroup();
-				this.nodes.push(this.assistantTextNode(entry, part.key, part.item.text));
+				this.nodes.push(this.assistantTextNode(entry, part.key, part.item.text, copyText));
 				continue;
 			}
 			this.appendToolItem(entry, localToolRunItem(entry.id, part, this.toolResults.get(part.item.id)));
@@ -1516,7 +1549,8 @@ class TranscriptDisplayBuilder {
 	private assistantTextNode(
 		entry: AssistantMessageEntry,
 		key: string,
-		text: string
+		text: string,
+		copyText: string,
 	): Extract<TranscriptDisplayNode, { type: "assistant_text" }> {
 		const step = this.turnByEntryId.get(entry.id)?.modelSteps.find((candidate) => candidate.entry.id === entry.id);
 		return {
@@ -1524,7 +1558,7 @@ class TranscriptDisplayBuilder {
 			key: `${entry.id}-${key}`,
 			entry,
 			text,
-			copyText: assistantMessageText(entry.item),
+			copyText,
 			phase: step?.phase ?? "unknown",
 		};
 	}

@@ -1,9 +1,10 @@
 use super::*;
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn creates_top_level_root_child_and_publishes_complete_provenance() {
     let Some(env) = test_env().await else {
-        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     std::fs::copy(

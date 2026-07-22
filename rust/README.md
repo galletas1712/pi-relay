@@ -1,8 +1,8 @@
 # Rust Agent Stack
 
-Personal-use Rust rewrite of the core pi-style agent runtime. It keeps the good
-local semantics around resume, switch, and compaction while removing the
-hierarchical subagent machinery from the TypeScript fork.
+Personal-use Rust agent runtime and control plane. It provides durable
+PostgreSQL-backed sessions, resume/switch/compaction, host-side workspace
+tools and MCP routes, bounded delegation, and the React web client.
 
 ## Documentation
 
@@ -33,11 +33,67 @@ hierarchical subagent machinery from the TypeScript fork.
 
 ## Build And Test
 
+The standard workspace commands use Cargo. PostgreSQL-backed tests are
+explicitly ignored unless `PI_RELAY_TEST_DATABASE_URL` is supplied, so an
+ordinary test run reports them in its ignored count rather than presenting
+them as successful database coverage. If ignored tests are explicitly
+included without the variable, their bodies print
+`SKIPPED PostgreSQL test` and return without database coverage.
+
 ```sh
 cargo check --manifest-path rust/Cargo.toml --all
-cargo test  --manifest-path rust/Cargo.toml --all
+cargo test  --manifest-path rust/Cargo.toml --all -- --nocapture
 cargo fmt   --manifest-path rust/Cargo.toml --all --check
 ```
+
+The `--nocapture` flag is intentional: it makes each missing-database
+`SKIPPED PostgreSQL test` report visible if an ignored test is selected
+directly. Use `--include-ignored` only with a configured PostgreSQL URL.
+
+For the complete test suite, start a PostgreSQL 16 instance with a role that
+can create and drop databases, then run:
+
+```sh
+docker compose -f infra/docker-compose.yml up -d postgres
+PI_RELAY_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres \
+  cargo test --manifest-path rust/Cargo.toml --workspace -- --include-ignored --nocapture
+```
+
+The tests create uniquely named databases and remove them afterward. Do not
+point `PI_RELAY_TEST_DATABASE_URL` at a production database.
+
+The frontend's checked-in `package-lock.json` is the canonical reproducible
+install for npm-based development:
+
+```sh
+npm ci
+npm test --workspaces --if-present
+npm run build --workspace @pi-relay/web
+```
+
+The repository uses npm and `package-lock.json` for the local Docker/host
+stack. The obsolete Bun lockfile is not part of the supported workflow.
+
+## Prerequisites and runtime requirements
+
+- Rust stable with Cargo and `rustfmt`, Node.js 20+, and npm.
+- Docker Engine with Compose v2 and PostgreSQL 16. The integration tests need
+  a PostgreSQL role allowed to `CREATE DATABASE` and `DROP DATABASE`.
+- A Linux host with `btrfs-progs`, `git`, `rsync`, and passwordless `sudo -n`
+  for `pi-runtime` when using `infra/dev.sh`; the runtime is intentionally a
+  host process and is not dockerized.
+- Provider credentials at model-call time. OpenAI/Codex accepts
+  `CODEX_ACCESS_TOKEN` or `$HOME/.codex/auth.json`; Anthropic accepts
+  `ANTHROPIC_API_KEY` or Claude Code's
+  `$HOME/.claude/config.json`/`$HOME/.claude.json`.
+
+The compose control service mounts `$HOME/.codex`,
+`$HOME/.claude/config.json`, and `$HOME/.claude.json` read-only into the
+container. Ensure the credential paths used by the selected provider exist
+and are readable by Docker, or run the binaries directly on the host instead
+of using the compose mounts. MCP configuration and OAuth credential state are
+host-runtime files; compose deliberately does not mount them into the control
+container.
 
 ## Run The Services
 
@@ -96,6 +152,17 @@ The service boundary is explicit:
 - `pi-runtime` owns its identity, control address, workspace root, MCP routes,
   MCP OAuth state, and the host/workspace skills it publishes to the control
   plane.
+
+### Database initialization and migrations
+
+`PostgresAgentStore::migrate()` runs the embedded, idempotent current schema at
+every daemon startup. On a fresh database this creates the complete schema.
+On an existing current database it reapplies the current `create ... if not
+exists`/additive schema statements safely. This is not a general historical
+data-migration runner: startup does not rewrite old session or transcript
+rows. Back up databases from older product/schema revisions and follow any
+release-specific migration instructions before using them; do not assume a
+fresh startup upgrades old data layouts.
 
 For the repository's local stack, `infra/dev.sh` mounts
 `infra/config/control.toml` into the control container's `pi-relay/agentd`
@@ -298,7 +365,9 @@ the exact session subset in the New Session UI. Existing sessions and all their
 full/read-only children keep that frozen subset.
 
 The daemon creates its schema on startup but does not run old-session
-migrations automatically.
+data migrations automatically. See
+[Database initialization and migrations](#database-initialization-and-migrations)
+for the fresh-versus-existing database contract.
 
 ## Run The Web UI
 

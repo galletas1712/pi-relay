@@ -250,10 +250,11 @@ async fn queued_input_index_migration_results(
     Ok((fresh, repeated))
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn migration_creates_exact_queued_input_indexes_idempotently() -> Result<()> {
     let Some(db) = test_store_without_schema().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return Ok(());
     };
     let db = db?;
@@ -319,11 +320,14 @@ async fn migration_creates_exact_queued_input_indexes_idempotently() -> Result<(
     Ok(())
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn provider_route_migration_is_nullable_idempotent_and_rollback_compatible() -> Result<()> {
-    let db = test_store_without_schema()
-        .await
-        .expect("PI_RELAY_TEST_DATABASE_URL is required for provider route tests")?;
+    let Some(db) = test_store_without_schema().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return Ok(());
+    };
+    let db = db?;
     let work = async {
         db.store.migrate().await?;
         let project_id = Uuid::new_v4();
@@ -642,10 +646,11 @@ async fn persist_turn(store: &PostgresAgentStore, session_id: &str, timestamp_ms
         .expect("turn persists");
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn manual_compaction_failure_terminalizes_without_installing_a_checkpoint() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let store = &db.store;
@@ -704,10 +709,11 @@ async fn manual_compaction_failure_terminalizes_without_installing_a_checkpoint(
     db.cleanup().await.expect("clean up isolated test database");
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn compaction_provider_replay_round_trips_nullable_and_omitted_encrypted_content() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let store = &db.store;
@@ -779,10 +785,11 @@ async fn compaction_provider_replay_round_trips_nullable_and_omitted_encrypted_c
     db.cleanup().await.expect("clean up isolated test database");
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn subagent_type_round_trips_through_start_session_outputs() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let store = &db.store;
@@ -841,10 +848,11 @@ async fn subagent_type_round_trips_through_start_session_outputs() {
     db.cleanup().await.expect("clean up isolated test database");
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn delete_session_rejects_active_queued_input_under_session_lock() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let store = &db.store;
@@ -895,10 +903,11 @@ async fn delete_session_rejects_active_queued_input_under_session_lock() {
     db.cleanup().await.expect("clean up isolated test database");
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn list_sessions_sorts_by_last_user_message_timestamp() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let store = &db.store;

@@ -78,7 +78,7 @@ pub(super) async fn history_target_context_for_user_tx(
     let row = sqlx::query(
         r#"
         with recursive ancestors as (
-            select t.id, t.parent_id, t.item, 0 as depth
+            select t.id, t.parent_id, t.item, 0::bigint as depth
             from transcript_entries t
             where t.session_id=$1 and t.id=$2::text
               and t.item->>'type' = 'user_message'
@@ -90,20 +90,20 @@ pub(super) async fn history_target_context_for_user_tx(
             join ancestors child
               on parent.session_id=$1 and parent.id=child.parent_id
             where child.item->>'type' not in ('turn_finished', 'compaction_summary')
-              and child.depth + 1 < $3
+              and child.depth <= $3
         ),
         context as (
             select
                 (array_agg(id order by depth)
                     filter (where item->>'type' in ('turn_finished', 'compaction_summary')))[1]
                     as target_leaf_id,
-                bool_or(parent_id is null) as reached_root
+                bool_or(parent_id is null) as reached_root,
+                max(depth) as max_depth
             from ancestors
             having count(*) > 0
         )
-        select target_leaf_id
+        select target_leaf_id, reached_root, max_depth
         from context
-        where target_leaf_id is not null or reached_root
         "#,
     )
     .bind(session_id)
@@ -114,7 +114,18 @@ pub(super) async fn history_target_context_for_user_tx(
     let Some(row) = row else {
         return Err(crate::HistoryChanged.into());
     };
-    Ok(row.get("target_leaf_id"))
+    let depth: i64 = row.get("max_depth");
+    if depth > HISTORY_TARGET_ANCESTRY_LIMIT {
+        return Err(anyhow::anyhow!(
+            "transcript ancestry exceeds maximum depth {HISTORY_TARGET_ANCESTRY_LIMIT}; possible cycle"
+        ));
+    }
+    let reached_root: bool = row.get("reached_root");
+    let target_leaf_id: Option<String> = row.get("target_leaf_id");
+    if target_leaf_id.is_none() && !reached_root {
+        return Err(crate::HistoryChanged.into());
+    }
+    Ok(target_leaf_id)
 }
 
 pub(super) async fn branch_entry_ids_tx(
@@ -128,13 +139,13 @@ pub(super) async fn branch_entry_ids_tx(
     let rows = sqlx::query(
         r#"
         with recursive branch as (
-            select t.id, t.parent_id, t.item, t.sequence
+            select t.id, t.parent_id, t.item, t.sequence, 0::bigint as depth
             from transcript_entries t
             where t.session_id = $1 and t.id = $2::text
 
             union all
 
-            select parent.id, parent.parent_id, parent.item, parent.sequence
+            select parent.id, parent.parent_id, parent.item, parent.sequence, child.depth + 1
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
@@ -145,14 +156,24 @@ pub(super) async fn branch_entry_ids_tx(
                 end,
                 child.parent_id
              )
+             and child.depth <= $3
         )
-        select id from branch order by sequence
+        select id, depth from branch order by sequence
         "#,
     )
     .bind(session_id)
     .bind(leaf_id)
+    .bind(HISTORY_TARGET_ANCESTRY_LIMIT)
     .fetch_all(&mut **tx)
     .await?;
+    if rows
+        .iter()
+        .any(|row| row.get::<i64, _>("depth") > HISTORY_TARGET_ANCESTRY_LIMIT)
+    {
+        return Err(anyhow::anyhow!(
+            "transcript ancestry exceeds maximum depth {HISTORY_TARGET_ANCESTRY_LIMIT}; possible cycle"
+        ));
+    }
     Ok(rows
         .into_iter()
         .map(|row| row.get::<String, _>("id"))

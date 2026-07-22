@@ -96,10 +96,11 @@ select id from sessions where id = $1 for update;
 ```
 
 This serializes one session at a time; it is not a table-wide or database-wide
-lock, and provider/tool work never runs while the lock is held. Fresh databases
-get the revision/order columns from the schema below. The current development
-database has already been upgraded manually; the daemon does not run old-session
-migrations automatically.
+lock, and provider/tool work never runs while the lock is held. A fresh database
+gets the complete current schema, while an existing current database receives
+the idempotent current schema statements again at startup. The daemon does not
+run historical old-session/data migrations automatically; older deployments
+must follow their release-specific migration instructions first.
 
 ### `sessions`
 
@@ -1020,14 +1021,26 @@ materialized by `session.start`.
 The response contains:
 
 ```json
-{ "replayed": [] }
+{
+  "replayed": [],
+  "has_more": false,
+  "next_after_event_id": null
+}
 ```
 
 After the response, matching live events stream as event frames.
 
+Replay responses are bounded to a server-side page budget (currently 500
+events). If more rows remain, the response sets `has_more: true` and includes
+`next_after_event_id`, the id of the last returned event. The caller must issue
+another `events.subscribe` with that id to continue; a page with
+`has_more: true` is not a complete replay and must not be treated as a resync
+success. The web client follows these continuation pages automatically while
+retaining the same `EventFrame[]` API.
+
 If `after_event_id` is `null` or omitted, the daemon subscribes from the current
-head and returns an empty replay. Use a concrete id only for reconnecting after
-a known high-water mark.
+head and returns an empty replay with `has_more: false` and a null continuation.
+Use a concrete id only for reconnecting after a known high-water mark.
 
 ### `events.unsubscribe`
 

@@ -20,12 +20,15 @@ use agent_store::{
 };
 use agent_vocab::ProviderReplayItem;
 use anyhow::Context;
+use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::codec::transcript_store_from_stored;
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
+
+const BOOT_RECOVERY_CONCURRENCY: usize = 4;
 
 pub(crate) use compaction::spawn_compaction;
 use dispatch::dispatch_all;
@@ -60,18 +63,29 @@ async fn recover_post_compaction_dispatches_once(state: &AppState) -> anyhow::Re
     }
     let mut recovered_total = 0;
     let session_ids = state.repo.post_compaction_dispatch_session_ids().await?;
-    for session_id in session_ids {
-        let driver = SessionDriver::acquire(state, &session_id).await;
-        recovered_total += driver
-            .recover_post_compaction_dispatches()
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to recover post-compaction dispatch for {session_id}: {}: {}",
-                    error.code,
-                    error.message
-                )
-            })?;
+    let results = stream::iter(session_ids.into_iter().map(|session_id| {
+        let state = state.clone();
+        async move {
+            let driver = SessionDriver::acquire(&state, &session_id).await;
+            driver
+                .recover_post_compaction_dispatches()
+                .await
+                .map(|count| (session_id.clone(), count))
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to recover post-compaction dispatch for {session_id}: {}: {}",
+                        error.code,
+                        error.message
+                    )
+                })
+        }
+    }))
+    .buffer_unordered(BOOT_RECOVERY_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    for result in results {
+        let (_, count) = result?;
+        recovered_total += count;
     }
     Ok(recovered_total)
 }

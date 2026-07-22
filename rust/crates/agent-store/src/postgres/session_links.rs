@@ -156,9 +156,13 @@ mod tests {
         }
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn parent_session_ids_can_be_set_and_listed() {
-        let Some(db) = test_store().await else { return };
+        let Some(db) = test_store().await else {
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
         let project_id = Uuid::new_v4();
         let parent_session_id = "parent-session";
         let child_session_id = "child-session";
@@ -243,9 +247,13 @@ mod tests {
         db.cleanup().await;
     }
 
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
     async fn subagent_idle_notifications_are_idempotent_by_terminal_key() {
-        let Some(db) = test_store().await else { return };
+        let Some(db) = test_store().await else {
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
         let project_id = Uuid::new_v4();
         let parent_session_id = "idle-parent";
         let child_session_id = "idle-child";

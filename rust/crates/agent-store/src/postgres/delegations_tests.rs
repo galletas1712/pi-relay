@@ -17,6 +17,24 @@ use super::*;
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(70_000);
 
+#[test]
+fn cancelled_child_input_ids_are_grouped_once_without_changing_order() {
+    let grouped = group_input_ids_by_session([
+        ("child_b".to_string(), "input_2".to_string()),
+        ("child_a".to_string(), "input_1".to_string()),
+        ("child_b".to_string(), "input_3".to_string()),
+    ]);
+
+    assert_eq!(
+        grouped.get("child_a").map(Vec::as_slice),
+        Some(["input_1".to_string()].as_slice())
+    );
+    assert_eq!(
+        grouped.get("child_b").map(Vec::as_slice),
+        Some(["input_2".to_string(), "input_3".to_string()].as_slice())
+    );
+}
+
 struct TestDb {
     store: PostgresAgentStore,
     admin_url: String,
@@ -235,10 +253,11 @@ async fn create_delegation_subagent_with_leaf(
         .expect("create delegation subagent");
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn create_delegation_persists_kind_status_and_attempt() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -293,10 +312,11 @@ async fn create_delegation_persists_kind_status_and_attempt() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn concurrent_delegation_creation_allows_only_one_running_row() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -347,10 +367,11 @@ async fn concurrent_delegation_creation_allows_only_one_running_row() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn migration_creates_delegation_ledger_query_indexes() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
 
@@ -387,10 +408,11 @@ async fn migration_creates_delegation_ledger_query_indexes() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn list_delegation_subagents_for_context_is_bounded_and_ordered() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -447,10 +469,11 @@ async fn list_delegation_subagents_for_context_is_bounded_and_ordered() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn parent_has_running_delegation_tracks_status() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -496,10 +519,11 @@ async fn parent_has_running_delegation_tracks_status() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn parent_delegations_include_complete_parent_set_across_statuses() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -604,10 +628,11 @@ async fn parent_delegations_include_complete_parent_set_across_statuses() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn delegation_progress_is_lightweight_and_counts_terminal_failures() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -705,10 +730,11 @@ async fn delegation_progress_is_lightweight_and_counts_terminal_failures() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -835,10 +861,11 @@ async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact()
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn list_delegation_subagents_returns_only_its_members() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -926,10 +953,11 @@ async fn list_delegation_subagents_returns_only_its_members() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -1033,10 +1061,11 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn completion_and_scoped_steer_have_one_invariant_safe_winner() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -1116,10 +1145,11 @@ async fn completion_and_scoped_steer_have_one_invariant_safe_winner() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn combined_control_phases_block_mailbox_and_fence_newer_action_generation() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -1409,10 +1439,11 @@ async fn combined_control_phases_block_mailbox_and_fence_newer_action_generation
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn atomic_cancel_is_attempt_fenced_and_terminal_safe() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -1574,10 +1605,11 @@ async fn atomic_cancel_is_attempt_fenced_and_terminal_safe() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn cancel_running_delegation_atomically_cancels_queued_partial_wakeup() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -1723,10 +1755,11 @@ async fn cancel_running_delegation_atomically_cancels_queued_partial_wakeup() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn cancellation_and_boundary_control_reconciliation_do_not_deadlock() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -1881,10 +1914,11 @@ async fn cancellation_and_boundary_control_reconciliation_do_not_deadlock() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn all_terminal_predicate_and_boot_sweep() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -1985,10 +2019,11 @@ async fn all_terminal_predicate_and_boot_sweep() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn queued_input_on_boundary_subagent_blocks_delegation_terminality() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -2088,10 +2123,11 @@ async fn queued_input_on_boundary_subagent_blocks_delegation_terminality() {
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn enqueue_delegation_observation_event_uses_minimal_payload_and_queue_projection() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
@@ -2159,10 +2195,11 @@ async fn enqueue_delegation_observation_event_uses_minimal_payload_and_queue_pro
     db.cleanup().await;
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn partial_delegation_observation_suppresses_duplicate_active_wakeups_transactionally() {
     let Some(db) = test_store().await else {
-        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();

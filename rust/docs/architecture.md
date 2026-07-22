@@ -10,8 +10,9 @@ This document is the overview and map. Each crate has its own reference under
 [`modules/`](modules/); the cross-cutting product/engineering rationale lives in
 [`design-decisions.md`](design-decisions.md); the frontend wire contract is in
 [`websocket-rpc.md`](websocket-rpc.md); the React client is documented in
-[`../../packages/web/docs/web-ui.md`](../../packages/web/docs/web-ui.md); and
-the audited provider capability matrix is in
+[`../../packages/web/docs/web-ui.md`](../../packages/web/docs/web-ui.md); the
+host runtime boundary is documented in [`runtime.md`](runtime.md); and the
+audited provider capability matrix is in
 [`provider-api-support.md`](provider-api-support.md). In-flight future work
 lives under [`plans/`](plans/).
 
@@ -72,7 +73,7 @@ agent-vocab      shared ids, message blocks, tool calls/results,
 | `agent-mcp-types` | Pure catalog / manager / OAuth DTOs used on the wire between control and runtime without pulling in the `rmcp` engine. | — |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. Proxies MCP RPCs to the session's runtime. | [modules/agent-daemon.md](modules/agent-daemon.md) |
 | `agent-runtime-protocol` | Framed JSON control/runtime commands and results, including workspace, tool, skill, and MCP operations. | — |
-| `agent-runtime` | `pi-runtime` host worker that owns managed workspaces, executes local tools, publishes runtime skills, and hosts MCP. Its policy lives under the runtime host's XDG `pi-relay/runtime` configuration root. | — |
+| `agent-runtime` | `pi-runtime` host worker that owns managed workspaces, executes local tools, publishes runtime skills, and hosts MCP. Its policy lives under the runtime host's XDG `pi-relay/runtime` configuration root. | [runtime.md](runtime.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt from session/workspace/tool/skill context. | [modules/agent-prompt.md](modules/agent-prompt.md) |
 
 `agent-vocab` stays at the bottom of the graph so providers, tools, storage,

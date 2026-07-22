@@ -28,6 +28,39 @@ pub struct WebSearchArgs {
     pub max_output_tokens: Option<usize>,
 }
 
+async fn read_bounded_response_body(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_WEB_FETCH_BODY_BYTES as u64)
+    {
+        return Err(format!(
+            "response body exceeds {MAX_WEB_FETCH_BODY_BYTES} bytes"
+        ));
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_WEB_FETCH_BODY_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("request body read error: {error}"))?
+    {
+        append_bounded_chunk(&mut body, &chunk, MAX_WEB_FETCH_BODY_BYTES)?;
+    }
+    Ok(body)
+}
+
+fn append_bounded_chunk(body: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), String> {
+    if body.len().saturating_add(chunk.len()) > limit {
+        return Err(format!("response body exceeds {limit} bytes"));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
 pub fn nonempty_domains(domains: Option<&[String]>) -> Option<Vec<String>> {
     let domains = domains?
         .iter()
@@ -39,6 +72,7 @@ pub fn nonempty_domains(domains: Option<&[String]>) -> Option<Vec<String>> {
 }
 
 const WEB_FETCH_USER_AGENT: &str = "pi-relay-web-fetch/0.1";
+const MAX_WEB_FETCH_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct WebFetchArgs {
@@ -197,7 +231,7 @@ async fn fetch_url(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("unknown")
         .to_string();
-    let bytes = match response.bytes().await {
+    let bytes = match read_bounded_response_body(response).await {
         Ok(bytes) => bytes,
         Err(error) => {
             return ToolResultMessage::error(
@@ -324,4 +358,54 @@ fn decode_basic_entities(input: &str) -> String {
 
 fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn bounded_chunk_reader_rejects_oversized_chunk_without_growing_body() {
+        let mut body = Vec::new();
+        append_bounded_chunk(&mut body, b"abcd", 5).expect("first chunk fits");
+        let error = append_bounded_chunk(&mut body, b"xy", 5)
+            .expect_err("chunked response must stop at the byte ceiling");
+        assert!(error.contains("response body exceeds 5 bytes"));
+        assert_eq!(body, b"abcd");
+    }
+
+    #[tokio::test]
+    async fn bounded_response_reader_rejects_oversized_declared_body() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind response fixture");
+        let address = listener.local_addr().expect("response fixture address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept response request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_WEB_FETCH_BODY_BYTES + 1
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response headers");
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .expect("request response fixture");
+        let error = read_bounded_response_body(response)
+            .await
+            .expect_err("oversized response must be rejected");
+        assert!(error.contains(&format!(
+            "response body exceeds {MAX_WEB_FETCH_BODY_BYTES} bytes"
+        )));
+        server.await.expect("response fixture server");
+    }
 }
