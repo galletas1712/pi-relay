@@ -14,8 +14,7 @@ This document is the overview and map. Each crate has its own reference under
 host runtime boundary is documented in [`runtime.md`](runtime.md); and the
 audited provider capability matrix is in
 [`provider-api-support.md`](provider-api-support.md). In-flight future work
-lives under [`plans/`](plans/), with superseded records under
-[`plans/archive/`](plans/archive/).
+lives under [`plans/`](plans/).
 
 ## Goals
 
@@ -222,5 +221,4 @@ Anthropic real-provider websocket tests require a raw `ANTHROPIC_API_KEY`.
 - Why the visible/invisible choices were made: [design-decisions.md](design-decisions.md).
 - The frontend wire contract and manual exercise plan: [websocket-rpc.md](websocket-rpc.md).
 - The React client: [`../../packages/web/docs/web-ui.md`](../../packages/web/docs/web-ui.md).
-- In-flight future work: [`plans/`](plans/); historical records:
-  [`plans/archive/`](plans/archive/).
+- In-flight future work: [`plans/`](plans/).

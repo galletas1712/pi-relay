@@ -63,7 +63,7 @@ The tests create uniquely named databases and remove them afterward. Do not
 point `PI_RELAY_TEST_DATABASE_URL` at a production database.
 
 The frontend's checked-in `package-lock.json` is the canonical reproducible
-install for CI and npm-based development:
+install for npm-based development:
 
 ```sh
 npm ci
@@ -71,9 +71,8 @@ npm test --workspaces --if-present
 npm run build --workspace @pi-relay/web
 ```
 
-The repository uses npm and `package-lock.json` for both CI and the local
-Docker/host stack. The obsolete Bun lockfile is not part of the supported
-workflow.
+The repository uses npm and `package-lock.json` for the local Docker/host
+stack. The obsolete Bun lockfile is not part of the supported workflow.
 
 ## Prerequisites and runtime requirements
 

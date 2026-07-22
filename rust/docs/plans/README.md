@@ -1,4 +1,4 @@
-# Plans and historical records
+# Plans
 
 `plans/` contains actionable work and short design records. It is not the
 authoritative description of implemented behavior; use
@@ -14,7 +14,3 @@ Owner:
 Current gaps:
 Next action:
 ```
-
-Documents explicitly marked historical or superseded belong in
-[`archive/`](archive/). Preserve them for rationale and archaeology, but do
-not use them as implementation instructions.
