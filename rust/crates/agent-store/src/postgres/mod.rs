@@ -36,9 +36,7 @@ fn ensure_valid_transcript_ancestry(rows: &[PgRow]) -> Result<()> {
         .iter()
         .any(|row| row.get::<bool, _>("ancestry_invalid"))
     {
-        return Err(anyhow!(
-            "transcript ancestry contains a cycle or non-append-only link"
-        ));
+        return Err(anyhow!("transcript ancestry contains a cycle"));
     }
     Ok(())
 }

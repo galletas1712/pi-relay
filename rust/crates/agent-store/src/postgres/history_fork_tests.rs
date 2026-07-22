@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     CreateForkRequest, DelegationKind, HistoryChanged, HistoryTarget, HistoryTargetNotTurnBoundary,
     OutputBatch, PostgresAgentStore, RunningDelegationConflict, SessionConfig,
-    SourceMutationConflict, SwitchActiveLeafRequest,
+    SourceMutationConflict, SwitchActiveLeafRequest, TranscriptEntryBodyMode,
 };
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(40_000);
@@ -506,10 +506,10 @@ async fn long_history_target_ancestry_remains_valid() {
         select
             'long-source',
             'deep-' || depth,
-            case when depth = 0 then null else 'deep-' || (depth - 1) end,
+            case when depth = 10001 then null else 'deep-' || (depth + 1) end,
             depth,
             case
-                when depth = 10001 then '{"type":"user_message","content":[{"type":"text","text":"long history"}]}'::jsonb
+                when depth = 0 then '{"type":"user_message","content":[{"type":"text","text":"long history"}]}'::jsonb
                 else '{"type":"assistant_message","items":[]}'::jsonb
             end,
             '[]'::jsonb,
@@ -520,28 +520,50 @@ async fn long_history_target_ancestry_remains_valid() {
     .execute(&store.pool)
     .await
     .expect("deep ancestry inserts");
-    sqlx::query("update sessions set active_leaf_id='deep-10001' where id='long-source'")
+    sqlx::query("update sessions set active_leaf_id='deep-0' where id='long-source'")
         .execute(&store.pool)
         .await
         .expect("long active leaf installs");
 
-    let stored = store
-        .load_stored_session("long-source")
+    let active_branch = store
+        .active_branch("long-source")
         .await
         .expect("long active branch loads");
-    assert_eq!(stored.entries.len(), 10_002);
+    assert_eq!(active_branch.entries.len(), 10_002);
+    assert_eq!(active_branch.entries.first().unwrap().id, "deep-10001");
+    assert_eq!(active_branch.entries.last().unwrap().id, "deep-0");
 
     let page = store
         .history_targets("long-source", None, None)
         .await
         .expect("history targets load");
     assert_eq!(page.targets.len(), 1);
-    assert_eq!(page.targets[0].entry_id, "deep-10001");
+    assert_eq!(page.targets[0].entry_id, "deep-0");
     assert_eq!(page.targets[0].target_leaf_id, None);
+    let synced = store
+        .sync_active_branch(
+            "long-source",
+            Some("deep-10001"),
+            TranscriptEntryBodyMode::Ui,
+        )
+        .await
+        .expect("long active branch syncs");
+    assert_eq!(synced.entries.len(), 10_001);
+    assert_eq!(synced.entries.first().unwrap().id, "deep-10000");
+    assert_eq!(synced.entries.last().unwrap().id, "deep-0");
+    store
+        .transcript_turns("long-source", None, Some(1))
+        .await
+        .expect("long turn-card ancestry loads");
+    assert!(store
+        .latest_model_token_usage_estimate("long-source", "deep-0", "missing-toolset")
+        .await
+        .expect("long token-usage ancestry loads")
+        .is_none());
 
     let target = HistoryTarget {
         leaf_id: None,
-        source_entry_id: Some("deep-10001"),
+        source_entry_id: Some("deep-0"),
         expected_active_leaf_id: None,
         expected_transcript_revision: None,
         expected_active_branch_entry_ids: None,
@@ -583,7 +605,7 @@ async fn cyclic_history_target_ancestry_is_rejected() {
         )
         values
             ('cyclic-source', 'cycle-root', null, 1,
-             '{"type":"assistant_message","items":[]}'::jsonb, '[]'::jsonb, null),
+             '{"type":"turn_started","turn_id":1}'::jsonb, '[]'::jsonb, 1),
             ('cyclic-source', 'cycle-user', 'cycle-root', 2,
              '{"type":"user_message","content":[{"type":"text","text":"cycle"}]}'::jsonb, '[]'::jsonb, null)
         "#,
@@ -598,12 +620,44 @@ async fn cyclic_history_target_ancestry_is_rejected() {
     .execute(&store.pool)
     .await
     .expect("cycle installs");
+    sqlx::query("update sessions set active_leaf_id='cycle-user' where id='cyclic-source'")
+        .execute(&store.pool)
+        .await
+        .expect("cyclic active leaf installs");
 
     let error = store
         .history_targets("cyclic-source", None, None)
         .await
         .expect_err("cyclic ancestry is rejected");
-    assert!(error.to_string().contains("cycle or non-append-only link"));
+    assert!(error
+        .to_string()
+        .contains("transcript ancestry contains a cycle"));
+    for error in [
+        store
+            .active_branch("cyclic-source")
+            .await
+            .expect_err("cyclic active branch is rejected"),
+        store
+            .transcript_turns("cyclic-source", None, Some(2))
+            .await
+            .expect_err("cyclic turn-card ancestry is rejected"),
+        store
+            .latest_model_token_usage_estimate("cyclic-source", "cycle-user", "missing-toolset")
+            .await
+            .expect_err("cyclic token-usage ancestry is rejected"),
+        store
+            .sync_active_branch(
+                "cyclic-source",
+                Some("missing-base"),
+                TranscriptEntryBodyMode::Ui,
+            )
+            .await
+            .expect_err("cyclic branch synchronization is rejected"),
+    ] {
+        assert!(error
+            .to_string()
+            .contains("transcript ancestry contains a cycle"));
+    }
 
     db.cleanup().await;
 }

@@ -368,6 +368,62 @@ describe("App connection recovery integration", () => {
 		client.clear();
 	});
 
+	it("fences stale replay completion and failure across reconnect generations", async () => {
+		const api = createControllableApi();
+		const firstReplay = deferred<EventFrame[]>();
+		const secondReplay = deferred<EventFrame[]>();
+		const thirdReplay = deferred<EventFrame[]>();
+		const replays = [firstReplay, secondReplay, thirdReplay];
+		api.subscribeEvents.mockImplementation(() => replays.shift()!.promise);
+		const { client, unmount } = renderApp(api);
+		await openAndLoad(api);
+		await waitFor(() => expect(api.subscribeEvents).toHaveBeenCalledTimes(1));
+
+		await emitStatus(api, "closed");
+		await emitStatus(api, "open");
+		await waitFor(() => expect(api.subscribeEvents).toHaveBeenCalledTimes(2));
+		await act(async () => {
+			firstReplay.resolve([{
+				event_id: 5,
+				event: "model.error",
+				session_id: SESSION_ID,
+				data: { error: "stale replay completion" },
+			}]);
+			await firstReplay.promise;
+		});
+		expect(screen.queryByText("model error: stale replay completion")).toBeNull();
+
+		await emitStatus(api, "closed");
+		await emitStatus(api, "open");
+		await waitFor(() => expect(api.subscribeEvents).toHaveBeenCalledTimes(3));
+		await act(async () => {
+			secondReplay.reject(new Error("stale replay failure"));
+			await secondReplay.promise.catch(() => undefined);
+		});
+		expect(screen.queryByText("stale replay failure")).toBeNull();
+
+		await emitEvent(api, {
+			event_id: 9,
+			event: "turn.started",
+			session_id: SESSION_ID,
+			data: {},
+		});
+		await act(async () => {
+			thirdReplay.resolve([{
+				event_id: 8,
+				event: "model.error",
+				session_id: SESSION_ID,
+				data: { error: "current replay" },
+			}]);
+			await thirdReplay.promise;
+		});
+		expect(await screen.findByText("model error: current replay")).toBeTruthy();
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
 	it("blocks initial-load Retry on connection error and loads canonically after open", async () => {
 		const api = createControllableApi();
 		api.getSession.mockRejectedValueOnce(new Error("initial load failed"));

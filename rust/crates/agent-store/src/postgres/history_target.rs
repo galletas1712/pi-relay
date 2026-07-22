@@ -76,31 +76,56 @@ pub(super) async fn history_target_context_for_user_tx(
 ) -> Result<Option<String>> {
     let row = sqlx::query(
         r#"
-        with recursive ancestors as (
-            select t.id, t.parent_id, t.item, t.sequence,
-                   0::bigint as depth, false as ancestry_invalid
+        with recursive reachable as (
+            select t.id, t.parent_id, t.item->>'type' as item_type
             from transcript_entries t
+            where t.session_id=$1 and t.id=$2::text
+              and t.item->>'type' = 'user_message'
+
+            union
+
+            select parent.id, parent.parent_id, parent.item->>'type' as item_type
+            from transcript_entries parent
+            join reachable child
+              on parent.session_id=$1 and parent.id=child.parent_id
+            where child.item_type not in ('turn_finished', 'compaction_summary')
+        ),
+        path_state as (
+            select coalesce(bool_and(
+                reachable.item_type not in ('turn_finished', 'compaction_summary')
+                and exists(
+                    select 1
+                    from transcript_entries parent
+                    where parent.session_id=$1 and parent.id=reachable.parent_id
+                )
+            ), false) as ancestry_invalid
+            from reachable
+        ),
+        path as (
+            select t.id, t.parent_id, t.item->>'type' as item_type,
+                   0::bigint as depth, path_state.ancestry_invalid
+            from transcript_entries t
+            cross join path_state
             where t.session_id=$1 and t.id=$2::text
               and t.item->>'type' = 'user_message'
 
             union all
 
-            select parent.id, parent.parent_id, parent.item, parent.sequence,
-                   child.depth + 1, parent.sequence >= child.sequence
+            select parent.id, parent.parent_id, parent.item->>'type' as item_type,
+                   child.depth + 1, child.ancestry_invalid
             from transcript_entries parent
-            join ancestors child
-              on parent.session_id=$1 and parent.id=child.parent_id
-            where child.item->>'type' not in ('turn_finished', 'compaction_summary')
+            join path child on parent.session_id=$1 and parent.id=child.parent_id
+            where child.item_type not in ('turn_finished', 'compaction_summary')
               and not child.ancestry_invalid
         ),
         context as (
             select
                 (array_agg(id order by depth)
-                    filter (where item->>'type' in ('turn_finished', 'compaction_summary')))[1]
+                    filter (where item_type in ('turn_finished', 'compaction_summary')))[1]
                     as target_leaf_id,
                 bool_or(parent_id is null) as reached_root,
                 bool_or(ancestry_invalid) as ancestry_invalid
-            from ancestors
+            from path
             having count(*) > 0
         )
         select target_leaf_id, reached_root, ancestry_invalid
@@ -133,29 +158,73 @@ pub(super) async fn branch_entry_ids_tx(
     };
     let rows = sqlx::query(
         r#"
-        with recursive branch as (
-            select t.id, t.parent_id, t.item, t.sequence,
-                   0::bigint as depth, false as ancestry_invalid
+        with recursive reachable as (
+            select t.id,
+                   coalesce(
+                       case
+                           when t.item->>'type' = 'compaction_summary' then t.item->>'source_leaf_id'
+                           else null
+                       end,
+                       t.parent_id
+                   ) as next_id
             from transcript_entries t
             where t.session_id = $1 and t.id = $2::text
 
+            union
+
+            select parent.id,
+                   coalesce(
+                       case
+                           when parent.item->>'type' = 'compaction_summary' then parent.item->>'source_leaf_id'
+                           else null
+                       end,
+                       parent.parent_id
+                   ) as next_id
+            from transcript_entries parent
+            join reachable child on parent.session_id=$1 and parent.id=child.next_id
+        ),
+        path_state as (
+            select coalesce(bool_and(exists(
+                select 1
+                from transcript_entries parent
+                where parent.session_id=$1 and parent.id=reachable.next_id
+            )), false) as ancestry_invalid
+            from reachable
+        ),
+        path as (
+            select t.id,
+                   coalesce(
+                       case
+                           when t.item->>'type' = 'compaction_summary' then t.item->>'source_leaf_id'
+                           else null
+                       end,
+                       t.parent_id
+                   ) as next_id,
+                   0::bigint as depth,
+                   path_state.ancestry_invalid
+            from transcript_entries t
+            cross join path_state
+            where t.session_id=$1 and t.id=$2::text
+
             union all
 
-            select parent.id, parent.parent_id, parent.item, parent.sequence,
-                   child.depth + 1, parent.sequence >= child.sequence
+            select parent.id,
+                   coalesce(
+                       case
+                           when parent.item->>'type' = 'compaction_summary' then parent.item->>'source_leaf_id'
+                           else null
+                       end,
+                       parent.parent_id
+                   ) as next_id,
+                   child.depth + 1,
+                   child.ancestry_invalid
             from transcript_entries parent
-            join branch child
-              on parent.session_id = $1
-             and parent.id = coalesce(
-                case
-                    when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
-                    else null
-                end,
-                child.parent_id
-             )
+            join path child on parent.session_id=$1 and parent.id=child.next_id
             where not child.ancestry_invalid
         )
-        select id, ancestry_invalid from branch order by sequence
+        select id, ancestry_invalid
+        from path
+        order by depth desc
         "#,
     )
     .bind(session_id)

@@ -14,18 +14,38 @@ impl PostgresAgentStore {
     ) -> Result<Option<TokenUsageEstimate>> {
         let row = sqlx::query(
             r#"
-            with recursive path as (
-                select id, parent_id, sequence, 0::bigint as depth,
-                       false as ancestry_invalid
+            with recursive reachable as (
+                select id, parent_id
                 from transcript_entries
                 where session_id=$1 and id=$2::text
+                union
+                select parent.id, parent.parent_id
+                from transcript_entries parent
+                join reachable on reachable.parent_id = parent.id
+                where parent.session_id=$1
+            ),
+            path_state as (
+                select coalesce(bool_and(exists(
+                    select 1
+                    from transcript_entries parent
+                    where parent.session_id=$1 and parent.id=reachable.parent_id
+                )), false) as ancestry_invalid
+                from reachable
+            ),
+            path as (
+                select entry.id, entry.parent_id, 0::bigint as depth
+                from transcript_entries entry
+                cross join path_state
+                where entry.session_id=$1 and entry.id=$2::text
+                  and not path_state.ancestry_invalid
                 union all
-                select parent.id, parent.parent_id, parent.sequence, path.depth + 1,
-                       parent.sequence >= path.sequence
+                select parent.id, parent.parent_id, path.depth + 1
                 from transcript_entries parent
                 join path on path.parent_id = parent.id
-                where parent.session_id=$1 and not path.ancestry_invalid
-            ), latest_usage as (
+                cross join path_state
+                where parent.session_id=$1 and not path_state.ancestry_invalid
+            ),
+            latest_usage as (
                 select a.result->'usage' as usage,
                     a.payload->>'context_leaf_id' as context_leaf_id,
                     p.depth
@@ -44,7 +64,7 @@ impl PostgresAgentStore {
                 limit 1
             )
             select path.id, path.parent_id, path.depth, entry.item, entry.provider_replay,
-                latest_usage.usage, latest_usage.context_leaf_id, path.ancestry_invalid
+                latest_usage.usage, latest_usage.context_leaf_id, false as ancestry_invalid
             from latest_usage
             join path on path.depth < latest_usage.depth
             join transcript_entries entry
@@ -56,12 +76,12 @@ impl PostgresAgentStore {
             from latest_usage
             where latest_usage.depth = 0
             union all
-            select null::text as id, null::text as parent_id, path.depth,
+            select null::text as id, null::text as parent_id, null::bigint as depth,
                 null::jsonb as item, null::jsonb as provider_replay,
                 null::jsonb as usage, null::text as context_leaf_id,
                 true as ancestry_invalid
-            from path
-            where path.ancestry_invalid
+            from path_state
+            where path_state.ancestry_invalid
             order by depth desc nulls last
             "#,
         )

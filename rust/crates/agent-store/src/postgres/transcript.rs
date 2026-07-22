@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use agent_session::{
     ModelContext, ModelContextEntry, StoredSession, StoredTranscriptEntry, TranscriptStorageNode,
@@ -58,22 +58,35 @@ async fn active_branch_entry_ids_tx(
     branch_entry_ids_tx(tx, session_id, active_leaf_id.as_deref()).await
 }
 
+#[derive(Clone, Copy)]
+enum TranscriptEntryRecordOrder {
+    Sequence,
+    Requested,
+}
+
 async fn transcript_entry_records_by_id_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     entry_ids: &[String],
     body_mode: TranscriptEntryBodyMode,
+    order: TranscriptEntryRecordOrder,
 ) -> Result<Vec<TranscriptEntryRecord>> {
     if entry_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let provider_replay_select = provider_replay_select(body_mode);
+    let provider_replay_select = aliased_provider_replay_select("entry", body_mode);
+    let order_by = match order {
+        TranscriptEntryRecordOrder::Sequence => "entry.sequence",
+        TranscriptEntryRecordOrder::Requested => "requested.ordinal",
+    };
     let query = format!(
         r#"
-        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}
-        from transcript_entries
-        where session_id=$1 and id = any($2::text[])
-        order by sequence
+        select entry.id, entry.parent_id, entry.timestamp_ms, entry.sequence,
+               entry.item, {provider_replay_select}
+        from unnest($2::text[]) with ordinality as requested(id, ordinal)
+        join transcript_entries entry
+          on entry.session_id=$1 and entry.id=requested.id
+        order by {order_by}
         "#
     );
     let rows = sqlx::query(&query)
@@ -91,38 +104,80 @@ async fn active_branch_entry_records_tx(
     session_id: &str,
     body_mode: TranscriptEntryBodyMode,
 ) -> Result<Vec<TranscriptEntryRecord>> {
-    let provider_replay_select = provider_replay_select(body_mode);
-    let leaf_provider_replay_select = aliased_provider_replay_select("t", body_mode);
-    let parent_provider_replay_select = aliased_provider_replay_select("parent", body_mode);
+    let entry_provider_replay_select = aliased_provider_replay_select("entry", body_mode);
     let query = format!(
         r#"
-        with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence,
-                   0::bigint as depth, false as ancestry_invalid
+        with recursive reachable as (
+            select t.id,
+                   coalesce(
+                       case
+                           when t.item->>'type' = 'compaction_summary' then t.item->>'source_leaf_id'
+                           else null
+                       end,
+                       t.parent_id
+                   ) as next_id
             from transcript_entries t
             join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
             where t.session_id = $1
 
+            union
+
+            select parent.id,
+                   coalesce(
+                       case
+                           when parent.item->>'type' = 'compaction_summary' then parent.item->>'source_leaf_id'
+                           else null
+                       end,
+                       parent.parent_id
+                   ) as next_id
+            from transcript_entries parent
+            join reachable child on parent.session_id=$1 and parent.id=child.next_id
+        ),
+        path_state as (
+            select coalesce(bool_and(exists(
+                select 1
+                from transcript_entries parent
+                where parent.session_id=$1 and parent.id=reachable.next_id
+            )), false) as ancestry_invalid
+            from reachable
+        ),
+        path as (
+            select t.id,
+                   coalesce(
+                       case
+                           when t.item->>'type' = 'compaction_summary' then t.item->>'source_leaf_id'
+                           else null
+                       end,
+                       t.parent_id
+                   ) as next_id,
+                   0::bigint as depth,
+                   path_state.ancestry_invalid
+            from transcript_entries t
+            join sessions s on s.id=t.session_id and s.active_leaf_id=t.id
+            cross join path_state
+            where t.session_id=$1
+
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence,
-                   child.depth + 1, parent.sequence >= child.sequence
+            select parent.id,
+                   coalesce(
+                       case
+                           when parent.item->>'type' = 'compaction_summary' then parent.item->>'source_leaf_id'
+                           else null
+                       end,
+                       parent.parent_id
+                   ) as next_id,
+                   child.depth + 1,
+                   child.ancestry_invalid
             from transcript_entries parent
-            join branch child
-              on parent.session_id = $1
-             and parent.id = coalesce(
-                case
-                    when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
-                    else null
-                end,
-                child.parent_id
-             )
+            join path child on parent.session_id=$1 and parent.id=child.next_id
             where not child.ancestry_invalid
         )
-        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}, depth,
-               ancestry_invalid
-        from branch
-        order by sequence
+        select entry.id, entry.parent_id, entry.timestamp_ms, entry.sequence, entry.item,
+               {entry_provider_replay_select}, path.depth, path.ancestry_invalid
+        from path
+        join transcript_entries entry on entry.session_id=$1 and entry.id=path.id
+        order by path.depth desc
         "#
     );
     let rows = sqlx::query(&query)
@@ -143,42 +198,102 @@ async fn active_branch_entry_records_between_tx(
     end_sequence: i64,
     body_mode: TranscriptEntryBodyMode,
 ) -> Result<Vec<TranscriptEntryRecord>> {
-    let provider_replay_select = provider_replay_select(body_mode);
-    let leaf_provider_replay_select = aliased_provider_replay_select("t", body_mode);
-    let parent_provider_replay_select = aliased_provider_replay_select("parent", body_mode);
+    let entry_provider_replay_select = aliased_provider_replay_select("entry", body_mode);
     let query = format!(
         r#"
-        with recursive card_path as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence,
-                   0::bigint as depth, false as ancestry_invalid
+        with recursive bounds as materialized (
+            select id as start_id
+            from transcript_entries
+            where session_id=$1 and sequence=$3
+        ),
+        reachable as (
+            select t.id,
+                   coalesce(
+                       case
+                           when t.item->>'type' = 'compaction_summary' then t.item->>'source_leaf_id'
+                           else null
+                       end,
+                       t.parent_id
+                   ) as next_id,
+                   t.sequence
             from transcript_entries t
+            cross join bounds
             where t.session_id = $1
               and t.id = $2::text
               and t.sequence = $4
 
+            union
+
+            select parent.id,
+                   coalesce(
+                       case
+                           when parent.item->>'type' = 'compaction_summary' then parent.item->>'source_leaf_id'
+                           else null
+                       end,
+                       parent.parent_id
+                   ) as next_id,
+                   parent.sequence
+            from transcript_entries parent
+            join reachable child on parent.session_id=$1 and parent.id=child.next_id
+            cross join bounds
+            where child.id <> bounds.start_id
+        ),
+        path_state as (
+            select
+                coalesce(bool_or(reachable.id=bounds.start_id), false) as start_found,
+                coalesce(bool_and(
+                    reachable.id <> bounds.start_id
+                    and exists(
+                        select 1
+                        from transcript_entries parent
+                        where parent.session_id=$1 and parent.id=reachable.next_id
+                    )
+                ), false) as ancestry_invalid
+            from reachable
+            cross join bounds
+        ),
+        path as (
+            select t.id,
+                   coalesce(
+                       case
+                           when t.item->>'type' = 'compaction_summary' then t.item->>'source_leaf_id'
+                           else null
+                       end,
+                       t.parent_id
+                   ) as next_id,
+                   t.sequence,
+                   0::bigint as depth,
+                   path_state.ancestry_invalid
+            from transcript_entries t
+            cross join path_state
+            cross join bounds
+            where t.session_id=$1 and t.id=$2::text and t.sequence=$4
+
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence,
-                   child.depth + 1, parent.sequence >= child.sequence
+            select parent.id,
+                   coalesce(
+                       case
+                           when parent.item->>'type' = 'compaction_summary' then parent.item->>'source_leaf_id'
+                           else null
+                       end,
+                       parent.parent_id
+                   ) as next_id,
+                   parent.sequence,
+                   child.depth + 1,
+                   child.ancestry_invalid
             from transcript_entries parent
-            join card_path child
-              on parent.session_id = $1
-             and parent.id = coalesce(
-                case
-                    when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
-                    else null
-                end,
-                child.parent_id
-             )
-            where child.sequence > $3
-              and not child.ancestry_invalid
+            join path child on parent.session_id=$1 and parent.id=child.next_id
+            cross join bounds
+            where child.id <> bounds.start_id and not child.ancestry_invalid
         )
-        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}, depth,
-               ancestry_invalid
-        from card_path
-        where sequence between $3 and $4
-           or ancestry_invalid
-        order by sequence
+        select entry.id, entry.parent_id, entry.timestamp_ms, entry.sequence, entry.item,
+               {entry_provider_replay_select}, path.depth, path.ancestry_invalid
+        from path
+        join transcript_entries entry on entry.session_id=$1 and entry.id=path.id
+        cross join path_state
+        where path_state.start_found or path.ancestry_invalid
+        order by path.depth desc
         "#
     );
     let rows = sqlx::query(&query)
@@ -388,7 +503,14 @@ impl PostgresAgentStore {
         let entries = if entry_ids.is_empty() {
             Vec::new()
         } else {
-            transcript_entry_records_by_id_tx(&mut tx, session_id, entry_ids, body_mode).await?
+            transcript_entry_records_by_id_tx(
+                &mut tx,
+                session_id,
+                entry_ids,
+                body_mode,
+                TranscriptEntryRecordOrder::Sequence,
+            )
+            .await?
         };
         tx.commit().await?;
         Ok(TranscriptEntriesResult {
@@ -497,11 +619,6 @@ impl PostgresAgentStore {
         .await?
         .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         let active_leaf_id: Option<String> = session.get("active_leaf_id");
-        let active_branch_entry_ids =
-            branch_entry_ids_tx(&mut tx, session_id, active_leaf_id.as_deref())
-                .await?
-                .into_iter()
-                .collect::<HashSet<_>>();
         let rows = sqlx::query(
             r#"
             with recursive users as materialized (
@@ -513,40 +630,118 @@ impl PostgresAgentStore {
                 order by u.sequence desc, u.id desc
                 limit $3 + 1
             ),
-            ancestors as (
-                select u.id as source_id, u.id, u.parent_id, u.item, u.sequence as ancestry_sequence,
-                       0::bigint as depth, false as ancestry_invalid
+            ancestor_reachable as (
+                select u.id as source_id, u.id, u.parent_id,
+                       u.item->>'type' as item_type,
+                       nullif(u.item->>'turn_id', '')::bigint as turn_id
                 from users u
+
+                union
+
+                select child.source_id, parent.id, parent.parent_id,
+                       parent.item->>'type' as item_type,
+                       nullif(parent.item->>'turn_id', '')::bigint as turn_id
+                from transcript_entries parent
+                join ancestor_reachable child
+                  on parent.session_id=$1 and parent.id=child.parent_id
+                where child.item_type not in ('turn_finished', 'compaction_summary')
+            ),
+            ancestor_state as (
+                select source_id,
+                       coalesce(bool_and(
+                           item_type not in ('turn_finished', 'compaction_summary')
+                           and exists(
+                               select 1
+                               from transcript_entries parent
+                               where parent.session_id=$1
+                                 and parent.id=ancestor_reachable.parent_id
+                           )
+                       ), false) as ancestry_invalid
+                from ancestor_reachable
+                group by source_id
+            ),
+            ancestor_path as (
+                select u.id as source_id, u.id, u.parent_id,
+                       u.item->>'type' as item_type,
+                       nullif(u.item->>'turn_id', '')::bigint as turn_id,
+                       0::bigint as depth,
+                       ancestor_state.ancestry_invalid
+                from users u
+                join ancestor_state on ancestor_state.source_id=u.id
 
                 union all
 
-                select child.source_id, parent.id, parent.parent_id, parent.item,
-                       parent.sequence, child.depth + 1,
-                       parent.sequence >= child.ancestry_sequence
+                select child.source_id, parent.id, parent.parent_id,
+                       parent.item->>'type' as item_type,
+                       nullif(parent.item->>'turn_id', '')::bigint as turn_id,
+                       child.depth + 1,
+                       child.ancestry_invalid
                 from transcript_entries parent
-                join ancestors child
+                join ancestor_path child
                   on parent.session_id=$1 and parent.id=child.parent_id
-                where child.item->>'type' not in ('turn_finished', 'compaction_summary')
+                where child.item_type not in ('turn_finished', 'compaction_summary')
                   and not child.ancestry_invalid
             ),
             contexts as (
                 select source_id,
                        (array_agg(id order by depth)
-                           filter (where item->>'type' in ('turn_finished', 'compaction_summary')))[1]
+                           filter (where item_type in ('turn_finished', 'compaction_summary')))[1]
                            as target_leaf_id,
-                       (array_agg(nullif(item->>'turn_id', '')::bigint order by depth)
-                           filter (where item->>'type' = 'turn_started'))[1]
+                       (array_agg(turn_id order by depth)
+                           filter (where item_type = 'turn_started'))[1]
                            as turn_id,
                        bool_or(parent_id is null)
-                           or bool_or(item->>'type' in ('turn_finished', 'compaction_summary'))
+                           or bool_or(item_type in ('turn_finished', 'compaction_summary'))
                            as resolved,
                        bool_or(ancestry_invalid) as ancestry_invalid
-                from ancestors
+                from ancestor_path
                 group by source_id
+            ),
+            active_reachable as (
+                select t.id,
+                       coalesce(
+                           case
+                               when t.item->>'type' = 'compaction_summary' then t.item->>'source_leaf_id'
+                               else null
+                           end,
+                           t.parent_id
+                       ) as next_id
+                from transcript_entries t
+                where t.session_id=$1 and t.id=$4::text
+
+                union
+
+                select parent.id,
+                       coalesce(
+                           case
+                               when parent.item->>'type' = 'compaction_summary' then parent.item->>'source_leaf_id'
+                               else null
+                           end,
+                           parent.parent_id
+                       ) as next_id
+                from transcript_entries parent
+                join active_reachable child
+                  on parent.session_id=$1 and parent.id=child.next_id
+            ),
+            active_branch_state as (
+                select coalesce(bool_and(exists(
+                    select 1
+                    from transcript_entries parent
+                    where parent.session_id=$1 and parent.id=active_reachable.next_id
+                )), false) as ancestry_invalid
+                from active_reachable
+            ),
+            active_users as (
+                select active_reachable.id
+                from active_reachable
+                join users on users.id=active_reachable.id
             )
             select u.id, u.timestamp_ms, u.sequence,
                    contexts.target_leaf_id, contexts.turn_id, contexts.resolved,
-                   contexts.ancestry_invalid,
+                   contexts.ancestry_invalid or active_branch_state.ancestry_invalid
+                       as ancestry_invalid,
+                   exists(select 1 from active_users where active_users.id=u.id)
+                       as is_on_active_branch,
                    coalesce((
                        select left(string_agg(
                            left(coalesce(block->>'text', '[image]'), 160),
@@ -558,12 +753,14 @@ impl PostgresAgentStore {
                    ), '') as preview
             from users u
             join contexts on contexts.source_id=u.id
+            cross join active_branch_state
             order by u.sequence desc, u.id desc
             "#,
         )
         .bind(session_id)
         .bind(before_sequence)
         .bind(limit)
+        .bind(active_leaf_id.as_deref())
         .fetch_all(&mut *tx)
         .await?;
         ensure_valid_transcript_ancestry(&rows)?;
@@ -579,7 +776,7 @@ impl PostgresAgentStore {
             targets.push(HistoryTargetRecord {
                 target_leaf_id: row.get("target_leaf_id"),
                 turn_id: row.get("turn_id"),
-                is_on_active_branch: active_branch_entry_ids.contains(&entry_id),
+                is_on_active_branch: row.get("is_on_active_branch"),
                 entry_id,
                 timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
                 preview: row.get("preview"),
@@ -770,44 +967,89 @@ impl PostgresAgentStore {
         base_leaf_id: &str,
         body_mode: TranscriptEntryBodyMode,
     ) -> Result<Vec<TranscriptEntryRecord>> {
-        let provider_replay_select = provider_replay_select(body_mode);
-        let leaf_provider_replay_select = aliased_provider_replay_select("t", body_mode);
-        let parent_provider_replay_select = aliased_provider_replay_select("parent", body_mode);
+        let entry_provider_replay_select = aliased_provider_replay_select("entry", body_mode);
         let query = format!(
             r#"
-            with recursive branch as (
-                select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence,
-                       0::bigint as depth, false as ancestry_invalid
+            with recursive reachable as (
+                select t.id,
+                       coalesce(
+                           case
+                               when t.item->>'type' = 'compaction_summary' then t.item->>'source_leaf_id'
+                               else null
+                           end,
+                           t.parent_id
+                       ) as next_id
                 from transcript_entries t
                 join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
                 where t.session_id = $1
 
+                union
+
+                select parent.id,
+                       coalesce(
+                           case
+                               when parent.item->>'type' = 'compaction_summary' then parent.item->>'source_leaf_id'
+                               else null
+                           end,
+                           parent.parent_id
+                       ) as next_id
+                from transcript_entries parent
+                join reachable child on parent.session_id=$1 and parent.id=child.next_id
+                where child.id <> $2::text
+            ),
+            path_state as (
+                select
+                    coalesce(bool_or(id=$2::text), false) as base_found,
+                    coalesce(bool_and(
+                        id <> $2::text
+                        and exists(
+                            select 1
+                            from transcript_entries parent
+                            where parent.session_id=$1 and parent.id=reachable.next_id
+                        )
+                    ), false) as ancestry_invalid
+                from reachable
+            ),
+            path as (
+                select t.id,
+                       coalesce(
+                           case
+                               when t.item->>'type' = 'compaction_summary' then t.item->>'source_leaf_id'
+                               else null
+                           end,
+                           t.parent_id
+                       ) as next_id,
+                       0::bigint as depth,
+                       path_state.ancestry_invalid
+                from transcript_entries t
+                join sessions s on s.id=t.session_id and s.active_leaf_id=t.id
+                cross join path_state
+                where t.session_id=$1
+
                 union all
 
-                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence,
-                       child.depth + 1, parent.sequence >= child.sequence
+                select parent.id,
+                       coalesce(
+                           case
+                               when parent.item->>'type' = 'compaction_summary' then parent.item->>'source_leaf_id'
+                               else null
+                           end,
+                           parent.parent_id
+                       ) as next_id,
+                       child.depth + 1,
+                       child.ancestry_invalid
                 from transcript_entries parent
-                join branch child
-                  on parent.session_id = $1
-                 and parent.id = coalesce(
-                    case
-                        when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
-                        else null
-                    end,
-                    child.parent_id
-                 )
-                where child.id <> $2::text
-                  and not child.ancestry_invalid
-            ),
-            base as (
-                select min(depth) as depth from branch where id = $2::text
+                join path child on parent.session_id=$1 and parent.id=child.next_id
+                where child.id <> $2::text and not child.ancestry_invalid
             )
-            select branch.id, branch.parent_id, branch.timestamp_ms, branch.sequence, branch.item, {provider_replay_select}, branch.depth,
-                   branch.ancestry_invalid
-            from branch, base
-            where branch.depth < base.depth
-               or branch.ancestry_invalid
-            order by branch.depth desc
+            select entry.id, entry.parent_id, entry.timestamp_ms, entry.sequence, entry.item,
+                   {entry_provider_replay_select}, path.depth, path.ancestry_invalid
+            from path
+            join transcript_entries entry on entry.session_id=$1 and entry.id=path.id
+            cross join path_state
+            where (path_state.base_found and path.id <> $2::text)
+               or path.ancestry_invalid
+            order by path.depth desc
             "#
         );
         let rows = sqlx::query(&query)
@@ -915,6 +1157,7 @@ impl PostgresAgentStore {
                     session_id,
                     &requested_branch_ids,
                     TranscriptEntryBodyMode::Ui,
+                    TranscriptEntryRecordOrder::Requested,
                 )
                 .await?,
             )
@@ -925,6 +1168,7 @@ impl PostgresAgentStore {
                     session_id,
                     active_branch_entry_ids.as_deref().unwrap_or(&[]),
                     TranscriptEntryBodyMode::Ui,
+                    TranscriptEntryRecordOrder::Requested,
                 )
                 .await?,
             )
@@ -1019,26 +1263,48 @@ where
 {
     let rows = sqlx::query(
         r#"
-        with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence,
-                   0::bigint as depth, false as ancestry_invalid
+        with recursive reachable as (
+            select t.id, t.parent_id
             from transcript_entries t
             where t.session_id = $1
               and t.id = $2::text
 
-            union all
+            union
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence,
-                   child.depth + 1, parent.sequence >= child.sequence
+            select parent.id, parent.parent_id
             from transcript_entries parent
-            join branch child
+            join reachable child
               on parent.session_id = $1
              and parent.id = child.parent_id
+        ),
+        path_state as (
+            select coalesce(bool_and(exists(
+                select 1
+                from transcript_entries parent
+                where parent.session_id=$1 and parent.id=reachable.parent_id
+            )), false) as ancestry_invalid
+            from reachable
+        ),
+        path as (
+            select t.id, t.parent_id, 0::bigint as depth,
+                   path_state.ancestry_invalid
+            from transcript_entries t
+            cross join path_state
+            where t.session_id=$1 and t.id=$2::text
+
+            union all
+
+            select parent.id, parent.parent_id, child.depth + 1,
+                   child.ancestry_invalid
+            from transcript_entries parent
+            join path child on parent.session_id=$1 and parent.id=child.parent_id
             where not child.ancestry_invalid
         )
-        select id, parent_id, timestamp_ms, item, provider_replay, depth, ancestry_invalid
-        from branch
-        order by sequence
+        select entry.id, entry.parent_id, entry.timestamp_ms, entry.item,
+               entry.provider_replay, path.depth, path.ancestry_invalid
+        from path
+        join transcript_entries entry on entry.session_id=$1 and entry.id=path.id
+        order by path.depth desc
         "#,
     )
     .bind(session_id)
@@ -1666,6 +1932,21 @@ mod tests {
             )
             .await
             .expect("transcript persists");
+        sqlx::query(
+            r#"
+            update transcript_entries
+            set sequence = case id
+                when 'entry_start' then 3
+                when 'entry_user' then 2
+                when 'entry_finish' then 1
+            end
+            where session_id=$1
+            "#,
+        )
+        .bind(session_id)
+        .execute(&store.pool)
+        .await
+        .expect("child-first sequence installs");
         let before = store
             .session_snapshot(session_id)
             .await
@@ -1704,6 +1985,34 @@ mod tests {
                 .map(|entry| entry.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["entry_user"]
+        );
+
+        let after_sparse = store
+            .session_snapshot(session_id)
+            .await
+            .expect("post-switch snapshot loads");
+        let full = store
+            .switch_active_leaf(SwitchActiveLeafRequest {
+                session_id,
+                target: HistoryTarget {
+                    leaf_id: Some("entry_finish"),
+                    source_entry_id: None,
+                    expected_active_leaf_id: Some(Some("entry_finish")),
+                    expected_transcript_revision: Some(after_sparse.transcript_revision),
+                    expected_active_branch_entry_ids: Some(&expected_ids),
+                },
+                return_active_branch: true,
+                missing_body_ids: None,
+            })
+            .await
+            .expect("full branch switch succeeds");
+        assert_eq!(
+            full.active_branch_entries
+                .expect("full entries returned")
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["entry_start", "entry_user", "entry_finish"]
         );
 
         db.cleanup().await;
