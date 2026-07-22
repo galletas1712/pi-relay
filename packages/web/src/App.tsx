@@ -288,6 +288,26 @@ function cachedProjectIdForSession(queryClient: QueryClient, sessionId: string):
 	return undefined;
 }
 
+function applyReplayedAndBufferedEvents(
+	replayed: EventFrame[],
+	buffered: EventFrame[],
+	apply: (event: EventFrame) => void,
+) {
+	let replayIndex = 0;
+	let bufferedIndex = 0;
+	while (replayIndex < replayed.length || bufferedIndex < buffered.length) {
+		const replayEvent = replayed[replayIndex];
+		const bufferedEvent = buffered[bufferedIndex];
+		if (!bufferedEvent || (replayEvent && replayEvent.event_id <= bufferedEvent.event_id)) {
+			apply(replayEvent);
+			replayIndex += 1;
+		} else {
+			apply(bufferedEvent);
+			bufferedIndex += 1;
+		}
+	}
+}
+
 function LoadingConversation() {
 	const [dotCount, setDotCount] = useState(1);
 
@@ -462,6 +482,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	routeRemoteReadsEnabledRef.current = routeRemoteReadsEnabled;
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
+	const eventReplayBuffers = useRef(new Map<string, EventFrame[]>());
 	const deletedEventSessionTombstones = useRef(
 		new Map<string, DeletedEventSessionTombstone>(),
 	);
@@ -2671,6 +2692,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (status === "open") setTransportDisconnected(false);
 			else if (status !== "connecting") setTransportDisconnected(true);
 			subscribedEventSessionIds.current.clear();
+			eventReplayBuffers.current.clear();
 			// A parse error can leave the current socket alive. Other statuses mark
 			// a transport-generation boundary, where daemon subscriptions are gone.
 			if (status !== "error") clearDeletedEventSessionTombstones();
@@ -2684,11 +2706,19 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				invalidateKnownSessionLists(),
 			]).catch(() => undefined);
 		});
-		const offEvent = api.onEvent((event) => handleSessionEventRef.current(event));
+		const offEvent = api.onEvent((event) => {
+			const replayBuffer = eventReplayBuffers.current.get(event.session_id);
+			if (replayBuffer) {
+				replayBuffer.push(event);
+				return;
+			}
+			handleSessionEventRef.current(event);
+		});
 		void api.connect().catch(() => undefined);
 		return () => {
 			offStatus();
 			offEvent();
+			eventReplayBuffers.current.clear();
 			if (selectedSyncTimer.current !== null) window.clearTimeout(selectedSyncTimer.current);
 			for (const timer of sessionListRefreshTimers.current.values()) window.clearTimeout(timer);
 			sessionListRefreshTimers.current.clear();
@@ -2760,6 +2790,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		for (const sessionId of Array.from(subscribedEventSessionIds.current)) {
 			if (desiredSessionIds.has(sessionId)) continue;
 			subscribedEventSessionIds.current.delete(sessionId);
+			eventReplayBuffers.current.delete(sessionId);
 			if (api.isOpen()) {
 				void api.unsubscribeEvents(sessionId).catch(() => undefined);
 			}
@@ -2768,16 +2799,22 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			if (deletedEventSessionTombstones.current.has(sessionId)) continue;
 			if (subscribedEventSessionIds.current.has(sessionId)) continue;
 			subscribedEventSessionIds.current.add(sessionId);
+			const replayBuffer: EventFrame[] = [];
+			eventReplayBuffers.current.set(sessionId, replayBuffer);
 			const afterEventId =
 				lastEventIds.current.get(sessionId) ?? (loadedSnapshot?.session_id === sessionId ? loadedSnapshot.last_event_id : null);
 			void api
 				.subscribeEvents(sessionId, afterEventId)
 				.then((replayed) => {
+					if (eventReplayBuffers.current.get(sessionId) !== replayBuffer) return undefined;
+					eventReplayBuffers.current.delete(sessionId);
 					if (!subscribedEventSessionIds.current.has(sessionId)) return undefined;
-					for (const event of replayed) handleSessionEvent(event);
+					applyReplayedAndBufferedEvents(replayed, replayBuffer, handleSessionEvent);
 					return undefined;
 				})
 				.catch((error) => {
+					if (eventReplayBuffers.current.get(sessionId) !== replayBuffer) return;
+					eventReplayBuffers.current.delete(sessionId);
 					subscribedEventSessionIds.current.delete(sessionId);
 					pushErrorNotice(errorMessage(error));
 				});

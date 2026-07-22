@@ -17,14 +17,12 @@ use crate::{
 };
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
-use super::history_target::{
-    branch_entry_ids_tx, validate_history_target_tx, HISTORY_TARGET_ANCESTRY_LIMIT,
-};
+use super::history_target::{branch_entry_ids_tx, validate_history_target_tx};
 use super::queue::bump_revisions_tx;
 use super::rows::{row_to_stored_entry, row_to_transcript_entry};
 use super::sql::{lock_session_tx, stale_unfinished_actions_for_session};
 use super::turn_cards::{active_branch_turn_card_page_tx, TurnCardPage};
-use super::{PostgresAgentStore, TRANSCRIPT_RECURSION_LIMIT};
+use super::{ensure_valid_transcript_ancestry, PostgresAgentStore};
 
 const DEFAULT_TRANSCRIPT_INDEX_LIMIT: i64 = 1000;
 const MAX_TRANSCRIPT_INDEX_LIMIT: i64 = 5000;
@@ -99,14 +97,16 @@ async fn active_branch_entry_records_tx(
     let query = format!(
         r#"
         with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence, 0::bigint as depth
+            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence,
+                   0::bigint as depth, false as ancestry_invalid
             from transcript_entries t
             join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
             where t.session_id = $1
 
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence, child.depth + 1
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence,
+                   child.depth + 1, parent.sequence >= child.sequence
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
@@ -117,9 +117,10 @@ async fn active_branch_entry_records_tx(
                 end,
                 child.parent_id
              )
-            where child.depth <= {TRANSCRIPT_RECURSION_LIMIT}
+            where not child.ancestry_invalid
         )
-        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}, depth
+        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}, depth,
+               ancestry_invalid
         from branch
         order by sequence
         "#
@@ -128,16 +129,8 @@ async fn active_branch_entry_records_tx(
         .bind(session_id)
         .fetch_all(&mut **tx)
         .await?;
-    if rows
-        .iter()
-        .any(|row| row.get::<i64, _>("depth") > TRANSCRIPT_RECURSION_LIMIT)
-    {
-        return Err(anyhow!(
-            "transcript ancestry exceeds maximum depth {TRANSCRIPT_RECURSION_LIMIT}; possible cycle"
-        ));
-    }
+    ensure_valid_transcript_ancestry(&rows)?;
     rows.into_iter()
-        .filter(|row| row.get::<i64, _>("depth") <= TRANSCRIPT_RECURSION_LIMIT)
         .map(|row| row_to_transcript_entry(&row))
         .collect()
 }
@@ -156,7 +149,8 @@ async fn active_branch_entry_records_between_tx(
     let query = format!(
         r#"
         with recursive card_path as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence, 0::bigint as depth
+            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence,
+                   0::bigint as depth, false as ancestry_invalid
             from transcript_entries t
             where t.session_id = $1
               and t.id = $2::text
@@ -164,7 +158,8 @@ async fn active_branch_entry_records_between_tx(
 
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence, child.depth + 1
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence,
+                   child.depth + 1, parent.sequence >= child.sequence
             from transcript_entries parent
             join card_path child
               on parent.session_id = $1
@@ -176,12 +171,13 @@ async fn active_branch_entry_records_between_tx(
                 child.parent_id
              )
             where child.sequence > $3
-              and child.depth <= {TRANSCRIPT_RECURSION_LIMIT}
+              and not child.ancestry_invalid
         )
-        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}, depth
+        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}, depth,
+               ancestry_invalid
         from card_path
         where sequence between $3 and $4
-           or depth > {TRANSCRIPT_RECURSION_LIMIT}
+           or ancestry_invalid
         order by sequence
         "#
     );
@@ -192,16 +188,8 @@ async fn active_branch_entry_records_between_tx(
         .bind(end_sequence)
         .fetch_all(&mut **tx)
         .await?;
-    if rows
-        .iter()
-        .any(|row| row.get::<i64, _>("depth") > TRANSCRIPT_RECURSION_LIMIT)
-    {
-        return Err(anyhow!(
-            "transcript ancestry exceeds maximum depth {TRANSCRIPT_RECURSION_LIMIT}; possible cycle"
-        ));
-    }
+    ensure_valid_transcript_ancestry(&rows)?;
     rows.into_iter()
-        .filter(|row| row.get::<i64, _>("depth") <= TRANSCRIPT_RECURSION_LIMIT)
         .map(|row| row_to_transcript_entry(&row))
         .collect()
 }
@@ -526,18 +514,20 @@ impl PostgresAgentStore {
                 limit $3 + 1
             ),
             ancestors as (
-                select u.id as source_id, u.id, u.parent_id, u.item, 0::bigint as depth
+                select u.id as source_id, u.id, u.parent_id, u.item, u.sequence as ancestry_sequence,
+                       0::bigint as depth, false as ancestry_invalid
                 from users u
 
                 union all
 
                 select child.source_id, parent.id, parent.parent_id, parent.item,
-                       child.depth + 1
+                       parent.sequence, child.depth + 1,
+                       parent.sequence >= child.ancestry_sequence
                 from transcript_entries parent
                 join ancestors child
                   on parent.session_id=$1 and parent.id=child.parent_id
                 where child.item->>'type' not in ('turn_finished', 'compaction_summary')
-                  and child.depth <= $4
+                  and not child.ancestry_invalid
             ),
             contexts as (
                 select source_id,
@@ -550,13 +540,13 @@ impl PostgresAgentStore {
                        bool_or(parent_id is null)
                            or bool_or(item->>'type' in ('turn_finished', 'compaction_summary'))
                            as resolved,
-                       max(depth) as max_depth
+                       bool_or(ancestry_invalid) as ancestry_invalid
                 from ancestors
                 group by source_id
             )
             select u.id, u.timestamp_ms, u.sequence,
                    contexts.target_leaf_id, contexts.turn_id, contexts.resolved,
-                   contexts.max_depth,
+                   contexts.ancestry_invalid,
                    coalesce((
                        select left(string_agg(
                            left(coalesce(block->>'text', '[image]'), 160),
@@ -574,19 +564,14 @@ impl PostgresAgentStore {
         .bind(session_id)
         .bind(before_sequence)
         .bind(limit)
-        .bind(HISTORY_TARGET_ANCESTRY_LIMIT)
         .fetch_all(&mut *tx)
         .await?;
+        ensure_valid_transcript_ancestry(&rows)?;
         let has_more = rows.len() as i64 > limit;
         let mut targets = Vec::with_capacity(rows.len().min(limit as usize));
         let mut next_before_sequence = None;
         for row in rows.into_iter().take(limit as usize) {
             next_before_sequence = Some(row.get::<i64, _>("sequence"));
-            if row.get::<i64, _>("max_depth") > HISTORY_TARGET_ANCESTRY_LIMIT {
-                return Err(anyhow!(
-                    "transcript ancestry exceeds maximum depth {HISTORY_TARGET_ANCESTRY_LIMIT}; possible cycle"
-                ));
-            }
             if !row.get::<bool, _>("resolved") {
                 continue;
             }
@@ -791,14 +776,16 @@ impl PostgresAgentStore {
         let query = format!(
             r#"
             with recursive branch as (
-                select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence, 0::bigint as depth
+                select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence,
+                       0::bigint as depth, false as ancestry_invalid
                 from transcript_entries t
                 join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
                 where t.session_id = $1
 
                 union all
 
-                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence, child.depth + 1
+                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence,
+                       child.depth + 1, parent.sequence >= child.sequence
                 from transcript_entries parent
                 join branch child
                   on parent.session_id = $1
@@ -810,15 +797,16 @@ impl PostgresAgentStore {
                     child.parent_id
                  )
                 where child.id <> $2::text
-                  and child.depth <= {TRANSCRIPT_RECURSION_LIMIT}
+                  and not child.ancestry_invalid
             ),
             base as (
                 select min(depth) as depth from branch where id = $2::text
             )
-            select branch.id, branch.parent_id, branch.timestamp_ms, branch.sequence, branch.item, {provider_replay_select}, branch.depth
+            select branch.id, branch.parent_id, branch.timestamp_ms, branch.sequence, branch.item, {provider_replay_select}, branch.depth,
+                   branch.ancestry_invalid
             from branch, base
             where branch.depth < base.depth
-               or branch.depth > {TRANSCRIPT_RECURSION_LIMIT}
+               or branch.ancestry_invalid
             order by branch.depth desc
             "#
         );
@@ -827,16 +815,8 @@ impl PostgresAgentStore {
             .bind(base_leaf_id)
             .fetch_all(&self.pool)
             .await?;
-        if rows
-            .iter()
-            .any(|row| row.get::<i64, _>("depth") > TRANSCRIPT_RECURSION_LIMIT)
-        {
-            return Err(anyhow!(
-                "transcript ancestry exceeds maximum depth {TRANSCRIPT_RECURSION_LIMIT}; possible cycle"
-            ));
-        }
+        ensure_valid_transcript_ancestry(&rows)?;
         rows.into_iter()
-            .filter(|row| row.get::<i64, _>("depth") <= TRANSCRIPT_RECURSION_LIMIT)
             .map(|row| row_to_transcript_entry(&row))
             .collect()
     }
@@ -1040,40 +1020,33 @@ where
     let rows = sqlx::query(
         r#"
         with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence, 0::bigint as depth
+            select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence,
+                   0::bigint as depth, false as ancestry_invalid
             from transcript_entries t
             where t.session_id = $1
               and t.id = $2::text
 
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence, child.depth + 1
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence,
+                   child.depth + 1, parent.sequence >= child.sequence
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
              and parent.id = child.parent_id
-            where child.depth <= $3
+            where not child.ancestry_invalid
         )
-        select id, parent_id, timestamp_ms, item, provider_replay, depth
+        select id, parent_id, timestamp_ms, item, provider_replay, depth, ancestry_invalid
         from branch
         order by sequence
         "#,
     )
     .bind(session_id)
     .bind(leaf_id)
-    .bind(TRANSCRIPT_RECURSION_LIMIT)
     .fetch_all(executor)
     .await?;
-    if rows
-        .iter()
-        .any(|row| row.get::<i64, _>("depth") > TRANSCRIPT_RECURSION_LIMIT)
-    {
-        return Err(anyhow!(
-            "transcript ancestry exceeds maximum depth {TRANSCRIPT_RECURSION_LIMIT}; possible cycle"
-        ));
-    }
+    ensure_valid_transcript_ancestry(&rows)?;
     rows.into_iter()
-        .filter(|row| row.get::<i64, _>("depth") <= TRANSCRIPT_RECURSION_LIMIT)
         .map(|row| row_to_stored_entry(&row))
         .collect()
 }

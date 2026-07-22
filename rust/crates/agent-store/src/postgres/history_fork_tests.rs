@@ -480,7 +480,7 @@ async fn history_targets_page_newest_users_with_safe_bounded_previews() {
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
-async fn capped_history_target_ancestry_is_omitted_and_rejected() {
+async fn long_history_target_ancestry_remains_valid() {
     let Some(db) = test_store().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -490,58 +490,120 @@ async fn capped_history_target_ancestry_is_omitted_and_rejected() {
     store
         .create_project(
             project_id,
-            "capped history target test",
+            "long history target test",
             "runtime-test",
             &[],
             json!({}),
         )
         .await
         .expect("project creates");
-    let config = create_session(store, project_id, "capped-source", false).await;
+    let config = create_session(store, project_id, "long-source", false).await;
     sqlx::query(
         r#"
         insert into transcript_entries (
             session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id
         )
         select
-            'capped-source',
+            'long-source',
             'deep-' || depth,
-            case when depth = 10000 then null else 'deep-' || (depth + 1) end,
+            case when depth = 0 then null else 'deep-' || (depth - 1) end,
             depth,
             case
-                when depth = 0 then '{"type":"user_message","content":[{"type":"text","text":"too deep"}]}'::jsonb
-                else '{"type":"daemon_observation","text":"ancestor"}'::jsonb
+                when depth = 10001 then '{"type":"user_message","content":[{"type":"text","text":"long history"}]}'::jsonb
+                else '{"type":"assistant_message","items":[]}'::jsonb
             end,
             '[]'::jsonb,
             null
-        from generate_series(0, 10000) as ancestry(depth)
+        from generate_series(0, 10001) as ancestry(depth)
         "#,
     )
     .execute(&store.pool)
     .await
     .expect("deep ancestry inserts");
+    sqlx::query("update sessions set active_leaf_id='deep-10001' where id='long-source'")
+        .execute(&store.pool)
+        .await
+        .expect("long active leaf installs");
+
+    let stored = store
+        .load_stored_session("long-source")
+        .await
+        .expect("long active branch loads");
+    assert_eq!(stored.entries.len(), 10_002);
 
     let page = store
-        .history_targets("capped-source", None, None)
+        .history_targets("long-source", None, None)
         .await
         .expect("history targets load");
-    assert!(page.targets.is_empty());
+    assert_eq!(page.targets.len(), 1);
+    assert_eq!(page.targets[0].entry_id, "deep-10001");
+    assert_eq!(page.targets[0].target_leaf_id, None);
 
     let target = HistoryTarget {
         leaf_id: None,
-        source_entry_id: Some("deep-0"),
+        source_entry_id: Some("deep-10001"),
         expected_active_leaf_id: None,
         expected_transcript_revision: None,
         expected_active_branch_entry_ids: None,
     };
-    let switch_error = switch(store, "capped-source", target)
+    switch(store, "long-source", target)
         .await
-        .expect_err("capped ancestry cannot validate as root");
-    let fork_error = fork(store, "capped-source", "capped-child", &config, target)
+        .expect("long ancestry switches to root");
+    fork(store, "long-source", "long-child", &config, target)
         .await
-        .expect_err("capped ancestry cannot fork from root");
-    assert!(switch_error.downcast_ref::<HistoryChanged>().is_some());
-    assert!(fork_error.downcast_ref::<HistoryChanged>().is_some());
+        .expect("long ancestry forks from root");
+
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn cyclic_history_target_ancestry_is_rejected() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "cyclic history target test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    create_session(store, project_id, "cyclic-source", false).await;
+    sqlx::query(
+        r#"
+        insert into transcript_entries (
+            session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id
+        )
+        values
+            ('cyclic-source', 'cycle-root', null, 1,
+             '{"type":"assistant_message","items":[]}'::jsonb, '[]'::jsonb, null),
+            ('cyclic-source', 'cycle-user', 'cycle-root', 2,
+             '{"type":"user_message","content":[{"type":"text","text":"cycle"}]}'::jsonb, '[]'::jsonb, null)
+        "#,
+    )
+    .execute(&store.pool)
+    .await
+    .expect("ancestry installs");
+    sqlx::query(
+        "update transcript_entries set parent_id='cycle-user' \
+         where session_id='cyclic-source' and id='cycle-root'",
+    )
+    .execute(&store.pool)
+    .await
+    .expect("cycle installs");
+
+    let error = store
+        .history_targets("cyclic-source", None, None)
+        .await
+        .expect_err("cyclic ancestry is rejected");
+    assert!(error.to_string().contains("cycle or non-append-only link"));
 
     db.cleanup().await;
 }

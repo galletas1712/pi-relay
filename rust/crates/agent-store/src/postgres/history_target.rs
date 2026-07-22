@@ -4,9 +4,8 @@ use sqlx::{Postgres, Row, Transaction};
 
 use crate::HistoryTarget;
 
+use super::ensure_valid_transcript_ancestry;
 use super::sql::{ensure_no_active_work_tx, ensure_no_running_delegation_tx};
-
-pub(super) const HISTORY_TARGET_ANCESTRY_LIMIT: i64 = 10_000;
 
 pub(super) async fn validate_history_target_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -78,19 +77,21 @@ pub(super) async fn history_target_context_for_user_tx(
     let row = sqlx::query(
         r#"
         with recursive ancestors as (
-            select t.id, t.parent_id, t.item, 0::bigint as depth
+            select t.id, t.parent_id, t.item, t.sequence,
+                   0::bigint as depth, false as ancestry_invalid
             from transcript_entries t
             where t.session_id=$1 and t.id=$2::text
               and t.item->>'type' = 'user_message'
 
             union all
 
-            select parent.id, parent.parent_id, parent.item, child.depth + 1
+            select parent.id, parent.parent_id, parent.item, parent.sequence,
+                   child.depth + 1, parent.sequence >= child.sequence
             from transcript_entries parent
             join ancestors child
               on parent.session_id=$1 and parent.id=child.parent_id
             where child.item->>'type' not in ('turn_finished', 'compaction_summary')
-              and child.depth <= $3
+              and not child.ancestry_invalid
         ),
         context as (
             select
@@ -98,28 +99,22 @@ pub(super) async fn history_target_context_for_user_tx(
                     filter (where item->>'type' in ('turn_finished', 'compaction_summary')))[1]
                     as target_leaf_id,
                 bool_or(parent_id is null) as reached_root,
-                max(depth) as max_depth
+                bool_or(ancestry_invalid) as ancestry_invalid
             from ancestors
             having count(*) > 0
         )
-        select target_leaf_id, reached_root, max_depth
+        select target_leaf_id, reached_root, ancestry_invalid
         from context
         "#,
     )
     .bind(session_id)
     .bind(entry_id)
-    .bind(HISTORY_TARGET_ANCESTRY_LIMIT)
     .fetch_optional(&mut **tx)
     .await?;
     let Some(row) = row else {
         return Err(crate::HistoryChanged.into());
     };
-    let depth: i64 = row.get("max_depth");
-    if depth > HISTORY_TARGET_ANCESTRY_LIMIT {
-        return Err(anyhow::anyhow!(
-            "transcript ancestry exceeds maximum depth {HISTORY_TARGET_ANCESTRY_LIMIT}; possible cycle"
-        ));
-    }
+    ensure_valid_transcript_ancestry(std::slice::from_ref(&row))?;
     let reached_root: bool = row.get("reached_root");
     let target_leaf_id: Option<String> = row.get("target_leaf_id");
     if target_leaf_id.is_none() && !reached_root {
@@ -139,13 +134,15 @@ pub(super) async fn branch_entry_ids_tx(
     let rows = sqlx::query(
         r#"
         with recursive branch as (
-            select t.id, t.parent_id, t.item, t.sequence, 0::bigint as depth
+            select t.id, t.parent_id, t.item, t.sequence,
+                   0::bigint as depth, false as ancestry_invalid
             from transcript_entries t
             where t.session_id = $1 and t.id = $2::text
 
             union all
 
-            select parent.id, parent.parent_id, parent.item, parent.sequence, child.depth + 1
+            select parent.id, parent.parent_id, parent.item, parent.sequence,
+                   child.depth + 1, parent.sequence >= child.sequence
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
@@ -156,24 +153,16 @@ pub(super) async fn branch_entry_ids_tx(
                 end,
                 child.parent_id
              )
-             and child.depth <= $3
+            where not child.ancestry_invalid
         )
-        select id, depth from branch order by sequence
+        select id, ancestry_invalid from branch order by sequence
         "#,
     )
     .bind(session_id)
     .bind(leaf_id)
-    .bind(HISTORY_TARGET_ANCESTRY_LIMIT)
     .fetch_all(&mut **tx)
     .await?;
-    if rows
-        .iter()
-        .any(|row| row.get::<i64, _>("depth") > HISTORY_TARGET_ANCESTRY_LIMIT)
-    {
-        return Err(anyhow::anyhow!(
-            "transcript ancestry exceeds maximum depth {HISTORY_TARGET_ANCESTRY_LIMIT}; possible cycle"
-        ));
-    }
+    ensure_valid_transcript_ancestry(&rows)?;
     Ok(rows
         .into_iter()
         .map(|row| row.get::<String, _>("id"))

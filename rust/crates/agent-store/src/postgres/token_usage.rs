@@ -3,7 +3,7 @@ use sqlx::Row;
 
 use crate::{TokenUsageEstimate, TranscriptStorageNode};
 
-use super::{PostgresAgentStore, TRANSCRIPT_RECURSION_LIMIT};
+use super::{ensure_valid_transcript_ancestry, PostgresAgentStore};
 
 impl PostgresAgentStore {
     pub async fn latest_model_token_usage_estimate(
@@ -12,42 +12,19 @@ impl PostgresAgentStore {
         leaf_id: &str,
         toolset_fingerprint: &str,
     ) -> Result<Option<TokenUsageEstimate>> {
-        let max_path_depth: Option<i64> = sqlx::query_scalar(
-            r#"
-            with recursive path as (
-                select id, parent_id, 0::bigint as depth
-                from transcript_entries
-                where session_id=$1 and id=$2::text
-                union all
-                select parent.id, parent.parent_id, path.depth + 1
-                from transcript_entries parent
-                join path on path.parent_id = parent.id
-                where parent.session_id=$1 and path.depth <= $3
-            )
-            select max(depth) from path
-            "#,
-        )
-        .bind(session_id)
-        .bind(leaf_id)
-        .bind(TRANSCRIPT_RECURSION_LIMIT)
-        .fetch_one(&self.pool)
-        .await?;
-        if max_path_depth.is_some_and(|depth| depth > TRANSCRIPT_RECURSION_LIMIT) {
-            return Err(anyhow::anyhow!(
-                "transcript ancestry exceeds maximum depth {TRANSCRIPT_RECURSION_LIMIT}; possible cycle"
-            ));
-        }
         let row = sqlx::query(
             r#"
             with recursive path as (
-                select id, parent_id, 0::bigint as depth
+                select id, parent_id, sequence, 0::bigint as depth,
+                       false as ancestry_invalid
                 from transcript_entries
                 where session_id=$1 and id=$2::text
                 union all
-                select parent.id, parent.parent_id, path.depth + 1
+                select parent.id, parent.parent_id, parent.sequence, path.depth + 1,
+                       parent.sequence >= path.sequence
                 from transcript_entries parent
                 join path on path.parent_id = parent.id
-                where parent.session_id=$1 and path.depth <= $4
+                where parent.session_id=$1 and not path.ancestry_invalid
             ), latest_usage as (
                 select a.result->'usage' as usage,
                     a.payload->>'context_leaf_id' as context_leaf_id,
@@ -67,7 +44,7 @@ impl PostgresAgentStore {
                 limit 1
             )
             select path.id, path.parent_id, path.depth, entry.item, entry.provider_replay,
-                latest_usage.usage, latest_usage.context_leaf_id
+                latest_usage.usage, latest_usage.context_leaf_id, path.ancestry_invalid
             from latest_usage
             join path on path.depth < latest_usage.depth
             join transcript_entries entry
@@ -75,18 +52,25 @@ impl PostgresAgentStore {
             union all
             select null::text as id, null::text as parent_id, null::bigint as depth,
                 null::jsonb as item, null::jsonb as provider_replay,
-                latest_usage.usage, latest_usage.context_leaf_id
+                latest_usage.usage, latest_usage.context_leaf_id, false as ancestry_invalid
             from latest_usage
             where latest_usage.depth = 0
+            union all
+            select null::text as id, null::text as parent_id, path.depth,
+                null::jsonb as item, null::jsonb as provider_replay,
+                null::jsonb as usage, null::text as context_leaf_id,
+                true as ancestry_invalid
+            from path
+            where path.ancestry_invalid
             order by depth desc nulls last
             "#,
         )
         .bind(session_id)
         .bind(leaf_id)
         .bind(toolset_fingerprint)
-        .bind(TRANSCRIPT_RECURSION_LIMIT)
         .fetch_all(&self.pool)
         .await?;
+        ensure_valid_transcript_ancestry(&row)?;
         let Some(first) = row.first() else {
             return Ok(None);
         };

@@ -11,8 +11,9 @@ use sqlx::PgPool;
 ///   source metadata; project sessions get their own private workspace
 ///   directories addressed by their runtime-scoped `workspace_id`.
 /// - `daemon_config`: reserved daemon key-value config.
-/// - `transcript_entries`: append-only transcript forest. `parent_id` points
-///   within the same session, while `sequence` preserves insertion order.
+/// - `transcript_entries`: append-only transcript forest. `parent_id` and
+///   compaction source links point to lower-sequence entries in the same
+///   session, while `sequence` preserves insertion order.
 /// - `queued_inputs`: user inputs waiting to be consumed by a session turn.
 ///   Idempotency is keyed by `(session_id, client_input_id)` and
 ///   `provider_config` snapshots submission-time routing.

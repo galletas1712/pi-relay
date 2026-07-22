@@ -336,6 +336,38 @@ describe("App connection recovery integration", () => {
 		expect(api.eventListenerCount()).toBe(0);
 	});
 
+	it("applies replayed events before live events that arrive during replay", async () => {
+		const api = createControllableApi();
+		const replay = deferred<EventFrame[]>();
+		api.subscribeEvents.mockImplementation(() => replay.promise);
+		const { client, unmount } = renderApp(api);
+		await openAndLoad(api);
+		await waitFor(() => expect(api.subscribeEvents).toHaveBeenCalledWith(SESSION_ID, 4));
+
+		await emitEvent(api, {
+			event_id: 7,
+			event: "turn.started",
+			session_id: SESSION_ID,
+			data: {},
+		});
+		expect(screen.queryByText("model error: replayed failure")).toBeNull();
+
+		await act(async () => {
+			replay.resolve([{
+				event_id: 5,
+				event: "model.error",
+				session_id: SESSION_ID,
+				data: { error: "replayed failure" },
+			}]);
+			await replay.promise;
+		});
+		expect(await screen.findByText("model error: replayed failure")).toBeTruthy();
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
 	it("blocks initial-load Retry on connection error and loads canonically after open", async () => {
 		const api = createControllableApi();
 		api.getSession.mockRejectedValueOnce(new Error("initial load failed"));
@@ -694,6 +726,7 @@ type ControllableApi = AgentApi & {
 	getSession: ApiSpy;
 	getTranscriptTurns: ApiSpy;
 	getTranscriptTurnDetail: ApiSpy;
+	subscribeEvents: ApiSpy;
 	startSession: ApiSpy;
 	queueFollowUp: ApiSpy;
 	renameSession: ApiSpy;
