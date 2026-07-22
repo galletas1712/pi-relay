@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use sqlx::{Postgres, Row, Transaction};
 
-use super::TRANSCRIPT_RECURSION_LIMIT;
+use super::ensure_valid_transcript_ancestry;
 use crate::{TranscriptEntryRecord, TurnCardRecord, TurnCardStatus};
 
 #[derive(Debug, Default)]
@@ -39,15 +39,22 @@ async fn active_branch_turn_card_rows_tx(
         r#"
         with recursive branch as (
             select t.id,
-                   t.parent_id,
-                   t.timestamp_ms,
-                   t.item,
-                   t.sequence,
+                   coalesce(
+                       case
+                           when t.item->>'type' = 'compaction_summary' then t.item->>'source_leaf_id'
+                           else null
+                       end,
+                       t.parent_id
+                   ) as next_id,
                    0::bigint as depth,
                    case
                      when t.item->>'type' = 'turn_started' then 1
                      else 0
-                   end as boundary_count
+                   end as boundary_count,
+                   t.id as cycle_anchor_id,
+                   1::numeric as cycle_power,
+                   0::numeric as cycle_length,
+                   false as ancestry_invalid
             from transcript_entries t
             left join sessions s on s.id = t.session_id
             where t.session_id = $1
@@ -56,48 +63,66 @@ async fn active_branch_turn_card_rows_tx(
             union all
 
             select parent.id,
-                   parent.parent_id,
-                   parent.timestamp_ms,
-                   parent.item,
-                   parent.sequence,
+                   coalesce(
+                       case
+                           when parent.item->>'type' = 'compaction_summary' then parent.item->>'source_leaf_id'
+                           else null
+                       end,
+                       parent.parent_id
+                   ) as next_id,
                    child.depth + 1,
                    child.boundary_count
                      + case
                          when parent.item->>'type' = 'turn_started' then 1
                          else 0
-                       end as boundary_count
+                       end as boundary_count,
+                   cycle_state.anchor_id,
+                   cycle_state.power,
+                   cycle_state.length,
+                   parent.id = cycle_state.anchor_id as ancestry_invalid
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
-             and parent.id = coalesce(
-                case
-                    when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
-                    else null
-                end,
-                child.parent_id
-             )
+             and parent.id = child.next_id
+            cross join lateral (
+                select
+                    case
+                        when child.cycle_power = child.cycle_length then child.id
+                        else child.cycle_anchor_id
+                    end as anchor_id,
+                    case
+                        when child.cycle_power = child.cycle_length then child.cycle_power * 2
+                        else child.cycle_power
+                    end as power,
+                    case
+                        when child.cycle_power = child.cycle_length then 1::numeric
+                        else child.cycle_length + 1
+                    end as length
+            ) cycle_state
             where child.boundary_count < $3
-              and child.depth <= $4
+              and not child.ancestry_invalid
         ),
         card_rows as (
-            select id,
-                   parent_id,
-                   timestamp_ms,
-                   item,
-                   sequence,
-                   depth,
+            select entry.id,
+                   entry.parent_id,
+                   entry.timestamp_ms,
+                   entry.item,
+                   entry.sequence,
+                   branch.depth,
+                   branch.ancestry_invalid,
                    sum(
                      case
-                       when item->>'type' = 'turn_started' then 1
+                       when entry.item->>'type' = 'turn_started' then 1
                        else 0
                      end
-                   ) over (order by sequence rows between unbounded preceding and current row) as card_ordinal
+                   ) over (order by branch.depth desc rows between unbounded preceding and current row) as card_ordinal
             from branch
-            where depth > $4
-               or item->>'type' in ('turn_started', 'user_message', 'assistant_message', 'tool_call_started', 'tool_result', 'turn_finished', 'compaction_summary', 'daemon_tool_observation')
+            join transcript_entries entry on entry.session_id=$1 and entry.id=branch.id
+            where branch.ancestry_invalid
+               or entry.item->>'type' in ('turn_started', 'user_message', 'assistant_message', 'tool_call_started', 'tool_result', 'turn_finished', 'compaction_summary', 'daemon_tool_observation')
         ),
         terminal_assistant as (
-            select card_ordinal, max(sequence) as sequence
+            select card_ordinal, min(depth) as depth
             from card_rows
             where item->>'type' = 'assistant_message'
             group by card_ordinal
@@ -108,7 +133,7 @@ async fn active_branch_turn_card_rows_tx(
                card_rows.sequence,
                case
                  when card_rows.item->>'type' in ('user_message', 'daemon_tool_observation')
-                      or terminal_assistant.sequence = card_rows.sequence then card_rows.item
+                      or terminal_assistant.depth = card_rows.depth then card_rows.item
                  else null
                end as body_item,
                card_rows.item->>'type' as item_type,
@@ -117,28 +142,19 @@ async fn active_branch_turn_card_rows_tx(
                card_rows.item->>'source_leaf_id' as compaction_source_leaf_id,
                card_rows.item #>> '{last_turn_id}' as compaction_last_turn_id,
                card_rows.item #>> '{turn_started_at_ms}' as compaction_turn_started_at_ms,
-               card_rows.depth
+               card_rows.ancestry_invalid
         from card_rows
         left join terminal_assistant
           on terminal_assistant.card_ordinal = card_rows.card_ordinal
-        order by card_rows.sequence
+        order by card_rows.depth desc
         "#
     )
     .bind(session_id)
     .bind(before_entry_id)
     .bind(limit)
-    .bind(TRANSCRIPT_RECURSION_LIMIT)
     .fetch_all(&mut **tx)
     .await?;
-    if rows
-        .iter()
-        .any(|row| row.get::<i64, _>("depth") > TRANSCRIPT_RECURSION_LIMIT)
-    {
-        return Err(anyhow!(
-            "transcript ancestry exceeds maximum depth {}; possible cycle",
-            TRANSCRIPT_RECURSION_LIMIT
-        ));
-    }
+    ensure_valid_transcript_ancestry(&rows)?;
     rows.into_iter().map(|row| turn_card_row(&row)).collect()
 }
 

@@ -22,19 +22,24 @@ mod token_usage;
 mod transcript;
 mod turn_cards;
 
-/// Maximum transcript ancestry depth accepted by recursive reads. Recursive
-/// queries fetch one sentinel row beyond this budget so malformed/cyclic data
-/// is reported instead of silently truncated.
-pub(super) const TRANSCRIPT_RECURSION_LIMIT: i64 = 10_000;
-
 pub use delegations::{
     Delegation, DelegationProgress, DelegationSubagent, DelegationSubagentOverview,
 };
 
-use anyhow::Result;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use anyhow::{anyhow, Result};
+use sqlx::postgres::{PgPoolOptions, PgRow};
+use sqlx::{PgPool, Row};
 use std::time::Duration;
+
+fn ensure_valid_transcript_ancestry(rows: &[PgRow]) -> Result<()> {
+    if rows
+        .iter()
+        .any(|row| row.get::<bool, _>("ancestry_invalid"))
+    {
+        return Err(anyhow!("transcript ancestry contains a cycle"));
+    }
+    Ok(())
+}
 
 pub struct PostgresAgentStore {
     pub(crate) pool: PgPool,
