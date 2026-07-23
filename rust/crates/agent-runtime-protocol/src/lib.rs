@@ -129,9 +129,12 @@ pub enum RuntimeCommand {
         rel_path: String,
     },
     /// Return runtime-owned instructions and skill packages for a session.
+    /// `project_key` selects `$HOME/.agents/projects/<project_key>/skills`
+    /// when the session belongs to a project; ephemeral sessions pass `None`.
     ReadRuntimeContext {
         workspace_id: String,
         workspace_dirs: Vec<String>,
+        project_key: Option<String>,
     },
     /// Enumerate live MCP servers + tools for the new-session picker. The
     /// control-computed first-party toolsets ride along for name-collision and

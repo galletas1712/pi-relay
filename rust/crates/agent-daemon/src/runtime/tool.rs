@@ -68,20 +68,30 @@ pub(super) async fn run_tool_turn(
             .iter()
             .map(|workspace| workspace.workspace_dir.clone())
             .collect::<Vec<_>>();
-        match state
-            .runtime_hosts
-            .read_runtime_context(
-                &dispatch.config.runtime_id,
-                &dispatch.config.workspace_id,
-                &workspace_dirs,
-            )
+        match crate::provider_runtime::home_project_key(&state.repo, dispatch.config.project_id)
             .await
         {
-            Ok(runtime_context) => load_skill_result(&runtime_context.skills, &tool_call),
+            Ok(project_key) => match state
+                .runtime_hosts
+                .read_runtime_context(
+                    &dispatch.config.runtime_id,
+                    &dispatch.config.workspace_id,
+                    &workspace_dirs,
+                    project_key,
+                )
+                .await
+            {
+                Ok(runtime_context) => load_skill_result(&runtime_context.skills, &tool_call),
+                Err(error) => ToolResultMessage::error(
+                    tool_call.id.clone(),
+                    tool_call.tool_name.clone(),
+                    format!("failed to read runtime skills: {error:#}"),
+                ),
+            },
             Err(error) => ToolResultMessage::error(
                 tool_call.id.clone(),
                 tool_call.tool_name.clone(),
-                format!("failed to read runtime skills: {error:#}"),
+                format!("failed to resolve project skills: {error:#}"),
             ),
         }
     } else if is_web_tool_name(&tool_call.tool_name) {

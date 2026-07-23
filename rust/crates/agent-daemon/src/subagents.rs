@@ -86,12 +86,17 @@ pub(crate) async fn spawn_subagent(
         .iter()
         .map(|workspace| workspace.workspace_dir.clone())
         .collect::<Vec<_>>();
+    let project_key =
+        crate::provider_runtime::home_project_key(&state.repo, parent_config.project_id)
+            .await
+            .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
     let runtime_context = state
         .runtime_hosts
         .read_runtime_context(
             &parent_config.runtime_id,
             &parent_config.workspace_id,
             &parent_workspace_dirs,
+            project_key,
         )
         .await
         .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;

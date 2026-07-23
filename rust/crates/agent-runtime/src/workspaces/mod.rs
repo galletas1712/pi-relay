@@ -105,11 +105,13 @@ impl WorkspaceManager {
     }
 
     /// Return all runtime-owned instructions and skill packages visible to a
-    /// session. Personal project skills override same-named repository skills.
+    /// session. Personal project skills (keyed by `project_key`) override
+    /// same-named repository skills.
     pub async fn read_runtime_context(
         &self,
         workspace_id: &str,
         workspace_dirs: &[String],
+        project_key: Option<&str>,
     ) -> Result<RuntimeContext> {
         let mut instructions = Vec::new();
         collect_instruction(
@@ -165,14 +167,16 @@ impl WorkspaceManager {
                 &mut project_skills,
             )
             .await?;
+        }
+        if let Some(project_key) = project_key.filter(|key| !key.is_empty()) {
             collect_skill_dir(
                 &self
                     .home_dir
                     .join(".agents")
                     .join("projects")
-                    .join(workspace_dir)
+                    .join(project_key)
                     .join("skills"),
-                workspace,
+                Some(project_key),
                 SkillKind::Skill,
                 SkillOrigin::HomeProject,
                 &mut project_skills,
@@ -846,6 +850,10 @@ mod tests {
         );
         write_file(&cwd.join("repo/AGENTS.md"), "repo instructions");
         write_file(
+            &cwd.join("other/.agents/skills/placeholder/SKILL.md"),
+            "---\nname: placeholder\ndescription: selected workspace only\n---\nother",
+        );
+        write_file(
             &cwd.join("repo/.agents/skills/kubernetes/SKILL.md"),
             "---\nname: kubernetes\ndescription: contributed\n---\ncontributed",
         );
@@ -855,14 +863,15 @@ mod tests {
         );
 
         let manager = WorkspaceManager::new(state, config, home);
+        // Home project overlays key off project_key, not selected workspace_dirs.
+        // Selecting only "other" still surfaces projects/repo/skills/kubernetes.
         let context = manager
-            .read_runtime_context("session-test", &["repo".to_string()])
+            .read_runtime_context("session-test", &["other".to_string()], Some("repo"))
             .await
             .expect("runtime context");
 
-        assert_eq!(context.instructions.len(), 2);
+        assert_eq!(context.instructions.len(), 1);
         assert_eq!(context.instructions[0].workspace, None);
-        assert_eq!(context.instructions[1].workspace.as_deref(), Some("repo"));
         assert!(context.skills.iter().any(|skill| {
             skill.package_name == "swe" && skill.origin == SkillOrigin::HomeGlobal
         }));
@@ -872,12 +881,16 @@ mod tests {
         assert!(context.skills.iter().any(|skill| {
             skill.package_name == "reviewer" && skill.kind == SkillKind::SubagentRole
         }));
+        assert!(context.skills.iter().any(|skill| {
+            skill.package_name == "placeholder" && skill.origin == SkillOrigin::WorkspaceProject
+        }));
         let kubernetes = context
             .skills
             .iter()
             .find(|skill| skill.package_name == "kubernetes")
             .expect("kubernetes");
         assert_eq!(kubernetes.origin, SkillOrigin::HomeProject);
+        assert_eq!(kubernetes.workspace.as_deref(), Some("repo"));
         assert!(kubernetes.contents.contains("personal"));
 
         std::fs::remove_dir_all(root).ok();

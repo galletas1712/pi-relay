@@ -484,10 +484,11 @@ impl Runtime {
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,
+                project_key,
             } => {
                 let context = self
                     .workspaces
-                    .read_runtime_context(&workspace_id, &workspace_dirs)
+                    .read_runtime_context(&workspace_id, &workspace_dirs, project_key.as_deref())
                     .await?;
                 Ok(RuntimeCommandResult::RuntimeContext { context })
             }

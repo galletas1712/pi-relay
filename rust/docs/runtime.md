@@ -65,7 +65,7 @@ $XDG_CONFIG_HOME/pi-relay/runtime/
 
 $HOME/.agents/
 ├── skills/<skill>/SKILL.md
-└── projects/<workspace>/skills/<skill>/SKILL.md
+└── projects/<project_key>/skills/<skill>/SKILL.md
 
 <workspace>/.agents/skills/<skill>/SKILL.md
 <workspace>/AGENTS.md
@@ -73,9 +73,13 @@ $HOME/.agents/
 
 The runtime reads these files and returns their contents, category, origin, and
 absolute runtime-host paths over `agent-runtime-protocol`. The daemon never
-opens those paths. Personal project packages under `$HOME/.agents/projects`
-replace same-named packages from a selected workspace. `LoadSkill` returns only
-the absolute `SKILL.md` path so linked sibling files remain available through
+opens those paths. `project_key` is derived from the project display name
+(lowercase; whitespace becomes `-`; only `[a-z0-9_-]` kept), so a project named
+`Dynamo` loads `$HOME/.agents/projects/dynamo/skills` for every session in that
+project regardless of which workspace dirs are selected. Personal project
+packages replace same-named packages from a selected workspace when both share
+the `{project_key}/{skill}` key. `LoadSkill` returns only the absolute
+`SKILL.md` path so linked sibling files remain available through
 runtime-executed filesystem tools.
 
 The repository's local stack can start the runtime through `infra/dev.sh`.

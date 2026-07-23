@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agent_prompt::Skill;
 use agent_runtime_protocol::{RawSkillFile, SkillKind, SkillOrigin};
+use agent_store::PostgresAgentStore;
 use agent_vocab::{ProviderConfig, ProviderKind, ReasoningEffort, ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use uuid::Uuid;
 
 use super::prompt::{parse_runtime_skills, parse_skill_contents, ParsedSkillFile};
 
@@ -237,10 +240,55 @@ fn role_provider_from_frontmatter(
     }))
 }
 
+/// Map a project display name to the `$HOME/.agents/projects/<key>` directory.
+pub(crate) fn project_agents_key(name: &str) -> String {
+    let mut key = String::new();
+    let mut pending_dash = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_whitespace() {
+            pending_dash = !key.is_empty();
+            continue;
+        }
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() || lower == '-' || lower == '_' {
+            if pending_dash {
+                key.push('-');
+                pending_dash = false;
+            }
+            key.push(lower);
+        }
+    }
+    key
+}
+
+/// Resolve the home-project skill overlay key for a session, if any.
+pub(crate) async fn home_project_key(
+    repo: &Arc<PostgresAgentStore>,
+    project_id: Option<Uuid>,
+) -> Result<Option<String>> {
+    let Some(project_id) = project_id else {
+        return Ok(None);
+    };
+    let project = repo.get_project(project_id).await?;
+    let key = project_agents_key(&project.name);
+    if key.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_vocab::{ToolCallId, ToolResultStatus};
+
+    #[test]
+    fn project_agents_key_sanitizes_display_names() {
+        assert_eq!(project_agents_key("Dynamo"), "dynamo");
+        assert_eq!(project_agents_key(" My Project "), "my-project");
+        assert_eq!(project_agents_key("foo_bar-2"), "foo_bar-2");
+        assert_eq!(project_agents_key("@@@"), "");
+    }
 
     #[test]
     fn load_skill_returns_only_absolute_skill_path() {
