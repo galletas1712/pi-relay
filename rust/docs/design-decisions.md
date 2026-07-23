@@ -73,11 +73,13 @@ have dedicated UI controls, without adding a second frontend command model.
   template. It is unavailable before a durable session exists.
 
 Model selection is not a slash command. The web top bar exposes the small model
-picker and provider-specific reasoning effort picker. Provider/model identity is
-locked after the first transcript entry because OpenAI Responses and Anthropic
-Messages both carry provider-shaped replay state across turns; reasoning effort
-is still a per-request knob and can be changed during a running turn. The change
-applies to later provider requests, not one already in flight.
+picker and provider-specific reasoning effort picker. Provider/model identity may
+change while the session is idle, including across OpenAI and Claude; the next
+queued input captures the new route and adapters rebuild from the canonical
+transcript (foreign replay ignored; compaction without matching native replay
+uses the text summary). Reasoning effort is still a per-request knob and can be
+changed during a running turn. The change applies to later provider requests,
+not one already in flight.
 
 Normal composer text in a selected top-level session is `input.follow_up`, even
 while the agent is running. In a selected delegation child it is instead a

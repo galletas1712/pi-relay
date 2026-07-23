@@ -583,7 +583,7 @@ describe("App connection recovery integration", () => {
 		client.clear();
 	});
 
-	it("keeps effort editable during a running response while model remains locked", async () => {
+	it("keeps effort editable during a running response while model stays idle-gated", async () => {
 		const api = createControllableApi();
 		const running = {
 			...sessionSnapshot(),
@@ -601,7 +601,7 @@ describe("App connection recovery integration", () => {
 		const { client, unmount } = renderApp(api);
 		await openAndLoad(api);
 
-		const model = screen.getByRole("combobox", { name: "Model, locked" }) as HTMLSelectElement;
+		const model = screen.getByRole("combobox", { name: "Model" }) as HTMLSelectElement;
 		const effort = screen.getByRole("combobox", { name: "Reasoning effort" }) as HTMLSelectElement;
 		expect(model.disabled).toBe(true);
 		expect(effort.disabled).toBe(false);

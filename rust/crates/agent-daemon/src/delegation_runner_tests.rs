@@ -5237,6 +5237,180 @@ async fn configure_and_rename_refresh_non_provider_state_without_retargeting_act
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
+async fn idle_session_can_switch_provider_after_transcript_and_enqueue_captures_new_route() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    let session_id = "idle-provider-switch";
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "idle provider switch",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    let original = session_config(
+        &env,
+        project_id,
+        json!({ "title": "Switchable", "harness": true }),
+    );
+    env.state
+        .repo
+        .start_session_outputs(
+            session_id,
+            &original,
+            &[
+                TranscriptStorageNode {
+                    id: "entry-1".to_string(),
+                    parent_id: None,
+                    timestamp_ms: 1,
+                    item: TranscriptItem::UserMessage(UserMessage::text("hello")),
+                    provider_replay: Vec::new(),
+                },
+                TranscriptStorageNode {
+                    id: "entry-finish".to_string(),
+                    parent_id: Some("entry-1".to_string()),
+                    timestamp_ms: 2,
+                    item: TranscriptItem::TurnFinished {
+                        turn_id: TurnId(1),
+                        outcome: TurnOutcome::Graceful,
+                    },
+                    provider_replay: Vec::new(),
+                },
+            ],
+            Some("entry-finish"),
+            &[],
+            &[],
+            InputPriority::FollowUp,
+            &UserMessage::text("hello"),
+            None,
+        )
+        .await
+        .expect("start with transcript");
+    assert!(env
+        .state
+        .repo
+        .has_transcript_entries(session_id)
+        .await
+        .expect("transcript check"));
+    assert_eq!(
+        env.state.repo.activity(session_id).await.expect("activity"),
+        agent_store::SessionActivity::Idle
+    );
+
+    let response = crate::session_configure(
+        &env.state,
+        json!({
+            "session_id": session_id,
+            "provider": {
+                "kind": "claude",
+                "model": "claude-opus-4-8",
+                "reasoning_effort": "high"
+            }
+        }),
+    )
+    .await
+    .expect("idle kind/model switch after transcript");
+    assert_eq!(response["provider"]["kind"], "claude");
+    assert_eq!(response["provider"]["model"], "claude-opus-4-8");
+
+    let queued = enqueue_session_input(
+        &env.state,
+        SessionInputRequest {
+            session_id: session_id.to_string(),
+            priority: InputPriority::FollowUp,
+            content: UserMessage::text("continue on Claude"),
+            client_input_id: Some("after-switch".to_string()),
+            base_leaf_id: None,
+            expected_active_leaf_id: None,
+        },
+    )
+    .await
+    .expect("enqueue after switch");
+    let input_id = queued["input_id"].as_str().expect("input_id");
+    let database_url = database_url_with_name(&env.admin_url, &env.name);
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect route check pool");
+    let value: serde_json::Value = sqlx::query_scalar(
+        "select provider_config from queued_inputs where id=$1",
+    )
+    .bind(input_id)
+    .fetch_one(&pool)
+    .await
+    .expect("queued route");
+    pool.close().await;
+    let route: ProviderConfig = serde_json::from_value(value).expect("provider route");
+    assert_eq!(route.kind, ProviderKind::Claude);
+    assert_eq!(route.model, "claude-opus-4-8");
+    assert_eq!(route.reasoning_effort, ReasoningEffort::High);
+
+    env.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn busy_session_rejects_provider_model_switch() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    let session_id = "busy-provider-switch";
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "busy provider switch",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    let original = session_config(&env, project_id, json!({ "title": "Busy" }));
+    env.state
+        .repo
+        .create_session(session_id, &original)
+        .await
+        .expect("create session");
+    let active = Arc::new(Mutex::new(RuntimeSession {
+        session: AgentSession::new(),
+        config: original.clone(),
+        persisted_active_leaf_id: None,
+    }));
+    env.state
+        .active
+        .lock()
+        .await
+        .insert(session_id.to_string(), active);
+
+    let error = crate::session_configure(
+        &env.state,
+        json!({
+            "session_id": session_id,
+            "provider": {
+                "kind": "claude",
+                "model": "claude-opus-4-8",
+                "reasoning_effort": "high"
+            }
+        }),
+    )
+    .await
+    .expect_err("model switch while busy must fail");
+    assert_eq!(error.code, "session_busy");
+
+    env.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
 async fn subagent_model_context_does_not_get_parent_delegation_summary() {
     let Some(env) = test_env().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");

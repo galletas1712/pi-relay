@@ -24,7 +24,9 @@ pub use session_state::OpenAiCodexSessionState;
 #[cfg(test)]
 use crate::sse::read_json_sse_text;
 use crate::{
-    common::{ensure_success, push_text_item, response_excerpt, response_text},
+    common::{
+        compaction_summary_text, ensure_success, push_text_item, response_excerpt, response_text,
+    },
     http::send_provider_generation_request,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
@@ -2704,7 +2706,7 @@ fn openai_reasoning_effort(
 }
 
 pub(crate) fn transcript_to_response_items(
-    _prompt: &crate::PromptSections,
+    prompt: &crate::PromptSections,
     items: &[ModelTranscriptEntry],
 ) -> ProviderResult<Vec<Value>> {
     let mut responses = Vec::new();
@@ -2717,10 +2719,22 @@ pub(crate) fn transcript_to_response_items(
                     "content": responses_user_content(message),
                 }));
             }
-            TranscriptItem::CompactionSummary(_) => {
+            TranscriptItem::CompactionSummary(summary) => {
                 let replay = openai_replay_items(entry, true)?;
-                validate_openai_compaction_replay(&replay)?;
-                responses.extend(replay);
+                if replay.is_empty() {
+                    // Foreign-provider compaction: continue from the text summary.
+                    responses.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": compaction_summary_text(summary, prompt),
+                        }],
+                    }));
+                } else {
+                    validate_openai_compaction_replay(&replay)?;
+                    responses.extend(replay);
+                }
             }
             TranscriptItem::AssistantMessage(message) => {
                 let replay_items = openai_replay_items(entry, false)?;
@@ -5982,7 +5996,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     }
 
     #[test]
-    fn responses_input_compaction_replay_fails_closed_when_missing_or_corrupt() {
+    fn responses_input_compaction_replay_fails_closed_when_corrupt() {
         let summary = || {
             TranscriptItem::CompactionSummary(CompactionSummary::new(
                 "session",
@@ -5993,7 +6007,6 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
             ))
         };
         for provider_replay in [
-            Vec::new(),
             vec![ProviderReplayItem {
                 provider: ProviderKind::OpenAi,
                 raw_json: "{".to_string(),
@@ -6055,6 +6068,104 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn responses_input_falls_back_to_text_for_foreign_compaction_replay() {
+        let openai_raw = json!({ "type": "compaction", "encrypted_content": "opaque" });
+        let claude_raw = json!({
+            "type": "compaction",
+            "content": "opaque summary",
+            "encrypted_content": "opaque",
+        });
+        for provider_replay in [
+            Vec::new(),
+            vec![ProviderReplayItem::new(ProviderKind::Claude, &claude_raw).unwrap()],
+        ] {
+            let items = transcript_to_response_items(
+                &PromptSections::default(),
+                &[
+                    ModelTranscriptEntry {
+                        item: TranscriptItem::CompactionSummary(CompactionSummary::new(
+                            "session",
+                            "leaf",
+                            "cross-provider summary",
+                            Some(123),
+                            TurnId(3),
+                        )),
+                        provider_replay,
+                    },
+                    TranscriptItem::UserMessage(UserMessage::text("continue")).into(),
+                ],
+            )
+            .expect("foreign compaction should fall back to text");
+
+            assert_eq!(items[0]["type"], "message");
+            assert_eq!(items[0]["role"], "user");
+            assert!(items[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cross-provider summary"));
+            assert_eq!(items[1]["role"], "user");
+        }
+
+        let with_native = transcript_to_response_items(
+            &PromptSections::default(),
+            &[ModelTranscriptEntry {
+                item: TranscriptItem::CompactionSummary(CompactionSummary::new(
+                    "session",
+                    "leaf",
+                    "ignored when native replay exists",
+                    Some(123),
+                    TurnId(3),
+                )),
+                provider_replay: vec![
+                    ProviderReplayItem::new(ProviderKind::OpenAi, &openai_raw).unwrap()
+                ],
+            }],
+        )
+        .expect("native OpenAI compaction still preferred");
+        assert_eq!(with_native, vec![openai_raw]);
+    }
+
+    #[test]
+    fn responses_input_rebuilds_canonical_items_when_only_claude_replay_present() {
+        let claude_raw = json!({
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "Bash",
+            "input": { "command": "true" },
+        });
+        let items = transcript_to_response_items(
+            &PromptSections::default(),
+            &[
+                TranscriptItem::UserMessage(UserMessage::text("run it")).into(),
+                ModelTranscriptEntry {
+                    item: TranscriptItem::AssistantMessage(AssistantMessage {
+                        items: vec![
+                            AssistantItem::Text("working".to_string()),
+                            AssistantItem::ToolCall(ToolCall {
+                                id: ToolCallId::new("call_1"),
+                                tool_name: "Bash".to_string(),
+                                args_json: r#"{"command":"true"}"#.to_string(),
+                            }),
+                        ],
+                    }),
+                    provider_replay: vec![
+                        ProviderReplayItem::new(ProviderKind::Claude, &claude_raw).unwrap()
+                    ],
+                },
+            ],
+        )
+        .expect("OpenAI renderer rebuilds from canonical items");
+
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(items[1]["type"], "message");
+        assert_eq!(items[1]["role"], "assistant");
+        assert_eq!(items[1]["content"][0]["text"], "working");
+        assert_eq!(items[2]["type"], "function_call");
+        assert_eq!(items[2]["call_id"], "call_1");
+        assert_eq!(items[2]["name"], "Bash");
     }
 
     #[test]

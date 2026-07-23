@@ -1749,6 +1749,11 @@ fn emitted_anthropic_replay(
         .provider_replay_values_for(ProviderKind::Claude)
         .map_err(ProviderError::Json)?;
     if compaction_summary {
+        // Empty Claude replay means a foreign-provider compaction; the caller
+        // continues from the text summary alone.
+        if blocks.is_empty() {
+            return Ok((blocks, false));
+        }
         if blocks.len() != 1 {
             return Err(ProviderError::Provider(
                 "refusing malformed persisted Anthropic compaction replay: expected exactly one Claude block"
@@ -7384,6 +7389,79 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         .expect("messages render");
 
         assert_eq!(messages[0]["content"], json!([raw]));
+    }
+
+    #[test]
+    fn anthropic_serializer_rebuilds_canonical_items_when_only_openai_replay_present() {
+        let openai_raw = json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "Bash",
+            "arguments": "{\"command\":\"true\"}",
+        });
+        let messages = transcript_to_messages(
+            &PromptSections::default(),
+            &[
+                TranscriptItem::UserMessage(UserMessage::text("run it")).into(),
+                ModelTranscriptEntry {
+                    item: TranscriptItem::AssistantMessage(AssistantMessage {
+                        items: vec![
+                            AssistantItem::Text("working".to_string()),
+                            AssistantItem::ToolCall(ToolCall {
+                                id: ToolCallId::new("call_1"),
+                                tool_name: "Bash".to_string(),
+                                args_json: r#"{"command":"true"}"#.to_string(),
+                            }),
+                        ],
+                    }),
+                    provider_replay: vec![
+                        ProviderReplayItem::new(ProviderKind::OpenAi, &openai_raw).unwrap()
+                    ],
+                },
+            ],
+        )
+        .expect("Claude renderer rebuilds from canonical items");
+
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["type"], "text");
+        assert_eq!(messages[1]["content"][0]["text"], "working");
+        assert_eq!(messages[1]["content"][1]["type"], "tool_use");
+        assert_eq!(messages[1]["content"][1]["id"], "call_1");
+        assert_eq!(messages[1]["content"][1]["name"], "Bash");
+    }
+
+    #[test]
+    fn anthropic_serializer_falls_back_to_text_for_foreign_compaction_replay() {
+        let openai_raw = json!({ "type": "compaction", "encrypted_content": "opaque" });
+        let messages = transcript_to_messages(
+            &PromptSections::default(),
+            &[
+                ModelTranscriptEntry {
+                    item: TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+                        "session-1",
+                        "leaf-1",
+                        "cross-provider summary",
+                        Some(80_000),
+                        agent_vocab::TurnId(7),
+                    )),
+                    provider_replay: vec![
+                        ProviderReplayItem::new(ProviderKind::OpenAi, &openai_raw).unwrap()
+                    ],
+                },
+                TranscriptItem::UserMessage(UserMessage::text("continue")).into(),
+            ],
+        )
+        .expect("foreign compaction should fall back to text");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert!(messages[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cross-provider summary"));
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["text"], "continue");
     }
 
     #[test]

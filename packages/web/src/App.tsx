@@ -1456,11 +1456,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		[backgroundWarmRevision, delegations, getSelectedCache, selectedId],
 	);
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
-	const hasTranscriptEntries =
-		loadedSnapshot?.has_transcript_entries ??
-		selectedSession?.has_transcript_entries ??
-		(loadedSnapshot ? loadedEntries.length > 0 || loadedSnapshot.active_leaf_id !== null : false);
-	const modelLocked = !!selectedId && !!loadedSnapshot && hasTranscriptEntries;
 	const modelControlsDisabled = !!selectedId && (!loadedSnapshot || loadedSnapshot.activity !== "idle");
 	const reasoningControlsDisabled = !!selectedId && !loadedSnapshot;
 
@@ -2885,7 +2880,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 
 	const changeModel = useCallback(
 		(modelKey: string) => {
-			if (modelLocked) return;
 			const sessionId = selectedRef.current;
 			if (!sessionId) {
 				const provider = providerFromModelKey(modelKey, activeProvider);
@@ -2916,7 +2910,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		[
 			activeProvider,
 			assertServerMutationAllowed,
-			modelLocked,
 			providerConfigurationController,
 		],
 	);
@@ -4320,7 +4313,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						hasRunningDelegations={hasRunningDelegations}
 						modelOptions={MODEL_OPTIONS}
 						modelValue={providerModelKey(activeProvider)}
-						modelLocked={modelLocked}
 						modelControlsDisabled={modelControlsDisabled}
 						reasoningControlsDisabled={reasoningControlsDisabled}
 						mutationBlockedReason={selectedId ? connectionRemoteActionBlockedReason : null}

@@ -10,7 +10,6 @@ export function LogHeader({
 	modelOptions,
 	modelValue,
 	modelDisabled,
-	modelLocked = false,
 	reasoningDisabled = false,
 	reasoningEfforts,
 	reasoningEffort,
@@ -27,7 +26,6 @@ export function LogHeader({
 	modelOptions: { id: string; label: string; description?: string }[];
 	modelValue: string;
 	modelDisabled: boolean;
-	modelLocked?: boolean;
 	reasoningDisabled?: boolean;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
@@ -67,13 +65,13 @@ export function LogHeader({
 				</span>
 			) : null}
 			<div className="log-controls">
-				<label className="header-select" title={modelLocked ? "Model, locked" : "Model"}>
+				<label className="header-select" title="Model">
 					<span className="sr-only">Model</span>
 					<select
 						value={modelValue}
 						disabled={modelDisabled}
-						title={modelLocked ? "Model, locked" : "Model"}
-						aria-label={modelLocked ? "Model, locked" : "Model"}
+						title="Model"
+						aria-label="Model"
 						onChange={(event) => onModelChange(event.target.value)}
 					>
 						{modelOptions.map((option) => (

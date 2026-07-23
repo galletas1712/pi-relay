@@ -24,7 +24,6 @@ export interface ChatPaneProps {
 	hasRunningDelegations: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
-	modelLocked: boolean;
 	modelControlsDisabled: boolean;
 	reasoningControlsDisabled: boolean;
 	mutationBlockedReason?: string | null;
@@ -66,7 +65,6 @@ export const ChatPane = memo(function ChatPane({
 	hasRunningDelegations,
 	modelOptions,
 	modelValue,
-	modelLocked,
 	modelControlsDisabled,
 	reasoningControlsDisabled,
 	mutationBlockedReason,
@@ -106,7 +104,6 @@ export const ChatPane = memo(function ChatPane({
 				hasRunningDelegations={hasRunningDelegations}
 				modelOptions={modelOptions}
 				modelValue={modelValue}
-				modelLocked={modelLocked}
 				modelControlsDisabled={modelControlsDisabled}
 				reasoningControlsDisabled={reasoningControlsDisabled}
 				mutationBlockedReason={mutationBlockedReason}
@@ -163,7 +160,6 @@ interface ChatHeaderProps {
 	hasRunningDelegations: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
-	modelLocked: boolean;
 	modelControlsDisabled: boolean;
 	reasoningControlsDisabled: boolean;
 	mutationBlockedReason?: string | null;
@@ -182,7 +178,6 @@ const ChatHeader = memo(function ChatHeader({
 	hasRunningDelegations,
 	modelOptions,
 	modelValue,
-	modelLocked,
 	modelControlsDisabled,
 	reasoningControlsDisabled,
 	mutationBlockedReason,
@@ -195,7 +190,7 @@ const ChatHeader = memo(function ChatHeader({
 	onToggleRight
 }: ChatHeaderProps) {
 	const archived = session ? isArchivedSession(session) : false;
-	const modelDisabled = modelLocked || modelControlsDisabled || !!mutationBlockedReason;
+	const modelDisabled = modelControlsDisabled || !!mutationBlockedReason;
 	const displayedModelOptions = modelOptions.some((option) => option.id === modelValue)
 		? modelOptions
 		: [{ id: modelValue, label: modelValue }, ...modelOptions];
@@ -211,7 +206,6 @@ const ChatHeader = memo(function ChatHeader({
 			modelOptions={displayedModelOptions}
 			modelValue={modelValue}
 			modelDisabled={modelDisabled}
-			modelLocked={modelLocked}
 			reasoningDisabled={reasoningControlsDisabled || !!mutationBlockedReason}
 			reasoningEfforts={displayedEfforts}
 			reasoningEffort={reasoningEffort}

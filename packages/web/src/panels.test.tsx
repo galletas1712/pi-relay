@@ -185,11 +185,12 @@ describe("LogHeader", () => {
 		expect(html).not.toContain(">delegating</span>");
 	});
 
-	it("keeps the model disabled with concise accessible locked state and no verbose explanation", () => {
-		const html = renderLogHeader({ modelDisabled: true, modelLocked: true });
-		expect(html).toContain(`aria-label="Model, locked"`);
-		expect(html).toContain(`title="Model, locked"`);
+	it("disables the model control without a locked accessible name", () => {
+		const html = renderLogHeader({ modelDisabled: true });
+		expect(html).toContain(`aria-label="Model"`);
+		expect(html).toContain(`title="Model"`);
 		expect(html).toContain(`disabled=""`);
+		expect(html).not.toContain("Model, locked");
 		expect(html).not.toContain("Model is locked after the first transcript entry");
 	});
 });
