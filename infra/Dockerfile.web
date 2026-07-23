@@ -10,12 +10,6 @@ RUN npm ci --workspace=@pi-relay/web --include-workspace-root
 
 COPY packages/web packages/web
 
-# Bake websocket / host allowlist at build time (empty = local loopback defaults).
-ARG VITE_PI_AGENT_WS=
-ARG VITE_PI_ALLOWED_HOSTS=
-ENV VITE_PI_AGENT_WS=$VITE_PI_AGENT_WS \
-    VITE_PI_ALLOWED_HOSTS=$VITE_PI_ALLOWED_HOSTS
-
 RUN npm run build --workspace @pi-relay/web
 
 FROM nginx:1.27-alpine
