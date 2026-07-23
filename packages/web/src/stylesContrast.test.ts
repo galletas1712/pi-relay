@@ -7,6 +7,7 @@ const foregroundTokens = ["muted-foreground", "warning", "success"] as const;
 const surfaceTokens = ["background", "card", "muted"] as const;
 
 const styles = readFileSync(resolve(import.meta.dirname, "styles.css"), "utf8");
+const domain = readFileSync(resolve(import.meta.dirname, "domain.css"), "utf8");
 const lightTheme = lightThemeBlock(styles);
 
 describe("light theme semantic color contrast", () => {
@@ -27,7 +28,7 @@ describe("light theme semantic color contrast", () => {
 
 it("uses a light gray status rail for archived sidebar sessions", () => {
 	expect(hexToken(lightTheme, "archived-status")).toBe("#a89984");
-	expect(styles).toMatch(/\.status-rail\.archived\s*\{\s*background:\s*var\(--archived-status\);/);
+	expect(domain).toMatch(/\.status-rail\.archived\s*\{\s*background:\s*var\(--archived-status\);/);
 });
 
 function lightThemeBlock(css: string): string {

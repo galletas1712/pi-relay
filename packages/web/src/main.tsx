@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.tsx";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import "./styles.css";
 
 const rootEl = document.getElementById("root");
@@ -19,6 +20,8 @@ const queryClient = new QueryClient({
 
 createRoot(rootEl).render(
 	<QueryClientProvider client={queryClient}>
-		<App />
+		<TooltipProvider>
+			<App />
+		</TooltipProvider>
 	</QueryClientProvider>,
 );

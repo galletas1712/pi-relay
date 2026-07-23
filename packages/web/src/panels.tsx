@@ -7,7 +7,7 @@ import { SessionRow } from "./sessionRow.tsx";
 export { ProjectList, projectMenuItems } from "./projectList.tsx";
 export { SessionRow, sessionMenuItems } from "./sessionRow.tsx";
 export { SidebarToolbar } from "./sidebarToolbar.tsx";
-export { LogHeader, NoticeStack } from "./statusPanels.tsx";
+export { LogHeader } from "./statusPanels.tsx";
 export {
 	RUN_BOARD_DEFAULT_DELEGATION_COUNT,
 	RUN_BOARD_EXPANDED_DELEGATION_COUNT,

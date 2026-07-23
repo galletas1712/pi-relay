@@ -1,5 +1,5 @@
-import { ArrowUp, Bot, PanelRightOpen, X } from "lucide-react";
-import type { ErrorNotice, ReasoningEffort } from "./types.ts";
+import { ArrowUp, Bot, PanelRightOpen } from "lucide-react";
+import type { ReasoningEffort } from "./types.ts";
 import type { SessionStatus } from "./sessionList.ts";
 
 export function LogHeader({
@@ -109,36 +109,6 @@ export function LogHeader({
 					<PanelRightOpen size={14} />
 				</button>
 			)}
-		</div>
-	);
-}
-
-export function NoticeStack({
-	notices,
-	rightOpen,
-	onDismiss
-}: {
-	notices: ErrorNotice[];
-	rightOpen: boolean;
-	onDismiss: (noticeId: string) => void;
-}) {
-	if (notices.length === 0) return null;
-	return (
-		<div className={`notice-stack ${rightOpen ? "with-inspector" : ""}`} aria-live="assertive">
-			{notices.slice(-4).map((notice) => (
-				<div className="notice-toast error" key={notice.id}>
-					<span>{notice.text}</span>
-					<button
-						type="button"
-						className="notice-dismiss"
-						aria-label="Dismiss notification"
-						title="Dismiss"
-						onClick={() => onDismiss(notice.id)}
-					>
-						<X size={14} />
-					</button>
-				</div>
-			))}
 		</div>
 	);
 }

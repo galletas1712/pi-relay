@@ -4,13 +4,13 @@ import { describe, expect, it } from "vitest";
 
 describe("MCP picker layout", () => {
 	it("does not retain an obsolete hidden inventory rule", () => {
-		const css = readFileSync(resolve(import.meta.dirname, "styles.css"), "utf8");
+		const css = readFileSync(resolve(import.meta.dirname, "domain.css"), "utf8");
 
 		expect(css).not.toContain(".mcp-picker-list[hidden]");
 	});
 
 	it("uses the central transcript scroll and a responsive stacked context manifest", () => {
-		const css = readFileSync(resolve(import.meta.dirname, "styles.css"), "utf8");
+		const css = readFileSync(resolve(import.meta.dirname, "domain.css"), "utf8");
 		const setupRule = css.match(/\.new-session-setup\s*\{[^}]+\}/)?.[0] ?? "";
 		const manifestRule = css.match(/\.new-session-setup-manifest\s*\{[^}]+\}/)?.[0] ?? "";
 		const srOnlyRule = css.match(/\.sr-only\s*\{[^}]+\}/)?.[0] ?? "";

@@ -11,7 +11,7 @@ const activeFrontendSources = [
 	"inspector.tsx",
 	"App.tsx",
 	"panels.tsx",
-	"styles.css",
+	"domain.css",
 ] as const;
 
 function source(path: string): string {

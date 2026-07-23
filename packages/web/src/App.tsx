@@ -80,9 +80,10 @@ import {
 	routeScopeProjectId,
 	type RouteValidationState,
 } from "./appRouting.ts";
+import { toast } from "sonner";
+import { Toaster } from "@/components/ui/sonner";
 import {
 	Inspector,
-	NoticeStack,
 	RUN_BOARD_DEFAULT_DELEGATION_COUNT,
 	RUN_BOARD_EXPANDED_DELEGATION_COUNT,
 	Sidebar,
@@ -206,7 +207,6 @@ import {
 } from "./workspaceRoute.ts";
 import type {
 	EventFrame,
-	ErrorNotice,
 	McpInventory,
 	McpLoginResult,
 	Project,
@@ -219,8 +219,6 @@ import type {
 	TranscriptTurnsResult,
 } from "./types.ts";
 
-const MAX_ERROR_NOTICES = 24;
-const ERROR_NOTICE_TTL_MS = 4000;
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
 const SESSION_LIST_REFETCH_MS = 2000;
 const BACKGROUND_SESSION_WARM_CONCURRENCY = 2;
@@ -373,7 +371,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	);
 	const selectedId = conversationSessionId;
 	const selectedRef = useRef<string | null>(initialSelection.conversationSessionId);
-	const [notices, setNotices] = useState<ErrorNotice[]>([]);
 	const [query, setQuery] = useState("");
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
 	const [newSessionProviderWasExplicit, setNewSessionProviderWasExplicit] = useState(false);
@@ -615,14 +612,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 
 	const pushErrorNotice = useCallback((text: string, persistent = false) => {
 		if (connectionRef.current !== "open") return;
-		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_ERROR_NOTICES + 1)), { id: randomId("notice"), text, persistent }]);
+		toast.error(text, {
+			duration: persistent ? Number.POSITIVE_INFINITY : 4000,
+			closeButton: true,
+		});
 	}, []);
 	const reportActionError = useCallback((error: unknown) => {
 		if (shouldReportActionError(error)) pushErrorNotice(errorMessage(error));
 	}, [pushErrorNotice]);
-	const dismissNotice = useCallback((noticeId: string) => {
-		setNotices((current) => current.filter((notice) => notice.id !== noticeId));
-	}, []);
 
 	useEffect(() => {
 		if (selectedRef.current !== selectedId) selectedRef.current = selectedId;
@@ -631,15 +628,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	useEffect(() => {
 		if (selectedProjectRef.current !== selectedProjectId) selectedProjectRef.current = selectedProjectId;
 	}, [selectedProjectId]);
-
-	useEffect(() => {
-		const expiringNotice = notices.find((notice) => !notice.persistent);
-		if (!expiringNotice) return;
-		const timer = window.setTimeout(() => {
-			setNotices((current) => current.filter((notice) => notice.id !== expiringNotice.id));
-		}, ERROR_NOTICE_TTL_MS);
-		return () => window.clearTimeout(timer);
-	}, [notices]);
 
 	const projectsQuery = useQuery({
 		queryKey: queryKeys.projects,
@@ -4602,7 +4590,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					returnFocusFallbackRef={composerDialogReturnFocusRef}
 				/>
 			) : null}
-			<NoticeStack notices={notices} rightOpen={rightOpen} onDismiss={dismissNotice} />
+			<Toaster position="top-right" closeButton richColors={false} />
 		</div>
 	);
 }
