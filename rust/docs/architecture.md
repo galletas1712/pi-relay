@@ -73,7 +73,7 @@ agent-vocab      shared ids, message blocks, tool calls/results,
 | `agent-mcp-types` | Pure catalog / manager / OAuth DTOs used on the wire between control and runtime without pulling in the `rmcp` engine. | — |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. Proxies MCP RPCs to the session's runtime. | [modules/agent-daemon.md](modules/agent-daemon.md) |
 | `agent-runtime-protocol` | Framed JSON control/runtime commands and results, including workspace, tool, skill, and MCP operations. | — |
-| `agent-runtime` | `pi-runtime` host worker that owns managed workspaces, executes local tools, publishes runtime skills, and hosts MCP. Its policy lives under the runtime host's XDG `pi-relay/runtime` configuration root. | [runtime.md](runtime.md) |
+| `agent-runtime` | `pi-runtime` host worker that owns managed workspaces, executes local tools, publishes runtime instructions/skills/roles, and hosts MCP. Its policy lives under the runtime host's XDG `pi-relay/runtime` configuration root. | [runtime.md](runtime.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt from session/workspace/tool/skill context. | [modules/agent-prompt.md](modules/agent-prompt.md) |
 
 `agent-vocab` stays at the bottom of the graph so providers, tools, storage,
@@ -172,8 +172,8 @@ Implemented user-facing behavior:
   later/running.
   Delegation subagents may emit `subagent.spawned`/`subagent.running` progress
   events, but parent-visible completion is the delegation wakeup observation and
-  handoff, not a per-child idle event. Reusable patterns are **workflow skills** (`SKILL.md` +
-  `LoadSkill`), not a DSL. Web/inspector RPCs use the canonical
+  handoff, not a per-child idle event. Reusable patterns are ordinary
+  **workflow skills** (`SKILL.md` + `LoadSkill`), not a DSL. Web/inspector RPCs use the canonical
   `delegation.*` client API. See
   [agent-daemon](modules/agent-daemon.md).
 
@@ -190,7 +190,7 @@ Not implemented by design:
   writer in time; read-only subagents are isolated in throwaway snapshots and
   never merged back.
 - Daemon-executed workflow graphs/DSLs and a workflow variable store. Workflow
-  control flow lives in parent-interpreted skills.
+  control flow lives in ordinary parent-interpreted skills published by the runtime.
 
 ## Removed Pieces
 

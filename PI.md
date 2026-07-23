@@ -56,7 +56,9 @@ Two kinds of subagent:
 - **read-only (RO)** — for investigation, review, analysis, and running
   builds/tests to gather information. RO subagents run in a private throwaway copy
   of the workspace; nothing they write reaches your workspace. Use
-  `delegate_readonly_tasks` to run several in parallel. MCP side-effects are ok (only filesystem changes are ephemeral)
+  `delegate_readonly_tasks` to run several in parallel. Only writes under the
+  session cwd are isolated; absolute runtime-host paths are shared and must be
+  treated as read-only. MCP calls may still have external side effects.
 - **full** — for making changes. A full subagent edits your workspace in place.
   Use `delegate_writing_task`. There is exactly one full subagent at a time.
 
@@ -130,5 +132,6 @@ Here is the full list of skills available to you:
 
 When a task surfaces that matches one (or more) of the available skills, call `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` for each skill you want to gain.
 Each invocation of `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` will insert useful context about the chosen domain in your context before acting, which makes you more knowledgeable!
+Call it with the exact name from the JSON list, then read the returned `SKILL.md` path before acting. Resolve relative links in that file from its enclosing directory.
 Use the exact skill `name` from the JSON list. Workspace skill names include their workspace prefix (for example `repo/repo-build`); names without a prefix are globally available.
 {% endif %}

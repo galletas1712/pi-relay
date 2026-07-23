@@ -117,10 +117,6 @@ impl PromptProfile {
     fn can_delegate(self) -> bool {
         matches!(self, Self::Parent)
     }
-
-    fn can_load_workflows(self) -> bool {
-        matches!(self, Self::Parent)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +157,7 @@ pub struct PromptContext {
     pub cwd: PathBuf,
     pub has_project: bool,
     pub workspaces: Vec<PromptWorkspace>,
+    pub agents_md: String,
     pub tools: Vec<ToolSpec>,
     pub skills: Vec<Skill>,
     pub subagent_roles: Vec<SubagentRole>,
@@ -198,18 +195,12 @@ fn render(template: &str, ctx: &PromptContext) -> String {
 }
 
 fn template_context(ctx: &PromptContext) -> Value {
-    let agents_md = if ctx.has_project {
-        agents_md_for_workspaces(&ctx.cwd, &ctx.workspaces)
-    } else {
-        String::new()
-    };
     json!({
         "profile": {
             "name": ctx.profile.as_str(),
         },
         "capabilities": {
             "can_delegate": ctx.profile.can_delegate(),
-            "can_load_workflows": ctx.profile.can_load_workflows(),
         },
         "session": {
             "cwd": path_display(&ctx.cwd),
@@ -218,7 +209,7 @@ fn template_context(ctx: &PromptContext) -> Value {
             "workspaces_markdown": workspaces_markdown(&ctx.workspaces),
         },
         "project": {
-            "agents_md": agents_md,
+            "agents_md": ctx.agents_md,
         },
         "tools": {
             "specs": tools_specs_markdown(&ctx.tools),
@@ -362,25 +353,6 @@ fn subagent_role_catalog_json(roles: &[SubagentRole]) -> String {
     .expect("subagent role catalog JSON must serialize")
 }
 
-fn agents_md_for_workspaces(cwd: &Path, workspaces: &[PromptWorkspace]) -> String {
-    workspaces
-        .iter()
-        .filter_map(|workspace| {
-            let path = cwd.join(&workspace.workspace_dir).join("AGENTS.md");
-            let content = std::fs::read_to_string(path).ok()?;
-            if content.trim().is_empty() {
-                return None;
-            }
-            Some(format!(
-                "### {}\n\n{}",
-                workspace.workspace_dir,
-                content.trim()
-            ))
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 fn path_display(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
@@ -425,6 +397,7 @@ mod tests {
                 base_sha: Some("abc123".to_string()),
                 local_branch: Some("pi/session/test/repo".to_string()),
             }],
+            agents_md: String::new(),
             tools: tools
                 .into_iter()
                 .map(|name| {

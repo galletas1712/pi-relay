@@ -9,7 +9,7 @@
 - Load the repo-level templates `PI.md` and `PI.compaction.md` from a given repo root.
 - Render either template against a `PromptContext` using [minijinja](https://docs.rs/minijinja) (Jinja2 syntax).
 - Expose a small, stable set of template variables (project instructions, workspace facts, tool specs/aliases, skills index) and nothing else.
-- Compose per-workspace `AGENTS.md` files into a single project-instructions block.
+- Render runtime-supplied global/workspace `AGENTS.md` contents as one instructions block.
 - Collapse runs of blank lines so conditional template blocks do not leave large gaps.
 
 This crate does not decide *when* the prompt is rendered or how it reaches a provider. The daemon does that (see [How it works](#how-it-works)).
@@ -25,7 +25,7 @@ render_compaction_prompt(template, ctx) -> String   (same renderer, separate ent
 
 Input types the caller fills in:
 
-- `PromptContext` — `cwd: PathBuf`, `has_project: bool`, `workspaces: Vec<PromptWorkspace>`, `tools: Vec<ToolSpec>`, `skills: Vec<Skill>`.
+- `PromptContext` — `cwd`, `has_project`, `workspaces`, precomposed `agents_md`, tools, skills, roles, and MCP servers.
 - `PromptWorkspace` — `kind` (`Git` | `Local`), `workspace_dir`, and git lineage fields (`remote_url`, `remote_branch`, `source_path`, `base_sha`, `local_branch`).
 - `ToolSpec` — `name`, `description`, `input_schema` (JSON), `canonical_name`, `prompt_alias`.
 - `Skill` — optional `workspace`, `name`, `description`, `file_path`. Built via `Skill::global(..)` or `Skill::workspace(workspace, ..)`.
@@ -36,7 +36,7 @@ Input types the caller fills in:
 
 | Variable | Type | Contents |
 | --- | --- | --- |
-| `project.agents_md` | string | Concatenated per-workspace `AGENTS.md` content. Empty when `has_project` is false. |
+| `project.agents_md` | string | Ordered runtime-supplied global and per-workspace instructions. |
 | `session.cwd` | string | The session `cwd`, with backslashes normalized to `/`. |
 | `session.has_project` | bool | Whether the session is attached to a project. |
 | `session.workspaces` | array | Per-workspace objects (`kind`, `workspace_dir`, git lineage fields). |
@@ -57,7 +57,10 @@ The registered builtin tools and their aliases are owned by the daemon tool regi
 
 ### Workspaces -> project instructions
 
-When `has_project` is true, `agents_md` is built by reading `<cwd>/<workspace_dir>/AGENTS.md` for each workspace, in order. Missing or whitespace-only files are skipped. Each surviving file becomes a section headed by its workspace dir:
+The selected runtime reads its XDG `runtime/AGENTS.md` followed by each
+`<workspace_dir>/AGENTS.md` in workspace order. Agentd composes workspace
+contents under their workspace heading and passes the resulting string into
+this pure renderer:
 
 ```
 ### repo
@@ -69,7 +72,7 @@ When `has_project` is true, `agents_md` is built by reading `<cwd>/<workspace_di
 <contents of docs/AGENTS.md>
 ```
 
-This is the only place project-specific instructions enter the prompt. There is no separate global instructions file and no recursive scan — only the AGENTS.md at each workspace root is read.
+No agentd filesystem path is used to discover these files.
 
 ### `workspaces_markdown`
 
@@ -107,11 +110,13 @@ Git and local workspaces render differently so the model knows the publish postu
 
 Workspace-scoped skills are exposed to the model with their workspace directory
 as a prefix (`workspace/name`); skills without a slash prefix are global.
-`LoadSkill` should be called with the exact `name` from this JSON. JSON escaping
-is handled by `serde_json`. With no skills the variable is the empty string, and
+`LoadSkill` should be called with the exact `name` from this JSON; it returns the
+absolute runtime-host `SKILL.md` path. JSON escaping is handled by `serde_json`.
+With no skills the variable is the empty string, and
 `PI.md` drops the entire Skills section via `{% if skills.index %}`.
 
-Skill *discovery* (scanning `~/.agents/skills` and each workspace root's `.agents/skills`, parsing SKILL.md frontmatter) lives in the daemon's `provider_runtime`, not this crate. The crate only formats the `Skill` list it is handed.
+Skill filesystem discovery lives in `agent-runtime`. Agentd parses the returned
+frontmatter and hands this crate the resulting `Skill` and role lists.
 
 ### Render and cleanup
 

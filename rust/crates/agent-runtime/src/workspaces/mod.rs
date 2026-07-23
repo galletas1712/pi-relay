@@ -11,7 +11,10 @@ use std::{
     sync::Arc,
 };
 
-use agent_runtime_protocol::{ProjectWorkspace, RawSkillFile, SessionWorkspace, WorkspaceKind};
+use agent_runtime_protocol::{
+    ProjectWorkspace, RawInstructionFile, RawSkillFile, RuntimeContext, SessionWorkspace,
+    SkillKind, SkillOrigin, WorkspaceKind,
+};
 use anyhow::{bail, Context, Result};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
@@ -37,14 +40,18 @@ pub use self::selection::SelectedWorkspace;
 #[derive(Clone)]
 pub struct WorkspaceManager {
     state_root: PathBuf,
+    runtime_config_root: PathBuf,
+    home_dir: PathBuf,
     workspace_base_lock: Arc<Mutex<()>>,
     cwd_mutation_guards: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
 impl WorkspaceManager {
-    pub fn new(state_root: PathBuf) -> Self {
+    pub fn new(state_root: PathBuf, runtime_config_root: PathBuf, home_dir: PathBuf) -> Self {
         Self {
             state_root,
+            runtime_config_root,
+            home_dir,
             workspace_base_lock: Arc::new(Mutex::new(())),
             cwd_mutation_guards: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -97,26 +104,91 @@ impl WorkspaceManager {
         }
     }
 
-    /// Enumerate every runtime-side authored skill — the runtime host's
-    /// `~/.agents/skills` (global) plus each workspace's `.agents/skills` — and
-    /// return the raw `SKILL.md` contents for control-plane frontmatter parsing.
-    pub async fn read_runtime_skills(
+    /// Return all runtime-owned instructions and skill packages visible to a
+    /// session. Personal project skills override same-named repository skills.
+    pub async fn read_runtime_context(
         &self,
         workspace_id: &str,
         workspace_dirs: &[String],
-    ) -> Result<Vec<RawSkillFile>> {
-        let mut files = Vec::new();
-        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-            let home_skills = PathBuf::from(home).join(".agents/skills");
-            collect_skill_dir(&home_skills, None, &mut files).await?;
-        }
+    ) -> Result<RuntimeContext> {
+        let mut instructions = Vec::new();
+        collect_instruction(
+            &self.runtime_config_root.join("AGENTS.md"),
+            None,
+            &mut instructions,
+        )
+        .await?;
+
+        let mut global_skills = std::collections::BTreeMap::new();
+        collect_skill_dir(
+            &self.runtime_config_root.join("skills"),
+            None,
+            SkillKind::Skill,
+            SkillOrigin::RuntimeWorkflow,
+            &mut global_skills,
+        )
+        .await?;
+        collect_skill_dir(
+            &self.home_dir.join(".agents/skills"),
+            None,
+            SkillKind::Skill,
+            SkillOrigin::HomeGlobal,
+            &mut global_skills,
+        )
+        .await?;
+
+        let mut roles = std::collections::BTreeMap::new();
+        collect_skill_dir(
+            &self.runtime_config_root.join("subagent-roles"),
+            None,
+            SkillKind::SubagentRole,
+            SkillOrigin::RuntimeRole,
+            &mut roles,
+        )
+        .await?;
+
+        let mut project_skills = std::collections::BTreeMap::new();
         let cwd = self.resolve(workspace_id);
         for workspace_dir in workspace_dirs {
-            let skills_dir = cwd.join(workspace_dir).join(".agents/skills");
-            collect_skill_dir(&skills_dir, Some(workspace_dir.as_str()), &mut files).await?;
+            let workspace = Some(workspace_dir.as_str());
+            collect_instruction(
+                &cwd.join(workspace_dir).join("AGENTS.md"),
+                workspace,
+                &mut instructions,
+            )
+            .await?;
+            collect_skill_dir(
+                &cwd.join(workspace_dir).join(".agents/skills"),
+                workspace,
+                SkillKind::Skill,
+                SkillOrigin::WorkspaceProject,
+                &mut project_skills,
+            )
+            .await?;
+            collect_skill_dir(
+                &self
+                    .home_dir
+                    .join(".agents")
+                    .join("projects")
+                    .join(workspace_dir)
+                    .join("skills"),
+                workspace,
+                SkillKind::Skill,
+                SkillOrigin::HomeProject,
+                &mut project_skills,
+            )
+            .await?;
         }
-        files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-        Ok(files)
+
+        let skills = global_skills
+            .into_values()
+            .chain(roles.into_values())
+            .chain(project_skills.into_values())
+            .collect();
+        Ok(RuntimeContext {
+            instructions,
+            skills,
+        })
     }
 
     pub async fn validate_root(&self) -> Result<()> {
@@ -565,13 +637,32 @@ struct WorkspaceBase {
     config: WorkspaceBaseConfig,
 }
 
-/// Read every `<dir>/<name>/SKILL.md` into a `RawSkillFile`. A missing directory
-/// is not an error. `workspace` labels the source: the owning workspace dir, or
-/// `None` for the runtime host's global `~/.agents/skills`.
+async fn collect_instruction(
+    path: &Path,
+    workspace: Option<&str>,
+    files: &mut Vec<RawInstructionFile>,
+) -> Result<()> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) if !contents.trim().is_empty() => files.push(RawInstructionFile {
+            workspace: workspace.map(str::to_string),
+            path: path.display().to_string(),
+            contents,
+        }),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// Read every `<dir>/<name>/SKILL.md` into a package map. A missing directory
+/// is not an error. Later sources replace same-named packages.
 async fn collect_skill_dir(
     dir: &Path,
     workspace: Option<&str>,
-    files: &mut Vec<RawSkillFile>,
+    kind: SkillKind,
+    origin: SkillOrigin,
+    files: &mut std::collections::BTreeMap<String, RawSkillFile>,
 ) -> Result<()> {
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
@@ -587,15 +678,22 @@ async fn collect_skill_dir(
         };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let rel_path = match workspace {
-            Some(workspace) => format!("{workspace}/.agents/skills/{name}/SKILL.md"),
-            None => format!("~/.agents/skills/{name}/SKILL.md"),
+        let package_key = match workspace {
+            Some(workspace) => format!("{workspace}/{name}"),
+            None => name.to_string(),
         };
-        files.push(RawSkillFile {
-            workspace: workspace.map(str::to_string),
-            rel_path,
-            contents,
-        });
+        let skill_path = entry.path().join("SKILL.md");
+        files.insert(
+            package_key,
+            RawSkillFile {
+                kind: kind.clone(),
+                origin: origin.clone(),
+                workspace: workspace.map(str::to_string),
+                package_name: name.to_string(),
+                path: skill_path.display().to_string(),
+                contents,
+            },
+        );
     }
     Ok(())
 }
@@ -690,21 +788,97 @@ mod tests {
             "---\nname: deep\ndescription: deep\n---\nbody",
         );
 
-        let mut files = Vec::new();
-        collect_skill_dir(&skills, Some("repo"), &mut files)
-            .await
-            .expect("collect");
+        let mut files = std::collections::BTreeMap::new();
+        collect_skill_dir(
+            &skills,
+            Some("repo"),
+            SkillKind::Skill,
+            SkillOrigin::WorkspaceProject,
+            &mut files,
+        )
+        .await
+        .expect("collect");
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].workspace.as_deref(), Some("repo"));
-        assert_eq!(files[0].rel_path, "repo/.agents/skills/reviewer/SKILL.md");
-        assert!(files[0].contents.contains("name: reviewer"));
+        let file = files.get("repo/reviewer").expect("reviewer");
+        assert_eq!(file.workspace.as_deref(), Some("repo"));
+        assert_eq!(file.origin, SkillOrigin::WorkspaceProject);
+        assert_eq!(
+            file.path,
+            skills.join("reviewer/SKILL.md").display().to_string()
+        );
+        assert!(file.contents.contains("name: reviewer"));
 
         // A missing directory is not an error and yields nothing.
-        let mut none = Vec::new();
-        collect_skill_dir(&root.join("absent"), None, &mut none)
-            .await
-            .expect("missing dir is ok");
+        let mut none = std::collections::BTreeMap::new();
+        collect_skill_dir(
+            &root.join("absent"),
+            None,
+            SkillKind::Skill,
+            SkillOrigin::HomeGlobal,
+            &mut none,
+        )
+        .await
+        .expect("missing dir is ok");
         assert!(none.is_empty());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn runtime_context_merges_sources_with_personal_precedence() {
+        let root = temp_dir("runtime-context");
+        let state = root.join("state");
+        let config = root.join("config/pi-relay/runtime");
+        let home = root.join("home");
+        let cwd = state.join("sessions/session-test/cwd");
+        write_file(&config.join("AGENTS.md"), "global instructions");
+        write_file(
+            &home.join(".agents/skills/swe/SKILL.md"),
+            "---\nname: swe\ndescription: global\n---\nglobal",
+        );
+        write_file(
+            &config.join("skills/workflow-review/SKILL.md"),
+            "---\nname: workflow-review\ndescription: workflow\n---\nworkflow",
+        );
+        write_file(
+            &config.join("subagent-roles/reviewer/SKILL.md"),
+            "---\nname: reviewer\ndescription: role\n---\nrole",
+        );
+        write_file(&cwd.join("repo/AGENTS.md"), "repo instructions");
+        write_file(
+            &cwd.join("repo/.agents/skills/kubernetes/SKILL.md"),
+            "---\nname: kubernetes\ndescription: contributed\n---\ncontributed",
+        );
+        write_file(
+            &home.join(".agents/projects/repo/skills/kubernetes/SKILL.md"),
+            "---\nname: kubernetes\ndescription: personal\n---\npersonal",
+        );
+
+        let manager = WorkspaceManager::new(state, config, home);
+        let context = manager
+            .read_runtime_context("session-test", &["repo".to_string()])
+            .await
+            .expect("runtime context");
+
+        assert_eq!(context.instructions.len(), 2);
+        assert_eq!(context.instructions[0].workspace, None);
+        assert_eq!(context.instructions[1].workspace.as_deref(), Some("repo"));
+        assert!(context.skills.iter().any(|skill| {
+            skill.package_name == "swe" && skill.origin == SkillOrigin::HomeGlobal
+        }));
+        assert!(context.skills.iter().any(|skill| {
+            skill.package_name == "workflow-review" && skill.origin == SkillOrigin::RuntimeWorkflow
+        }));
+        assert!(context.skills.iter().any(|skill| {
+            skill.package_name == "reviewer" && skill.kind == SkillKind::SubagentRole
+        }));
+        let kubernetes = context
+            .skills
+            .iter()
+            .find(|skill| skill.package_name == "kubernetes")
+            .expect("kubernetes");
+        assert_eq!(kubernetes.origin, SkillOrigin::HomeProject);
+        assert!(kubernetes.contents.contains("personal"));
 
         std::fs::remove_dir_all(root).ok();
     }

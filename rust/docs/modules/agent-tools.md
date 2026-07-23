@@ -133,14 +133,13 @@ table.
 
 ### LoadSkill
 
-`LoadSkill` activates an available skill by exact model-facing name so its
-instructions are injected into model context. Workspace skills are exposed in
-the prompt JSON with a workspace prefix such as `repo/repo-build`; global skills
-use their plain name. The tool schema accepts only a `name` argument, so callers
-must pass the exact JSON name shown in the available-skills prompt. It is
-registered as a provider tool for declaration/replay, but has no registry
-executor — the daemon runtime intercepts `tool_name == "LoadSkill"` and resolves
-it against the session's loaded-skill set and workspace skills.
+`LoadSkill` resolves an available skill by exact model-facing name. Workspace
+skills are exposed in the prompt JSON with a prefix such as `repo/repo-build`;
+global skills use their plain name. The tool result is only the absolute
+runtime-host path to `SKILL.md`, with no JSON envelope or prose. The agent reads
+that file through runtime-executed filesystem tools and resolves relative links
+from its enclosing directory. `LoadSkill` has no registry executor; agentd
+intercepts it and resolves the current runtime catalog.
 
 ### delegation tools
 

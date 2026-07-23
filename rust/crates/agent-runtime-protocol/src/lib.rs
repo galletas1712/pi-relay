@@ -128,10 +128,8 @@ pub enum RuntimeCommand {
         workspace_id: String,
         rel_path: String,
     },
-    /// Enumerate every runtime-side authored skill — the runtime host's
-    /// `~/.agents/skills` plus each `<workspace_dir>/.agents/skills` — and return
-    /// the raw `SKILL.md` contents for the control plane to parse.
-    ReadRuntimeSkills {
+    /// Return runtime-owned instructions and skill packages for a session.
+    ReadRuntimeContext {
         workspace_id: String,
         workspace_dirs: Vec<String>,
     },
@@ -189,7 +187,7 @@ pub enum RuntimeCommandResult {
     Materialized { workspaces: Vec<SessionWorkspace> },
     Tool { result: ToolResultMessage },
     FileContents { contents: Option<String> },
-    RuntimeSkills { files: Vec<RawSkillFile> },
+    RuntimeContext { context: RuntimeContext },
     McpInventory { inventory: McpInventory },
     McpManifest { manifest: McpSessionManifest },
     McpToolViews { views: Vec<McpToolView> },
@@ -198,14 +196,45 @@ pub enum RuntimeCommandResult {
     McpLogout { result: McpLogoutResult },
 }
 
-/// A raw `SKILL.md` found on the session's runtime, returned to the control
-/// plane for frontmatter parsing. `workspace` is the owning workspace dir, or
-/// `None` for a global home (`~/.agents/skills`) skill. `rel_path` identifies
-/// the file for display only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillKind {
+    Skill,
+    SubagentRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillOrigin {
+    HomeGlobal,
+    RuntimeWorkflow,
+    HomeProject,
+    WorkspaceProject,
+    RuntimeRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RawInstructionFile {
+    pub workspace: Option<String>,
+    pub path: String,
+    pub contents: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeContext {
+    pub instructions: Vec<RawInstructionFile>,
+    pub skills: Vec<RawSkillFile>,
+}
+
+/// A raw `SKILL.md` found on the session's runtime. `path` is an absolute path
+/// on that runtime host and is returned verbatim by `LoadSkill`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawSkillFile {
+    pub kind: SkillKind,
+    pub origin: SkillOrigin,
     pub workspace: Option<String>,
-    pub rel_path: String,
+    pub package_name: String,
+    pub path: String,
     pub contents: String,
 }
 
@@ -230,7 +259,10 @@ fn is_empty_error_data(value: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_frame, write_frame};
+    use super::{
+        read_frame, write_frame, RawInstructionFile, RawSkillFile, RuntimeContext, SkillKind,
+        SkillOrigin,
+    };
     use tokio::io::duplex;
 
     #[tokio::test]
@@ -249,6 +281,30 @@ mod tests {
             .expect("large frame should be writable");
 
         assert_eq!(received.len(), 8 * 1024 * 1024 + 1);
+    }
+
+    #[test]
+    fn runtime_context_round_trips_typed_skill_origins() {
+        let context = RuntimeContext {
+            instructions: vec![RawInstructionFile {
+                workspace: None,
+                path: "/config/runtime/AGENTS.md".to_string(),
+                contents: "instructions".to_string(),
+            }],
+            skills: vec![RawSkillFile {
+                kind: SkillKind::SubagentRole,
+                origin: SkillOrigin::RuntimeRole,
+                workspace: None,
+                package_name: "reviewer".to_string(),
+                path: "/config/runtime/subagent-roles/reviewer/SKILL.md".to_string(),
+                contents: "---\nname: reviewer\ndescription: review\n---\n".to_string(),
+            }],
+        };
+
+        let encoded = serde_json::to_string(&context).expect("serialize");
+        let decoded: RuntimeContext = serde_json::from_str(&encoded).expect("deserialize");
+
+        assert_eq!(decoded, context);
     }
 }
 

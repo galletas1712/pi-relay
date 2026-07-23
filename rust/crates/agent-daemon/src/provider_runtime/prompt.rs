@@ -1,14 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use agent_prompt::{
     load_pi_compaction_md, load_pi_md, render_prompt, PromptContext, PromptMcpServer,
     PromptProfile, PromptWorkspace, PromptWorkspaceKind, Skill, SubagentRole, ToolSpec,
 };
-use agent_runtime_protocol::RawSkillFile;
+use agent_runtime_protocol::{RawInstructionFile, RawSkillFile, SkillKind};
 use agent_store::{SessionConfig, WorkspaceKind};
 use agent_tools::ProviderTool;
 use agent_vocab::ProviderKind;
-use anyhow::{anyhow, Context};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::state::AppState;
@@ -21,20 +21,6 @@ pub(super) async fn assemble_agent_prompt(
     Ok(agent_provider::PromptSections::stable(
         config.system_prompt.clone(),
     ))
-}
-
-/// Add daemon-owned skills only when a runtime home/workspace skill does not
-/// already expose the same name.
-pub(super) fn extend_with_fallback_skills(skills: &mut Vec<Skill>, fallback: Vec<Skill>) {
-    let mut names = skills
-        .iter()
-        .map(Skill::exposed_name)
-        .collect::<std::collections::BTreeSet<_>>();
-    for skill in fallback {
-        if names.insert(skill.exposed_name()) {
-            skills.push(skill);
-        }
-    }
 }
 
 pub(crate) async fn render_pi_prompt(
@@ -57,10 +43,18 @@ pub(super) async fn render_pi_compaction_prompt(
     config: &SessionConfig,
 ) -> anyhow::Result<String> {
     let template = load_pi_compaction_md(&state.prompt_root)?;
-    Ok(render_prompt(
-        &template,
-        &prompt_context(state, config).await?,
-    ))
+    let context = PromptContext {
+        profile: prompt_profile(config),
+        cwd: PathBuf::from(&config.workspace_id),
+        has_project: config.project_id.is_some(),
+        workspaces: Vec::new(),
+        agents_md: String::new(),
+        tools: Vec::new(),
+        skills: Vec::new(),
+        subagent_roles: Vec::new(),
+        mcp_servers: Vec::new(),
+    };
+    Ok(render_prompt(&template, &context))
 }
 
 pub(super) async fn prompt_context(
@@ -87,9 +81,9 @@ pub(super) async fn prompt_context(
         .iter()
         .map(|workspace| workspace.workspace_dir.clone())
         .collect::<Vec<_>>();
-    let runtime_raw = state
+    let runtime_context = state
         .runtime_hosts
-        .read_runtime_skills(&config.runtime_id, &config.workspace_id, &workspace_dirs)
+        .read_runtime_context(&config.runtime_id, &config.workspace_id, &workspace_dirs)
         .await?;
     Ok(PromptContext {
         profile,
@@ -111,9 +105,10 @@ pub(super) async fn prompt_context(
                 local_branch: workspace.local_branch.clone(),
             })
             .collect(),
+        agents_md: render_runtime_instructions(&runtime_context.instructions),
         tools: tool_specs(state, config.provider.kind, profile),
-        skills: load_prompt_skills(&state.config_root, &runtime_raw, profile),
-        subagent_roles: load_configured_subagent_role_catalog(&state.config_root),
+        skills: parse_runtime_skills(&runtime_context.skills),
+        subagent_roles: load_subagent_role_catalog(&runtime_context.skills),
         mcp_servers,
     })
 }
@@ -208,26 +203,23 @@ fn tool_specs_from_provider_tools(tools: Vec<ProviderTool>) -> Vec<ToolSpec> {
         .collect()
 }
 
-fn load_prompt_skills(
-    config_root: &Path,
-    runtime_raw: &[RawSkillFile],
-    profile: PromptProfile,
-) -> Vec<Skill> {
-    let mut skills = parse_runtime_skills(runtime_raw);
-    if profile == PromptProfile::Parent {
-        extend_with_fallback_skills(
-            &mut skills,
-            load_global_skills_from_dir(&config_root.join("workflows")),
-        );
-    }
-    skills
+fn load_subagent_role_catalog(raw: &[RawSkillFile]) -> Vec<SubagentRole> {
+    super::skills::resolved_role_catalog(raw)
+        .into_iter()
+        .map(|role| SubagentRole::new(role.name, role.description))
+        .collect()
 }
 
-fn load_configured_subagent_role_catalog(config_root: &Path) -> Vec<SubagentRole> {
-    load_global_skills_from_dir(&config_root.join("subagent-roles"))
-        .into_iter()
-        .map(|skill| SubagentRole::new(skill.name, skill.description))
-        .collect()
+fn render_runtime_instructions(files: &[RawInstructionFile]) -> String {
+    files
+        .iter()
+        .filter(|file| !file.contents.trim().is_empty())
+        .map(|file| match &file.workspace {
+            Some(workspace) => format!("### {workspace}\n\n{}", file.contents.trim()),
+            None => file.contents.trim().to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[derive(Debug)]
@@ -235,7 +227,23 @@ pub(super) struct ParsedSkillFile {
     pub(super) name: String,
     pub(super) description: String,
     pub(super) body: String,
-    pub(super) frontmatter: std::collections::BTreeMap<String, String>,
+    pub(super) frontmatter: SkillFrontmatter,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct SkillFrontmatter {
+    pub(super) name: String,
+    pub(super) description: String,
+    #[serde(default)]
+    pub(super) kind: Option<String>,
+    #[serde(default)]
+    pub(super) model: Option<String>,
+    #[serde(default)]
+    pub(super) reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub(super) max_tokens: Option<u32>,
+    #[serde(default)]
+    pub(super) skills: Vec<String>,
 }
 
 /// Build the skill catalog from the runtime's raw `SKILL.md` set. `None`
@@ -244,87 +252,33 @@ pub(super) struct ParsedSkillFile {
 /// identifier so LoadSkill can match a body back to this same set.
 pub(super) fn parse_runtime_skills(raw: &[RawSkillFile]) -> Vec<Skill> {
     raw.iter()
+        .filter(|file| file.kind == SkillKind::Skill)
         .filter_map(|file| {
             let parsed = parse_skill_contents(&file.contents)?;
+            if parsed.name != file.package_name {
+                return None;
+            }
             let skill = match &file.workspace {
                 Some(workspace) => Skill::workspace(
                     workspace.clone(),
                     parsed.name,
                     parsed.description,
-                    &file.rel_path,
+                    &file.path,
                 ),
-                None => Skill::global(parsed.name, parsed.description, &file.rel_path),
+                None => Skill::global(parsed.name, parsed.description, &file.path),
             };
             Some(skill)
         })
         .collect()
 }
 
-pub(super) fn load_global_skills_from_dir(dir: &Path) -> Vec<Skill> {
-    let mut skills = Vec::new();
-    add_skills_from_agents_dir(dir, None, &mut skills);
-    skills
-}
-
-fn add_skills_from_agents_dir(dir: &Path, workspace: Option<&str>, skills: &mut Vec<Skill>) {
-    if !dir.is_dir() {
-        return;
-    }
-
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries = entries.flatten().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') || !path.is_dir() {
-            continue;
-        }
-        let skill_file = path.join("SKILL.md");
-        if !skill_file.is_file() {
-            continue;
-        }
-        if let Some(skill) = load_skill_file(&skill_file, workspace) {
-            skills.push(skill);
-        }
-    }
-}
-
-fn load_skill_file(path: &Path, workspace: Option<&str>) -> Option<Skill> {
-    let parsed = load_parsed_skill_file(path).ok()?;
-    if parsed.name.is_empty() || parsed.description.is_empty() {
-        return None;
-    }
-    let skill = match workspace {
-        Some(workspace) => {
-            Skill::workspace(workspace.to_string(), parsed.name, parsed.description, path)
-        }
-        None => Skill::global(parsed.name, parsed.description, path),
-    };
-    Some(skill)
-}
-
-pub(super) fn load_parsed_skill_file(path: &Path) -> anyhow::Result<ParsedSkillFile> {
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("read skill {}", path.display()))?;
-    parse_skill_contents(&raw).ok_or_else(|| {
-        anyhow!(
-            "skill {} missing frontmatter name or description",
-            path.display()
-        )
-    })
-}
-
 /// Parse `SKILL.md` contents into name/description/body. Returns `None` when the
 /// frontmatter lacks a non-empty name or description.
 pub(super) fn parse_skill_contents(raw: &str) -> Option<ParsedSkillFile> {
     let (frontmatter, body) = split_frontmatter(raw);
-    let frontmatter = parse_simple_frontmatter(frontmatter.unwrap_or_default());
-    let name = frontmatter.get("name")?.trim().to_string();
-    let description = frontmatter.get("description")?.trim().to_string();
+    let frontmatter: SkillFrontmatter = serde_yaml::from_str(frontmatter?).ok()?;
+    let name = frontmatter.name.trim().to_string();
+    let description = frontmatter.description.trim().to_string();
     if name.is_empty() || description.is_empty() {
         return None;
     }
@@ -352,33 +306,10 @@ fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
     (Some(&rest[..end]), body)
 }
 
-fn parse_simple_frontmatter(frontmatter: &str) -> std::collections::BTreeMap<String, String> {
-    let mut map = std::collections::BTreeMap::new();
-    for line in frontmatter.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        map.insert(
-            key.trim().to_string(),
-            value
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_string(),
-        );
-    }
-    map
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_tools::ToolRegistry;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parse_runtime_skills_classifies_home_and_workspace_sources() {
@@ -416,13 +347,19 @@ mod tests {
         let raw = vec![
             raw_skill(Some("repo"), "ok", "good"),
             RawSkillFile {
+                kind: SkillKind::Skill,
+                origin: agent_runtime_protocol::SkillOrigin::WorkspaceProject,
                 workspace: Some("repo".to_string()),
-                rel_path: "repo/.agents/skills/no-desc/SKILL.md".to_string(),
+                package_name: "no-desc".to_string(),
+                path: "/tmp/repo/.agents/skills/no-desc/SKILL.md".to_string(),
                 contents: "---\nname: no-desc\n---\n\nbody".to_string(),
             },
             RawSkillFile {
+                kind: SkillKind::Skill,
+                origin: agent_runtime_protocol::SkillOrigin::HomeGlobal,
                 workspace: None,
-                rel_path: "~/.agents/skills/blank/SKILL.md".to_string(),
+                package_name: "blank".to_string(),
+                path: "/home/test/.agents/skills/blank/SKILL.md".to_string(),
                 contents: "no frontmatter at all\n".to_string(),
             },
         ];
@@ -432,89 +369,50 @@ mod tests {
     }
 
     #[test]
-    fn workflow_skills_are_prompt_skills_but_roles_stay_hidden() {
-        let prompt_root = make_temp_dir("workflow-skills-in-index");
-        let outer = prompt_root.join("outer");
-        let workspace = outer.join("repo");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        write_skill(
-            &prompt_root.join("workflows/workflow-explore/SKILL.md"),
-            "workflow-explore",
-            "parallel read-only exploration",
-        );
-        write_skill(
-            &prompt_root.join("subagent-roles/explore/SKILL.md"),
-            "explore",
-            "default subagent role",
-        );
-        let runtime_raw = vec![raw_skill(Some("repo"), "visible", "normal skill")];
+    fn workflow_skills_are_ordinary_but_roles_stay_hidden() {
+        let mut workflow = raw_skill(None, "workflow-explore", "parallel exploration");
+        workflow.origin = agent_runtime_protocol::SkillOrigin::RuntimeWorkflow;
+        let mut role = raw_skill(None, "explore", "default subagent role");
+        role.kind = SkillKind::SubagentRole;
+        role.origin = agent_runtime_protocol::SkillOrigin::RuntimeRole;
+        let runtime_raw = vec![
+            workflow,
+            role,
+            raw_skill(Some("repo"), "visible", "normal skill"),
+        ];
 
-        let skills = load_prompt_skills(&prompt_root, &runtime_raw, PromptProfile::Parent);
+        let skills = parse_runtime_skills(&runtime_raw);
         assert!(skills
             .iter()
             .any(|skill| skill.workspace.is_none() && skill.name == "workflow-explore"));
         assert!(skills.iter().any(|skill| skill.name == "visible"));
         assert!(!skills.iter().any(|skill| skill.name == "explore"));
 
-        let subagent_skills =
-            load_prompt_skills(&prompt_root, &runtime_raw, PromptProfile::Subagent);
-        assert!(!subagent_skills
-            .iter()
-            .any(|skill| skill.name == "workflow-explore"));
-        assert!(subagent_skills.iter().any(|skill| skill.name == "visible"));
-
-        let roles = load_configured_subagent_role_catalog(&prompt_root);
+        let roles = load_subagent_role_catalog(&runtime_raw);
         assert!(roles
             .iter()
             .any(|role| role.name == "explore" && role.description == "default subagent role"));
-
-        std::fs::remove_dir_all(prompt_root).ok();
     }
 
     #[test]
-    fn parent_prompt_uses_only_configured_daemon_catalogs() {
-        let prompt_root = make_temp_dir("non-config-prompt-catalog");
-        let config_root = make_temp_dir("config-prompt-catalog");
-        let outer = prompt_root.join("outer");
-        std::fs::create_dir_all(&outer).expect("outer");
-        write_skill(
-            &prompt_root.join("workflows/fallback/SKILL.md"),
-            "fallback",
-            "bundled fallback",
-        );
-        write_skill(
-            &config_root.join("workflows/review/SKILL.md"),
-            "review",
-            "configured workflow",
-        );
-        write_skill(
-            &config_root.join("subagent-roles/reviewer/SKILL.md"),
-            "reviewer",
-            "configured reviewer",
-        );
-        let skills = load_prompt_skills(&config_root, &[], PromptProfile::Parent);
-        assert_eq!(
-            skills
-                .iter()
-                .filter(|skill| skill.workspace.is_none() && skill.name == "review")
-                .count(),
-            1
-        );
-        assert!(skills
-            .iter()
-            .any(|skill| { skill.name == "review" && skill.description == "configured workflow" }));
-        assert!(!skills.iter().any(|skill| skill.name == "fallback"));
-        let roles = load_configured_subagent_role_catalog(&config_root);
-        assert_eq!(
-            roles.iter().filter(|role| role.name == "reviewer").count(),
-            1
-        );
-        assert!(roles
-            .iter()
-            .any(|role| role.name == "reviewer" && role.description == "configured reviewer"));
+    fn runtime_instructions_keep_global_then_workspace_order() {
+        let files = vec![
+            RawInstructionFile {
+                workspace: None,
+                path: "/config/runtime/AGENTS.md".to_string(),
+                contents: "global rules\n".to_string(),
+            },
+            RawInstructionFile {
+                workspace: Some("repo".to_string()),
+                path: "/workspace/repo/AGENTS.md".to_string(),
+                contents: "repo rules\n".to_string(),
+            },
+        ];
 
-        std::fs::remove_dir_all(prompt_root).ok();
-        std::fs::remove_dir_all(config_root).ok();
+        assert_eq!(
+            render_runtime_instructions(&files),
+            "global rules\n\n### repo\n\nrepo rules"
+        );
     }
 
     #[test]
@@ -595,38 +493,25 @@ mod tests {
     }
 
     fn raw_skill(workspace: Option<&str>, name: &str, description: &str) -> RawSkillFile {
-        let rel_path = match workspace {
-            Some(workspace) => format!("{workspace}/.agents/skills/{name}/SKILL.md"),
-            None => format!("~/.agents/skills/{name}/SKILL.md"),
+        let (origin, path) = match workspace {
+            Some(workspace) => (
+                agent_runtime_protocol::SkillOrigin::WorkspaceProject,
+                format!("/tmp/{workspace}/.agents/skills/{name}/SKILL.md"),
+            ),
+            None => (
+                agent_runtime_protocol::SkillOrigin::HomeGlobal,
+                format!("/home/test/.agents/skills/{name}/SKILL.md"),
+            ),
         };
         RawSkillFile {
+            kind: SkillKind::Skill,
+            origin,
             workspace: workspace.map(str::to_string),
-            rel_path,
+            package_name: name.to_string(),
+            path,
             contents: format!(
                 "---\nname: {name}\ndescription: {description}\nignored: true\n---\n\n# {name}\n"
             ),
         }
-    }
-
-    fn write_skill(path: &Path, name: &str, description: &str) {
-        std::fs::create_dir_all(path.parent().expect("skill parent")).expect("skill dir");
-        std::fs::write(
-            path,
-            format!(
-                "---\nname: {name}\ndescription: {description}\nignored: true\n---\n\n# {name}\n"
-            ),
-        )
-        .expect("write skill");
-    }
-
-    fn make_temp_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("pi-relay-{prefix}-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
     }
 }

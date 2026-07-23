@@ -20,8 +20,9 @@ leased actions and session state when the control connection returns.
 ## Workspace and security boundary
 
 Each runtime has a `workspace_root`. Managed workspaces, local tool execution,
-skills, and runtime-owned MCP state are kept below that root unless a
-configuration explicitly opts into another path. The runtime is a host-trust
+and runtime-owned MCP state are kept below that root. Instructions and skill
+packages come from the runtime user's home/XDG directories and selected
+workspaces. The runtime is a host-trust
 boundary: it can read credentials and execute local tools available to the
 runtime user, while the daemon remains the source of truth for session
 authorization and durable state.
@@ -53,6 +54,29 @@ $HOME/.config/pi-relay/runtime/config.toml
 The configuration identifies the runtime, its display name, workspace root,
 and control bind/connect settings. MCP policy is kept separately in the
 runtime `mcp.toml` file when MCP is enabled.
+
+Runtime context is discovered without another configured root:
+
+```text
+$XDG_CONFIG_HOME/pi-relay/runtime/
+├── AGENTS.md
+├── skills/<workflow>/SKILL.md
+└── subagent-roles/<role>/SKILL.md
+
+$HOME/.agents/
+├── skills/<skill>/SKILL.md
+└── projects/<workspace>/skills/<skill>/SKILL.md
+
+<workspace>/.agents/skills/<skill>/SKILL.md
+<workspace>/AGENTS.md
+```
+
+The runtime reads these files and returns their contents, category, origin, and
+absolute runtime-host paths over `agent-runtime-protocol`. The daemon never
+opens those paths. Personal project packages under `$HOME/.agents/projects`
+replace same-named packages from a selected workspace. `LoadSkill` returns only
+the absolute `SKILL.md` path so linked sibling files remain available through
+runtime-executed filesystem tools.
 
 The repository's local stack can start the runtime through `infra/dev.sh`.
 For a manual run:

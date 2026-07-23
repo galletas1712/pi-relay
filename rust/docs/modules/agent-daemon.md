@@ -59,15 +59,12 @@ handoff.rs         renders per-subagent task_prompt.md / final_message.md /
 parses only the required strict `config.toml` startup-policy schema: root
 `database_url`, optional frontend `bind`, optional `runtime_bind`, an optional
 default parent provider. `pi-agentd` accepts no configuration arguments.
-Invalid configuration fails startup. Global roles live only under
-`agentd/subagent-roles/<role>/`; each directory requires a same-named
-`SKILL.md`, whose optional provider frontmatter selects that role's model.
-Unavailable role providers fall back to OpenAI `gpt-5.6-sol` with high
-reasoning. Runtime and workspace roles instead inherit their parent's provider
-unless explicitly overridden when spawned. Global workflows likewise live only under
-`agentd/workflows`; the repository packages no workflow or role fallback.
-Runtime home/workspace skills take precedence over same-named configured
-workflows, and roles remain hidden from ordinary `LoadSkill`. MCP server
+Invalid configuration fails startup. User instructions, workflows, roles, and
+skills are discovered by the selected runtime and returned as a typed runtime
+context; agentd never opens runtime-host paths. Runtime roles may select their
+model and preload reusable global skills. Unavailable role providers retain the
+stable-provider fallback. Workflow packages are ordinary loadable skills, while
+roles remain hidden from `LoadSkill`. MCP server
 definitions (`$XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml`) and OAuth credentials
 live on each runtime host (see `agent-runtime`), not in the control plane.
 
@@ -149,7 +146,7 @@ driver loop after its durable store update. The narrow extension precedent
 remains `ToolRegistry`/`ToolExtension`, where the variation point is real and
 does not own session durability.
 
-`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (provider-native compaction and parent-only post-compaction delegation ledger append), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery + stable prompt sections), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization). The adjacent `delegation_context.rs` builds the bounded compaction ledger for top-level parent sessions.
+`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (provider-native compaction and parent-only post-compaction delegation ledger append), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + runtime-context parsing + stable prompt sections), `skills.rs` (`LoadSkill` and role resolution), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization). The adjacent `delegation_context.rs` builds the bounded compaction ledger for top-level parent sessions.
 
 ## Key types
 

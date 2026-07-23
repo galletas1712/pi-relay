@@ -154,6 +154,8 @@ struct Config {
     workspace_root: PathBuf,
     #[serde(skip)]
     config_root: PathBuf,
+    #[serde(skip)]
+    home_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -185,7 +187,11 @@ async fn main() -> Result<()> {
         }
     };
     let runtime = Runtime {
-        workspaces: WorkspaceManager::new(config.workspace_root.clone()),
+        workspaces: WorkspaceManager::new(
+            config.workspace_root.clone(),
+            config.config_root.clone(),
+            config.home_dir.clone(),
+        ),
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         running: Default::default(),
         mcp,
@@ -239,7 +245,13 @@ fn load_config_from_values(
             "runtime_id, name, control_addr, and absolute workspace_root are required"
         ));
     }
+    let home_dir = home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| anyhow!("HOME must be an absolute path"))?;
     config.config_root = config_root;
+    config.home_dir = home_dir;
     Ok(config)
 }
 
@@ -469,15 +481,15 @@ impl Runtime {
                     .await?;
                 Ok(RuntimeCommandResult::FileContents { contents })
             }
-            RuntimeCommand::ReadRuntimeSkills {
+            RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,
             } => {
-                let files = self
+                let context = self
                     .workspaces
-                    .read_runtime_skills(&workspace_id, &workspace_dirs)
+                    .read_runtime_context(&workspace_id, &workspace_dirs)
                     .await?;
-                Ok(RuntimeCommandResult::RuntimeSkills { files })
+                Ok(RuntimeCommandResult::RuntimeContext { context })
             }
             RuntimeCommand::McpInventory {
                 provider,
@@ -651,8 +663,12 @@ workspace_root = "/tmp/pi-runtime-test"
         )
         .expect("runtime config");
 
-        let config = load_config_from_values(Some(xdg.as_os_str().to_owned()), None, Vec::new())
-            .expect("load runtime config");
+        let config = load_config_from_values(
+            Some(xdg.as_os_str().to_owned()),
+            Some(xdg.as_os_str().to_owned()),
+            Vec::new(),
+        )
+        .expect("load runtime config");
         assert_eq!(config.runtime_id, "runtime-test");
         assert_eq!(config.config_root, config_root);
 
@@ -667,8 +683,12 @@ mcp_config = "/tmp/mcp.toml"
 "#,
         )
         .expect("runtime config with removed field");
-        let error = load_config_from_values(Some(xdg.as_os_str().to_owned()), None, Vec::new())
-            .expect_err("mcp_config is no longer part of runtime config");
+        let error = load_config_from_values(
+            Some(xdg.as_os_str().to_owned()),
+            Some(xdg.as_os_str().to_owned()),
+            Vec::new(),
+        )
+        .expect_err("mcp_config is no longer part of runtime config");
         assert!(format!("{error:#}").contains("unknown field"));
 
         fs::remove_dir_all(xdg).ok();
