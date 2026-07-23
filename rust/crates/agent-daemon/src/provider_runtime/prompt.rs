@@ -81,9 +81,16 @@ pub(super) async fn prompt_context(
         .iter()
         .map(|workspace| workspace.workspace_dir.clone())
         .collect::<Vec<_>>();
+    let project_key =
+        crate::provider_runtime::home_project_key(&state.repo, config.project_id).await?;
     let runtime_context = state
         .runtime_hosts
-        .read_runtime_context(&config.runtime_id, &config.workspace_id, &workspace_dirs)
+        .read_runtime_context(
+            &config.runtime_id,
+            &config.workspace_id,
+            &workspace_dirs,
+            project_key,
+        )
         .await?;
     Ok(PromptContext {
         profile,

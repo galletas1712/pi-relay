@@ -38,5 +38,7 @@ pub(crate) use session_titles::{
     schedule_session_title_refresh_for_model_turn, SessionTitleScheduler,
 };
 pub(crate) use sidecar::{run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
-pub(crate) use skills::{load_skill_result, resolve_skill_role, ResolvedPreloadedSkill};
+pub(crate) use skills::{
+    home_project_key, load_skill_result, resolve_skill_role, ResolvedPreloadedSkill,
+};
 pub(crate) use web_tools::{is_web_tool_name, run_web_tool};

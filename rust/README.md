@@ -223,7 +223,7 @@ ${XDG_CONFIG_HOME:-$HOME/.config}/pi-relay/runtime/
 
 $HOME/.agents/
 ├── skills/<skill>/SKILL.md
-└── projects/<workspace>/skills/<skill>/SKILL.md
+└── projects/<project_key>/skills/<skill>/SKILL.md
 
 <workspace>/.agents/skills/<skill>/SKILL.md
 ```
@@ -231,7 +231,10 @@ $HOME/.agents/
 The top-level `AGENTS.md` applies on that runtime before selected workspaces'
 own `AGENTS.md` files. Home skills are reusable global capabilities. Runtime
 `skills/` contains workflow skills; workflows remain ordinary loadable skills.
-Personal project skills override same-named repository project skills.
+`project_key` is derived from the project display name (lowercase; whitespace
+becomes `-`; only `[a-z0-9_-]` kept). Personal project skills under that key
+apply to every session in the project and override same-named repository
+project skills when both share the `{project_key}/{skill}` key.
 
 A role-local provider policy and global skill preloads use frontmatter:
 

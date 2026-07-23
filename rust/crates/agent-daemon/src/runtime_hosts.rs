@@ -524,6 +524,7 @@ impl RuntimeRegistry {
         runtime_id: &str,
         workspace_id: &str,
         workspace_dirs: &[String],
+        project_key: Option<String>,
     ) -> Result<agent_runtime_protocol::RuntimeContext> {
         match self
             .execute(
@@ -531,6 +532,7 @@ impl RuntimeRegistry {
                 RuntimeCommand::ReadRuntimeContext {
                     workspace_id: workspace_id.to_string(),
                     workspace_dirs: workspace_dirs.to_vec(),
+                    project_key,
                 },
             )
             .await?
@@ -876,6 +878,7 @@ pub(crate) mod test_support {
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,
+                project_key: _,
             } => {
                 // The fake runtime serves only workspace skills; home skills are
                 // exercised by pure parse tests to keep results host-independent.
