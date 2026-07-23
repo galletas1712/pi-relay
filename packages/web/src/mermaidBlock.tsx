@@ -216,15 +216,13 @@ export const MermaidBlock = memo(function MermaidBlock({ code }: MermaidBlockPro
 					initialFocusRef={titleRef}
 					onDismiss={() => setExpanded(false)}
 				>
-					<div className="history-dialog-head">
-						<div className="history-dialog-copy">
-							<DialogTitle ref={titleRef} tabIndex={-1}>Mermaid diagram</DialogTitle>
-							<DialogDescription className="sr-only">
-								Expanded view. Press Escape to close.
-							</DialogDescription>
-						</div>
-						<DialogCloseButton label="close Mermaid diagram" />
-					</div>
+					<DialogTitle ref={titleRef} className="sr-only" tabIndex={-1}>
+						Mermaid diagram
+					</DialogTitle>
+					<DialogDescription className="sr-only">
+						Expanded view. Press Escape to close.
+					</DialogDescription>
+					<DialogCloseButton label="close Mermaid diagram" />
 					<div className="mermaid-dialog-body">
 						<div className="mermaid-dialog-svg" dangerouslySetInnerHTML={{ __html: svg }} />
 					</div>
