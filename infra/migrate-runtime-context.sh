@@ -26,9 +26,22 @@ source_root = Path(os.environ.get("PI_AGENT_CONFIG_SOURCE") or home / "agent-con
 for path in (home, config_home, product_root, runtime_root, source_root):
     if not path.is_absolute():
         raise SystemExit(f"path must be absolute: {path}")
+for path in (product_root, agentd_root, runtime_root, source_root):
+    if path.is_symlink():
+        raise SystemExit(f"migration refuses symlink root: {path}")
+
+
+def reject_symlinks(path: Path) -> None:
+    if path.is_symlink():
+        raise SystemExit(f"migration refuses symlink: {path}")
+    if path.is_dir():
+        for child in path.iterdir():
+            reject_symlinks(child)
 
 
 def files_equal(left: Path, right: Path) -> bool:
+    if left.is_symlink() or right.is_symlink():
+        raise SystemExit(f"migration refuses symlink comparison: {left} -> {right}")
     if left.is_dir():
         return right.is_dir() and all(
             files_equal(child, right / child.name) for child in left.iterdir()
@@ -39,9 +52,11 @@ def files_equal(left: Path, right: Path) -> bool:
 def copy_exact(source: Path, destination: Path) -> None:
     if not source.exists():
         return
-    if source.is_symlink():
-        raise SystemExit(f"migration refuses symlink source: {source}")
+    reject_symlinks(source)
+    if destination.is_symlink():
+        raise SystemExit(f"migration refuses symlink: {destination}")
     if destination.exists():
+        reject_symlinks(destination)
         if not files_equal(source, destination):
             raise SystemExit(f"destination conflicts with source: {destination}")
         return
@@ -53,6 +68,8 @@ def copy_exact(source: Path, destination: Path) -> None:
 
 
 def copy_packages(source: Path, destination: Path) -> None:
+    if source.is_symlink() or destination.is_symlink():
+        raise SystemExit(f"migration refuses symlink catalog: {source} -> {destination}")
     if not source.is_dir():
         return
     for package in sorted(source.iterdir()):
@@ -67,13 +84,19 @@ def migrate_packages(source: Path, destination: Path) -> None:
     copy_packages(source, destination)
     if source.is_dir():
         for package in sorted(source.iterdir()):
-            if package.is_dir() and (package / "SKILL.md").is_file():
+            if (
+                not package.name.startswith(".")
+                and package.is_dir()
+                and (package / "SKILL.md").is_file()
+            ):
                 if files_equal(package, destination / package.name):
                     shutil.rmtree(package)
         if not any(source.iterdir()):
             source.rmdir()
 
 
+if source_root.exists():
+    reject_symlinks(source_root)
 runtime_root.mkdir(parents=True, exist_ok=True)
 migrate_packages(agentd_root / "workflows", runtime_root / "skills")
 migrate_packages(agentd_root / "subagent-roles", runtime_root / "subagent-roles")

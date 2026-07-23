@@ -325,7 +325,7 @@ fn delegate_writing_task_definition() -> ToolDefinition {
             "properties": {
                 "role": {
                     "type": "string",
-                    "description": "The subagent role skill name. Use prefixed workspace role names like \"repo/reviewer\" for workspace-scoped skills; unprefixed names resolve configured global roles such as \"implementer\"."
+                    "description": "The exact unprefixed runtime-global role name from the packaged subagent roles catalog, for example \"implementer\"."
                 },
                 "prompt": {
                     "type": "string",
@@ -361,7 +361,7 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
                         "properties": {
                             "role": {
                                 "type": "string",
-                                "description": "The subagent role skill name. Use prefixed workspace role names like \"repo/reviewer\" for workspace-scoped skills; unprefixed names resolve configured global roles such as \"reviewer\"."
+                                "description": "The exact unprefixed runtime-global role name from the packaged subagent roles catalog, for example \"reviewer\"."
                             },
                             "prompt": {
                                 "type": "string",
@@ -756,6 +756,21 @@ mod tests {
             .as_str()
             .expect("name description")
             .contains("repo/repo-build"));
+    }
+
+    #[test]
+    fn delegation_role_schemas_require_runtime_global_names() {
+        let full = delegate_writing_task_definition();
+        let readonly = delegate_readonly_tasks_definition();
+        for description in [
+            &full.input_schema["properties"]["role"]["description"],
+            &readonly.input_schema["properties"]["tasks"]["items"]["properties"]["role"]
+                ["description"],
+        ] {
+            let description = description.as_str().expect("role description");
+            assert!(description.contains("runtime-global"));
+            assert!(!description.contains("repo/reviewer"));
+        }
     }
 
     #[test]

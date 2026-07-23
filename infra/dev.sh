@@ -42,11 +42,8 @@ if [ ! -d "$PI_AGENTD_CONFIG_HOME" ]; then
 fi
 export PI_AGENTD_CONFIG_HOME
 
-# Control plane + Postgres + web in Docker. The runtime is a host process
-# (below); --remove-orphans clears a previously-dockerized runtime container.
-docker compose -f infra/docker-compose.yml up -d --build --wait --remove-orphans
-
-# Build + launch pi-runtime as a host process. Its required policy lives at
+# Build pi-runtime before replacing either side of the control protocol. Its
+# required policy lives at
 # $XDG_CONFIG_HOME/pi-relay/runtime/config.toml (or
 # ~/.config/pi-relay/runtime/config.toml)
 # and optional MCP policy is the sibling mcp.toml. Root is required for btrfs
@@ -61,24 +58,45 @@ if [ ! -f "$RUNTIME_CONFIG_HOME/config.toml" ]; then
   exit 1
 fi
 
-# Re-running this script should replace any prior host runtime from a previous
-# launch without touching Docker (sessions survive a web-only rebuild; a full
-# re-run still restarts runtime intentionally).
-sudo -n pkill -f "$RUNTIME_BIN" 2>/dev/null || true
-sleep 0.2
+# Stop the old runtime before deploying the new control plane.
+sudo -n true
+if sudo -n pgrep -x pi-runtime >/dev/null; then
+  sudo -n pkill -x pi-runtime
+  for _ in {1..50}; do
+    if ! sudo -n pgrep -x pi-runtime >/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  if sudo -n pgrep -x pi-runtime >/dev/null; then
+    echo "old pi-runtime did not stop" >&2
+    exit 1
+  fi
+fi
+
+# Deploy the matching control plane only after the runtime build succeeds.
+docker compose -f infra/docker-compose.yml up -d --build --wait --remove-orphans
 
 if [ -n "${XDG_CONFIG_HOME:-}" ]; then
   sudo -n env HOME="$HOME" PATH="$PATH" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" "$RUNTIME_BIN" &
 else
   sudo -n env HOME="$HOME" PATH="$PATH" "$RUNTIME_BIN" &
 fi
+RUNTIME_LAUNCH_PID=$!
+sleep 0.5
+if ! kill -0 "$RUNTIME_LAUNCH_PID" 2>/dev/null \
+  || ! sudo -n pgrep -x pi-runtime >/dev/null; then
+  sudo -n pkill -x pi-runtime 2>/dev/null || true
+  wait "$RUNTIME_LAUNCH_PID" 2>/dev/null || true
+  echo "pi-runtime exited during startup" >&2
+  exit 1
+fi
 
 shutdown() {
   trap - EXIT INT TERM
-  # pi-runtime runs as root; stop it by binary path (its sudo child outlives a
-  # kill of the backgrounded sudo pid). Leave Docker services running so a
-  # Ctrl-C does not drop control/postgres/web or force a full stack rebuild.
-  sudo -n pkill -f "$RUNTIME_BIN" 2>/dev/null || true
+  # pi-runtime runs as root; its sudo child outlives a kill of the backgrounded
+  # sudo pid. Leave Docker services running so Ctrl-C does not drop the stack.
+  sudo -n pkill -x pi-runtime 2>/dev/null || true
   wait 2>/dev/null || true
 }
 trap shutdown EXIT INT TERM

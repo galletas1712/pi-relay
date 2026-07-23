@@ -492,7 +492,7 @@ fn subagent_workspace_semantics(subagent_type: SubagentType) -> &'static str {
             "You are a full subagent. Your filesystem edits are made in the parent workspace in place and affect what the parent will see."
         }
         SubagentType::ReadOnly => {
-            "You are a read-only subagent. You run in a disposable snapshot; any local writes or artifacts stay in that snapshot and do not reach the parent unless you explicitly report them."
+            "You are a read-only subagent. Writes under your session cwd stay in a disposable snapshot and do not reach the parent. Absolute runtime-host paths are shared and must be treated as read-only."
         }
     }
 }

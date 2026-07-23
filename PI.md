@@ -56,7 +56,9 @@ Two kinds of subagent:
 - **read-only (RO)** — for investigation, review, analysis, and running
   builds/tests to gather information. RO subagents run in a private throwaway copy
   of the workspace; nothing they write reaches your workspace. Use
-  `delegate_readonly_tasks` to run several in parallel. MCP side-effects are ok (only filesystem changes are ephemeral)
+  `delegate_readonly_tasks` to run several in parallel. Only writes under the
+  session cwd are isolated; absolute runtime-host paths are shared and must be
+  treated as read-only. MCP calls may still have external side effects.
 - **full** — for making changes. A full subagent edits your workspace in place.
   Use `delegate_writing_task`. There is exactly one full subagent at a time.
 

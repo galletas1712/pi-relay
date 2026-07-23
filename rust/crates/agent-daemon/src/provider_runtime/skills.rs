@@ -76,20 +76,37 @@ pub(crate) fn resolve_skill_role(
     if name.is_empty() {
         return Err(anyhow!("role name cannot be empty"));
     }
-    let mut matches = runtime_raw
+    let matches = runtime_raw
         .iter()
         .filter(|file| file.kind == SkillKind::SubagentRole && file.package_name == name)
         .collect::<Vec<_>>();
-    let file = match matches.len() {
-        1 => matches.remove(0),
-        0 => return Err(anyhow!("role skill not found: {name}")),
-        _ => return Err(anyhow!("role skill is ambiguous: {name}")),
-    };
+    match matches.as_slice() {
+        [file] => resolve_role_file(runtime_raw, file),
+        [] => Err(anyhow!("role skill not found: {name}")),
+        _ => Err(anyhow!("role skill is ambiguous: {name}")),
+    }
+}
+
+pub(crate) fn resolved_role_catalog(runtime_raw: &[RawSkillFile]) -> Vec<ResolvedSkillRole> {
+    runtime_raw
+        .iter()
+        .filter(|file| file.kind == SkillKind::SubagentRole)
+        .filter_map(|file| resolve_role_file(runtime_raw, file).ok())
+        .collect()
+}
+
+fn resolve_role_file(
+    runtime_raw: &[RawSkillFile],
+    file: &RawSkillFile,
+) -> Result<ResolvedSkillRole> {
     if file.origin != SkillOrigin::RuntimeRole || file.workspace.is_some() {
-        return Err(anyhow!("role skill is not a global runtime role: {name}"));
+        return Err(anyhow!(
+            "role skill is not a global runtime role: {}",
+            file.package_name
+        ));
     }
     let parsed = parse_skill_contents(&file.contents)
-        .ok_or_else(|| anyhow!("role skill {name} missing valid frontmatter"))?;
+        .ok_or_else(|| anyhow!("role skill {} missing valid frontmatter", file.package_name))?;
     if parsed.name != file.package_name {
         return Err(anyhow!(
             "role skill directory {} must match SKILL.md name {}",
@@ -331,6 +348,19 @@ mod tests {
 
         let error = resolve_skill_role(&[role], "reviewer").expect_err("mismatch");
         assert!(error.to_string().contains("must match"));
+    }
+
+    #[test]
+    fn role_catalog_omits_unusable_roles() {
+        let invalid = raw_skill(
+            SkillKind::SubagentRole,
+            SkillOrigin::RuntimeRole,
+            None,
+            "reviewer",
+            "model: claude-opus-4-8\n",
+        );
+
+        assert!(resolved_role_catalog(&[invalid]).is_empty());
     }
 
     fn raw_skill(

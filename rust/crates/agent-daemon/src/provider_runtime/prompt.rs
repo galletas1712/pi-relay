@@ -43,10 +43,18 @@ pub(super) async fn render_pi_compaction_prompt(
     config: &SessionConfig,
 ) -> anyhow::Result<String> {
     let template = load_pi_compaction_md(&state.prompt_root)?;
-    Ok(render_prompt(
-        &template,
-        &prompt_context(state, config).await?,
-    ))
+    let context = PromptContext {
+        profile: prompt_profile(config),
+        cwd: PathBuf::from(&config.workspace_id),
+        has_project: config.project_id.is_some(),
+        workspaces: Vec::new(),
+        agents_md: String::new(),
+        tools: Vec::new(),
+        skills: Vec::new(),
+        subagent_roles: Vec::new(),
+        mcp_servers: Vec::new(),
+    };
+    Ok(render_prompt(&template, &context))
 }
 
 pub(super) async fn prompt_context(
@@ -196,13 +204,9 @@ fn tool_specs_from_provider_tools(tools: Vec<ProviderTool>) -> Vec<ToolSpec> {
 }
 
 fn load_subagent_role_catalog(raw: &[RawSkillFile]) -> Vec<SubagentRole> {
-    raw.iter()
-        .filter(|file| file.kind == SkillKind::SubagentRole)
-        .filter_map(|file| {
-            let parsed = parse_skill_contents(&file.contents)?;
-            (parsed.name == file.package_name).then_some(parsed)
-        })
-        .map(|parsed| SubagentRole::new(parsed.name, parsed.description))
+    super::skills::resolved_role_catalog(raw)
+        .into_iter()
+        .map(|role| SubagentRole::new(role.name, role.description))
         .collect()
 }
 

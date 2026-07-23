@@ -174,7 +174,18 @@ configuration root, converts `subagent_models` entries into role-local
 processes before running it. After that migration,
 `infra/migrate-runtime-context.sh --apply` moves workflows and roles to the
 runtime-owned catalog and optionally copies `~/agent-config` instructions and
-skills into their canonical locations.
+skills into their canonical locations. Back up Postgres, stop agentd and the
+runtime, then update persisted prompts before restarting:
+
+```bash
+docker exec -i pi-relay-postgres \
+  psql -v ON_ERROR_STOP=1 -U postgres -d pi_relay \
+  < infra/migrate-runtime-context-prompts.sql
+```
+
+Ordinary home/workspace skills are no longer subagent roles. If one was used as
+a role, copy it into `agentd/subagent-roles/<global-name>/` before running the
+filesystem migration and update workflows to use that unprefixed global name.
 
 ### Daemon and runtime configuration
 
