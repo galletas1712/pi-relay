@@ -1,6 +1,4 @@
-import * as AlertDialogPrimitive from "@radix-ui/react-alert-dialog";
-import * as DialogPrimitive from "@radix-ui/react-dialog";
-import { X } from "lucide-react";
+import { XIcon } from "lucide-react";
 import {
 	createContext,
 	useContext,
@@ -10,6 +8,25 @@ import {
 	type ReactNode,
 	type RefObject,
 } from "react";
+import {
+	AlertDialog,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+	Dialog,
+	DialogClose as ShadDialogClose,
+	DialogContent,
+	DialogDescription as ShadDialogDescription,
+	DialogFooter as ShadDialogFooter,
+	DialogHeader as ShadDialogHeader,
+	DialogTitle as ShadDialogTitle,
+} from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
 
 type DialogKind = "dialog" | "alertdialog";
 
@@ -104,57 +121,58 @@ function DialogRoot({
 		? (event: Event) => {
 				event.preventDefault();
 				initialFocusRef.current?.focus();
-		  }
+			}
 		: undefined;
-	const contentClassName = ["dialog-content", className].filter(Boolean).join(" ");
+	const contentClassName = cn("dialog-content max-w-[min(760px,calc(100vw-2rem))]", className);
 
 	if (kind === "alertdialog") {
 		return (
 			<DialogKindContext.Provider value={kind}>
-				<AlertDialogPrimitive.Root open onOpenChange={handleOpenChange}>
-					<AlertDialogPrimitive.Portal>
-						<AlertDialogPrimitive.Overlay className="dialog-overlay" />
-						<AlertDialogPrimitive.Content
-							className={contentClassName}
-							onCloseAutoFocus={handleCloseAutoFocus}
-							onEscapeKeyDown={handleEscapeKeyDown}
-							onOpenAutoFocus={handleOpenAutoFocus}
-						>
-							{children}
-						</AlertDialogPrimitive.Content>
-					</AlertDialogPrimitive.Portal>
-				</AlertDialogPrimitive.Root>
+				<AlertDialog open onOpenChange={handleOpenChange}>
+					<AlertDialogContent
+						className={contentClassName}
+						size="default"
+						onCloseAutoFocus={handleCloseAutoFocus}
+						onEscapeKeyDown={handleEscapeKeyDown}
+						onOpenAutoFocus={handleOpenAutoFocus}
+					>
+						{children}
+					</AlertDialogContent>
+				</AlertDialog>
 			</DialogKindContext.Provider>
 		);
 	}
 
 	return (
 		<DialogKindContext.Provider value={kind}>
-			<DialogPrimitive.Root open onOpenChange={handleOpenChange}>
-				<DialogPrimitive.Portal>
-					<DialogPrimitive.Overlay className="dialog-overlay" />
-					<DialogPrimitive.Content
-						className={contentClassName}
-						onCloseAutoFocus={handleCloseAutoFocus}
-						onEscapeKeyDown={handleEscapeKeyDown}
-						onOpenAutoFocus={handleOpenAutoFocus}
-						onPointerDownOutside={(event) => {
-							if (busy) event.preventDefault();
-						}}
-						onInteractOutside={(event) => {
-							if (busy) event.preventDefault();
-						}}
-					>
-						{children}
-					</DialogPrimitive.Content>
-				</DialogPrimitive.Portal>
-			</DialogPrimitive.Root>
+			<Dialog open onOpenChange={handleOpenChange}>
+				<DialogContent
+					showCloseButton={false}
+					className={contentClassName}
+					onCloseAutoFocus={handleCloseAutoFocus}
+					onEscapeKeyDown={handleEscapeKeyDown}
+					onOpenAutoFocus={handleOpenAutoFocus}
+					onPointerDownOutside={(event) => {
+						if (busy) event.preventDefault();
+					}}
+					onInteractOutside={(event) => {
+						if (busy) event.preventDefault();
+					}}
+				>
+					{children}
+				</DialogContent>
+			</Dialog>
 		</DialogKindContext.Provider>
 	);
 }
 
-export function DialogHeader({ children }: { children: ReactNode }) {
-	return <div className="dialog-header">{children}</div>;
+export function DialogHeader({ children, className }: { children: ReactNode; className?: string }) {
+	const kind = useContext(DialogKindContext);
+	return kind === "alertdialog" ? (
+		<AlertDialogHeader className={cn("dialog-header", className)}>{children}</AlertDialogHeader>
+	) : (
+		<ShadDialogHeader className={cn("dialog-header", className)}>{children}</ShadDialogHeader>
+	);
 }
 
 export function DialogHeading({ children }: { children: ReactNode }) {
@@ -163,25 +181,35 @@ export function DialogHeading({ children }: { children: ReactNode }) {
 
 export function DialogTitle({
 	children,
+	className,
 	...props
-}: ComponentPropsWithRef<typeof DialogPrimitive.Title>) {
+}: ComponentPropsWithRef<typeof ShadDialogTitle>) {
 	const kind = useContext(DialogKindContext);
 	return kind === "alertdialog" ? (
-		<AlertDialogPrimitive.Title {...props}>{children}</AlertDialogPrimitive.Title>
+		<AlertDialogTitle className={className} {...props}>
+			{children}
+		</AlertDialogTitle>
 	) : (
-		<DialogPrimitive.Title {...props}>{children}</DialogPrimitive.Title>
+		<ShadDialogTitle className={className} {...props}>
+			{children}
+		</ShadDialogTitle>
 	);
 }
 
 export function DialogDescription({
 	children,
+	className,
 	...props
-}: ComponentPropsWithoutRef<typeof DialogPrimitive.Description>) {
+}: ComponentPropsWithoutRef<typeof ShadDialogDescription>) {
 	const kind = useContext(DialogKindContext);
 	return kind === "alertdialog" ? (
-		<AlertDialogPrimitive.Description {...props}>{children}</AlertDialogPrimitive.Description>
+		<AlertDialogDescription className={className} {...props}>
+			{children}
+		</AlertDialogDescription>
 	) : (
-		<DialogPrimitive.Description {...props}>{children}</DialogPrimitive.Description>
+		<ShadDialogDescription className={className} {...props}>
+			{children}
+		</ShadDialogDescription>
 	);
 }
 
@@ -192,23 +220,37 @@ export function DialogBody({
 	children: ReactNode;
 	className?: string;
 }) {
-	return <div className={["dialog-body", className].filter(Boolean).join(" ")}>{children}</div>;
+	return <div className={cn("dialog-body", className)}>{children}</div>;
 }
 
-export function DialogFooter({ children }: { children: ReactNode }) {
-	return <div className="dialog-footer">{children}</div>;
+export function DialogFooter({ children, className }: { children: ReactNode; className?: string }) {
+	const kind = useContext(DialogKindContext);
+	return kind === "alertdialog" ? (
+		<AlertDialogFooter className={cn("dialog-footer", className)}>{children}</AlertDialogFooter>
+	) : (
+		<ShadDialogFooter className={cn("dialog-footer", className)}>{children}</ShadDialogFooter>
+	);
 }
 
 export function DialogClose({
 	children,
+	className,
 	...props
 }: ComponentPropsWithRef<"button">) {
 	const kind = useContext(DialogKindContext);
-	const button = <button type="button" {...props}>{children}</button>;
-	return kind === "alertdialog" ? (
-		<AlertDialogPrimitive.Cancel asChild>{button}</AlertDialogPrimitive.Cancel>
-	) : (
-		<DialogPrimitive.Close asChild>{button}</DialogPrimitive.Close>
+	if (kind === "alertdialog") {
+		return (
+			<AlertDialogCancel className={className} {...props}>
+				{children}
+			</AlertDialogCancel>
+		);
+	}
+	return (
+		<ShadDialogClose asChild>
+			<button type="button" className={className} {...props}>
+				{children}
+			</button>
+		</ShadDialogClose>
 	);
 }
 
@@ -221,7 +263,7 @@ export function DialogCloseButton({
 }) {
 	return (
 		<DialogClose className="plain-close-button" aria-label={label} disabled={disabled}>
-			<X size={16} aria-hidden />
+			<XIcon aria-hidden />
 		</DialogClose>
 	);
 }

@@ -1,17 +1,13 @@
-import { X } from "lucide-react";
-import { useState } from "react";
+import { XIcon } from "lucide-react";
 import { RunBoard } from "./runBoard.tsx";
 import { COMMANDS } from "./slash.ts";
 import type { Delegation, SessionSnapshot, ToolListing } from "./types.ts";
+import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
 
 type InspectorTab = "run-board" | "debug";
-
-const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
-	{ id: "run-board", label: "Agents" },
-	{ id: "debug", label: "Inspector" },
-];
 
 function pendingActionLabel(action: SessionSnapshot["pending_actions"][number]): string {
 	if (action.kind !== "compaction") return action.kind;
@@ -61,34 +57,34 @@ export function Inspector({
 	remoteReadBlockedReason,
 	tools,
 	onSelectSession,
-	onClose
+	onClose,
 }: InspectorProps) {
-	const [activeTab, setActiveTab] = useState<InspectorTab>("run-board");
 	return (
 		<div className="inspector-inner">
-			<div className="inspector-tabs" role="tablist" aria-label="inspector tabs">
-				{INSPECTOR_TABS.map((tab) => (
-					<button
-						key={tab.id}
-						className={`inspector-tab ${activeTab === tab.id ? "active" : ""}`}
+			<Tabs defaultValue={"run-board" satisfies InspectorTab} className="gap-0">
+				<div className="inspector-tabs flex items-center gap-2">
+					<TabsList aria-label="inspector tabs" className="flex-1">
+						<TabsTrigger value="run-board" id="inspector-tab-run-board">
+							Agents
+						</TabsTrigger>
+						<TabsTrigger value="debug" id="inspector-tab-debug">
+							Inspector
+						</TabsTrigger>
+					</TabsList>
+					<Button
 						type="button"
-						role="tab"
-						id={`inspector-tab-${tab.id}`}
-						aria-selected={activeTab === tab.id}
-						aria-controls={`inspector-panel-${tab.id}`}
-						onClick={() => setActiveTab(tab.id)}
+						variant="ghost"
+						size="icon-xs"
+						className="inspector-close"
+						onClick={onClose}
+						aria-label="close inspector"
 					>
-						{tab.label}
-					</button>
-				))}
-				<button className="plain-close-button inspector-close" type="button" onClick={onClose} aria-label="close inspector">
-					<X size={14} />
-				</button>
-			</div>
-			{activeTab === "run-board" ? (
-				<div
+						<XIcon />
+					</Button>
+				</div>
+				<TabsContent
+					value="run-board"
 					className="inspector-tab-panel"
-					role="tabpanel"
 					id="inspector-panel-run-board"
 					aria-labelledby="inspector-tab-run-board"
 				>
@@ -111,11 +107,10 @@ export function Inspector({
 						mutationBlockedReason={mutationBlockedReason}
 						remoteReadBlockedReason={remoteReadBlockedReason}
 					/>
-				</div>
-			) : (
-				<div
+				</TabsContent>
+				<TabsContent
+					value="debug"
 					className="inspector-tab-panel"
-					role="tabpanel"
 					id="inspector-panel-debug"
 					aria-labelledby="inspector-tab-debug"
 				>
@@ -176,7 +171,9 @@ export function Inspector({
 						<h2>Tools</h2>
 						<div className="tool-list">
 							{tools.map((tool) => (
-								<span key={`${tool.kind}:${tool.name}`} title={tool.description || tool.name}>{tool.name}</span>
+								<span key={`${tool.kind}:${tool.name}`} title={tool.description || tool.name}>
+									{tool.name}
+								</span>
 							))}
 						</div>
 					</section>
@@ -189,8 +186,8 @@ export function Inspector({
 							</div>
 						))}
 					</section>
-				</div>
-			)}
+				</TabsContent>
+			</Tabs>
 		</div>
 	);
 }

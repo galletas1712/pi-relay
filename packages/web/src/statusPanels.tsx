@@ -1,6 +1,8 @@
 import { ArrowUp, Bot, PanelRightOpen } from "lucide-react";
 import type { ReasoningEffort } from "./types.ts";
 import type { SessionStatus } from "./sessionList.ts";
+import { Button } from "@/components/ui/button";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 
 export function LogHeader({
 	archived,
@@ -17,7 +19,7 @@ export function LogHeader({
 	onReasoningEffortChange,
 	onSelectSession,
 	rightOpen,
-	onToggleRight
+	onToggleRight,
 }: {
 	archived: boolean;
 	status: SessionStatus | null;
@@ -40,7 +42,7 @@ export function LogHeader({
 		<div className="log-header">
 			{title ? (
 				<span
-					className={`session-status-icon ${archived ? "archived" : status ?? "idle"}`}
+					className={`session-status-icon ${archived ? "archived" : (status ?? "idle")}`}
 					role="img"
 					aria-label={statusLabel ?? undefined}
 					title={statusLabel ?? undefined}
@@ -52,22 +54,25 @@ export function LogHeader({
 				<span className="log-title-group">
 					<span className="log-session">{title}</span>
 					{parentSessionId ? (
-						<button
-							className="parent-session-link"
+						<Button
 							type="button"
+							variant="ghost"
+							size="icon-xs"
+							className="parent-session-link"
 							onClick={() => onSelectSession?.(parentSessionId)}
 							title="Open parent conversation"
 							aria-label="Open parent conversation"
 						>
-							<ArrowUp size={14} aria-hidden />
-						</button>
+							<ArrowUp aria-hidden />
+						</Button>
 					) : null}
 				</span>
 			) : null}
 			<div className="log-controls">
 				<label className="header-select" title="Model">
 					<span className="sr-only">Model</span>
-					<select
+					<NativeSelect
+						size="sm"
 						value={modelValue}
 						disabled={modelDisabled}
 						title="Model"
@@ -75,15 +80,16 @@ export function LogHeader({
 						onChange={(event) => onModelChange(event.target.value)}
 					>
 						{modelOptions.map((option) => (
-							<option key={option.id} value={option.id} title={option.description}>
+							<NativeSelectOption key={option.id} value={option.id} title={option.description}>
 								{option.label}
-							</option>
+							</NativeSelectOption>
 						))}
-					</select>
+					</NativeSelect>
 				</label>
-				<label className="header-select compact">
+				<label className="header-select compact" title="Reasoning effort">
 					<span className="sr-only">Reasoning effort</span>
-					<select
+					<NativeSelect
+						size="sm"
 						value={reasoningEffort}
 						disabled={reasoningDisabled}
 						title="Reasoning effort"
@@ -91,23 +97,24 @@ export function LogHeader({
 						onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
 					>
 						{reasoningEfforts.map((effort) => (
-							<option key={effort} value={effort}>
+							<NativeSelectOption key={effort} value={effort}>
 								{effort}
-							</option>
+							</NativeSelectOption>
 						))}
-					</select>
+					</NativeSelect>
 				</label>
 			</div>
 			{rightOpen ? null : (
-				<button
-					className="icon-button tiny"
+				<Button
 					type="button"
+					variant="ghost"
+					size="icon-xs"
 					onClick={onToggleRight}
 					title="open inspector"
 					aria-label="open inspector"
 				>
-					<PanelRightOpen size={14} />
-				</button>
+					<PanelRightOpen />
+				</Button>
 			)}
 		</div>
 	);

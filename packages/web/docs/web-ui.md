@@ -8,6 +8,10 @@ for the runtime it drives, and [agent-daemon](../../../rust/docs/modules/agent-d
 The UI is operational, not marketing-shaped: a dense three-pane layout, compact rows, small controls,
 and transcript-first interaction.
 
+Presentation is migrating onto **shadcn/ui** (Radix Nova + Tailwind v4) under `src/components/ui`, with Gruvbox
+tokens in `styles.css`. Domain-owned wrappers (`dialog.tsx`, `actionMenu.tsx`) keep busy/focus policy while
+composing those primitives. Leftover hand-rolled layout CSS lives in `domain.css` until surfaces finish cutover.
+
 ```
 +----------------+----------------------------------+--------------+
 | Sidebar        | Chat pane                        | Inspector    |

@@ -289,10 +289,10 @@ describe("Sidebar session list loading states", () => {
 		expect(html).toContain('aria-label="Open session actions for Menu session"');
 		expect(html.match(/aria-haspopup="menu"/g)).toHaveLength(2);
 		expect(html).toMatch(
-			/<li class="project-row selected"><button class="project-row-primary"[\s\S]*?<\/button><button class="action-menu-trigger"/,
+			/<li class="project-row selected"><button class="project-row-primary"[\s\S]*?<\/button><button[^>]*class="[^"]*action-menu-trigger[^"]*"/,
 		);
 		expect(html).toMatch(
-			/<li class="session-row selected [^"]*"><button class="session-row-primary"[\s\S]*?<\/button><button class="action-menu-trigger"/,
+			/<li class="session-row selected [^"]*"><button class="session-row-primary"[\s\S]*?<\/button><button[^>]*class="[^"]*action-menu-trigger[^"]*"/,
 		);
 		expect(html).not.toContain('role="listbox"');
 		expect(html).not.toContain('role="button"');
