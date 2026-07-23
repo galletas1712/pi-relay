@@ -667,8 +667,8 @@ the transcript data counter.
 be `"active_branch"` or `"full_tree"` and defaults to `"full_tree"` for
 compatibility. The web UI can use the active-branch scope for normal display and
 reserve the full tree for switch/history UI. `has_transcript_entries`
-allows provider/model lock checks even when the active branch is empty after a
-root switch. `server_time_ms` is the daemon's wall-clock (ms) at response time,
+reports whether any transcript row exists even when the active branch is empty
+after a root switch. `server_time_ms` is the daemon's wall-clock (ms) at response time,
 used by the UI to anchor live timers against server time rather than client
 clocks. Transcript entries returned by websocket RPCs include the Postgres
 `sequence` column, which is an append/order cursor but not itself a freshness
@@ -955,18 +955,23 @@ subscribed clients can update lists/snapshots without a transcript refresh.
 ### `session.configure`
 
 Idle-only for metadata or model/source-changing updates. Replaces provider
-config and/or metadata. Once a session has any transcript entry, `provider.kind`
-and `provider.model` are locked; clients may still change provider-adjacent
-knobs such as `reasoning_effort` during or between turns. An effort-only update
-persists immediately as the session default for future accepted work; it does
-not replace an active runtime's route. Each queued input captures the provider
-config when accepted, and each action captures its open-turn route. Existing
-queued items, provider retries, tool continuations, compaction/recovery, and
-steering consumed into an open turn therefore retain their captured config;
-newly accepted future work captures the new default. These route snapshots are
-daemon-internal and do not add fields to queue RPC views. Responses and
-`session.configured` events include `provider`, `metadata`, and `activity` so
-clients can patch cached summaries and selected snapshots.
+config and/or metadata. While idle, clients may change `provider.kind` and
+`provider.model` (including OpenAI ↔ Claude) as well as provider-adjacent
+knobs such as `reasoning_effort`. An effort-only update may persist while work
+is active: it becomes the session default for future accepted work and does
+not replace an active runtime's route. A kind/model change drops sticky
+provider connections for the session so the next turn starts a fresh provider
+handle. Cross-provider continuation rebuilds from the canonical transcript;
+foreign `provider_replay` is ignored, and compaction checkpoints without the
+new provider's native replay fall back to the text summary. Each queued input
+captures the provider config when accepted, and each action captures its
+open-turn route. Existing queued items, provider retries, tool continuations,
+compaction/recovery, and steering consumed into an open turn therefore retain
+their captured config; newly accepted future work captures the new default.
+These route snapshots are daemon-internal and do not add fields to queue RPC
+views. Responses and `session.configured` events include `provider`,
+`metadata`, and `activity` so clients can patch cached summaries and selected
+snapshots.
 
 ### `session.sync_active_branch`
 

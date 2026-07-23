@@ -469,10 +469,8 @@ project workspaces are safe to clone.
 The chat header exposes a model picker and a provider-specific reasoning-effort picker (`sessionDefaults.ts`). OpenAI
 offers `gpt-5.6-sol` (default), `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude offers Opus 4.8 and Fable 5.
 Fable 5 is listed last as an explicit opt-in, and its option text and tooltip state that it is not ZDR.
-The provider/model is locked
-once the session has any transcript history, because both providers carry provider-shaped replay state across turns.
-The model control keeps its `Model, locked` accessible name after that point and
-retains the existing running-state lock. Reasoning effort is independently
+The model control is idle-only for an existing session (`activity !== "idle"` disables it); kind and model
+may change after transcript history, including OpenAI ↔ Claude. Reasoning effort is independently
 editable while a response is running whenever the selected session is loaded,
 the client is connected, and the selected provider/model supports the value.
 The picker remains a static seeded convenience: its existing hosted GPT-5.6 choices remain `none`,

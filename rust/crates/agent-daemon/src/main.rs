@@ -918,12 +918,6 @@ async fn session_configure(
     let metadata_changed = metadata != current.metadata;
     if model_changed {
         driver.ensure_idle_for_source_mutation().await?;
-        if state.repo.has_transcript_entries(&session_id).await? {
-            return Err(RpcError::new(
-                "provider_locked",
-                "session model cannot be changed after the first transcript entry",
-            ));
-        }
     } else if metadata_changed {
         driver.ensure_idle_for_metadata_mutation().await?;
     }
@@ -941,6 +935,9 @@ async fn session_configure(
     // Refresh non-provider session state while the active runtime retains the
     // immutable route captured for its open turn.
     replace_active_session_config(state, &session_id, config.clone()).await;
+    if model_changed {
+        state.provider_connections.remove_session(&session_id).await;
+    }
     publish_events(state, events);
     clear_event_buffer_if_idle(state, &session_id).await?;
     Ok(json!({
