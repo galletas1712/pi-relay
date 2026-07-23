@@ -232,10 +232,12 @@ directories:
 ${XDG_CONFIG_HOME:-$HOME/.config}/pi-relay/runtime/
 ├── AGENTS.md
 ├── skills/<workflow>/SKILL.md
-├── subagent-roles/<role>/SKILL.md
+└── subagent-roles/<role>/SKILL.md
+
+$HOME/.agents/
+├── skills/<skill>/SKILL.md
 └── projects/<workspace>/skills/<skill>/SKILL.md
 
-$HOME/.agents/skills/<skill>/SKILL.md
 <workspace>/.agents/skills/<skill>/SKILL.md
 ```
 

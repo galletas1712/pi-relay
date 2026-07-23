@@ -311,13 +311,13 @@ mod tests {
     #[test]
     fn role_rejects_project_or_workflow_preloads() {
         for origin in [
-            SkillOrigin::RuntimeProject,
+            SkillOrigin::HomeProject,
             SkillOrigin::WorkspaceProject,
             SkillOrigin::RuntimeWorkflow,
         ] {
             let workspace = matches!(
                 origin,
-                SkillOrigin::RuntimeProject | SkillOrigin::WorkspaceProject
+                SkillOrigin::HomeProject | SkillOrigin::WorkspaceProject
             )
             .then_some("repo");
             let dependency = raw_skill(SkillKind::Skill, origin, workspace, "special", "");

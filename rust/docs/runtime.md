@@ -61,19 +61,21 @@ Runtime context is discovered without another configured root:
 $XDG_CONFIG_HOME/pi-relay/runtime/
 ├── AGENTS.md
 ├── skills/<workflow>/SKILL.md
-├── subagent-roles/<role>/SKILL.md
+└── subagent-roles/<role>/SKILL.md
+
+$HOME/.agents/
+├── skills/<skill>/SKILL.md
 └── projects/<workspace>/skills/<skill>/SKILL.md
 
-$HOME/.agents/skills/<skill>/SKILL.md
 <workspace>/.agents/skills/<skill>/SKILL.md
 <workspace>/AGENTS.md
 ```
 
 The runtime reads these files and returns their contents, category, origin, and
 absolute runtime-host paths over `agent-runtime-protocol`. The daemon never
-opens those paths. Personal project packages under the XDG runtime root replace
-same-named packages from a selected workspace. `LoadSkill` returns only the
-absolute `SKILL.md` path so linked sibling files remain available through
+opens those paths. Personal project packages under `$HOME/.agents/projects`
+replace same-named packages from a selected workspace. `LoadSkill` returns only
+the absolute `SKILL.md` path so linked sibling files remain available through
 runtime-executed filesystem tools.
 
 The repository's local stack can start the runtime through `infra/dev.sh`.

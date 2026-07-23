@@ -113,10 +113,11 @@ if source_root.is_dir():
                     packages = workspace
                 copy_packages(
                     packages,
-                    runtime_root / "projects" / workspace.name / "skills",
+                    home / ".agents/projects" / workspace.name / "skills",
                 )
 
 print(f"runtime configuration: {runtime_root}")
 print(f"global skills: {home / '.agents/skills'}")
+print(f"project skills: {home / '.agents/projects'}")
 print("runtime-owned catalogs migrated successfully")
 PY

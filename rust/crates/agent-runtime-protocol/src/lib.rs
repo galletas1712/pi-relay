@@ -208,7 +208,7 @@ pub enum SkillKind {
 pub enum SkillOrigin {
     HomeGlobal,
     RuntimeWorkflow,
-    RuntimeProject,
+    HomeProject,
     WorkspaceProject,
     RuntimeRole,
 }

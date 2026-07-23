@@ -48,8 +48,8 @@ export PI_AGENTD_CONFIG_HOME
 # ~/.config/pi-relay/runtime/config.toml)
 # and optional MCP policy is the sibling mcp.toml. Root is required for btrfs
 # subvolume operations; HOME, PATH, and XDG_CONFIG_HOME are preserved so the
-# runtime resolves the host's policy, instructions, role/workflow/project
-# catalogs, binaries, venvs, and ~/.agents/skills.
+# runtime resolves the host's policy, instructions, role/workflow catalogs,
+# binaries, venvs, and ~/.agents global/project skills.
 ( cd rust && cargo build --release -p agent-runtime )
 RUNTIME_BIN="$REPO_ROOT/rust/target/release/pi-runtime"
 RUNTIME_CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay/runtime"

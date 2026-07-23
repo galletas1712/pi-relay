@@ -167,13 +167,14 @@ impl WorkspaceManager {
             .await?;
             collect_skill_dir(
                 &self
-                    .runtime_config_root
+                    .home_dir
+                    .join(".agents")
                     .join("projects")
                     .join(workspace_dir)
                     .join("skills"),
                 workspace,
                 SkillKind::Skill,
-                SkillOrigin::RuntimeProject,
+                SkillOrigin::HomeProject,
                 &mut project_skills,
             )
             .await?;
@@ -849,7 +850,7 @@ mod tests {
             "---\nname: kubernetes\ndescription: contributed\n---\ncontributed",
         );
         write_file(
-            &config.join("projects/repo/skills/kubernetes/SKILL.md"),
+            &home.join(".agents/projects/repo/skills/kubernetes/SKILL.md"),
             "---\nname: kubernetes\ndescription: personal\n---\npersonal",
         );
 
@@ -876,7 +877,7 @@ mod tests {
             .iter()
             .find(|skill| skill.package_name == "kubernetes")
             .expect("kubernetes");
-        assert_eq!(kubernetes.origin, SkillOrigin::RuntimeProject);
+        assert_eq!(kubernetes.origin, SkillOrigin::HomeProject);
         assert!(kubernetes.contents.contains("personal"));
 
         std::fs::remove_dir_all(root).ok();
