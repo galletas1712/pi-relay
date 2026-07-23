@@ -7,9 +7,9 @@
 # host process (sudo) dialing the control runtime listener published on
 # 127.0.0.1:8786. Control, Postgres, and the static web UI stay in Docker.
 #
-# Local mode  (TAILNET_HOST unset): browse http://127.0.0.1:8788/.
-# Tailnet mode (TAILNET_HOST set):  pair with infra/serve.sh and browse
-#   https://${TAILNET_HOST}/ — the bundle has that origin baked in.
+# Local access: browse http://127.0.0.1:8788/.
+# Tailnet access: pair with infra/serve.sh. The browser derives the websocket
+# endpoint from the page location, so both access paths use the same bundle.
 #
 # Static by design: no HMR, no daemon auto-restart. The agent-daemon edits this
 # repo, so an in-flight bad edit must not tear down running services.
@@ -28,12 +28,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 WEB_PORT="${WEB_PORT:-8788}"
-TAILNET_HOST="${TAILNET_HOST:-}"
-# ${VAR:+...} expands to empty when VAR is unset/empty, so local mode passes
-# through the rpc.ts default (ws://127.0.0.1:8787) and skips allowed-host gating.
 export WEB_PORT
-export VITE_PI_AGENT_WS="${TAILNET_HOST:+wss://${TAILNET_HOST}/ws}"
-export VITE_PI_ALLOWED_HOSTS="$TAILNET_HOST"
 
 PI_AGENTD_CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay/agentd"
 if [ ! -d "$PI_AGENTD_CONFIG_HOME" ]; then

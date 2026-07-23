@@ -385,10 +385,11 @@ Rebuild only the frontend without restarting host `pi-runtime`:
 docker compose -f infra/docker-compose.yml up -d --build web
 ```
 
-Override the baked websocket URL with `VITE_PI_AGENT_WS` (passed as a Compose
-build arg; `infra/dev.sh` sets this in Tailnet mode). See
-[`../packages/web/docs/web-ui.md`](../packages/web/docs/web-ui.md) for the client
-design.
+The client uses `ws://127.0.0.1:8787` when opened on loopback and same-origin
+`/ws` when served through `infra/serve.sh`. The same build therefore works
+through local TCP forwarding and Tailnet access. See
+[`../packages/web/docs/web-ui.md`](../packages/web/docs/web-ui.md) for the
+client design.
 
 
 ## Provider Credentials
