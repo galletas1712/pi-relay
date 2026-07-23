@@ -1,6 +1,14 @@
-import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { MoreHorizontal } from "lucide-react";
 import { Fragment, useRef, type ReactNode } from "react";
+import { Button } from "@/components/ui/button";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuGroup,
+	DropdownMenuItem,
+	DropdownMenuSeparator,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 export interface ActionMenuItem {
 	id: string;
@@ -30,37 +38,44 @@ export function ActionMenu({
 	const pendingDialogAction = useRef<(() => void) | null>(null);
 	const triggerRef = useRef<HTMLButtonElement>(null);
 	return (
-		<DropdownMenu.Root open={open} defaultOpen={defaultOpen} onOpenChange={onOpenChange}>
-			<DropdownMenu.Trigger asChild>
-				<button ref={triggerRef} className="action-menu-trigger" type="button" aria-label={triggerLabel}>
-					<MoreHorizontal size={17} aria-hidden />
-				</button>
-			</DropdownMenu.Trigger>
-			<DropdownMenu.Portal>
-				<DropdownMenu.Content
-					className="action-menu-content"
-					align="end"
-					sideOffset={4}
-					collisionPadding={8}
-					onEscapeKeyDown={(event) => event.stopPropagation()}
-					onCloseAutoFocus={(event) => {
-						const action = pendingDialogAction.current;
-						if (!action) return;
-						pendingDialogAction.current = null;
-						event.preventDefault();
-						// Radix removes the closing menu focus scope after this handler.
-						// Re-focus the opener before mounting so the dialog can restore it.
-						queueMicrotask(() => {
-							triggerRef.current?.focus();
-							action();
-						});
-					}}
+		<DropdownMenu open={open} defaultOpen={defaultOpen} onOpenChange={onOpenChange}>
+			<DropdownMenuTrigger asChild>
+				<Button
+					ref={triggerRef}
+					type="button"
+					variant="ghost"
+					size="icon-sm"
+					className="action-menu-trigger"
+					aria-label={triggerLabel}
 				>
+					<MoreHorizontal aria-hidden />
+				</Button>
+			</DropdownMenuTrigger>
+			<DropdownMenuContent
+				className="action-menu-content min-w-40"
+				align="end"
+				sideOffset={4}
+				collisionPadding={8}
+				onEscapeKeyDown={(event) => event.stopPropagation()}
+				onCloseAutoFocus={(event) => {
+					const action = pendingDialogAction.current;
+					if (!action) return;
+					pendingDialogAction.current = null;
+					event.preventDefault();
+					// Radix removes the closing menu focus scope after this handler.
+					// Re-focus the opener before mounting so the dialog can restore it.
+					queueMicrotask(() => {
+						triggerRef.current?.focus();
+						action();
+					});
+				}}
+			>
+				<DropdownMenuGroup>
 					{items.map((item) => (
 						<Fragment key={item.id}>
-							{item.separatorBefore ? <DropdownMenu.Separator className="action-menu-separator" /> : null}
-							<DropdownMenu.Item
-								className={`action-menu-item ${item.destructive ? "destructive" : ""}`}
+							{item.separatorBefore ? <DropdownMenuSeparator /> : null}
+							<DropdownMenuItem
+								variant={item.destructive ? "destructive" : "default"}
 								disabled={item.disabled}
 								onSelect={() => {
 									if (item.focusDestination === "dialog") {
@@ -77,11 +92,11 @@ export function ActionMenu({
 										<span className="action-menu-item-reason">{item.disabledReason}</span>
 									) : null}
 								</span>
-							</DropdownMenu.Item>
+							</DropdownMenuItem>
 						</Fragment>
 					))}
-				</DropdownMenu.Content>
-			</DropdownMenu.Portal>
-		</DropdownMenu.Root>
+				</DropdownMenuGroup>
+			</DropdownMenuContent>
+		</DropdownMenu>
 	);
 }

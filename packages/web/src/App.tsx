@@ -12,6 +12,7 @@ import {
 	type RefObject,
 } from "react";
 import { ArrowUp, Bot, Menu, PanelRightOpen } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { createAgentApi, type AgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
 import { clearAcknowledgedTranscriptDestination } from "./transcript.tsx";
@@ -4164,16 +4165,18 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	return (
 		<div ref={appShellRef} className={appClassName} style={appStyle}>
 			<div className="mobile-topbar">
-				<button
+				<Button
 					ref={mobileSidebarToggleRef}
 					className="icon-button"
 					type="button"
+					variant="ghost"
+					size="icon"
 					onClick={handleToggleSidebar}
 					aria-label={sidebarOpen ? "close projects and sessions" : "open projects and sessions"}
 					aria-expanded={sidebarOpen}
 				>
-					<Menu size={17} />
-				</button>
+					<Menu />
+				</Button>
 				<div className="mobile-topbar-title">
 					<div className="mobile-topbar-title-main">
 						{mobileSessionStatus ? (
@@ -4188,28 +4191,32 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						) : null}
 						<span className="mobile-topbar-title-text">{mobileTitle}</span>
 						{mobileParentSessionId ? (
-							<button
+							<Button
 								className="parent-session-link"
 								type="button"
+								variant="ghost"
+								size="icon-xs"
 								onClick={() => selectSession(mobileParentSessionId)}
 								title="Open parent conversation"
 								aria-label="Open parent conversation"
 							>
-								<ArrowUp size={13} aria-hidden />
-							</button>
+								<ArrowUp aria-hidden />
+							</Button>
 						) : null}
 					</div>
 				</div>
 				{inspectorIsOverlay && !rightOpen ? (
-					<button
+					<Button
 						className="icon-button"
 						type="button"
+						variant="ghost"
+						size="icon"
 						onClick={handleToggleRight}
 						aria-label="open inspector"
 						aria-expanded={rightOpen}
 					>
-						<PanelRightOpen size={17} />
-					</button>
+						<PanelRightOpen />
+					</Button>
 				) : null}
 			</div>
 
@@ -4379,13 +4386,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						<code>{routeConversationSessionId(executionRoute)}</code>. The visual Execution
 						overview, activity, and handoffs workspace comes next.
 					</p>
-					<button
+					<Button
 						type="button"
-						className="primary-button workspace-route-action"
+						className="workspace-route-action"
 						onClick={() => applyNavigation(showConversation(executionRoute))}
 					>
 						Open effective Conversation
-					</button>
+					</Button>
 				</main>
 			) : unavailableState ? (
 				<main className="workspace-route-state unavailable-route-state" data-slot="route-unavailable">
