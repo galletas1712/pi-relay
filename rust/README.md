@@ -400,8 +400,8 @@ docker compose -f infra/docker-compose.yml up -d --build web
 ```
 
 The client uses `ws://127.0.0.1:8787` when opened on loopback and same-origin
-`/ws` when served through `infra/serve.sh`. The same build therefore works
-through local TCP forwarding and Tailnet access. See
+`/ws` when served through `infra/serve.sh` (Tailscale → nginx → agentd). The
+same build therefore works through local TCP forwarding and Tailnet access. See
 [`../packages/web/docs/web-ui.md`](../packages/web/docs/web-ui.md) for the
 client design.
 

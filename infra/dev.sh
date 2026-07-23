@@ -8,8 +8,8 @@
 # 127.0.0.1:8786. Control, Postgres, and the static web UI stay in Docker.
 #
 # Local access: browse http://127.0.0.1:8788/.
-# Tailnet access: pair with infra/serve.sh. The browser derives the websocket
-# endpoint from the page location, so both access paths use the same bundle.
+# Tailnet access: pair with infra/serve.sh (Tailscale → web; nginx proxies /ws).
+# The browser derives the websocket endpoint from the page location.
 #
 # Static by design: no HMR, no daemon auto-restart. The agent-daemon edits this
 # repo, so an in-flight bad edit must not tear down running services.
