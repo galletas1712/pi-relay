@@ -50,6 +50,19 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  web:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.web
+      args:
+        # Empty in local mode → browser uses ws://127.0.0.1:8787 defaults.
+        # Tailnet mode: set via infra/dev.sh (VITE_PI_AGENT_WS / VITE_PI_ALLOWED_HOSTS).
+        VITE_PI_AGENT_WS: ${VITE_PI_AGENT_WS:-}
+        VITE_PI_ALLOWED_HOSTS: ${VITE_PI_ALLOWED_HOSTS:-}
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8788}:80"
+    restart: unless-stopped
+
   # NOTE: pi-runtime is intentionally NOT a service here. It executes the
   # session's tools in your real host environment (arbitrary local-workspace
   # source_paths, your toolchain/venvs) and needs root for btrfs subvolumes,

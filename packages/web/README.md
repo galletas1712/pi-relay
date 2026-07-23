@@ -5,12 +5,22 @@ React/Vite web client for the pi-relay Rust agent daemon (`pi-agentd`).
 ## Develop
 
 ```sh
-npm run dev:web   # from the repo root
+npm run dev:web   # from the repo root (Vite HMR; host process)
 ```
 
 Serves at `http://127.0.0.1:8788` and connects to `ws://127.0.0.1:8787` by
 default; override the daemon URL with `VITE_PI_AGENT_WS`. Start the daemon
 first - see [`../../rust/README.md`](../../rust/README.md).
+
+## Stack / Docker
+
+The local stack (`infra/dev.sh`) serves this UI from the Compose `web` service
+(nginx), not host `vite preview`. Rebuild only the frontend without touching
+`pi-runtime` or sessions:
+
+```sh
+docker compose -f infra/docker-compose.yml up -d --build web
+```
 
 ## Documentation
 
