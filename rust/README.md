@@ -167,25 +167,12 @@ fresh startup upgrades old data layouts.
 For the repository's local stack, `infra/dev.sh` mounts
 `infra/config/control.toml` into the control container's `pi-relay/agentd`
 configuration root and launches the host runtime with the caller's
-`pi-relay/runtime` XDG configuration. The one-time
-`infra/migrate-service-config.sh --apply` command splits the former shared
-configuration root, converts `subagent_models` entries into role-local
-`SKILL.md` frontmatter, and removes obsolete bootstrap artifacts; stop both
-processes before running it. After that migration,
-`infra/migrate-runtime-context.sh --apply` moves workflows and roles to the
-runtime-owned catalog and optionally copies `~/agent-config` instructions and
-skills into their canonical locations. Back up Postgres, stop agentd and the
-runtime, then update persisted prompts before restarting:
-
-```bash
-docker exec -i pi-relay-postgres \
-  psql -v ON_ERROR_STOP=1 -U postgres -d pi_relay \
-  < infra/migrate-runtime-context-prompts.sql
-```
-
-Ordinary home/workspace skills are no longer subagent roles. If one was used as
-a role, copy it into `agentd/subagent-roles/<global-name>/` before running the
-filesystem migration and update workflows to use that unprefixed global name.
+`pi-relay/runtime` XDG configuration. Workflows and subagent roles live under
+the runtime catalog (`$XDG_CONFIG_HOME/pi-relay/runtime/{skills,subagent-roles}`);
+home and project overlays live under `$HOME/.agents/{skills,projects}/`.
+Ordinary home/workspace skills are not subagent roles; put roles under
+`runtime/subagent-roles/<global-name>/` and reference them by that unprefixed
+global name.
 
 ### Daemon and runtime configuration
 
