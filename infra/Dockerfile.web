@@ -1,0 +1,24 @@
+# Static web UI for pi-relay. Built from packages/web and served by nginx.
+# Browser opens this service; the websocket still goes to control (:8787).
+
+FROM node:20-bookworm AS build
+WORKDIR /src
+
+COPY package.json package-lock.json ./
+COPY packages/web/package.json packages/web/
+RUN npm ci --workspace=@pi-relay/web --include-workspace-root
+
+COPY packages/web packages/web
+
+# Bake websocket / host allowlist at build time (empty = local loopback defaults).
+ARG VITE_PI_AGENT_WS=
+ARG VITE_PI_ALLOWED_HOSTS=
+ENV VITE_PI_AGENT_WS=$VITE_PI_AGENT_WS \
+    VITE_PI_ALLOWED_HOSTS=$VITE_PI_ALLOWED_HOSTS
+
+RUN npm run build --workspace @pi-relay/web
+
+FROM nginx:1.27-alpine
+COPY infra/nginx-web.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /src/packages/web/dist /usr/share/nginx/html
+EXPOSE 80

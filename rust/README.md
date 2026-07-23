@@ -371,14 +371,25 @@ for the fresh-versus-existing database contract.
 
 ## Run The Web UI
 
+For day-to-day UI edits with HMR:
+
 ```sh
 npm run dev:web
 ```
 
-The web UI serves at `http://127.0.0.1:8788` and connects to
-`ws://127.0.0.1:8787` by default; override with `VITE_PI_AGENT_WS`. See
+The full local stack (`infra/dev.sh`) serves the built UI from the Compose
+`web` service at `http://127.0.0.1:8788` (websocket still `ws://127.0.0.1:8787`).
+Rebuild only the frontend without restarting host `pi-runtime`:
+
+```sh
+docker compose -f infra/docker-compose.yml up -d --build web
+```
+
+Override the baked websocket URL with `VITE_PI_AGENT_WS` (passed as a Compose
+build arg; `infra/dev.sh` sets this in Tailnet mode). See
 [`../packages/web/docs/web-ui.md`](../packages/web/docs/web-ui.md) for the client
 design.
+
 
 ## Provider Credentials
 
