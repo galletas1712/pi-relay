@@ -1568,14 +1568,12 @@ Result:
 ```
 
 Roles supplied to `delegation.start_full` and
-`delegation.start_readonly_fanout` must be either agentd-configured global
-subagent role skills or exact skill names from the available skills JSON.
-Workspace-scoped skills must use their prefixed names, for example
-`repo/reviewer`; unprefixed names resolve only configured global role skills.
-Workflow skills such as `workflow-explore` are loadable global
-`LoadSkill` skills and may label delegation orchestration, but they do not
-become subagent roles unless separately present under `subagent-roles` or a
-workspace skill package.
+`delegation.start_readonly_fanout` must be runtime-published global role names
+from `$XDG_CONFIG_HOME/pi-relay/runtime/subagent-roles`. Ordinary global,
+workflow, and workspace skill packages are not roles. A role may select its
+provider and preload only reusable global packages from `$HOME/.agents/skills`.
+Workflow skills such as `workflow-explore` remain ordinary `LoadSkill`
+packages; the delegation `workflow` value is an unvalidated observability label.
 
 ### `delegation.cancel`
 

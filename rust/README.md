@@ -148,10 +148,10 @@ cargo run --manifest-path rust/Cargo.toml -p agent-runtime
 The service boundary is explicit:
 
 - `pi-agentd` owns database/frontend/runtime-listener settings, provider policy,
-  global workflows, and global subagent roles.
+  prompt construction, and delegation execution.
 - `pi-runtime` owns its identity, control address, workspace root, MCP routes,
-  MCP OAuth state, and the host/workspace skills it publishes to the control
-  plane.
+  MCP OAuth state, instructions, and skill/role files it publishes to the
+  control plane.
 
 ### Database initialization and migrations
 
@@ -171,9 +171,12 @@ configuration root and launches the host runtime with the caller's
 `infra/migrate-service-config.sh --apply` command splits the former shared
 configuration root, converts `subagent_models` entries into role-local
 `SKILL.md` frontmatter, and removes obsolete bootstrap artifacts; stop both
-processes before running it.
+processes before running it. After that migration,
+`infra/migrate-runtime-context.sh --apply` moves workflows and roles to the
+runtime-owned catalog and optionally copies `~/agent-config` instructions and
+skills into their canonical locations.
 
-### Daemon configuration and host catalogs
+### Daemon and runtime configuration
 
 General daemon configuration is read from
 `$XDG_CONFIG_HOME/pi-relay/agentd/config.toml`; when `XDG_CONFIG_HOME` is unset
@@ -211,15 +214,26 @@ parent session uses an explicit `session.start.provider`, otherwise
 Existing or replayed sessions retain their persisted provider and are never
 retargeted by changed defaults.
 
-Global workflows and subagent roles are host configuration only:
+Runtime-owned instructions and catalogs use the runtime host's XDG and home
+directories:
 
 ```text
-$XDG_CONFIG_HOME/pi-relay/agentd/
-├── workflows/<workflow>/SKILL.md
-└── subagent-roles/<role>/SKILL.md
+${XDG_CONFIG_HOME:-$HOME/.config}/pi-relay/runtime/
+├── AGENTS.md
+├── skills/<workflow>/SKILL.md
+├── subagent-roles/<role>/SKILL.md
+└── projects/<workspace>/skills/<skill>/SKILL.md
+
+$HOME/.agents/skills/<skill>/SKILL.md
+<workspace>/.agents/skills/<skill>/SKILL.md
 ```
 
-A role-local provider policy uses optional flat frontmatter fields:
+The top-level `AGENTS.md` applies on that runtime before selected workspaces'
+own `AGENTS.md` files. Home skills are reusable global capabilities. Runtime
+`skills/` contains workflow skills; workflows remain ordinary loadable skills.
+Personal project skills override same-named repository project skills.
+
+A role-local provider policy and global skill preloads use frontmatter:
 
 ```yaml
 ---
@@ -228,22 +242,22 @@ description: Review artifacts and handoffs against the objective.
 kind: claude
 model: claude-opus-4-8
 reasoning_effort: high
+skills:
+  - swe
 ---
 ```
 
 Each immediate role directory must contain a valid `SKILL.md` whose frontmatter
-name exactly matches the directory name. Role model fields are validated at
-agentd startup; `kind` and `model` must appear together, while
-`reasoning_effort` and `max_tokens` are optional. A child uses an explicit
-spawn override, then its available global role provider, then OpenAI
-`gpt-5.6-sol` with `high` reasoning when that role provider is unavailable.
-Runtime-global and workspace-specific roles have no agentd-local provider file
-and therefore inherit the parent unless explicitly overridden.
+name exactly matches the directory name. `kind` and `model` must appear
+together; `reasoning_effort` and `max_tokens` are optional. `skills` may name
+only global packages from `$HOME/.agents/skills`; project and workflow packages
+cannot be role preloads. A child uses an explicit spawn override, then its role
+provider, then the parent provider. An unavailable role provider retains the
+existing stable-provider fallback.
 
-The daemon ships no workflow or role catalog and never creates one. Configured
-workflows are parent-only `LoadSkill` entries; configured roles remain hidden
-from ordinary `LoadSkill` discovery. Runtime home/workspace skills retain
-precedence over same-named configured workflows.
+Roles stay hidden from ordinary `LoadSkill` discovery. `LoadSkill` returns only
+the absolute runtime-host path to the selected `SKILL.md`; the agent reads that
+file and resolves relative links from its enclosing directory.
 
 Optional MCP configuration is read only from an already-existing
 `$XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml` on each runtime host; when it is

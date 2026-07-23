@@ -86,18 +86,18 @@ pub(crate) async fn spawn_subagent(
         .iter()
         .map(|workspace| workspace.workspace_dir.clone())
         .collect::<Vec<_>>();
-    let runtime_raw = state
+    let runtime_context = state
         .runtime_hosts
-        .read_runtime_skills(
+        .read_runtime_context(
             &parent_config.runtime_id,
             &parent_config.workspace_id,
             &parent_workspace_dirs,
         )
         .await
         .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
-    let role = resolve_skill_role(&state.config_root, &runtime_raw, &request.role)
+    let role = resolve_skill_role(&runtime_context.skills, &request.role)
         .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
-    let resolved_role_name = resolved_role_name(&role.name, role.workspace.as_deref());
+    let resolved_role_name = role.name.clone();
 
     // A full subagent is the durable workspace's single writer for its
     // delegation: it runs against the parent's dirs in place (no fork). A
@@ -170,9 +170,10 @@ pub(crate) async fn spawn_subagent(
         &child_config,
         ChildPromptRole {
             name: &resolved_role_name,
-            workspace: role.workspace.as_deref(),
             description: &role.description,
+            file_path: &role.file_path,
             content: &role.content,
+            skills: &role.skills,
             parent_session_id: &request.parent_session_id,
             subagent_type: request.subagent_type,
         },
@@ -477,13 +478,6 @@ fn subagent_metadata(
     metadata
 }
 
-fn resolved_role_name(name: &str, workspace: Option<&str>) -> String {
-    match workspace {
-        Some(workspace) => format!("{workspace}/{name}"),
-        None => name.to_string(),
-    }
-}
-
 fn child_initial_task_message(parent_session_id: &str, task: &str) -> String {
     format!(
         "# Delegated task\n\nParent session: `{parent_session_id}`\n\n{task}\n\n# Parent active context\n\n\
@@ -511,7 +505,6 @@ You are a child agent spawned by parent session `{parent_session_id}`.\n\
 The parent can inspect your transcript, send follow-up messages, interrupt you, and decide whether to merge your filesystem changes.\n\
 Keep your own context focused on the delegated task. Do not assume your changes are merged automatically.\n\
 You cannot spawn nested delegations. Do not call `delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, or `steer_subagent`; those parent orchestration tools are unavailable to subagents.\n\
-Do not load workflow skills. Workflow skills are for parent sessions that orchestrate subagents, not for delegated subagent work.\n\
 Answer only the delegated task. Your final message/report is the durable handoff to the parent, so include the evidence, changed files, commands, risks, and follow-up work the parent needs.\n\
 {workspace_semantics}"
     )
@@ -519,9 +512,10 @@ Answer only the delegated task. Your final message/report is the durable handoff
 
 struct ChildPromptRole<'a> {
     name: &'a str,
-    workspace: Option<&'a str>,
     description: &'a str,
+    file_path: &'a PathBuf,
     content: &'a str,
+    skills: &'a [crate::provider_runtime::ResolvedPreloadedSkill],
     parent_session_id: &'a str,
     subagent_type: SubagentType,
 }
@@ -532,20 +526,33 @@ async fn child_system_prompt(
     role: ChildPromptRole<'_>,
 ) -> std::result::Result<String, RpcError> {
     let base = render_pi_prompt(state, config).await?;
-    let workspace = role
-        .workspace
-        .map(|workspace| format!("workspace `{workspace}`"))
-        .unwrap_or_else(|| "global role".to_string());
     let contract = subagent_contract_text(role.parent_session_id, role.subagent_type);
+    let preloaded = role
+        .skills
+        .iter()
+        .map(|skill| {
+            format!(
+                "# Preloaded skill: {}\n\nSKILL.md: `{}`\n\n{}",
+                skill.name,
+                skill.file_path.display(),
+                skill.content.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     Ok(format!(
         "{base}\n\n{contract}\n\n\
 # Subagent role\n\n\
-Role: `{}` ({workspace})\n\
+Role: `{}`\n\
 Description: {}\n\n\
+SKILL.md: `{}`\n\n\
+{}\n\n\
 {}\n",
         role.name,
         role.description.trim(),
-        role.content.trim()
+        role.file_path.display(),
+        role.content.trim(),
+        preloaded
     ))
 }
 
@@ -557,7 +564,7 @@ mod tests {
     fn subagent_metadata_marks_session_hidden() {
         let metadata = subagent_metadata(
             json!({ "custom": true }),
-            "repo/reviewer",
+            "reviewer",
             "Review this",
             &PathBuf::from("/tmp/reviewer/SKILL.md"),
             &json!({ "harness": true, "auto_title_disabled": true }),
@@ -573,20 +580,11 @@ mod tests {
                 "subagent": true,
                 "prompt_profile": "subagent",
                 "subagent_type": "read_only",
-                "role_name": "repo/reviewer",
+                "role_name": "reviewer",
                 "task": "Review this",
                 "role_file_path": "/tmp/reviewer/SKILL.md",
             })
         );
-    }
-
-    #[test]
-    fn resolved_role_name_prefixes_workspace_roles() {
-        assert_eq!(
-            resolved_role_name("reviewer", Some("repo")),
-            "repo/reviewer"
-        );
-        assert_eq!(resolved_role_name("reviewer", None), "reviewer");
     }
 
     #[test]
@@ -613,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_contract_forbids_nested_delegation_and_workflow_skills() {
+    fn subagent_contract_forbids_nested_delegation() {
         let contract = subagent_contract_text("parent-session", SubagentType::ReadOnly);
 
         assert!(contract.contains("parent session `parent-session`"));
@@ -623,7 +621,6 @@ mod tests {
         assert!(contract.contains("`inspect_delegation`"));
         assert!(contract.contains("`cancel_delegation`"));
         assert!(contract.contains("`steer_subagent`"));
-        assert!(contract.contains("Do not load workflow skills"));
         assert!(contract.contains("final message/report is the durable handoff"));
         assert!(contract.contains("read-only subagent"));
     }

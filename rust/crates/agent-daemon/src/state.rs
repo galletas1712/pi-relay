@@ -51,7 +51,6 @@ pub(crate) struct AppState {
     pub(crate) session_titles: SessionTitleScheduler,
     pub(crate) runtime_hosts: RuntimeRegistry,
     pub(crate) prompt_root: PathBuf,
-    pub(crate) config_root: PathBuf,
     pub(crate) daemon_config: DaemonConfig,
     #[cfg(test)]
     pub(crate) pause_subagent_control_after_commit: Arc<AtomicBool>,

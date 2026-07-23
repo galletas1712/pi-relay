@@ -283,7 +283,7 @@ pub(crate) fn sort_tools_by_name(tools: &mut [ProviderTool]) {
 fn load_skill_definition() -> ToolDefinition {
     ToolDefinition::new(
         "LoadSkill",
-        "Activate one of the available skills by name. Use this when a task matches a skill description; pi-relay will inject that skill's instructions into the model context. If the skill is already loaded, the tool reports that it is already loaded.",
+        "Resolve an available skill name to the absolute path of its SKILL.md on the runtime host.",
         json!({
             "type": "object",
             "properties": {

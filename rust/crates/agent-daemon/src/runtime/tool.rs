@@ -1,17 +1,13 @@
-use std::collections::BTreeSet;
-
 use agent_core::AgentInput;
 use agent_runtime_protocol::{RuntimeCommand, RuntimeCommandResult};
 use agent_session::SessionAction;
 use agent_store::{ActionStatus, ActionUpdate};
 use agent_tools::{limit_tool_output, ToolContext};
-use agent_vocab::{ToolResultMessage, ToolResultStatus, TranscriptItem};
+use agent_vocab::{ToolResultMessage, ToolResultStatus};
 use serde_json::json;
 
 use crate::delegation_tools::{is_delegation_tool_name, run_delegation_tool};
-use crate::provider_runtime::{
-    effective_prompt_profile, is_web_tool_name, load_skill_result, run_web_tool,
-};
+use crate::provider_runtime::{is_web_tool_name, load_skill_result, run_web_tool};
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError};
 
@@ -66,8 +62,6 @@ pub(super) async fn run_tool_turn(
             ),
         }
     } else if tool_call.tool_name == "LoadSkill" {
-        let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
-        let profile = effective_prompt_profile(&state, &dispatch.config, &session_id).await?;
         let workspace_dirs = dispatch
             .config
             .workspaces
@@ -76,20 +70,14 @@ pub(super) async fn run_tool_turn(
             .collect::<Vec<_>>();
         match state
             .runtime_hosts
-            .read_runtime_skills(
+            .read_runtime_context(
                 &dispatch.config.runtime_id,
                 &dispatch.config.workspace_id,
                 &workspace_dirs,
             )
             .await
         {
-            Ok(runtime_raw) => load_skill_result(
-                &state.config_root,
-                &runtime_raw,
-                &loaded_skills,
-                &tool_call,
-                profile,
-            ),
+            Ok(runtime_context) => load_skill_result(&runtime_context.skills, &tool_call),
             Err(error) => ToolResultMessage::error(
                 tool_call.id.clone(),
                 tool_call.tool_name.clone(),
@@ -225,42 +213,6 @@ fn finalize_tool_result(result: &mut ToolResultMessage) {
     result.output = limit_tool_output(std::mem::take(&mut result.output));
 }
 
-async fn loaded_skills_for_session(state: &AppState, session_id: &str) -> BTreeSet<String> {
-    let Some(active) = state.active.lock().await.get(session_id).cloned() else {
-        return BTreeSet::new();
-    };
-    let runtime = active.lock().await;
-    runtime
-        .session
-        .model_context()
-        .transcript_items()
-        .iter()
-        .filter_map(|item| match item {
-            TranscriptItem::ToolResult(result) if result.tool_name == "LoadSkill" => {
-                loaded_skill_identifier(&result.output)
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn loaded_skill_identifier(output: &str) -> Option<String> {
-    loaded_skill_identifier_json(output)
-}
-
-fn loaded_skill_identifier_json(output: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(output).ok()?;
-    let name = value
-        .get("skill_name")
-        .and_then(serde_json::Value::as_str)?;
-    let workspace = value
-        .get("workspace")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|workspace| !workspace.is_empty());
-    Some(crate::provider_runtime::skill_identifier(workspace, name))
-}
-
 #[cfg(test)]
 mod tests {
     use agent_tools::{ToolContext, ToolRegistry};
@@ -306,45 +258,5 @@ mod tests {
         assert!(!result.output.contains('\0'));
         assert!(result.output.chars().count() <= 40_100);
         assert!(result.output.contains("[tool output truncated:"));
-    }
-
-    #[test]
-    fn loaded_skill_identifier_accepts_json_output() {
-        let output = serde_json::json!({
-            "status": "loaded",
-            "name": "repo/rust-refactor",
-            "skill_name": "rust-refactor",
-            "workspace": "repo",
-            "content": "Prefer small, tested changes."
-        })
-        .to_string();
-
-        assert_eq!(
-            loaded_skill_identifier(&output),
-            Some(crate::provider_runtime::skill_identifier(
-                Some("repo"),
-                "rust-refactor"
-            ))
-        );
-    }
-
-    #[test]
-    fn loaded_skill_identifier_rejects_non_json_output() {
-        let output = "not json";
-
-        assert_eq!(loaded_skill_identifier(output), None);
-    }
-
-    #[test]
-    fn loaded_skill_identifier_requires_current_json_shape() {
-        let output = serde_json::json!({
-            "status": "loaded",
-            "name": "repo/rust-refactor",
-            "workspace": "repo",
-            "content": "Prefer small, tested changes."
-        })
-        .to_string();
-
-        assert_eq!(loaded_skill_identifier(&output), None);
     }
 }

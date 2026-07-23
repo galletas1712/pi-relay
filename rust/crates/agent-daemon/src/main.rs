@@ -28,8 +28,7 @@ use crate::codec::{
 use crate::config::Config;
 use crate::provider_runtime::{
     current_pi_template, effective_prompt_profile, mcp_snapshot_for_session,
-    provider_tools_for_session, validate_global_role_catalog, PromptProfile,
-    ProviderConnectionRegistry, SessionTitleScheduler,
+    provider_tools_for_session, PromptProfile, ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::*;
 use crate::runtime_hosts::RuntimeRegistry;
@@ -65,7 +64,6 @@ const BOOT_RECOVERY_CONCURRENCY: usize = 4;
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
-    validate_global_role_catalog(&config.config_root)?;
     let prompt_root = find_prompt_root(std::env::current_dir()?)?;
     let repo = Arc::new(PostgresAgentStore::connect(&config.database_url).await?);
     repo.migrate().await?;
@@ -90,7 +88,6 @@ async fn main() -> Result<()> {
         session_titles: SessionTitleScheduler::default(),
         runtime_hosts: runtime_hosts.clone(),
         prompt_root,
-        config_root: config.config_root,
         daemon_config: config.daemon_config,
         #[cfg(test)]
         pause_subagent_control_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),

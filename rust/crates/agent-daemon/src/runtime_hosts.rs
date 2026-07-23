@@ -519,24 +519,24 @@ impl RuntimeRegistry {
         }
     }
 
-    pub(crate) async fn read_runtime_skills(
+    pub(crate) async fn read_runtime_context(
         &self,
         runtime_id: &str,
         workspace_id: &str,
         workspace_dirs: &[String],
-    ) -> Result<Vec<agent_runtime_protocol::RawSkillFile>> {
+    ) -> Result<agent_runtime_protocol::RuntimeContext> {
         match self
             .execute(
                 runtime_id,
-                RuntimeCommand::ReadRuntimeSkills {
+                RuntimeCommand::ReadRuntimeContext {
                     workspace_id: workspace_id.to_string(),
                     workspace_dirs: workspace_dirs.to_vec(),
                 },
             )
             .await?
         {
-            RuntimeCommandResult::RuntimeSkills { files } => Ok(files),
-            _ => Err(anyhow!("runtime returned the wrong runtime-skills result")),
+            RuntimeCommandResult::RuntimeContext { context } => Ok(context),
+            _ => Err(anyhow!("runtime returned the wrong runtime-context result")),
         }
     }
 
@@ -873,15 +873,24 @@ pub(crate) mod test_support {
                     contents: std::fs::read_to_string(&path).ok(),
                 })
             }
-            RuntimeCommand::ReadRuntimeSkills {
+            RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,
             } => {
                 // The fake runtime serves only workspace skills; home skills are
                 // exercised by pure parse tests to keep results host-independent.
                 let base = fake_workspace_dir(dirs, &workspace_id).await;
-                let mut files = Vec::new();
+                let mut skills = Vec::new();
+                let mut instructions = Vec::new();
                 for workspace_dir in workspace_dirs {
+                    let agents_path = base.join(&workspace_dir).join("AGENTS.md");
+                    if let Ok(contents) = std::fs::read_to_string(&agents_path) {
+                        instructions.push(agent_runtime_protocol::RawInstructionFile {
+                            workspace: Some(workspace_dir.clone()),
+                            path: agents_path.display().to_string(),
+                            contents,
+                        });
+                    }
                     let skills_dir = base.join(&workspace_dir).join(".agents/skills");
                     let Ok(entries) = std::fs::read_dir(&skills_dir) else {
                         continue;
@@ -895,19 +904,24 @@ pub(crate) mod test_support {
                         else {
                             continue;
                         };
-                        files.push(agent_runtime_protocol::RawSkillFile {
+                        let package_name = name.to_string_lossy().to_string();
+                        skills.push(agent_runtime_protocol::RawSkillFile {
+                            kind: agent_runtime_protocol::SkillKind::Skill,
+                            origin: agent_runtime_protocol::SkillOrigin::WorkspaceProject,
                             workspace: Some(workspace_dir.clone()),
-                            rel_path: format!(
-                                "{}/.agents/skills/{}/SKILL.md",
-                                workspace_dir,
-                                name.to_string_lossy()
-                            ),
+                            package_name,
+                            path: entry.path().join("SKILL.md").display().to_string(),
                             contents,
                         });
                     }
                 }
-                files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-                Ok(RuntimeCommandResult::RuntimeSkills { files })
+                skills.sort_by(|left, right| left.path.cmp(&right.path));
+                Ok(RuntimeCommandResult::RuntimeContext {
+                    context: agent_runtime_protocol::RuntimeContext {
+                        instructions,
+                        skills,
+                    },
+                })
             }
             // The fake runtime does not simulate MCP; MCP is exercised in
             // agent-mcp's own tests.

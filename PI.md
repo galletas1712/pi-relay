@@ -128,7 +128,6 @@ Here is the full list of skills available to you:
 {{ skills.index }}
 ```
 
-When a task surfaces that matches one (or more) of the available skills, call `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` for each skill you want to gain.
-Each invocation of `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` will insert useful context about the chosen domain in your context before acting, which makes you more knowledgeable!
+When a task surfaces that matches an available skill, call `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` with its exact name, then read the returned `SKILL.md` path before acting. Resolve relative links in that file from its enclosing directory.
 Use the exact skill `name` from the JSON list. Workspace skill names include their workspace prefix (for example `repo/repo-build`); names without a prefix are globally available.
 {% endif %}

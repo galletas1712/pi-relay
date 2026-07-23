@@ -18,7 +18,6 @@ pub(crate) struct Config {
     pub(crate) database_url: String,
     pub(crate) bind: String,
     pub(crate) runtime_bind: String,
-    pub(crate) config_root: PathBuf,
     pub(crate) daemon_config: DaemonConfig,
 }
 
@@ -75,7 +74,6 @@ impl Config {
             database_url: policy.database_url,
             bind: policy.bind,
             runtime_bind: policy.runtime_bind,
-            config_root,
             daemon_config: policy.daemon_config,
         })
     }
