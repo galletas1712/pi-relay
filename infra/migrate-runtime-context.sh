@@ -68,6 +68,12 @@ def copy_exact(source: Path, destination: Path) -> None:
 
 
 def copy_packages(source: Path, destination: Path) -> None:
+    if (
+        source.exists()
+        and destination.exists()
+        and source.resolve() == destination.resolve()
+    ):
+        return
     if source.is_symlink() or destination.is_symlink():
         raise SystemExit(f"migration refuses symlink catalog: {source} -> {destination}")
     if not source.is_dir():
