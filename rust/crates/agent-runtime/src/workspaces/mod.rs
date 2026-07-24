@@ -12,8 +12,8 @@ use std::{
 };
 
 use agent_runtime_protocol::{
-    ProjectWorkspace, RawInstructionFile, RawSkillFile, RuntimeContext, SessionWorkspace,
-    SkillKind, SkillOrigin, WorkspaceKind,
+    InstructionScope, ProjectWorkspace, RawInstructionFile, RawSkillFile, RuntimeContext,
+    SessionWorkspace, SkillKind, SkillOrigin, WorkspaceKind,
 };
 use anyhow::{bail, Context, Result};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -105,8 +105,8 @@ impl WorkspaceManager {
     }
 
     /// Return all runtime-owned instructions and skill packages visible to a
-    /// session. Personal project skills (keyed by `project_key`) override
-    /// same-named repository skills.
+    /// session. Personal project/workspace skills (keyed by `project_key`)
+    /// override same-named repository skills.
     pub async fn read_runtime_context(
         &self,
         workspace_id: &str,
@@ -115,8 +115,9 @@ impl WorkspaceManager {
     ) -> Result<RuntimeContext> {
         let mut instructions = Vec::new();
         collect_instruction(
-            &self.runtime_config_root.join("AGENTS.md"),
+            &self.home_dir.join(".agents/AGENTS.md"),
             None,
+            InstructionScope::Global,
             &mut instructions,
         )
         .await?;
@@ -151,37 +152,79 @@ impl WorkspaceManager {
 
         let mut project_skills = std::collections::BTreeMap::new();
         let cwd = self.resolve(workspace_id);
-        for workspace_dir in workspace_dirs {
-            let workspace = Some(workspace_dir.as_str());
+        let project_key = project_key.filter(|key| !key.is_empty());
+        let project_root =
+            project_key.map(|key| self.home_dir.join(".agents").join("projects").join(key));
+
+        if let (Some(key), Some(project_root)) = (project_key, project_root.as_ref()) {
             collect_instruction(
-                &cwd.join(workspace_dir).join("AGENTS.md"),
-                workspace,
+                &project_root.join("AGENTS.md"),
+                Some(key),
+                InstructionScope::Project,
                 &mut instructions,
             )
             .await?;
+        }
+
+        for workspace_dir in workspace_dirs {
+            let mut parts = Vec::new();
+            let mut paths = Vec::new();
+            if let Some(project_root) = project_root.as_ref() {
+                let personal = project_root
+                    .join("workspaces")
+                    .join(workspace_dir)
+                    .join("AGENTS.md");
+                if let Some(contents) = read_instruction_contents(&personal).await? {
+                    parts.push(contents);
+                    paths.push(personal.display().to_string());
+                }
+            }
+            let repo = cwd.join(workspace_dir).join("AGENTS.md");
+            if let Some(contents) = read_instruction_contents(&repo).await? {
+                parts.push(contents);
+                paths.push(repo.display().to_string());
+            }
+            if !parts.is_empty() {
+                instructions.push(RawInstructionFile {
+                    workspace: Some(workspace_dir.clone()),
+                    path: paths.join("+"),
+                    contents: parts.join("\n\n"),
+                    scope: InstructionScope::Workspace,
+                });
+            }
+
             collect_skill_dir(
                 &cwd.join(workspace_dir).join(".agents/skills"),
-                workspace,
+                Some(workspace_dir.as_str()),
                 SkillKind::Skill,
                 SkillOrigin::WorkspaceProject,
                 &mut project_skills,
             )
             .await?;
         }
-        if let Some(project_key) = project_key.filter(|key| !key.is_empty()) {
+
+        if let (Some(key), Some(project_root)) = (project_key, project_root.as_ref()) {
             collect_skill_dir(
-                &self
-                    .home_dir
-                    .join(".agents")
-                    .join("projects")
-                    .join(project_key)
-                    .join("skills"),
-                Some(project_key),
+                &project_root.join("skills"),
+                Some(key),
                 SkillKind::Skill,
                 SkillOrigin::HomeProject,
                 &mut project_skills,
             )
             .await?;
+            for workspace_dir in workspace_dirs {
+                collect_skill_dir(
+                    &project_root
+                        .join("workspaces")
+                        .join(workspace_dir)
+                        .join("skills"),
+                    Some(workspace_dir.as_str()),
+                    SkillKind::Skill,
+                    SkillOrigin::HomeProject,
+                    &mut project_skills,
+                )
+                .await?;
+            }
         }
 
         let skills = global_skills
@@ -641,21 +684,30 @@ struct WorkspaceBase {
     config: WorkspaceBaseConfig,
 }
 
+async fn read_instruction_contents(path: &Path) -> Result<Option<String>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) if !contents.trim().is_empty() => Ok(Some(contents)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn collect_instruction(
     path: &Path,
     workspace: Option<&str>,
+    scope: InstructionScope,
     files: &mut Vec<RawInstructionFile>,
 ) -> Result<()> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(contents) if !contents.trim().is_empty() => files.push(RawInstructionFile {
-            workspace: workspace.map(str::to_string),
-            path: path.display().to_string(),
-            contents,
-        }),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    let Some(contents) = read_instruction_contents(path).await? else {
+        return Ok(());
+    };
+    files.push(RawInstructionFile {
+        workspace: workspace.map(str::to_string),
+        path: path.display().to_string(),
+        contents,
+        scope,
+    });
     Ok(())
 }
 
@@ -835,7 +887,7 @@ mod tests {
         let config = root.join("config/pi-relay/runtime");
         let home = root.join("home");
         let cwd = state.join("sessions/session-test/cwd");
-        write_file(&config.join("AGENTS.md"), "global instructions");
+        write_file(&home.join(".agents/AGENTS.md"), "global instructions");
         write_file(
             &home.join(".agents/skills/swe/SKILL.md"),
             "---\nname: swe\ndescription: global\n---\nglobal",
@@ -848,14 +900,26 @@ mod tests {
             &config.join("subagent-roles/reviewer/SKILL.md"),
             "---\nname: reviewer\ndescription: role\n---\nrole",
         );
-        write_file(&cwd.join("repo/AGENTS.md"), "repo instructions");
+        write_file(
+            &home.join(".agents/projects/repo/AGENTS.md"),
+            "project instructions",
+        );
+        write_file(
+            &home.join(".agents/projects/repo/workspaces/other/AGENTS.md"),
+            "personal other instructions",
+        );
+        write_file(&cwd.join("other/AGENTS.md"), "repo other instructions");
         write_file(
             &cwd.join("other/.agents/skills/placeholder/SKILL.md"),
             "---\nname: placeholder\ndescription: selected workspace only\n---\nother",
         );
         write_file(
-            &cwd.join("repo/.agents/skills/kubernetes/SKILL.md"),
-            "---\nname: kubernetes\ndescription: contributed\n---\ncontributed",
+            &cwd.join("other/.agents/skills/shared/SKILL.md"),
+            "---\nname: shared\ndescription: repo shared\n---\nrepo-shared",
+        );
+        write_file(
+            &home.join(".agents/projects/repo/workspaces/other/skills/shared/SKILL.md"),
+            "---\nname: shared\ndescription: personal shared\n---\npersonal-shared",
         );
         write_file(
             &home.join(".agents/projects/repo/skills/kubernetes/SKILL.md"),
@@ -863,15 +927,25 @@ mod tests {
         );
 
         let manager = WorkspaceManager::new(state, config, home);
-        // Home project overlays key off project_key, not selected workspace_dirs.
-        // Selecting only "other" still surfaces projects/repo/skills/kubernetes.
+        // Selecting only "other" still surfaces project-level skills and
+        // concatenates personal+repo AGENTS under that workspace.
         let context = manager
             .read_runtime_context("session-test", &["other".to_string()], Some("repo"))
             .await
             .expect("runtime context");
 
-        assert_eq!(context.instructions.len(), 1);
-        assert_eq!(context.instructions[0].workspace, None);
+        assert_eq!(context.instructions.len(), 3);
+        assert_eq!(context.instructions[0].scope, InstructionScope::Global);
+        assert_eq!(context.instructions[1].scope, InstructionScope::Project);
+        assert_eq!(context.instructions[1].workspace.as_deref(), Some("repo"));
+        assert_eq!(context.instructions[2].scope, InstructionScope::Workspace);
+        assert_eq!(context.instructions[2].workspace.as_deref(), Some("other"));
+        assert!(context.instructions[2]
+            .contents
+            .contains("personal other instructions"));
+        assert!(context.instructions[2]
+            .contents
+            .contains("repo other instructions"));
         assert!(context.skills.iter().any(|skill| {
             skill.package_name == "swe" && skill.origin == SkillOrigin::HomeGlobal
         }));
@@ -892,6 +966,14 @@ mod tests {
         assert_eq!(kubernetes.origin, SkillOrigin::HomeProject);
         assert_eq!(kubernetes.workspace.as_deref(), Some("repo"));
         assert!(kubernetes.contents.contains("personal"));
+        let shared = context
+            .skills
+            .iter()
+            .find(|skill| skill.package_name == "shared")
+            .expect("shared");
+        assert_eq!(shared.origin, SkillOrigin::HomeProject);
+        assert_eq!(shared.workspace.as_deref(), Some("other"));
+        assert!(shared.contents.contains("personal-shared"));
 
         std::fs::remove_dir_all(root).ok();
     }
