@@ -19,9 +19,11 @@ describe("session defaults", () => {
 	it("exposes the picker Claude models and a Fable ZDR warning", () => {
 		const claude = MODEL_OPTIONS.filter((option) => option.provider.kind === "claude");
 		expect(claude.map((option) => option.provider.model)).toEqual([
+			"claude-opus-5",
 			"claude-opus-4-8",
 			"claude-fable-5",
 		]);
+		expect(claude[0]?.provider.reasoning_effort).toBe("high");
 		const fable = claude.find((option) => option.provider.model === "claude-fable-5");
 		expect(fable?.label).toBe("Claude Fable 5");
 		expect(fable?.description).toBe("Explicit opt-in: not ZDR.");

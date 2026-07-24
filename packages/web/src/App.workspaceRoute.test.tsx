@@ -1561,7 +1561,7 @@ describe("App workspace route identity integration", () => {
 		await user.selectOptions(screen.getByRole("combobox", { name: "Reasoning effort" }), "high");
 		expect(screen.getByRole("button", { name: /MCP tools/ }).textContent).toContain("2 tools selected");
 
-		await user.selectOptions(screen.getByRole("combobox", { name: "Model" }), "claude:claude-opus-4-8");
+		await user.selectOptions(screen.getByRole("combobox", { name: "Model" }), "claude:claude-opus-5");
 		await waitFor(() => expect(api.getMcpInventory).toHaveBeenCalledWith("claude", "runtime-test"));
 		expect((await screen.findByRole("button", { name: /MCP tools/ })).textContent).toContain(
 			"No tools selected",
