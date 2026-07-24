@@ -4,7 +4,7 @@ use agent_prompt::{
     load_pi_compaction_md, load_pi_md, render_prompt, PromptContext, PromptMcpServer,
     PromptProfile, PromptWorkspace, PromptWorkspaceKind, Skill, SubagentRole, ToolSpec,
 };
-use agent_runtime_protocol::{RawInstructionFile, RawSkillFile, SkillKind};
+use agent_runtime_protocol::{InstructionScope, RawInstructionFile, RawSkillFile, SkillKind};
 use agent_store::{SessionConfig, WorkspaceKind};
 use agent_tools::ProviderTool;
 use agent_vocab::ProviderKind;
@@ -221,12 +221,34 @@ fn render_runtime_instructions(files: &[RawInstructionFile]) -> String {
     files
         .iter()
         .filter(|file| !file.contents.trim().is_empty())
-        .map(|file| match &file.workspace {
-            Some(workspace) => format!("### {workspace}\n\n{}", file.contents.trim()),
-            None => file.contents.trim().to_string(),
+        .map(|file| {
+            let body = file.contents.trim();
+            match file.scope {
+                InstructionScope::Global => body.to_string(),
+                InstructionScope::Project => {
+                    let key = file.workspace.as_deref().unwrap_or("project");
+                    format!(
+                        "### Project: {key}
+
+{body}"
+                    )
+                }
+                InstructionScope::Workspace => {
+                    let workspace = file.workspace.as_deref().unwrap_or("workspace");
+                    format!(
+                        "#### {workspace}
+
+{body}"
+                    )
+                }
+            }
         })
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join(
+            "
+
+",
+        )
 }
 
 #[derive(Debug)]
@@ -406,19 +428,45 @@ mod tests {
         let files = vec![
             RawInstructionFile {
                 workspace: None,
-                path: "/config/runtime/AGENTS.md".to_string(),
-                contents: "global rules\n".to_string(),
+                path: "/home/test/.agents/AGENTS.md".to_string(),
+                contents: "global rules
+"
+                .to_string(),
+                scope: InstructionScope::Global,
+            },
+            RawInstructionFile {
+                workspace: Some("dynamo".to_string()),
+                path: "/home/test/.agents/projects/dynamo/AGENTS.md".to_string(),
+                contents: "project rules
+"
+                .to_string(),
+                scope: InstructionScope::Project,
             },
             RawInstructionFile {
                 workspace: Some("repo".to_string()),
-                path: "/workspace/repo/AGENTS.md".to_string(),
-                contents: "repo rules\n".to_string(),
+                path: "/overlay+/workspace/repo/AGENTS.md".to_string(),
+                contents: "personal overlay
+
+repo rules
+"
+                .to_string(),
+                scope: InstructionScope::Workspace,
             },
         ];
 
         assert_eq!(
             render_runtime_instructions(&files),
-            "global rules\n\n### repo\n\nrepo rules"
+            "global rules
+
+### Project: dynamo
+
+project rules
+
+#### repo
+
+personal overlay
+
+repo rules"
         );
     }
 
