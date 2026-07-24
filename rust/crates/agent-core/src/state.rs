@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::action::AgentAction;
 use crate::event::{AgentEvent, TurnInput};
 use agent_vocab::{
@@ -17,6 +19,7 @@ pub enum AgentState {
     RunningTools {
         turn_id: TurnId,
         tools: Vec<RunningTool>,
+        tool_index_by_action_id: HashMap<ActionId, usize>,
         next_result_index: usize,
     },
     // Internal transition point after every tool in a batch has completed.
@@ -183,6 +186,7 @@ impl AgentState {
         }
 
         let mut tools = Vec::with_capacity(tool_calls.len());
+        let mut tool_index_by_action_id = HashMap::with_capacity(tool_calls.len());
         for tool_call in tool_calls {
             let action_id = ActionId::take_next(next_action_id);
             items.push(TranscriptItem::ToolCallStarted {
@@ -199,10 +203,12 @@ impl AgentState {
                 action_id,
                 result: None,
             });
+            tool_index_by_action_id.insert(action_id, tools.len() - 1);
         }
         *self = Self::RunningTools {
             turn_id,
             tools,
+            tool_index_by_action_id,
             next_result_index: 0,
         };
         (items, actions)
@@ -241,6 +247,7 @@ impl AgentState {
         let Self::RunningTools {
             turn_id: active_turn_id,
             tools,
+            tool_index_by_action_id,
             next_result_index,
         } = self
         else {
@@ -251,13 +258,15 @@ impl AgentState {
             return empty_transition();
         }
 
-        let Some(result_index) = tools.iter().position(|tool| {
-            tool.call.id == result.tool_call_id && tool.call.tool_name == result.tool_name
-        }) else {
+        #[cfg(test)]
+        count_tool_completion_operation();
+        let Some(&result_index) = tool_index_by_action_id.get(&action_id) else {
             return empty_transition();
         };
 
-        if tools[result_index].action_id != action_id {
+        if tools[result_index].call.id != result.tool_call_id
+            || tools[result_index].call.tool_name != result.tool_name
+        {
             return empty_transition();
         }
 
@@ -269,6 +278,8 @@ impl AgentState {
 
         let mut items = Vec::new();
         while *next_result_index < tools.len() {
+            #[cfg(test)]
+            count_tool_completion_operation();
             let Some(result) = tools[*next_result_index].result.take() else {
                 break;
             };
@@ -330,6 +341,7 @@ impl AgentState {
                 turn_id,
                 tools,
                 next_result_index,
+                ..
             } => {
                 *self = Self::Idle;
                 let mut items = Vec::new();
@@ -351,6 +363,18 @@ impl AgentState {
 
 fn empty_transition() -> (Vec<TranscriptItem>, Vec<AgentAction>) {
     (Vec::new(), Vec::new())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOOL_COMPLETION_OPERATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn count_tool_completion_operation() {
+    TOOL_COMPLETION_OPERATIONS.set(TOOL_COMPLETION_OPERATIONS.get() + 1);
 }
 
 #[cfg(test)]
@@ -400,6 +424,22 @@ mod tests {
 
     fn transition_is_empty((items, actions): &(Vec<TranscriptItem>, Vec<AgentAction>)) -> bool {
         items.is_empty() && actions.is_empty()
+    }
+
+    fn tool_index_by_action_id(tools: &[RunningTool]) -> HashMap<ActionId, usize> {
+        tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| (tool.action_id, index))
+            .collect()
+    }
+
+    fn reset_tool_completion_operations() {
+        TOOL_COMPLETION_OPERATIONS.set(0);
+    }
+
+    fn tool_completion_operations() -> usize {
+        TOOL_COMPLETION_OPERATIONS.get()
     }
 
     #[test]
@@ -459,10 +499,54 @@ mod tests {
     }
 
     #[test]
+    fn running_tools_correlate_duplicate_provider_identities_by_action_id() {
+        let call = tool_call(1, "same");
+        let tools = vec![running_tool(1, call.clone()), running_tool(2, call.clone())];
+        let mut state = AgentState::RunningTools {
+            turn_id: TurnId(1),
+            tool_index_by_action_id: tool_index_by_action_id(&tools),
+            tools,
+            next_result_index: 0,
+        };
+        let mut next_action_id = ActionId(3);
+
+        assert_eq!(
+            state.step(
+                AgentEvent::ToolCompleted {
+                    action_id: ActionId(1),
+                    turn_id: TurnId(1),
+                    result: tool_result(1, "same"),
+                },
+                &mut next_action_id,
+            ),
+            (
+                vec![TranscriptItem::ToolResult(tool_result(1, "same"))],
+                Vec::new(),
+            )
+        );
+        assert_eq!(
+            state.step(
+                AgentEvent::ToolCompleted {
+                    action_id: ActionId(2),
+                    turn_id: TurnId(1),
+                    result: tool_result(1, "same"),
+                },
+                &mut next_action_id,
+            ),
+            (
+                vec![TranscriptItem::ToolResult(tool_result(1, "same"))],
+                Vec::new(),
+            )
+        );
+        assert_eq!(state, AgentState::ReadyToContinue { turn_id: TurnId(1) });
+    }
+
+    #[test]
     fn running_tool_accepts_only_matching_tool_completion() {
         let mut state = AgentState::RunningTools {
             turn_id: TurnId(1),
             tools: vec![running_tool(1, tool_call(1, "bash"))],
+            tool_index_by_action_id: HashMap::from([(ActionId(1), 0)]),
             next_result_index: 0,
         };
         let result = AgentEvent::ToolCompleted {
@@ -539,6 +623,7 @@ mod tests {
                     running_tool(2, first_tool.clone()),
                     running_tool(3, second_tool.clone()),
                 ],
+                tool_index_by_action_id: HashMap::from([(ActionId(2), 0), (ActionId(3), 1),]),
                 next_result_index: 0,
             }
         );
@@ -575,6 +660,7 @@ mod tests {
                     running_tool(2, first_tool.clone()),
                     completed_running_tool(3, second_tool.clone(), tool_result(2, "read")),
                 ],
+                tool_index_by_action_id: HashMap::from([(ActionId(2), 0), (ActionId(3), 1),]),
                 next_result_index: 0,
             }
         );
@@ -618,6 +704,7 @@ mod tests {
         let mut state = AgentState::RunningTools {
             turn_id: TurnId(3),
             tools: vec![running_tool(1, tool_call(1, "bash"))],
+            tool_index_by_action_id: HashMap::from([(ActionId(1), 0)]),
             next_result_index: 0,
         };
         let mut next_action_id = ActionId::first();
@@ -642,5 +729,47 @@ mod tests {
             actions,
             vec![AgentAction::CancelTurn { turn_id: TurnId(3) }]
         );
+    }
+
+    #[test]
+    fn tool_completion_matching_and_source_order_release_scale_linearly() {
+        for tool_count in [1, 10, 100, 1_000] {
+            let tools = (0..tool_count)
+                .map(|index| running_tool(index as u64 + 1, tool_call(index as u64 + 1, "tool")))
+                .collect::<Vec<_>>();
+            let mut state = AgentState::RunningTools {
+                turn_id: TurnId(1),
+                tool_index_by_action_id: tool_index_by_action_id(&tools),
+                tools,
+                next_result_index: 0,
+            };
+            let mut next_action_id = ActionId(tool_count as u64 + 1);
+            let mut items = Vec::new();
+            reset_tool_completion_operations();
+
+            for index in (0..tool_count).rev() {
+                let (released, actions) = state.step(
+                    AgentEvent::ToolCompleted {
+                        action_id: ActionId(index as u64 + 1),
+                        turn_id: TurnId(1),
+                        result: tool_result(index as u64 + 1, "tool"),
+                    },
+                    &mut next_action_id,
+                );
+                items.extend(released);
+                assert!(actions.is_empty());
+            }
+
+            let expected_items = (0..tool_count)
+                .map(|index| TranscriptItem::ToolResult(tool_result(index as u64 + 1, "tool")))
+                .collect::<Vec<_>>();
+            assert_eq!(items, expected_items);
+            assert_eq!(state, AgentState::ReadyToContinue { turn_id: TurnId(1) });
+            assert_eq!(
+                tool_completion_operations(),
+                3 * tool_count - 1,
+                "one lookup per completion plus amortized source-front examinations"
+            );
+        }
     }
 }

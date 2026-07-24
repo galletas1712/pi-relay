@@ -526,6 +526,168 @@ fn unmatched_tool_completion_before_tool_request_is_ignored() {
 }
 
 #[test]
+fn reverse_tool_completions_with_duplicate_provider_identity_release_in_source_order() {
+    let mut session = AgentSession::new();
+    session
+        .enqueue_input(AgentInput::follow_up("go"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
+
+    let tool_call = ToolCall {
+        id: ToolCallId::from_u64(1),
+        tool_name: "same".to_string(),
+        args_json: "{}".to_string(),
+    };
+    session
+        .enqueue_session_input(SessionInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant: AssistantMessage {
+                items: vec![
+                    AssistantItem::ToolCall(tool_call.clone()),
+                    AssistantItem::ToolCall(tool_call.clone()),
+                ],
+            },
+        })
+        .expect("matching model completion is valid");
+    session.drive();
+    session.drain_events();
+
+    let completion = |action_id| AgentInput::ToolCompleted {
+        action_id: ActionId(action_id),
+        turn_id: TurnId(1),
+        result: ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.tool_name.clone(),
+            output: format!("action {action_id}"),
+            status: ToolResultStatus::Success,
+        },
+    };
+    session
+        .enqueue_input(completion(3))
+        .expect("second tool completion is valid");
+    session
+        .enqueue_input(completion(3))
+        .expect("duplicate completion is ignored");
+    session
+        .enqueue_input(completion(2))
+        .expect("first tool completion is valid");
+    session.drive();
+
+    assert!(session.drain_actions().is_empty());
+    assert_eq!(
+        session
+            .drain_events()
+            .into_iter()
+            .filter(|event| matches!(event, SessionEvent::ActionCompleted { .. }))
+            .collect::<Vec<_>>(),
+        vec![
+            SessionEvent::ActionCompleted {
+                kind: SessionActionKind::Tool,
+                id: "2".to_string(),
+            },
+            SessionEvent::ActionCompleted {
+                kind: SessionActionKind::Tool,
+                id: "3".to_string(),
+            },
+        ]
+    );
+    assert_eq!(
+        session
+            .model_context()
+            .transcript_items()
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::ToolResult(result) => Some(result.output.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["action 2", "action 3"]
+    );
+}
+
+#[test]
+fn action_outbox_drain_filters_completed_start_once_and_preserves_order() {
+    let mut session = AgentSession::new();
+    let actions = (1..=3)
+        .map(|id| SessionAction::RequestTool {
+            action_id: ActionId(id),
+            turn_id: TurnId(1),
+            tool_call: ToolCall {
+                id: ToolCallId::from_u64(id),
+                tool_name: "tool".to_string(),
+                args_json: "{}".to_string(),
+            },
+        })
+        .collect::<Vec<_>>();
+    for action in &actions {
+        session.outstanding_actions.track_session_action(action);
+        session.queue_session_action(action.clone());
+    }
+    let middle_completion = AgentInput::ToolCompleted {
+        action_id: ActionId(2),
+        turn_id: TurnId(1),
+        result: ToolResultMessage {
+            tool_call_id: ToolCallId::from_u64(2),
+            tool_name: "tool".to_string(),
+            output: "done".to_string(),
+            status: ToolResultStatus::Success,
+        },
+    };
+
+    assert!(session.accept_agent_input(&middle_completion));
+    assert!(!session.accept_agent_input(&middle_completion));
+    assert_eq!(
+        session.drain_actions(),
+        vec![actions[0].clone(), actions[2].clone()]
+    );
+    assert!(session.drain_actions().is_empty());
+}
+
+#[test]
+fn compacted_runtime_reconstruction_rebuilds_completion_ledger_without_queued_action() {
+    let mut session = AgentSession::from_model_context(finished_model_context("first"));
+    let active_leaf_id = session
+        .transcript_store()
+        .active_leaf_id()
+        .expect("finished context has an active leaf")
+        .to_string();
+
+    session
+        .restore_compacted_runtime(&active_leaf_id, TurnId(2), ActionId(10))
+        .expect("compacted runtime can restore its model action");
+    session
+        .enqueue_session_input(SessionInput::ModelCompleted {
+            action_id: ActionId(10),
+            turn_id: TurnId(2),
+            assistant: empty_assistant(),
+        })
+        .expect("reconstructed model completion is valid");
+    session.drive();
+
+    assert!(session.drain_actions().is_empty());
+    assert_eq!(
+        session
+            .drain_events()
+            .into_iter()
+            .filter(|event| matches!(event, SessionEvent::ActionCompleted { .. }))
+            .collect::<Vec<_>>(),
+        vec![SessionEvent::ActionCompleted {
+            kind: SessionActionKind::Model,
+            id: "10".to_string(),
+        }]
+    );
+    assert_eq!(
+        session.model_context().transcript_items().last(),
+        Some(&TranscriptItem::TurnFinished {
+            turn_id: TurnId(2),
+            outcome: TurnOutcome::Graceful,
+        })
+    );
+}
+
+#[test]
 fn completion_event_is_not_emitted_when_interrupt_wins_before_drive() {
     let mut session = AgentSession::new();
     session

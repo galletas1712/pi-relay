@@ -282,6 +282,7 @@ mod tests {
                     action_id: ActionId(2),
                     result: None,
                 }],
+                tool_index_by_action_id: std::collections::HashMap::from([(ActionId(2), 0)]),
                 next_result_index: 0,
             }
         );
