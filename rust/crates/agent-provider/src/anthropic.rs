@@ -805,6 +805,14 @@ struct ModelsApiThinkingTypes {
 fn static_anthropic_model_metadata(model: &str) -> AnthropicModelMetadata {
     let normalized = model.to_ascii_lowercase();
     let (max_input_tokens, max_tokens, capabilities) = match normalized.as_str() {
+        "claude-opus-5" => (
+            Some(1_000_000),
+            128_000,
+            AnthropicModelCapabilities {
+                native_compaction: false,
+                ..AnthropicModelCapabilities::adaptive_with_all_efforts(true)
+            },
+        ),
         "claude-sonnet-5" | "claude-fable-5" => (
             Some(1_000_000),
             128_000,
@@ -1286,9 +1294,10 @@ fn anthropic_request_body(
         // budget changes). Reasoning effort lives in `output_config` instead,
         // which is documented not to affect the messages-level cache.
         // See: https://docs.claude.com/en/docs/build-with-claude/prompt-caching
-        // Fable 5 always thinks and Sonnet 5 defaults to adaptive thinking, so
-        // their canonical shape omits the redundant `thinking` field. Opus
-        // 4.8 requires an explicit adaptive mode; omission turns thinking off.
+        // Opus 5 and Sonnet 5 default to adaptive thinking, and Fable 5 always
+        // thinks, so their canonical shape omits the redundant `thinking`
+        // field. Opus 4.8 requires an explicit adaptive mode; omission turns
+        // thinking off.
         if capabilities.adaptive_thinking && !capabilities.adaptive_thinking_default {
             body["thinking"] = json!({ "type": "adaptive" });
         }
@@ -3518,7 +3527,7 @@ mod tests {
             );
         }
 
-        for unsupported in ["claude-sonnet-4-5", "claude-unknown"] {
+        for unsupported in ["claude-opus-5", "claude-sonnet-4-5", "claude-unknown"] {
             let mut request = test_compaction_request(vec![TranscriptItem::UserMessage(
                 UserMessage::text("history"),
             )
@@ -3689,8 +3698,8 @@ mod tests {
     }
 
     #[test]
-    fn sonnet_5_and_fable_5_use_default_on_adaptive_thinking_and_all_efforts() {
-        for model in ["claude-sonnet-5", "claude-fable-5"] {
+    fn claude_5_models_use_default_on_adaptive_thinking_and_all_efforts() {
+        for model in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
             for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
                 let body =
                     messages_body(ModelRequest {
