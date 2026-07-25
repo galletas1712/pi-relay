@@ -303,8 +303,8 @@ fn is_empty_error_data(value: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_frame, write_frame, InstructionScope, RawInstructionFile, RawSkillFile, RuntimeContext,
-        SkillKind, SkillOrigin,
+        read_frame, write_frame, InstructionScope, RawInstructionFile, RawSkillFile,
+        RuntimeContext, SkillKind, SkillOrigin,
     };
     use tokio::io::duplex;
 
