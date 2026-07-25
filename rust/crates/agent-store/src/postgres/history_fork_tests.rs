@@ -924,7 +924,15 @@ async fn switch_and_fork_share_history_target_validation() {
 
     let delegation_config = create_session(store, project_id, "delegation-source", false).await;
     store
-        .create_delegation("delegation-source", DelegationKind::Full, None, None, 1)
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "delegation-source",
+            launch_key: "test:blocks-source-mutation",
+            launch_shape: r#"{"kind":"full","role":"implementer","prompt":"work"}"#,
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
         .await
         .expect("running delegation creates");
     let delegation_target = HistoryTarget {

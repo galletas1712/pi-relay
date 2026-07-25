@@ -550,7 +550,6 @@ async fn classify_subagents(
 ///    `done_with_failures`; cancelled delegations remain transcript-only and
 ///    are never reactivated.
 pub(crate) async fn sweep_running_delegations_on_boot(state: &AppState) {
-    reconcile_partial_launches_on_boot(state).await;
     publish_running_delegation_partial_observations_on_boot(state).await;
 
     let ready = match state.repo.sweep_running_delegations().await {

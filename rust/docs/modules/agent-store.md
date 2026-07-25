@@ -15,7 +15,9 @@ covers the mechanics.
 Delegation creation is the admission module. Under the parent-session row lock
 it permits one admission-active (`running` or `cancelling`) `full` row and
 read-only fan-outs totaling at most eight reserved slots until delegation
-terminality. A partial unique index backstops writer exclusivity. Parent-scoped
+terminality. A partial unique index backstops writer exclusivity; the read-only
+slot bound has no index backstop, because an aggregate `sum(expected_subagents)`
+constraint is not expressible as a partial unique index. Parent-scoped
 launch keys make creation idempotent; canonical launch JSON, a PostgreSQL
 materialization claim, and immutable child indices make replay and boot recovery
 resume missing children without duplication.

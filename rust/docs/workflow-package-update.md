@@ -16,9 +16,12 @@ Implementation → review → test gates remain sequential. Kubernetes and MCP
 workflows must continue treating read-only agents as capable of remote side
 effects and keep their existing safety policy.
 
-Existing sessions remain valid with their persisted conservative prompts.
-Start a new session after publication to receive the new `PI.md` contract and
-use concurrent orchestration.
+Existing sessions keep the persisted prompt they were rendered with, so the
+upgrade runbook in [`../migrations/README.md`](../migrations/README.md) removes
+the pre-concurrency single-delegation instructions from stored top-level
+prompts. It does not regenerate whole prompts; it only guarantees that no
+stored prompt contradicts the concurrent-capable tool schemas that are rebuilt
+on every model request.
 
 ## Publication procedure
 

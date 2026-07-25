@@ -107,7 +107,7 @@ pub(super) async fn run_tool_turn(
         crate::delegation_tools::run_delegation_tool_with_launch_key(
             &state,
             &session_id,
-            &dispatch.row_id,
+            &format!("action:{}", dispatch.row_id),
             &tool_call,
         )
         .await

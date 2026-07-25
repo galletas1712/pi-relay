@@ -1803,7 +1803,7 @@ pub(crate) async fn run_delegation_tool(
     run_delegation_tool_with_launch_key(
         state,
         parent_session_id,
-        &format!("tool-call:{}", call.id.0),
+        &format!("action:{}", call.id.0),
         call,
     )
     .await

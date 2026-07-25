@@ -1091,6 +1091,7 @@ Response:
   "input_id": "input_...",
   "accepted": true,
   "queued": true,
+  "replayed": false,
   "queue": {
     "session_revision": 12,
     "queue_revision": 5,
@@ -1101,16 +1102,21 @@ Response:
 }
 ```
 
-Retries with the same `client_input_id` return `"replayed": true` and the same
-canonical queue object when the original ledger row is found.
+All three flags are derived from the stored row's status. `accepted` is true
+while the row is `queued`, `consuming`, or `consumed`; `queued` is true only
+while it is `queued` or `consuming`; `replayed` is true when the store matched
+an existing `client_input_id` instead of inserting a new row, and is present as
+`false` on ordinary sends. A replay returns the original `input_id` and the same
+canonical queue object.
 
 Queue snapshots in responses and events use the canonical ordering: queued
 steers first by steering/promote time, then queued follow-ups by dense
 `follow_up_position`.
 
-For backward compatibility, raw ordinary-priority
-`input.follow_up`/`session.input` can target a subagent. It is an ordinary child
-follow-up and does not provide parent/delegation control validation. Raw
+Raw ordinary-priority `input.follow_up`/`session.input` can target a subagent.
+It is an ordinary child follow-up and does not provide parent/delegation control
+validation; it is rejected with `delegation_not_running` inside the store
+transaction when the child's delegation is not `running`. Raw
 `priority = "steer"` input to a child is rejected with
 `subagent_steer_requires_parent_scope`; callers must use parent-scoped
 `delegation.steer_subagent`/`steer_subagent` for a validated child steer.
@@ -1390,8 +1396,8 @@ The child receives the source's complete committed transcript forest in source
 insertion order, preserving entry ids, parent links, typed items, turn ids,
 compaction roots/sibling branches, and opaque `provider_replay`. Its active
 leaf is exactly `leaf_id`; the fork does not synthesize transcript entries. Queued
-inputs, actions, reconnect events, delegations, and subagent relationships are
-not copied. Fork provenance is stored in
+inputs, actions, reconnect events, delegations, subagent relationships, and
+`.pi-handoff` delegation artifacts are not copied. Fork provenance is stored in
 `metadata.fork = { source_session_id, source_leaf_id }`; the child has no
 `parent_session_id` and uses the parent prompt/tool profile. The child inherits
 the source title, auto-title preference, and compaction policy, but starts
@@ -1423,9 +1429,11 @@ session list before deciding to retry.
 Workspace snapshot serialization covers daemon-managed local and MCP tool
 futures that share the exact managed cwd. `history.fork` and read-only
 delegation snapshots wait on that guard; the guard is released when a tool
-future returns or is dropped/aborted. `.pi-handoff` is excluded from clones.
-The daemon does not claim to track independently running background processes
-beyond the managed future lifetime.
+future returns or is dropped/aborted. Both take a btrfs subvolume snapshot of
+the parent cwd and then remove `.pi-handoff` from the child cwd under the same
+guard, so a fork or read-only child never sees the source session's delegation
+artifacts. The daemon does not claim to track independently running background
+processes beyond the managed future lifetime.
 
 ### `turn.resume`
 
@@ -1591,8 +1599,7 @@ packages; the delegation `workflow` value is an unvalidated observability label.
 Interrupts all running subagents in a delegation and marks the delegation
 cancelled. Terminal delegations are left unchanged and return
 `{ "cancelled": false }`. A successful cancellation returns a cwd-relative `handoff_dir` and compact
-per-subagent transcript file references relative to it. Handoff paths remain
-portable when the session runs on a remote runtime host.
+per-subagent transcript file references relative to it.
 
 ```json
 {

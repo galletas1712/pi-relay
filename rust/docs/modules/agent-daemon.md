@@ -172,7 +172,9 @@ cleanup it deterministically reconciles durable selected-subagent controls and
 recovers durable post-compaction dispatch intents. It then stales claimed
 process-owned abandoned actions while preserving unclaimed pending actions for
 children of running delegations, materializes every missing child index, and
-reconstructs/drives every existing child index. The last phase recovers initial
+reconstructs/drives every existing child index. Materialization happens exactly
+once per boot, in that pass, because the following delegation crash sweep
+iterates the child set it produced. The last phase recovers initial
 work committed just before a launch crash. The action claim CAS makes repeated
 recovery scans no-ops after the first runner wins. This ordering also lets an
 already-committed exact-child interrupt settle its captured generation before
@@ -203,10 +205,12 @@ parent, delegation, and child sessions in that order; claims
 Ordinary child follow-ups take the same lock order and reject any delegation
 that is not `running`. The daemon then joins child tasks/runtime work before the
 store permits the terminal transition, dropping daemon-managed tool futures and
-their cwd guards. Delegation artifacts live under `.pi-handoff`, which is
-excluded from every fork/read-only clone. Delegation snapshots expose
-`handoff_dir` relative to the session cwd because the cwd may live on a remote
-runtime host; artifact file fields are relative to that directory.
+their cwd guards. Read-only forks and `history.fork` take a btrfs subvolume
+snapshot of the parent cwd, which has no exclude facility, then remove
+`.pi-handoff` from the child cwd immediately, under the same per-cwd mutation
+guard. A forked session therefore does not inherit the source session's
+delegation artifacts. Delegation snapshots expose `handoff_dir` relative to the
+session cwd; artifact file fields are relative to that directory.
 
 ### Driving the loop
 

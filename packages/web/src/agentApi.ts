@@ -246,10 +246,13 @@ export interface SteerSubagentResult {
 }
 
 export interface FollowUpResult {
-	input_id?: string;
-	accepted?: boolean;
-	queued?: boolean;
-	replayed?: boolean;
+	input_id: string;
+	/** True while the stored row is queued, consuming, or consumed. */
+	accepted: boolean;
+	/** True only while the stored row is still queued or consuming. */
+	queued: boolean;
+	/** True when the store matched an existing client_input_id instead of inserting. */
+	replayed: boolean;
 	queue?: QueueProjection | null;
 	active_branch?: SwitchHistoryResult | null;
 	active_branch_sync?: ActiveBranchSyncResponse | null;
