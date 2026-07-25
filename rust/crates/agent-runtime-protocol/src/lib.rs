@@ -216,11 +216,23 @@ pub enum SkillOrigin {
     RuntimeRole,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionScope {
+    #[default]
+    Global,
+    Project,
+    Workspace,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawInstructionFile {
     pub workspace: Option<String>,
     pub path: String,
     pub contents: String,
+    /// Controls prompt heading: global (none), `### Project: …`, or `#### <ws>`.
+    #[serde(default)]
+    pub scope: InstructionScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,8 +275,8 @@ fn is_empty_error_data(value: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_frame, write_frame, RawInstructionFile, RawSkillFile, RuntimeContext, SkillKind,
-        SkillOrigin,
+        read_frame, write_frame, InstructionScope, RawInstructionFile, RawSkillFile, RuntimeContext,
+        SkillKind, SkillOrigin,
     };
     use tokio::io::duplex;
 
@@ -291,8 +303,9 @@ mod tests {
         let context = RuntimeContext {
             instructions: vec![RawInstructionFile {
                 workspace: None,
-                path: "/config/runtime/AGENTS.md".to_string(),
+                path: "/home/test/.agents/AGENTS.md".to_string(),
                 contents: "instructions".to_string(),
+                scope: InstructionScope::Global,
             }],
             skills: vec![RawSkillFile {
                 kind: SkillKind::SubagentRole,

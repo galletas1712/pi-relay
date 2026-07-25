@@ -892,6 +892,7 @@ pub(crate) mod test_support {
                             workspace: Some(workspace_dir.clone()),
                             path: agents_path.display().to_string(),
                             contents,
+                            scope: agent_runtime_protocol::InstructionScope::Workspace,
                         });
                     }
                     let skills_dir = base.join(&workspace_dir).join(".agents/skills");
