@@ -79,9 +79,10 @@ stack. The obsolete Bun lockfile is not part of the supported workflow.
 - Rust stable with Cargo and `rustfmt`, Node.js 20+, and npm.
 - Docker Engine with Compose v2 and PostgreSQL 16. The integration tests need
   a PostgreSQL role allowed to `CREATE DATABASE` and `DROP DATABASE`.
-- A Linux host with `btrfs-progs`, `git`, `rsync`, and passwordless `sudo -n`
-  for `pi-runtime` when using `infra/dev.sh`; the runtime is intentionally a
-  host process and is not dockerized.
+- A Linux host with `btrfs-progs`, `git`, and `rsync`. Workspace btrfs
+  mount(s) must allow unprivileged deletion of owned subvolumes
+  (`user_subvol_rm_allowed`). `pi-runtime` runs as your login user via
+  `infra/dev.sh` and is intentionally a host process (not dockerized).
 - Provider credentials at model-call time. OpenAI/Codex accepts
   `CODEX_ACCESS_TOKEN` or `$HOME/.codex/auth.json`; Anthropic accepts
   `ANTHROPIC_API_KEY` or Claude Code's
