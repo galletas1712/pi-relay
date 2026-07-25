@@ -68,7 +68,7 @@ pub(crate) async fn session_start(
             .map_err(|error| RpcError::new("invalid_params", error.to_string()))?;
         let (workspace_id, workspaces) = state
             .runtime_hosts
-            .materialize_session_with_progress(
+            .materialize_session(
                 &project.runtime_id,
                 project_id,
                 &project.workspaces,
@@ -84,7 +84,7 @@ pub(crate) async fn session_start(
         state.runtime_hosts.require_available(&runtime_id).await?;
         let (workspace_id, workspaces) = state
             .runtime_hosts
-            .materialize_session(&runtime_id, Uuid::nil(), &[], &[])
+            .materialize_session(&runtime_id, Uuid::nil(), &[], &[], None)
             .await?;
         (runtime_id, workspace_id, workspaces)
     };

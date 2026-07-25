@@ -60,7 +60,6 @@ describe("AgentApi MCP wire format", () => {
 			},
 			options: {
 				timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS,
-				onProgress: undefined,
 			},
 		});
 	});

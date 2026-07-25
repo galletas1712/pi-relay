@@ -5,7 +5,6 @@ import {
 	type ConnectionStatus,
 	type RpcClient,
 } from "./rpc.ts";
-import type { WorkspaceMaterializeProgress } from "./workspaceMaterializeProgress.ts";
 import type {
 	Activity,
 	ActiveBranchSyncResponse,
@@ -38,6 +37,7 @@ import type {
 	TranscriptTurnsResult,
 	ProjectWorkspace,
 	Runtime,
+	WorkspaceMaterializeProgress,
 } from "./types.ts";
 import type { EntryScope } from "./queryKeys.ts";
 

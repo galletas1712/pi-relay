@@ -144,6 +144,20 @@ export interface Project {
 	updated_at: string;
 }
 
+export type WorkspaceMaterializePhase =
+	| "refreshing_base"
+	| "copying"
+	| "branch_override"
+	| "done"
+	| "error";
+
+export interface WorkspaceMaterializeProgress {
+	workspace_dir: string;
+	phase: WorkspaceMaterializePhase;
+	index: number;
+	total: number;
+}
+
 export interface EventFrame {
 	event_id: number;
 	event: string;

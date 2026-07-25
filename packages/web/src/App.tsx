@@ -46,7 +46,6 @@ import {
 	workspaceDraftFromProject,
 	type ProjectDialogState,
 } from "./entityDialogs.tsx";
-import { randomId } from "./ids.ts";
 import {
 	backgroundSessionNeedsWarm,
 	canWarmBackgroundSession,
@@ -96,12 +95,8 @@ import {
 	ProviderConfigurationController,
 	type ProviderConfigurationTarget,
 } from "./providerConfigurationController.ts";
-import { isRpcErrorCode, type ConnectionStatus } from "./rpc.ts";
-import {
-	formatWorkspacePreparationStatus,
-	isUncertainSessionStartError,
-	type WorkspaceMaterializeProgress,
-} from "./workspaceMaterializeProgress.ts";
+import { isRpcErrorCode, RpcTransportError, type ConnectionStatus } from "./rpc.ts";
+import { formatWorkspacePreparationStatus } from "./workspaceMaterializeProgress.ts";
 import { findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
 import { stopSession } from "./stopSession.ts";
@@ -222,6 +217,7 @@ import type {
 	ToolListing,
 	TranscriptEntry,
 	TranscriptTurnsResult,
+	WorkspaceMaterializeProgress,
 } from "./types.ts";
 
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
@@ -390,12 +386,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		useState<string | null>(null);
 	const [newSessionSetupGeneration, setNewSessionSetupGeneration] = useState(0);
 	const [sending, setSending] = useState(false);
-	const [workspacePreparationProjectId, setWorkspacePreparationProjectId] =
-		useState<string | null>(null);
-	const [workspacePreparationProgress, setWorkspacePreparationProgress] =
-		useState<WorkspaceMaterializeProgress | null>(null);
-	const [workspacePreparationStatusOverride, setWorkspacePreparationStatusOverride] =
-		useState<string | null>(null);
+	const [workspacePreparation, setWorkspacePreparation] =
+		useState<{ projectId: string; status: string } | null>(null);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
 	const [transcriptDestination, setTranscriptDestination] = useState<TranscriptDestination | null>(null);
@@ -3194,8 +3186,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const workspaces = projectId
 				? startWorkspacesFromScope(submittedWorkspaceScope)
 				: undefined;
-			const preparing =
-				!!projectId && submittedWorkspaceScope.some((entry) => entry.included);
+			const preparingProjectId =
+				projectId && submittedWorkspaceScope.some((entry) => entry.included)
+					? projectId
+					: null;
+			const showWorkspacePreparation = (status: string) =>
+				setWorkspacePreparation(
+					preparingProjectId ? { projectId: preparingProjectId, status } : null,
+				);
 			const params = {
 				sessionId,
 				projectId,
@@ -3224,30 +3222,19 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					mcpAuthStatus,
 					mcpAuthStatusReady,
 				),
-				onProgress: preparing
-					? (progress: WorkspaceMaterializeProgress) => {
-							setWorkspacePreparationProgress(progress);
-							setWorkspacePreparationStatusOverride(null);
-						}
+				onProgress: preparingProjectId
+					? (progress: WorkspaceMaterializeProgress) =>
+							showWorkspacePreparation(formatWorkspacePreparationStatus(progress))
 					: undefined,
 			};
 			let result;
 			try {
-				setWorkspacePreparationProjectId(preparing ? projectId : null);
-				setWorkspacePreparationProgress(null);
-				setWorkspacePreparationStatusOverride(
-					preparing ? "Preparing workspaces…" : null,
-				);
+				showWorkspacePreparation(formatWorkspacePreparationStatus(null));
 				try {
 					result = await api.startSession(params);
 				} catch (error) {
-					if (isUncertainSessionStartError(error)) {
-						setWorkspacePreparationStatusOverride(
-							"Checking whether the session started…",
-						);
-						if (preparing) {
-							setWorkspacePreparationProjectId(projectId);
-						}
+					if (error instanceof RpcTransportError) {
+						showWorkspacePreparation("Checking whether the session started…");
 						const recovered = await reconcileUncertainSessionStart(api, sessionId);
 						if (recovered) {
 							result = recovered;
@@ -3262,9 +3249,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						throw error;
 					}
 				} finally {
-					setWorkspacePreparationProjectId(null);
-					setWorkspacePreparationProgress(null);
-					setWorkspacePreparationStatusOverride(null);
+					setWorkspacePreparation(null);
 				}
 			} catch (error) {
 				if (errorMessage(error).startsWith("mcp_inventory_changed:")) {
@@ -4166,13 +4151,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		workspaceRouteResult.kind === "route"
 			? workspaceRouteResult.warnings.filter((warning) => warning.persistent)
 			: [];
-	const preparingWorkspaces =
-		workspacePreparationProjectId !== null &&
-		workspacePreparationProjectId === selectedProjectId;
-	const workspacePreparationStatus = preparingWorkspaces
-		? workspacePreparationStatusOverride ??
-			formatWorkspacePreparationStatus(workspacePreparationProgress)
-		: null;
+	const workspacePreparationStatus =
+		workspacePreparation?.projectId === selectedProjectId
+			? workspacePreparation.status
+			: null;
 	const mobileTitle = selectedChatSession
 		? sessionTitle(selectedChatSession)
 		: selectedProject
@@ -4395,7 +4377,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 									onMcpLogout={cancelOrLogoutMcp}
 									mcpAuthBusyServer={mcpAuthBusyServer}
 									disabled={sending}
-									preparingWorkspaces={preparingWorkspaces}
 									workspacePreparationStatus={workspacePreparationStatus}
 									mcpAuthMutationBlockedReason={connectionRemoteActionBlockedReason}
 								/>
@@ -4672,8 +4653,11 @@ async function reconcileUncertainSessionStart(
 				replayed: true,
 			};
 		} catch (error) {
-			if (!isSessionNotFoundError(error) && !isUncertainSessionStartError(error)) {
-				// Keep polling through transient read failures while the socket recovers.
+			// Not-found means the start has not landed yet, and a transport failure
+			// leaves the read itself unanswered; anything else is a real error the
+			// caller must see immediately instead of after the whole window.
+			if (!isSessionNotFoundError(error) && !(error instanceof RpcTransportError)) {
+				throw error;
 			}
 		}
 		await new Promise((resolve) => window.setTimeout(resolve, UNCERTAIN_START_POLL_MS));

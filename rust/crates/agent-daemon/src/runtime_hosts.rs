@@ -9,7 +9,7 @@ use agent_mcp_types::{
 use agent_runtime_protocol::{
     read_frame, write_frame, ControlToRuntime, RuntimeCommand, RuntimeCommandError,
     RuntimeCommandResult, RuntimeHello, RuntimeRecord, RuntimeToControl, SelectedWorkspace,
-    WorkspaceMaterializeProgress, COMMAND_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
+    WorkspaceMaterializeProgress, HEARTBEAT_TIMEOUT_SECS,
 };
 use agent_store::PostgresAgentStore;
 use agent_tools::ProviderTool;
@@ -230,7 +230,11 @@ impl RuntimeRegistry {
                                 .get(&command_id)
                                 .and_then(|waiter| waiter.progress.clone());
                             if let Some(progress_tx) = progress_tx {
-                                let _ = progress_tx.send(progress).await;
+                                // Progress is ephemeral UI status, so a full
+                                // queue drops frames rather than stalling this
+                                // loop's heartbeats and Result frames behind a
+                                // slow websocket client.
+                                let _ = progress_tx.try_send(progress);
                             }
                         }
                         RuntimeToControl::Result { command_id, result } => {
@@ -297,17 +301,10 @@ impl RuntimeRegistry {
         &self,
         runtime_id: &str,
         command: RuntimeCommand,
-    ) -> Result<RuntimeCommandResult> {
-        self.execute_with_progress(runtime_id, command, None).await
-    }
-
-    pub(crate) async fn execute_with_progress(
-        &self,
-        runtime_id: &str,
-        command: RuntimeCommand,
-        mut on_progress: Option<mpsc::Sender<WorkspaceMaterializeProgress>>,
+        on_progress: Option<mpsc::Sender<WorkspaceMaterializeProgress>>,
     ) -> Result<RuntimeCommandResult> {
         let command_id = format!("runtime_command_{}", Uuid::new_v4());
+        let command_timeout = command.timeout();
         let (tx, rx) = oneshot::channel();
         let (connection_id, sender) = {
             let connections = self.connections.lock().await;
@@ -336,12 +333,10 @@ impl RuntimeRegistry {
             return Err(anyhow!("runtime unavailable: {runtime_id}"));
         }
         let mut cancellation = RuntimeCommandCancellation::new(command_id.clone(), sender);
-        let outcome = timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), rx).await;
-        // Drop the progress sender so any forwarder task can finish.
-        on_progress.take();
-        if let Some(waiter) = self.waiters.lock().await.get_mut(&command_id) {
-            waiter.progress = None;
-        }
+        let outcome = timeout(command_timeout, rx).await;
+        // Dropping the waiter closes this command's progress channel; the result
+        // handler and `teardown_connection` may already have removed it.
+        self.waiters.lock().await.remove(&command_id);
         match outcome {
             Ok(Ok(result)) => {
                 cancellation.disarm();
@@ -351,10 +346,7 @@ impl RuntimeRegistry {
                 cancellation.disarm();
                 Err(anyhow!("runtime disconnected while command was running"))
             }
-            Err(_) => {
-                self.waiters.lock().await.remove(&command_id);
-                Err(anyhow!("runtime command timed out"))
-            }
+            Err(_) => Err(anyhow!("runtime command timed out")),
         }
     }
 
@@ -387,28 +379,11 @@ impl RuntimeRegistry {
         project_id: Uuid,
         project_workspaces: &[agent_store::ProjectWorkspace],
         selected: &[crate::workspace_selection::SelectedWorkspace],
-    ) -> Result<(String, Vec<agent_store::SessionWorkspace>)> {
-        self.materialize_session_with_progress(
-            runtime_id,
-            project_id,
-            project_workspaces,
-            selected,
-            None,
-        )
-        .await
-    }
-
-    pub(crate) async fn materialize_session_with_progress(
-        &self,
-        runtime_id: &str,
-        project_id: Uuid,
-        project_workspaces: &[agent_store::ProjectWorkspace],
-        selected: &[crate::workspace_selection::SelectedWorkspace],
         on_progress: Option<mpsc::Sender<WorkspaceMaterializeProgress>>,
     ) -> Result<(String, Vec<agent_store::SessionWorkspace>)> {
         let workspace_id = format!("workspace_{}", Uuid::new_v4());
         let result = self
-            .execute_with_progress(
+            .execute(
                 runtime_id,
                 RuntimeCommand::MaterializeSession {
                     project_id: project_id.to_string(),
@@ -443,6 +418,7 @@ impl RuntimeRegistry {
                 workspace_id: workspace_id.to_string(),
                 workspaces: workspaces.to_vec(),
             },
+            None,
         )
         .await
         .map(|_| ())
@@ -475,6 +451,7 @@ impl RuntimeRegistry {
                     target_workspace_id: target_workspace_id.to_string(),
                     workspaces: workspaces.to_vec(),
                 },
+                None,
             )
             .await?;
         let RuntimeCommandResult::Materialized { workspaces } = result else {
@@ -490,6 +467,7 @@ impl RuntimeRegistry {
             RuntimeCommand::DestroySession {
                 workspace_id: config.workspace_id,
             },
+            None,
         )
         .await
         .map(|_| ())
@@ -507,6 +485,7 @@ impl RuntimeRegistry {
                 project_id: project_id.to_string(),
                 workspaces: workspaces.to_vec(),
             },
+            None,
         )
         .await
         .map(|_| ())
@@ -522,6 +501,7 @@ impl RuntimeRegistry {
             RuntimeCommand::RemoveProject {
                 project_id: project_id.to_string(),
             },
+            None,
         )
         .await
         .map(|_| ())
@@ -542,6 +522,7 @@ impl RuntimeRegistry {
                 rel_path: rel_path.to_string(),
                 contents: contents.to_string(),
             },
+            None,
         )
         .await
         .map(|_| ())
@@ -560,6 +541,7 @@ impl RuntimeRegistry {
                     workspace_id: workspace_id.to_string(),
                     rel_path: rel_path.to_string(),
                 },
+                None,
             )
             .await?
         {
@@ -583,6 +565,7 @@ impl RuntimeRegistry {
                     workspace_dirs: workspace_dirs.to_vec(),
                     project_key,
                 },
+                None,
             )
             .await?
         {
@@ -602,7 +585,7 @@ impl RuntimeRegistry {
         extract: impl FnOnce(RuntimeCommandResult) -> Option<T>,
         wrong: &'static str,
     ) -> Result<T> {
-        extract(self.execute(runtime_id, command).await?).ok_or_else(|| anyhow!(wrong))
+        extract(self.execute(runtime_id, command, None).await?).ok_or_else(|| anyhow!(wrong))
     }
 
     pub(crate) async fn mcp_inventory(

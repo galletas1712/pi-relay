@@ -1,16 +1,4 @@
-export type WorkspaceMaterializePhase =
-	| "refreshing_base"
-	| "copying"
-	| "branch_override"
-	| "done"
-	| "error";
-
-export interface WorkspaceMaterializeProgress {
-	workspace_dir: string;
-	phase: WorkspaceMaterializePhase;
-	index: number;
-	total: number;
-}
+import type { WorkspaceMaterializePhase, WorkspaceMaterializeProgress } from "./types.ts";
 
 export function formatWorkspacePreparationStatus(
 	progress: WorkspaceMaterializeProgress | null,
@@ -34,16 +22,5 @@ function phaseLabel(phase: WorkspaceMaterializePhase): string {
 			return "Prepared";
 		case "error":
 			return "Failed preparing";
-		default:
-			return "Preparing";
 	}
-}
-
-export function isUncertainSessionStartError(error: unknown): boolean {
-	const message = error instanceof Error ? error.message : String(error ?? "");
-	return (
-		message === "websocket request timed out" ||
-		message === "websocket closed" ||
-		message === "websocket reconnecting"
-	);
 }

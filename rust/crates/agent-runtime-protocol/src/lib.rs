@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use agent_mcp_types::{
     McpAuthServerStatus, McpInventory, McpLogoutResult, McpOAuthLoginStart, McpSessionManifest,
@@ -13,9 +14,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 pub const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
-/// Matches the web client's workspace-operation RPC timeout so long multi-repo
-/// materialize/fork work is not cut off by the daemon↔runtime hop first.
-pub const COMMAND_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeHello {
@@ -211,6 +209,39 @@ pub enum RuntimeCommand {
     },
 }
 
+impl RuntimeCommand {
+    /// How long the daemon waits for this command's result. Materializing a
+    /// session clones or fetches every selected repo, so it gets a far larger
+    /// budget than the interactive commands sharing the same connection; a
+    /// single global budget would let a slow bash tool call hold a turn for as
+    /// long as a multi-repo checkout. Matching exhaustively keeps a new variant
+    /// a compile error rather than a silent inheritance of the default.
+    pub fn timeout(&self) -> Duration {
+        match self {
+            Self::MaterializeSession { .. } => Duration::from_secs(300),
+            Self::ValidateProject { .. }
+            | Self::EnsureSession { .. }
+            | Self::ForkSession { .. }
+            | Self::DestroySession { .. }
+            | Self::ReconcileProject { .. }
+            | Self::RemoveProject { .. }
+            | Self::ExecuteTool { .. }
+            | Self::WriteWorkspaceFile { .. }
+            | Self::ReadWorkspaceFile { .. }
+            | Self::ReadRuntimeContext { .. }
+            | Self::McpInventory { .. }
+            | Self::McpSelect { .. }
+            | Self::ExecuteMcpTool { .. }
+            | Self::McpToolViews { .. }
+            | Self::McpAuthStatuses {}
+            | Self::McpBeginLogin { .. }
+            | Self::McpCompleteLogin { .. }
+            | Self::McpCancelLogin { .. }
+            | Self::McpLogout { .. } => Duration::from_secs(120),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeCommandResult {
@@ -304,9 +335,37 @@ fn is_empty_error_data(value: &serde_json::Value) -> bool {
 mod tests {
     use super::{
         read_frame, write_frame, InstructionScope, RawInstructionFile, RawSkillFile,
-        RuntimeContext, SkillKind, SkillOrigin,
+        RuntimeCommand, RuntimeContext, SkillKind, SkillOrigin,
     };
+    use std::time::Duration;
     use tokio::io::duplex;
+
+    #[test]
+    fn materialize_gets_the_long_timeout_and_ordinary_commands_the_default() {
+        assert_eq!(
+            RuntimeCommand::MaterializeSession {
+                project_id: "project".to_string(),
+                workspace_id: "workspace".to_string(),
+                project_workspaces: Vec::new(),
+                selected_workspaces: Vec::new(),
+            }
+            .timeout(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            RuntimeCommand::ExecuteTool {
+                workspace_id: "workspace".to_string(),
+                provider: agent_vocab::ProviderKind::Claude,
+                tool_call: agent_vocab::ToolCall {
+                    id: agent_vocab::ToolCallId::new("call-1"),
+                    tool_name: "Bash".to_string(),
+                    args_json: "{}".to_string(),
+                },
+            }
+            .timeout(),
+            Duration::from_secs(120)
+        );
+    }
 
     #[tokio::test]
     async fn round_trips_frames_larger_than_eight_megabytes() {

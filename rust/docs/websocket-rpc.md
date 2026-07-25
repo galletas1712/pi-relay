@@ -485,6 +485,21 @@ Live events:
 }
 ```
 
+Progress frames, correlated to an in-flight request by `id` and lossy (see
+`session.start`):
+
+```json
+{
+  "id": "req_1",
+  "progress": {
+    "workspace_dir": "repo-a",
+    "phase": "refreshing_base",
+    "index": 1,
+    "total": 3
+  }
+}
+```
+
 ## Session RPC
 
 ### `session.start`
@@ -550,8 +565,9 @@ it from the managed base, leaving the shared per-project base on the project's
 configured branch. Branch overrides are only valid for git workspaces. The daemon
 rejects (`invalid_params`) a `workspaces` array that is empty, names a directory the
 project does not declare, repeats a workspace, or sets `branch` on a local-folder
-workspace. Selected workspaces are materialized in the project's declared order
-regardless of request order. The field is ignored for ephemeral sessions.
+workspace. Selected workspaces are materialized concurrently; the response lists
+them in the project's declared order regardless of request order. The field is
+ignored for ephemeral sessions.
 
 While materializing, the daemon may emit ephemeral request-correlated progress
 frames on the same websocket (not durable `events.*` rows):
@@ -571,8 +587,11 @@ frames on the same websocket (not durable `events.*` rows):
 `phase` is one of `refreshing_base`, `copying`, `branch_override`, `done`, or
 `error`. `index` is 1-based in the selected set. These frames do not complete
 the `session.start` request; the normal `{ "id", "ok", "result" }` response
-still does. The daemon↔runtime materialize command timeout is 300 seconds to
-match the web client's workspace-operation RPC timeout.
+still does. They are ephemeral: when a client drains them too slowly the daemon
+drops frames rather than stalling the runtime connection, so a client must treat
+the sequence as lossy and rely on the response for the final state. Each
+daemon↔runtime command carries its own timeout: 300 seconds for the materialize
+command, 120 seconds for every other command.
 
 The daemon writes `session.created`, `input.accepted`, transcript entries,
 actions, the optional content-addressed MCP-only manifest reference, and events

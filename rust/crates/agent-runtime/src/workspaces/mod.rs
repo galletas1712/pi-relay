@@ -17,8 +17,8 @@ use agent_runtime_protocol::{
     WorkspaceMaterializeProgress,
 };
 use anyhow::{bail, Context, Result};
-use futures_util::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
+use futures_util::{stream, StreamExt, TryStreamExt};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 pub use self::config::validate_workspace_dir;
@@ -35,13 +35,14 @@ use self::instantiate::{
 use self::local::refresh_local_workspace_base;
 pub use self::selection::SelectedWorkspace;
 
-/// Cap concurrent workspace materializations so many large `git fetch`es do not
-/// melt the host. Serial still works for small selections.
+/// Bounds the network/CPU load from concurrent `git fetch`es during materialization.
 const MATERIALIZE_CONCURRENCY: usize = 4;
 
 pub type MaterializeProgressSink = tokio::sync::mpsc::Sender<WorkspaceMaterializeProgress>;
 
-type SlotLockMap = HashMap<(Uuid, String), Arc<Mutex<()>>>;
+/// Per-key mutexes, created on first use and held by key for the duration of a
+/// mutation.
+type KeyedLocks<K> = Arc<Mutex<HashMap<K, Arc<Mutex<()>>>>>;
 
 // `.pi-handoff` is a sibling of the workspace dirs under the cwd root. It is
 // owned by the daemon for delegation artifact files; it is never a workspace,
@@ -53,10 +54,10 @@ pub struct WorkspaceManager {
     runtime_config_root: PathBuf,
     home_dir: PathBuf,
     /// Serializes project-level base-tree mutations (stale slot cleanup, wipe).
-    project_bases_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
+    project_bases_locks: KeyedLocks<Uuid>,
     /// Serializes refresh of a single managed workspace base slot.
-    workspace_base_slot_locks: Arc<Mutex<SlotLockMap>>,
-    cwd_mutation_guards: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    workspace_base_slot_locks: KeyedLocks<(Uuid, String)>,
+    cwd_mutation_guards: KeyedLocks<PathBuf>,
 }
 
 impl WorkspaceManager {
@@ -343,55 +344,29 @@ impl WorkspaceManager {
                     .await?;
             }
             let total = selected_workspaces.len();
-            let semaphore = Arc::new(Semaphore::new(MATERIALIZE_CONCURRENCY.max(1)));
-            let mut tasks = FuturesUnordered::new();
+            let mut pending = Vec::with_capacity(total);
             for (offset, selected) in selected_workspaces.iter().enumerate() {
-                let manager = self.clone();
-                let cwd = cwd.clone();
-                let workspace_id = workspace_id.to_string();
-                let selected = selected.clone();
-                let progress = progress.clone();
-                let semaphore = semaphore.clone();
-                let index = offset + 1;
                 let workspace_dir = workspace_base_config(&selected.workspace)?.workspace_dir;
-                tasks.push(async move {
-                    let _permit = semaphore
-                        .acquire()
-                        .await
-                        .expect("materialize concurrency semaphore stays open");
-                    let result = manager
-                        .materialize_workspace(
-                            project_id,
-                            &workspace_id,
-                            &cwd,
-                            &selected.workspace,
-                            selected.branch_override.as_deref(),
-                            MaterializeProgressCtx {
-                                workspace_dir,
-                                index,
-                                total,
-                                progress: progress.as_ref(),
-                            },
-                        )
-                        .await;
-                    (offset, result)
-                });
+                pending.push(self.materialize_workspace(
+                    project_id,
+                    workspace_id,
+                    &cwd,
+                    &selected.workspace,
+                    selected.branch_override.as_deref(),
+                    MaterializeProgressCtx {
+                        workspace_dir,
+                        index: offset + 1,
+                        total,
+                        progress: progress.as_ref(),
+                    },
+                ));
             }
-            let mut slots: Vec<Option<SessionWorkspace>> = (0..total).map(|_| None).collect();
-            while let Some((offset, result)) = tasks.next().await {
-                match result {
-                    Ok(workspace) => slots[offset] = Some(workspace),
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok::<_, anyhow::Error>(
-                slots
-                    .into_iter()
-                    .map(|workspace| {
-                        workspace.expect("every selected workspace slot is filled on success")
-                    })
-                    .collect(),
-            )
+            // `buffered` bounds in-flight materializations while yielding results
+            // in the project's declared workspace order.
+            stream::iter(pending)
+                .buffered(MATERIALIZE_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await
         }
         .await;
         match materialized {
@@ -703,8 +678,8 @@ impl WorkspaceManager {
             }
         };
         match &result {
-            Ok(_) => progress.emit(WorkspaceMaterializePhase::Done).await,
-            Err(_) => progress.emit(WorkspaceMaterializePhase::Error).await,
+            Ok(_) => progress.emit(WorkspaceMaterializePhase::Done),
+            Err(_) => progress.emit(WorkspaceMaterializePhase::Error),
         }
         result
     }
@@ -718,9 +693,7 @@ impl WorkspaceManager {
         branch_override: Option<&str>,
         progress: &MaterializeProgressCtx<'_>,
     ) -> Result<SessionWorkspace> {
-        progress
-            .emit(WorkspaceMaterializePhase::RefreshingBase)
-            .await;
+        progress.emit(WorkspaceMaterializePhase::RefreshingBase);
         let base = self.refresh_workspace_base(project_id, workspace).await?;
         let remote_url = required_git_field(base.config.remote_url.as_deref(), "remote_url")?;
         let default_branch =
@@ -732,16 +705,14 @@ impl WorkspaceManager {
         }
         let local_branch = local_branch(session_id, workspace_dir);
 
-        progress.emit(WorkspaceMaterializePhase::Copying).await;
+        progress.emit(WorkspaceMaterializePhase::Copying);
         populate_workspace(&base.path, &target).await?;
         // The session copy inherits the base's branch by default; an override fetches
         // the requested branch into this session's copy only, leaving the shared base
         // on the project's configured branch.
         let (session_branch, base_sha) = match branch_override {
             Some(branch) if branch != default_branch => {
-                progress
-                    .emit(WorkspaceMaterializePhase::BranchOverride)
-                    .await;
+                progress.emit(WorkspaceMaterializePhase::BranchOverride);
                 let sha = fetch_session_branch_head(&target, branch).await?;
                 (branch, sha)
             }
@@ -768,9 +739,7 @@ impl WorkspaceManager {
         workspace: &ProjectWorkspace,
         progress: &MaterializeProgressCtx<'_>,
     ) -> Result<SessionWorkspace> {
-        progress
-            .emit(WorkspaceMaterializePhase::RefreshingBase)
-            .await;
+        progress.emit(WorkspaceMaterializePhase::RefreshingBase);
         let base = self.refresh_workspace_base(project_id, workspace).await?;
         let source_path = required_local_field(base.config.source_path.as_deref(), "source_path")?;
         let workspace_dir = base.config.workspace_dir.as_str();
@@ -778,7 +747,7 @@ impl WorkspaceManager {
         if target.exists() {
             bail!("session workspace already exists: {}", target.display());
         }
-        progress.emit(WorkspaceMaterializePhase::Copying).await;
+        progress.emit(WorkspaceMaterializePhase::Copying);
         populate_workspace(&base.path, &target).await?;
         Ok(SessionWorkspace::local(workspace_dir, source_path))
     }
@@ -792,16 +761,16 @@ struct MaterializeProgressCtx<'a> {
 }
 
 impl MaterializeProgressCtx<'_> {
-    async fn emit(&self, phase: WorkspaceMaterializePhase) {
+    /// Progress is ephemeral status, so a full queue drops frames rather than
+    /// throttling materialize work behind progress delivery.
+    fn emit(&self, phase: WorkspaceMaterializePhase) {
         if let Some(progress) = self.progress {
-            let _ = progress
-                .send(WorkspaceMaterializeProgress {
-                    workspace_dir: self.workspace_dir.clone(),
-                    phase,
-                    index: self.index,
-                    total: self.total,
-                })
-                .await;
+            let _ = progress.try_send(WorkspaceMaterializeProgress {
+                workspace_dir: self.workspace_dir.clone(),
+                phase,
+                index: self.index,
+                total: self.total,
+            });
         }
     }
 }
@@ -954,6 +923,26 @@ mod tests {
     fn write_file(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
         std::fs::write(path, contents).expect("write");
+    }
+
+    /// A sync test: `emit` has no async context to block in, and a full sink
+    /// drops the frame rather than making materialize wait for a reader.
+    #[test]
+    fn progress_emit_drops_frames_once_the_sink_is_full() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let progress = MaterializeProgressCtx {
+            workspace_dir: "repo".to_string(),
+            index: 1,
+            total: 1,
+            progress: Some(&sender),
+        };
+
+        progress.emit(WorkspaceMaterializePhase::RefreshingBase);
+        progress.emit(WorkspaceMaterializePhase::Copying);
+
+        let delivered = receiver.try_recv().expect("first frame");
+        assert_eq!(delivered.phase, WorkspaceMaterializePhase::RefreshingBase);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
