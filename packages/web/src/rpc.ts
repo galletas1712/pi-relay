@@ -279,11 +279,8 @@ export class AgentRpcClient implements RpcClient {
 			const timer = globalThis.setTimeout(() => {
 				const pending = this.pending.get(id);
 				if (!pending) return;
-				// Abandon only this request. Closing the whole socket used to kill
-				// in-flight workspace starts when an unrelated 15s RPC timed out.
+				// Abandon only this request so other in-flight RPCs keep the socket.
 				this.pending.delete(id);
-				// Reject the pending entry; the promise.then handler below settles
-				// this wrapper (do not reject twice).
 				pending.reject(new Error("websocket request timed out"));
 			}, timeoutMs);
 			promise.then(

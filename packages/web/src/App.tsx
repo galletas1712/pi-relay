@@ -3245,9 +3245,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						setWorkspacePreparationStatusOverride(
 							"Checking whether the session started…",
 						);
-						if (preparing) {
-							setWorkspacePreparationProjectId(projectId);
-						}
 						const recovered = await reconcileUncertainSessionStart(api, sessionId);
 						if (recovered) {
 							result = recovered;
