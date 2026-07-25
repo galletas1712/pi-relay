@@ -196,10 +196,11 @@ impl WorkspaceManager {
     }
 
     pub async fn validate_root(&self) -> Result<()> {
-        tokio::fs::create_dir_all(self.state_root.join("sessions")).await?;
-        let probe = self
-            .state_root
-            .join(format!(".btrfs-probe-{}", Uuid::new_v4()));
+        let sessions = self.state_root.join("sessions");
+        tokio::fs::create_dir_all(&sessions).await?;
+        // Probe under sessions/: that is where cwd subvolumes live (and may be a
+        // separate btrfs mount from state_root itself).
+        let probe = sessions.join(format!(".btrfs-probe-{}", Uuid::new_v4()));
         create_session_subvolume(&probe).await?;
         destroy_session_subvolume(&probe).await
     }
