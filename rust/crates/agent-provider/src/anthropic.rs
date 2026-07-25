@@ -7423,9 +7423,11 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
                             }),
                         ],
                     }),
-                    provider_replay: vec![
-                        ProviderReplayItem::new(ProviderKind::OpenAi, &openai_raw).unwrap()
-                    ],
+                    provider_replay: vec![ProviderReplayItem::new(
+                        ProviderKind::OpenAi,
+                        &openai_raw,
+                    )
+                    .unwrap()],
                 },
             ],
         )
@@ -7454,9 +7456,11 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
                         Some(80_000),
                         agent_vocab::TurnId(7),
                     )),
-                    provider_replay: vec![
-                        ProviderReplayItem::new(ProviderKind::OpenAi, &openai_raw).unwrap()
-                    ],
+                    provider_replay: vec![ProviderReplayItem::new(
+                        ProviderKind::OpenAi,
+                        &openai_raw,
+                    )
+                    .unwrap()],
                 },
                 TranscriptItem::UserMessage(UserMessage::text("continue")).into(),
             ],

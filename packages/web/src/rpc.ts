@@ -245,9 +245,8 @@ export class AgentRpcClient implements RpcClient {
 			}
 			return;
 		}
-		if ("progress" in data && "id" in data && !("event" in data)) {
-			const pending = this.pending.get(data.id);
-			pending?.onProgress?.(data.progress);
+		if ("progress" in data) {
+			this.pending.get(data.id)?.onProgress?.(data.progress);
 			return;
 		}
 		for (const handler of this.eventHandlers) handler(data);

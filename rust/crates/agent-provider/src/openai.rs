@@ -6151,9 +6151,11 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
                             }),
                         ],
                     }),
-                    provider_replay: vec![
-                        ProviderReplayItem::new(ProviderKind::Claude, &claude_raw).unwrap()
-                    ],
+                    provider_replay: vec![ProviderReplayItem::new(
+                        ProviderKind::Claude,
+                        &claude_raw,
+                    )
+                    .unwrap()],
                 },
             ],
         )

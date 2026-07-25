@@ -5336,13 +5336,12 @@ async fn idle_session_can_switch_provider_after_transcript_and_enqueue_captures_
     let pool = sqlx::PgPool::connect(&database_url)
         .await
         .expect("connect route check pool");
-    let value: serde_json::Value = sqlx::query_scalar(
-        "select provider_config from queued_inputs where id=$1",
-    )
-    .bind(input_id)
-    .fetch_one(&pool)
-    .await
-    .expect("queued route");
+    let value: serde_json::Value =
+        sqlx::query_scalar("select provider_config from queued_inputs where id=$1")
+            .bind(input_id)
+            .fetch_one(&pool)
+            .await
+            .expect("queued route");
     pool.close().await;
     let route: ProviderConfig = serde_json::from_value(value).expect("provider route");
     assert_eq!(route.kind, ProviderKind::Claude);
