@@ -34,8 +34,6 @@ function phaseLabel(phase: WorkspaceMaterializePhase): string {
 			return "Prepared";
 		case "error":
 			return "Failed preparing";
-		default:
-			return "Preparing";
 	}
 }
 

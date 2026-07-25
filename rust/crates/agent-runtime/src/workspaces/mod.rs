@@ -35,8 +35,7 @@ use self::instantiate::{
 use self::local::refresh_local_workspace_base;
 pub use self::selection::SelectedWorkspace;
 
-/// Cap concurrent workspace materializations so many large `git fetch`es do not
-/// melt the host. Serial still works for small selections.
+/// Bounds the network/CPU load from concurrent `git fetch`es during materialization.
 const MATERIALIZE_CONCURRENCY: usize = 4;
 
 pub type MaterializeProgressSink = tokio::sync::mpsc::Sender<WorkspaceMaterializeProgress>;
@@ -343,7 +342,7 @@ impl WorkspaceManager {
                     .await?;
             }
             let total = selected_workspaces.len();
-            let semaphore = Arc::new(Semaphore::new(MATERIALIZE_CONCURRENCY.max(1)));
+            let semaphore = Arc::new(Semaphore::new(MATERIALIZE_CONCURRENCY));
             let mut tasks = FuturesUnordered::new();
             for (offset, selected) in selected_workspaces.iter().enumerate() {
                 let manager = self.clone();

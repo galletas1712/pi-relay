@@ -337,7 +337,6 @@ impl RuntimeRegistry {
         }
         let mut cancellation = RuntimeCommandCancellation::new(command_id.clone(), sender);
         let outcome = timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), rx).await;
-        // Drop the progress sender so any forwarder task can finish.
         on_progress.take();
         if let Some(waiter) = self.waiters.lock().await.get_mut(&command_id) {
             waiter.progress = None;

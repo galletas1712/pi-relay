@@ -1501,7 +1501,6 @@ describe("App workspace route identity integration", () => {
 		expect(startParams).toEqual({
 			sessionId: params.sessionId,
 			projectId: "project-1",
-			runtimeId: undefined,
 			provider: undefined,
 			metadata: {
 				title: "start combined setup",

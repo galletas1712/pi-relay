@@ -539,75 +539,63 @@ async fn dispatch_request(
     };
     match method {
         RpcMethod::SessionStart => session_start::session_start(state, params, on_progress).await,
-        other => {
-            let _ = on_progress;
-            match other {
-                RpcMethod::SessionStart => unreachable!("session.start handled above"),
-                RpcMethod::SessionList => session_list(state, params).await,
-                RpcMethod::SessionGet => session_get(state, params).await,
-                RpcMethod::SessionSyncActiveBranch => {
-                    session_sync_active_branch(state, params).await
-                }
-                RpcMethod::SessionRename => session_rename(state, params).await,
-                RpcMethod::SessionConfigure => session_configure(state, params).await,
-                RpcMethod::SessionDelete => session_delete(state, params).await,
-                RpcMethod::ProjectList => project_list(state).await,
-                RpcMethod::ProjectCreate => project_create(state, params).await,
-                RpcMethod::ProjectUpdate => project_update(state, params).await,
-                RpcMethod::ProjectDelete => project_delete(state, params).await,
-                RpcMethod::RuntimeList => runtime_list(state).await,
-                RpcMethod::SystemPrompt => system_prompt(state, params).await,
-                RpcMethod::EventsSubscribe => {
-                    events_subscribe(state, subscriptions, event_high_water, params).await
-                }
-                RpcMethod::EventsUnsubscribe => {
-                    events_unsubscribe(subscriptions, event_high_water, params)
-                }
-                RpcMethod::InputFollowUp => input_user(state, params).await,
-                RpcMethod::InputPromoteQueued => input_promote_queued(state, params).await,
-                RpcMethod::InputUpdateQueued => input_update_queued(state, params).await,
-                RpcMethod::InputCancelQueued => input_cancel_queued(state, params).await,
-                RpcMethod::InputReorderQueuedFollowUps => {
-                    input_reorder_queued_follow_ups(state, params).await
-                }
-                RpcMethod::InputInterrupt => input_interrupt(state, params).await,
-                RpcMethod::TranscriptIndex => transcript_index(state, params).await,
-                RpcMethod::TranscriptEntries => transcript_entries(state, params).await,
-                RpcMethod::TranscriptTurns => transcript_turns(state, params).await,
-                RpcMethod::TranscriptTurnDetail => transcript_turn_detail(state, params).await,
-                RpcMethod::HistoryTargets => history_targets(state, params).await,
-                RpcMethod::HistoryTree => history_tree(state, params).await,
-                RpcMethod::HistoryContext => history_context(state, params).await,
-                RpcMethod::HistorySwitch => history::switch(state, params).await,
-                RpcMethod::HistoryFork => history_fork::fork(state, params).await,
-                RpcMethod::TurnResume => turn_resume(state, params).await,
-                RpcMethod::McpInventory => mcp_inventory(state, params).await,
-                RpcMethod::McpStatus => mcp_auth::status(state, params).await,
-                RpcMethod::McpLogin => mcp_auth::login(state, params).await,
-                RpcMethod::McpComplete => mcp_auth::complete(state, params).await,
-                RpcMethod::McpCancel => mcp_auth::cancel(state, params).await,
-                RpcMethod::McpLogout => mcp_auth::logout(state, params).await,
-                RpcMethod::ToolsList => tools_list(state, params).await,
-                RpcMethod::CompactionRequest => compaction_request(state, params).await,
-                RpcMethod::DelegationStartFull => {
-                    delegation_tools::rpc_start_full(state, params).await
-                }
-                RpcMethod::DelegationStartReadonlyFanout => {
-                    delegation_tools::rpc_start_readonly_fanout(state, params).await
-                }
-                RpcMethod::DelegationStatus => delegation_tools::rpc_status(state, params).await,
-                RpcMethod::DelegationCancel => delegation_tools::rpc_cancel(state, params).await,
-                RpcMethod::DelegationSteerSubagent => {
-                    delegation_tools::rpc_steer_subagent(state, params).await
-                }
-                RpcMethod::DelegationList => delegation_tools::rpc_list(state, params).await,
-                RpcMethod::DelegationReadHandoffFile => {
-                    delegation_tools::rpc_read_handoff_file(state, params).await
-                }
-                RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
-                RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
-            }
+        RpcMethod::SessionList => session_list(state, params).await,
+        RpcMethod::SessionGet => session_get(state, params).await,
+        RpcMethod::SessionSyncActiveBranch => session_sync_active_branch(state, params).await,
+        RpcMethod::SessionRename => session_rename(state, params).await,
+        RpcMethod::SessionConfigure => session_configure(state, params).await,
+        RpcMethod::SessionDelete => session_delete(state, params).await,
+        RpcMethod::ProjectList => project_list(state).await,
+        RpcMethod::ProjectCreate => project_create(state, params).await,
+        RpcMethod::ProjectUpdate => project_update(state, params).await,
+        RpcMethod::ProjectDelete => project_delete(state, params).await,
+        RpcMethod::RuntimeList => runtime_list(state).await,
+        RpcMethod::SystemPrompt => system_prompt(state, params).await,
+        RpcMethod::EventsSubscribe => {
+            events_subscribe(state, subscriptions, event_high_water, params).await
         }
+        RpcMethod::EventsUnsubscribe => events_unsubscribe(subscriptions, event_high_water, params),
+        RpcMethod::InputFollowUp => input_user(state, params).await,
+        RpcMethod::InputPromoteQueued => input_promote_queued(state, params).await,
+        RpcMethod::InputUpdateQueued => input_update_queued(state, params).await,
+        RpcMethod::InputCancelQueued => input_cancel_queued(state, params).await,
+        RpcMethod::InputReorderQueuedFollowUps => {
+            input_reorder_queued_follow_ups(state, params).await
+        }
+        RpcMethod::InputInterrupt => input_interrupt(state, params).await,
+        RpcMethod::TranscriptIndex => transcript_index(state, params).await,
+        RpcMethod::TranscriptEntries => transcript_entries(state, params).await,
+        RpcMethod::TranscriptTurns => transcript_turns(state, params).await,
+        RpcMethod::TranscriptTurnDetail => transcript_turn_detail(state, params).await,
+        RpcMethod::HistoryTargets => history_targets(state, params).await,
+        RpcMethod::HistoryTree => history_tree(state, params).await,
+        RpcMethod::HistoryContext => history_context(state, params).await,
+        RpcMethod::HistorySwitch => history::switch(state, params).await,
+        RpcMethod::HistoryFork => history_fork::fork(state, params).await,
+        RpcMethod::TurnResume => turn_resume(state, params).await,
+        RpcMethod::McpInventory => mcp_inventory(state, params).await,
+        RpcMethod::McpStatus => mcp_auth::status(state, params).await,
+        RpcMethod::McpLogin => mcp_auth::login(state, params).await,
+        RpcMethod::McpComplete => mcp_auth::complete(state, params).await,
+        RpcMethod::McpCancel => mcp_auth::cancel(state, params).await,
+        RpcMethod::McpLogout => mcp_auth::logout(state, params).await,
+        RpcMethod::ToolsList => tools_list(state, params).await,
+        RpcMethod::CompactionRequest => compaction_request(state, params).await,
+        RpcMethod::DelegationStartFull => delegation_tools::rpc_start_full(state, params).await,
+        RpcMethod::DelegationStartReadonlyFanout => {
+            delegation_tools::rpc_start_readonly_fanout(state, params).await
+        }
+        RpcMethod::DelegationStatus => delegation_tools::rpc_status(state, params).await,
+        RpcMethod::DelegationCancel => delegation_tools::rpc_cancel(state, params).await,
+        RpcMethod::DelegationSteerSubagent => {
+            delegation_tools::rpc_steer_subagent(state, params).await
+        }
+        RpcMethod::DelegationList => delegation_tools::rpc_list(state, params).await,
+        RpcMethod::DelegationReadHandoffFile => {
+            delegation_tools::rpc_read_handoff_file(state, params).await
+        }
+        RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
+        RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }
 }
 
