@@ -13,10 +13,12 @@ use std::{
 
 use agent_runtime_protocol::{
     InstructionScope, ProjectWorkspace, RawInstructionFile, RawSkillFile, RuntimeContext,
-    SessionWorkspace, SkillKind, SkillOrigin, WorkspaceKind,
+    SessionWorkspace, SkillKind, SkillOrigin, WorkspaceKind, WorkspaceMaterializePhase,
+    WorkspaceMaterializeProgress,
 };
 use anyhow::{bail, Context, Result};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
 use uuid::Uuid;
 
 pub use self::config::validate_workspace_dir;
@@ -33,6 +35,14 @@ use self::instantiate::{
 use self::local::refresh_local_workspace_base;
 pub use self::selection::SelectedWorkspace;
 
+/// Cap concurrent workspace materializations so many large `git fetch`es do not
+/// melt the host. Serial still works for small selections.
+const MATERIALIZE_CONCURRENCY: usize = 4;
+
+pub type MaterializeProgressSink = tokio::sync::mpsc::Sender<WorkspaceMaterializeProgress>;
+
+type SlotLockMap = HashMap<(Uuid, String), Arc<Mutex<()>>>;
+
 // `.pi-handoff` is a sibling of the workspace dirs under the cwd root. It is
 // owned by the daemon for delegation artifact files; it is never a workspace,
 // never snapshotted into an RO fork.
@@ -42,7 +52,10 @@ pub struct WorkspaceManager {
     state_root: PathBuf,
     runtime_config_root: PathBuf,
     home_dir: PathBuf,
-    workspace_base_lock: Arc<Mutex<()>>,
+    /// Serializes project-level base-tree mutations (stale slot cleanup, wipe).
+    project_bases_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
+    /// Serializes refresh of a single managed workspace base slot.
+    workspace_base_slot_locks: Arc<Mutex<SlotLockMap>>,
     cwd_mutation_guards: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
@@ -52,7 +65,8 @@ impl WorkspaceManager {
             state_root,
             runtime_config_root,
             home_dir,
-            workspace_base_lock: Arc::new(Mutex::new(())),
+            project_bases_locks: Arc::new(Mutex::new(HashMap::new())),
+            workspace_base_slot_locks: Arc::new(Mutex::new(HashMap::new())),
             cwd_mutation_guards: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -266,6 +280,35 @@ impl WorkspaceManager {
         guard.lock_owned().await
     }
 
+    async fn acquire_project_bases_lock(&self, project_id: Uuid) -> OwnedMutexGuard<()> {
+        let guard = {
+            let mut locks = self.project_bases_locks.lock().await;
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            locks
+                .entry(project_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        guard.lock_owned().await
+    }
+
+    async fn acquire_workspace_base_slot_lock(
+        &self,
+        project_id: Uuid,
+        workspace_dir: &str,
+    ) -> OwnedMutexGuard<()> {
+        let key = (project_id, workspace_dir.to_string());
+        let guard = {
+            let mut locks = self.workspace_base_slot_locks.lock().await;
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        guard.lock_owned().await
+    }
+
     /// Materialize a new session's workspaces under a private `outer_cwd`.
     ///
     /// `project_workspaces` is the project's full declared set and is used to
@@ -281,6 +324,7 @@ impl WorkspaceManager {
         workspace_id: &str,
         project_workspaces: &[ProjectWorkspace],
         selected_workspaces: &[SelectedWorkspace],
+        progress: Option<MaterializeProgressSink>,
     ) -> Result<(String, Vec<SessionWorkspace>)> {
         let root = self.session_root(workspace_id);
         if root.exists() {
@@ -293,23 +337,61 @@ impl WorkspaceManager {
         // tree down; otherwise a partial materialize leaks a btrfs subvolume that
         // no later call reclaims (every session uses a fresh workspace_id).
         let materialized = async {
-            let _workspace_base_guard = self.workspace_base_lock.lock().await;
-            self.remove_stale_workspace_bases(project_id, project_workspaces)
-                .await?;
-            let mut workspaces = Vec::with_capacity(selected_workspaces.len());
-            for selected in selected_workspaces {
-                workspaces.push(
-                    self.materialize_workspace(
-                        project_id,
-                        workspace_id,
-                        &cwd,
-                        &selected.workspace,
-                        selected.branch_override.as_deref(),
-                    )
-                    .await?,
-                );
+            {
+                let _project_guard = self.acquire_project_bases_lock(project_id).await;
+                self.remove_stale_workspace_bases(project_id, project_workspaces)
+                    .await?;
             }
-            Ok::<_, anyhow::Error>(workspaces)
+            let total = selected_workspaces.len();
+            let semaphore = Arc::new(Semaphore::new(MATERIALIZE_CONCURRENCY.max(1)));
+            let mut tasks = FuturesUnordered::new();
+            for (offset, selected) in selected_workspaces.iter().enumerate() {
+                let manager = self.clone();
+                let cwd = cwd.clone();
+                let workspace_id = workspace_id.to_string();
+                let selected = selected.clone();
+                let progress = progress.clone();
+                let semaphore = semaphore.clone();
+                let index = offset + 1;
+                let workspace_dir = workspace_base_config(&selected.workspace)?.workspace_dir;
+                tasks.push(async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .expect("materialize concurrency semaphore stays open");
+                    let result = manager
+                        .materialize_workspace(
+                            project_id,
+                            &workspace_id,
+                            &cwd,
+                            &selected.workspace,
+                            selected.branch_override.as_deref(),
+                            MaterializeProgressCtx {
+                                workspace_dir,
+                                index,
+                                total,
+                                progress: progress.as_ref(),
+                            },
+                        )
+                        .await;
+                    (offset, result)
+                });
+            }
+            let mut slots: Vec<Option<SessionWorkspace>> = (0..total).map(|_| None).collect();
+            while let Some((offset, result)) = tasks.next().await {
+                match result {
+                    Ok(workspace) => slots[offset] = Some(workspace),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok::<_, anyhow::Error>(
+                slots
+                    .into_iter()
+                    .map(|workspace| {
+                        workspace.expect("every selected workspace slot is filled on success")
+                    })
+                    .collect(),
+            )
         }
         .await;
         match materialized {
@@ -468,7 +550,7 @@ impl WorkspaceManager {
         project_id: Uuid,
         project_workspaces: &[ProjectWorkspace],
     ) -> Result<()> {
-        let _workspace_base_guard = self.workspace_base_lock.lock().await;
+        let _project_guard = self.acquire_project_bases_lock(project_id).await;
         self.remove_stale_workspace_bases(project_id, project_workspaces)
             .await?;
         self.remove_changed_workspace_bases(project_id, project_workspaces)
@@ -476,7 +558,7 @@ impl WorkspaceManager {
     }
 
     pub async fn remove_project_bases(&self, project_id: Uuid) -> Result<()> {
-        let _workspace_base_guard = self.workspace_base_lock.lock().await;
+        let _project_guard = self.acquire_project_bases_lock(project_id).await;
         let root = self.workspace_bases_root(project_id);
         if root.exists() {
             tokio::fs::remove_dir_all(root).await?;
@@ -561,6 +643,9 @@ impl WorkspaceManager {
         workspace: &ProjectWorkspace,
     ) -> Result<WorkspaceBase> {
         let config = workspace_base_config(workspace)?;
+        let _slot_guard = self
+            .acquire_workspace_base_slot_lock(project_id, &config.workspace_dir)
+            .await;
         let slot = self.workspace_base_slot(project_id, &config.workspace_dir);
         let metadata_path = slot.join(WORKSPACE_BASE_METADATA);
         let base_path = slot.join(WORKSPACE_BASE_DIR);
@@ -598,8 +683,9 @@ impl WorkspaceManager {
         cwd: &Path,
         workspace: &ProjectWorkspace,
         branch_override: Option<&str>,
+        progress: MaterializeProgressCtx<'_>,
     ) -> Result<SessionWorkspace> {
-        match workspace.kind {
+        let result = match workspace.kind {
             WorkspaceKind::Git => {
                 self.materialize_git_workspace(
                     project_id,
@@ -607,14 +693,20 @@ impl WorkspaceManager {
                     cwd,
                     workspace,
                     branch_override,
+                    &progress,
                 )
                 .await
             }
             WorkspaceKind::Local => {
-                self.materialize_local_workspace(project_id, cwd, workspace)
+                self.materialize_local_workspace(project_id, cwd, workspace, &progress)
                     .await
             }
+        };
+        match &result {
+            Ok(_) => progress.emit(WorkspaceMaterializePhase::Done).await,
+            Err(_) => progress.emit(WorkspaceMaterializePhase::Error).await,
         }
+        result
     }
 
     async fn materialize_git_workspace(
@@ -624,7 +716,11 @@ impl WorkspaceManager {
         cwd: &Path,
         workspace: &ProjectWorkspace,
         branch_override: Option<&str>,
+        progress: &MaterializeProgressCtx<'_>,
     ) -> Result<SessionWorkspace> {
+        progress
+            .emit(WorkspaceMaterializePhase::RefreshingBase)
+            .await;
         let base = self.refresh_workspace_base(project_id, workspace).await?;
         let remote_url = required_git_field(base.config.remote_url.as_deref(), "remote_url")?;
         let default_branch =
@@ -636,12 +732,16 @@ impl WorkspaceManager {
         }
         let local_branch = local_branch(session_id, workspace_dir);
 
+        progress.emit(WorkspaceMaterializePhase::Copying).await;
         populate_workspace(&base.path, &target).await?;
         // The session copy inherits the base's branch by default; an override fetches
         // the requested branch into this session's copy only, leaving the shared base
         // on the project's configured branch.
         let (session_branch, base_sha) = match branch_override {
             Some(branch) if branch != default_branch => {
+                progress
+                    .emit(WorkspaceMaterializePhase::BranchOverride)
+                    .await;
                 let sha = fetch_session_branch_head(&target, branch).await?;
                 (branch, sha)
             }
@@ -666,7 +766,11 @@ impl WorkspaceManager {
         project_id: Uuid,
         cwd: &Path,
         workspace: &ProjectWorkspace,
+        progress: &MaterializeProgressCtx<'_>,
     ) -> Result<SessionWorkspace> {
+        progress
+            .emit(WorkspaceMaterializePhase::RefreshingBase)
+            .await;
         let base = self.refresh_workspace_base(project_id, workspace).await?;
         let source_path = required_local_field(base.config.source_path.as_deref(), "source_path")?;
         let workspace_dir = base.config.workspace_dir.as_str();
@@ -674,8 +778,31 @@ impl WorkspaceManager {
         if target.exists() {
             bail!("session workspace already exists: {}", target.display());
         }
+        progress.emit(WorkspaceMaterializePhase::Copying).await;
         populate_workspace(&base.path, &target).await?;
         Ok(SessionWorkspace::local(workspace_dir, source_path))
+    }
+}
+
+struct MaterializeProgressCtx<'a> {
+    workspace_dir: String,
+    index: usize,
+    total: usize,
+    progress: Option<&'a MaterializeProgressSink>,
+}
+
+impl MaterializeProgressCtx<'_> {
+    async fn emit(&self, phase: WorkspaceMaterializePhase) {
+        if let Some(progress) = self.progress {
+            let _ = progress
+                .send(WorkspaceMaterializeProgress {
+                    workspace_dir: self.workspace_dir.clone(),
+                    phase,
+                    index: self.index,
+                    total: self.total,
+                })
+                .await;
+        }
     }
 }
 

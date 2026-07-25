@@ -323,7 +323,13 @@ The web retains one stable control/input id while unchanged text is restored
 after an uncertain response; a deliberate edit or a definite success clears or
 replaces it. New-session submissions also retain the proposed session id, so a
 retry targets the same `session.start`; the daemon treats an existing requested
-session id as a replay. Model-facing controls derive their id from the durable
+session id as a replay. After an uncertain transport failure during
+`session.start` (timeout / websocket close / reconnect), the web polls
+`session.get` for the draft session id for a short window and opens the session
+if it appears; otherwise it keeps the draft ids and shows a persistent notice
+to retry or check the session list. While workspaces are materializing, the UI
+shows per-workspace prep progress from ephemeral RPC progress frames. Model-facing
+controls derive their id from the durable
 tool-call id. A matching steer retry does not enqueue text twice; a matching
 interrupt-only retry returns its prior durable state and cannot stop a newer
 generation. This is practical ledger idempotency, not an exactly-once guarantee:

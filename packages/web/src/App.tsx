@@ -97,6 +97,11 @@ import {
 	type ProviderConfigurationTarget,
 } from "./providerConfigurationController.ts";
 import { isRpcErrorCode, type ConnectionStatus } from "./rpc.ts";
+import {
+	formatWorkspacePreparationStatus,
+	isUncertainSessionStartError,
+	type WorkspaceMaterializeProgress,
+} from "./workspaceMaterializeProgress.ts";
 import { findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
 import { stopSession } from "./stopSession.ts";
@@ -386,6 +391,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [newSessionSetupGeneration, setNewSessionSetupGeneration] = useState(0);
 	const [sending, setSending] = useState(false);
 	const [workspacePreparationProjectId, setWorkspacePreparationProjectId] =
+		useState<string | null>(null);
+	const [workspacePreparationProgress, setWorkspacePreparationProgress] =
+		useState<WorkspaceMaterializeProgress | null>(null);
+	const [workspacePreparationStatusOverride, setWorkspacePreparationStatusOverride] =
 		useState<string | null>(null);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
@@ -3185,6 +3194,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const workspaces = projectId
 				? startWorkspacesFromScope(submittedWorkspaceScope)
 				: undefined;
+			const preparing =
+				!!projectId && submittedWorkspaceScope.some((entry) => entry.included);
 			const params = {
 				sessionId,
 				projectId,
@@ -3213,16 +3224,47 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					mcpAuthStatus,
 					mcpAuthStatusReady,
 				),
+				onProgress: preparing
+					? (progress: WorkspaceMaterializeProgress) => {
+							setWorkspacePreparationProgress(progress);
+							setWorkspacePreparationStatusOverride(null);
+						}
+					: undefined,
 			};
 			let result;
 			try {
-				setWorkspacePreparationProjectId(
-					submittedWorkspaceScope.some((entry) => entry.included) ? projectId : null,
+				setWorkspacePreparationProjectId(preparing ? projectId : null);
+				setWorkspacePreparationProgress(null);
+				setWorkspacePreparationStatusOverride(
+					preparing ? "Preparing workspaces…" : null,
 				);
 				try {
 					result = await api.startSession(params);
+				} catch (error) {
+					if (isUncertainSessionStartError(error)) {
+						setWorkspacePreparationStatusOverride(
+							"Checking whether the session started…",
+						);
+						if (preparing) {
+							setWorkspacePreparationProjectId(projectId);
+						}
+						const recovered = await reconcileUncertainSessionStart(api, sessionId);
+						if (recovered) {
+							result = recovered;
+						} else {
+							pushErrorNotice(
+								"Session start may still be running. Retry send (same draft) or check the session list.",
+								true,
+							);
+							throw error;
+						}
+					} else {
+						throw error;
+					}
 				} finally {
 					setWorkspacePreparationProjectId(null);
+					setWorkspacePreparationProgress(null);
+					setWorkspacePreparationStatusOverride(null);
 				}
 			} catch (error) {
 				if (errorMessage(error).startsWith("mcp_inventory_changed:")) {
@@ -3255,6 +3297,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			newSessionProviderWasExplicit,
 			newSessionRuntimeId,
 			openRootConversation,
+			pushErrorNotice,
 			queryClient,
 		],
 	);
@@ -4126,6 +4169,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const preparingWorkspaces =
 		workspacePreparationProjectId !== null &&
 		workspacePreparationProjectId === selectedProjectId;
+	const workspacePreparationStatus = preparingWorkspaces
+		? workspacePreparationStatusOverride ??
+			formatWorkspacePreparationStatus(workspacePreparationProgress)
+		: null;
 	const mobileTitle = selectedChatSession
 		? sessionTitle(selectedChatSession)
 		: selectedProject
@@ -4349,6 +4396,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 									mcpAuthBusyServer={mcpAuthBusyServer}
 									disabled={sending}
 									preparingWorkspaces={preparingWorkspaces}
+									workspacePreparationStatus={workspacePreparationStatus}
 									mcpAuthMutationBlockedReason={connectionRemoteActionBlockedReason}
 								/>
 							) : null
@@ -4605,6 +4653,32 @@ function errorMessageOrNull(error: unknown): string | null {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+const UNCERTAIN_START_RECONCILE_MS = 45_000;
+const UNCERTAIN_START_POLL_MS = 1_500;
+
+async function reconcileUncertainSessionStart(
+	api: { getSession(sessionId: string): Promise<{ session_id: string; activity: string }> },
+	sessionId: string,
+): Promise<{ session_id: string; activity: string; replayed: true } | null> {
+	const deadline = Date.now() + UNCERTAIN_START_RECONCILE_MS;
+	while (Date.now() < deadline) {
+		try {
+			const snapshot = await api.getSession(sessionId);
+			return {
+				session_id: snapshot.session_id,
+				activity: snapshot.activity,
+				replayed: true,
+			};
+		} catch (error) {
+			if (!isSessionNotFoundError(error) && !isUncertainSessionStartError(error)) {
+				// Keep polling through transient read failures while the socket recovers.
+			}
+		}
+		await new Promise((resolve) => window.setTimeout(resolve, UNCERTAIN_START_POLL_MS));
+	}
+	return null;
 }
 
 function isSessionNotFoundError(error: unknown): boolean {
