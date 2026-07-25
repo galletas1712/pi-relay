@@ -485,6 +485,21 @@ Live events:
 }
 ```
 
+Progress frames, correlated to an in-flight request by `id` and lossy (see
+`session.start`):
+
+```json
+{
+  "id": "req_1",
+  "progress": {
+    "workspace_dir": "repo-a",
+    "phase": "refreshing_base",
+    "index": 1,
+    "total": 3
+  }
+}
+```
+
 ## Session RPC
 
 ### `session.start`
@@ -550,8 +565,9 @@ it from the managed base, leaving the shared per-project base on the project's
 configured branch. Branch overrides are only valid for git workspaces. The daemon
 rejects (`invalid_params`) a `workspaces` array that is empty, names a directory the
 project does not declare, repeats a workspace, or sets `branch` on a local-folder
-workspace. Selected workspaces are materialized in the project's declared order
-regardless of request order. The field is ignored for ephemeral sessions.
+workspace. Selected workspaces are materialized concurrently; the response lists
+them in the project's declared order regardless of request order. The field is
+ignored for ephemeral sessions.
 
 While materializing, the daemon may emit ephemeral request-correlated progress
 frames on the same websocket (not durable `events.*` rows):

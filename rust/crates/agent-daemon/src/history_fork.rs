@@ -72,6 +72,7 @@ pub(crate) async fn fork(state: &AppState, params: Value) -> Result<Value, RpcEr
                     agent_runtime_protocol::RuntimeCommand::DestroySession {
                         workspace_id: child_workspace_id,
                     },
+                    None,
                 )
                 .await
             {

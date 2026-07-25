@@ -45,6 +45,7 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
             project_id,
             &project_workspaces,
             &selected_workspaces,
+            None,
         )
         .await
         .expect("materialize managed source cwd");

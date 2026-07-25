@@ -115,6 +115,7 @@ pub(super) async fn run_tool_turn(
                     provider: dispatch.config.provider.kind,
                     tool_call: tool_call.clone(),
                 },
+                None,
             )
             .await
         {
