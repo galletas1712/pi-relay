@@ -17,6 +17,7 @@ export type AgentStatusIconKey =
 
 const AGENT_STATUS_ICON_KEYS: Record<AgentStatus, AgentStatusIconKey> = {
 	running: "running",
+	cancelling: "running",
 	done: "done",
 	done_with_failures: "done-with-failures",
 	failed: "failed",
@@ -52,22 +53,22 @@ export function orderDelegations(delegations: readonly Delegation[]): Delegation
 	const recent: Delegation[] = [];
 	for (const delegation of delegations) {
 		if (delegationNeedsAttention(delegation)) attention.push(delegation);
-		else if (delegation.status === "running") active.push(delegation);
+		else if (isDelegationRunning(delegation)) active.push(delegation);
 		else recent.push(delegation);
 	}
 	return [...attention, ...active, ...recent];
 }
 
-/** A delegation is in flight (and therefore cancellable / its subagents pollable)
- * exactly while its status is `running`. Every other status is terminal. */
+/** A delegation is in flight while running or quiescing after cancellation. */
 export function isDelegationRunning(delegation: Delegation): boolean {
-	return delegation.status === "running";
+	return delegation.status === "running" || delegation.status === "cancelling";
 }
 
 /** Map a delegation or subagent status to a CSS-safe icon modifier. */
 export function statusIconClass(status: string): string {
 	switch (status) {
 		case "running":
+		case "cancelling":
 			return "running";
 		case "done":
 			return "done";

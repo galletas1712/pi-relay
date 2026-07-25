@@ -5,9 +5,10 @@ use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    CancelQueuedInputResult, EnqueueUserInputResult, EventType, ExpectedActiveLeafMismatch,
-    InputPriority, InputRecord, PromoteQueuedInputResult, QueueMutationError, QueuedInput,
-    QueuedInputContent, QueuedInputStatus, ReorderQueuedFollowUpsResult, UpdateQueuedInputResult,
+    CancelQueuedInputResult, DelegationInputClosed, EnqueueUserInputResult, EventType,
+    ExpectedActiveLeafMismatch, InputPriority, InputRecord, PromoteQueuedInputResult,
+    QueueMutationError, QueuedInput, QueuedInputContent, QueuedInputStatus,
+    ReorderQueuedFollowUpsResult, UpdateQueuedInputResult,
 };
 
 use super::events::insert_event_tx;
@@ -26,6 +27,50 @@ use super::PostgresAgentStore;
 const QUEUE_CHANGED: &str = "queue_changed";
 const NOT_EDITABLE: &str = "not_editable";
 
+async fn lock_user_input_scope_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+) -> Result<()> {
+    let scope: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("select parent_session_id, delegation_id from sessions where id=$1")
+            .bind(session_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some((parent_session_id, delegation_id)) = scope else {
+        lock_session_tx(tx, session_id).await?;
+        return Ok(());
+    };
+    let Some(delegation_id) = delegation_id else {
+        lock_session_tx(tx, session_id).await?;
+        return Ok(());
+    };
+    let parent_session_id =
+        parent_session_id.ok_or_else(|| anyhow::anyhow!("delegation child has no parent"))?;
+
+    // Match teardown's global parent -> delegation -> child lock order. The
+    // child binding is immutable, but re-read it under the child lock so this
+    // trust-boundary check never relies on the optimistic scope read alone.
+    lock_session_tx(tx, &parent_session_id).await?;
+    let status: String =
+        sqlx::query_scalar("select status from delegations where id=$1 for update")
+            .bind(&delegation_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    lock_session_tx(tx, session_id).await?;
+    let bound_delegation: Option<String> =
+        sqlx::query_scalar("select delegation_id from sessions where id=$1")
+            .bind(session_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if bound_delegation.as_deref() != Some(delegation_id.as_str()) {
+        anyhow::bail!("delegation child scope changed while accepting input");
+    }
+    if status != "running" {
+        return Err(DelegationInputClosed::new(delegation_id, status).into());
+    }
+    Ok(())
+}
+
 impl PostgresAgentStore {
     pub async fn enqueue_user_input(
         &self,
@@ -37,7 +82,7 @@ impl PostgresAgentStore {
     ) -> Result<EnqueueUserInputResult> {
         let id = format!("input_{}", Uuid::new_v4());
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_user_input_scope_tx(&mut tx, session_id).await?;
         if let Some(client_input_id) = client_input_id {
             if let Some(row) = sqlx::query(
                 "select id, status from queued_inputs where session_id=$1 and client_input_id=$2::text",
@@ -678,7 +723,7 @@ impl PostgresAgentStore {
                 where {active_queue}
                     and (
                         s.parent_session_id is null
-                        or d.status = 'running'
+                        or d.status in ('running','cancelling')
                     )
                 order by q.session_id
                 "#
@@ -1109,6 +1154,116 @@ mod tests {
 
     #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
     #[tokio::test]
+    async fn teardown_atomically_closes_child_mailbox_against_racing_and_terminal_follow_ups() {
+        let Some(db) = test_store().await else {
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let config = create_session(store, "parent").await;
+        let delegation = store
+            .create_delegation("parent", DelegationKind::Full, None, None, 1)
+            .await
+            .expect("create delegation");
+        store
+            .start_session_outputs_with_parent(
+                "child",
+                &config,
+                &[],
+                None,
+                &[],
+                &[],
+                InputPriority::FollowUp,
+                &UserMessage::text("start"),
+                None,
+                Some("parent"),
+                Some(crate::SubagentType::Full),
+                Some(&delegation.id),
+            )
+            .await
+            .expect("create child");
+        store
+            .enqueue_user_input(
+                "child",
+                InputPriority::FollowUp,
+                &UserMessage::text("queued before teardown"),
+                Some("before"),
+                None,
+            )
+            .await
+            .expect("queue initial child input");
+
+        let racing_message = UserMessage::text("racing teardown");
+        let (teardown, racing_input) = tokio::join!(
+            store.begin_delegation_teardown(
+                "parent",
+                &delegation.id,
+                &delegation.attempt_id,
+                DelegationStatus::Cancelled,
+                "race"
+            ),
+            store.enqueue_user_input(
+                "child",
+                InputPriority::FollowUp,
+                &racing_message,
+                Some("racing"),
+                None
+            )
+        );
+        assert!(teardown.expect("teardown transition").0);
+        if racing_input.is_ok() {
+            // If input won the parent/delegation lock, teardown cancelled it in
+            // the same transaction. Otherwise admission observed cancelling.
+            assert!(!store
+                .has_queued_inputs("child")
+                .await
+                .expect("active queue"));
+        } else {
+            let error = match racing_input {
+                Ok(_) => unreachable!("checked error branch"),
+                Err(error) => error,
+            };
+            assert!(error
+                .downcast_ref::<crate::DelegationInputClosed>()
+                .is_some());
+        }
+        assert!(!store
+            .has_queued_inputs("child")
+            .await
+            .expect("active queue"));
+        assert!(store
+            .finish_delegation_teardown(
+                &delegation.id,
+                &delegation.attempt_id,
+                DelegationStatus::Cancelled
+            )
+            .await
+            .expect("finish teardown"));
+        let terminal = match store
+            .enqueue_user_input(
+                "child",
+                InputPriority::FollowUp,
+                &UserMessage::text("must reject"),
+                Some("terminal"),
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("terminal delegation child mailbox is closed"),
+            Err(error) => error,
+        };
+        assert!(terminal
+            .downcast_ref::<crate::DelegationInputClosed>()
+            .is_some());
+        assert!(!store
+            .has_queued_inputs("child")
+            .await
+            .expect("active queue"));
+        db.cleanup().await;
+    }
+
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+    #[tokio::test]
     async fn config_update_freezes_legacy_active_rows_and_rejects_mixed_open_routes() {
         let Some(db) = test_store().await else {
             eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -1307,41 +1462,15 @@ mod tests {
             .await
             .expect("parent session creates");
 
-        let cancelled = store
-            .create_delegation("parent", DelegationKind::Full, None, Some("cancelled"), 1)
-            .await
-            .expect("cancelled delegation creates");
-        store
-            .set_delegation_status(&cancelled.id, DelegationStatus::Cancelled)
-            .await
-            .expect("cancel delegation");
-        let done = store
-            .create_delegation("parent", DelegationKind::Full, None, Some("done"), 1)
-            .await
-            .expect("done delegation creates");
-        store
-            .set_delegation_status(&done.id, DelegationStatus::Done)
-            .await
-            .expect("finish delegation");
-        let failed = store
-            .create_delegation("parent", DelegationKind::Full, None, Some("failed"), 1)
-            .await
-            .expect("failed delegation creates");
-        store
-            .set_delegation_status(&failed.id, DelegationStatus::Failed)
-            .await
-            .expect("fail delegation");
-        let running = store
-            .create_delegation("parent", DelegationKind::Full, None, Some("running"), 1)
-            .await
-            .expect("running delegation creates");
-
-        for (session_id, delegation_id) in [
-            ("running_child", running.id.as_str()),
-            ("cancelled_child", cancelled.id.as_str()),
-            ("done_child", done.id.as_str()),
-            ("failed_child", failed.id.as_str()),
+        for (session_id, label, status) in [
+            ("cancelled_child", "cancelled", DelegationStatus::Cancelled),
+            ("done_child", "done", DelegationStatus::Done),
+            ("failed_child", "failed", DelegationStatus::Failed),
         ] {
+            let delegation = store
+                .create_delegation("parent", DelegationKind::Full, None, Some(label), 1)
+                .await
+                .expect("terminal delegation creates");
             store
                 .start_session_outputs_with_parent(
                     session_id,
@@ -1355,11 +1484,46 @@ mod tests {
                     None,
                     Some("parent"),
                     Some(crate::SubagentType::Full),
-                    Some(delegation_id),
+                    Some(&delegation.id),
                 )
                 .await
                 .expect("subagent session creates");
+            store
+                .enqueue_user_input(
+                    session_id,
+                    InputPriority::FollowUp,
+                    &UserMessage::text("queued"),
+                    Some(&format!("{session_id}-client-input")),
+                    None,
+                )
+                .await
+                .expect("queued input enqueues before terminal transition");
+            store
+                .set_delegation_status(&delegation.id, status)
+                .await
+                .expect("delegation becomes terminal");
         }
+        let running = store
+            .create_delegation("parent", DelegationKind::Full, None, Some("running"), 1)
+            .await
+            .expect("running delegation creates");
+        store
+            .start_session_outputs_with_parent(
+                "running_child",
+                &config,
+                &[],
+                None,
+                &[],
+                &[],
+                InputPriority::FollowUp,
+                &UserMessage::text("start"),
+                None,
+                Some("parent"),
+                Some(crate::SubagentType::Full),
+                Some(&running.id),
+            )
+            .await
+            .expect("running subagent session creates");
         store
             .start_session_outputs_with_parent(
                 "legacy_child_without_delegation",
@@ -1381,9 +1545,6 @@ mod tests {
         for session_id in [
             "main_with_queue",
             "running_child",
-            "cancelled_child",
-            "done_child",
-            "failed_child",
             "legacy_child_without_delegation",
         ] {
             store

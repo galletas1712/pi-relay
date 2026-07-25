@@ -142,7 +142,12 @@ compaction call:
      "## Delegation state at compaction time" to the stored summary
 ```
 
-The prompt is rendered exactly once, at `session.start`, after project workspaces are materialized (so AGENTS.md and skills are present on disk). The rendered string is persisted in `SessionConfig.system_prompt` and is the session's immutable global prompt. The `/system` RPC (`system.prompt`) re-renders the same template to show the prompt and its source for a selected session.
+The prompt is rendered exactly once, at `session.start`, after project
+workspaces are materialized (so AGENTS.md and skills are present on disk). The
+rendered string is persisted in `SessionConfig.system_prompt` and is the
+session's immutable global prompt. The `/system` RPC (`system.prompt`) returns
+that persisted prompt together with the current repository `PI.md` template; it
+does not regenerate or mutate the session prompt.
 
 ## Stable prefix vs dynamic context
 
@@ -152,8 +157,8 @@ Compaction is the exception, but the ledger is appended after the provider
 returns rather than sent as compaction input. For top-level parent sessions, the
 daemon stores the provider summary plus a fresh
 `## Delegation state at compaction time` section. That ledger lists every
-delegation row for the parent session (running, done, done_with_failures,
-cancelled, failed) with bounded progress/subagent fields, `outcome`
+delegation row for the parent session (running, cancelling, done,
+done_with_failures, cancelled, failed) with bounded progress/subagent fields, `outcome`
 control data when available, and artifact paths. It deliberately does not inline
 full transcripts or final-message prose, or refresh handoff artifacts. Running entries are
 point-in-time facts; summaries must not assume they completed before a later
@@ -171,6 +176,5 @@ transcript/model history, and own tool results/facts.
 
 - The `agent-prompt` crate itself injects no date, time, or cwd implicitly. If `PI.md` does not reference `session.cwd`, the rendered stable prefix never includes it. Any daemon-owned volatile context is added later by `agent-daemon`.
 - Because the template can choose to surface `session.cwd` / `session.workspaces_markdown` / `tools.specs`, a custom template *can* place dynamic-looking data in the rendered text — but that text is still part of the stable prefix and will churn the prompt cache. Keep volatile data out of `PI.md`; when dynamic context is needed for ordinary model calls, providers append it after transcript history. Delegation state is different: parent-session delegation ledgers are appended to the stored compaction summary after provider compaction returns, not sent as compaction input.
-- The prompt is rendered once and stored; editing `PI.md` does not retroactively change existing sessions. New sessions pick up the new template.
 - `render` panics on a malformed template. This is intentional for a repo-authored file; do not feed untrusted templates through this crate.
 - Thinking/reasoning blocks never reach the prompt. The provider parse layer keeps only `Text` and `ToolCall` assistant items, so the prompt has no notion of reasoning content.

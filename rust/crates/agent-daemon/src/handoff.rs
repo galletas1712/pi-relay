@@ -358,7 +358,7 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
 
     if matches!(
         delegation.status,
-        DelegationStatus::Cancelled | DelegationStatus::Failed
+        DelegationStatus::Cancelling | DelegationStatus::Cancelled | DelegationStatus::Failed
     ) {
         return Ok((dir, Vec::new()));
     }
@@ -380,7 +380,9 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
                     .is_completion_terminal()
             }
             DelegationStatus::Done | DelegationStatus::DoneWithFailures => true,
-            DelegationStatus::Cancelled | DelegationStatus::Failed => false,
+            DelegationStatus::Cancelling
+            | DelegationStatus::Cancelled
+            | DelegationStatus::Failed => false,
         };
 
         let has_task_prompt = refresh_task_prompt_artifact_if_present(

@@ -196,6 +196,51 @@ describe("AgentApi history fork wire format", () => {
 	});
 });
 
+describe("AgentApi delegation launch identity", () => {
+	it("retains each caller launch ID across a parallel launch batch", async () => {
+		const calls: RpcCall[] = [];
+		const api = createAgentApi(fakeClient(calls));
+
+		await Promise.all([
+			api.startFullDelegation({
+				parentSessionId: "parent",
+				clientLaunchId: "full-launch",
+				role: "implementer",
+				prompt: "Implement it",
+			}),
+			api.startReadonlyDelegationFanout({
+				parentSessionId: "parent",
+				clientLaunchId: "readonly-launch",
+				tasks: [{ role: "reviewer", prompt: "Review it" }],
+			}),
+		]);
+
+		expect(calls).toEqual([
+			{
+				method: "delegation.start_full",
+				params: {
+					parent_session_id: "parent",
+					client_launch_id: "full-launch",
+					role: "implementer",
+					prompt: "Implement it",
+					workflow: undefined,
+					label: undefined,
+				},
+			},
+			{
+				method: "delegation.start_readonly_fanout",
+				params: {
+					parent_session_id: "parent",
+					client_launch_id: "readonly-launch",
+					tasks: [{ role: "reviewer", prompt: "Review it" }],
+					workflow: undefined,
+					label: undefined,
+				},
+			},
+		]);
+	});
+});
+
 function fakeClient(calls: RpcCall[]): RpcClient {
 	return {
 		connect: async () => {},

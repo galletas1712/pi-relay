@@ -12,6 +12,20 @@ is authoritative and trait-free lives in [design decisions](../design-decisions.
 ("Postgres Store Is The Storage Crate", "Postgres Is Authoritative"); this doc
 covers the mechanics.
 
+Delegation creation is the admission module. Under the parent-session row lock
+it permits one admission-active (`running` or `cancelling`) `full` row and
+read-only fan-outs totaling at most eight reserved slots until delegation
+terminality. A partial unique index backstops writer exclusivity. Parent-scoped
+launch keys make creation idempotent; canonical launch JSON, a PostgreSQL
+materialization claim, and immutable child indices make replay and boot recovery
+resume missing children without duplication.
+
+Delegation teardown is also a complete store operation: the
+`running -> cancelling` claim atomically cancels every queued/consuming child
+mailbox row under parent -> delegation -> child locks. Ordinary child input
+admission follows the same order and accepts only `running`; terminalization
+refuses to release reservations while active child mailbox rows remain.
+
 ## Responsibilities
 
 - Persist and query sessions, projects, transcript forest, queued inputs,

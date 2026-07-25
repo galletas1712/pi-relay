@@ -4,6 +4,11 @@ Personal-use Rust agent runtime and control plane. It provides durable
 PostgreSQL-backed sessions, resume/switch/compaction, host-side workspace
 tools and MCP routes, bounded delegation, and the React web client.
 
+Concurrent-delegation production upgrades use the one-time, fail-closed
+procedure in [`migrations/README.md`](migrations/README.md). Back up Postgres
+and the runtime workspace root and stop the old control/runtime before applying
+it; never reset volumes or workspace roots.
+
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) - overview and crate map.

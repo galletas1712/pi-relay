@@ -13,6 +13,27 @@ pub(crate) fn abort_session_tasks(state: &AppState, session_id: &str) -> Vec<Act
     abort_matching_tasks(&mut tasks, session_id)
 }
 
+pub(crate) async fn abort_and_join_session_tasks(state: &AppState, session_id: &str) {
+    let handles = {
+        let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
+        tasks.retain(|_, task| !task.handle.is_finished());
+        let action_row_ids = tasks
+            .iter()
+            .filter(|(_, task)| task.session_id == session_id)
+            .map(|(action_row_id, _)| action_row_id.clone())
+            .collect::<Vec<_>>();
+        action_row_ids
+            .into_iter()
+            .filter_map(|action_row_id| tasks.remove(&action_row_id))
+            .map(|task| task.handle)
+            .collect::<Vec<_>>()
+    };
+    for handle in handles {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
 fn abort_matching_tasks(
     tasks: &mut HashMap<String, RunningTask>,
     session_id: &str,

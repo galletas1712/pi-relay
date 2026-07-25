@@ -105,8 +105,12 @@ Consequences:
 
 **Confirmed current source facts:**
 
-- `delegation.list` is explicitly a bounded, newest-first page for one parent session and is documented as the lightweight Agents-outline feed (`rust/docs/websocket-rpc.md:1550-1554`).
-- The daemon defaults to 3 rows, caps the request at 100, fetches one extra row only to compute `has_more`, and exposes no cursor in the current request (`rust/crates/agent-daemon/src/delegation_tools.rs:1472-1491`, `rust/crates/agent-daemon/src/delegation_tools.rs:1517-1544`).
+- `delegation.list` returns every active (`running` or `cancelling`) row for one
+  parent plus bounded newest-first terminal history. Active coverage is
+  complete; only older terminal rows are omitted.
+- The daemon defaults terminal history to 3 rows, caps that request at 100,
+  fetches one extra terminal row only to compute `has_more`, and exposes no
+  cursor in the current request.
 - The frontend model is `Delegation[]`, each with direct `subagents[]`; the list response has `has_more` but no cursor (`packages/web/src/types.ts:124-174`).
 - Subagent prompt profiles exclude all delegation tools, and the child contract explicitly says nested delegation is unavailable (`rust/crates/agent-daemon/src/provider_runtime/prompt.rs:551-590`, `rust/crates/agent-daemon/src/subagents.rs:459-469`).
 - Current event frames have an ID, name, session ID, and data but no event timestamp in the web type (`packages/web/src/types.ts:117-122`).
@@ -486,7 +490,9 @@ Execution Overview:
 - Outline is authoritative and supports keyboard navigation with ordinary links/buttons; do not prematurely use `role=tree` unless full APG tree keyboard semantics are implemented.
 - Show root -> delegation -> direct agents only.
 - Keep the default outline minimal; task prompts, outcomes, handoffs, and raw metadata belong to focused Handoffs/Debug inspection rather than ambient rows.
-- If `has_more=true`, say that older delegations are not loaded and offer the backend-supported action available at that phase; do not present the outline as complete.
+- If `has_more=true`, say that older terminal delegations are not loaded and
+  offer the backend-supported action available at that phase. Do not imply that
+  any active delegation is omitted.
 
 Activity:
 
@@ -802,15 +808,16 @@ The following can ship without backend schema changes:
 - On-demand reads for currently known Handoffs.
 - Debug Inspector separation, primitives, semantic rows, contrast, transcript/composer changes, connection gating, and owned async states.
 
-Limitations must be visible where they change decisions: bounded delegation
-list, direct topology, and non-retained live events. Unknown outcomes are never
+Limitations must be visible where they change decisions: bounded terminal
+delegation history, direct topology, and non-retained live events. Active
+delegation coverage is complete. Unknown outcomes are never
 inferred or surfaced as ambient “missing outcome” copy.
 
 ### 10.2 Backend-dependent contracts
 
 | Capability | Proposed contract work | Why it is required | Dependent UI |
 | --- | --- | --- | --- |
-| Complete delegation history | Add cursor-paged `delegation.list` or a new root execution endpoint with stable ordering, `next_cursor`, and filters; remove the 100-row completeness ceiling for pagination. | Current list is bounded/newest-first/per-parent with only `has_more`. | Complete Outline/Handoffs coverage without exposing an ambient Recent section. |
+| Complete delegation history | Add cursor-paged `delegation.list` or a new root execution endpoint with stable ordering, `next_cursor`, and filters; remove the 100-row terminal-history ceiling for pagination. | Current active coverage is complete, but terminal history is bounded/newest-first/per-parent with only `has_more`. | Complete historical Outline/Handoffs coverage without exposing an ambient Recent section. |
 | Aggregate root execution projection | If multiple calls are otherwise expensive, add one projection returning root, delegations, direct agents, known state, cancellation-scope progress, and handoff availability with a projection revision. | Prevent client N+1 and cross-query inconsistency while keeping root pinned. Progress supports scoped cancellation, not ambient row counts. | Run Navigator and Overview convergence. |
 | Delegation metadata | Add created/started/completed/updated timestamps, duration or enough timestamps to compute it, attempt/revision, last-change time, known outcome, and handoff availability metadata. | Current web `Delegation` has no timestamps/revision and list examples leave outcomes/files null. | Detail inspection and internal ordering; ambient rows remain icon + task/role only. |
 | Change notification | Emit a root/delegation projection-change event containing root/parent ID and new revision, or a lightweight invalidation topic. | Current UI infers invalidation from subagent events and polls. | Efficient stable Run Navigator/Outline updates. |

@@ -436,10 +436,19 @@ impl RuntimeRegistry {
 
     pub(crate) async fn destroy_session_workspaces(&self, session_id: &str) -> Result<()> {
         let config = self.repo.load_session_config(session_id).await?;
+        self.destroy_workspace_for_runtime(&config.runtime_id, &config.workspace_id)
+            .await
+    }
+
+    pub(crate) async fn destroy_workspace_for_runtime(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+    ) -> Result<()> {
         self.execute(
-            &config.runtime_id,
+            runtime_id,
             RuntimeCommand::DestroySession {
-                workspace_id: config.workspace_id,
+                workspace_id: workspace_id.to_string(),
             },
         )
         .await
@@ -883,7 +892,19 @@ pub(crate) mod test_support {
                 // The fake runtime serves only workspace skills; home skills are
                 // exercised by pure parse tests to keep results host-independent.
                 let base = fake_workspace_dir(dirs, &workspace_id).await;
-                let mut skills = Vec::new();
+                let mut skills = ["implementer", "reviewer"]
+                    .into_iter()
+                    .map(|name| agent_runtime_protocol::RawSkillFile {
+                        kind: agent_runtime_protocol::SkillKind::SubagentRole,
+                        origin: agent_runtime_protocol::SkillOrigin::RuntimeRole,
+                        workspace: None,
+                        package_name: name.to_string(),
+                        path: format!("/runtime/roles/{name}/SKILL.md"),
+                        contents: format!(
+                            "---\nname: {name}\ndescription: test {name} role\n---\n\nTest role."
+                        ),
+                    })
+                    .collect::<Vec<_>>();
                 let mut instructions = Vec::new();
                 for workspace_dir in workspace_dirs {
                     let agents_path = base.join(&workspace_dir).join("AGENTS.md");
@@ -947,6 +968,10 @@ pub(crate) mod test_support {
         dirs: &Arc<TokioMutex<HashMap<String, std::path::PathBuf>>>,
         workspace_id: &str,
     ) -> std::path::PathBuf {
+        let workspace_path = std::path::PathBuf::from(workspace_id);
+        if workspace_path.is_absolute() {
+            return workspace_path;
+        }
         let mut dirs = dirs.lock().await;
         dirs.entry(workspace_id.to_string())
             .or_insert_with(|| {

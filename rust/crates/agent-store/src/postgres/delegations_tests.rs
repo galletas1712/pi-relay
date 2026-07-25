@@ -35,6 +35,328 @@ fn cancelled_child_input_ids_are_grouped_once_without_changing_order() {
     );
 }
 
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn concurrent_readonly_and_full_admission_is_kind_aware_and_bounded() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(
+            project_id,
+            "concurrent kinds",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+
+    let (full, readonly) = tokio::join!(
+        db.store
+            .create_delegation_idempotent(crate::CreateDelegationRequest {
+                parent_session_id: "parent",
+                launch_key: "full",
+                launch_shape: "full-shape",
+                kind: DelegationKind::Full,
+                workflow: None,
+                label: None,
+                expected_subagents: 1,
+            }),
+        db.store
+            .create_delegation_idempotent(crate::CreateDelegationRequest {
+                parent_session_id: "parent",
+                launch_key: "readonly",
+                launch_shape: "readonly-shape",
+                kind: DelegationKind::ReadonlyFanout,
+                workflow: None,
+                label: None,
+                expected_subagents: 4,
+            }),
+    );
+    assert!(full.is_ok());
+    assert!(readonly.is_ok());
+
+    let second_readonly = db
+        .store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "readonly-2",
+            launch_shape: "readonly-shape-2",
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: None,
+            label: None,
+            expected_subagents: 5,
+        })
+        .await
+        .expect_err("nine active read-only children exceed capacity");
+    assert!(second_readonly
+        .downcast_ref::<crate::ReadonlyCapacityExceeded>()
+        .is_some());
+
+    let replay = db
+        .store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "readonly",
+            launch_shape: "readonly-shape",
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: None,
+            label: None,
+            expected_subagents: 4,
+        })
+        .await
+        .expect("same launch replays");
+    assert_eq!(replay.id, readonly.unwrap().id);
+
+    let (same_key_a, same_key_b) = tokio::join!(
+        db.store
+            .create_delegation_idempotent(crate::CreateDelegationRequest {
+                parent_session_id: "parent",
+                launch_key: "same-key",
+                launch_shape: "same-shape",
+                kind: DelegationKind::ReadonlyFanout,
+                workflow: None,
+                label: None,
+                expected_subagents: 1,
+            }),
+        db.store
+            .create_delegation_idempotent(crate::CreateDelegationRequest {
+                parent_session_id: "parent",
+                launch_key: "same-key",
+                launch_shape: "same-shape",
+                kind: DelegationKind::ReadonlyFanout,
+                workflow: None,
+                label: None,
+                expected_subagents: 1,
+            }),
+    );
+    let same_key_a = same_key_a.expect("first same-key launch");
+    let same_key_b = same_key_b.expect("second same-key launch");
+    assert_eq!(same_key_a.id, same_key_b.id);
+    assert_eq!(
+        db.store
+            .list_parent_delegations("parent")
+            .await
+            .expect("list parent")
+            .iter()
+            .filter(|delegation| delegation.launch_shape == "same-shape")
+            .count(),
+        1
+    );
+
+    let readonly = db
+        .store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "teardown-capacity",
+            launch_shape: "teardown-capacity",
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: None,
+            label: None,
+            expected_subagents: 3,
+        })
+        .await
+        .expect("remaining three slots");
+    assert!(
+        db.store
+            .begin_delegation_teardown(
+                "parent",
+                &readonly.id,
+                &readonly.attempt_id,
+                DelegationStatus::Cancelled,
+                "test",
+            )
+            .await
+            .expect("begin teardown")
+            .0
+    );
+    let while_cancelling = db
+        .store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "blocked-during-teardown",
+            launch_shape: "blocked-during-teardown",
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect_err("cancelling delegation retains reserved slots");
+    assert!(while_cancelling
+        .downcast_ref::<crate::ReadonlyCapacityExceeded>()
+        .is_some());
+    assert!(db
+        .store
+        .finish_delegation_teardown(
+            &readonly.id,
+            &readonly.attempt_id,
+            DelegationStatus::Cancelled,
+        )
+        .await
+        .expect("finish teardown"));
+
+    let conflict = db
+        .store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "readonly",
+            launch_shape: "changed",
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: None,
+            label: None,
+            expected_subagents: 4,
+        })
+        .await
+        .expect_err("launch key shape cannot change");
+    assert!(conflict
+        .downcast_ref::<crate::DelegationLaunchKeyConflict>()
+        .is_some());
+
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn every_delegation_row_query_loads_durable_launch_and_teardown_fields() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "query shapes", "runtime-test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+
+    let running = db
+        .store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "running",
+            launch_shape: "running-shape",
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("create running delegation");
+    let replay = db
+        .store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "running",
+            launch_shape: "running-shape",
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("replay running delegation");
+    assert_eq!(replay.launch_shape, "running-shape");
+    assert_eq!(replay.teardown_target, None);
+
+    let cancelling = db
+        .store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "cancelling",
+            launch_shape: "cancelling-shape",
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("create cancelling delegation");
+    assert!(
+        db.store
+            .begin_delegation_teardown(
+                "parent",
+                &cancelling.id,
+                &cancelling.attempt_id,
+                DelegationStatus::Cancelled,
+                "query shape test",
+            )
+            .await
+            .expect("begin teardown")
+            .0
+    );
+
+    assert_eq!(
+        db.store
+            .get_delegation(&running.id)
+            .await
+            .expect("get delegation")
+            .expect("delegation exists")
+            .launch_shape,
+        "running-shape"
+    );
+    assert!(db
+        .store
+        .list_parent_delegations("parent")
+        .await
+        .expect("list parent delegations")
+        .iter()
+        .all(|delegation| !delegation.launch_shape.is_empty()));
+    let cancelling_rows = db
+        .store
+        .list_cancelling_delegations()
+        .await
+        .expect("list cancelling delegations");
+    assert_eq!(cancelling_rows.len(), 1);
+    assert_eq!(
+        cancelling_rows[0].teardown_target,
+        Some(DelegationStatus::Cancelled)
+    );
+    assert_eq!(
+        db.store
+            .list_parent_delegations_active_complete("parent", 10)
+            .await
+            .expect("list active and complete")
+            .len(),
+        2
+    );
+    assert_eq!(
+        db.store
+            .list_parent_delegations_newest("parent", 10)
+            .await
+            .expect("list newest")
+            .len(),
+        2
+    );
+    assert_eq!(
+        db.store
+            .list_running_delegations()
+            .await
+            .expect("list running delegations")[0]
+            .launch_shape,
+        "running-shape"
+    );
+
+    db.store
+        .set_delegation_status(&running.id, DelegationStatus::Done)
+        .await
+        .expect("complete running delegation");
+    let repairs = db
+        .store
+        .list_completed_delegations_for_repair()
+        .await
+        .expect("list completed publication repairs");
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(repairs[0].launch_shape, "running-shape");
+    assert_eq!(repairs[0].teardown_target, None);
+
+    db.cleanup().await;
+}
+
 struct TestDb {
     store: PostgresAgentStore,
     admin_url: String,
@@ -314,7 +636,98 @@ async fn create_delegation_persists_kind_status_and_attempt() {
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
-async fn concurrent_delegation_creation_allows_only_one_running_row() {
+async fn fallback_launch_shape_is_postgres_safe_canonical_json_and_replay_stable() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(
+            project_id,
+            "fallback launch shape",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+
+    let created = db
+        .store
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            Some("workflow"),
+            Some("label"),
+            2,
+        )
+        .await
+        .expect("fallback launch persists in PostgreSQL");
+    let (launch_key, launch_shape): (String, String) =
+        sqlx::query_as("select launch_key, launch_shape from delegations where id=$1")
+            .bind(&created.id)
+            .fetch_one(&db.store.pool)
+            .await
+            .expect("load durable launch identity");
+
+    assert!(!launch_shape.contains('\0'));
+    assert_eq!(
+        serde_json::from_str::<Value>(&launch_shape).expect("canonical JSON launch shape"),
+        json!({
+            "kind": "readonly_fanout",
+            "tasks": [
+                { "role": "reviewer", "prompt": "Complete the delegated task." },
+                { "role": "reviewer", "prompt": "Complete the delegated task." }
+            ],
+            "workflow": "workflow",
+            "label": "label"
+        })
+    );
+
+    let replay = db
+        .store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: &launch_key,
+            launch_shape: &launch_shape,
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: Some("workflow"),
+            label: Some("label"),
+            expected_subagents: 2,
+        })
+        .await
+        .expect("identical durable shape replays");
+    assert_eq!(replay.id, created.id);
+
+    let changed_shape = launch_shape.replace(
+        "\"prompt\":\"Complete the delegated task.\"",
+        "\"prompt\":\"Changed task.\"",
+    );
+    let conflict = db
+        .store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: &launch_key,
+            launch_shape: &changed_shape,
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: Some("workflow"),
+            label: Some("label"),
+            expected_subagents: 2,
+        })
+        .await
+        .expect_err("changed durable shape conflicts deterministically");
+    assert!(conflict
+        .downcast_ref::<crate::DelegationLaunchKeyConflict>()
+        .is_some());
+
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn concurrent_full_creation_allows_only_one_running_writer() {
     let Some(db) = test_store().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -347,7 +760,7 @@ async fn concurrent_delegation_creation_allows_only_one_running_row() {
                 result
                     .as_ref()
                     .err()
-                    .and_then(|error| error.downcast_ref::<crate::RunningDelegationConflict>())
+                    .and_then(|error| error.downcast_ref::<crate::FullDelegationConflict>())
                     .is_some()
             })
             .count(),
@@ -382,8 +795,11 @@ async fn migration_creates_delegation_ledger_query_indexes() {
         where schemaname='public'
           and indexname in (
               'sessions_delegation_created_idx',
+              'sessions_delegation_spawn_index_uq',
               'delegations_parent_created_idx',
+              'delegations_parent_launch_key_uq',
               'delegations_parent_running_idx',
+              'delegations_parent_running_full_uq',
               'delegations_running_created_idx',
               'delegations_completed_repair_idx'
           )
@@ -399,12 +815,14 @@ async fn migration_creates_delegation_ledger_query_indexes() {
         vec![
             "delegations_completed_repair_idx".to_string(),
             "delegations_parent_created_idx".to_string(),
+            "delegations_parent_launch_key_uq".to_string(),
+            "delegations_parent_running_full_uq".to_string(),
             "delegations_parent_running_idx".to_string(),
             "delegations_running_created_idx".to_string(),
             "sessions_delegation_created_idx".to_string(),
+            "sessions_delegation_spawn_index_uq".to_string(),
         ]
     );
-
     db.cleanup().await;
 }
 
@@ -430,11 +848,11 @@ async fn list_delegation_subagents_for_context_is_bounded_and_ordered() {
 
     let delegation = db
         .store
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 12)
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 8)
         .await
         .expect("create delegation");
 
-    for index in 0..12 {
+    for index in 0..8 {
         create_delegation_subagent(
             &db,
             &format!("child_{index:02}"),
@@ -449,7 +867,7 @@ async fn list_delegation_subagents_for_context_is_bounded_and_ordered() {
 
     let subagents = db
         .store
-        .list_delegation_subagents_for_context(&delegation.id, 8)
+        .list_delegation_subagents_for_context(&delegation.id, 4)
         .await
         .expect("list bounded context subagents");
     let ids = subagents
@@ -457,14 +875,14 @@ async fn list_delegation_subagents_for_context_is_bounded_and_ordered() {
         .map(|subagent| subagent.session_id.clone())
         .collect::<Vec<_>>();
 
-    assert_eq!(subagents.len(), 9, "limit + 1 row detects omission");
+    assert_eq!(subagents.len(), 5, "limit + 1 row detects omission");
     assert_eq!(
         ids,
-        (0..9)
+        (0..5)
             .map(|index| format!("child_{index:02}"))
             .collect::<Vec<_>>()
     );
-    assert!(!ids.contains(&"child_09".to_string()));
+    assert!(!ids.contains(&"child_05".to_string()));
 
     db.cleanup().await;
 }
@@ -793,6 +1211,35 @@ async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact()
             Some("delegation-3"),
             Some("delegation-2")
         ]
+    );
+    db.store
+        .set_delegation_status(&delegations[4].id, DelegationStatus::Cancelling)
+        .await
+        .expect("begin cancelling active delegation");
+    let active_complete = db
+        .store
+        .list_parent_delegations_active_complete("parent", 2)
+        .await
+        .expect("list cancelling plus terminal history");
+    assert_eq!(
+        active_complete
+            .iter()
+            .filter(|delegation| delegation.status == DelegationStatus::Cancelling)
+            .map(|delegation| delegation.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![delegations[4].id.as_str()]
+    );
+    assert_eq!(
+        active_complete
+            .iter()
+            .filter(|delegation| {
+                !matches!(
+                    delegation.status,
+                    DelegationStatus::Running | DelegationStatus::Cancelling
+                )
+            })
+            .count(),
+        2
     );
 
     let overview_delegation = &delegations[4];

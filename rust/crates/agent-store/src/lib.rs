@@ -13,8 +13,9 @@ use agent_vocab::{
     TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 pub use postgres::{
-    Delegation, DelegationProgress, DelegationSubagent, DelegationSubagentOverview,
-    PostgresAgentStore,
+    CreateDelegationRequest, Delegation, DelegationLaunchGuard, DelegationProgress,
+    DelegationSubagent, DelegationSubagentOverview, PostgresAgentStore,
+    MAX_RESERVED_READONLY_SLOTS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -64,6 +65,7 @@ text_enum! {
 
     pub enum DelegationStatus {
         Running => "running",
+        Cancelling => "cancelling",
         Done => "done",
         DoneWithFailures => "done_with_failures",
         Cancelled => "cancelled",
@@ -430,15 +432,40 @@ impl fmt::Display for SourceMutationConflict {
 impl std::error::Error for SourceMutationConflict {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunningDelegationConflict;
+pub struct FullDelegationConflict;
 
-impl fmt::Display for RunningDelegationConflict {
+impl fmt::Display for FullDelegationConflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "a delegation is already running for this session")
+        write!(f, "a full delegation is already running for this session")
     }
 }
 
-impl std::error::Error for RunningDelegationConflict {}
+impl std::error::Error for FullDelegationConflict {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadonlyCapacityExceeded;
+
+impl fmt::Display for ReadonlyCapacityExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "read-only delegation capacity exceeded")
+    }
+}
+
+impl std::error::Error for ReadonlyCapacityExceeded {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegationLaunchKeyConflict;
+
+impl fmt::Display for DelegationLaunchKeyConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "delegation launch key was already used with different parameters"
+        )
+    }
+}
+
+impl std::error::Error for DelegationLaunchKeyConflict {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryChanged;
@@ -871,6 +898,33 @@ impl fmt::Display for QueueMutationError {
 }
 
 impl std::error::Error for QueueMutationError {}
+
+#[derive(Debug, Clone)]
+pub struct DelegationInputClosed {
+    delegation_id: String,
+    status: String,
+}
+
+impl DelegationInputClosed {
+    pub fn new(delegation_id: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            delegation_id: delegation_id.into(),
+            status: status.into(),
+        }
+    }
+}
+
+impl fmt::Display for DelegationInputClosed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "delegation {} is {}; child inputs are closed",
+            self.delegation_id, self.status
+        )
+    }
+}
+
+impl std::error::Error for DelegationInputClosed {}
 
 #[derive(Debug, Clone)]
 pub struct InputRecord {

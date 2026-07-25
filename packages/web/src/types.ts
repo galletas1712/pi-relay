@@ -152,7 +152,7 @@ export interface EventFrame {
 }
 
 export type DelegationKind = "full" | "readonly_fanout";
-export type DelegationStatus = "running" | "done" | "done_with_failures" | "cancelled" | "failed";
+export type DelegationStatus = "running" | "cancelling" | "done" | "done_with_failures" | "cancelled" | "failed";
 export type DelegationSubagentStatus = DelegationStatus | "idle" | "queued" | "done";
 export type SubagentType = "full" | "read_only";
 

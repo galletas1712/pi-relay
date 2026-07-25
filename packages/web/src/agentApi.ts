@@ -189,6 +189,7 @@ export interface QueueFollowUpParams {
 
 export interface StartFullDelegationParams {
 	parentSessionId: string;
+	clientLaunchId: string;
 	role: string;
 	prompt: string;
 	workflow?: string | null;
@@ -202,6 +203,7 @@ export interface StartFullDelegationResult {
 
 export interface StartReadonlyDelegationFanoutParams {
 	parentSessionId: string;
+	clientLaunchId: string;
 	tasks: { role: string; prompt: string }[];
 	workflow?: string | null;
 	label?: string | null;
@@ -510,6 +512,7 @@ class AgentApiClient implements AgentApi {
 	startFullDelegation(params: StartFullDelegationParams): Promise<StartFullDelegationResult> {
 		return this.client.request<StartFullDelegationResult>("delegation.start_full", {
 			parent_session_id: params.parentSessionId,
+			client_launch_id: params.clientLaunchId,
 			role: params.role,
 			prompt: params.prompt,
 			workflow: params.workflow ?? undefined,
@@ -520,6 +523,7 @@ class AgentApiClient implements AgentApi {
 	startReadonlyDelegationFanout(params: StartReadonlyDelegationFanoutParams): Promise<StartReadonlyDelegationFanoutResult> {
 		return this.client.request<StartReadonlyDelegationFanoutResult>("delegation.start_readonly_fanout", {
 			parent_session_id: params.parentSessionId,
+			client_launch_id: params.clientLaunchId,
 			tasks: params.tasks,
 			workflow: params.workflow ?? undefined,
 			label: params.label ?? undefined

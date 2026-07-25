@@ -431,6 +431,20 @@ mod tests {
     }
 
     #[test]
+    fn parent_prompt_describes_concurrent_launch_batches_without_polling() {
+        let rendered = render_prompt(
+            TEST_PI_MD,
+            &ctx(PromptProfile::Parent, vec!["Bash"], Vec::new()),
+        );
+        let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(normalized.contains("launch several independent delegations in one turn"));
+        assert!(normalized.contains("one full writer and read-only fan-outs together"));
+        assert!(normalized.contains("After launching the useful batch, end your turn"));
+        assert!(normalized.contains("Do not poll or loop"));
+    }
+
+    #[test]
     fn prompt_mcp_section_is_conditional_and_contains_names_only() {
         let empty = render_prompt(
             TEST_PI_MD,

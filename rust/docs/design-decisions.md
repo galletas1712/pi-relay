@@ -5,6 +5,23 @@ while reducing the Rust rewrite toward a small personal agent runtime.
 
 ## Visible Surface
 
+### Concurrent Delegation Admission Is Parent-Scoped
+
+Delegations remain immutable completion, cancellation, handoff, and recovery
+scopes; concurrency is an admission policy rather than a global delegation
+lock. A parent may own one running/cancelling full writer and read-only fan-outs
+totaling eight reserved slots. Each fan-out retains its full reservation until
+terminality. Admission serializes on the parent session row and a partial
+unique Postgres index independently prevents two admission-active full rows.
+Model action IDs and websocket `client_launch_id` values provide launch replay
+identity; canonical durable child specifications and stable indices let one
+Postgres-serialized materializer recover missing children without duplication.
+
+Read-only work receives a point-in-time Btrfs snapshot under the source cwd
+mutation guard. This isolates workspace writes, not MCP or other remote side
+effects. Every wakeup and control operation remains delegation-ID scoped rather
+than introducing a global coordinator.
+
 ### Sessions Are The Product Unit
 
 The frontend exposes sessions only. There is no task abstraction, project queue,
@@ -137,13 +154,14 @@ switch picker.
 
 ### Global System Prompt
 
-The system prompt is repo-level `PI.md`, not per-session state. The UI exposes
-`/system` only for selected sessions because project workspaces must be
-materialized before the rendered prompt can include workspace instructions and
-skills.
-
-Sessions keep provider and metadata only. This avoids hidden prompt drift and
-makes the daemon's behavior easier to reason about for personal use.
+The repository-level `PI.md` is the system-prompt template. After project
+workspaces are materialized, the daemon renders it with the session's
+workspace, tool, and skill context and persists the result as the immutable
+`sessions.system_prompt`. Provider calls use that stored prompt, so repository
+template edits cannot introduce prompt drift within a session. The
+session-scoped `/system` interface returns the selected session's persisted
+prompt together with the current repository template; it does not re-render or
+mutate the session prompt.
 
 ### No Approval UI
 

@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::{
     CreateForkRequest, DelegationKind, HistoryChanged, HistoryTarget, HistoryTargetNotTurnBoundary,
-    OutputBatch, PostgresAgentStore, RunningDelegationConflict, SessionConfig,
-    SourceMutationConflict, SwitchActiveLeafRequest, TranscriptEntryBodyMode,
+    OutputBatch, PostgresAgentStore, SessionConfig, SourceMutationConflict,
+    SwitchActiveLeafRequest, TranscriptEntryBodyMode,
 };
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(40_000);
@@ -947,10 +947,10 @@ async fn switch_and_fork_share_history_target_validation() {
     .await
     .expect_err("running delegation blocks fork");
     assert!(switch_error
-        .downcast_ref::<RunningDelegationConflict>()
+        .downcast_ref::<SourceMutationConflict>()
         .is_some());
     assert!(fork_error
-        .downcast_ref::<RunningDelegationConflict>()
+        .downcast_ref::<SourceMutationConflict>()
         .is_some());
 
     db.cleanup().await;

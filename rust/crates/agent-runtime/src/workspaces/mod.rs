@@ -33,9 +33,8 @@ use self::instantiate::{
 use self::local::refresh_local_workspace_base;
 pub use self::selection::SelectedWorkspace;
 
-// `.pi-handoff` is a sibling of the workspace dirs under the cwd root. It is
-// owned by the daemon for delegation artifact files; it is never a workspace,
-// never snapshotted into an RO fork.
+// `.pi-handoff` is a daemon-owned child of the cwd root rather than a workspace.
+// Read-only forks remove it immediately after taking the guarded snapshot.
 
 #[derive(Clone)]
 pub struct WorkspaceManager {
@@ -369,6 +368,14 @@ impl WorkspaceManager {
                         child_cwd.display()
                     )
                 })?;
+            let handoff_dir = child_cwd.join(".pi-handoff");
+            match tokio::fs::remove_dir_all(&handoff_dir).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("remove {}", handoff_dir.display()))
+                }
+            }
 
             let mut child_workspaces = Vec::with_capacity(parent_workspaces.len());
             for workspace in parent_workspaces {

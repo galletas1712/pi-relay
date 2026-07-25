@@ -117,7 +117,6 @@ function DelegationCard({
 	mutationBlockedReason?: string | null;
 	onSelectSession?: (sessionId: string) => void;
 }) {
-	const running = isDelegationRunning(delegation);
 	const title = delegation.label?.trim() || "Agent task";
 	const statusLabel = delegation.status === "done_with_failures"
 		? "done with failures"
@@ -130,7 +129,7 @@ function DelegationCard({
 				<AgentStatusIcon status={delegation.status} />
 				<strong className="run-board-delegation-title">{title}</strong>
 				<div className="run-board-delegation-controls">
-					{running ? (
+					{delegation.status === "running" ? (
 						<button
 							className="stop-button run-board-stop"
 							type="button"
@@ -146,7 +145,7 @@ function DelegationCard({
 						</button>
 					) : null}
 				</div>
-				{running ? <ConnectionBlockedReason reason={mutationBlockedReason} className="run-board-blocked-reason" /> : null}
+				{delegation.status === "running" ? <ConnectionBlockedReason reason={mutationBlockedReason} className="run-board-blocked-reason" /> : null}
 			</div>
 			{actionState?.error ? (
 				<p className="run-board-action-error" role="alert">
@@ -200,13 +199,20 @@ export function RunBoardDelegationList({
 }) {
 	const [actionStates, setActionStates] = useState<Record<string, DelegationActionState>>({});
 	const actionLocks = useRef(new Set<string>());
-	// The daemon returns a bounded newest-first page for the Agents outline. Keep
-	// a local cap as a defensive fallback when tests or cached data include extras.
-	const hiddenLocalCount = Math.max(0, delegations.length - RUN_BOARD_DEFAULT_DELEGATION_COUNT);
+	// Active coverage is complete; collapse only bounded terminal history.
+	const activeDelegations = delegations.filter(isDelegationRunning);
+	const terminalDelegations = delegations.filter((delegation) => !isDelegationRunning(delegation));
+	const hiddenLocalCount = Math.max(
+		0,
+		terminalDelegations.length - RUN_BOARD_DEFAULT_DELEGATION_COUNT,
+	);
 	const visibleDelegations =
 		showAllDelegations || hiddenLocalCount === 0
 			? delegations
-			: delegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT);
+			: [
+				...activeDelegations,
+				...terminalDelegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT),
+			];
 	const orderedDelegations = useMemo(
 		() => orderDelegations(visibleDelegations),
 		[visibleDelegations],

@@ -503,7 +503,7 @@ impl PostgresAgentStore {
                     exists(select 1 from actions a where a.session_id=s.id and {running_actions}) as has_running_work,
                     exists(select 1 from queued_inputs q where q.session_id=s.id and {active_queue}) as has_queued_input,
                     exists(select 1 from transcript_entries t where t.session_id=s.id) as has_transcript_entries,
-                    exists(select 1 from delegations d where d.parent_session_id = s.id and d.status = 'running') as has_running_delegations
+                    exists(select 1 from delegations d where d.parent_session_id = s.id and d.status in ('running','cancelling')) as has_running_delegations
                 from sessions s
                 where s.metadata->>'hidden' is distinct from 'true'
                     and (

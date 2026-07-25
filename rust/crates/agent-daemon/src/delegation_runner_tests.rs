@@ -49,6 +49,7 @@ async fn ordinary_tool_dispatch_claims_starts_and_completes_exactly_once() {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
+    let mut live_events = env.state.events.subscribe();
     let project_id = Uuid::new_v4();
     env.state
         .repo
@@ -108,12 +109,12 @@ async fn ordinary_tool_dispatch_claims_starts_and_completes_exactly_once() {
         std::fs::read_to_string(&marker).expect("tool side effect exists"),
         "run"
     );
-    let events = env
-        .state
-        .repo
-        .events_after(session_id, None)
-        .await
-        .expect("events load");
+    let mut events = Vec::new();
+    while let Ok(event) = live_events.try_recv() {
+        if event.session_id == session_id {
+            events.push(event);
+        }
+    }
     assert_eq!(
         events
             .iter()
@@ -293,6 +294,14 @@ impl TempDir {
     }
 }
 
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        for handle in take_tasks(&self.state) {
+            handle.abort();
+        }
+    }
+}
+
 const BLOCKED_USER_INSTRUCTION: &str =
     "Return the exact requested sentinel facts from this instruction.";
 
@@ -315,6 +324,7 @@ use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart,
 };
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
+use crate::subagents::{spawn_subagent, DelegationSubagentSpawn};
 use crate::types::{DispatchAction, RuntimeSession};
 
 use super::{
@@ -322,8 +332,9 @@ use super::{
     sweep_running_delegations_on_boot, try_claim_and_publish_completed_delegation,
 };
 use crate::delegation_tools::{
-    cancel_core, interrupt_subagent_core, read_handoff_file_core, rpc_list, run_delegation_tool,
-    status_core, steer_subagent_core,
+    cancel_core, interrupt_subagent_core, read_handoff_file_core,
+    reconcile_cancelling_delegations_on_boot, rpc_list, run_delegation_tool, status_core,
+    steer_subagent_core,
 };
 use crate::{enqueue_session_input, SessionInputRequest};
 
@@ -430,6 +441,7 @@ async fn test_env() -> Option<TestEnv> {
         fail_subagent_control_reload_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(
             false,
         )),
+        fail_subagent_after_start_before_dispatch: Arc::new(AtomicBool::new(false)),
     };
     Some(TestEnv {
         state,
@@ -498,6 +510,7 @@ async fn test_app_state(
         fail_subagent_control_reload_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(
             false,
         )),
+        fail_subagent_after_start_before_dispatch: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -1300,6 +1313,7 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
         fail_subagent_control_reload_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(
             false,
         )),
+        fail_subagent_after_start_before_dispatch: Arc::new(AtomicBool::new(false)),
     };
 
     restarted_state
@@ -1494,6 +1508,205 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
     terminal_pool.close().await;
     restarted_state.repo.close().await;
 
+    env.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn boot_finishes_cancelling_child_before_expired_post_compaction_recovery() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "cancelling post-compaction boot fence",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "cancelling-parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation(
+            "cancelling-parent",
+            DelegationKind::Full,
+            None,
+            Some("boot fence"),
+            1,
+        )
+        .await
+        .expect("create running delegation");
+    let child_id = "cancelling-post-compaction-child";
+    let (resumed, _) = commit_post_compaction_dispatch_with_faults(
+        &env,
+        project_id,
+        child_id,
+        json!({
+            "pause_model_dispatch_before_provider": false,
+            "model_result": "complete"
+        }),
+    )
+    .await;
+    let database_url = database_url_with_name(&env.admin_url, &env.name);
+    let assertion_pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect crash-fixture assertion pool");
+    sqlx::query(
+        r#"
+        update sessions
+        set parent_session_id=$2,
+            subagent_type='full',
+            delegation_id=$3,
+            metadata=metadata || '{"delegation_spawn_index":0}'::jsonb
+        where id=$1
+        "#,
+    )
+    .bind(child_id)
+    .bind("cancelling-parent")
+    .bind(&delegation.id)
+    .execute(&assertion_pool)
+    .await
+    .expect("bind committed session as delegation child");
+    let intent = agent_store::PostCompactionDispatchIntent {
+        session_id: child_id.to_string(),
+        row_id: resumed.row_id.clone(),
+        attempt_id: resumed.attempt_id.clone(),
+    };
+    env.state
+        .repo
+        .claim_post_compaction_model_action(&intent, std::time::Duration::from_secs(30))
+        .await
+        .expect("running delegation child claim succeeds")
+        .expect("post-compaction intent claims before cancellation");
+    let (won, _) = env
+        .state
+        .repo
+        .begin_delegation_teardown(
+            "cancelling-parent",
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Cancelled,
+            "simulated crash after cancelling commit",
+        )
+        .await
+        .expect("commit running to cancelling");
+    assert!(won);
+
+    expire_post_compaction_lease(
+        &database_url,
+        child_id,
+        &resumed.row_id,
+        &resumed.attempt_id,
+    )
+    .await;
+    env.state.repo.close().await;
+    let restarted_store = PostgresAgentStore::connect(&database_url)
+        .await
+        .expect("restart opens a new store");
+    restarted_store.migrate().await.expect("restart migrates");
+    let restarted_state = test_app_state(
+        restarted_store,
+        &env._state_dir,
+        env.cwd.path().to_path_buf(),
+    )
+    .await;
+
+    assert!(
+        !restarted_state
+            .repo
+            .post_compaction_dispatch_session_ids()
+            .await
+            .expect("discover recoverable sessions")
+            .contains(&child_id.to_string()),
+        "discovery excludes children whose delegation is cancelling"
+    );
+    assert!(
+        restarted_state
+            .repo
+            .claim_post_compaction_model_action(&intent, std::time::Duration::from_secs(30))
+            .await
+            .expect("transactional cancelling-state fence")
+            .is_none(),
+        "claim rechecks delegation status under parent/delegation/child locks"
+    );
+
+    reconcile_cancelling_delegations_on_boot(&restarted_state)
+        .await
+        .expect("boot teardown reaches its durable target before recovery");
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&restarted_state)
+            .await
+            .expect("first post-teardown recovery"),
+        0
+    );
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&restarted_state)
+            .await
+            .expect("repeated post-teardown recovery"),
+        0
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    assert_eq!(
+        restarted_state
+            .repo
+            .get_delegation(&delegation.id)
+            .await
+            .expect("load delegation")
+            .expect("delegation remains")
+            .status,
+        DelegationStatus::Cancelled,
+        "teardown reaches its committed cancellation target"
+    );
+    let action = sqlx::query(
+        "select status, payload from actions where session_id=$1 and id=$2 and attempt_id=$3",
+    )
+    .bind(child_id)
+    .bind(&resumed.row_id)
+    .bind(&resumed.attempt_id)
+    .fetch_one(&assertion_pool)
+    .await
+    .expect("load stopped action");
+    assert_eq!(action.get::<String, _>("status"), "interrupted");
+    assert!(
+        action
+            .get::<serde_json::Value, _>("payload")
+            .get("post_compaction_dispatch")
+            .is_none(),
+        "teardown removes the expired recovery intent"
+    );
+    assert_eq!(
+        crate::runtime::runner_start_count(child_id, "model"),
+        0,
+        "no recovered model runner starts"
+    );
+    assert_eq!(
+        crate::provider_runtime::injected_provider_start_count(child_id),
+        0,
+        "no provider request starts"
+    );
+    assert!(
+        !restarted_state
+            .tasks
+            .lock()
+            .expect("task registry")
+            .values()
+            .any(|task| task.session_id == child_id),
+        "repeated recovery cannot register a child runner"
+    );
+
+    for handle in take_tasks(&restarted_state) {
+        handle.abort();
+    }
+    assertion_pool.close().await;
+    restarted_state.repo.close().await;
     env.cleanup().await;
 }
 
@@ -5335,13 +5548,12 @@ async fn idle_session_can_switch_provider_after_transcript_and_enqueue_captures_
     let pool = sqlx::PgPool::connect(&database_url)
         .await
         .expect("connect route check pool");
-    let value: serde_json::Value = sqlx::query_scalar(
-        "select provider_config from queued_inputs where id=$1",
-    )
-    .bind(input_id)
-    .fetch_one(&pool)
-    .await
-    .expect("queued route");
+    let value: serde_json::Value =
+        sqlx::query_scalar("select provider_config from queued_inputs where id=$1")
+            .bind(input_id)
+            .fetch_one(&pool)
+            .await
+            .expect("queued route");
     pool.close().await;
     let route: ProviderConfig = serde_json::from_value(value).expect("provider route");
     assert_eq!(route.kind, ProviderKind::Claude);
@@ -5899,11 +6111,11 @@ async fn parent_compaction_ledger_bounds_large_fanout_subagents() {
             DelegationKind::ReadonlyFanout,
             None,
             Some("large"),
-            12,
+            8,
         )
         .await
         .expect("create large delegation");
-    for index in 0..12 {
+    for index in 0..8 {
         create_terminal_subagent(
             &env,
             project_id,
@@ -5939,15 +6151,15 @@ async fn parent_compaction_ledger_bounds_large_fanout_subagents() {
 
     assert!(ledger.contains("## Delegation state at compaction time"));
     assert!(ledger.contains(&format!("delegation_id: `{}`", delegation.id)));
-    assert!(ledger.contains("progress: expected 12, spawned 12"));
-    assert!(ledger.contains("... 4 more subagent(s) omitted"));
+    assert!(ledger.contains("progress: expected 8, spawned 8"));
+    assert!(!ledger.contains("more subagent(s) omitted"));
     assert!(ledger.contains("subagent_id: `review_00`"));
     assert!(ledger.contains("subagent_id: `review_07`"));
     assert!(
         !ledger.contains("subagent_id: `review_08`"),
         "limit+1 probe row must not be rendered: {ledger}"
     );
-    assert!(!ledger.contains("review_11/final_message.md"));
+    assert!(!ledger.contains("review_08/final_message.md"));
 
     env.cleanup().await;
 }
@@ -7407,9 +7619,7 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     .expect("cancel delegation");
     assert_eq!(result["cancelled"], true);
     assert_eq!(result["delegation_id"], delegation.id);
-    let expected_handoff_dir = handoff_root(&env, &delegation.id)
-        .to_string_lossy()
-        .into_owned();
+    let expected_handoff_dir = format!(".pi-handoff/{}", delegation.id);
     assert_eq!(
         result["handoff_dir"].as_str(),
         Some(expected_handoff_dir.as_str())
@@ -8532,7 +8742,10 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
     assert_eq!(snapshot["kind"], "readonly_fanout");
     assert_eq!(snapshot["workflow"], "implement_review_test");
     assert_eq!(snapshot["label"], "review");
-    assert_eq!(snapshot["handoff_dir"], root.to_string_lossy().as_ref());
+    assert_eq!(
+        snapshot["handoff_dir"],
+        format!(".pi-handoff/{}", delegation.id)
+    );
     assert_eq!(snapshot["progress"]["expected"], 2);
     assert_eq!(snapshot["progress"]["spawned"], 2);
     assert_eq!(snapshot["progress"]["terminal"], 2);
@@ -9343,7 +9556,7 @@ async fn one_delegation_per_parent_is_rejected() {
     )
     .await
     .expect_err("second delegation must be rejected");
-    assert_eq!(error.code, "delegation_already_running");
+    assert_eq!(error.code, "full_delegation_already_running");
 
     env.cleanup().await;
 }
@@ -9403,7 +9616,7 @@ async fn spawn_failure_leaves_no_running_delegation() {
     };
     // A parent with NO project makes spawn_subagent fail with project_required,
     // exercising the compensation path: the half-started delegation is failed so the
-    // one-delegation-per-parent guard releases rather than stranding the parent.
+    // Writer admission releases rather than stranding the parent.
     env.state
         .repo
         .start_session_outputs(
@@ -9449,6 +9662,235 @@ async fn spawn_failure_leaves_no_running_delegation() {
     assert_eq!(delegations.len(), 1);
     assert_eq!(delegations[0].status, DelegationStatus::Failed);
 
+    env.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn boot_sweep_materializes_every_missing_durable_child_index_idempotently() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    std::fs::write(
+        env.cwd.path().join("PI.md"),
+        "Test prompt for {{ session.cwd }}.\n",
+    )
+    .expect("write test PI template");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "partial launch recovery",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+
+    let launch_shape = json!({
+        "kind": "readonly_fanout",
+        "tasks": [
+            {"role": "reviewer", "prompt": "first"},
+            {"role": "reviewer", "prompt": "second"}
+        ],
+        "workflow": null,
+        "label": "recovery"
+    })
+    .to_string();
+    let before_child_zero = env
+        .state
+        .repo
+        .create_delegation_idempotent(agent_store::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "fault:before-child-zero",
+            launch_shape: &launch_shape,
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: None,
+            label: Some("recovery"),
+            expected_subagents: 2,
+        })
+        .await
+        .expect("persist launch intent before child zero");
+    crate::delegation_tools::materialize_delegation_launch(&env.state, &before_child_zero)
+        .await
+        .expect("recover both missing children");
+    assert_eq!(
+        env.state
+            .repo
+            .delegation_spawned_indices(&before_child_zero.id)
+            .await
+            .expect("spawned indices")
+            .len(),
+        2
+    );
+
+    let after_child_zero = env
+        .state
+        .repo
+        .create_delegation_idempotent(agent_store::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "fault:after-child-zero",
+            launch_shape: &launch_shape,
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: None,
+            label: Some("recovery"),
+            expected_subagents: 2,
+        })
+        .await
+        .expect("persist second launch");
+    spawn_subagent(
+        &env.state,
+        DelegationSubagentSpawn {
+            parent_session_id: "parent".to_string(),
+            role: "reviewer".to_string(),
+            task: "first".to_string(),
+            subagent_type: SubagentType::ReadOnly,
+            delegation_id: after_child_zero.id.clone(),
+            spawn_index: 0,
+        },
+    )
+    .await
+    .expect("spawn child zero before simulated crash");
+    crate::delegation_tools::materialize_delegation_launch(&env.state, &after_child_zero)
+        .await
+        .expect("recover child one");
+    crate::delegation_tools::materialize_delegation_launch(&env.state, &after_child_zero)
+        .await
+        .expect("completed launch replay");
+    let indices = env
+        .state
+        .repo
+        .delegation_spawned_indices(&after_child_zero.id)
+        .await
+        .expect("spawned indices");
+    assert_eq!(indices.len(), 2);
+    assert!(indices.contains_key(&0));
+    assert!(indices.contains_key(&1));
+
+    env.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn boot_recovers_child_committed_immediately_before_initial_dispatch_registration() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    std::fs::write(
+        env.cwd.path().join("PI.md"),
+        "Test prompt for {{ session.cwd }}.\n",
+    )
+    .expect("write test PI template");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "post-commit launch recovery",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let launch_shape = json!({
+        "kind": "full",
+        "role": "implementer",
+        "prompt": "recover me",
+        "workflow": null,
+        "label": "post-commit"
+    })
+    .to_string();
+    let delegation = env
+        .state
+        .repo
+        .create_delegation_idempotent(agent_store::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "fault:post-child-commit",
+            launch_shape: &launch_shape,
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: Some("post-commit"),
+            expected_subagents: 1,
+        })
+        .await
+        .expect("persist launch");
+    env.state
+        .fail_subagent_after_start_before_dispatch
+        .store(true, Ordering::SeqCst);
+    crate::delegation_tools::materialize_delegation_launch(&env.state, &delegation)
+        .await
+        .expect("persisted index makes injected materialization replay-safe");
+    let child_id = env
+        .state
+        .repo
+        .delegation_spawned_indices(&delegation.id)
+        .await
+        .expect("load committed child")
+        .get(&0)
+        .expect("child index zero")
+        .clone();
+    let mut child_config = env
+        .state
+        .repo
+        .load_session_config(&child_id)
+        .await
+        .expect("load committed child config");
+    child_config.metadata["fault_injection"]["force_harness_model_dispatch"] = json!(true);
+    env.state
+        .repo
+        .update_session_metadata(&child_id, &child_config.metadata)
+        .await
+        .expect("force the production registration path");
+    assert!(
+        !env.state
+            .repo
+            .pending_actions_for_dispatch(&child_id)
+            .await
+            .expect("pending initial action")
+            .is_empty(),
+        "initial work committed before the fault"
+    );
+    assert!(
+        !env.state
+            .tasks
+            .lock()
+            .expect("task map")
+            .values()
+            .any(|task| task.session_id == child_id),
+        "fault happened before dispatch registration"
+    );
+
+    env.state.active.lock().await.clear();
+    env.state
+        .repo
+        .mark_all_unfinished_actions_stale()
+        .await
+        .expect("global stale mark");
+    crate::delegation_runner::recover_active_delegations_after_stale_mark(&env.state).await;
+    assert!(
+        env.state
+            .tasks
+            .lock()
+            .expect("task map")
+            .values()
+            .any(|task| task.session_id == child_id),
+        "boot recovery registers the committed initial action"
+    );
+    assert!(
+        env.state
+            .repo
+            .has_unfinished_actions(&child_id)
+            .await
+            .expect("child work after stale mark"),
+        "child work is reconstructed after startup stale marking"
+    );
     env.cleanup().await;
 }
 
@@ -9999,17 +10441,17 @@ async fn raw_session_input_steer_to_any_subagent_is_rejected_server_side() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
+    let readonly_delegation = env
         .state
         .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 2)
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
         .await
-        .expect("create delegation");
+        .expect("create read-only delegation");
     create_terminal_subagent(
         &env,
         project_id,
         "parent",
-        &delegation.id,
+        &readonly_delegation.id,
         "ro",
         "reviewer",
         SubagentType::ReadOnly,
@@ -10017,7 +10459,43 @@ async fn raw_session_input_steer_to_any_subagent_is_rejected_server_side() {
         "done",
     )
     .await;
-    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "full_running").await;
+    let terminal_full_delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create terminal full delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &terminal_full_delegation.id,
+        "full_terminal",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "done",
+    )
+    .await;
+    env.state
+        .repo
+        .set_delegation_status(&terminal_full_delegation.id, DelegationStatus::Done)
+        .await
+        .expect("finish terminal full delegation");
+    let full_delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create full delegation");
+    create_busy_full_subagent(
+        &env,
+        project_id,
+        "parent",
+        &full_delegation.id,
+        "full_running",
+    )
+    .await;
 
     let steer = |session_id: &str| {
         json!({
@@ -10062,18 +10540,6 @@ async fn raw_session_input_steer_to_any_subagent_is_rejected_server_side() {
 
     // A terminal full subagent must not be reactivated by a raw steer-priority
     // input either.
-    create_terminal_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "full_terminal",
-        "implementer",
-        SubagentType::Full,
-        TurnOutcome::Graceful,
-        "done",
-    )
-    .await;
     let rejected = crate::input_user(&env.state, steer("full_terminal"))
         .await
         .expect_err("raw steering a terminal full subagent must be rejected");
