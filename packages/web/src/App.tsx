@@ -96,10 +96,9 @@ import {
 	ProviderConfigurationController,
 	type ProviderConfigurationTarget,
 } from "./providerConfigurationController.ts";
-import { isRpcErrorCode, type ConnectionStatus } from "./rpc.ts";
+import { isRpcErrorCode, RpcTransportError, type ConnectionStatus } from "./rpc.ts";
 import {
 	formatWorkspacePreparationStatus,
-	isUncertainSessionStartError,
 	type WorkspaceMaterializeProgress,
 } from "./workspaceMaterializeProgress.ts";
 import { findCommand, type ParsedSlash } from "./slash.ts";
@@ -3241,7 +3240,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				try {
 					result = await api.startSession(params);
 				} catch (error) {
-					if (isUncertainSessionStartError(error)) {
+					if (error instanceof RpcTransportError) {
 						setWorkspacePreparationStatusOverride(
 							"Checking whether the session started…",
 						);
@@ -4669,8 +4668,11 @@ async function reconcileUncertainSessionStart(
 				replayed: true,
 			};
 		} catch (error) {
-			if (!isSessionNotFoundError(error) && !isUncertainSessionStartError(error)) {
-				// Keep polling through transient read failures while the socket recovers.
+			// Not-found means the start has not landed yet, and a transport failure
+			// leaves the read itself unanswered; anything else is a real error the
+			// caller must see immediately instead of after the whole window.
+			if (!isSessionNotFoundError(error) && !(error instanceof RpcTransportError)) {
+				throw error;
 			}
 		}
 		await new Promise((resolve) => window.setTimeout(resolve, UNCERTAIN_START_POLL_MS));

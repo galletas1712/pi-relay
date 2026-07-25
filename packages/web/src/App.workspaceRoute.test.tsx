@@ -6,7 +6,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentApi } from "./agentApi.ts";
 import { App } from "./App.tsx";
-import { RpcRequestError, type ConnectionStatus } from "./rpc.ts";
+import { RpcRequestError, RpcTransportError, type ConnectionStatus } from "./rpc.ts";
 import { queryKeys } from "./queryKeys.ts";
 import type {
 	DelegationListResult,
@@ -1312,6 +1312,97 @@ describe("App workspace route identity integration", () => {
 			await mounted.dispose();
 		},
 	);
+
+	it("opens the session an uncertain start actually created once it appears", async () => {
+		const api = createRouteApi();
+		const knownSession = vi.mocked(api.getSession).getMockImplementation()!;
+		let newSessionId = "";
+		let notFoundReads = 0;
+		api.startSession.mockImplementation(async (params: { sessionId: string }) => {
+			newSessionId = params.sessionId;
+			throw new RpcTransportError("websocket request timed out");
+		});
+		vi.mocked(api.getSession).mockImplementation(async (sessionId: string) => {
+			if (sessionId !== newSessionId) return knownSession(sessionId);
+			if (notFoundReads < 2) {
+				notFoundReads += 1;
+				throw new RpcRequestError("session_not_found", "session not found", {});
+			}
+			return snapshot(sessionId, null, null, "Recovered start");
+		});
+		const browser = new FakeWorkspaceBrowser("/");
+		const mounted = renderRouteApp(api, browser);
+
+		await open(api);
+		await sendComposerText("start that may have landed");
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(UNCERTAIN_START_POLL_MS * 2);
+		});
+
+		expect(notFoundReads).toBe(2);
+		expect(browser.currentUrl).toContain(newSessionId);
+		expect(screen.queryByText(UNCERTAIN_START_NOTICE)).toBeNull();
+
+		vi.useRealTimers();
+		await mounted.dispose();
+	});
+
+	it("warns and surfaces the original error when an uncertain start never appears", async () => {
+		const api = createRouteApi();
+		let newSessionId = "";
+		api.startSession.mockImplementation(async (params: { sessionId: string }) => {
+			newSessionId = params.sessionId;
+			throw new RpcTransportError("websocket request timed out");
+		});
+		const browser = new FakeWorkspaceBrowser("/");
+		const mounted = renderRouteApp(api, browser);
+
+		await open(api);
+		await sendComposerText("start that never lands");
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(UNCERTAIN_START_RECONCILE_MS + UNCERTAIN_START_POLL_MS);
+		});
+
+		expect(screen.getByText(UNCERTAIN_START_NOTICE)).toBeTruthy();
+		expect(screen.getByText("websocket request timed out")).toBeTruthy();
+		expect(browser.currentUrl).not.toContain(newSessionId);
+
+		vi.useRealTimers();
+		await mounted.dispose();
+	});
+
+	it("fails an uncertain start fast when the reconciling read is not retryable", async () => {
+		const api = createRouteApi();
+		const knownSession = vi.mocked(api.getSession).getMockImplementation()!;
+		let newSessionId = "";
+		let reads = 0;
+		api.startSession.mockImplementation(async (params: { sessionId: string }) => {
+			newSessionId = params.sessionId;
+			throw new RpcTransportError("websocket request timed out");
+		});
+		vi.mocked(api.getSession).mockImplementation(async (sessionId: string) => {
+			if (sessionId !== newSessionId) return knownSession(sessionId);
+			reads += 1;
+			throw new RpcRequestError("invalid_params", "session_id is malformed", {});
+		});
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+
+		await open(api);
+		await sendComposerText("start with an unusable id");
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(UNCERTAIN_START_POLL_MS);
+		});
+
+		expect(reads).toBe(1);
+		expect(screen.getByText("invalid_params: session_id is malformed")).toBeTruthy();
+		expect(screen.queryByText(UNCERTAIN_START_NOTICE)).toBeNull();
+
+		vi.useRealTimers();
+		await mounted.dispose();
+	});
 
 	it("fails closed during a retained-inventory refetch but allows deselection and an MCP-free start", async () => {
 		const refresh = deferred<McpInventory>();
@@ -2737,6 +2828,22 @@ function turnsWithContent(
 async function open(api: RouteApi) {
 	await openStatusOnly(api);
 	await waitFor(() => expect(screen.queryByText("Loading conversation")).toBeNull());
+}
+
+const UNCERTAIN_START_POLL_MS = 1_500;
+const UNCERTAIN_START_RECONCILE_MS = 45_000;
+const UNCERTAIN_START_NOTICE =
+	"Session start may still be running. Retry send (same draft) or check the session list.";
+
+/** Submit composer text and switch to fake timers so the reconcile poll can be driven. */
+async function sendComposerText(text: string) {
+	const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
+	fireEvent.change(composer, { target: { value: text } });
+	vi.useFakeTimers();
+	await act(async () => {
+		fireEvent.click(screen.getByRole("button", { name: "send message" }));
+		await Promise.resolve();
+	});
 }
 
 async function openStatusOnly(api: RouteApi) {
