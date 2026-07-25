@@ -1052,6 +1052,7 @@ async fn project_create(state: &AppState, params: Value) -> std::result::Result<
             agent_runtime_protocol::RuntimeCommand::ValidateProject {
                 workspaces: params.workspaces.clone(),
             },
+            None,
         )
         .await?;
     let workspaces = params.workspaces;
@@ -1094,6 +1095,7 @@ async fn project_update(state: &AppState, params: Value) -> std::result::Result<
                 agent_runtime_protocol::RuntimeCommand::ValidateProject {
                     workspaces: workspaces.clone(),
                 },
+                None,
             )
             .await?;
         workspaces

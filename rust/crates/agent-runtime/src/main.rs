@@ -27,7 +27,9 @@ use tokio::task::AbortHandle;
 use tokio::time::Duration;
 use uuid::Uuid;
 
-use workspaces::{validate_remote_branch, validate_workspace_dir, WorkspaceManager};
+use workspaces::{
+    validate_remote_branch, validate_workspace_dir, MaterializeProgressSink, WorkspaceManager,
+};
 
 const PRODUCT_CONFIG_DIR: &str = "pi-relay";
 const RUNTIME_CONFIG_DIR: &str = "runtime";
@@ -405,9 +407,7 @@ impl Runtime {
     async fn execute(
         &self,
         command: RuntimeCommand,
-        _progress: Option<
-            tokio::sync::mpsc::Sender<agent_runtime_protocol::WorkspaceMaterializeProgress>,
-        >,
+        progress: Option<MaterializeProgressSink>,
     ) -> Result<RuntimeCommandResult> {
         match command {
             RuntimeCommand::ValidateProject { workspaces } => {
@@ -431,7 +431,7 @@ impl Runtime {
                             .into_iter()
                             .map(Into::into)
                             .collect::<Vec<_>>(),
-                        _progress,
+                        progress,
                     )
                     .await?;
                 Ok(RuntimeCommandResult::Materialized { workspaces })

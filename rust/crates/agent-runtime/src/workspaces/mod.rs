@@ -17,8 +17,8 @@ use agent_runtime_protocol::{
     WorkspaceMaterializeProgress,
 };
 use anyhow::{bail, Context, Result};
-use futures_util::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
+use futures_util::{stream, StreamExt, TryStreamExt};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 pub use self::config::validate_workspace_dir;
@@ -40,7 +40,9 @@ const MATERIALIZE_CONCURRENCY: usize = 4;
 
 pub type MaterializeProgressSink = tokio::sync::mpsc::Sender<WorkspaceMaterializeProgress>;
 
-type SlotLockMap = HashMap<(Uuid, String), Arc<Mutex<()>>>;
+/// Per-key mutexes, created on first use and held by key for the duration of a
+/// mutation.
+type KeyedLocks<K> = Arc<Mutex<HashMap<K, Arc<Mutex<()>>>>>;
 
 // `.pi-handoff` is a sibling of the workspace dirs under the cwd root. It is
 // owned by the daemon for delegation artifact files; it is never a workspace,
@@ -52,10 +54,10 @@ pub struct WorkspaceManager {
     runtime_config_root: PathBuf,
     home_dir: PathBuf,
     /// Serializes project-level base-tree mutations (stale slot cleanup, wipe).
-    project_bases_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
+    project_bases_locks: KeyedLocks<Uuid>,
     /// Serializes refresh of a single managed workspace base slot.
-    workspace_base_slot_locks: Arc<Mutex<SlotLockMap>>,
-    cwd_mutation_guards: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    workspace_base_slot_locks: KeyedLocks<(Uuid, String)>,
+    cwd_mutation_guards: KeyedLocks<PathBuf>,
 }
 
 impl WorkspaceManager {
@@ -342,55 +344,29 @@ impl WorkspaceManager {
                     .await?;
             }
             let total = selected_workspaces.len();
-            let semaphore = Arc::new(Semaphore::new(MATERIALIZE_CONCURRENCY));
-            let mut tasks = FuturesUnordered::new();
+            let mut pending = Vec::with_capacity(total);
             for (offset, selected) in selected_workspaces.iter().enumerate() {
-                let manager = self.clone();
-                let cwd = cwd.clone();
-                let workspace_id = workspace_id.to_string();
-                let selected = selected.clone();
-                let progress = progress.clone();
-                let semaphore = semaphore.clone();
-                let index = offset + 1;
                 let workspace_dir = workspace_base_config(&selected.workspace)?.workspace_dir;
-                tasks.push(async move {
-                    let _permit = semaphore
-                        .acquire()
-                        .await
-                        .expect("materialize concurrency semaphore stays open");
-                    let result = manager
-                        .materialize_workspace(
-                            project_id,
-                            &workspace_id,
-                            &cwd,
-                            &selected.workspace,
-                            selected.branch_override.as_deref(),
-                            MaterializeProgressCtx {
-                                workspace_dir,
-                                index,
-                                total,
-                                progress: progress.as_ref(),
-                            },
-                        )
-                        .await;
-                    (offset, result)
-                });
+                pending.push(self.materialize_workspace(
+                    project_id,
+                    workspace_id,
+                    &cwd,
+                    &selected.workspace,
+                    selected.branch_override.as_deref(),
+                    MaterializeProgressCtx {
+                        workspace_dir,
+                        index: offset + 1,
+                        total,
+                        progress: progress.as_ref(),
+                    },
+                ));
             }
-            let mut slots: Vec<Option<SessionWorkspace>> = (0..total).map(|_| None).collect();
-            while let Some((offset, result)) = tasks.next().await {
-                match result {
-                    Ok(workspace) => slots[offset] = Some(workspace),
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok::<_, anyhow::Error>(
-                slots
-                    .into_iter()
-                    .map(|workspace| {
-                        workspace.expect("every selected workspace slot is filled on success")
-                    })
-                    .collect(),
-            )
+            // `buffered` bounds in-flight materializations while yielding results
+            // in the project's declared workspace order.
+            stream::iter(pending)
+                .buffered(MATERIALIZE_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await
         }
         .await;
         match materialized {
