@@ -553,6 +553,27 @@ project does not declare, repeats a workspace, or sets `branch` on a local-folde
 workspace. Selected workspaces are materialized in the project's declared order
 regardless of request order. The field is ignored for ephemeral sessions.
 
+While materializing, the daemon may emit ephemeral request-correlated progress
+frames on the same websocket (not durable `events.*` rows):
+
+```json
+{
+  "id": "web_1",
+  "progress": {
+    "workspace_dir": "repo-a",
+    "phase": "refreshing_base",
+    "index": 1,
+    "total": 3
+  }
+}
+```
+
+`phase` is one of `refreshing_base`, `copying`, `branch_override`, `done`, or
+`error`. `index` is 1-based in the selected set. These frames do not complete
+the `session.start` request; the normal `{ "id", "ok", "result" }` response
+still does. The daemon↔runtime materialize command timeout is 300 seconds to
+match the web client's workspace-operation RPC timeout.
+
 The daemon writes `session.created`, `input.accepted`, transcript entries,
 actions, the optional content-addressed MCP-only manifest reference, and events
 in the same session-start transition before dispatching provider/tool work.

@@ -13,7 +13,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 pub const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
-pub const COMMAND_TIMEOUT_SECS: u64 = 120;
+/// Matches the web client's workspace-operation RPC timeout so long multi-repo
+/// materialize/fork work is not cut off by the daemon↔runtime hop first.
+pub const COMMAND_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeHello {
@@ -58,10 +60,36 @@ pub async fn write_frame<T: Serialize>(
 pub enum RuntimeToControl {
     Hello(RuntimeHello),
     Heartbeat,
+    /// Ephemeral mid-command status for long MaterializeSession work. Does not
+    /// complete the waiter; [`Self::Result`] still does.
+    Progress {
+        command_id: String,
+        progress: WorkspaceMaterializeProgress,
+    },
     Result {
         command_id: String,
         result: Result<RuntimeCommandResult, RuntimeCommandError>,
     },
+}
+
+/// Per-workspace status while a session's workspaces are being prepared.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceMaterializeProgress {
+    pub workspace_dir: String,
+    pub phase: WorkspaceMaterializePhase,
+    /// 1-based index in the selected workspace set.
+    pub index: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMaterializePhase {
+    RefreshingBase,
+    Copying,
+    BranchOverride,
+    Done,
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

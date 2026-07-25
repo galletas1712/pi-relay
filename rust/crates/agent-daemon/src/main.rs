@@ -357,7 +357,8 @@ async fn drain_dispatch_tasks(state: &AppState) {
 
 async fn handle_socket(state: AppState, stream: TcpStream) -> Result<()> {
     let ws = tokio_tungstenite::accept_async(stream).await?;
-    let (mut writer, mut reader) = ws.split();
+    let (writer, mut reader) = ws.split();
+    let writer = Arc::new(Mutex::new(writer));
     let mut events_rx = state.events.subscribe();
     let mut subscriptions = BTreeSet::<String>::new();
     let mut event_high_water = BTreeMap::<String, i64>::new();
@@ -385,15 +386,46 @@ async fn handle_socket(state: AppState, stream: TcpStream) -> Result<()> {
                                 data: json!({}),
                             }),
                         };
-                        writer.send(Message::Text(serde_json::to_string(&response)?.into())).await?;
+                        writer.lock().await.send(Message::Text(serde_json::to_string(&response)?.into())).await?;
                         continue;
                     }
                 };
-                let response = match handle_request(&state, &mut subscriptions, &mut event_high_water, request).await {
+                let request_id = request.id.clone();
+                let progress_tx = if request.method == "session.start" {
+                    let (progress_tx, mut progress_rx) =
+                        tokio::sync::mpsc::channel::<agent_runtime_protocol::WorkspaceMaterializeProgress>(32);
+                    let writer = writer.clone();
+                    let progress_id = request_id.clone();
+                    tokio::spawn(async move {
+                        while let Some(progress) = progress_rx.recv().await {
+                            let frame = json!({
+                                "id": progress_id,
+                                "progress": progress,
+                            });
+                            let Ok(text) = serde_json::to_string(&frame) else {
+                                continue;
+                            };
+                            let mut writer = writer.lock().await;
+                            let _ = writer.send(Message::Text(text.into())).await;
+                        }
+                    });
+                    Some(progress_tx)
+                } else {
+                    None
+                };
+                let response = match handle_request(
+                    &state,
+                    &mut subscriptions,
+                    &mut event_high_water,
+                    request,
+                    progress_tx,
+                )
+                .await
+                {
                     Ok((id, value)) => RpcResponse { id, ok: true, result: Some(value), error: None },
                     Err((id, error)) => RpcResponse { id, ok: false, result: None, error: Some(error) },
                 };
-                writer.send(Message::Text(serde_json::to_string(&response)?.into())).await?;
+                writer.lock().await.send(Message::Text(serde_json::to_string(&response)?.into())).await?;
             }
             event = events_rx.recv() => {
                 let event = match event {
@@ -419,6 +451,8 @@ async fn handle_socket(state: AppState, stream: TcpStream) -> Result<()> {
                                     }
                                     event_high_water.insert(session_id.clone(), event.event_id);
                                     writer
+                                        .lock()
+                                        .await
                                         .send(Message::Text(
                                             serde_json::to_string(&event)?.into(),
                                         ))
@@ -446,7 +480,7 @@ async fn handle_socket(state: AppState, stream: TcpStream) -> Result<()> {
                         continue;
                     }
                     event_high_water.insert(event.session_id.clone(), event.event_id);
-                    writer.send(Message::Text(serde_json::to_string(&event)?.into())).await?;
+                    writer.lock().await.send(Message::Text(serde_json::to_string(&event)?.into())).await?;
                 }
             }
         }
@@ -460,6 +494,7 @@ async fn handle_request(
     subscriptions: &mut BTreeSet<String>,
     event_high_water: &mut BTreeMap<String, i64>,
     request: RpcRequest,
+    on_progress: Option<tokio::sync::mpsc::Sender<agent_runtime_protocol::WorkspaceMaterializeProgress>>,
 ) -> std::result::Result<(Value, Value), (Value, RpcErrorBody)> {
     let id = request.id;
     match dispatch_request(
@@ -468,6 +503,7 @@ async fn handle_request(
         event_high_water,
         request.method,
         request.params,
+        on_progress,
     )
     .await
     {
@@ -489,6 +525,9 @@ async fn dispatch_request(
     event_high_water: &mut BTreeMap<String, i64>,
     method: String,
     params: Value,
+    on_progress: Option<
+        tokio::sync::mpsc::Sender<agent_runtime_protocol::WorkspaceMaterializeProgress>,
+    >,
 ) -> std::result::Result<Value, RpcError> {
     let Some(method) = RpcMethod::parse(&method) else {
         return Err(RpcError::new(
@@ -497,8 +536,14 @@ async fn dispatch_request(
         ));
     };
     match method {
-        RpcMethod::SessionStart => session_start::session_start(state, params).await,
-        RpcMethod::SessionList => session_list(state, params).await,
+        RpcMethod::SessionStart => {
+            session_start::session_start(state, params, on_progress).await
+        }
+        other => {
+            let _ = on_progress;
+            match other {
+                RpcMethod::SessionStart => unreachable!("session.start handled above"),
+                RpcMethod::SessionList => session_list(state, params).await,
         RpcMethod::SessionGet => session_get(state, params).await,
         RpcMethod::SessionSyncActiveBranch => session_sync_active_branch(state, params).await,
         RpcMethod::SessionRename => session_rename(state, params).await,
@@ -555,6 +600,8 @@ async fn dispatch_request(
         }
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
+            }
+        }
     }
 }
 

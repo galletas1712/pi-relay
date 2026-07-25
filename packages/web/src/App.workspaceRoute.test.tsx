@@ -1496,9 +1496,12 @@ describe("App workspace route identity integration", () => {
 
 		await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1));
 		const params = api.startSession.mock.calls[0][0];
-		expect(params).toEqual({
+		const { onProgress, ...startParams } = params;
+		expect(typeof onProgress).toBe("function");
+		expect(startParams).toEqual({
 			sessionId: params.sessionId,
 			projectId: "project-1",
+			runtimeId: undefined,
 			provider: undefined,
 			metadata: {
 				title: "start combined setup",

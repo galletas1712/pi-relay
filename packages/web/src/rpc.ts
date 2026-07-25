@@ -1,5 +1,6 @@
 import { perfEnabled, perfLog, perfNow } from "./perf.ts";
 import type { EventFrame } from "./types.ts";
+import type { WorkspaceMaterializeProgress } from "./workspaceMaterializeProgress.ts";
 
 interface RpcResponse<T> {
 	id: string;
@@ -12,9 +13,15 @@ interface RpcResponse<T> {
 	};
 }
 
+interface RpcProgressFrame {
+	id: string;
+	progress: WorkspaceMaterializeProgress;
+}
+
 type Pending = {
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
+	onProgress?: (progress: WorkspaceMaterializeProgress) => void;
 	method: string;
 	startedAt: number;
 };
@@ -40,6 +47,7 @@ export interface RpcClient {
 
 export interface RpcRequestOptions {
 	timeoutMs?: number;
+	onProgress?: (progress: WorkspaceMaterializeProgress) => void;
 }
 
 export class RpcRequestError extends Error {
@@ -190,6 +198,7 @@ export class AgentRpcClient implements RpcClient {
 			this.pending.set(id, {
 				resolve: (value) => resolve(value as T),
 				reject,
+				onProgress: options?.onProgress,
 				method,
 				startedAt: perfNow()
 			});
@@ -199,16 +208,16 @@ export class AgentRpcClient implements RpcClient {
 	}
 
 	private handleMessage(message: MessageEvent<string>): void {
-		let data: RpcResponse<unknown> | EventFrame;
+		let data: RpcResponse<unknown> | RpcProgressFrame | EventFrame;
 		const shouldLogPerf = perfEnabled();
 		const receivedAt = shouldLogPerf ? perfNow() : 0;
 		try {
-			data = JSON.parse(message.data) as RpcResponse<unknown> | EventFrame;
+			data = JSON.parse(message.data) as RpcResponse<unknown> | RpcProgressFrame | EventFrame;
 			if (shouldLogPerf) {
 				perfLog("rpc message parsed", {
 					bytes: message.data.length,
 					parseMs: Math.round(perfNow() - receivedAt),
-					kind: "ok" in data ? "response" : "event"
+					kind: "ok" in data ? "response" : "progress" in data ? "progress" : "event"
 				});
 			}
 		} catch {
@@ -234,6 +243,11 @@ export class AgentRpcClient implements RpcClient {
 				const detail = data.error?.message ?? "request failed";
 				pending.reject(new RpcRequestError(code, detail, data.error?.data));
 			}
+			return;
+		}
+		if ("progress" in data && "id" in data && !("event" in data)) {
+			const pending = this.pending.get(data.id);
+			pending?.onProgress?.(data.progress);
 			return;
 		}
 		for (const handler of this.eventHandlers) handler(data);
@@ -266,16 +280,12 @@ export class AgentRpcClient implements RpcClient {
 			const timer = globalThis.setTimeout(() => {
 				const pending = this.pending.get(id);
 				if (!pending) return;
+				// Abandon only this request. Closing the whole socket used to kill
+				// in-flight workspace starts when an unrelated 15s RPC timed out.
 				this.pending.delete(id);
-				const ws = this.ws;
-				this.ws = null;
-				ws?.close();
-				const error = new Error("websocket request timed out");
-				this.rejectPending("websocket closed");
-				pending.reject(error);
-				reject(error);
-				this.emitStatus("closed");
-				if (!this.closedByUser) this.scheduleReconnect();
+				// Reject the pending entry; the promise.then handler below settles
+				// this wrapper (do not reject twice).
+				pending.reject(new Error("websocket request timed out"));
 			}, timeoutMs);
 			promise.then(
 				(value) => {

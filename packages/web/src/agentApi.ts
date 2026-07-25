@@ -5,6 +5,7 @@ import {
 	type ConnectionStatus,
 	type RpcClient,
 } from "./rpc.ts";
+import type { WorkspaceMaterializeProgress } from "./workspaceMaterializeProgress.ts";
 import type {
 	Activity,
 	ActiveBranchSyncResponse,
@@ -171,6 +172,7 @@ export interface StartSessionParams {
 	/** Subset of the project's workspaces to materialize, with optional per-session git branch overrides. Omit for all. */
 	workspaces?: StartSessionWorkspace[] | null;
 	mcp?: StartSessionMcpSelection;
+	onProgress?: (progress: WorkspaceMaterializeProgress) => void;
 }
 
 export interface StartSessionResult {
@@ -673,7 +675,7 @@ class AgentApiClient implements AgentApi {
 							branch: workspace.branch?.trim() || undefined
 						}))
 			},
-			{ timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
+			{ timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS, onProgress: params.onProgress },
 		);
 	}
 
