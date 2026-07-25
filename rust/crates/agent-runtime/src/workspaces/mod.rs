@@ -702,8 +702,8 @@ impl WorkspaceManager {
             }
         };
         match &result {
-            Ok(_) => progress.emit(WorkspaceMaterializePhase::Done).await,
-            Err(_) => progress.emit(WorkspaceMaterializePhase::Error).await,
+            Ok(_) => progress.emit(WorkspaceMaterializePhase::Done),
+            Err(_) => progress.emit(WorkspaceMaterializePhase::Error),
         }
         result
     }
@@ -717,9 +717,7 @@ impl WorkspaceManager {
         branch_override: Option<&str>,
         progress: &MaterializeProgressCtx<'_>,
     ) -> Result<SessionWorkspace> {
-        progress
-            .emit(WorkspaceMaterializePhase::RefreshingBase)
-            .await;
+        progress.emit(WorkspaceMaterializePhase::RefreshingBase);
         let base = self.refresh_workspace_base(project_id, workspace).await?;
         let remote_url = required_git_field(base.config.remote_url.as_deref(), "remote_url")?;
         let default_branch =
@@ -731,16 +729,14 @@ impl WorkspaceManager {
         }
         let local_branch = local_branch(session_id, workspace_dir);
 
-        progress.emit(WorkspaceMaterializePhase::Copying).await;
+        progress.emit(WorkspaceMaterializePhase::Copying);
         populate_workspace(&base.path, &target).await?;
         // The session copy inherits the base's branch by default; an override fetches
         // the requested branch into this session's copy only, leaving the shared base
         // on the project's configured branch.
         let (session_branch, base_sha) = match branch_override {
             Some(branch) if branch != default_branch => {
-                progress
-                    .emit(WorkspaceMaterializePhase::BranchOverride)
-                    .await;
+                progress.emit(WorkspaceMaterializePhase::BranchOverride);
                 let sha = fetch_session_branch_head(&target, branch).await?;
                 (branch, sha)
             }
@@ -767,9 +763,7 @@ impl WorkspaceManager {
         workspace: &ProjectWorkspace,
         progress: &MaterializeProgressCtx<'_>,
     ) -> Result<SessionWorkspace> {
-        progress
-            .emit(WorkspaceMaterializePhase::RefreshingBase)
-            .await;
+        progress.emit(WorkspaceMaterializePhase::RefreshingBase);
         let base = self.refresh_workspace_base(project_id, workspace).await?;
         let source_path = required_local_field(base.config.source_path.as_deref(), "source_path")?;
         let workspace_dir = base.config.workspace_dir.as_str();
@@ -777,7 +771,7 @@ impl WorkspaceManager {
         if target.exists() {
             bail!("session workspace already exists: {}", target.display());
         }
-        progress.emit(WorkspaceMaterializePhase::Copying).await;
+        progress.emit(WorkspaceMaterializePhase::Copying);
         populate_workspace(&base.path, &target).await?;
         Ok(SessionWorkspace::local(workspace_dir, source_path))
     }
@@ -791,16 +785,16 @@ struct MaterializeProgressCtx<'a> {
 }
 
 impl MaterializeProgressCtx<'_> {
-    async fn emit(&self, phase: WorkspaceMaterializePhase) {
+    /// Progress is ephemeral status, so a full queue drops frames rather than
+    /// throttling materialize work behind progress delivery.
+    fn emit(&self, phase: WorkspaceMaterializePhase) {
         if let Some(progress) = self.progress {
-            let _ = progress
-                .send(WorkspaceMaterializeProgress {
-                    workspace_dir: self.workspace_dir.clone(),
-                    phase,
-                    index: self.index,
-                    total: self.total,
-                })
-                .await;
+            let _ = progress.try_send(WorkspaceMaterializeProgress {
+                workspace_dir: self.workspace_dir.clone(),
+                phase,
+                index: self.index,
+                total: self.total,
+            });
         }
     }
 }
@@ -953,6 +947,26 @@ mod tests {
     fn write_file(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
         std::fs::write(path, contents).expect("write");
+    }
+
+    /// A sync test: `emit` has no async context to block in, and a full sink
+    /// drops the frame rather than making materialize wait for a reader.
+    #[test]
+    fn progress_emit_drops_frames_once_the_sink_is_full() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let progress = MaterializeProgressCtx {
+            workspace_dir: "repo".to_string(),
+            index: 1,
+            total: 1,
+            progress: Some(&sender),
+        };
+
+        progress.emit(WorkspaceMaterializePhase::RefreshingBase);
+        progress.emit(WorkspaceMaterializePhase::Copying);
+
+        let delivered = receiver.try_recv().expect("first frame");
+        assert_eq!(delivered.phase, WorkspaceMaterializePhase::RefreshingBase);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]

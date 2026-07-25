@@ -571,8 +571,11 @@ frames on the same websocket (not durable `events.*` rows):
 `phase` is one of `refreshing_base`, `copying`, `branch_override`, `done`, or
 `error`. `index` is 1-based in the selected set. These frames do not complete
 the `session.start` request; the normal `{ "id", "ok", "result" }` response
-still does. The daemon↔runtime materialize command timeout is 300 seconds to
-match the web client's workspace-operation RPC timeout.
+still does. They are ephemeral: when a client drains them too slowly the daemon
+drops frames rather than stalling the runtime connection, so a client must treat
+the sequence as lossy and rely on the response for the final state. Each
+daemon↔runtime command carries its own timeout: 300 seconds for the materialize
+command, 120 seconds for every other command.
 
 The daemon writes `session.created`, `input.accepted`, transcript entries,
 actions, the optional content-addressed MCP-only manifest reference, and events
