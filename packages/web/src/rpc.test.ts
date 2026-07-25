@@ -141,7 +141,48 @@ describe("AgentRpcClient reconnect hardening", () => {
 		expect(FakeWebSocket.instances).toHaveLength(0);
 	});
 
-	it("times out a hung request without closing the websocket", async () => {
+	it("times out a hung request without closing a socket that is still delivering frames", async () => {
+		const client = new AgentRpcClient("ws://agent.test/ws");
+		const statuses: string[] = [];
+		client.onStatus((status) => statuses.push(status));
+		const connect = client.connect();
+		const socket = FakeWebSocket.instances[0];
+		socket.open();
+		await connect;
+
+		const request = client.request("session.list");
+		const progress: unknown[] = [];
+		const sibling = client.request(
+			"session.get",
+			{},
+			{
+				timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS,
+				onProgress: (update) => progress.push(update),
+			},
+		);
+		const requestRejected = expect(request).rejects.toThrow("websocket request timed out");
+		await Promise.resolve();
+		expect(socket.sent).toHaveLength(2);
+
+		await vi.advanceTimersByTimeAsync(RPC_REQUEST_TIMEOUT_MS / 2);
+		socket.respond({
+			id: "web_2",
+			progress: { workspace_dir: "repo-a", phase: "copying", index: 1, total: 2 },
+		});
+		await vi.advanceTimersByTimeAsync(RPC_REQUEST_TIMEOUT_MS / 2);
+		await requestRejected;
+
+		expect(progress).toHaveLength(1);
+		expect(client.isOpen()).toBe(true);
+		expect(statuses).not.toContain("closed");
+		expect(FakeWebSocket.instances).toHaveLength(1);
+
+		socket.respond({ id: "web_2", ok: true, result: { session_id: "s1" } });
+		await expect(sibling).resolves.toEqual({ session_id: "s1" });
+		client.close();
+	});
+
+	it("closes a socket that has delivered no frame for a whole timeout window and reconnects", async () => {
 		const client = new AgentRpcClient("ws://agent.test/ws");
 		const statuses: string[] = [];
 		client.onStatus((status) => statuses.push(status));
@@ -157,22 +198,23 @@ describe("AgentRpcClient reconnect hardening", () => {
 			{ timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
 		);
 		const requestRejected = expect(request).rejects.toThrow("websocket request timed out");
+		const siblingRejected = expect(sibling).rejects.toThrow("websocket closed");
 		await Promise.resolve();
-		expect(socket.sent).toHaveLength(2);
 
 		await vi.advanceTimersByTimeAsync(RPC_REQUEST_TIMEOUT_MS);
 		await requestRejected;
+		await siblingRejected;
 
-		expect(client.isOpen()).toBe(true);
-		expect(statuses).not.toContain("closed");
-		expect(FakeWebSocket.instances).toHaveLength(1);
+		expect(socket.closed).toBe(true);
+		expect(client.isOpen()).toBe(false);
+		expect(statuses).toContain("closed");
 
-		socket.respond({ id: "web_2", ok: true, result: { session_id: "s1" } });
-		await expect(sibling).resolves.toEqual({ session_id: "s1" });
+		await vi.advanceTimersByTimeAsync(750);
+		expect(FakeWebSocket.instances).toHaveLength(2);
 		client.close();
 	});
 
-	it("honors a longer per-request timeout without closing the socket", async () => {
+	it("honors a longer per-request timeout while progress frames keep the socket alive", async () => {
 		const client = new AgentRpcClient("ws://agent.test/ws");
 		const connect = client.connect();
 		const socket = FakeWebSocket.instances[0];
@@ -197,9 +239,13 @@ describe("AgentRpcClient reconnect hardening", () => {
 		expect(settled).toBe(false);
 		expect(client.isOpen()).toBe(true);
 
-		await vi.advanceTimersByTimeAsync(
-			WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS - RPC_REQUEST_TIMEOUT_MS,
-		);
+		const remaining = WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS - RPC_REQUEST_TIMEOUT_MS;
+		await vi.advanceTimersByTimeAsync(remaining / 2);
+		socket.respond({
+			id: "web_1",
+			progress: { workspace_dir: "repo-a", phase: "copying", index: 1, total: 2 },
+		});
+		await vi.advanceTimersByTimeAsync(remaining / 2);
 		await requestRejected;
 		expect(settled).toBe(true);
 		expect(client.isOpen()).toBe(true);

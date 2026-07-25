@@ -36,12 +36,3 @@ function phaseLabel(phase: WorkspaceMaterializePhase): string {
 			return "Failed preparing";
 	}
 }
-
-export function isUncertainSessionStartError(error: unknown): boolean {
-	const message = error instanceof Error ? error.message : String(error ?? "");
-	return (
-		message === "websocket request timed out" ||
-		message === "websocket closed" ||
-		message === "websocket reconnecting"
-	);
-}

@@ -61,12 +61,31 @@ export class RpcRequestError extends Error {
 	}
 }
 
+/**
+ * A request that reached the wire but whose outcome is unknown: the socket was
+ * closed, replaced, or stopped answering after `ws.send`. The server may still
+ * have executed it, so callers with non-idempotent requests must reconcile
+ * rather than assume failure. Requests rejected before `ws.send` throw a plain
+ * `Error` instead, because those provably never ran.
+ */
+export class RpcTransportError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "RpcTransportError";
+	}
+}
+
 export function isRpcErrorCode(error: unknown, code: string): boolean {
 	return error instanceof RpcRequestError && error.code === code;
 }
 
 export const RPC_REQUEST_TIMEOUT_MS = 15_000;
-export const WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS = 300_000;
+/**
+ * Must stay above the daemon's longest per-command budget (`RuntimeCommand::timeout`,
+ * 300s for `MaterializeSession`) so the inner hop always expires first and the client
+ * receives a typed error instead of guessing at an uncertain outcome.
+ */
+export const WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS = 330_000;
 
 export class AgentRpcClient implements RpcClient {
 	private ws: WebSocket | null = null;
@@ -78,6 +97,7 @@ export class AgentRpcClient implements RpcClient {
 	private rejectOpenPromise: ((error: Error) => void) | null = null;
 	private closedByUser = false;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private lastFrameAt = 0;
 
 	constructor(private readonly url: string) {}
 
@@ -98,6 +118,7 @@ export class AgentRpcClient implements RpcClient {
 				"open",
 				() => {
 					if (this.ws !== ws) return;
+					this.lastFrameAt = Date.now();
 					this.emitStatus("open");
 					this.openPromise = null;
 					this.rejectOpenPromise = null;
@@ -208,6 +229,7 @@ export class AgentRpcClient implements RpcClient {
 	}
 
 	private handleMessage(message: MessageEvent<string>): void {
+		this.lastFrameAt = Date.now();
 		let data: RpcResponse<unknown> | RpcProgressFrame | EventFrame;
 		const shouldLogPerf = perfEnabled();
 		const receivedAt = shouldLogPerf ? perfNow() : 0;
@@ -258,7 +280,7 @@ export class AgentRpcClient implements RpcClient {
 
 	private rejectPending(message: string): void {
 		for (const pending of this.pending.values()) {
-			pending.reject(new Error(message));
+			pending.reject(new RpcTransportError(message));
 		}
 		this.pending.clear();
 	}
@@ -281,7 +303,12 @@ export class AgentRpcClient implements RpcClient {
 				if (!pending) return;
 				// Abandon only this request so other in-flight RPCs keep the socket.
 				this.pending.delete(id);
-				pending.reject(new Error("websocket request timed out"));
+				pending.reject(new RpcTransportError("websocket request timed out"));
+				// A half-open TCP connection fires no `close` event and browsers
+				// cannot send ping frames, so silence across a whole timeout window
+				// is the only liveness signal available. Closing here lets the
+				// `close` listener reject the rest and reconnect.
+				if (Date.now() - this.lastFrameAt >= timeoutMs) this.ws?.close();
 			}, timeoutMs);
 			promise.then(
 				(value) => {
