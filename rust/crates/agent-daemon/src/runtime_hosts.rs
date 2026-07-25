@@ -9,7 +9,7 @@ use agent_mcp_types::{
 use agent_runtime_protocol::{
     read_frame, write_frame, ControlToRuntime, RuntimeCommand, RuntimeCommandError,
     RuntimeCommandResult, RuntimeHello, RuntimeRecord, RuntimeToControl, SelectedWorkspace,
-    WorkspaceMaterializeProgress, COMMAND_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
+    WorkspaceMaterializeProgress, HEARTBEAT_TIMEOUT_SECS,
 };
 use agent_store::PostgresAgentStore;
 use agent_tools::ProviderTool;
@@ -230,7 +230,11 @@ impl RuntimeRegistry {
                                 .get(&command_id)
                                 .and_then(|waiter| waiter.progress.clone());
                             if let Some(progress_tx) = progress_tx {
-                                let _ = progress_tx.send(progress).await;
+                                // Progress is ephemeral UI status, so a full
+                                // queue drops frames rather than stalling this
+                                // loop's heartbeats and Result frames behind a
+                                // slow websocket client.
+                                let _ = progress_tx.try_send(progress);
                             }
                         }
                         RuntimeToControl::Result { command_id, result } => {
@@ -308,6 +312,7 @@ impl RuntimeRegistry {
         mut on_progress: Option<mpsc::Sender<WorkspaceMaterializeProgress>>,
     ) -> Result<RuntimeCommandResult> {
         let command_id = format!("runtime_command_{}", Uuid::new_v4());
+        let command_timeout = command.timeout();
         let (tx, rx) = oneshot::channel();
         let (connection_id, sender) = {
             let connections = self.connections.lock().await;
@@ -336,7 +341,7 @@ impl RuntimeRegistry {
             return Err(anyhow!("runtime unavailable: {runtime_id}"));
         }
         let mut cancellation = RuntimeCommandCancellation::new(command_id.clone(), sender);
-        let outcome = timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), rx).await;
+        let outcome = timeout(command_timeout, rx).await;
         on_progress.take();
         if let Some(waiter) = self.waiters.lock().await.get_mut(&command_id) {
             waiter.progress = None;
