@@ -121,7 +121,7 @@ reconnect — because the daemon may still have executed the request. Failures b
 since those provably never ran. Callers of non-idempotent RPCs classify with `instanceof` rather than message text;
 `session.start` uses it to enter its uncertain-start reconcile.
 
-A per-request timeout abandons only that request, so one slow RPC no longer kills a socket carrying long-running work.
+A per-request timeout abandons only that request, so one slow RPC does not kill a socket carrying long-running work.
 Liveness is tracked socket-wide instead: every inbound frame (response, progress, or event) refreshes `lastFrameAt`,
 and a request timeout on a socket that has produced no frame for the whole timeout window closes it, which drives the
 normal close path (reject pending, `closed` status, reconnect). This is the only detection available for a half-open
@@ -194,8 +194,9 @@ render an "Edit …" header with a diff-style preview. Display names map the bui
 
 ## Events and reconciliation
 
-`rpc.ts` parses each frame as either an RPC response (`ok` field present) or an event, then fans events out to handlers.
-`sessionEvents.ts` classifies each event into a refresh plan:
+`rpc.ts` dispatches each frame on its shape: an `ok` field makes it an RPC response (resolve/reject the pending
+request), a `progress` field makes it an ephemeral progress update for the pending request of that id, and anything
+else is an event fanned out to handlers. `sessionEvents.ts` classifies each event into a refresh plan:
 
 - `refreshList` — debounced session-list invalidation (most lifecycle/queue/turn events).
 - `syncSelected` — schedule a selected-session reconciliation, but only for events whose canonical projection is not

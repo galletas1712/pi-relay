@@ -1,6 +1,5 @@
 import { perfEnabled, perfLog, perfNow } from "./perf.ts";
-import type { EventFrame } from "./types.ts";
-import type { WorkspaceMaterializeProgress } from "./workspaceMaterializeProgress.ts";
+import type { EventFrame, WorkspaceMaterializeProgress } from "./types.ts";
 
 interface RpcResponse<T> {
 	id: string;

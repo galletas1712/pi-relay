@@ -1,16 +1,4 @@
-export type WorkspaceMaterializePhase =
-	| "refreshing_base"
-	| "copying"
-	| "branch_override"
-	| "done"
-	| "error";
-
-export interface WorkspaceMaterializeProgress {
-	workspace_dir: string;
-	phase: WorkspaceMaterializePhase;
-	index: number;
-	total: number;
-}
+import type { WorkspaceMaterializePhase, WorkspaceMaterializeProgress } from "./types.ts";
 
 export function formatWorkspacePreparationStatus(
 	progress: WorkspaceMaterializeProgress | null,

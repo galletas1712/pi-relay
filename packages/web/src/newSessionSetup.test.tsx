@@ -57,7 +57,7 @@ function setup(
 			onMcpLogin={() => {}}
 			onMcpLogout={() => {}}
 			mcpAuthMutationBlockedReason={readiness.mcpAuthMutationBlockedReason}
-			preparingWorkspaces={false}
+			workspacePreparationStatus={null}
 		/>
 	);
 }
