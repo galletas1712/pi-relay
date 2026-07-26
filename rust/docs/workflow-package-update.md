@@ -1,8 +1,8 @@
 # Workflow package publication
 
 The workflow skills loaded by `LoadSkill` are host-owned runtime packages and
-are not modified by this repository. Before using concurrent delegations,
-update and republish these packages on every runtime host:
+are not modified by this repository. Any edit to them is published by hand on
+every runtime host:
 
 - `workflow-explore`
 - `workflow-implement-review`
@@ -16,12 +16,10 @@ Implementation → review → test gates remain sequential. Kubernetes and MCP
 workflows must continue treating read-only agents as capable of remote side
 effects and keep their existing safety policy.
 
-Existing sessions keep the persisted prompt they were rendered with, so the
-upgrade runbook in [`../migrations/README.md`](../migrations/README.md) removes
-the pre-concurrency single-delegation instructions from stored top-level
-prompts. It does not regenerate whole prompts; it only guarantees that no
-stored prompt contradicts the concurrent-capable tool schemas that are rebuilt
-on every model request.
+Sessions render `sessions.system_prompt` once at `session.start` and keep it
+forever, so a republished package only affects sessions started after it lands.
+Tool descriptions and JSON schemas are rebuilt from the registry on every model
+request and always match the deployed binaries.
 
 ## Publication procedure
 
@@ -54,8 +52,8 @@ $XDG_CONFIG_HOME/pi-relay/runtime/skills/<workflow>/SKILL.md
 $HOME/.config/pi-relay/runtime/skills/<workflow>/SKILL.md
 ```
 
-Before starting new concurrent sessions, verify every installed package and
-reject the obsolete single-delegation wording:
+After publishing, verify every installed package and reject single-delegation
+wording:
 
 ```sh
 runtime_config="${XDG_CONFIG_HOME:-$HOME/.config}/pi-relay/runtime"

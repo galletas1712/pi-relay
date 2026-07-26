@@ -246,7 +246,7 @@ pub(super) async fn migrate(pool: &PgPool) -> Result<()> {
     .await?;
     if !invalid.is_empty() {
         anyhow::bail!(
-            "invalid required delegation index(es): {}; run the one-time concurrent-delegations migration while old processes are stopped",
+            "required delegation index(es) present but not valid/ready: {}; rebuild each one with the old processes stopped (REINDEX INDEX, or drop and recreate it)",
             invalid.join(", ")
         );
     }
