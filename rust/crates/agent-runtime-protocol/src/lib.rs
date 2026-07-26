@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use agent_mcp_types::{
     McpAuthServerStatus, McpInventory, McpLogoutResult, McpOAuthLoginStart, McpSessionManifest,
@@ -13,7 +14,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 pub const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
-pub const COMMAND_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeHello {
@@ -58,10 +58,36 @@ pub async fn write_frame<T: Serialize>(
 pub enum RuntimeToControl {
     Hello(RuntimeHello),
     Heartbeat,
+    /// Ephemeral mid-command status for long MaterializeSession work. Does not
+    /// complete the waiter; [`Self::Result`] still does.
+    Progress {
+        command_id: String,
+        progress: WorkspaceMaterializeProgress,
+    },
     Result {
         command_id: String,
         result: Result<RuntimeCommandResult, RuntimeCommandError>,
     },
+}
+
+/// Per-workspace status while a session's workspaces are being prepared.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceMaterializeProgress {
+    pub workspace_dir: String,
+    pub phase: WorkspaceMaterializePhase,
+    /// 1-based index in the selected workspace set.
+    pub index: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMaterializePhase {
+    RefreshingBase,
+    Copying,
+    BranchOverride,
+    Done,
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +209,39 @@ pub enum RuntimeCommand {
     },
 }
 
+impl RuntimeCommand {
+    /// How long the daemon waits for this command's result. Materializing a
+    /// session clones or fetches every selected repo, so it gets a far larger
+    /// budget than the interactive commands sharing the same connection; a
+    /// single global budget would let a slow bash tool call hold a turn for as
+    /// long as a multi-repo checkout. Matching exhaustively keeps a new variant
+    /// a compile error rather than a silent inheritance of the default.
+    pub fn timeout(&self) -> Duration {
+        match self {
+            Self::MaterializeSession { .. } => Duration::from_secs(300),
+            Self::ValidateProject { .. }
+            | Self::EnsureSession { .. }
+            | Self::ForkSession { .. }
+            | Self::DestroySession { .. }
+            | Self::ReconcileProject { .. }
+            | Self::RemoveProject { .. }
+            | Self::ExecuteTool { .. }
+            | Self::WriteWorkspaceFile { .. }
+            | Self::ReadWorkspaceFile { .. }
+            | Self::ReadRuntimeContext { .. }
+            | Self::McpInventory { .. }
+            | Self::McpSelect { .. }
+            | Self::ExecuteMcpTool { .. }
+            | Self::McpToolViews { .. }
+            | Self::McpAuthStatuses {}
+            | Self::McpBeginLogin { .. }
+            | Self::McpCompleteLogin { .. }
+            | Self::McpCancelLogin { .. }
+            | Self::McpLogout { .. } => Duration::from_secs(120),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeCommandResult {
@@ -216,11 +275,23 @@ pub enum SkillOrigin {
     RuntimeRole,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionScope {
+    #[default]
+    Global,
+    Project,
+    Workspace,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawInstructionFile {
     pub workspace: Option<String>,
     pub path: String,
     pub contents: String,
+    /// Controls prompt heading: global (none), `### Project: …`, or `#### <ws>`.
+    #[serde(default)]
+    pub scope: InstructionScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,10 +334,38 @@ fn is_empty_error_data(value: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_frame, write_frame, RawInstructionFile, RawSkillFile, RuntimeContext, SkillKind,
-        SkillOrigin,
+        read_frame, write_frame, InstructionScope, RawInstructionFile, RawSkillFile,
+        RuntimeCommand, RuntimeContext, SkillKind, SkillOrigin,
     };
+    use std::time::Duration;
     use tokio::io::duplex;
+
+    #[test]
+    fn materialize_gets_the_long_timeout_and_ordinary_commands_the_default() {
+        assert_eq!(
+            RuntimeCommand::MaterializeSession {
+                project_id: "project".to_string(),
+                workspace_id: "workspace".to_string(),
+                project_workspaces: Vec::new(),
+                selected_workspaces: Vec::new(),
+            }
+            .timeout(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            RuntimeCommand::ExecuteTool {
+                workspace_id: "workspace".to_string(),
+                provider: agent_vocab::ProviderKind::Claude,
+                tool_call: agent_vocab::ToolCall {
+                    id: agent_vocab::ToolCallId::new("call-1"),
+                    tool_name: "Bash".to_string(),
+                    args_json: "{}".to_string(),
+                },
+            }
+            .timeout(),
+            Duration::from_secs(120)
+        );
+    }
 
     #[tokio::test]
     async fn round_trips_frames_larger_than_eight_megabytes() {
@@ -291,8 +390,9 @@ mod tests {
         let context = RuntimeContext {
             instructions: vec![RawInstructionFile {
                 workspace: None,
-                path: "/config/runtime/AGENTS.md".to_string(),
+                path: "/home/test/.agents/AGENTS.md".to_string(),
                 contents: "instructions".to_string(),
+                scope: InstructionScope::Global,
             }],
             skills: vec![RawSkillFile {
                 kind: SkillKind::SubagentRole,

@@ -21,10 +21,13 @@ use crate::runtime::{
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
 use crate::workspace_selection::{RequestedWorkspace, WorkspaceSelection};
+use agent_runtime_protocol::WorkspaceMaterializeProgress;
+use tokio::sync::mpsc;
 
 pub(crate) async fn session_start(
     state: &AppState,
     params: Value,
+    on_progress: Option<mpsc::Sender<WorkspaceMaterializeProgress>>,
 ) -> std::result::Result<Value, RpcError> {
     let params: StartSessionParams = from_params(params)?;
     let session_id = params
@@ -70,6 +73,7 @@ pub(crate) async fn session_start(
                 project_id,
                 &project.workspaces,
                 &selected,
+                on_progress,
             )
             .await?;
         (project.runtime_id, workspace_id, workspaces)
@@ -80,7 +84,7 @@ pub(crate) async fn session_start(
         state.runtime_hosts.require_available(&runtime_id).await?;
         let (workspace_id, workspaces) = state
             .runtime_hosts
-            .materialize_session(&runtime_id, Uuid::nil(), &[], &[])
+            .materialize_session(&runtime_id, Uuid::nil(), &[], &[], None)
             .await?;
         (runtime_id, workspace_id, workspaces)
     };

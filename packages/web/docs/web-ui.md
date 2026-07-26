@@ -121,6 +121,23 @@ returned suffix does not extend the cached leaf).
 Provider replay is never on the wire: UI transcript projections omit `provider_replay` entirely, and the frontend
 `TranscriptEntry` type has no such field. The UI renders only semantic `TranscriptItem`s.
 
+### Transport failures and liveness
+
+`rpc.ts` throws `RpcTransportError` for every failure after `ws.send` — request timeout, socket close, forced
+reconnect — because the daemon may still have executed the request. Failures before `ws.send` throw a plain `Error`,
+since those provably never ran. Callers of non-idempotent RPCs classify with `instanceof` rather than message text;
+`session.start` uses it to enter its uncertain-start reconcile.
+
+A per-request timeout abandons only that request, so one slow RPC does not kill a socket carrying long-running work.
+Liveness is tracked socket-wide instead: every inbound frame (response, progress, or event) refreshes `lastFrameAt`,
+and a request timeout on a socket that has produced no frame for the whole timeout window closes it, which drives the
+normal close path (reject pending, `closed` status, reconnect). This is the only detection available for a half-open
+TCP connection, where the browser fires no `close` event and cannot send ping frames.
+
+`WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS` must stay above the daemon's longest per-command budget
+(`RuntimeCommand::timeout`, 300s for `MaterializeSession`) so the inner hop always expires first and the client gets a
+real error rather than an uncertain outcome.
+
 ## Turn-oriented transcript
 
 The chat pane renders the active branch as turn cards (`transcript.tsx` / `selectedSessionCache/turns.ts`), not a flat
@@ -184,8 +201,9 @@ render an "Edit …" header with a diff-style preview. Display names map the bui
 
 ## Events and reconciliation
 
-`rpc.ts` parses each frame as either an RPC response (`ok` field present) or an event, then fans events out to handlers.
-`sessionEvents.ts` classifies each event into a refresh plan:
+`rpc.ts` dispatches each frame on its shape: an `ok` field makes it an RPC response (resolve/reject the pending
+request), a `progress` field makes it an ephemeral progress update for the pending request of that id, and anything
+else is an event fanned out to handlers. `sessionEvents.ts` classifies each event into a refresh plan:
 
 - `refreshList` — debounced session-list invalidation (most lifecycle/queue/turn events).
 - `syncSelected` — schedule a selected-session reconciliation, but only for events whose canonical projection is not
@@ -330,7 +348,14 @@ The web retains one stable control/input id while unchanged text is restored
 after an uncertain response; a deliberate edit or a definite success clears or
 replaces it. New-session submissions also retain the proposed session id, so a
 retry targets the same `session.start`; the daemon treats an existing requested
-session id as a replay. Model-facing controls derive their id from the durable
+session id as a replay. After an uncertain transport failure during
+`session.start` (`RpcTransportError`: timeout / websocket close / reconnect), the web polls
+`session.get` for the draft session id for a short window and opens the session
+if it appears; any other read failure is rethrown immediately rather than polled.
+Otherwise it keeps the draft ids and shows a persistent notice
+to retry or check the session list. While workspaces are materializing, the UI
+shows per-workspace prep progress from ephemeral RPC progress frames. Model-facing
+controls derive their id from the durable
 tool-call id. A matching steer retry does not enqueue text twice; a matching
 interrupt-only retry returns its prior durable state and cannot stop a newer
 generation. This is practical ledger idempotency, not an exactly-once guarantee:

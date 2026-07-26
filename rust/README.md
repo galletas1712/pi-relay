@@ -92,9 +92,10 @@ stack. The obsolete Bun lockfile is not part of the supported workflow.
 - Rust stable with Cargo and `rustfmt`, Node.js 20+, and npm.
 - Docker Engine with Compose v2 and PostgreSQL 16. The integration tests need
   a PostgreSQL role allowed to `CREATE DATABASE` and `DROP DATABASE`.
-- A Linux host with `btrfs-progs`, `git`, `rsync`, and passwordless `sudo -n`
-  for `pi-runtime` when using `infra/dev.sh`; the runtime is intentionally a
-  host process and is not dockerized.
+- A Linux host with `btrfs-progs`, `git`, and `rsync`. Workspace btrfs
+  mount(s) must allow unprivileged deletion of owned subvolumes
+  (`user_subvol_rm_allowed`). `pi-runtime` runs as your login user via
+  `infra/dev.sh` and is intentionally a host process (not dockerized).
 - Provider credentials at model-call time. OpenAI/Codex accepts
   `CODEX_ACCESS_TOKEN` or `$HOME/.codex/auth.json`; Anthropic accepts
   `ANTHROPIC_API_KEY` or Claude Code's
@@ -230,24 +231,30 @@ directories:
 
 ```text
 ${XDG_CONFIG_HOME:-$HOME/.config}/pi-relay/runtime/
-├── AGENTS.md
 ├── skills/<workflow>/SKILL.md
 └── subagent-roles/<role>/SKILL.md
 
 $HOME/.agents/
+├── AGENTS.md
 ├── skills/<skill>/SKILL.md
-└── projects/<project_key>/skills/<skill>/SKILL.md
+└── projects/<project_key>/
+    ├── AGENTS.md
+    ├── skills/<skill>/SKILL.md
+    └── workspaces/<workspace_dir>/
+        ├── AGENTS.md
+        └── skills/<skill>/SKILL.md
 
 <workspace>/.agents/skills/<skill>/SKILL.md
 ```
 
-The top-level `AGENTS.md` applies on that runtime before selected workspaces'
-own `AGENTS.md` files. Home skills are reusable global capabilities. Runtime
-`skills/` contains workflow skills; workflows remain ordinary loadable skills.
-`project_key` is derived from the project display name (lowercase; whitespace
-becomes `-`; only `[a-z0-9_-]` kept). Personal project skills under that key
-apply to every session in the project and override same-named repository
-project skills when both share the `{project_key}/{skill}` key.
+`$HOME/.agents/AGENTS.md` is global. Project and per-workspace personal overlays
+live under `projects/<project_key>/` (including `workspaces/<workspace_dir>/`)
+and layer with each selected repo `AGENTS.md` in the prompt. Home skills are
+reusable global capabilities. Runtime `skills/` contains workflow skills;
+workflows remain ordinary loadable skills. `project_key` is derived from the
+project display name (lowercase; whitespace becomes `-`; only `[a-z0-9_-]`
+kept). Personal project/workspace skills override same-named repository skills
+when keys collide.
 
 A role-local provider policy and global skill preloads use frontmatter:
 

@@ -12,10 +12,12 @@ use std::{
 };
 
 use agent_runtime_protocol::{
-    ProjectWorkspace, RawInstructionFile, RawSkillFile, RuntimeContext, SessionWorkspace,
-    SkillKind, SkillOrigin, WorkspaceKind,
+    InstructionScope, ProjectWorkspace, RawInstructionFile, RawSkillFile, RuntimeContext,
+    SessionWorkspace, SkillKind, SkillOrigin, WorkspaceKind, WorkspaceMaterializePhase,
+    WorkspaceMaterializeProgress,
 };
 use anyhow::{bail, Context, Result};
+use futures_util::{stream, StreamExt, TryStreamExt};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
@@ -33,6 +35,15 @@ use self::instantiate::{
 use self::local::refresh_local_workspace_base;
 pub use self::selection::SelectedWorkspace;
 
+/// Bounds the network/CPU load from concurrent `git fetch`es during materialization.
+const MATERIALIZE_CONCURRENCY: usize = 4;
+
+pub type MaterializeProgressSink = tokio::sync::mpsc::Sender<WorkspaceMaterializeProgress>;
+
+/// Per-key mutexes, created on first use and held by key for the duration of a
+/// mutation.
+type KeyedLocks<K> = Arc<Mutex<HashMap<K, Arc<Mutex<()>>>>>;
+
 // `.pi-handoff` is a daemon-owned child of the cwd root rather than a workspace.
 // Read-only forks remove it immediately after taking the guarded snapshot.
 
@@ -41,8 +52,11 @@ pub struct WorkspaceManager {
     state_root: PathBuf,
     runtime_config_root: PathBuf,
     home_dir: PathBuf,
-    workspace_base_lock: Arc<Mutex<()>>,
-    cwd_mutation_guards: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    /// Serializes project-level base-tree mutations (stale slot cleanup, wipe).
+    project_bases_locks: KeyedLocks<Uuid>,
+    /// Serializes refresh of a single managed workspace base slot.
+    workspace_base_slot_locks: KeyedLocks<(Uuid, String)>,
+    cwd_mutation_guards: KeyedLocks<PathBuf>,
 }
 
 impl WorkspaceManager {
@@ -51,7 +65,8 @@ impl WorkspaceManager {
             state_root,
             runtime_config_root,
             home_dir,
-            workspace_base_lock: Arc::new(Mutex::new(())),
+            project_bases_locks: Arc::new(Mutex::new(HashMap::new())),
+            workspace_base_slot_locks: Arc::new(Mutex::new(HashMap::new())),
             cwd_mutation_guards: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -104,8 +119,8 @@ impl WorkspaceManager {
     }
 
     /// Return all runtime-owned instructions and skill packages visible to a
-    /// session. Personal project skills (keyed by `project_key`) override
-    /// same-named repository skills.
+    /// session. Personal project/workspace skills (keyed by `project_key`)
+    /// override same-named repository skills.
     pub async fn read_runtime_context(
         &self,
         workspace_id: &str,
@@ -114,8 +129,9 @@ impl WorkspaceManager {
     ) -> Result<RuntimeContext> {
         let mut instructions = Vec::new();
         collect_instruction(
-            &self.runtime_config_root.join("AGENTS.md"),
+            &self.home_dir.join(".agents/AGENTS.md"),
             None,
+            InstructionScope::Global,
             &mut instructions,
         )
         .await?;
@@ -150,37 +166,79 @@ impl WorkspaceManager {
 
         let mut project_skills = std::collections::BTreeMap::new();
         let cwd = self.resolve(workspace_id);
-        for workspace_dir in workspace_dirs {
-            let workspace = Some(workspace_dir.as_str());
+        let project_key = project_key.filter(|key| !key.is_empty());
+        let project_root =
+            project_key.map(|key| self.home_dir.join(".agents").join("projects").join(key));
+
+        if let (Some(key), Some(project_root)) = (project_key, project_root.as_ref()) {
             collect_instruction(
-                &cwd.join(workspace_dir).join("AGENTS.md"),
-                workspace,
+                &project_root.join("AGENTS.md"),
+                Some(key),
+                InstructionScope::Project,
                 &mut instructions,
             )
             .await?;
+        }
+
+        for workspace_dir in workspace_dirs {
+            let mut parts = Vec::new();
+            let mut paths = Vec::new();
+            if let Some(project_root) = project_root.as_ref() {
+                let personal = project_root
+                    .join("workspaces")
+                    .join(workspace_dir)
+                    .join("AGENTS.md");
+                if let Some(contents) = read_instruction_contents(&personal).await? {
+                    parts.push(contents);
+                    paths.push(personal.display().to_string());
+                }
+            }
+            let repo = cwd.join(workspace_dir).join("AGENTS.md");
+            if let Some(contents) = read_instruction_contents(&repo).await? {
+                parts.push(contents);
+                paths.push(repo.display().to_string());
+            }
+            if !parts.is_empty() {
+                instructions.push(RawInstructionFile {
+                    workspace: Some(workspace_dir.clone()),
+                    path: paths.join("+"),
+                    contents: parts.join("\n\n"),
+                    scope: InstructionScope::Workspace,
+                });
+            }
+
             collect_skill_dir(
                 &cwd.join(workspace_dir).join(".agents/skills"),
-                workspace,
+                Some(workspace_dir.as_str()),
                 SkillKind::Skill,
                 SkillOrigin::WorkspaceProject,
                 &mut project_skills,
             )
             .await?;
         }
-        if let Some(project_key) = project_key.filter(|key| !key.is_empty()) {
+
+        if let (Some(key), Some(project_root)) = (project_key, project_root.as_ref()) {
             collect_skill_dir(
-                &self
-                    .home_dir
-                    .join(".agents")
-                    .join("projects")
-                    .join(project_key)
-                    .join("skills"),
-                Some(project_key),
+                &project_root.join("skills"),
+                Some(key),
                 SkillKind::Skill,
                 SkillOrigin::HomeProject,
                 &mut project_skills,
             )
             .await?;
+            for workspace_dir in workspace_dirs {
+                collect_skill_dir(
+                    &project_root
+                        .join("workspaces")
+                        .join(workspace_dir)
+                        .join("skills"),
+                    Some(workspace_dir.as_str()),
+                    SkillKind::Skill,
+                    SkillOrigin::HomeProject,
+                    &mut project_skills,
+                )
+                .await?;
+            }
         }
 
         let skills = global_skills
@@ -195,10 +253,11 @@ impl WorkspaceManager {
     }
 
     pub async fn validate_root(&self) -> Result<()> {
-        tokio::fs::create_dir_all(self.state_root.join("sessions")).await?;
-        let probe = self
-            .state_root
-            .join(format!(".btrfs-probe-{}", Uuid::new_v4()));
+        let sessions = self.state_root.join("sessions");
+        tokio::fs::create_dir_all(&sessions).await?;
+        // Probe under sessions/: that is where cwd subvolumes live (and may be a
+        // separate btrfs mount from state_root itself).
+        let probe = sessions.join(format!(".btrfs-probe-{}", Uuid::new_v4()));
         create_session_subvolume(&probe).await?;
         destroy_session_subvolume(&probe).await
     }
@@ -221,6 +280,35 @@ impl WorkspaceManager {
         guard.lock_owned().await
     }
 
+    async fn acquire_project_bases_lock(&self, project_id: Uuid) -> OwnedMutexGuard<()> {
+        let guard = {
+            let mut locks = self.project_bases_locks.lock().await;
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            locks
+                .entry(project_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        guard.lock_owned().await
+    }
+
+    async fn acquire_workspace_base_slot_lock(
+        &self,
+        project_id: Uuid,
+        workspace_dir: &str,
+    ) -> OwnedMutexGuard<()> {
+        let key = (project_id, workspace_dir.to_string());
+        let guard = {
+            let mut locks = self.workspace_base_slot_locks.lock().await;
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        guard.lock_owned().await
+    }
+
     /// Materialize a new session's workspaces under a private `outer_cwd`.
     ///
     /// `project_workspaces` is the project's full declared set and is used to
@@ -236,6 +324,7 @@ impl WorkspaceManager {
         workspace_id: &str,
         project_workspaces: &[ProjectWorkspace],
         selected_workspaces: &[SelectedWorkspace],
+        progress: Option<MaterializeProgressSink>,
     ) -> Result<(String, Vec<SessionWorkspace>)> {
         let root = self.session_root(workspace_id);
         if root.exists() {
@@ -248,23 +337,35 @@ impl WorkspaceManager {
         // tree down; otherwise a partial materialize leaks a btrfs subvolume that
         // no later call reclaims (every session uses a fresh workspace_id).
         let materialized = async {
-            let _workspace_base_guard = self.workspace_base_lock.lock().await;
-            self.remove_stale_workspace_bases(project_id, project_workspaces)
-                .await?;
-            let mut workspaces = Vec::with_capacity(selected_workspaces.len());
-            for selected in selected_workspaces {
-                workspaces.push(
-                    self.materialize_workspace(
-                        project_id,
-                        workspace_id,
-                        &cwd,
-                        &selected.workspace,
-                        selected.branch_override.as_deref(),
-                    )
-                    .await?,
-                );
+            {
+                let _project_guard = self.acquire_project_bases_lock(project_id).await;
+                self.remove_stale_workspace_bases(project_id, project_workspaces)
+                    .await?;
             }
-            Ok::<_, anyhow::Error>(workspaces)
+            let total = selected_workspaces.len();
+            let mut pending = Vec::with_capacity(total);
+            for (offset, selected) in selected_workspaces.iter().enumerate() {
+                let workspace_dir = workspace_base_config(&selected.workspace)?.workspace_dir;
+                pending.push(self.materialize_workspace(
+                    project_id,
+                    workspace_id,
+                    &cwd,
+                    &selected.workspace,
+                    selected.branch_override.as_deref(),
+                    MaterializeProgressCtx {
+                        workspace_dir,
+                        index: offset + 1,
+                        total,
+                        progress: progress.as_ref(),
+                    },
+                ));
+            }
+            // `buffered` bounds in-flight materializations while yielding results
+            // in the project's declared workspace order.
+            stream::iter(pending)
+                .buffered(MATERIALIZE_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await
         }
         .await;
         match materialized {
@@ -431,7 +532,7 @@ impl WorkspaceManager {
         project_id: Uuid,
         project_workspaces: &[ProjectWorkspace],
     ) -> Result<()> {
-        let _workspace_base_guard = self.workspace_base_lock.lock().await;
+        let _project_guard = self.acquire_project_bases_lock(project_id).await;
         self.remove_stale_workspace_bases(project_id, project_workspaces)
             .await?;
         self.remove_changed_workspace_bases(project_id, project_workspaces)
@@ -439,7 +540,7 @@ impl WorkspaceManager {
     }
 
     pub async fn remove_project_bases(&self, project_id: Uuid) -> Result<()> {
-        let _workspace_base_guard = self.workspace_base_lock.lock().await;
+        let _project_guard = self.acquire_project_bases_lock(project_id).await;
         let root = self.workspace_bases_root(project_id);
         if root.exists() {
             tokio::fs::remove_dir_all(root).await?;
@@ -524,6 +625,9 @@ impl WorkspaceManager {
         workspace: &ProjectWorkspace,
     ) -> Result<WorkspaceBase> {
         let config = workspace_base_config(workspace)?;
+        let _slot_guard = self
+            .acquire_workspace_base_slot_lock(project_id, &config.workspace_dir)
+            .await;
         let slot = self.workspace_base_slot(project_id, &config.workspace_dir);
         let metadata_path = slot.join(WORKSPACE_BASE_METADATA);
         let base_path = slot.join(WORKSPACE_BASE_DIR);
@@ -561,8 +665,9 @@ impl WorkspaceManager {
         cwd: &Path,
         workspace: &ProjectWorkspace,
         branch_override: Option<&str>,
+        progress: MaterializeProgressCtx<'_>,
     ) -> Result<SessionWorkspace> {
-        match workspace.kind {
+        let result = match workspace.kind {
             WorkspaceKind::Git => {
                 self.materialize_git_workspace(
                     project_id,
@@ -570,14 +675,20 @@ impl WorkspaceManager {
                     cwd,
                     workspace,
                     branch_override,
+                    &progress,
                 )
                 .await
             }
             WorkspaceKind::Local => {
-                self.materialize_local_workspace(project_id, cwd, workspace)
+                self.materialize_local_workspace(project_id, cwd, workspace, &progress)
                     .await
             }
+        };
+        match &result {
+            Ok(_) => progress.emit(WorkspaceMaterializePhase::Done),
+            Err(_) => progress.emit(WorkspaceMaterializePhase::Error),
         }
+        result
     }
 
     async fn materialize_git_workspace(
@@ -587,7 +698,9 @@ impl WorkspaceManager {
         cwd: &Path,
         workspace: &ProjectWorkspace,
         branch_override: Option<&str>,
+        progress: &MaterializeProgressCtx<'_>,
     ) -> Result<SessionWorkspace> {
+        progress.emit(WorkspaceMaterializePhase::RefreshingBase);
         let base = self.refresh_workspace_base(project_id, workspace).await?;
         let remote_url = required_git_field(base.config.remote_url.as_deref(), "remote_url")?;
         let default_branch =
@@ -599,12 +712,14 @@ impl WorkspaceManager {
         }
         let local_branch = local_branch(session_id, workspace_dir);
 
+        progress.emit(WorkspaceMaterializePhase::Copying);
         populate_workspace(&base.path, &target).await?;
         // The session copy inherits the base's branch by default; an override fetches
         // the requested branch into this session's copy only, leaving the shared base
         // on the project's configured branch.
         let (session_branch, base_sha) = match branch_override {
             Some(branch) if branch != default_branch => {
+                progress.emit(WorkspaceMaterializePhase::BranchOverride);
                 let sha = fetch_session_branch_head(&target, branch).await?;
                 (branch, sha)
             }
@@ -629,7 +744,9 @@ impl WorkspaceManager {
         project_id: Uuid,
         cwd: &Path,
         workspace: &ProjectWorkspace,
+        progress: &MaterializeProgressCtx<'_>,
     ) -> Result<SessionWorkspace> {
+        progress.emit(WorkspaceMaterializePhase::RefreshingBase);
         let base = self.refresh_workspace_base(project_id, workspace).await?;
         let source_path = required_local_field(base.config.source_path.as_deref(), "source_path")?;
         let workspace_dir = base.config.workspace_dir.as_str();
@@ -637,8 +754,31 @@ impl WorkspaceManager {
         if target.exists() {
             bail!("session workspace already exists: {}", target.display());
         }
+        progress.emit(WorkspaceMaterializePhase::Copying);
         populate_workspace(&base.path, &target).await?;
         Ok(SessionWorkspace::local(workspace_dir, source_path))
+    }
+}
+
+struct MaterializeProgressCtx<'a> {
+    workspace_dir: String,
+    index: usize,
+    total: usize,
+    progress: Option<&'a MaterializeProgressSink>,
+}
+
+impl MaterializeProgressCtx<'_> {
+    /// Progress is ephemeral status, so a full queue drops frames rather than
+    /// throttling materialize work behind progress delivery.
+    fn emit(&self, phase: WorkspaceMaterializePhase) {
+        if let Some(progress) = self.progress {
+            let _ = progress.try_send(WorkspaceMaterializeProgress {
+                workspace_dir: self.workspace_dir.clone(),
+                phase,
+                index: self.index,
+                total: self.total,
+            });
+        }
     }
 }
 
@@ -648,21 +788,30 @@ struct WorkspaceBase {
     config: WorkspaceBaseConfig,
 }
 
+async fn read_instruction_contents(path: &Path) -> Result<Option<String>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) if !contents.trim().is_empty() => Ok(Some(contents)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn collect_instruction(
     path: &Path,
     workspace: Option<&str>,
+    scope: InstructionScope,
     files: &mut Vec<RawInstructionFile>,
 ) -> Result<()> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(contents) if !contents.trim().is_empty() => files.push(RawInstructionFile {
-            workspace: workspace.map(str::to_string),
-            path: path.display().to_string(),
-            contents,
-        }),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    let Some(contents) = read_instruction_contents(path).await? else {
+        return Ok(());
+    };
+    files.push(RawInstructionFile {
+        workspace: workspace.map(str::to_string),
+        path: path.display().to_string(),
+        contents,
+        scope,
+    });
     Ok(())
 }
 
@@ -783,6 +932,26 @@ mod tests {
         std::fs::write(path, contents).expect("write");
     }
 
+    /// A sync test: `emit` has no async context to block in, and a full sink
+    /// drops the frame rather than making materialize wait for a reader.
+    #[test]
+    fn progress_emit_drops_frames_once_the_sink_is_full() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let progress = MaterializeProgressCtx {
+            workspace_dir: "repo".to_string(),
+            index: 1,
+            total: 1,
+            progress: Some(&sender),
+        };
+
+        progress.emit(WorkspaceMaterializePhase::RefreshingBase);
+        progress.emit(WorkspaceMaterializePhase::Copying);
+
+        let delivered = receiver.try_recv().expect("first frame");
+        assert_eq!(delivered.phase, WorkspaceMaterializePhase::RefreshingBase);
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn collect_skill_dir_loads_immediate_children_only() {
         let root = temp_dir("collect-skill");
@@ -842,7 +1011,7 @@ mod tests {
         let config = root.join("config/pi-relay/runtime");
         let home = root.join("home");
         let cwd = state.join("sessions/session-test/cwd");
-        write_file(&config.join("AGENTS.md"), "global instructions");
+        write_file(&home.join(".agents/AGENTS.md"), "global instructions");
         write_file(
             &home.join(".agents/skills/swe/SKILL.md"),
             "---\nname: swe\ndescription: global\n---\nglobal",
@@ -855,14 +1024,26 @@ mod tests {
             &config.join("subagent-roles/reviewer/SKILL.md"),
             "---\nname: reviewer\ndescription: role\n---\nrole",
         );
-        write_file(&cwd.join("repo/AGENTS.md"), "repo instructions");
+        write_file(
+            &home.join(".agents/projects/repo/AGENTS.md"),
+            "project instructions",
+        );
+        write_file(
+            &home.join(".agents/projects/repo/workspaces/other/AGENTS.md"),
+            "personal other instructions",
+        );
+        write_file(&cwd.join("other/AGENTS.md"), "repo other instructions");
         write_file(
             &cwd.join("other/.agents/skills/placeholder/SKILL.md"),
             "---\nname: placeholder\ndescription: selected workspace only\n---\nother",
         );
         write_file(
-            &cwd.join("repo/.agents/skills/kubernetes/SKILL.md"),
-            "---\nname: kubernetes\ndescription: contributed\n---\ncontributed",
+            &cwd.join("other/.agents/skills/shared/SKILL.md"),
+            "---\nname: shared\ndescription: repo shared\n---\nrepo-shared",
+        );
+        write_file(
+            &home.join(".agents/projects/repo/workspaces/other/skills/shared/SKILL.md"),
+            "---\nname: shared\ndescription: personal shared\n---\npersonal-shared",
         );
         write_file(
             &home.join(".agents/projects/repo/skills/kubernetes/SKILL.md"),
@@ -870,15 +1051,25 @@ mod tests {
         );
 
         let manager = WorkspaceManager::new(state, config, home);
-        // Home project overlays key off project_key, not selected workspace_dirs.
-        // Selecting only "other" still surfaces projects/repo/skills/kubernetes.
+        // Selecting only "other" still surfaces project-level skills and
+        // concatenates personal+repo AGENTS under that workspace.
         let context = manager
             .read_runtime_context("session-test", &["other".to_string()], Some("repo"))
             .await
             .expect("runtime context");
 
-        assert_eq!(context.instructions.len(), 1);
-        assert_eq!(context.instructions[0].workspace, None);
+        assert_eq!(context.instructions.len(), 3);
+        assert_eq!(context.instructions[0].scope, InstructionScope::Global);
+        assert_eq!(context.instructions[1].scope, InstructionScope::Project);
+        assert_eq!(context.instructions[1].workspace.as_deref(), Some("repo"));
+        assert_eq!(context.instructions[2].scope, InstructionScope::Workspace);
+        assert_eq!(context.instructions[2].workspace.as_deref(), Some("other"));
+        assert!(context.instructions[2]
+            .contents
+            .contains("personal other instructions"));
+        assert!(context.instructions[2]
+            .contents
+            .contains("repo other instructions"));
         assert!(context.skills.iter().any(|skill| {
             skill.package_name == "swe" && skill.origin == SkillOrigin::HomeGlobal
         }));
@@ -899,6 +1090,14 @@ mod tests {
         assert_eq!(kubernetes.origin, SkillOrigin::HomeProject);
         assert_eq!(kubernetes.workspace.as_deref(), Some("repo"));
         assert!(kubernetes.contents.contains("personal"));
+        let shared = context
+            .skills
+            .iter()
+            .find(|skill| skill.package_name == "shared")
+            .expect("shared");
+        assert_eq!(shared.origin, SkillOrigin::HomeProject);
+        assert_eq!(shared.workspace.as_deref(), Some("other"));
+        assert!(shared.contents.contains("personal-shared"));
 
         std::fs::remove_dir_all(root).ok();
     }

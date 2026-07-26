@@ -57,19 +57,27 @@ The registered builtin tools and their aliases are owned by the daemon tool regi
 
 ### Workspaces -> project instructions
 
-The selected runtime reads its XDG `runtime/AGENTS.md` followed by each
-`<workspace_dir>/AGENTS.md` in workspace order. Agentd composes workspace
-contents under their workspace heading and passes the resulting string into
-this pure renderer:
+The selected runtime reads `$HOME/.agents/AGENTS.md`, optional
+`projects/<project_key>/AGENTS.md`, and per selected workspace the concatenation
+of personal `projects/<project_key>/workspaces/<ws>/AGENTS.md` with repo
+`<ws>/AGENTS.md`. Agentd renders that into one instructions block:
 
 ```
-### repo
+<global ~/.agents/AGENTS.md>
 
-<contents of repo/AGENTS.md>
+### Project: dynamo
 
-### docs
+<projects/dynamo/AGENTS.md>
 
-<contents of docs/AGENTS.md>
+#### repo
+
+<personal workspaces/repo/AGENTS.md>
+
+<repo AGENTS.md>
+
+#### docs
+
+<docs AGENTS.md>
 ```
 
 No agentd filesystem path is used to discover these files.

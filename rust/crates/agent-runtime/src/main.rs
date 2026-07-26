@@ -27,7 +27,9 @@ use tokio::task::AbortHandle;
 use tokio::time::Duration;
 use uuid::Uuid;
 
-use workspaces::{validate_remote_branch, validate_workspace_dir, WorkspaceManager};
+use workspaces::{
+    validate_remote_branch, validate_workspace_dir, MaterializeProgressSink, WorkspaceManager,
+};
 
 const PRODUCT_CONFIG_DIR: &str = "pi-relay";
 const RUNTIME_CONFIG_DIR: &str = "runtime";
@@ -336,10 +338,36 @@ async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
                         // would leak a stale abort handle).
                         let mut running = runtime.running.lock().await;
                         let handle = tokio::spawn(async move {
+                            let (progress_tx, progress_forward) = if matches!(
+                                &command,
+                                RuntimeCommand::MaterializeSession { .. }
+                            ) {
+                                let (progress_tx, mut progress_rx) = mpsc::channel(32);
+                                let sender = sender.clone();
+                                let command_id = task_id.clone();
+                                let forward = tokio::spawn(async move {
+                                    while let Some(progress) = progress_rx.recv().await {
+                                        let _ = sender
+                                            .send(RuntimeToControl::Progress {
+                                                command_id: command_id.clone(),
+                                                progress,
+                                            })
+                                            .await;
+                                    }
+                                });
+                                (Some(progress_tx), Some(forward))
+                            } else {
+                                (None, None)
+                            };
                             let result = task_runtime
-                                .execute(command)
+                                .execute(command, progress_tx)
                                 .await
                                 .map_err(into_runtime_command_error);
+                            // Progress sender drops inside execute; await the
+                            // forwarder so Progress frames flush before Result.
+                            if let Some(forward) = progress_forward {
+                                let _ = forward.await;
+                            }
                             task_runtime.running.lock().await.remove(&task_id);
                             let _ = sender
                                 .send(RuntimeToControl::Result {
@@ -376,7 +404,11 @@ async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
 }
 
 impl Runtime {
-    async fn execute(&self, command: RuntimeCommand) -> Result<RuntimeCommandResult> {
+    async fn execute(
+        &self,
+        command: RuntimeCommand,
+        progress: Option<MaterializeProgressSink>,
+    ) -> Result<RuntimeCommandResult> {
         match command {
             RuntimeCommand::ValidateProject { workspaces } => {
                 validate_project(&workspaces).await?;
@@ -399,6 +431,7 @@ impl Runtime {
                             .into_iter()
                             .map(Into::into)
                             .collect::<Vec<_>>(),
+                        progress,
                     )
                     .await?;
                 Ok(RuntimeCommandResult::Materialized { workspaces })

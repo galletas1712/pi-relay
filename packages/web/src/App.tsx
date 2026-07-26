@@ -46,7 +46,6 @@ import {
 	workspaceDraftFromProject,
 	type ProjectDialogState,
 } from "./entityDialogs.tsx";
-import { randomId } from "./ids.ts";
 import {
 	backgroundSessionNeedsWarm,
 	canWarmBackgroundSession,
@@ -96,7 +95,8 @@ import {
 	ProviderConfigurationController,
 	type ProviderConfigurationTarget,
 } from "./providerConfigurationController.ts";
-import { isRpcErrorCode, type ConnectionStatus } from "./rpc.ts";
+import { isRpcErrorCode, RpcTransportError, type ConnectionStatus } from "./rpc.ts";
+import { formatWorkspacePreparationStatus } from "./workspaceMaterializeProgress.ts";
 import { findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
 import { stopSession } from "./stopSession.ts";
@@ -217,6 +217,7 @@ import type {
 	ToolListing,
 	TranscriptEntry,
 	TranscriptTurnsResult,
+	WorkspaceMaterializeProgress,
 } from "./types.ts";
 
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
@@ -385,8 +386,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		useState<string | null>(null);
 	const [newSessionSetupGeneration, setNewSessionSetupGeneration] = useState(0);
 	const [sending, setSending] = useState(false);
-	const [workspacePreparationProjectId, setWorkspacePreparationProjectId] =
-		useState<string | null>(null);
+	const [workspacePreparation, setWorkspacePreparation] =
+		useState<{ projectId: string; status: string } | null>(null);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
 	const [transcriptDestination, setTranscriptDestination] = useState<TranscriptDestination | null>(null);
@@ -3165,6 +3166,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const workspaces = projectId
 				? startWorkspacesFromScope(submittedWorkspaceScope)
 				: undefined;
+			const preparingProjectId =
+				projectId && submittedWorkspaceScope.some((entry) => entry.included)
+					? projectId
+					: null;
+			const showWorkspacePreparation = (status: string) =>
+				setWorkspacePreparation(
+					preparingProjectId ? { projectId: preparingProjectId, status } : null,
+				);
 			const params = {
 				sessionId,
 				projectId,
@@ -3193,16 +3202,34 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					mcpAuthStatus,
 					mcpAuthStatusReady,
 				),
+				onProgress: preparingProjectId
+					? (progress: WorkspaceMaterializeProgress) =>
+							showWorkspacePreparation(formatWorkspacePreparationStatus(progress))
+					: undefined,
 			};
 			let result;
 			try {
-				setWorkspacePreparationProjectId(
-					submittedWorkspaceScope.some((entry) => entry.included) ? projectId : null,
-				);
+				showWorkspacePreparation(formatWorkspacePreparationStatus(null));
 				try {
 					result = await api.startSession(params);
+				} catch (error) {
+					if (error instanceof RpcTransportError) {
+						showWorkspacePreparation("Checking whether the session started…");
+						const recovered = await reconcileUncertainSessionStart(api, sessionId);
+						if (recovered) {
+							result = recovered;
+						} else {
+							pushErrorNotice(
+								"Session start may still be running. Retry send (same draft) or check the session list.",
+								true,
+							);
+							throw error;
+						}
+					} else {
+						throw error;
+					}
 				} finally {
-					setWorkspacePreparationProjectId(null);
+					setWorkspacePreparation(null);
 				}
 			} catch (error) {
 				if (errorMessage(error).startsWith("mcp_inventory_changed:")) {
@@ -3235,6 +3262,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			newSessionProviderWasExplicit,
 			newSessionRuntimeId,
 			openRootConversation,
+			pushErrorNotice,
 			queryClient,
 		],
 	);
@@ -4103,9 +4131,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		workspaceRouteResult.kind === "route"
 			? workspaceRouteResult.warnings.filter((warning) => warning.persistent)
 			: [];
-	const preparingWorkspaces =
-		workspacePreparationProjectId !== null &&
-		workspacePreparationProjectId === selectedProjectId;
+	const workspacePreparationStatus =
+		workspacePreparation?.projectId === selectedProjectId
+			? workspacePreparation.status
+			: null;
 	const mobileTitle = selectedChatSession
 		? sessionTitle(selectedChatSession)
 		: selectedProject
@@ -4328,7 +4357,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 									onMcpLogout={cancelOrLogoutMcp}
 									mcpAuthBusyServer={mcpAuthBusyServer}
 									disabled={sending}
-									preparingWorkspaces={preparingWorkspaces}
+									workspacePreparationStatus={workspacePreparationStatus}
 									mcpAuthMutationBlockedReason={connectionRemoteActionBlockedReason}
 								/>
 							) : null
@@ -4585,6 +4614,35 @@ function errorMessageOrNull(error: unknown): string | null {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+const UNCERTAIN_START_RECONCILE_MS = 45_000;
+const UNCERTAIN_START_POLL_MS = 1_500;
+
+async function reconcileUncertainSessionStart(
+	api: { getSession(sessionId: string): Promise<{ session_id: string; activity: string }> },
+	sessionId: string,
+): Promise<{ session_id: string; activity: string; replayed: true } | null> {
+	const deadline = Date.now() + UNCERTAIN_START_RECONCILE_MS;
+	while (Date.now() < deadline) {
+		try {
+			const snapshot = await api.getSession(sessionId);
+			return {
+				session_id: snapshot.session_id,
+				activity: snapshot.activity,
+				replayed: true,
+			};
+		} catch (error) {
+			// Not-found means the start has not landed yet, and a transport failure
+			// leaves the read itself unanswered; anything else is a real error the
+			// caller must see immediately instead of after the whole window.
+			if (!isSessionNotFoundError(error) && !(error instanceof RpcTransportError)) {
+				throw error;
+			}
+		}
+		await new Promise((resolve) => window.setTimeout(resolve, UNCERTAIN_START_POLL_MS));
+	}
+	return null;
 }
 
 function isSessionNotFoundError(error: unknown): boolean {

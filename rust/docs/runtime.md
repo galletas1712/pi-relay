@@ -59,13 +59,18 @@ Runtime context is discovered without another configured root:
 
 ```text
 $XDG_CONFIG_HOME/pi-relay/runtime/
-├── AGENTS.md
 ├── skills/<workflow>/SKILL.md
 └── subagent-roles/<role>/SKILL.md
 
 $HOME/.agents/
+├── AGENTS.md
 ├── skills/<skill>/SKILL.md
-└── projects/<project_key>/skills/<skill>/SKILL.md
+└── projects/<project_key>/
+    ├── AGENTS.md
+    ├── skills/<skill>/SKILL.md
+    └── workspaces/<workspace_dir>/
+        ├── AGENTS.md
+        └── skills/<skill>/SKILL.md
 
 <workspace>/.agents/skills/<skill>/SKILL.md
 <workspace>/AGENTS.md
@@ -73,14 +78,16 @@ $HOME/.agents/
 
 The runtime reads these files and returns their contents, category, origin, and
 absolute runtime-host paths over `agent-runtime-protocol`. The daemon never
-opens those paths. `project_key` is derived from the project display name
-(lowercase; whitespace becomes `-`; only `[a-z0-9_-]` kept), so a project named
-`Dynamo` loads `$HOME/.agents/projects/dynamo/skills` for every session in that
-project regardless of which workspace dirs are selected. Personal project
-packages replace same-named packages from a selected workspace when both share
-the `{project_key}/{skill}` key. `LoadSkill` returns only the absolute
-`SKILL.md` path so linked sibling files remain available through
-runtime-executed filesystem tools.
+opens those paths. Prompt instructions compose as global `$HOME/.agents/AGENTS.md`,
+then `### Project: <project_key>` from `projects/<project_key>/AGENTS.md`, then
+per selected workspace a single `#### <workspace_dir>` section that concatenates
+personal `projects/.../workspaces/<ws>/AGENTS.md` with the repo
+`<ws>/AGENTS.md`. `project_key` is derived from the project display name
+(lowercase; whitespace becomes `-`; only `[a-z0-9_-]` kept). Personal project
+and workspace skill packages override same-named repository packages when keys
+collide (`{project_key}/{skill}` or `{workspace}/{skill}`). `LoadSkill` returns
+only the absolute `SKILL.md` path so linked sibling files remain available
+through runtime-executed filesystem tools.
 
 The repository's local stack can start the runtime through `infra/dev.sh`.
 For a manual run:

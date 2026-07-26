@@ -462,6 +462,7 @@ async fn public_rpc(
         &mut std::collections::BTreeMap::new(),
         method.to_string(),
         params,
+        None,
     )
     .await
 }

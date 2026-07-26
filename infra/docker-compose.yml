@@ -62,9 +62,9 @@ services:
 
   # NOTE: pi-runtime is intentionally NOT a service here. It executes the
   # session's tools in your real host environment (arbitrary local-workspace
-  # source_paths, your toolchain/venvs) and needs root for btrfs subvolumes,
-  # so it runs as a host process launched by infra/dev.sh, dialing the control
-  # runtime listener published above on 127.0.0.1:8786.
+  # source_paths, your toolchain/venvs) as your login user, so it runs as a
+  # host process launched by infra/dev.sh, dialing the control runtime
+  # listener published above on 127.0.0.1:8786.
 
 volumes:
   pgdata:

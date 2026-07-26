@@ -3,8 +3,9 @@
 #
 # The runtime is deliberately NOT dockerized: it executes each session's tools
 # in your real host environment (arbitrary local-workspace source_paths, your
-# toolchain/venvs, PATH) and needs root for btrfs subvolumes. It runs here as a
-# host process (sudo) dialing the control runtime listener published on
+# toolchain/venvs, PATH). It runs as your login user (not root) and needs the
+# workspace btrfs mount(s) to allow unprivileged deletion of owned subvolumes
+# (`user_subvol_rm_allowed`). It dials the control runtime listener published on
 # 127.0.0.1:8786. Control, Postgres, and the static web UI stay in Docker.
 #
 # Local access: browse http://127.0.0.1:8788/.
@@ -41,10 +42,10 @@ export PI_AGENTD_CONFIG_HOME
 # required policy lives at
 # $XDG_CONFIG_HOME/pi-relay/runtime/config.toml (or
 # ~/.config/pi-relay/runtime/config.toml)
-# and optional MCP policy is the sibling mcp.toml. Root is required for btrfs
-# subvolume operations; HOME, PATH, and XDG_CONFIG_HOME are preserved so the
-# runtime resolves the host's policy, instructions, role/workflow catalogs,
-# binaries, venvs, and ~/.agents global/project skills.
+# and optional MCP policy is the sibling mcp.toml. HOME, PATH, and
+# XDG_CONFIG_HOME are used so the runtime resolves the host's policy,
+# instructions, role/workflow catalogs, binaries, venvs, and ~/.agents
+# global/project skills.
 ( cd rust && cargo build --release -p agent-runtime )
 RUNTIME_BIN="$REPO_ROOT/rust/target/release/pi-runtime"
 RUNTIME_CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay/runtime"
@@ -53,46 +54,51 @@ if [ ! -f "$RUNTIME_CONFIG_HOME/config.toml" ]; then
   exit 1
 fi
 
-# Stop the old runtime before deploying the new control plane.
-sudo -n true
-if sudo -n pgrep -x pi-runtime >/dev/null; then
-  sudo -n pkill -x pi-runtime
+stop_runtime() {
+  # Prefer the PID we launched; also clear any leftover user-owned pi-runtime.
+  if [ -n "${RUNTIME_PID:-}" ] && kill -0 "$RUNTIME_PID" 2>/dev/null; then
+    kill "$RUNTIME_PID" 2>/dev/null || true
+  fi
+  pkill -x -u "$USER" pi-runtime 2>/dev/null || true
   for _ in {1..50}; do
-    if ! sudo -n pgrep -x pi-runtime >/dev/null; then
-      break
+    if ! pgrep -x -u "$USER" pi-runtime >/dev/null; then
+      return 0
     fi
     sleep 0.1
   done
-  if sudo -n pgrep -x pi-runtime >/dev/null; then
+  if pgrep -x -u "$USER" pi-runtime >/dev/null; then
     echo "old pi-runtime did not stop" >&2
-    exit 1
+    return 1
   fi
-fi
+}
+
+# Stop the old runtime before deploying the new control plane.
+stop_runtime
 
 # Deploy the matching control plane only after the runtime build succeeds.
 docker compose -f infra/docker-compose.yml up -d --build --wait --remove-orphans
 
 if [ -n "${XDG_CONFIG_HOME:-}" ]; then
-  sudo -n env HOME="$HOME" PATH="$PATH" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" "$RUNTIME_BIN" &
+  env HOME="$HOME" PATH="$PATH" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" "$RUNTIME_BIN" &
 else
-  sudo -n env HOME="$HOME" PATH="$PATH" "$RUNTIME_BIN" &
+  env HOME="$HOME" PATH="$PATH" "$RUNTIME_BIN" &
 fi
-RUNTIME_LAUNCH_PID=$!
+RUNTIME_PID=$!
 sleep 0.5
-if ! kill -0 "$RUNTIME_LAUNCH_PID" 2>/dev/null \
-  || ! sudo -n pgrep -x pi-runtime >/dev/null; then
-  sudo -n pkill -x pi-runtime 2>/dev/null || true
-  wait "$RUNTIME_LAUNCH_PID" 2>/dev/null || true
+if ! kill -0 "$RUNTIME_PID" 2>/dev/null \
+  || ! pgrep -x -u "$USER" pi-runtime >/dev/null; then
+  stop_runtime || true
+  wait "$RUNTIME_PID" 2>/dev/null || true
   echo "pi-runtime exited during startup" >&2
   exit 1
 fi
 
 shutdown() {
   trap - EXIT INT TERM
-  # pi-runtime runs as root; its sudo child outlives a kill of the backgrounded
-  # sudo pid. Leave Docker services running so Ctrl-C does not drop the stack.
-  sudo -n pkill -x pi-runtime 2>/dev/null || true
+  # Leave Docker services running so Ctrl-C does not drop the stack.
+  stop_runtime || true
   wait 2>/dev/null || true
+  exit 0
 }
 trap shutdown EXIT INT TERM
 

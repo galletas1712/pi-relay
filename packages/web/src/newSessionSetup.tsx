@@ -30,7 +30,7 @@ export function NewSessionSetup({
 	mcpAuthBusyServer,
 	mcpAuthMutationBlockedReason,
 	disabled,
-	preparingWorkspaces,
+	workspacePreparationStatus,
 }: {
 	workspaceConfiguration: WorkspaceConfiguration;
 	onWorkspaceScopeChange: (scope: WorkspaceScopeEntry[]) => void;
@@ -48,7 +48,7 @@ export function NewSessionSetup({
 	mcpAuthBusyServer?: string | null;
 	mcpAuthMutationBlockedReason?: string | null;
 	disabled?: boolean;
-	preparingWorkspaces: boolean;
+	workspacePreparationStatus: string | null;
 }) {
 	const [open, setOpen] = useState<OpenSetup>(null);
 	const workspaceScope =
@@ -95,14 +95,14 @@ export function NewSessionSetup({
 										)}
 									</>
 								)}
-								{preparingWorkspaces ? (
+								{workspacePreparationStatus ? (
 									<p
 										className="new-session-setup-status workspace-preparation-status"
 										role="status"
-										aria-label="Preparing workspaces…"
+										aria-label={workspacePreparationStatus}
 									>
 										<Loader2 className="spin" size={14} aria-hidden />
-										<span>Preparing workspaces…</span>
+										<span>{workspacePreparationStatus}</span>
 									</p>
 								) : null}
 							</section>
