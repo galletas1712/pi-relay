@@ -19,8 +19,7 @@ This crate does not decide *when* the prompt is rendered or how it reaches a pro
 ```
 load_pi_md(repo_root)            -> reads <repo_root>/PI.md
 load_pi_compaction_md(repo_root) -> reads <repo_root>/PI.compaction.md
-render_prompt(template, ctx)            -> String
-render_compaction_prompt(template, ctx) -> String   (same renderer, separate entry point)
+render_prompt(template, ctx)     -> String (used for both templates)
 ```
 
 Input types the caller fills in:
@@ -128,7 +127,7 @@ frontmatter and hands this crate the resulting `Skill` and role lists.
 
 ### Render and cleanup
 
-`render` builds a fresh minijinja `Environment` per call, registers the template under the name `prompt`, and renders it against `template_context`. Template parse/render failures panic — these are repo-authored templates, not user input. After rendering, `compact_blank_lines` trims trailing whitespace per line and collapses any run of blank lines to at most two, then trims the ends. `render_compaction_prompt` is the same renderer pointed at `PI.compaction.md`.
+`render` builds a fresh minijinja `Environment` per call, registers the template under the name `prompt`, and renders it against `template_context`. Template parse/render failures panic — these are repo-authored templates, not user input. After rendering, `compact_blank_lines` trims trailing whitespace per line and collapses any run of blank lines to at most two, then trims the ends. `PI.compaction.md` goes through the same `render_prompt` entry point; the daemon passes it an otherwise-empty `PromptContext`.
 
 ### Where the daemon plugs in
 

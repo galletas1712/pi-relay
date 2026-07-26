@@ -319,13 +319,13 @@ fn interrupt_subagent_definition() -> ToolDefinition {
 fn delegate_writing_task_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_writing_task",
-        "Launch one full (writing) delegation. It edits the workspace in place; at most one full delegation may be active for this parent, but independent read-only delegations may run beside it and may be launched in the same model response. After launching the useful batch, end your turn; completion arrives later as a delegation-ID-scoped daemon wakeup.",
+        "Launch one full (writing) delegation. It edits the workspace in place; at most one full delegation may be active for this parent, though read-only delegations may run beside it, including in the same model response. After launching the useful batch, end your turn; completion arrives later as a delegation-ID-scoped daemon wakeup.",
         json!({
             "type": "object",
             "properties": {
                 "role": {
                     "type": "string",
-                    "description": "The exact unprefixed runtime-global role name from the packaged subagent roles catalog, for example \"implementer\"."
+                    "description": "Exact unprefixed runtime-global role name from the packaged subagent roles catalog, for example \"implementer\"."
                 },
                 "prompt": {
                     "type": "string",
@@ -333,11 +333,11 @@ fn delegate_writing_task_definition() -> ToolDefinition {
                 },
                 "workflow": {
                     "type": "string",
-                    "description": "Optional workflow skill name this delegation belongs to (a grouping label only)."
+                    "description": "Optional workflow skill name this delegation belongs to (grouping only)."
                 },
                 "label": {
                     "type": "string",
-                    "description": "Optional short human-readable label for the delegation."
+                    "description": "Optional short human-readable label."
                 }
             },
             "required": ["role", "prompt"],
@@ -349,7 +349,7 @@ fn delegate_writing_task_definition() -> ToolDefinition {
 fn delegate_readonly_tasks_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_readonly_tasks",
-        "Launch an independent read-only fan-out, each child in its own point-in-time disposable workspace snapshot. Fan-outs may reserve up to eight read-only slots across this parent; each fan-out keeps all of its slots until the delegation is terminal. Additional fan-outs may start while read-only or full delegations run, including in the same model response, when reserved capacity remains. Workspace isolation does not prevent MCP or other remote side effects. After the useful launch batch, end your turn; never poll.",
+        "Launch an independent read-only fan-out, each child in its own point-in-time disposable workspace snapshot. Up to eight read-only slots exist across this parent, and a fan-out keeps all of its slots until the whole delegation is terminal. Further fan-outs may start beside running delegations, including in the same model response, while capacity remains. Workspace isolation does not prevent MCP or other remote side effects. After the useful launch batch, end your turn; never poll.",
         json!({
             "type": "object",
             "properties": {
@@ -363,7 +363,7 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
                         "properties": {
                             "role": {
                                 "type": "string",
-                                "description": "The exact unprefixed runtime-global role name from the packaged subagent roles catalog, for example \"reviewer\"."
+                                "description": "Exact unprefixed runtime-global role name from the packaged subagent roles catalog, for example \"reviewer\"."
                             },
                             "prompt": {
                                 "type": "string",
@@ -376,11 +376,11 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
                 },
                 "workflow": {
                     "type": "string",
-                    "description": "Optional workflow skill name this delegation belongs to (a grouping label only)."
+                    "description": "Optional workflow skill name this delegation belongs to (grouping only)."
                 },
                 "label": {
                     "type": "string",
-                    "description": "Optional short human-readable label for the delegation."
+                    "description": "Optional short human-readable label."
                 }
             },
             "required": ["tasks"],
@@ -428,7 +428,7 @@ fn cancel_delegation_definition() -> ToolDefinition {
 fn steer_subagent_definition() -> ToolDefinition {
     ToolDefinition::new(
         "steer_subagent",
-        "Send an additional instruction or correction to a running subagent. By default it is non-interrupting and waits in the durable child mailbox. Set interrupt=true to durably queue the instruction first, then interrupt exactly that child's current work and drive the queued instruction. Read-only subagent workspaces are disposable, but their running conversations can still be controlled.",
+        "Send an additional instruction or correction to a running subagent. By default it is non-interrupting and waits in the durable child mailbox until the subagent picks it up. Read-only subagent workspaces are disposable, but their running conversations can still be controlled.",
         json!({
             "type": "object",
             "properties": {

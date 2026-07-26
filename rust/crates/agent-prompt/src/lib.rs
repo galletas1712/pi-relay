@@ -431,17 +431,24 @@ mod tests {
     }
 
     #[test]
-    fn parent_prompt_describes_concurrent_launch_batches_without_polling() {
+    fn parent_prompt_carries_delegation_facts_absent_from_tool_descriptions() {
         let rendered = render_prompt(
             TEST_PI_MD,
             &ctx(PromptProfile::Parent, vec!["Bash"], Vec::new()),
         );
         let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        assert!(normalized.contains("launch several independent delegations in one turn"));
-        assert!(normalized.contains("one full writer and read-only fan-outs together"));
-        assert!(normalized.contains("After launching the useful batch, end your turn"));
-        assert!(normalized.contains("Do not poll or loop"));
+        // Host paths are shared across subagents; the parent prompt is the only
+        // place that says so.
+        assert!(normalized.contains("absolute runtime-host paths are shared"));
+        // Parent-only supervision policy; no tool description implies it.
+        assert!(normalized
+            .contains("While a full subagent is running, supervise and read; do not edit"));
+        // The terminal status vocabulary the parent branches on.
+        assert!(normalized
+            .contains("terminal status of `done`, `done_with_failures`, `cancelled`, or `failed`"));
+        // The cancel tool description says nothing about rollback.
+        assert!(normalized.contains("Cancellation is terminal and does not roll back"));
     }
 
     #[test]
