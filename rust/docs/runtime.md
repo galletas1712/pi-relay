@@ -76,6 +76,15 @@ $HOME/.agents/
 <workspace>/AGENTS.md
 ```
 
+`runtime/skills` and `runtime/subagent-roles` are host-owned catalogs kept in an
+operator config repository and symlinked into place; `runtime/config.toml` and
+`runtime/mcp.toml` are machine-specific and stay real untracked files. Because
+`pi-runtime` runs as a host process rather than in a container, those symlinks
+resolve normally. See
+[`workflow-package-update.md`](workflow-package-update.md) for the update
+procedure and for the discovery constraint that makes the catalog directory,
+not the individual package, the thing that may be symlinked.
+
 The runtime reads these files and returns their contents, category, origin, and
 absolute runtime-host paths over `agent-runtime-protocol`. The daemon never
 opens those paths. Prompt instructions compose as global `$HOME/.agents/AGENTS.md`,

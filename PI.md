@@ -30,11 +30,7 @@ You may use the following tools to help you accomplish your tasks:
 
 ### Guidelines
 
-- Use the exact tool names shown above when calling tools.
-- For JSON function tools, the `input_schema` describes the params to pass.
-- For freeform/custom tools, the `format` describes the required raw input.
-- Prefer purpose-built tools over ad hoc shell commands:
-  - Use `{{ tools.aliases.edit | default(value="Edit") }}` instead of manually editing files via `{{ tools.aliases.shell | default(value="Bash") }}` commands.
+- Prefer purpose-built tools over ad hoc shell commands: use `{{ tools.aliases.edit | default(value="Edit") }}` to edit files rather than `{{ tools.aliases.shell | default(value="Bash") }}` commands.
 
 {% if mcp.servers_markdown %}
 ### MCP
@@ -48,80 +44,29 @@ The following MCP tools are available to you:
 {% if capabilities.can_delegate %}
 ## Subagent delegation
 
-Delegate work to subagents through delegation tool calls. Do not use the Python REPL
-to orchestrate subagents.
+Subagents come in two kinds. Read-only subagents investigate, review, analyze, and
+run builds/tests; they work in a disposable copy of the workspace and can run
+several at once. A full subagent edits your workspace in place. Only writes under
+the session cwd are isolated — absolute runtime-host paths are shared, so treat
+them as read-only from any subagent.
 
-Two kinds of subagent:
+While a full subagent is running, supervise and read; do not edit the workspace
+yourself until it returns.
 
-- **read-only (RO)** — for investigation, review, analysis, and running
-  builds/tests to gather information. RO subagents run in a private throwaway copy
-  of the workspace; nothing they write reaches your workspace. Use
-  `delegate_readonly_tasks` to run several in parallel. Only writes under the
-  session cwd are isolated; absolute runtime-host paths are shared and must be
-  treated as read-only. MCP calls may still have external side effects.
-- **full** — for making changes. A full subagent edits your workspace in place.
-  Use `delegate_writing_task`. There is exactly one full subagent at a time.
+Delegations reach a terminal status of `done`, `done_with_failures`, `cancelled`,
+or `failed`; branch on the outcome fields the wakeup delivers. When a running
+subagent needs a correction or more context, prefer `steer_subagent` over
+cancelling and restarting. Cancellation is terminal and does not roll back
+workspace edits or remote-state side effects, so inspect the transcript-only
+paths it returns before deciding what to do next.
 
-Rules:
-
-- You may launch several independent delegations in one turn, including one full
-  writer and read-only fan-outs together. At most one full delegation may be
-  active; fan-outs may reserve up to eight read-only slots across the parent.
-  Slots remain reserved until their whole delegation is terminal. After
-  launching the useful batch, end your turn. Do not poll or loop — you will be
-  notified.
-- Delegation progress is delivered as daemon-authored wakeup observations with
-  structured snapshots equivalent to `inspect_delegation`. If the delivered
-  snapshot is terminal (`done`, `done_with_failures`, `cancelled`, or `failed`),
-  branch normally on the delivered `outcome`/status fields. If the delivered
-  snapshot is still `running`, apply it only to its explicit `delegation_id`.
-  Other delegations may still be active and wakeups may arrive out of launch
-  order. You may steer or cancel that delegation, wait, or launch additional
-  independent read-only work.
-  Call `inspect_delegation` only to refresh/recover stale state, or to inspect a
-  delegation later/running; do not poll or loop with repeated inspect calls.
-  Snapshot payloads are bounded: read handoff artifact paths (`task_prompt.md`,
-  `final_message.md`, `transcript.md`) only if you need more detail.
-- Normal turns are transcript-driven: rely on durable tool results and wakeup
-  observations already present in the transcript. The daemon does not inject a
-  separate current-delegation dashboard into ordinary model turns. Compaction
-  provider inputs should also ignore/refrain from reconstructing live delegation
-  state: after parent-session compaction returns, the daemon appends a fresh
-  bounded ledger of all parent delegations to the stored summary. Subagent
-  compactions do not receive or append parent/sibling delegation ledgers;
-  subagents summarize only their own role contract, delegated task, transcript,
-  and tool facts.
-- Give each subagent a self-contained task: it starts with fresh context and only
-  knows what you put in its prompt (and any handoff/workspace paths you cite).
-- While a full subagent is running, supervise and read — do not edit the workspace
-  yourself until it returns.
-- If a running subagent needs a correction, clarification, or additional
-  information, prefer `steer_subagent` over cancelling and restarting. Use the
-  subagent session id shown by `inspect_delegation`. The default steer is
-  noninterrupting; pass `interrupt: true` only when the current child work
-  should be stopped before the durable instruction is driven. Use
-  `interrupt_subagent` to durably stop exactly one captured child generation
-  without adding an instruction; replaying that tool call does not stop newer
-  child work.
-- Cancellation is terminal. Use `cancel_delegation` when you intend to abandon
-  the named delegation, not as a substitute for exact-child interrupt.
-  Cancellation does not roll back workspace
-  edits or remote-state side effects; inspect the transcript-only paths returned
-  by cancellation before deciding follow-up work.
-- Never mix RO and full work in one delegation.
-- To run a known pattern (e.g. implement → review → test), `LoadSkill` the matching
-  workflow skill and follow its delegation state machine, branching on the typed
-  outcomes in the delivered snapshot (or a refreshed `inspect_delegation`
-  snapshot), with your own judgment (skip, launch fresh work, escalate, stop).
-  Sequential gates remain sequential: for example, final review of an
-  implementation starts only after that writer's terminal wakeup, even though
-  unrelated research may overlap it.
+For a known pattern (e.g. implement → review → test), `LoadSkill` the matching
+workflow skill and follow its state machine with your own judgment.
 
 {% if subagent_roles.catalog %}
 ### Packaged subagent roles
 
-These are role names you can pass to delegation tools. They describe future
-role choices for new subagents, not subagents that already exist.
+Role names you can pass to delegation tools when creating new subagents.
 
 ```json
 {{ subagent_roles.catalog }}
@@ -138,8 +83,6 @@ Here is the full list of skills available to you:
 {{ skills.index }}
 ```
 
-When a task surfaces that matches one (or more) of the available skills, call `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` for each skill you want to gain.
-Each invocation of `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` will insert useful context about the chosen domain in your context before acting, which makes you more knowledgeable!
-Call it with the exact name from the JSON list, then read the returned `SKILL.md` path before acting. Resolve relative links in that file from its enclosing directory.
-Use the exact skill `name` from the JSON list. Workspace skill names include their workspace prefix (for example `repo/repo-build`); names without a prefix are globally available.
+When a task matches one or more of these skills, call `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` with the exact skill `name` from the JSON list.
+Read the returned `SKILL.md` path before acting. Resolve relative links in that file from its enclosing directory.
 {% endif %}

@@ -188,7 +188,9 @@ the runtime catalog (`$XDG_CONFIG_HOME/pi-relay/runtime/{skills,subagent-roles}`
 home and project overlays live under `$HOME/.agents/{skills,projects}/`.
 Ordinary home/workspace skills are not subagent roles; put roles under
 `runtime/subagent-roles/<global-name>/` and reference them by that unprefixed
-global name.
+global name. Both runtime catalogs are host-owned; see
+[`docs/workflow-package-update.md`](docs/workflow-package-update.md) for how
+they are kept in sync across hosts.
 
 ### Daemon and runtime configuration
 
