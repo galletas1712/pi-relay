@@ -220,45 +220,6 @@ fn bounded_event_page(mut events: Vec<EventFrame>, limit: usize) -> EventReplayP
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bounded_event_page_reports_a_continuation_without_dropping_order() {
-        let frames = (1..=3)
-            .map(|event_id| EventFrame {
-                event_id,
-                event: EventType::SessionIdle,
-                session_id: "session".to_string(),
-                data: Value::Null,
-            })
-            .collect();
-        let page = bounded_event_page(frames, 2);
-        assert_eq!(
-            page.events
-                .iter()
-                .map(|event| event.event_id)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert!(page.has_more);
-        assert_eq!(page.next_after_event_id, Some(2));
-
-        let final_page = bounded_event_page(
-            vec![EventFrame {
-                event_id: 3,
-                event: EventType::SessionIdle,
-                session_id: "session".to_string(),
-                data: Value::Null,
-            }],
-            2,
-        );
-        assert!(!final_page.has_more);
-        assert_eq!(final_page.next_after_event_id, None);
-    }
-}
-
 pub(super) async fn insert_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
@@ -507,4 +468,43 @@ pub(super) async fn insert_transcript_item_events_tx(
         _ => {}
     }
     Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_event_page_reports_a_continuation_without_dropping_order() {
+        let frames = (1..=3)
+            .map(|event_id| EventFrame {
+                event_id,
+                event: EventType::SessionIdle,
+                session_id: "session".to_string(),
+                data: Value::Null,
+            })
+            .collect();
+        let page = bounded_event_page(frames, 2);
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(page.has_more);
+        assert_eq!(page.next_after_event_id, Some(2));
+
+        let final_page = bounded_event_page(
+            vec![EventFrame {
+                event_id: 3,
+                event: EventType::SessionIdle,
+                session_id: "session".to_string(),
+                data: Value::Null,
+            }],
+            2,
+        );
+        assert!(!final_page.has_more);
+        assert_eq!(final_page.next_after_event_id, None);
+    }
 }

@@ -942,15 +942,7 @@ async fn timeout_sends_cancellation_and_never_replays() {
             .await,
         Err(McpCallError::Timeout { .. })
     ));
-    for _ in 0..50 {
-        if std::fs::read_to_string(&marker)
-            .unwrap_or_default()
-            .contains("CANCEL")
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for_marker(&marker, "CANCEL").await;
     let contents = std::fs::read_to_string(&marker).expect("fixture recorded call");
     assert_eq!(contents.matches("CALL").count(), 1);
     assert_eq!(contents.matches("CANCEL").count(), 1);

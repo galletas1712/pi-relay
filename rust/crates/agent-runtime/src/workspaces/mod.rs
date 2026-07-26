@@ -17,7 +17,7 @@ use agent_runtime_protocol::{
     WorkspaceMaterializeProgress,
 };
 use anyhow::{bail, Context, Result};
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::future::try_join_all;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
@@ -34,9 +34,6 @@ use self::instantiate::{
 };
 use self::local::refresh_local_workspace_base;
 pub use self::selection::SelectedWorkspace;
-
-/// Bounds the network/CPU load from concurrent `git fetch`es during materialization.
-const MATERIALIZE_CONCURRENCY: usize = 4;
 
 pub type MaterializeProgressSink = tokio::sync::mpsc::Sender<WorkspaceMaterializeProgress>;
 
@@ -361,12 +358,7 @@ impl WorkspaceManager {
                     },
                 ));
             }
-            // `buffered` bounds in-flight materializations while yielding results
-            // in the project's declared workspace order.
-            stream::iter(pending)
-                .buffered(MATERIALIZE_CONCURRENCY)
-                .try_collect::<Vec<_>>()
-                .await
+            try_join_all(pending).await
         }
         .await;
         match materialized {
