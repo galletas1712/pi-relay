@@ -386,6 +386,15 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		useState<string | null>(null);
 	const [newSessionSetupGeneration, setNewSessionSetupGeneration] = useState(0);
 	const [sending, setSending] = useState(false);
+	// Aborts the uncertain-start reconcile poll so it cannot outlive the view and
+	// keep writing workspace-preparation state after unmount.
+	const reconcileAbortRef = useRef<AbortController | null>(null);
+	useEffect(
+		() => () => {
+			reconcileAbortRef.current?.abort();
+		},
+		[],
+	);
 	const [workspacePreparation, setWorkspacePreparation] =
 		useState<{ projectId: string; status: string } | null>(null);
 	const [stopping, setStopping] = useState(false);
@@ -3215,7 +3224,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				} catch (error) {
 					if (error instanceof RpcTransportError) {
 						showWorkspacePreparation("Checking whether the session started…");
-						const recovered = await reconcileUncertainSessionStart(api, sessionId);
+						reconcileAbortRef.current?.abort();
+						const controller = new AbortController();
+						reconcileAbortRef.current = controller;
+						const recovered = await reconcileUncertainSessionStart(
+							api,
+							sessionId,
+							controller.signal,
+						);
 						if (recovered) {
 							result = recovered;
 						} else {
@@ -4622,9 +4638,10 @@ const UNCERTAIN_START_POLL_MS = 1_500;
 async function reconcileUncertainSessionStart(
 	api: { getSession(sessionId: string): Promise<{ session_id: string; activity: string }> },
 	sessionId: string,
+	signal: AbortSignal,
 ): Promise<{ session_id: string; activity: string; replayed: true } | null> {
 	const deadline = Date.now() + UNCERTAIN_START_RECONCILE_MS;
-	while (Date.now() < deadline) {
+	while (Date.now() < deadline && !signal.aborted) {
 		try {
 			const snapshot = await api.getSession(sessionId);
 			return {
@@ -4640,7 +4657,17 @@ async function reconcileUncertainSessionStart(
 				throw error;
 			}
 		}
-		await new Promise((resolve) => window.setTimeout(resolve, UNCERTAIN_START_POLL_MS));
+		await new Promise<void>((resolve) => {
+			const timer = window.setTimeout(resolve, UNCERTAIN_START_POLL_MS);
+			signal.addEventListener(
+				"abort",
+				() => {
+					window.clearTimeout(timer);
+					resolve();
+				},
+				{ once: true },
+			);
+		});
 	}
 	return null;
 }

@@ -149,6 +149,7 @@ async fn git_remote_exists(cwd: &Path, name: &str) -> Result<bool> {
 fn git_command() -> Command {
     let mut command = Command::new("git");
     command
+        .kill_on_drop(true)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_AUTHOR_NAME", "pi-relay")
         .env("GIT_AUTHOR_EMAIL", "pi-relay@example.invalid")

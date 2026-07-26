@@ -24,7 +24,12 @@ pub(super) async fn refresh_local_workspace_base(
 
 async fn rsync_dir_delete(source: &Path, target: &Path) -> Result<()> {
     let source_contents = source.join(".");
-    let output = Command::new("rsync")
+    let mut command = Command::new("rsync");
+    // Abort (timeout, cancellation, sibling materialize failure) drops this
+    // future; without kill_on_drop the child keeps writing into a base slot
+    // whose lock has already been released.
+    command.kill_on_drop(true);
+    let output = command
         .arg("-a")
         .arg("--delete")
         .arg("--delete-excluded")

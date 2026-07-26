@@ -15,7 +15,9 @@ pub(super) async fn populate_workspace(source: &Path, target: &Path) -> Result<(
     tokio::fs::create_dir(target)
         .await
         .with_context(|| format!("create workspace {}", target.display()))?;
-    let output = Command::new("cp")
+    let mut command = Command::new("cp");
+    command.kill_on_drop(true);
+    let output = command
         .args(["-a", "--reflink=always"])
         .arg(source.join("."))
         .arg(target)
@@ -52,6 +54,7 @@ async fn run_btrfs<const N: usize>(
     target: Option<&Path>,
 ) -> Result<()> {
     let mut command = Command::new("btrfs");
+    command.kill_on_drop(true);
     command.args(args).arg(source);
     if let Some(target) = target {
         command.arg(target);

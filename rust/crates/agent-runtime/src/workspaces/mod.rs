@@ -617,7 +617,7 @@ impl WorkspaceManager {
         workspace: &ProjectWorkspace,
     ) -> Result<WorkspaceBase> {
         let config = workspace_base_config(workspace)?;
-        let _slot_guard = self
+        let slot_guard = self
             .acquire_workspace_base_slot_lock(project_id, &config.workspace_dir)
             .await;
         let slot = self.workspace_base_slot(project_id, &config.workspace_dir);
@@ -647,6 +647,7 @@ impl WorkspaceManager {
         Ok(WorkspaceBase {
             path: base_path,
             config,
+            _slot_guard: slot_guard,
         })
     }
 
@@ -774,10 +775,17 @@ impl MaterializeProgressCtx<'_> {
     }
 }
 
+/// Holds the base slot lock for as long as the caller may read `path`.
+///
+/// The session copy in `populate_workspace` reads the base tree directly, so the
+/// guard has to outlive this struct's use rather than just the refresh: releasing
+/// it at the end of `refresh_workspace_base` would let a concurrent refresh run
+/// `git reset --hard`/`clean -ffdx` on the same slot mid-copy.
 #[derive(Debug)]
 struct WorkspaceBase {
     path: PathBuf,
     config: WorkspaceBaseConfig,
+    _slot_guard: OwnedMutexGuard<()>,
 }
 
 async fn read_instruction_contents(path: &Path) -> Result<Option<String>> {
@@ -905,6 +913,51 @@ async fn canonicalize_git_path(workspace_root: &Path, git_path: &str) -> Result<
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The session copy reads the base tree after `refresh_workspace_base`
+    /// returns, so `WorkspaceBase` carries the slot guard. Polling directly
+    /// keeps this deterministic: a contended acquire must be `Pending` while the
+    /// guard is alive and `Ready` once it drops, with no wall-clock involved.
+    #[tokio::test]
+    async fn a_live_workspace_base_keeps_its_slot_locked() {
+        let root = temp_dir("slot-lock");
+        let manager = WorkspaceManager::new(root.clone(), root.clone(), root.clone());
+        let project = Uuid::new_v4();
+
+        let base = WorkspaceBase {
+            path: root.join("base"),
+            config: WorkspaceBaseConfig {
+                kind: WorkspaceKind::Git,
+                workspace_dir: "repo".to_string(),
+                remote_url: None,
+                remote_branch: None,
+                source_path: None,
+            },
+            _slot_guard: manager
+                .acquire_workspace_base_slot_lock(project, "repo")
+                .await,
+        };
+
+        let mut contended = Box::pin(manager.acquire_workspace_base_slot_lock(project, "repo"));
+        assert!(
+            futures_util::poll!(contended.as_mut()).is_pending(),
+            "same slot must stay locked while a WorkspaceBase is alive"
+        );
+
+        let mut other_slot = Box::pin(manager.acquire_workspace_base_slot_lock(project, "other"));
+        assert!(
+            futures_util::poll!(other_slot.as_mut()).is_ready(),
+            "a different slot must not be blocked"
+        );
+
+        drop(base);
+        assert!(
+            futures_util::poll!(contended.as_mut()).is_ready(),
+            "dropping the WorkspaceBase must release the slot"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()

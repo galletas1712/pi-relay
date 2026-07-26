@@ -1404,6 +1404,43 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
+	it("stops polling an uncertain start once the view unmounts", async () => {
+		const api = createRouteApi();
+		const knownSession = vi.mocked(api.getSession).getMockImplementation()!;
+		let newSessionId = "";
+		let reads = 0;
+		api.startSession.mockImplementation(async (params: { sessionId: string }) => {
+			newSessionId = params.sessionId;
+			throw new RpcTransportError("websocket request timed out");
+		});
+		vi.mocked(api.getSession).mockImplementation(async (sessionId: string) => {
+			if (sessionId !== newSessionId) return knownSession(sessionId);
+			reads += 1;
+			throw new RpcRequestError("session_not_found", "session not found", {});
+		});
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+
+		await open(api);
+		await sendComposerText("start that never lands");
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(UNCERTAIN_START_POLL_MS * 2);
+		});
+		const readsBeforeUnmount = reads;
+		expect(readsBeforeUnmount).toBeGreaterThan(0);
+
+		await mounted.dispose();
+
+		// Without the abort the loop would keep polling for the rest of the 45s
+		// window and keep setting state on an unmounted tree.
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(UNCERTAIN_START_RECONCILE_MS);
+		});
+		expect(reads).toBe(readsBeforeUnmount);
+
+		vi.useRealTimers();
+	});
+
 	it("fails closed during a retained-inventory refetch but allows deselection and an MCP-free start", async () => {
 		const refresh = deferred<McpInventory>();
 		const api = createRouteApi();
