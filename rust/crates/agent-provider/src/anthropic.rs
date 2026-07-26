@@ -5235,8 +5235,18 @@ mod tests {
         assert!(valid.beta_header.contains(COMPACTION_BETA));
         assert_eq!(valid.body["messages"][0]["content"][0], block);
 
+        // An empty Claude replay is valid, not malformed: it marks a compaction
+        // performed by another provider, which #295 made reachable via idle
+        // mid-session provider switches. `assistant_replay_blocks` returns it
+        // with `replays_compaction: false` so the caller continues from the text
+        // summary alone.
+        assert!(messages_body(request(ModelTranscriptEntry {
+            item: summary(),
+            provider_replay: Vec::new(),
+        }))
+        .is_ok());
+
         let invalid_replays = [
-            Vec::new(),
             vec![ProviderReplayItem {
                 provider: ProviderKind::Claude,
                 raw_json: "{".to_string(),
