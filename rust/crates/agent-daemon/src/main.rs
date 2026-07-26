@@ -718,8 +718,10 @@ async fn tools_list_profile(
     if let Some(session_id) = params.get("session_id").and_then(Value::as_str) {
         return prompt_profile_for_session(state, session_id).await;
     }
+    // No session means no `subagent_type` to read, so fail safe to the most
+    // restricted subagent profile. Tool filtering is identical for both.
     Ok(match params.get("prompt_profile").and_then(Value::as_str) {
-        Some("subagent") => PromptProfile::Subagent,
+        Some("subagent") => PromptProfile::SubagentReadOnly,
         _ => PromptProfile::Parent,
     })
 }

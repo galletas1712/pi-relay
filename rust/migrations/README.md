@@ -78,3 +78,32 @@ select count(*) from queued_inputs
  where content->>'type' = 'daemon_tool_observation'
    and content->'content' ? 'tool_call_id';
 ```
+
+## `prompt-profile-gating.sql`
+
+`sessions.system_prompt` is rendered once at `session.start` and stored forever.
+Read-only subagent sessions started before capability gating carry a rendered
+instruction to push a branch to the configured remote — a real side effect that
+outlives their disposable workspace snapshot. New sessions never render it.
+
+1. Take a `pg_dump` of `pi_relay`.
+2. Stop the control plane, or run while no read-only subagent is active. The
+   transaction takes an `access exclusive` lock on `sessions`; a running
+   subagent already holds its prompt in memory, so the rewrite reaches it only
+   on restart.
+3. Run:
+
+   ```sh
+   psql "$DATABASE_URL" -f rust/migrations/prompt-profile-gating.sql
+   ```
+
+   It rewrites only `subagent_type = 'read_only'` rows, reports how many, and
+   raises if any such prompt still carries the sentence. A rerun matches no
+   rows. It does not regenerate whole prompts and does not add the new
+   `## Subagent contract` or `./.pi-handoff/` text: those sessions run on code
+   that makes no such guarantee.
+4. Deploy matched control/runtime binaries and start the daemon.
+5. Spot-check `/system` on an old read-only subagent session.
+
+Never use `docker compose down -v`, prune the Postgres volume, reset the
+runtime workspace root, or point this at a test database you care about.

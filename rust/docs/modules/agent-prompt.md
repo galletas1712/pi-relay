@@ -8,7 +8,8 @@
 
 - Load the repo-level templates `PI.md` and `PI.compaction.md` from a given repo root.
 - Render either template against a `PromptContext` using [minijinja](https://docs.rs/minijinja) (Jinja2 syntax).
-- Expose a small, stable set of template variables (project instructions, workspace facts, tool specs/aliases, skills index) and nothing else.
+- Expose a small, stable set of template variables (profile, capabilities, project instructions, workspace facts, tool specs/aliases, skills index) and nothing else.
+- Own every sentence of agent-facing policy prose, including the subagent contract. Prose is gated by *capability* (`capabilities.writes_are_durable`), never by role name. Tool `description` fields stay in the tool registry: they are per-request JSON schema, not prompt text, and `PI.md` must not restate them.
 - Render runtime-supplied global/workspace `AGENTS.md` contents as one instructions block.
 - Collapse runs of blank lines so conditional template blocks do not leave large gaps.
 
@@ -24,7 +25,8 @@ render_prompt(template, ctx)     -> String (used for both templates)
 
 Input types the caller fills in:
 
-- `PromptContext` — `cwd`, `has_project`, `workspaces`, precomposed `agents_md`, tools, skills, roles, and MCP servers.
+- `PromptContext` — `profile`, `cwd`, `has_project`, `parent_session_id`, `workspaces`, precomposed `agents_md`, tools, skills, roles, and MCP servers.
+- `PromptProfile` — `Parent` | `SubagentFull` | `SubagentReadOnly`. `PromptCapabilities::from(profile)` derives the booleans the template gates on, so `can_delegate && !writes_are_durable` is unrepresentable.
 - `PromptWorkspace` — `kind` (`Git` | `Local`), `workspace_dir`, and git lineage fields (`remote_url`, `remote_branch`, `source_path`, `base_sha`, `local_branch`).
 - `ToolSpec` — `name`, `description`, `input_schema` (JSON), `canonical_name`, `prompt_alias`.
 - `Skill` — optional `workspace`, `name`, `description`, `file_path`. Built via `Skill::global(..)` or `Skill::workspace(workspace, ..)`.
@@ -35,9 +37,14 @@ Input types the caller fills in:
 
 | Variable | Type | Contents |
 | --- | --- | --- |
+| `profile.name` | string | `parent`, `subagent_full`, or `subagent_read_only`. |
+| `capabilities.can_delegate` | bool | Parent orchestration tools are available. |
+| `capabilities.writes_are_durable` | bool | Writes under the session cwd survive the session; false means a disposable snapshot. |
+| `capabilities.has_handoff_dir` | bool | `./.pi-handoff/` is copied out to the parent on completion. |
 | `project.agents_md` | string | Ordered runtime-supplied global and per-workspace instructions. |
 | `session.cwd` | string | The session `cwd`, with backslashes normalized to `/`. |
 | `session.has_project` | bool | Whether the session is attached to a project. |
+| `session.parent_id` | string \| null | The parent session that spawned this one; `PI.md` renders its `## Subagent contract` section exactly when this is set. |
 | `session.workspaces` | array | Per-workspace objects (`kind`, `workspace_dir`, git lineage fields). |
 | `session.workspaces_markdown` | string | Human-readable bullet list of workspaces (see below). Falls back to a "No project workspaces" sentence when empty. |
 | `tools.specs` | string | Markdown for every tool (`### name`, description, `Parameters:` JSON block), sorted by name. Falls back to "No tools are currently available." when empty. |

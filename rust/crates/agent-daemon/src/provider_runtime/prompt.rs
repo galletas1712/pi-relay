@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use agent_prompt::{
-    load_pi_compaction_md, load_pi_md, render_prompt, PromptContext, PromptMcpServer,
-    PromptProfile, PromptWorkspace, PromptWorkspaceKind, Skill, SubagentRole, ToolSpec,
+    load_pi_compaction_md, load_pi_md, render_prompt, PromptCapabilities, PromptContext,
+    PromptMcpServer, PromptProfile, PromptWorkspace, PromptWorkspaceKind, Skill, SubagentRole,
+    ToolSpec,
 };
 use agent_runtime_protocol::{InstructionScope, RawInstructionFile, RawSkillFile, SkillKind};
-use agent_store::{SessionConfig, WorkspaceKind};
+use agent_store::{SessionConfig, SubagentType, WorkspaceKind};
 use agent_tools::ProviderTool;
 use agent_vocab::ProviderKind;
 use serde::Deserialize;
@@ -47,6 +48,7 @@ pub(super) async fn render_pi_compaction_prompt(
         profile: prompt_profile(config),
         cwd: PathBuf::from(&config.workspace_id),
         has_project: config.project_id.is_some(),
+        parent_session_id: None,
         workspaces: Vec::new(),
         agents_md: String::new(),
         tools: Vec::new(),
@@ -96,6 +98,7 @@ pub(super) async fn prompt_context(
         profile,
         cwd: PathBuf::from(&config.workspace_id),
         has_project: config.project_id.is_some(),
+        parent_session_id: parent_session_id(config),
         workspaces: config
             .workspaces
             .iter()
@@ -120,26 +123,42 @@ pub(super) async fn prompt_context(
     })
 }
 
+/// The session's own view of its profile, read from the metadata that
+/// `subagent_metadata` / `session_start` wrote before the prompt was rendered.
+/// An unknown or missing `subagent_type` on a subagent fails safe to
+/// `SubagentReadOnly`: never claim durability that cannot be proven.
 pub(crate) fn prompt_profile(config: &SessionConfig) -> PromptProfile {
-    if config
+    let is_subagent = config
         .metadata
         .get("subagent")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-    {
-        return PromptProfile::Subagent;
+        || config
+            .metadata
+            .get("prompt_profile")
+            .and_then(Value::as_str)
+            .is_some_and(|profile| profile == "subagent");
+    if !is_subagent {
+        return PromptProfile::Parent;
     }
-    if let Some(profile) = config
+    subagent_profile(config.metadata.get("subagent_type").and_then(Value::as_str))
+}
+
+fn subagent_profile(subagent_type: Option<&str>) -> PromptProfile {
+    match subagent_type {
+        Some(value) if value == SubagentType::Full.as_str() => PromptProfile::SubagentFull,
+        _ => PromptProfile::SubagentReadOnly,
+    }
+}
+
+/// The parent this session was spawned by, as recorded in its own metadata. The
+/// `PI.md` subagent contract renders exactly when this is present.
+fn parent_session_id(config: &SessionConfig) -> Option<String> {
+    config
         .metadata
-        .get("prompt_profile")
+        .get("parent_session_id")
         .and_then(Value::as_str)
-    {
-        return match profile {
-            "subagent" => PromptProfile::Subagent,
-            _ => PromptProfile::Parent,
-        };
-    }
-    PromptProfile::Parent
+        .map(str::to_string)
 }
 
 pub(crate) async fn effective_prompt_profile(
@@ -147,13 +166,8 @@ pub(crate) async fn effective_prompt_profile(
     config: &SessionConfig,
     session_id: &str,
 ) -> anyhow::Result<PromptProfile> {
-    if state
-        .repo
-        .session_subagent_type(session_id)
-        .await?
-        .is_some()
-    {
-        return Ok(PromptProfile::Subagent);
+    if let Some(subagent_type) = state.repo.session_subagent_type(session_id).await? {
+        return Ok(subagent_profile(Some(subagent_type.as_str())));
     }
     Ok(prompt_profile(config))
 }
@@ -177,7 +191,7 @@ fn provider_tools_for_profile(
 }
 
 fn tool_allowed_for_profile(tool: &ProviderTool, profile: PromptProfile) -> bool {
-    if profile == PromptProfile::Parent {
+    if PromptCapabilities::from(profile).can_delegate {
         return true;
     }
     !matches!(
@@ -492,7 +506,7 @@ repo rules"
         assert!(parent_spec_names.contains(&"interrupt_subagent".to_string()));
 
         let subagent_provider_tools =
-            provider_tools_for_profile(all_tools, PromptProfile::Subagent);
+            provider_tools_for_profile(all_tools, PromptProfile::SubagentReadOnly);
         let subagent_spec_names = tool_specs_from_provider_tools(subagent_provider_tools.clone())
             .into_iter()
             .map(|tool| tool.canonical_name)
@@ -516,7 +530,7 @@ repo rules"
     }
 
     #[test]
-    fn prompt_profile_subagent_flag_wins_over_parent_profile() {
+    fn prompt_profile_reads_subagent_type_and_fails_safe_to_read_only() {
         let mut config = SessionConfig {
             project_id: None,
             runtime_id: "runtime-test".to_string(),
@@ -533,15 +547,59 @@ repo rules"
             metadata: serde_json::json!({
                 "prompt_profile": "parent",
                 "subagent": true,
+                "subagent_type": "full",
             }),
             mcp_manifest: None,
         };
 
-        assert_eq!(prompt_profile(&config), PromptProfile::Subagent);
-        config.metadata = serde_json::json!({ "prompt_profile": "subagent" });
-        assert_eq!(prompt_profile(&config), PromptProfile::Subagent);
+        // The structural `subagent` flag wins over a stale `prompt_profile`.
+        assert_eq!(prompt_profile(&config), PromptProfile::SubagentFull);
+        config.metadata = serde_json::json!({
+            "prompt_profile": "subagent",
+            "subagent_type": "read_only",
+        });
+        assert_eq!(prompt_profile(&config), PromptProfile::SubagentReadOnly);
+        // A subagent without a readable type never gets durable-write wording.
         config.metadata = serde_json::json!({ "subagent": true });
-        assert_eq!(prompt_profile(&config), PromptProfile::Subagent);
+        assert_eq!(prompt_profile(&config), PromptProfile::SubagentReadOnly);
+        config.metadata = serde_json::json!({ "subagent": true, "subagent_type": "bogus" });
+        assert_eq!(prompt_profile(&config), PromptProfile::SubagentReadOnly);
+        config.metadata = serde_json::json!({ "prompt_profile": "parent" });
+        assert_eq!(prompt_profile(&config), PromptProfile::Parent);
+    }
+
+    #[test]
+    fn prompt_context_names_the_parent_only_for_children() {
+        let mut metadata = serde_json::json!({
+            "subagent": true,
+            "subagent_type": "full",
+            "parent_session_id": "session_parent",
+        });
+        let config = |metadata: &serde_json::Value| SessionConfig {
+            project_id: None,
+            runtime_id: "runtime-test".to_string(),
+            workspace_id: "/tmp".to_string(),
+            workspaces: Vec::new(),
+            system_prompt: String::new(),
+            provider: agent_vocab::ProviderConfig {
+                kind: ProviderKind::OpenAi,
+                model: "gpt-5.2".to_string(),
+                reasoning_effort: agent_vocab::ReasoningEffort::Medium,
+                max_tokens: None,
+                prompt_cache: None,
+            },
+            metadata: metadata.clone(),
+            mcp_manifest: None,
+        };
+
+        assert_eq!(
+            parent_session_id(&config(&metadata)),
+            Some("session_parent".to_string())
+        );
+        // `history_fork` strips the child markers, so a fork renders as a parent.
+        metadata = serde_json::json!({ "prompt_profile": "parent" });
+        assert_eq!(parent_session_id(&config(&metadata)), None);
+        assert_eq!(prompt_profile(&config(&metadata)), PromptProfile::Parent);
     }
 
     fn raw_skill(workspace: Option<&str>, name: &str, description: &str) -> RawSkillFile {

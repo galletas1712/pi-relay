@@ -103,19 +103,54 @@ impl Skill {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptProfile {
     Parent,
-    Subagent,
+    SubagentFull,
+    SubagentReadOnly,
 }
 
 impl PromptProfile {
     fn as_str(self) -> &'static str {
         match self {
             Self::Parent => "parent",
-            Self::Subagent => "subagent",
+            Self::SubagentFull => "subagent_full",
+            Self::SubagentReadOnly => "subagent_read_only",
         }
     }
+}
 
-    fn can_delegate(self) -> bool {
-        matches!(self, Self::Parent)
+/// What this agent's actions can actually do — never what it is called. Every
+/// `PI.md` conditional must be expressible in these terms, so that no prompt
+/// sentence has to reason about roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptCapabilities {
+    /// Parent orchestration tools are available.
+    pub can_delegate: bool,
+    /// Filesystem writes under the session cwd survive this session: they are
+    /// what the user (or parent) will see. False means a disposable snapshot.
+    pub writes_are_durable: bool,
+    /// Files written under `./.pi-handoff/` are copied out to the parent when
+    /// the session finishes.
+    pub has_handoff_dir: bool,
+}
+
+impl From<PromptProfile> for PromptCapabilities {
+    fn from(profile: PromptProfile) -> Self {
+        match profile {
+            PromptProfile::Parent => Self {
+                can_delegate: true,
+                writes_are_durable: true,
+                has_handoff_dir: false,
+            },
+            PromptProfile::SubagentFull => Self {
+                can_delegate: false,
+                writes_are_durable: true,
+                has_handoff_dir: false,
+            },
+            PromptProfile::SubagentReadOnly => Self {
+                can_delegate: false,
+                writes_are_durable: false,
+                has_handoff_dir: true,
+            },
+        }
     }
 }
 
@@ -156,6 +191,7 @@ pub struct PromptContext {
     pub profile: PromptProfile,
     pub cwd: PathBuf,
     pub has_project: bool,
+    pub parent_session_id: Option<String>,
     pub workspaces: Vec<PromptWorkspace>,
     pub agents_md: String,
     pub tools: Vec<ToolSpec>,
@@ -195,16 +231,20 @@ fn render(template: &str, ctx: &PromptContext) -> String {
 }
 
 fn template_context(ctx: &PromptContext) -> Value {
+    let capabilities = PromptCapabilities::from(ctx.profile);
     json!({
         "profile": {
             "name": ctx.profile.as_str(),
         },
         "capabilities": {
-            "can_delegate": ctx.profile.can_delegate(),
+            "can_delegate": capabilities.can_delegate,
+            "writes_are_durable": capabilities.writes_are_durable,
+            "has_handoff_dir": capabilities.has_handoff_dir,
         },
         "session": {
             "cwd": path_display(&ctx.cwd),
             "has_project": ctx.has_project,
+            "parent_id": ctx.parent_session_id,
             "workspaces": workspaces_json(&ctx.workspaces),
             "workspaces_markdown": workspaces_markdown(&ctx.workspaces),
         },
@@ -388,6 +428,10 @@ mod tests {
             profile,
             cwd: PathBuf::from("/tmp/project"),
             has_project: true,
+            parent_session_id: match profile {
+                PromptProfile::Parent => None,
+                _ => Some("session_parent".to_string()),
+            },
             workspaces: vec![PromptWorkspace {
                 kind: PromptWorkspaceKind::Git,
                 workspace_dir: "repo".to_string(),
@@ -420,7 +464,11 @@ mod tests {
     fn subagent_profile_omits_parent_orchestration_sections() {
         let rendered = render_prompt(
             TEST_PI_MD,
-            &ctx(PromptProfile::Subagent, vec!["Bash", "Edit"], Vec::new()),
+            &ctx(
+                PromptProfile::SubagentReadOnly,
+                vec!["Bash", "Edit"],
+                Vec::new(),
+            ),
         );
 
         assert!(rendered.contains("### Bash"));
@@ -428,6 +476,48 @@ mod tests {
         assert!(!rendered.contains("Packaged subagent roles"));
         assert!(!rendered.contains("delegate_readonly_tasks"));
         assert!(!rendered.contains("delegate_writing_task"));
+    }
+
+    #[test]
+    fn parent_prompt_publishes_branches_and_omits_the_subagent_contract() {
+        let rendered = render_prompt(
+            TEST_PI_MD,
+            &ctx(PromptProfile::Parent, vec!["Bash"], Vec::new()),
+        );
+
+        assert!(rendered.contains("push that branch to the configured remote"));
+        assert!(rendered.contains("## Subagent delegation"));
+        assert!(!rendered.contains("## Subagent contract"));
+        assert!(!rendered.contains(".pi-handoff"));
+    }
+
+    #[test]
+    fn full_subagent_prompt_keeps_durable_write_instructions() {
+        let rendered = render_prompt(
+            TEST_PI_MD,
+            &ctx(PromptProfile::SubagentFull, vec!["Bash"], Vec::new()),
+        );
+
+        assert!(rendered.contains("push that branch to the configured remote"));
+        assert!(rendered.contains("## Subagent contract"));
+        assert!(rendered.contains("spawned by parent session `session_parent`"));
+        assert!(rendered.contains("parent workspace in place"));
+        assert!(!rendered.contains(".pi-handoff"));
+        assert!(!rendered.contains("## Subagent delegation"));
+    }
+
+    #[test]
+    fn read_only_subagent_prompt_never_instructs_remote_mutation() {
+        let rendered = render_prompt(
+            TEST_PI_MD,
+            &ctx(PromptProfile::SubagentReadOnly, vec!["Bash"], Vec::new()),
+        );
+
+        assert!(!rendered.contains("push that branch to the configured remote"));
+        assert!(rendered.contains("disposable copy"));
+        assert!(rendered.contains("do not create branches on, push to"));
+        assert!(rendered.contains("disposable snapshot and do not reach the"));
+        assert!(rendered.contains("`./.pi-handoff/`"));
     }
 
     #[test]
