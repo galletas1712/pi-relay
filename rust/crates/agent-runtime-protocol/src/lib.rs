@@ -154,6 +154,15 @@ pub enum RuntimeCommand {
         workspace_id: String,
         rel_path: String,
     },
+    /// Copy a bounded, symlink-free subtree out of one session cwd into another
+    /// on the same runtime host. Hands a terminal read-only subagent's staged
+    /// artifacts to its parent before the child subvolume is destroyed.
+    CopyWorkspaceSubtree {
+        source_workspace_id: String,
+        source_rel_path: String,
+        target_workspace_id: String,
+        target_rel_path: String,
+    },
     /// Return runtime-owned instructions and skill packages for a session.
     /// `project_key` selects `$HOME/.agents/projects/<project_key>/skills`
     /// when the session belongs to a project; ephemeral sessions pass `None`.
@@ -228,6 +237,7 @@ impl RuntimeCommand {
             | Self::ExecuteTool { .. }
             | Self::WriteWorkspaceFile { .. }
             | Self::ReadWorkspaceFile { .. }
+            | Self::CopyWorkspaceSubtree { .. }
             | Self::ReadRuntimeContext { .. }
             | Self::McpInventory { .. }
             | Self::McpSelect { .. }
@@ -249,6 +259,7 @@ pub enum RuntimeCommandResult {
     Materialized { workspaces: Vec<SessionWorkspace> },
     Tool { result: ToolResultMessage },
     FileContents { contents: Option<String> },
+    CopiedSubtree { artifacts: Option<CopiedArtifacts> },
     RuntimeContext { context: RuntimeContext },
     McpInventory { inventory: McpInventory },
     McpManifest { manifest: McpSessionManifest },
@@ -256,6 +267,22 @@ pub enum RuntimeCommandResult {
     McpAuthStatuses { servers: Vec<McpAuthServerStatus> },
     McpLoginStart { start: McpOAuthLoginStart },
     McpLogout { result: McpLogoutResult },
+}
+
+/// What a `CopyWorkspaceSubtree` actually copied. `truncated` is set when the
+/// walk stopped at a file-count or byte bound; `skipped` records entries that
+/// were not regular files (symlinks, sockets, fifos) and were never followed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CopiedArtifacts {
+    pub files: Vec<CopiedArtifactFile>,
+    pub skipped: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CopiedArtifactFile {
+    pub path: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

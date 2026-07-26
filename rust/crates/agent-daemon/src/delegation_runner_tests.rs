@@ -10088,3 +10088,277 @@ async fn two_siblings_wake_parent_exactly_once_via_live_seam() {
 
     env.cleanup().await;
 }
+
+/// Point a session at its own cwd. Delegation fixtures share the parent's
+/// workspace by default; a read-only child owns a private snapshot, which is
+/// what the artifact handback copies out of.
+async fn set_session_workspace(env: &TestEnv, session_id: &str, workspace_id: &str) {
+    let pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+        .await
+        .expect("connect workspace-setting pool");
+    sqlx::query("update sessions set workspace_id=$2 where id=$1")
+        .bind(session_id)
+        .bind(workspace_id)
+        .execute(&pool)
+        .await
+        .expect("set session workspace");
+    pool.close().await;
+}
+
+/// A terminal read-only subagent with its own cwd and files staged in that
+/// cwd's `.pi-handoff/`, i.e. the artifacts it wants to hand back.
+async fn create_terminal_subagent_with_staged_artifacts(
+    env: &TestEnv,
+    project_id: Uuid,
+    delegation_id: &str,
+    session_id: &str,
+    child_cwd: &TempDir,
+) {
+    create_terminal_subagent(
+        env,
+        project_id,
+        "parent",
+        delegation_id,
+        session_id,
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "staged some files\n\noutcome: done",
+    )
+    .await;
+    set_session_workspace(env, session_id, &child_cwd.path().to_string_lossy()).await;
+    let staging = child_cwd.path().join(".pi-handoff");
+    std::fs::create_dir_all(staging.join("report")).expect("staging dir");
+    std::fs::write(staging.join("notes.md"), "handed back").expect("stage notes");
+    std::fs::write(staging.join("report/data.csv"), "a,b\n1,2\n").expect("stage report");
+}
+
+/// Read-only children hand their staged `.pi-handoff/` files to the parent, and
+/// only then does their snapshot go away.
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn read_only_subagent_hands_staged_artifacts_to_the_parent() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "runtime-test", "artifacts test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        1,
+    )
+    .await
+    .expect("create delegation");
+    let child_cwd = TempDir::new("child-cwd");
+    create_terminal_subagent_with_staged_artifacts(
+        &env,
+        project_id,
+        &delegation.id,
+        "handback",
+        &child_cwd,
+    )
+    .await;
+
+    SessionDriver::acquire(&env.state, "handback")
+        .await
+        .handle_subagent_terminal_for_parent_if_needed()
+        .await;
+
+    // (a) The files landed in the parent's handoff dir, alongside a manifest.
+    let root = handoff_root(&env, &delegation.id).join("handback");
+    assert_eq!(
+        std::fs::read_to_string(root.join("artifacts/notes.md")).expect("copied notes"),
+        "handed back"
+    );
+    assert!(root.join("artifacts/report/data.csv").exists());
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("artifacts.json")).expect("manifest"),
+    )
+    .expect("manifest json");
+    assert_eq!(manifest["truncated"], false);
+
+    // (b) The snapshot lists them.
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
+    let subagent = &snapshot["subagents"][0];
+    assert_eq!(
+        subagent["artifact_files"],
+        json!(["notes.md", "report/data.csv"])
+    );
+    assert_eq!(subagent["artifacts_truncated"], false);
+
+    // (c) The web client can read a body back through the closed vocabulary.
+    let read = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "subagent_id": "handback",
+            "file": "artifacts/report/data.csv",
+        }),
+    )
+    .await
+    .expect("read handed-back artifact");
+    assert_eq!(read["content"], "a,b\n1,2\n");
+
+    // (d) Traversal out of the artifact subtree is rejected before any read.
+    for evil in ["artifacts/../../secret", "/etc/passwd", "artifacts/"] {
+        let error = read_handoff_file_core(
+            &env.state,
+            "parent",
+            json!({
+                "delegation_id": delegation.id,
+                "subagent_id": "handback",
+                "file": evil,
+            }),
+        )
+        .await
+        .expect_err("traversal must be rejected");
+        assert_eq!(error.code, "invalid_params", "file {evil} must be rejected");
+    }
+
+    // The fake runtime acks `DestroySession` without touching the filesystem,
+    // so teardown itself is covered by the runtime-side workspace tests; what
+    // matters here is that the copy happens while the snapshot still exists.
+
+    env.cleanup().await;
+}
+
+/// Cancellation is transcript-only for derived prose, but agent-authored
+/// artifacts are still handed back.
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn cancelled_read_only_subagent_still_hands_artifacts_back() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "cancel artifacts",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        1,
+    )
+    .await
+    .expect("create delegation");
+    let child_cwd = TempDir::new("cancel-child-cwd");
+    create_terminal_subagent_with_staged_artifacts(
+        &env,
+        project_id,
+        &delegation.id,
+        "cancelled_child",
+        &child_cwd,
+    )
+    .await;
+
+    let cancelled = cancel_core(
+        &env.state,
+        "parent",
+        json!({ "delegation_id": delegation.id }),
+    )
+    .await
+    .expect("cancel delegation");
+    assert_eq!(cancelled["cancelled"], true);
+
+    let read = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "subagent_id": "cancelled_child",
+            "file": "artifacts/notes.md",
+        }),
+    )
+    .await
+    .expect("artifacts remain readable after cancellation");
+    assert_eq!(read["content"], "handed back");
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
+    assert_eq!(
+        snapshot["subagents"][0]["artifact_files"],
+        json!(["notes.md", "report/data.csv"])
+    );
+
+    env.cleanup().await;
+}
+
+/// The highest-severity hazard: a full subagent works in the parent's workspace
+/// in place, so it must never be copied from or torn down.
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn full_subagent_workspace_is_never_copied_or_destroyed() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "runtime-test", "full artifacts", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "writer",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "done",
+    )
+    .await;
+    // The full subagent shares the parent's cwd; anything staged there is the
+    // parent's own working state.
+    std::fs::create_dir_all(env.cwd.path().join(".pi-handoff")).expect("shared handoff dir");
+    std::fs::write(env.cwd.path().join(".pi-handoff/parent_own.md"), "parent")
+        .expect("parent file");
+
+    SessionDriver::acquire(&env.state, "writer")
+        .await
+        .handle_subagent_terminal_for_parent_if_needed()
+        .await;
+
+    assert!(
+        env.cwd.path().exists(),
+        "the shared parent workspace must survive a full subagent finishing"
+    );
+    assert!(env.cwd.path().join(".pi-handoff/parent_own.md").exists());
+    assert!(
+        !handoff_root(&env, &delegation.id)
+            .join("writer")
+            .join("artifacts.json")
+            .exists(),
+        "full subagents never hand artifacts back"
+    );
+
+    env.cleanup().await;
+}

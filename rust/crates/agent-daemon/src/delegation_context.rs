@@ -1,7 +1,7 @@
 use agent_store::{Delegation, DelegationStatus, SessionActivity, SubagentType};
 
 use crate::delegation_tools::load_subagent_work_state;
-use crate::handoff::{delegation_dir, extract_outcome};
+use crate::handoff::{delegation_dir, extract_outcome, read_handed_back_artifacts};
 use crate::state::AppState;
 
 const MAX_SUBAGENTS_PER_DELEGATION: usize = 8;
@@ -173,6 +173,30 @@ async fn append_subagents(
                 read_outcome(state, runtime_id, workspace_id, &final_message_rel).await
             {
                 out.push_str(&format!("; outcome: {}", serde_json::to_string(&outcome)?));
+            }
+        }
+        // Token-budgeted: name the files only when there are few enough to be
+        // worth inlining; otherwise point at the directory.
+        let handed_back = read_handed_back_artifacts(
+            state,
+            runtime_id,
+            workspace_id,
+            handoff_dir,
+            &subagent.session_id,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+        if !handed_back.files.is_empty() {
+            out.push_str(&format!(
+                "; artifacts: {} (`{}/artifacts/`)",
+                handed_back.files.len(),
+                inline_code(&subagent.session_id),
+            ));
+            if handed_back.files.len() <= 3 {
+                out.push_str(&format!(": {}", handed_back.files.join(", ")));
+            }
+            if handed_back.truncated {
+                out.push_str("; artifacts_truncated: true");
             }
         }
         out.push('\n');
