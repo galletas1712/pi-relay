@@ -17,7 +17,12 @@ it permits one admission-active (`running` or `cancelling`) `full` row and
 read-only fan-outs totaling at most eight reserved slots until delegation
 terminality. A partial unique index backstops writer exclusivity; the read-only
 slot bound has no index backstop, because an aggregate `sum(expected_subagents)`
-constraint is not expressible as a partial unique index. Parent-scoped
+constraint is not expressible as a partial unique index. Startup checks only
+that the three uniqueness-critical indexes
+(`delegations_parent_launch_key_uq`, `sessions_delegation_spawn_index_uq`,
+`delegations_parent_running_full_uq`) are valid and ready, not that their
+definitions are correct, so a valid index carrying a required name but the wrong
+definition passes and must be repaired by hand. Parent-scoped
 launch keys make creation idempotent; canonical launch JSON, a PostgreSQL
 materialization claim, and immutable child indices make replay and boot recovery
 resume missing children without duplication.

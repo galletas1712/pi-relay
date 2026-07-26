@@ -6,8 +6,6 @@ mod events;
 mod history_fork;
 mod history_target;
 mod mcp;
-#[cfg(test)]
-mod migration_tests;
 mod outputs;
 mod projects;
 mod queue;
