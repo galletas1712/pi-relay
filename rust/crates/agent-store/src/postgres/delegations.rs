@@ -226,47 +226,6 @@ struct ScopedSubagentControlRequest<'a> {
 }
 
 impl PostgresAgentStore {
-    /// Test/setup convenience for a fresh uniquely keyed delegation.
-    pub async fn create_delegation(
-        &self,
-        parent_session_id: &str,
-        kind: DelegationKind,
-        workflow: Option<&str>,
-        label: Option<&str>,
-        expected_subagents: i32,
-    ) -> Result<Delegation> {
-        let launch_key = format!("manual:{}", Uuid::new_v4());
-        let launch_shape = match kind {
-            DelegationKind::Full => json!({
-                "kind": "full",
-                "role": "implementer",
-                "prompt": "Complete the delegated task.",
-                "workflow": workflow,
-                "label": label,
-            }),
-            DelegationKind::ReadonlyFanout => json!({
-                "kind": "readonly_fanout",
-                "tasks": vec![
-                    json!({ "role": "reviewer", "prompt": "Complete the delegated task." });
-                    expected_subagents.clamp(0, MAX_RESERVED_READONLY_SLOTS + 1) as usize
-                ],
-                "workflow": workflow,
-                "label": label,
-            }),
-        }
-        .to_string();
-        self.create_delegation_idempotent(CreateDelegationRequest {
-            parent_session_id,
-            launch_key: &launch_key,
-            launch_shape: &launch_shape,
-            kind,
-            workflow,
-            label,
-            expected_subagents,
-        })
-        .await
-    }
-
     /// Admit a delegation under the parent-session row lock. Replaying the same
     /// key and shape returns the original immutable delegation.
     pub async fn create_delegation_idempotent(
@@ -639,33 +598,6 @@ impl PostgresAgentStore {
         rows.iter().map(row_to_delegation).collect()
     }
 
-    /// A bounded newest-first page for internal history-oriented callers.
-    ///
-    /// Fetching all historical delegations made the common selected-session
-    /// poll scale with the lifetime of the parent session even though the UI
-    /// shows the newest few rows by default.
-    pub async fn list_parent_delegations_newest(
-        &self,
-        parent_session_id: &str,
-        limit: i64,
-    ) -> Result<Vec<Delegation>> {
-        let rows = sqlx::query(
-            r#"
-            select id, parent_session_id, workflow, label, kind, status, attempt_id,
-                   expected_subagents, launch_shape, teardown_target
-            from delegations
-            where parent_session_id=$1
-            order by created_at desc, id desc
-            limit $2
-            "#,
-        )
-        .bind(parent_session_id)
-        .bind(limit.max(0))
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(row_to_delegation).collect()
-    }
-
     /// Compute compact progress counts for a delegation without materializing
     /// active branches. A subagent is terminal only when it has no active queue
     /// or unfinished action and its active leaf is a turn boundary; a
@@ -756,21 +688,6 @@ impl PostgresAgentStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(exists)
-    }
-
-    /// Mark a delegation's status, e.g. when `delegation.cancel` cancels it. The
-    /// barrier's attempt-fenced completion lives in `finish_delegation`.
-    pub async fn set_delegation_status(
-        &self,
-        delegation_id: &str,
-        status: DelegationStatus,
-    ) -> Result<()> {
-        sqlx::query("update delegations set status=$2, updated_at=now() where id=$1")
-            .bind(delegation_id)
-            .bind(status.as_str())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 
     pub async fn begin_delegation_teardown(
@@ -895,89 +812,6 @@ impl PostgresAgentStore {
                 error.get("message")?.as_str()?.to_string(),
             ))
         }))
-    }
-
-    /// Attempt-fenced cancellation CAS that also cancels any active
-    /// partial wakeups for the same delegation attempt in the same transaction.
-    ///
-    /// This is the user-visible cancellation path. Keeping the status
-    /// transition and active partial cancellation in one commit prevents a
-    /// crash from leaving a terminal (`cancelled`) delegation with a stale
-    /// active running-snapshot wakeup queued on its top-level parent. Only
-    /// deterministic partial wakeups for this exact `(delegation_id,
-    /// attempt_id)` are cancelled; terminal wakeups and unrelated user
-    /// follow-ups do not share the `delegation-steer:{id}:{attempt}:` prefix and
-    /// are left alone.
-    pub async fn cancel_running_delegation_and_queued_partials(
-        &self,
-        parent_session_id: &str,
-        delegation_id: &str,
-        attempt_id: &str,
-        reason: &str,
-    ) -> Result<(bool, Vec<EventFrame>)> {
-        let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, parent_session_id).await?;
-        let status = sqlx::query_scalar::<_, String>(
-            r#"
-            select status
-            from delegations
-            where id=$1 and parent_session_id=$2 and attempt_id=$3
-            for update
-            "#,
-        )
-        .bind(delegation_id)
-        .bind(parent_session_id)
-        .bind(attempt_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if status.as_deref() != Some(DelegationStatus::Running.as_str()) {
-            tx.commit().await?;
-            return Ok((false, Vec::new()));
-        }
-        let updated = sqlx::query(
-            r#"
-            update delegations
-            set status='cancelled', updated_at=now()
-            where id=$1
-              and parent_session_id=$2
-              and attempt_id=$3
-              and status='running'
-            "#,
-        )
-        .bind(delegation_id)
-        .bind(parent_session_id)
-        .bind(attempt_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if updated != 1 {
-            tx.commit().await?;
-            return Ok((false, Vec::new()));
-        }
-        let mut events =
-            cancel_active_delegation_child_inputs_tx(&mut tx, delegation_id, reason).await?;
-
-        let input_ids = cancel_active_partial_delegation_wakeups_tx(
-            &mut tx,
-            parent_session_id,
-            delegation_id,
-            attempt_id,
-            reason,
-        )
-        .await?;
-        events.extend(
-            partial_wakeup_cancellation_events_tx(
-                &mut tx,
-                parent_session_id,
-                delegation_id,
-                attempt_id,
-                reason,
-                input_ids,
-            )
-            .await?,
-        );
-        tx.commit().await?;
-        Ok((true, events))
     }
 
     /// Whether a delegation has spawned the full subagent set promised by its

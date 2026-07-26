@@ -326,14 +326,6 @@ async fn every_delegation_row_query_loads_durable_launch_and_teardown_fields() {
     );
     assert_eq!(
         db.store
-            .list_parent_delegations_newest("parent", 10)
-            .await
-            .expect("list newest")
-            .len(),
-        2
-    );
-    assert_eq!(
-        db.store
             .list_running_delegations()
             .await
             .expect("list running delegations")[0]
@@ -341,10 +333,21 @@ async fn every_delegation_row_query_loads_durable_launch_and_teardown_fields() {
         "running-shape"
     );
 
-    db.store
-        .set_delegation_status(&running.id, DelegationStatus::Done)
+    create_delegation_subagent(
+        &db,
+        "running_child",
+        project_id,
+        "parent",
+        SubagentType::Full,
+        "implementer",
+        &running.id,
+    )
+    .await;
+    assert!(db
+        .store
+        .finish_delegation(&running.id, &running.attempt_id, DelegationStatus::Done)
         .await
-        .expect("complete running delegation");
+        .expect("complete running delegation"));
     let repairs = db
         .store
         .list_completed_delegations_for_repair()
@@ -361,6 +364,104 @@ struct TestDb {
     store: PostgresAgentStore,
     admin_url: String,
     name: String,
+}
+
+/// Create a delegation with a unique launch key and a launch shape matching the
+/// requested kind, mirroring what the daemon's delegation tools persist.
+async fn create_delegation(
+    db: &TestDb,
+    parent_session_id: &str,
+    kind: DelegationKind,
+    workflow: Option<&str>,
+    label: Option<&str>,
+    expected_subagents: i32,
+) -> Result<Delegation, anyhow::Error> {
+    let launch_shape = match kind {
+        DelegationKind::Full => json!({
+            "kind": "full",
+            "role": "implementer",
+            "prompt": "Complete the delegated task.",
+            "workflow": workflow,
+            "label": label,
+        }),
+        DelegationKind::ReadonlyFanout => json!({
+            "kind": "readonly_fanout",
+            "tasks": vec![
+                json!({ "role": "reviewer", "prompt": "Complete the delegated task." });
+                expected_subagents.max(0) as usize
+            ],
+            "workflow": workflow,
+            "label": label,
+        }),
+    }
+    .to_string();
+    db.store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id,
+            launch_key: &format!("test:{}", Uuid::new_v4()),
+            launch_shape: &launch_shape,
+            kind,
+            workflow,
+            label,
+            expected_subagents,
+        })
+        .await
+}
+
+/// Force an arbitrary delegation status that no production transition can
+/// reach, so list/projection queries can be exercised over every status.
+async fn force_delegation_status(db: &TestDb, delegation_id: &str, status: DelegationStatus) {
+    sqlx::query("update delegations set status=$2, updated_at=now() where id=$1")
+        .bind(delegation_id)
+        .bind(status.as_str())
+        .execute(&db.store.pool)
+        .await
+        .expect("force delegation status");
+}
+
+/// Run the production two-phase teardown the daemon drives, returning whether
+/// the teardown was claimed plus the events it emitted.
+async fn tear_down_delegation(
+    db: &TestDb,
+    parent_session_id: &str,
+    delegation_id: &str,
+    attempt_id: &str,
+    target: DelegationStatus,
+    reason: &str,
+) -> (bool, Vec<crate::EventFrame>) {
+    let (claimed, events) = db
+        .store
+        .begin_delegation_teardown(parent_session_id, delegation_id, attempt_id, target, reason)
+        .await
+        .expect("begin delegation teardown");
+    if claimed {
+        assert!(
+            db.store
+                .finish_delegation_teardown(delegation_id, attempt_id, target)
+                .await
+                .expect("finish delegation teardown"),
+            "teardown must finish once every child mailbox row is cancelled"
+        );
+    }
+    (claimed, events)
+}
+
+async fn cancel_delegation(
+    db: &TestDb,
+    parent_session_id: &str,
+    delegation_id: &str,
+    attempt_id: &str,
+    reason: &str,
+) -> (bool, Vec<crate::EventFrame>) {
+    tear_down_delegation(
+        db,
+        parent_session_id,
+        delegation_id,
+        attempt_id,
+        DelegationStatus::Cancelled,
+        reason,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -595,17 +696,16 @@ async fn create_delegation_persists_kind_status_and_attempt() {
         .expect("create project");
     create_session(&db, "parent", project_id).await;
 
-    let delegation = db
-        .store
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            Some("implement_review_test"),
-            Some("review fan-out"),
-            3,
-        )
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &db,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        Some("implement_review_test"),
+        Some("review fan-out"),
+        3,
+    )
+    .await
+    .expect("create delegation");
     assert_eq!(delegation.expected_subagents, 3);
     assert_eq!(delegation.kind, DelegationKind::ReadonlyFanout);
     assert_eq!(delegation.status, DelegationStatus::Running);
@@ -622,9 +722,7 @@ async fn create_delegation_persists_kind_status_and_attempt() {
     assert_eq!(loaded.label.as_deref(), Some("review fan-out"));
     assert_eq!(loaded.status, DelegationStatus::Running);
 
-    let zero_expected = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, None, 0)
+    let zero_expected = create_delegation(&db, "parent", DelegationKind::Full, None, None, 0)
         .await
         .expect_err("a delegation must promise at least one subagent");
     assert!(zero_expected
@@ -654,17 +752,16 @@ async fn fallback_launch_shape_is_postgres_safe_canonical_json_and_replay_stable
         .expect("create project");
     create_session(&db, "parent", project_id).await;
 
-    let created = db
-        .store
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            Some("workflow"),
-            Some("label"),
-            2,
-        )
-        .await
-        .expect("fallback launch persists in PostgreSQL");
+    let created = create_delegation(
+        &db,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        Some("workflow"),
+        Some("label"),
+        2,
+    )
+    .await
+    .expect("fallback launch persists in PostgreSQL");
     let (launch_key, launch_shape): (String, String) =
         sqlx::query_as("select launch_key, launch_shape from delegations where id=$1")
             .bind(&created.id)
@@ -746,10 +843,8 @@ async fn concurrent_full_creation_allows_only_one_running_writer() {
     create_session(&db, "parent", project_id).await;
 
     let (first, second) = tokio::join!(
-        db.store
-            .create_delegation("parent", DelegationKind::Full, None, Some("first"), 1),
-        db.store
-            .create_delegation("parent", DelegationKind::Full, None, Some("second"), 1),
+        create_delegation(&db, "parent", DelegationKind::Full, None, Some("first"), 1),
+        create_delegation(&db, "parent", DelegationKind::Full, None, Some("second"), 1),
     );
     let results = [first, second];
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
@@ -846,11 +941,10 @@ async fn list_delegation_subagents_for_context_is_bounded_and_ordered() {
         .expect("create project");
     create_session(&db, "parent", project_id).await;
 
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 8)
-        .await
-        .expect("create delegation");
+    let delegation =
+        create_delegation(&db, "parent", DelegationKind::ReadonlyFanout, None, None, 8)
+            .await
+            .expect("create delegation");
 
     for index in 0..8 {
         create_delegation_subagent(
@@ -913,9 +1007,7 @@ async fn parent_has_running_delegation_tracks_status() {
         .await
         .expect("no delegation yet"));
 
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&db, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     assert!(db
@@ -924,10 +1016,15 @@ async fn parent_has_running_delegation_tracks_status() {
         .await
         .expect("running delegation detected"));
 
-    db.store
-        .set_delegation_status(&delegation.id, DelegationStatus::Cancelled)
-        .await
-        .expect("cancel delegation");
+    let (claimed, _) = cancel_delegation(
+        &db,
+        "parent",
+        &delegation.id,
+        &delegation.attempt_id,
+        "test",
+    )
+    .await;
+    assert!(claimed);
     assert!(!db
         .store
         .parent_has_running_delegation("parent")
@@ -958,64 +1055,105 @@ async fn parent_delegations_include_complete_parent_set_across_statuses() {
     create_session(&db, "parent", project_id).await;
     create_session(&db, "other_parent", project_id).await;
 
-    let other_parent = db
-        .store
-        .create_delegation("other_parent", DelegationKind::Full, None, Some("other"), 1)
-        .await
-        .expect("create other parent delegation");
-    let done = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, Some("done"), 1)
+    let other_parent = create_delegation(
+        &db,
+        "other_parent",
+        DelegationKind::Full,
+        None,
+        Some("other"),
+        1,
+    )
+    .await
+    .expect("create other parent delegation");
+    let done = create_delegation(&db, "parent", DelegationKind::Full, None, Some("done"), 1)
         .await
         .expect("create done delegation");
-    db.store
-        .set_delegation_status(&done.id, DelegationStatus::Done)
-        .await
-        .expect("finish done delegation");
-    let done_with_failures = db
+    create_delegation_subagent(
+        &db,
+        "done_child",
+        project_id,
+        "parent",
+        SubagentType::Full,
+        "implementer",
+        &done.id,
+    )
+    .await;
+    assert!(db
         .store
-        .create_delegation(
+        .finish_delegation(&done.id, &done.attempt_id, DelegationStatus::Done)
+        .await
+        .expect("finish done delegation"));
+    let done_with_failures = create_delegation(
+        &db,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        Some("done-with-failures"),
+        2,
+    )
+    .await
+    .expect("create done_with_failures delegation");
+    for child in ["failures_child_a", "failures_child_b"] {
+        create_delegation_subagent(
+            &db,
+            child,
+            project_id,
             "parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            Some("done-with-failures"),
-            2,
+            SubagentType::ReadOnly,
+            "reviewer",
+            &done_with_failures.id,
+        )
+        .await;
+    }
+    assert!(db
+        .store
+        .finish_delegation(
+            &done_with_failures.id,
+            &done_with_failures.attempt_id,
+            DelegationStatus::DoneWithFailures
         )
         .await
-        .expect("create done_with_failures delegation");
-    db.store
-        .set_delegation_status(&done_with_failures.id, DelegationStatus::DoneWithFailures)
-        .await
-        .expect("finish done_with_failures delegation");
-    let cancelled = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, Some("cancelled"), 1)
-        .await
-        .expect("create cancelled delegation");
-    db.store
-        .set_delegation_status(&cancelled.id, DelegationStatus::Cancelled)
-        .await
-        .expect("cancel delegation");
-    let failed = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, Some("failed"), 1)
+        .expect("finish done_with_failures delegation"));
+    let cancelled = create_delegation(
+        &db,
+        "parent",
+        DelegationKind::Full,
+        None,
+        Some("cancelled"),
+        1,
+    )
+    .await
+    .expect("create cancelled delegation");
+    assert!(
+        cancel_delegation(&db, "parent", &cancelled.id, &cancelled.attempt_id, "test",)
+            .await
+            .0
+    );
+    let failed = create_delegation(&db, "parent", DelegationKind::Full, None, Some("failed"), 1)
         .await
         .expect("create failed delegation");
-    db.store
-        .set_delegation_status(&failed.id, DelegationStatus::Failed)
-        .await
-        .expect("fail delegation");
-    let running = db
-        .store
-        .create_delegation(
+    assert!(
+        tear_down_delegation(
+            &db,
             "parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            Some("running-old"),
-            2,
+            &failed.id,
+            &failed.attempt_id,
+            DelegationStatus::Failed,
+            "test",
         )
         .await
-        .expect("create running delegation");
+        .0
+    );
+    let running = create_delegation(
+        &db,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        Some("running-old"),
+        2,
+    )
+    .await
+    .expect("create running delegation");
 
     let parent_delegations = db
         .store
@@ -1066,11 +1204,10 @@ async fn delegation_progress_is_lightweight_and_counts_terminal_failures() {
         .expect("create project");
     create_session(&db, "parent", project_id).await;
 
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 4)
-        .await
-        .expect("create delegation");
+    let delegation =
+        create_delegation(&db, "parent", DelegationKind::ReadonlyFanout, None, None, 4)
+            .await
+            .expect("create delegation");
     create_delegation_subagent_with_leaf(
         &db,
         "child_done",
@@ -1127,10 +1264,9 @@ async fn delegation_progress_is_lightweight_and_counts_terminal_failures() {
         }
     );
 
-    db.store
-        .set_delegation_status(&delegation.id, DelegationStatus::DoneWithFailures)
-        .await
-        .expect("terminal status");
+    // No production transition can complete a delegation whose children are
+    // still running; force the terminal row so the projection is exercised.
+    force_delegation_status(&db, &delegation.id, DelegationStatus::DoneWithFailures).await;
     let terminal_delegation = db
         .store
         .get_delegation(&delegation.id)
@@ -1150,7 +1286,7 @@ async fn delegation_progress_is_lightweight_and_counts_terminal_failures() {
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
-async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact() {
+async fn parent_delegations_active_complete_is_bounded_and_subagent_overview_is_compact() {
     let Some(db) = test_store().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -1170,17 +1306,16 @@ async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact()
 
     let mut delegations = Vec::new();
     for index in 0..5 {
-        let delegation = db
-            .store
-            .create_delegation(
-                "parent",
-                DelegationKind::ReadonlyFanout,
-                None,
-                Some(&format!("delegation-{index}")),
-                1,
-            )
-            .await
-            .expect("create delegation");
+        let delegation = create_delegation(
+            &db,
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            Some(&format!("delegation-{index}")),
+            1,
+        )
+        .await
+        .expect("create delegation");
         sqlx::query("update delegations set created_at = now() + ($2::int * interval '1 second') where id=$1")
             .bind(&delegation.id)
             .bind(index)
@@ -1188,34 +1323,52 @@ async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact()
             .await
             .expect("set deterministic ordering");
         if index < 4 {
-            db.store
-                .set_delegation_status(&delegation.id, DelegationStatus::Failed)
+            assert!(
+                tear_down_delegation(
+                    &db,
+                    "parent",
+                    &delegation.id,
+                    &delegation.attempt_id,
+                    DelegationStatus::Failed,
+                    "test",
+                )
                 .await
-                .expect("finish historical delegation");
+                .0
+            );
         }
         delegations.push(delegation);
     }
 
-    let newest = db
+    assert!(
+        db.store
+            .begin_delegation_teardown(
+                "parent",
+                &delegations[4].id,
+                &delegations[4].attempt_id,
+                DelegationStatus::Cancelled,
+                "test",
+            )
+            .await
+            .expect("begin cancelling active delegation")
+            .0
+    );
+    let active_complete = db
         .store
-        .list_parent_delegations_newest("parent", 3)
+        .list_parent_delegations_active_complete("parent", 3)
         .await
-        .expect("list newest delegations");
+        .expect("list cancelling plus bounded terminal history");
     assert_eq!(
-        newest
+        active_complete
             .iter()
             .map(|delegation| delegation.label.as_deref())
             .collect::<Vec<_>>(),
         vec![
             Some("delegation-4"),
             Some("delegation-3"),
-            Some("delegation-2")
+            Some("delegation-2"),
+            Some("delegation-1"),
         ]
     );
-    db.store
-        .set_delegation_status(&delegations[4].id, DelegationStatus::Cancelling)
-        .await
-        .expect("begin cancelling active delegation");
     let active_complete = db
         .store
         .list_parent_delegations_active_complete("parent", 2)
@@ -1328,40 +1481,34 @@ async fn list_delegation_subagents_returns_only_its_members() {
         .expect("create project");
     create_session(&db, "parent", project_id).await;
 
-    let delegation = db
+    let delegation =
+        create_delegation(&db, "parent", DelegationKind::ReadonlyFanout, None, None, 2)
+            .await
+            .expect("create delegation");
+    for child in ["child_a", "child_b"] {
+        create_delegation_subagent(
+            &db,
+            child,
+            project_id,
+            "parent",
+            SubagentType::ReadOnly,
+            "reviewer",
+            &delegation.id,
+        )
+        .await;
+    }
+    assert!(db
         .store
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
+        .finish_delegation(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Done
+        )
         .await
-        .expect("create delegation");
-    create_delegation_subagent(
-        &db,
-        "child_a",
-        project_id,
-        "parent",
-        SubagentType::ReadOnly,
-        "reviewer",
-        &delegation.id,
-    )
-    .await;
-    db.store
-        .set_delegation_status(&delegation.id, DelegationStatus::Done)
-        .await
-        .expect("finish first delegation");
-    let other = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .expect("finish first delegation"));
+    let other = create_delegation(&db, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create other delegation");
-    create_delegation_subagent(
-        &db,
-        "child_b",
-        project_id,
-        "parent",
-        SubagentType::ReadOnly,
-        "reviewer",
-        &delegation.id,
-    )
-    .await;
     create_delegation_subagent(
         &db,
         "child_other",
@@ -1419,9 +1566,7 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&db, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_delegation_subagent(
@@ -1479,10 +1624,7 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
     assert_eq!(steer_count(&db, "parent", &key).await, 1);
 
     // A stale attempt id cannot re-fire a re-opened delegation.
-    db.store
-        .set_delegation_status(&delegation.id, DelegationStatus::Running)
-        .await
-        .expect("reopen");
+    force_delegation_status(&db, &delegation.id, DelegationStatus::Running).await;
     assert!(!db
         .store
         .finish_delegation(&delegation.id, "stale", DelegationStatus::Done)
@@ -1527,9 +1669,7 @@ async fn completion_and_scoped_steer_have_one_invariant_safe_winner() {
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&db, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_delegation_subagent(
@@ -1611,9 +1751,7 @@ async fn combined_control_phases_block_mailbox_and_fence_newer_action_generation
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&db, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     let active_leaf = "control_child_assistant";
@@ -1906,21 +2044,11 @@ async fn atomic_cancel_is_attempt_fenced_and_terminal_safe() {
         .expect("create project");
     create_session(&db, "parent", project_id).await;
 
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&db, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
-    let (won, events) = db
-        .store
-        .cancel_running_delegation_and_queued_partials(
-            "parent",
-            &delegation.id,
-            "stale-attempt-id",
-            "test",
-        )
-        .await
-        .expect("stale cancel loses");
+    let (won, events) =
+        cancel_delegation(&db, "parent", &delegation.id, "stale-attempt-id", "test").await;
     assert!(!won);
     assert!(events.is_empty());
     assert_eq!(
@@ -1932,28 +2060,24 @@ async fn atomic_cancel_is_attempt_fenced_and_terminal_safe() {
             .status,
         DelegationStatus::Running
     );
-    let (won, events) = db
-        .store
-        .cancel_running_delegation_and_queued_partials(
-            "parent",
-            &delegation.id,
-            &delegation.attempt_id,
-            "test",
-        )
-        .await
-        .expect("real cancel wins");
+    let (won, events) = cancel_delegation(
+        &db,
+        "parent",
+        &delegation.id,
+        &delegation.attempt_id,
+        "test",
+    )
+    .await;
     assert!(won);
     assert!(events.is_empty());
-    let (won, events) = db
-        .store
-        .cancel_running_delegation_and_queued_partials(
-            "parent",
-            &delegation.id,
-            &delegation.attempt_id,
-            "test",
-        )
-        .await
-        .expect("cancel replay loses");
+    let (won, events) = cancel_delegation(
+        &db,
+        "parent",
+        &delegation.id,
+        &delegation.attempt_id,
+        "test",
+    )
+    .await;
     assert!(!won);
     assert!(events.is_empty());
     assert_eq!(
@@ -1966,9 +2090,7 @@ async fn atomic_cancel_is_attempt_fenced_and_terminal_safe() {
         DelegationStatus::Cancelled
     );
 
-    let done = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let done = create_delegation(&db, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create done delegation");
     create_delegation_subagent(
@@ -1986,11 +2108,7 @@ async fn atomic_cancel_is_attempt_fenced_and_terminal_safe() {
         .finish_delegation(&done.id, &done.attempt_id, DelegationStatus::Done)
         .await
         .expect("finish done"));
-    let (won, events) = db
-        .store
-        .cancel_running_delegation_and_queued_partials("parent", &done.id, &done.attempt_id, "test")
-        .await
-        .expect("cancel after done loses");
+    let (won, events) = cancel_delegation(&db, "parent", &done.id, &done.attempt_id, "test").await;
     assert!(!won);
     assert!(events.is_empty());
     assert_eq!(
@@ -2003,9 +2121,7 @@ async fn atomic_cancel_is_attempt_fenced_and_terminal_safe() {
         DelegationStatus::Done
     );
 
-    let failed = db
-        .store
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let failed = create_delegation(&db, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create done_with_failures delegation");
     create_delegation_subagent(
@@ -2027,16 +2143,8 @@ async fn atomic_cancel_is_attempt_fenced_and_terminal_safe() {
         )
         .await
         .expect("finish done_with_failures"));
-    let (won, events) = db
-        .store
-        .cancel_running_delegation_and_queued_partials(
-            "parent",
-            &failed.id,
-            &failed.attempt_id,
-            "test",
-        )
-        .await
-        .expect("cancel after done_with_failures loses");
+    let (won, events) =
+        cancel_delegation(&db, "parent", &failed.id, &failed.attempt_id, "test").await;
     assert!(!won);
     assert!(events.is_empty());
     assert_eq!(
@@ -2071,11 +2179,10 @@ async fn cancel_running_delegation_atomically_cancels_queued_partial_wakeup() {
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
+    let delegation =
+        create_delegation(&db, "parent", DelegationKind::ReadonlyFanout, None, None, 2)
+            .await
+            .expect("create delegation");
     let partial_observation = DaemonToolObservation::inspect_delegation(
         ToolCallId::new("call_partial_atomic_cancel"),
         &delegation.id,
@@ -2136,16 +2243,14 @@ async fn cancel_running_delegation_atomically_cancels_queued_partial_wakeup() {
         .await
         .expect("enqueue unrelated follow-up");
 
-    let (cancelled, events) = db
-        .store
-        .cancel_running_delegation_and_queued_partials(
-            "parent",
-            &delegation.id,
-            &delegation.attempt_id,
-            "delegation_cancelled",
-        )
-        .await
-        .expect("atomic cancel");
+    let (cancelled, events) = cancel_delegation(
+        &db,
+        "parent",
+        &delegation.id,
+        &delegation.attempt_id,
+        "delegation_cancelled",
+    )
+    .await;
     assert!(cancelled);
     assert_eq!(events.len(), 1);
     assert_eq!(
@@ -2225,9 +2330,7 @@ async fn cancellation_and_boundary_control_reconciliation_do_not_deadlock() {
         let parent_id = format!("lock_parent_{iteration:02}");
         let child_id = format!("lock_child_{iteration:02}");
         create_session(&db, &parent_id, project_id).await;
-        let delegation = db
-            .store
-            .create_delegation(&parent_id, DelegationKind::Full, None, None, 1)
+        let delegation = create_delegation(&db, &parent_id, DelegationKind::Full, None, None, 1)
             .await
             .expect("create running delegation");
         create_delegation_subagent_with_task_and_leaf(
@@ -2289,10 +2392,11 @@ async fn cancellation_and_boundary_control_reconciliation_do_not_deadlock() {
         let cancel = async {
             cancel_barrier.wait().await;
             db.store
-                .cancel_running_delegation_and_queued_partials(
+                .begin_delegation_teardown(
                     &parent_id,
                     &delegation.id,
                     &delegation.attempt_id,
+                    DelegationStatus::Cancelled,
                     "lock_order_test",
                 )
                 .await
@@ -2317,13 +2421,23 @@ async fn cancellation_and_boundary_control_reconciliation_do_not_deadlock() {
             })
             .await
             .expect("cancellation/reconciliation race must not deadlock");
-        let (_, _) = cancel_result.expect("cancellation transaction remains usable");
+        let (claimed, _) = cancel_result.expect("cancellation transaction remains usable");
+        assert!(claimed);
         if let Err(error) = &reconcile_result {
             assert!(
                 !error.to_string().contains("deadlock detected"),
                 "legal cancellation loss must not be a SQL deadlock: {error:#}"
             );
         }
+        assert!(db
+            .store
+            .finish_delegation_teardown(
+                &delegation.id,
+                &delegation.attempt_id,
+                DelegationStatus::Cancelled
+            )
+            .await
+            .expect("finish teardown after the race"));
 
         assert_eq!(
             db.store
@@ -2381,11 +2495,10 @@ async fn all_terminal_predicate_and_boot_sweep() {
         .expect("create project");
     create_session(&db, "parent", project_id).await;
     // The delegation expects TWO subagents (FIX A: the expected-count fence).
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
+    let delegation =
+        create_delegation(&db, "parent", DelegationKind::ReadonlyFanout, None, None, 2)
+            .await
+            .expect("create delegation");
 
     // An empty delegation (no subagents yet) is NOT terminal — a delegation whose spawn
     // races the barrier must not complete prematurely.
@@ -2485,11 +2598,10 @@ async fn queued_input_on_boundary_subagent_blocks_delegation_terminality() {
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
-    let delegation = db
-        .store
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
+    let delegation =
+        create_delegation(&db, "parent", DelegationKind::ReadonlyFanout, None, None, 2)
+            .await
+            .expect("create delegation");
     create_delegation_subagent(
         &db,
         "child_a",
@@ -2661,17 +2773,16 @@ async fn partial_delegation_observation_suppresses_duplicate_active_wakeups_tran
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
-    let delegation = db
-        .store
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            Some("partial race"),
-            3,
-        )
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &db,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        Some("partial race"),
+        3,
+    )
+    .await
+    .expect("create delegation");
     let observation_a = DaemonToolObservation::inspect_delegation(
         ToolCallId::new("call_partial_a"),
         &delegation.id,

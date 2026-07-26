@@ -11,8 +11,11 @@ Delegations remain immutable completion, cancellation, handoff, and recovery
 scopes; concurrency is an admission policy rather than a global delegation
 lock. A parent may own one running/cancelling full writer and read-only fan-outs
 totaling eight reserved slots. Each fan-out retains its full reservation until
-terminality. Admission serializes on the parent session row and a partial
-unique Postgres index independently prevents two admission-active full rows.
+terminality. Admission serializes on the parent session row. A partial unique
+Postgres index independently prevents two admission-active full rows; the
+read-only slot bound has no such backstop, because an aggregate
+`sum(expected_subagents)` constraint is not expressible as a partial unique
+index, so it relies on the parent row lock alone.
 Model action IDs and websocket `client_launch_id` values provide launch replay
 identity; canonical durable child specifications and stable indices let one
 Postgres-serialized materializer recover missing children without duplication.

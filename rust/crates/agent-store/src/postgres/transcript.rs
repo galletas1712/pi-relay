@@ -2705,7 +2705,15 @@ mod tests {
         };
         let create = tokio::spawn(async move {
             delegation_store
-                .create_delegation(source_session_id, DelegationKind::Full, None, None, 1)
+                .create_delegation_idempotent(crate::CreateDelegationRequest {
+                    parent_session_id: source_session_id,
+                    launch_key: "test:blocked-by-source-row-lock",
+                    launch_shape: r#"{"kind":"full","role":"implementer","prompt":"work"}"#,
+                    kind: DelegationKind::Full,
+                    workflow: None,
+                    label: None,
+                    expected_subagents: 1,
+                })
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {

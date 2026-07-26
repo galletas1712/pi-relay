@@ -933,6 +933,41 @@ mod tests {
         config
     }
 
+    async fn create_delegation(
+        store: &PostgresAgentStore,
+        parent_session_id: &str,
+        label: Option<&str>,
+    ) -> crate::Delegation {
+        store
+            .create_delegation_idempotent(crate::CreateDelegationRequest {
+                parent_session_id,
+                launch_key: &format!("test:{}", Uuid::new_v4()),
+                launch_shape: r#"{"kind":"full","role":"implementer","prompt":"work"}"#,
+                kind: DelegationKind::Full,
+                workflow: None,
+                label,
+                expected_subagents: 1,
+            })
+            .await
+            .expect("delegation creates")
+    }
+
+    /// Force a terminal status while a child mailbox row is still active. No
+    /// production transition can produce that state, but
+    /// `sessions_with_active_queued_inputs` must still exclude such children.
+    async fn force_delegation_status(
+        store: &PostgresAgentStore,
+        delegation_id: &str,
+        status: DelegationStatus,
+    ) {
+        sqlx::query("update delegations set status=$2, updated_at=now() where id=$1")
+            .bind(delegation_id)
+            .bind(status.as_str())
+            .execute(&store.pool)
+            .await
+            .expect("force delegation status");
+    }
+
     fn with_effort(config: &SessionConfig, effort: ReasoningEffort) -> SessionConfig {
         let mut config = config.clone();
         config.provider.reasoning_effort = effort;
@@ -1161,10 +1196,7 @@ mod tests {
         };
         let store = &db.store;
         let config = create_session(store, "parent").await;
-        let delegation = store
-            .create_delegation("parent", DelegationKind::Full, None, None, 1)
-            .await
-            .expect("create delegation");
+        let delegation = create_delegation(store, "parent", None).await;
         store
             .start_session_outputs_with_parent(
                 "child",
@@ -1467,10 +1499,7 @@ mod tests {
             ("done_child", "done", DelegationStatus::Done),
             ("failed_child", "failed", DelegationStatus::Failed),
         ] {
-            let delegation = store
-                .create_delegation("parent", DelegationKind::Full, None, Some(label), 1)
-                .await
-                .expect("terminal delegation creates");
+            let delegation = create_delegation(store, "parent", Some(label)).await;
             store
                 .start_session_outputs_with_parent(
                     session_id,
@@ -1498,15 +1527,9 @@ mod tests {
                 )
                 .await
                 .expect("queued input enqueues before terminal transition");
-            store
-                .set_delegation_status(&delegation.id, status)
-                .await
-                .expect("delegation becomes terminal");
+            force_delegation_status(store, &delegation.id, status).await;
         }
-        let running = store
-            .create_delegation("parent", DelegationKind::Full, None, Some("running"), 1)
-            .await
-            .expect("running delegation creates");
+        let running = create_delegation(store, "parent", Some("running")).await;
         store
             .start_session_outputs_with_parent(
                 "running_child",

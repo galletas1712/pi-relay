@@ -902,4 +902,49 @@ mod tests {
 
         std::fs::remove_dir_all(root).ok();
     }
+
+    #[ignore = "requires PI_RELAY_TEST_BTRFS_ROOT; see rust/README.md"]
+    #[tokio::test]
+    async fn fork_drops_the_parents_handoff_artifacts_from_the_child_cwd() {
+        let Ok(btrfs_root) = std::env::var("PI_RELAY_TEST_BTRFS_ROOT") else {
+            eprintln!("SKIPPED btrfs test; PI_RELAY_TEST_BTRFS_ROOT is not set");
+            return;
+        };
+        let state = PathBuf::from(btrfs_root).join(format!(
+            "pi-runtime-fork-handoff-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let manager =
+            WorkspaceManager::new(state.clone(), state.join("config"), state.join("home"));
+        manager.validate_root().await.expect("btrfs state root");
+        std::fs::create_dir_all(state.join("sessions/parent")).expect("parent session root");
+        create_session_subvolume(&manager.resolve("parent"))
+            .await
+            .expect("parent cwd subvolume");
+        write_file(
+            &manager
+                .resolve("parent")
+                .join(".pi-handoff/delegation_1/index.json"),
+            "{}",
+        );
+        write_file(&manager.resolve("parent").join("keep.txt"), "kept");
+
+        manager
+            .fork_session_from_parent("parent", &[], "child")
+            .await
+            .expect("fork parent cwd");
+
+        assert!(!manager.resolve("child").join(".pi-handoff").exists());
+        assert!(manager.resolve("child").join("keep.txt").exists());
+        assert!(manager.resolve("parent").join(".pi-handoff").exists());
+
+        for workspace_id in ["child", "parent"] {
+            manager
+                .destroy_session_workspaces(workspace_id)
+                .await
+                .expect("reclaim session subvolumes");
+        }
+        std::fs::remove_dir_all(state).ok();
+    }
 }

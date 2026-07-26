@@ -9,6 +9,71 @@ use crate::DelegationStatus;
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(90_000);
 const PREFLIGHT: &str = include_str!("../../../../migrations/concurrent-delegations-preflight.sql");
 const MIGRATION: &str = include_str!("../../../../migrations/concurrent-delegations.sql");
+const PROMPT_MIGRATION: &str =
+    include_str!("../../../../migrations/concurrent-delegations-prompts.sql");
+const PI_MD: &str = include_str!("../../../../../PI.md");
+
+/// The delegation rules block exactly as pre-concurrency `PI.md` rendered it
+/// (`git show 658d9da3:PI.md`). Checked in as a literal so the seed data is
+/// independent of the migration's own replacement constants.
+const PRE_CONCURRENCY_RULES: &str = concat!(
+    "- Launch at most one delegation per turn, then end your turn. Do not poll or loop —\n",
+    "  you will be notified.\n",
+    "- Delegation progress is delivered as daemon-authored wakeup observations with\n",
+    "  structured snapshots equivalent to `inspect_delegation`. If the delivered\n",
+    "  snapshot is terminal (`done`, `done_with_failures`, `cancelled`, or `failed`),\n",
+    "  branch normally on the delivered `outcome`/status fields. If the delivered\n",
+    "  snapshot is still `running`, decide only for that current running delegation:\n",
+    "  steer a running/steerable subagent, cancel the delegation, or end your turn\n",
+    "  and wait. Do not start an unrelated delegation from a running partial wakeup.\n",
+    "  Call `inspect_delegation` only to refresh/recover stale state, or to inspect a\n",
+    "  delegation later/running; do not poll or loop with repeated inspect calls.\n",
+    "  Snapshot payloads are bounded: read handoff artifact paths (`task_prompt.md`,\n",
+    "  `final_message.md`, `transcript.md`) only if you need more detail.\n",
+    "- Normal turns are transcript-driven: rely on durable tool results and wakeup\n",
+    "  observations already present in the transcript. The daemon does not inject a\n",
+    "  separate current-delegation dashboard into ordinary model turns. Compaction\n",
+    "  provider inputs should also ignore/refrain from reconstructing live delegation\n",
+    "  state: after parent-session compaction returns, the daemon appends a fresh\n",
+    "  bounded ledger of all parent delegations to the stored summary. Subagent\n",
+    "  compactions do not receive or append parent/sibling delegation ledgers;\n",
+    "  subagents summarize only their own role contract, delegated task, transcript,\n",
+    "  and tool facts.\n",
+    "- Give each subagent a self-contained task: it starts with fresh context and only\n",
+    "  knows what you put in its prompt (and any handoff/workspace paths you cite).\n",
+    "- While a full subagent is running, supervise and read — do not edit the workspace\n",
+    "  yourself until it returns.\n",
+    "- If a running subagent needs a correction, clarification, or additional\n",
+    "  information, prefer `steer_subagent` over cancelling and restarting. Use the\n",
+    "  subagent session id shown by `inspect_delegation`. The default steer is\n",
+    "  noninterrupting; pass `interrupt: true` only when the current child work\n",
+    "  should be stopped before the durable instruction is driven. Use\n",
+    "  `interrupt_subagent` to durably stop exactly one captured child generation\n",
+    "  without adding an instruction; replaying that tool call does not stop newer\n",
+    "  child work.\n",
+    "- Cancellation is terminal. Use `cancel_delegation` when you intend to abandon\n",
+    "  the whole current delegation, not as a substitute for exact-child interrupt.\n",
+    "  Cancellation does not roll back workspace\n",
+    "  edits or remote-state side effects; inspect the transcript-only paths returned\n",
+    "  by cancellation before deciding follow-up work.\n",
+    "- Never mix RO and full work in one delegation.\n",
+    "- To run a known pattern (e.g. implement → review → test), `LoadSkill` the matching\n",
+    "  workflow skill and follow its delegation state machine, branching on the typed\n",
+    "  outcomes in the delivered snapshot (or a refreshed `inspect_delegation`\n",
+    "  snapshot), with your own judgment (skip, launch fresh work, escalate, stop).",
+);
+
+async fn session_prompts(
+    store: &PostgresAgentStore,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    Ok(
+        sqlx::query_as::<_, (String, String)>("select id, system_prompt from sessions order by id")
+            .fetch_all(&store.pool)
+            .await?
+            .into_iter()
+            .collect(),
+    )
+}
 
 struct TestDb {
     store: PostgresAgentStore,
@@ -675,5 +740,98 @@ async fn concurrent_delegations_migration_preserves_backfills_reruns_and_repairs
     .execute(&db.store.pool)
     .await
     .expect("constraint preserves oversized legacy read-only fan-outs");
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn prompt_migration_rewrites_only_the_pre_concurrency_delegation_rules() {
+    let Some(db) = test_db().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    db.store.migrate().await.expect("install fresh schema");
+    let new_prompt = PI_MD
+        .split_once("{% if capabilities.can_delegate %}")
+        .expect("template delegation section")
+        .1;
+    let current_rules = new_prompt
+        .split_once("Rules:\n\n")
+        .expect("current rules block")
+        .1
+        .split_once("\n\n{% if subagent_roles.catalog %}")
+        .expect("end of current rules block")
+        .0;
+    let old_prompt = new_prompt.replace(current_rules, PRE_CONCURRENCY_RULES);
+    assert_ne!(old_prompt, new_prompt);
+    let old_first_bullet = PRE_CONCURRENCY_RULES
+        .split_once("\n- Delegation progress")
+        .expect("first pre-concurrency bullet")
+        .0;
+    let new_first_bullet = current_rules
+        .split_once("\n- Delegation progress")
+        .expect("first current bullet")
+        .0;
+    // The dominant production shape: a top-level prompt older than the other
+    // three rewrite targets, so only the first bullet matches.
+    let first_bullet_only = format!("Rules:\n\n{old_first_bullet}\n- Older unrelated prose.\n");
+    for (id, prompt, parent) in [
+        ("old-parent-a", old_prompt.as_str(), None),
+        ("old-parent-b", old_prompt.as_str(), None),
+        ("first-bullet-only", first_bullet_only.as_str(), None),
+        ("legacy-subagent", old_prompt.as_str(), Some("old-parent-a")),
+        ("already-new", new_prompt, None),
+    ] {
+        sqlx::query(
+            r#"
+            insert into sessions(
+                id,runtime_id,workspace_id,system_prompt,provider_config,parent_session_id
+            )
+            values ($1,'runtime','workspace',$2,'{}',$3)
+            "#,
+        )
+        .bind(id)
+        .bind(prompt)
+        .bind(parent)
+        .execute(&db.store.pool)
+        .await
+        .expect("seed session prompt");
+    }
+
+    sqlx::raw_sql(psql_script(PROMPT_MIGRATION))
+        .execute(&db.store.pool)
+        .await
+        .expect("apply one-time prompt migration");
+    let migrated = session_prompts(&db.store)
+        .await
+        .expect("load migrated prompts");
+
+    assert_eq!(migrated["old-parent-a"], new_prompt);
+    assert_eq!(migrated["old-parent-b"], new_prompt);
+    assert_eq!(
+        migrated["first-bullet-only"],
+        format!("Rules:\n\n{new_first_bullet}\n- Older unrelated prose.\n"),
+        "a prompt carrying only the first bullet loses exactly that bullet"
+    );
+    assert_eq!(
+        migrated["legacy-subagent"], old_prompt,
+        "a pre-split subagent prompt embedding the block stays byte-for-byte identical"
+    );
+    assert_eq!(
+        migrated["already-new"], new_prompt,
+        "an already-current prompt stays byte-for-byte identical"
+    );
+
+    sqlx::raw_sql(psql_script(PROMPT_MIGRATION))
+        .execute(&db.store.pool)
+        .await
+        .expect("prompt migration reruns");
+    assert_eq!(
+        session_prompts(&db.store)
+            .await
+            .expect("load rerun prompts"),
+        migrated,
+        "rerun is a no-op"
+    );
     db.cleanup().await;
 }

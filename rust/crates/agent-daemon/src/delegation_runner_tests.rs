@@ -182,9 +182,7 @@ async fn history_switch_and_fork_rpc_reject_running_delegation_identically() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    env.state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create running delegation");
 
@@ -329,7 +327,8 @@ use crate::types::{DispatchAction, RuntimeSession};
 
 use super::{
     complete_delegation_if_ready, publish_next_partial_after_parent_decision,
-    sweep_running_delegations_on_boot, try_claim_and_publish_completed_delegation,
+    recover_active_delegations_after_stale_mark, sweep_running_delegations_on_boot,
+    try_claim_and_publish_completed_delegation,
 };
 use crate::delegation_tools::{
     cancel_core, interrupt_subagent_core, read_handoff_file_core,
@@ -632,6 +631,94 @@ async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
         )
         .await
         .expect("create parent");
+}
+
+/// Create a delegation with a unique launch key and a launch shape matching the
+/// requested kind, mirroring what the delegation tools persist.
+async fn create_delegation(
+    env: &TestEnv,
+    parent_session_id: &str,
+    kind: DelegationKind,
+    workflow: Option<&str>,
+    label: Option<&str>,
+    expected_subagents: i32,
+) -> anyhow::Result<Delegation> {
+    let launch_shape = match kind {
+        DelegationKind::Full => json!({
+            "kind": "full",
+            "role": "implementer",
+            "prompt": "Complete the delegated task.",
+            "workflow": workflow,
+            "label": label,
+        }),
+        DelegationKind::ReadonlyFanout => json!({
+            "kind": "readonly_fanout",
+            "tasks": vec![
+                json!({ "role": "reviewer", "prompt": "Complete the delegated task." });
+                expected_subagents.max(0) as usize
+            ],
+            "workflow": workflow,
+            "label": label,
+        }),
+    }
+    .to_string();
+    env.state
+        .repo
+        .create_delegation_idempotent(agent_store::CreateDelegationRequest {
+            parent_session_id,
+            launch_key: &format!("test:{}", Uuid::new_v4()),
+            launch_shape: &launch_shape,
+            kind,
+            workflow,
+            label,
+            expected_subagents,
+        })
+        .await
+}
+
+/// Force an arbitrary delegation status that no production transition can
+/// reach, so recovery/projection paths can be exercised over every status.
+async fn force_delegation_status(env: &TestEnv, delegation_id: &str, status: DelegationStatus) {
+    let pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+        .await
+        .expect("connect status-forcing pool");
+    sqlx::query("update delegations set status=$2, updated_at=now() where id=$1")
+        .bind(delegation_id)
+        .bind(status.as_str())
+        .execute(&pool)
+        .await
+        .expect("force delegation status");
+    pool.close().await;
+}
+
+/// The real boot sequence `main` runs, in order.
+async fn run_boot_recovery(state: &AppState) {
+    recover_active_delegations_after_stale_mark(state).await;
+    sweep_running_delegations_on_boot(state).await;
+}
+
+/// Run the production two-phase teardown the daemon drives.
+async fn tear_down_delegation(env: &TestEnv, delegation: &Delegation, target: DelegationStatus) {
+    assert!(
+        env.state
+            .repo
+            .begin_delegation_teardown(
+                &delegation.parent_session_id,
+                &delegation.id,
+                &delegation.attempt_id,
+                target,
+                "test",
+            )
+            .await
+            .expect("begin delegation teardown")
+            .0
+    );
+    assert!(env
+        .state
+        .repo
+        .finish_delegation_teardown(&delegation.id, &delegation.attempt_id, target)
+        .await
+        .expect("finish delegation teardown"));
 }
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
@@ -1531,18 +1618,16 @@ async fn boot_finishes_cancelling_child_before_expired_post_compaction_recovery(
         .await
         .expect("create project");
     create_parent(&env, project_id, "cancelling-parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation(
-            "cancelling-parent",
-            DelegationKind::Full,
-            None,
-            Some("boot fence"),
-            1,
-        )
-        .await
-        .expect("create running delegation");
+    let delegation = create_delegation(
+        &env,
+        "cancelling-parent",
+        DelegationKind::Full,
+        None,
+        Some("boot fence"),
+        1,
+    )
+    .await
+    .expect("create running delegation");
     let child_id = "cancelling-post-compaction-child";
     let (resumed, _) = commit_post_compaction_dispatch_with_faults(
         &env,
@@ -3405,12 +3490,16 @@ async fn exact_child_interrupt_and_combined_control_preserve_parent_and_sibling_
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
     create_parent(&env, project_id, "other_parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 3)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        3,
+    )
+    .await
+    .expect("create delegation");
     for child in ["child_stop", "child_tool", "child_combined"] {
         create_busy_subagent(
             &env,
@@ -3603,18 +3692,16 @@ async fn interrupt_only_replay_never_interrupts_newer_generation_or_queues_text(
         .expect("create project");
     create_parent(&env, project_id, "interrupt_parent").await;
     create_parent(&env, project_id, "interrupt_other_parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation(
-            "interrupt_parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            None,
-            2,
-        )
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "interrupt_parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        2,
+    )
+    .await
+    .expect("create delegation");
     create_busy_subagent(
         &env,
         project_id,
@@ -3772,11 +3859,7 @@ async fn interrupt_only_replay_never_interrupts_newer_generation_or_queues_text(
         .await
         .expect("generation B remains current"));
 
-    env.state
-        .repo
-        .set_delegation_status(&delegation.id, DelegationStatus::Cancelled)
-        .await
-        .expect("make delegation terminal");
+    force_delegation_status(&env, &delegation.id, DelegationStatus::Cancelled).await;
     let terminal_replay_tool_result = run_delegation_tool(
         &env.state,
         "interrupt_parent",
@@ -3878,10 +3961,7 @@ async fn parent_control_task_aborted_after_commit_is_reconciled_by_detached_chil
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "detached_child").await;
@@ -4021,10 +4101,7 @@ async fn restart_from_interrupt_applied_phase_does_not_repeat_interrupt() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(
@@ -4208,12 +4285,10 @@ async fn combined_control_interrupts_complete_parallel_tool_generation_once() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parallel_parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parallel_parent", DelegationKind::Full, None, None, 1)
-        .await
-        .expect("create delegation");
+    let delegation =
+        create_delegation(&env, "parallel_parent", DelegationKind::Full, None, None, 1)
+            .await
+            .expect("create delegation");
 
     let first_call = ToolCall {
         id: ToolCallId::from_u64(101),
@@ -4800,10 +4875,7 @@ async fn tools_list_filters_delegation_tools_for_subagent_session() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_empty_subagent(
@@ -4877,10 +4949,7 @@ async fn structural_subagent_stays_subagent_profile_after_session_configure() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_empty_subagent(
@@ -5266,18 +5335,16 @@ async fn parent_model_context_does_not_inject_current_delegations() {
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
 
-    let done = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            Some("review"),
-            1,
-        )
-        .await
-        .expect("create done delegation");
+    let done = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        Some("review"),
+        1,
+    )
+    .await
+    .expect("create done delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -5304,18 +5371,16 @@ async fn parent_model_context_does_not_inject_current_delegations() {
         "Looks good.\n\noutcome: approved",
     )
     .expect("write final message artifact");
-    let running = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::Full,
-            Some("workflow-implement-review"),
-            Some("implement"),
-            1,
-        )
-        .await
-        .expect("create running delegation");
+    let running = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::Full,
+        Some("workflow-implement-review"),
+        Some("implement"),
+        1,
+    )
+    .await
+    .expect("create running delegation");
     create_busy_full_subagent(&env, project_id, "parent", &running.id, "impl_busy").await;
 
     let mut config = env
@@ -5638,10 +5703,7 @@ async fn subagent_model_context_does_not_get_parent_delegation_summary() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
@@ -5718,18 +5780,16 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
 
-    let done = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            Some("review"),
-            1,
-        )
-        .await
-        .expect("create done delegation");
+    let done = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        Some("review"),
+        1,
+    )
+    .await
+    .expect("create done delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -5757,18 +5817,16 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
     )
     .expect("write final message artifact");
 
-    let done_with_failures = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            Some("review-failed"),
-            1,
-        )
-        .await
-        .expect("create done_with_failures delegation");
+    let done_with_failures = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        Some("review-failed"),
+        1,
+    )
+    .await
+    .expect("create done_with_failures delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -5801,25 +5859,29 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
     )
     .expect("write final message artifact");
 
-    let cancelled = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("cancelled"), 1)
-        .await
-        .expect("create cancelled delegation");
+    let cancelled = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::Full,
+        None,
+        Some("cancelled"),
+        1,
+    )
+    .await
+    .expect("create cancelled delegation");
     create_busy_full_subagent(&env, project_id, "parent", &cancelled.id, "impl_cancelled").await;
-    env.state
-        .repo
-        .set_delegation_status(&cancelled.id, DelegationStatus::Cancelled)
-        .await
-        .expect("mark cancelled");
+    tear_down_delegation(&env, &cancelled, DelegationStatus::Cancelled).await;
 
-    let failed = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("failed"), 1)
-        .await
-        .expect("create failed delegation");
+    let failed = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::Full,
+        None,
+        Some("failed"),
+        1,
+    )
+    .await
+    .expect("create failed delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -5832,23 +5894,17 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         "Failed before handoff publication.",
     )
     .await;
-    env.state
-        .repo
-        .set_delegation_status(&failed.id, DelegationStatus::Failed)
-        .await
-        .expect("mark failed");
-    let running = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::Full,
-            Some("workflow-implement-review"),
-            Some("implement"),
-            1,
-        )
-        .await
-        .expect("create running delegation");
+    tear_down_delegation(&env, &failed, DelegationStatus::Failed).await;
+    let running = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::Full,
+        Some("workflow-implement-review"),
+        Some("implement"),
+        1,
+    )
+    .await
+    .expect("create running delegation");
     create_busy_full_subagent(&env, project_id, "parent", &running.id, "impl_running").await;
 
     let mut config = env
@@ -5994,18 +6050,16 @@ async fn subagent_compaction_excludes_parent_delegation_ledger_and_sibling_state
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
 
-    let parent_delegation = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            Some("workflow-explore"),
-            Some("fanout"),
-            2,
-        )
-        .await
-        .expect("create parent delegation");
+    let parent_delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        Some("workflow-explore"),
+        Some("fanout"),
+        2,
+    )
+    .await
+    .expect("create parent delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -6103,18 +6157,16 @@ async fn parent_compaction_ledger_bounds_large_fanout_subagents() {
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
 
-    let delegation = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            Some("large"),
-            8,
-        )
-        .await
-        .expect("create large delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        Some("large"),
+        8,
+    )
+    .await
+    .expect("create large delegation");
     for index in 0..8 {
         create_terminal_subagent(
             &env,
@@ -6185,12 +6237,16 @@ async fn parent_compaction_ledger_marks_failed_transcripts_unavailable() {
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
 
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("failed"), 1)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::Full,
+        None,
+        Some("failed"),
+        1,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -6203,11 +6259,7 @@ async fn parent_compaction_ledger_marks_failed_transcripts_unavailable() {
         "Failed before handoff publication.",
     )
     .await;
-    env.state
-        .repo
-        .set_delegation_status(&delegation.id, DelegationStatus::Failed)
-        .await
-        .expect("mark failed");
+    tear_down_delegation(&env, &delegation, DelegationStatus::Failed).await;
 
     let output = append_delegation_ledger_to_output(
         &env.state,
@@ -6244,10 +6296,7 @@ async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
     create_parent(&env, project_id, "other_parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
@@ -6318,6 +6367,77 @@ async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
+async fn follow_up_response_derives_accepted_queued_and_replayed_from_the_store() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "follow-up response shape",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
+
+    let follow_up = |client_input_id: &str| {
+        let state = env.state.clone();
+        let client_input_id = client_input_id.to_string();
+        async move {
+            enqueue_session_input(
+                &state,
+                SessionInputRequest {
+                    session_id: "impl_busy".to_string(),
+                    priority: InputPriority::FollowUp,
+                    content: UserMessage::text("ordinary child follow-up"),
+                    client_input_id: Some(client_input_id),
+                    base_leaf_id: None,
+                    expected_active_leaf_id: None,
+                },
+            )
+            .await
+        }
+    };
+
+    let fresh = follow_up("child-follow-up")
+        .await
+        .expect("running delegation accepts an ordinary child follow-up");
+    assert_eq!(fresh["accepted"], true);
+    assert_eq!(fresh["queued"], true);
+    assert_eq!(
+        fresh["replayed"], false,
+        "ordinary responses carry replayed: false"
+    );
+
+    let replay = follow_up("child-follow-up")
+        .await
+        .expect("exact replay returns the original ledger row");
+    assert_eq!(replay["input_id"], fresh["input_id"]);
+    assert_eq!(replay["accepted"], true);
+    assert_eq!(replay["queued"], true);
+    assert_eq!(replay["replayed"], true);
+
+    tear_down_delegation(&env, &delegation, DelegationStatus::Cancelled).await;
+    let error = follow_up("child-follow-up-after-teardown")
+        .await
+        .expect_err("a non-running delegation closes its children's mailboxes");
+    assert_eq!(error.code, "delegation_not_running");
+
+    env.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
 async fn raw_session_input_steer_rejects_direct_subagent_target() {
     let Some(env) = test_env().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -6336,10 +6456,7 @@ async fn raw_session_input_steer_rejects_direct_subagent_target() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
@@ -6390,12 +6507,16 @@ async fn websocket_delegation_steer_subagent_uses_parent_scope() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        1,
+    )
+    .await
+    .expect("create delegation");
     create_busy_subagent(
         &env,
         project_id,
@@ -6451,10 +6572,7 @@ async fn model_and_websocket_steers_share_one_durable_subagent_mailbox() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
@@ -6537,10 +6655,7 @@ async fn model_facing_delegation_tools_reject_subagent_sessions() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
@@ -6577,12 +6692,16 @@ async fn model_facing_steer_subagent_queues_steer_for_running_read_only_subagent
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        1,
+    )
+    .await
+    .expect("create delegation");
     create_busy_subagent(
         &env,
         project_id,
@@ -6653,12 +6772,16 @@ async fn running_read_only_snapshot_reports_steerable_only_when_accepted() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        2,
+    )
+    .await
+    .expect("create delegation");
     create_busy_subagent(
         &env,
         project_id,
@@ -6760,12 +6883,16 @@ async fn queued_work_on_boundary_subagent_reports_running_and_steerable() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        1,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -6854,12 +6981,16 @@ async fn boundary_controls_settle_without_double_boundary_and_keep_mailbox_live(
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 4)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        4,
+    )
+    .await
+    .expect("create delegation");
 
     for (child, combined, boundary_action) in [
         ("combined_no_action", true, false),
@@ -7086,10 +7217,7 @@ async fn aborted_ready_steer_tool_future_is_recovered_by_live_control_sweep() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_terminal_subagent(
@@ -7243,10 +7371,7 @@ async fn interrupt_only_status_reload_failure_returns_accepted_fallback() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "fallback_child").await;
@@ -7307,12 +7432,16 @@ async fn steer_subagent_rejects_idle_terminal_subagent_without_reactivating_it()
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        1,
+    )
+    .await
+    .expect("create delegation");
     let active_leaf = "ro_idle_finish";
     let entries = vec![
         TranscriptStorageNode {
@@ -7408,10 +7537,7 @@ async fn steer_subagent_rejects_terminal_or_cancelled_delegations() {
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
 
-    let done = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let done = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create done delegation");
     create_terminal_subagent(
@@ -7426,11 +7552,12 @@ async fn steer_subagent_rejects_terminal_or_cancelled_delegations() {
         "Done.",
     )
     .await;
-    env.state
+    assert!(env
+        .state
         .repo
-        .set_delegation_status(&done.id, DelegationStatus::Done)
+        .finish_delegation(&done.id, &done.attempt_id, DelegationStatus::Done)
         .await
-        .expect("mark done");
+        .expect("mark done"));
     let tool_result = run_delegation_tool(
         &env.state,
         "parent",
@@ -7445,18 +7572,11 @@ async fn steer_subagent_rejects_terminal_or_cancelled_delegations() {
     assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Error);
     assert!(tool_result.output.contains("delegation_not_running"));
 
-    let cancelled = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let cancelled = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create cancelled delegation");
     create_busy_full_subagent(&env, project_id, "parent", &cancelled.id, "impl_cancelled").await;
-    env.state
-        .repo
-        .set_delegation_status(&cancelled.id, DelegationStatus::Cancelled)
-        .await
-        .expect("mark cancelled");
+    tear_down_delegation(&env, &cancelled, DelegationStatus::Cancelled).await;
     let tool_result = run_delegation_tool(
         &env.state,
         "parent",
@@ -7494,10 +7614,7 @@ async fn terminal_historical_control_replays_without_recovering_child() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(
@@ -7526,11 +7643,7 @@ async fn terminal_historical_control_replays_without_recovering_child() {
     // the durable scope terminal and discard all volatile child state.
     tokio::task::yield_now().await;
     drop(SessionDriver::acquire(&env.state, "terminal_replay_child").await);
-    env.state
-        .repo
-        .set_delegation_status(&delegation.id, DelegationStatus::Done)
-        .await
-        .expect("mark delegation terminal");
+    force_delegation_status(&env, &delegation.id, DelegationStatus::Done).await;
     env.state
         .active
         .lock()
@@ -7577,10 +7690,7 @@ async fn cancel_delegation_returns_transcript_only_paths() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_to_cancel").await;
@@ -7781,10 +7891,7 @@ async fn cancel_delegation_does_not_clobber_completed_delegation_or_write_artifa
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_terminal_subagent(
@@ -7861,18 +7968,16 @@ async fn terminal_subagent_wakes_parent_before_fanout_barrier_and_allows_scoped_
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            Some("explore"),
-            Some("parallel investigation"),
-            2,
-        )
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        Some("explore"),
+        Some("parallel investigation"),
+        2,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -8009,12 +8114,16 @@ async fn partial_wakeup_waits_until_expected_fanout_members_have_spawned() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        2,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -8091,12 +8200,16 @@ async fn partial_wakeup_queues_only_one_terminal_child_per_parent_decision_point
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
     let parent_lock = SessionDriver::acquire(&env.state, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 3)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        3,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -8205,12 +8318,16 @@ async fn final_completion_cancels_stale_queued_partial_wakeup() {
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
     let parent_lock = SessionDriver::acquire(&env.state, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        2,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -8310,12 +8427,16 @@ async fn consumed_partial_wakeup_triggers_next_already_terminal_sibling() {
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
     let parent_lock = SessionDriver::acquire(&env.state, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 3)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        3,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -8428,12 +8549,16 @@ async fn boot_sweep_repairs_partial_subagent_wakeup_for_still_running_delegation
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        2,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -8457,7 +8582,7 @@ async fn boot_sweep_repairs_partial_subagent_wakeup_for_still_running_delegation
     )
     .await;
 
-    sweep_running_delegations_on_boot(&env.state).await;
+    run_boot_recovery(&env.state).await;
     assert_eq!(
         env.state
             .repo
@@ -8474,7 +8599,7 @@ async fn boot_sweep_repairs_partial_subagent_wakeup_for_still_running_delegation
     assert_eq!(observations[0].result_json["progress"]["terminal"], 1);
     assert_eq!(observations[0].result_json["progress"]["running"], 1);
 
-    sweep_running_delegations_on_boot(&env.state).await;
+    run_boot_recovery(&env.state).await;
     assert_eq!(
         parent_delegation_observations(&env, "parent", &delegation.id)
             .await
@@ -8506,12 +8631,16 @@ async fn cancelling_after_partial_wakeup_preserves_completed_child_handoff_only(
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        2,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -8615,18 +8744,16 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            Some("implement_review_test"),
-            Some("review"),
-            2,
-        )
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        Some("implement_review_test"),
+        Some("review"),
+        2,
+    )
+    .await
+    .expect("create delegation");
 
     create_terminal_subagent(
         &env,
@@ -8706,7 +8833,7 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
     complete_delegation_if_ready(&env.state, &delegation.id)
         .await
         .expect("barrier (replay)");
-    sweep_running_delegations_on_boot(&env.state).await;
+    run_boot_recovery(&env.state).await;
     assert_eq!(
         durable_parent_wakeup_observation_events(&env, "parent", &delegation)
             .await
@@ -8819,18 +8946,16 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            Some("explore"),
-            None,
-            2,
-        )
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        Some("explore"),
+        None,
+        2,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -8989,18 +9114,16 @@ async fn delegation_list_treats_empty_active_branch_as_terminal_non_failed() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation(
-            "parent",
-            DelegationKind::ReadonlyFanout,
-            None,
-            Some("empty"),
-            2,
-        )
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        Some("empty"),
+        2,
+    )
+    .await
+    .expect("create delegation");
 
     create_empty_subagent(
         &env,
@@ -9086,18 +9209,11 @@ async fn failed_delegation_does_not_publish_normal_handoff_on_inspect_or_read() 
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_failed").await;
-    env.state
-        .repo
-        .set_delegation_status(&delegation.id, DelegationStatus::Failed)
-        .await
-        .expect("mark failed");
+    tear_down_delegation(&env, &delegation, DelegationStatus::Failed).await;
 
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
     let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
@@ -9152,10 +9268,7 @@ async fn completion_loser_after_cancellation_does_not_write_normal_handoff() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_terminal_subagent(
@@ -9178,16 +9291,27 @@ async fn completion_loser_after_cancellation_does_not_write_normal_handoff() {
     let (won_cancel, events) = env
         .state
         .repo
-        .cancel_running_delegation_and_queued_partials(
+        .begin_delegation_teardown(
             "parent",
             &delegation.id,
             &delegation.attempt_id,
+            DelegationStatus::Cancelled,
             "test cancellation wins",
         )
         .await
         .expect("cancellation wins");
     assert!(won_cancel);
     assert!(events.is_empty());
+    assert!(env
+        .state
+        .repo
+        .finish_delegation_teardown(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Cancelled
+        )
+        .await
+        .expect("finish cancellation"));
     let won_completion =
         try_claim_and_publish_completed_delegation(&env.state, &delegation, DelegationStatus::Done)
             .await
@@ -9234,12 +9358,16 @@ async fn missing_task_metadata_omits_task_prompt_handoff_metadata() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("legacy"), 1)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::Full,
+        None,
+        Some("legacy"),
+        1,
+    )
+    .await
+    .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_legacy").await;
 
     let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
@@ -9299,10 +9427,7 @@ async fn read_task_prompt_validates_subagent_segment_before_refreshing_artifact(
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, Some("impl"), 1)
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl").await;
@@ -9354,10 +9479,7 @@ async fn out_of_set_outcome_is_recorded_verbatim() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_terminal_subagent(
@@ -9397,10 +9519,7 @@ async fn stale_attempt_id_cannot_finish_delegation() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_terminal_subagent(
@@ -9440,11 +9559,7 @@ async fn stale_attempt_id_cannot_finish_delegation() {
         .expect("finish again"));
 
     // Re-open it and try a stale attempt id: must not transition.
-    env.state
-        .repo
-        .set_delegation_status(&delegation.id, DelegationStatus::Running)
-        .await
-        .expect("reopen");
+    force_delegation_status(&env, &delegation.id, DelegationStatus::Running).await;
     assert!(!env
         .state
         .repo
@@ -9479,10 +9594,7 @@ async fn boot_sweep_completes_a_crash_mid_barrier_delegation_exactly_once() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_terminal_subagent(
@@ -9500,7 +9612,7 @@ async fn boot_sweep_completes_a_crash_mid_barrier_delegation_exactly_once() {
 
     // The delegation is still `running` with all subagents terminal — i.e. a crash
     // mid-barrier. The boot sweep completes it exactly once.
-    sweep_running_delegations_on_boot(&env.state).await;
+    run_boot_recovery(&env.state).await;
     assert_eq!(
         env.state
             .repo
@@ -9517,7 +9629,7 @@ async fn boot_sweep_completes_a_crash_mid_barrier_delegation_exactly_once() {
     );
 
     // A second sweep (another restart) must not double-publish a wakeup.
-    sweep_running_delegations_on_boot(&env.state).await;
+    run_boot_recovery(&env.state).await;
     assert_eq!(
         wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
         1
@@ -9543,9 +9655,7 @@ async fn one_delegation_per_parent_is_rejected() {
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
     // A running delegation already exists for this parent.
-    env.state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
 
@@ -9575,10 +9685,7 @@ async fn subagent_cannot_start_a_nested_delegation() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_terminal_subagent(
@@ -9873,7 +9980,7 @@ async fn boot_recovers_child_committed_immediately_before_initial_dispatch_regis
         .mark_all_unfinished_actions_stale()
         .await
         .expect("global stale mark");
-    crate::delegation_runner::recover_active_delegations_after_stale_mark(&env.state).await;
+    recover_active_delegations_after_stale_mark(&env.state).await;
     assert!(
         env.state
             .tasks
@@ -10067,12 +10174,16 @@ async fn partial_spawn_does_not_complete_delegation() {
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
     // The fan-out will spawn TWO subagents.
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        2,
+    )
+    .await
+    .expect("create delegation");
     // Only subagent #1 exists so far and is terminal-on-arrival.
     create_terminal_subagent(
         &env,
@@ -10159,10 +10270,7 @@ async fn boot_repair_publishes_handoff_and_wakeup_observation_after_finish_claim
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_terminal_subagent(
@@ -10207,7 +10315,7 @@ async fn boot_repair_publishes_handoff_and_wakeup_observation_after_finish_claim
         0
     );
 
-    sweep_running_delegations_on_boot(&env.state).await;
+    run_boot_recovery(&env.state).await;
     assert!(env
         .state
         .repo
@@ -10262,7 +10370,7 @@ async fn boot_repair_publishes_handoff_and_wakeup_observation_after_finish_claim
     // repair may already have driven the idle parent and consumed the queued
     // input, so assert the deterministic idempotency row rather than requiring
     // the completion observation to remain in the active queue.
-    sweep_running_delegations_on_boot(&env.state).await;
+    run_boot_recovery(&env.state).await;
     let repaired_again = env
         .state
         .repo
@@ -10306,10 +10414,7 @@ async fn boot_sweep_does_not_complete_mid_turn_subagent() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     // A single full subagent stuck mid-turn (active leaf is an assistant message,
@@ -10334,7 +10439,7 @@ async fn boot_sweep_does_not_complete_mid_turn_subagent() {
 
     // The boot sweep must NOT complete this delegation: terminality is transcript-based,
     // and a mid-turn leaf is not a boundary.
-    sweep_running_delegations_on_boot(&env.state).await;
+    run_boot_recovery(&env.state).await;
     assert_eq!(
         env.state
             .repo
@@ -10372,10 +10477,7 @@ async fn terminal_delegation_member_yields_zero_parent_idle_rows() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+    let delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
     create_terminal_subagent(
@@ -10441,12 +10543,16 @@ async fn raw_session_input_steer_to_any_subagent_is_rejected_server_side() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let readonly_delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
-        .await
-        .expect("create read-only delegation");
+    let readonly_delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        1,
+    )
+    .await
+    .expect("create read-only delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -10459,12 +10565,10 @@ async fn raw_session_input_steer_to_any_subagent_is_rejected_server_side() {
         "done",
     )
     .await;
-    let terminal_full_delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
-        .await
-        .expect("create terminal full delegation");
+    let terminal_full_delegation =
+        create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
+            .await
+            .expect("create terminal full delegation");
     create_terminal_subagent(
         &env,
         project_id,
@@ -10477,15 +10581,17 @@ async fn raw_session_input_steer_to_any_subagent_is_rejected_server_side() {
         "done",
     )
     .await;
-    env.state
-        .repo
-        .set_delegation_status(&terminal_full_delegation.id, DelegationStatus::Done)
-        .await
-        .expect("finish terminal full delegation");
-    let full_delegation = env
+    assert!(env
         .state
         .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .finish_delegation(
+            &terminal_full_delegation.id,
+            &terminal_full_delegation.attempt_id,
+            DelegationStatus::Done
+        )
+        .await
+        .expect("finish terminal full delegation"));
+    let full_delegation = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create full delegation");
     create_busy_full_subagent(
@@ -10566,12 +10672,16 @@ async fn dispatch_failure_for_delegation_member_emits_no_parent_idle() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        1,
+    )
+    .await
+    .expect("create delegation");
     // A terminal delegation member already exists with a delegation_id; route a simulated
     // dispatch failure for it through the gate. The gate must suppress the
     // parent-visible idle because the child belongs to a delegation.
@@ -10618,12 +10728,16 @@ async fn two_siblings_wake_parent_exactly_once_via_live_seam() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
-    let delegation = env
-        .state
-        .repo
-        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create delegation");
+    let delegation = create_delegation(
+        &env,
+        "parent",
+        DelegationKind::ReadonlyFanout,
+        None,
+        None,
+        2,
+    )
+    .await
+    .expect("create delegation");
     create_terminal_subagent(
         &env,
         project_id,
