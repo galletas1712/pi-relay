@@ -326,9 +326,8 @@ use crate::subagents::{spawn_subagent, DelegationSubagentSpawn};
 use crate::types::{DispatchAction, RuntimeSession};
 
 use super::{
-    complete_delegation_if_ready, publish_next_partial_after_parent_decision,
-    recover_active_delegations_after_stale_mark, sweep_running_delegations_on_boot,
-    try_claim_and_publish_completed_delegation,
+    complete_delegation_if_ready, recover_active_delegations_after_stale_mark,
+    sweep_running_delegations_on_boot, try_claim_and_publish_completed_delegation,
 };
 use crate::delegation_tools::{
     cancel_core, interrupt_subagent_core, read_handoff_file_core,
@@ -5148,9 +5147,8 @@ async fn settle_subagent_terminal(env: &TestEnv, session_id: &str, boundary_leaf
 }
 
 /// Delegation observations that reached the parent. An idle parent accepts the
-/// daemon-authored observation as its next model-visible turn, so the typed
-/// observation lands in the parent's transcript. This includes partial
-/// still-running observations and the final terminal completion observation.
+/// daemon-authored observation as its next model-visible turn, so the terminal
+/// completion observation lands in the parent's transcript.
 async fn parent_delegation_observations(
     env: &TestEnv,
     parent_id: &str,
@@ -5179,32 +5177,12 @@ async fn parent_delegation_observations(
         .collect()
 }
 
-async fn parent_completion_observations(
-    env: &TestEnv,
-    parent_id: &str,
-    delegation_id: &str,
-) -> Vec<DaemonToolObservation> {
-    parent_delegation_observations(env, parent_id, delegation_id)
-        .await
-        .into_iter()
-        .filter(|observation| {
-            !matches!(
-                observation
-                    .result_json
-                    .get("status")
-                    .and_then(serde_json::Value::as_str),
-                Some("running")
-            )
-        })
-        .collect()
-}
-
 async fn wakeup_observations_to_parent(
     env: &TestEnv,
     parent_id: &str,
     delegation_id: &str,
 ) -> usize {
-    parent_completion_observations(env, parent_id, delegation_id)
+    parent_delegation_observations(env, parent_id, delegation_id)
         .await
         .len()
 }
@@ -5214,37 +5192,13 @@ async fn parent_completion_snapshot(
     parent_id: &str,
     delegation_id: &str,
 ) -> serde_json::Value {
-    let observations = parent_completion_observations(env, parent_id, delegation_id).await;
+    let observations = parent_delegation_observations(env, parent_id, delegation_id).await;
     assert_eq!(
         observations.len(),
         1,
         "expected exactly one completion wakeup"
     );
     observations[0].result_json.clone()
-}
-
-async fn parent_partial_client_input_ids(
-    env: &TestEnv,
-    parent_id: &str,
-    delegation: &Delegation,
-) -> Vec<String> {
-    env.state
-        .repo
-        .queue_state(parent_id)
-        .await
-        .expect("parent queue")
-        .queued_inputs
-        .into_iter()
-        .filter_map(|input| {
-            let client_input_id = input.client_input_id?;
-            client_input_id
-                .starts_with(&format!(
-                    "delegation-steer:{}:{}:",
-                    delegation.id, delegation.attempt_id
-                ))
-                .then_some(client_input_id)
-        })
-        .collect()
 }
 
 async fn inspect_delegation_snapshot(env: &TestEnv, delegation_id: &str) -> serde_json::Value {
@@ -7951,7 +7905,7 @@ async fn cancel_delegation_does_not_clobber_completed_delegation_or_write_artifa
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
-async fn terminal_subagent_wakes_parent_before_fanout_barrier_and_allows_scoped_steering() {
+async fn cancelling_after_inspection_preserves_completed_child_handoff_only() {
     let Some(env) = test_env().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -7962,670 +7916,7 @@ async fn terminal_subagent_wakes_parent_before_fanout_barrier_and_allows_scoped_
         .create_project(
             project_id,
             "runtime-test",
-            "partial wakeup test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("create project");
-    create_parent(&env, project_id, "parent").await;
-    let delegation = create_delegation(
-        &env,
-        "parent",
-        DelegationKind::ReadonlyFanout,
-        Some("explore"),
-        Some("parallel investigation"),
-        2,
-    )
-    .await
-    .expect("create delegation");
-    create_terminal_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "fast_child",
-        "explorer",
-        SubagentType::ReadOnly,
-        TurnOutcome::Graceful,
-        "Found a decisive issue.\n\noutcome: done",
-    )
-    .await;
-    create_busy_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "slow_child",
-        "explorer",
-        SubagentType::ReadOnly,
-    )
-    .await;
-
-    complete_delegation_if_ready(&env.state, &delegation.id)
-        .await
-        .expect("partial wakeup");
-    assert_eq!(
-        env.state
-            .repo
-            .get_delegation(&delegation.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .status,
-        DelegationStatus::Running
-    );
-    assert_eq!(
-        parent_completion_observations(&env, "parent", &delegation.id)
-            .await
-            .len(),
-        0,
-        "partial wakeup must not masquerade as terminal completion"
-    );
-    let observations = parent_delegation_observations(&env, "parent", &delegation.id).await;
-    assert_eq!(observations.len(), 1);
-    let partial = &observations[0];
-    assert!(partial
-        .summary
-        .as_deref()
-        .unwrap_or_default()
-        .contains("Subagent fast_child finished"));
-    assert_eq!(partial.result_json["status"], "running");
-    assert_eq!(partial.result_json["progress"]["terminal"], 1);
-    assert_eq!(partial.result_json["progress"]["running"], 1);
-    let fast = partial.result_json["subagents"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|subagent| subagent["id"] == "fast_child")
-        .unwrap();
-    assert_eq!(fast["status"], "done");
-    assert_eq!(fast["outcome"], "done");
-    assert_eq!(fast["final_message_file"], "fast_child/final_message.md");
-    assert!(handoff_root(&env, &delegation.id)
-        .join("fast_child")
-        .join("final_message.md")
-        .exists());
-    let slow = partial.result_json["subagents"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|subagent| subagent["id"] == "slow_child")
-        .unwrap();
-    assert_eq!(slow["status"], "running");
-    assert_eq!(slow["steerable"], true);
-    assert_eq!(slow["final_message_file"], serde_json::Value::Null);
-
-    let scoped_error = steer_subagent_core(
-        &env.state,
-        "other_parent",
-        json!({ "subagent_id": "slow_child", "message": "not your child" }),
-    )
-    .await
-    .expect_err("partial wakeup must not reintroduce raw/direct child steering");
-    assert_eq!(scoped_error.code, "subagent_not_found");
-    let steer = steer_subagent_core(
-        &env.state,
-        "parent",
-        json!({ "subagent_id": "slow_child", "message": "You can stop after checking the new clue." }),
-    )
-    .await
-    .expect("steer running read-only subagent");
-    assert_eq!(steer["queued"], true);
-    let queue = env
-        .state
-        .repo
-        .queue_state("slow_child")
-        .await
-        .expect("queue state");
-    assert_eq!(queue.queued_inputs.len(), 1);
-    assert_eq!(queue.queued_inputs[0].priority, InputPriority::Steer);
-
-    complete_delegation_if_ready(&env.state, &delegation.id)
-        .await
-        .expect("partial replay");
-    assert_eq!(
-        parent_delegation_observations(&env, "parent", &delegation.id)
-            .await
-            .len(),
-        1,
-        "partial child wakeup is deterministic and idempotent"
-    );
-
-    env.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn partial_wakeup_waits_until_expected_fanout_members_have_spawned() {
-    let Some(env) = test_env().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    env.state
-        .repo
-        .create_project(
-            project_id,
-            "runtime-test",
-            "partial spawn wakeup test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("create project");
-    create_parent(&env, project_id, "parent").await;
-    let delegation = create_delegation(
-        &env,
-        "parent",
-        DelegationKind::ReadonlyFanout,
-        None,
-        None,
-        2,
-    )
-    .await
-    .expect("create delegation");
-    create_terminal_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "fast_only_child",
-        "reviewer",
-        SubagentType::ReadOnly,
-        TurnOutcome::Graceful,
-        "Finished before sibling spawned.\n\noutcome: done",
-    )
-    .await;
-
-    complete_delegation_if_ready(&env.state, &delegation.id)
-        .await
-        .expect("partial spawn check");
-    assert_eq!(
-        parent_delegation_observations(&env, "parent", &delegation.id)
-            .await
-            .len(),
-        0,
-        "no running partial should be published before the expected fan-out set exists"
-    );
-
-    create_busy_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "late_sibling",
-        "reviewer",
-        SubagentType::ReadOnly,
-    )
-    .await;
-
-    complete_delegation_if_ready(&env.state, &delegation.id)
-        .await
-        .expect("partial after full spawn");
-    let observations = parent_delegation_observations(&env, "parent", &delegation.id).await;
-    assert_eq!(observations.len(), 1);
-    assert_eq!(observations[0].result_json["status"], "running");
-    assert_eq!(observations[0].result_json["progress"]["spawned"], 2);
-    assert_eq!(
-        observations[0].result_json["subagents"]
-            .as_array()
-            .expect("subagents")
-            .len(),
-        2,
-        "the delivered snapshot should include the late-spawned sibling"
-    );
-
-    env.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn partial_wakeup_queues_only_one_terminal_child_per_parent_decision_point_and_cancels_on_cancel(
-) {
-    let Some(env) = test_env().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    env.state
-        .repo
-        .create_project(
-            project_id,
-            "runtime-test",
-            "partial wakeup queue test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("create project");
-    create_parent(&env, project_id, "parent").await;
-    let parent_lock = SessionDriver::acquire(&env.state, "parent").await;
-    let delegation = create_delegation(
-        &env,
-        "parent",
-        DelegationKind::ReadonlyFanout,
-        None,
-        None,
-        3,
-    )
-    .await
-    .expect("create delegation");
-    create_terminal_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "fast_a",
-        "reviewer",
-        SubagentType::ReadOnly,
-        TurnOutcome::Graceful,
-        "First result.\n\noutcome: done",
-    )
-    .await;
-    create_terminal_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "fast_b",
-        "reviewer",
-        SubagentType::ReadOnly,
-        TurnOutcome::Graceful,
-        "Second result.\n\noutcome: done",
-    )
-    .await;
-    create_busy_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "slow_child",
-        "reviewer",
-        SubagentType::ReadOnly,
-    )
-    .await;
-
-    complete_delegation_if_ready(&env.state, &delegation.id)
-        .await
-        .expect("partial wakeup");
-    assert_eq!(
-        parent_delegation_observations(&env, "parent", &delegation.id)
-            .await
-            .len(),
-        0,
-        "held parent lock keeps the partial queued"
-    );
-    let partial_ids = parent_partial_client_input_ids(&env, "parent", &delegation).await;
-    assert_eq!(
-        partial_ids.len(),
-        1,
-        "only one partial wakeup should be queued before the parent decides"
-    );
-    let record = env
-        .state
-        .repo
-        .find_client_input("parent", &partial_ids[0])
-        .await
-        .expect("find partial")
-        .expect("partial row");
-    assert_eq!(record.status, QueuedInputStatus::Queued);
-
-    drop(parent_lock);
-    let cancelled = cancel_core(
-        &env.state,
-        "parent",
-        json!({ "delegation_id": delegation.id }),
-    )
-    .await
-    .expect("cancel delegation");
-    assert_eq!(cancelled["cancelled"], true);
-    assert!(
-        parent_partial_client_input_ids(&env, "parent", &delegation)
-            .await
-            .is_empty(),
-        "queued partial wakeup should be removed when cancellation wins"
-    );
-    let record = env
-        .state
-        .repo
-        .find_client_input("parent", &partial_ids[0])
-        .await
-        .expect("find cancelled partial")
-        .expect("partial row remains for idempotency");
-    assert_eq!(record.status, QueuedInputStatus::Cancelled);
-
-    env.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn final_completion_cancels_stale_queued_partial_wakeup() {
-    let Some(env) = test_env().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    env.state
-        .repo
-        .create_project(
-            project_id,
-            "runtime-test",
-            "partial completion race test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("create project");
-    create_parent(&env, project_id, "parent").await;
-    let parent_lock = SessionDriver::acquire(&env.state, "parent").await;
-    let delegation = create_delegation(
-        &env,
-        "parent",
-        DelegationKind::ReadonlyFanout,
-        None,
-        None,
-        2,
-    )
-    .await
-    .expect("create delegation");
-    create_terminal_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "fast_child",
-        "reviewer",
-        SubagentType::ReadOnly,
-        TurnOutcome::Graceful,
-        "First result.\n\noutcome: done",
-    )
-    .await;
-    let slow_boundary = create_running_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "slow_child",
-        "reviewer",
-        TurnOutcome::Graceful,
-    )
-    .await;
-
-    complete_delegation_if_ready(&env.state, &delegation.id)
-        .await
-        .expect("partial wakeup");
-    let partial_ids = parent_partial_client_input_ids(&env, "parent", &delegation).await;
-    assert_eq!(
-        partial_ids.len(),
-        1,
-        "partial should be queued while parent is busy"
-    );
-
-    settle_subagent_terminal(&env, "slow_child", &slow_boundary).await;
-    complete_delegation_if_ready(&env.state, &delegation.id)
-        .await
-        .expect("final completion");
-    assert_eq!(
-        env.state
-            .repo
-            .get_delegation(&delegation.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .status,
-        DelegationStatus::Done
-    );
-    assert!(
-        parent_partial_client_input_ids(&env, "parent", &delegation)
-            .await
-            .is_empty(),
-        "stale queued running partial should be cancelled before final completion wakeup remains"
-    );
-    let stale_partial = env
-        .state
-        .repo
-        .find_client_input("parent", &partial_ids[0])
-        .await
-        .expect("find stale partial")
-        .expect("stale partial row remains for idempotency");
-    assert_eq!(stale_partial.status, QueuedInputStatus::Cancelled);
-    let final_key = format!(
-        "delegation-steer:{}:{}",
-        delegation.id, delegation.attempt_id
-    );
-    let final_input = env
-        .state
-        .repo
-        .find_client_input("parent", &final_key)
-        .await
-        .expect("find final wakeup")
-        .expect("final wakeup exists");
-    assert_eq!(final_input.status, QueuedInputStatus::Queued);
-
-    drop(parent_lock);
-    env.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn consumed_partial_wakeup_triggers_next_already_terminal_sibling() {
-    let Some(env) = test_env().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    env.state
-        .repo
-        .create_project(
-            project_id,
-            "runtime-test",
-            "partial next sibling test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("create project");
-    create_parent(&env, project_id, "parent").await;
-    let parent_lock = SessionDriver::acquire(&env.state, "parent").await;
-    let delegation = create_delegation(
-        &env,
-        "parent",
-        DelegationKind::ReadonlyFanout,
-        None,
-        None,
-        3,
-    )
-    .await
-    .expect("create delegation");
-    create_terminal_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "first_done",
-        "reviewer",
-        SubagentType::ReadOnly,
-        TurnOutcome::Graceful,
-        "First result.\n\noutcome: done",
-    )
-    .await;
-    let second_boundary = create_running_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "second_later",
-        "reviewer",
-        TurnOutcome::Graceful,
-    )
-    .await;
-    create_busy_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "still_running",
-        "reviewer",
-        SubagentType::ReadOnly,
-    )
-    .await;
-
-    complete_delegation_if_ready(&env.state, &delegation.id)
-        .await
-        .expect("first partial");
-    let partial_ids = parent_partial_client_input_ids(&env, "parent", &delegation).await;
-    assert_eq!(partial_ids.len(), 1);
-    assert!(partial_ids[0].ends_with(":first_done"));
-
-    settle_subagent_terminal(&env, "second_later", &second_boundary).await;
-    complete_delegation_if_ready(&env.state, &delegation.id)
-        .await
-        .expect("second terminal while first partial queued");
-    assert_eq!(
-        parent_partial_client_input_ids(&env, "parent", &delegation).await,
-        partial_ids,
-        "do not pre-publish the second terminal sibling before the parent handles the first"
-    );
-
-    drop(parent_lock);
-    let consumed_first = env
-        .state
-        .repo
-        .take_next_queued_steer_input("parent")
-        .await
-        .expect("take first partial")
-        .expect("first partial queued");
-    assert_eq!(
-        consumed_first.client_input_id.as_deref(),
-        Some(partial_ids[0].as_str())
-    );
-    env.state
-        .repo
-        .persist_outputs(
-            "parent",
-            OutputBatch::new(&[], None, &[], &[]).with_consumed_input(Some(consumed_first)),
-        )
-        .await
-        .expect("mark first partial consumed");
-
-    publish_next_partial_after_parent_decision(&env.state, "parent", Some(&partial_ids[0]))
-        .await
-        .expect("next partial after parent decision");
-    let observations = parent_delegation_observations(&env, "parent", &delegation.id).await;
-    assert_eq!(
-        observations.len(),
-        1,
-        "the next already-terminal sibling should get its own parent decision point"
-    );
-    assert!(observations[0]
-        .summary
-        .as_deref()
-        .unwrap_or_default()
-        .contains("Subagent second_later finished"));
-    assert_eq!(observations[0].result_json["status"], "running");
-    assert_eq!(observations[0].result_json["progress"]["terminal"], 2);
-    assert_eq!(observations[0].result_json["progress"]["running"], 1);
-
-    env.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn boot_sweep_repairs_partial_subagent_wakeup_for_still_running_delegation() {
-    let Some(env) = test_env().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    env.state
-        .repo
-        .create_project(
-            project_id,
-            "runtime-test",
-            "partial boot repair test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("create project");
-    create_parent(&env, project_id, "parent").await;
-    let delegation = create_delegation(
-        &env,
-        "parent",
-        DelegationKind::ReadonlyFanout,
-        None,
-        None,
-        2,
-    )
-    .await
-    .expect("create delegation");
-    create_terminal_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "finished",
-        "reviewer",
-        SubagentType::ReadOnly,
-        TurnOutcome::Graceful,
-        "Finished early.\n\noutcome: done",
-    )
-    .await;
-    create_running_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "not_done",
-        "reviewer",
-        TurnOutcome::Graceful,
-    )
-    .await;
-
-    run_boot_recovery(&env.state).await;
-    assert_eq!(
-        env.state
-            .repo
-            .get_delegation(&delegation.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .status,
-        DelegationStatus::Running
-    );
-    let observations = parent_delegation_observations(&env, "parent", &delegation.id).await;
-    assert_eq!(observations.len(), 1);
-    assert_eq!(observations[0].result_json["status"], "running");
-    assert_eq!(observations[0].result_json["progress"]["terminal"], 1);
-    assert_eq!(observations[0].result_json["progress"]["running"], 1);
-
-    run_boot_recovery(&env.state).await;
-    assert_eq!(
-        parent_delegation_observations(&env, "parent", &delegation.id)
-            .await
-            .len(),
-        1,
-        "boot repair must be idempotent for partial wakeups"
-    );
-
-    env.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn cancelling_after_partial_wakeup_preserves_completed_child_handoff_only() {
-    let Some(env) = test_env().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    env.state
-        .repo
-        .create_project(
-            project_id,
-            "runtime-test",
-            "partial cancel test",
+            "inspect cancel test",
             &[],
             json!({}),
         )
@@ -8665,9 +7956,15 @@ async fn cancelling_after_partial_wakeup_preserves_completed_child_handoff_only(
     )
     .await;
 
-    complete_delegation_if_ready(&env.state, &delegation.id)
-        .await
-        .expect("partial wakeup");
+    // Inspecting a running delegation refreshes its handoff artifacts, so the
+    // completed child's final message exists on disk before cancellation.
+    status_core(
+        &env.state,
+        "parent",
+        json!({ "delegation_id": delegation.id }),
+    )
+    .await
+    .expect("inspect running delegation");
     assert!(handoff_root(&env, &delegation.id)
         .join("finished")
         .join("final_message.md")
@@ -8677,7 +7974,7 @@ async fn cancelling_after_partial_wakeup_preserves_completed_child_handoff_only(
             .join("still_running")
             .join("transcript.md")
             .exists(),
-        "running snapshots write normal transcripts before cancellation"
+        "inspection writes normal transcripts before cancellation"
     );
 
     let cancelled = cancel_core(
@@ -8784,7 +8081,7 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
     // leaf, so it stays non-terminal.
     complete_delegation_if_ready(&env.state, &delegation.id)
         .await
-        .expect("barrier (partial)");
+        .expect("barrier (not all terminal)");
     assert_eq!(
         env.state
             .repo
@@ -8806,9 +8103,9 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
     settle_subagent_terminal(&env, "still_running", &boundary_leaf).await;
 
     // Now all terminal -> exactly one durable wakeup publication,
-    // done_with_failures, and handoff for all. The parent may still be busy
-    // with the earlier partial-progress observation, so the final observation
-    // can legitimately remain queued rather than already be in its transcript.
+    // done_with_failures, and handoff for all. The observation can legitimately
+    // remain queued rather than already be in the parent's transcript, so the
+    // assertion below reads the durable publication rather than the transcript.
     complete_delegation_if_ready(&env.state, &delegation.id)
         .await
         .expect("barrier (complete)");
@@ -10064,7 +9361,7 @@ async fn published_parent_completion_observation(
     delegation: &Delegation,
 ) -> DaemonToolObservation {
     let transcript_observations =
-        parent_completion_observations(env, parent_id, &delegation.id).await;
+        parent_delegation_observations(env, parent_id, &delegation.id).await;
     if !transcript_observations.is_empty() {
         assert_eq!(
             transcript_observations.len(),

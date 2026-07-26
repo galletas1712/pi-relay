@@ -79,9 +79,10 @@ Subagent work runs as **delegations** (`delegate_writing_task` /
 `steer_subagent` / `interrupt_subagent`). Full subagents
 reuse the parent's workspace dirs in place; read-only subagents get a forked
 snapshot destroyed on return. Delegation subagents may emit
-`subagent.spawned`/`subagent.running` progress events; their terminal hook fires
-a single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
-terminal. After the DB finish CAS wins, the runner writes the handoff directory
+`subagent.spawned`/`subagent.running` progress events; an individual child
+reaching terminal produces no parent-visible wakeup. Their terminal hook fires a
+single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
+terminal, so the parent is woken exactly once, at delegation terminal status. After the DB finish CAS wins, the runner writes the handoff directory
 and then enqueues one `InputPriority::Steer` daemon observation to the parent.
 That observation includes the same structured snapshot shape as
 `inspect_delegation`, with `outcome` and compact handoff file

@@ -37,6 +37,26 @@
   ciphertext; that is bounded to each session's newest checkpoint and clears on
   its next compaction.
 
+### One Wakeup Per Delegation (Breaking)
+
+- Removed partial (per-child) delegation wakeups outright, with no compatibility
+  flag. A parent is now woken exactly once per delegation, at terminal status; a
+  child reaching terminal mid-fan-out produces no parent-visible event. Deleted
+  the store's partial enqueue/cancel paths, the runner's partial publisher, its
+  post-consumption chaining, its boot republication, and the per-child
+  observation builder. `persist_active_outputs_with_control` no longer does a
+  `get_delegation` round-trip on every parent persist.
+- Behavioural consequence: the parent can no longer be pushed a decision point
+  mid-fan-out. `inspect_delegation` / `steer_subagent` still work, but the parent
+  must already be awake to use them, so mid-flight steering is now
+  human-initiated. Running-delegation handoff artifacts are refreshed only on an
+  explicit inspection, so a completed child's `final_message.md` survives
+  cancellation only if the parent inspected first; cancellation still exports
+  transcript-only artifacts for every child.
+- Requires the one-shot `rust/migrations/single-delegation-wakeup.sql`, run with
+  the daemon stopped, after a `pg_dump`, between stopping the old binary and
+  starting the new one. See `rust/migrations/README.md`.
+
 ## 2026-07-09
 
 ### Pinned Codex Client Version Bump 0.142.3 -> 0.144.0

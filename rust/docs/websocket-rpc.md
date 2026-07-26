@@ -1582,13 +1582,10 @@ accepted for that child: the delegation is running, the child is a delegation
 member, the child has queued/unfinished/runtime work, and it is not
 completion-terminal.
 
-Daemon wakeup observations also carry this same snapshot. A terminal snapshot is
-the normal completion/cancellation handoff. A still-`running` snapshot is a
-partial fan-out decision point: at most one queued/consuming partial wakeup is
-active per delegation attempt, and it appears only after the expected fan-out
-members exist. The parent should steer a running/steerable child, cancel the
-delegation, or wait; final completion cancels stale queued partial wakeups before
-publishing the terminal wakeup.
+Daemon wakeup observations also carry this same snapshot. A parent receives
+exactly one wakeup per delegation, at terminal status; an individual child
+reaching terminal never wakes the parent. Mid-flight steering is parent-initiated
+via `inspect_delegation` / `steer_subagent`.
 
 ```json
 {
