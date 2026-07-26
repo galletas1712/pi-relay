@@ -1711,24 +1711,9 @@ fn render_transcript_messages(
                 }));
             }
             TranscriptItem::DaemonToolObservation(observation) => {
-                let tool_use_id = anthropic_daemon_tool_use_id(observation.tool_call_id.as_str());
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": tool_use_id,
-                        "name": anthropic_wire_tool_name(&observation.tool_name),
-                        "input": observation.args_value().unwrap_or_else(|_| json!({})),
-                    }],
-                }));
                 messages.push(json!({
                     "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": observation.result_text()?,
-                        "is_error": matches!(observation.status, agent_vocab::ToolResultStatus::Error | agent_vocab::ToolResultStatus::Interrupted | agent_vocab::ToolResultStatus::Crashed),
-                    }],
+                    "content": [{ "type": "text", "text": observation.render_text()? }],
                 }));
             }
             TranscriptItem::TurnStarted { .. }
@@ -1803,23 +1788,6 @@ fn anthropic_block_type<'a>(block: &'a Value, context: &str) -> ProviderResult<&
         .and_then(Value::as_str)
         .filter(|block_type| !block_type.is_empty())
         .ok_or_else(|| ProviderError::Provider(format!("{context} missing nonempty string type")))
-}
-
-fn anthropic_daemon_tool_use_id(tool_call_id: &str) -> String {
-    if tool_call_id.starts_with("toolu_") {
-        return tool_call_id.to_string();
-    }
-    let sanitized = tool_call_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    format!("toolu_{sanitized}")
 }
 
 fn anthropic_user_content(message: &UserMessage) -> Value {
@@ -7514,7 +7482,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
     }
 
     #[test]
-    fn daemon_tool_observation_renders_as_anthropic_synthetic_tool_pair() {
+    fn daemon_tool_observation_renders_as_anthropic_user_message() {
         let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
             ToolCallId::new("call_delegation_1_attempt_1"),
             "delegation_1",
@@ -7535,29 +7503,15 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         )
         .expect("messages render");
 
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "assistant");
-        assert_eq!(messages[0]["content"][0]["type"], "tool_use");
-        assert_eq!(
-            messages[0]["content"][0]["id"],
-            "toolu_call_delegation_1_attempt_1"
-        );
-        assert_eq!(messages[0]["content"][0]["name"], "inspect_delegation");
-        assert_eq!(
-            messages[0]["content"][0]["input"]["delegation_id"],
-            "delegation_1"
-        );
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"][0]["type"], "tool_result");
-        assert_eq!(
-            messages[1]["content"][0]["tool_use_id"],
-            "toolu_call_delegation_1_attempt_1"
-        );
-        assert_eq!(messages[1]["content"][0]["is_error"], false);
-        assert!(messages[1]["content"][0]["content"]
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["type"], "text");
+        let text = messages[0]["content"][0]["text"]
             .as_str()
-            .expect("json output")
-            .contains("\"delegation_id\": \"delegation_1\""));
+            .expect("observation text");
+        assert!(text.starts_with("Daemon observation: inspect_delegation"));
+        assert!(text.contains("1 ok, 0 failed"));
+        assert!(text.contains("\"delegation_id\": \"delegation_1\""));
     }
 
     #[test]
@@ -7592,23 +7546,14 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         )
         .expect("messages render");
 
+        assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[0]["content"][0]["type"], "tool_use");
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[1]["content"][0]["type"], "tool_result");
         assert_eq!(messages[1]["content"][0]["tool_use_id"], "toolu_1");
-        assert_eq!(messages[2]["role"], "assistant");
-        assert_eq!(messages[2]["content"][0]["type"], "tool_use");
-        assert_eq!(
-            messages[2]["content"][0]["id"],
-            "toolu_call_delegation_1_attempt_1"
-        );
-        assert_eq!(messages[3]["role"], "user");
-        assert_eq!(messages[3]["content"][0]["type"], "tool_result");
-        assert_eq!(
-            messages[3]["content"][0]["tool_use_id"],
-            "toolu_call_delegation_1_attempt_1"
-        );
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "text");
     }
 
     #[test]

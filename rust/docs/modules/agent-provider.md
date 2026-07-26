@@ -245,20 +245,19 @@ construction rather than being silently dropped.
 Daemon-authored observations, such as delegation completion wakeups carrying an
 `inspect_delegation`-equivalent snapshot, are not provider replay and are not
 stored as fake assistant choices. The durable transcript item is
-`daemon_tool_observation`; provider adapters synthesize a tool call/result pair
-only while building a request:
+`daemon_tool_observation`; provider adapters render it as a single plain
+user-role message while building a request:
 
-- OpenAI Responses receives adjacent `function_call` and
-  `function_call_output` items using the item's stable local `call_id`. The
-  synthetic call omits provider-generated-looking `id` and `status` fields.
-- Anthropic Messages receives an adjacent assistant `tool_use` message and user
-  `tool_result` message. Non-`toolu_...` internal ids are deterministically
-  adapted to Anthropic-style ids.
+- OpenAI Responses receives one `message` item with `role: "user"` and a single
+  `input_text` block.
+- Anthropic Messages receives one `role: "user"` message with a single `text`
+  block.
 
-Request-shape tests pin the adjacency rules and ensure ordinary assistant tool
-pairs are not split. The model sees an `inspect_delegation` result in the same
-shape as a real tool result, while the transcript/UI semantics remain explicit:
-the daemon authored the observation.
+The message text comes from `DaemonToolObservation::render_text`, which names
+the daemon as the author, so no tool call is manufactured on the wire.
+
+Request-shape tests pin this rendering and ensure ordinary assistant tool pairs
+are not split by an interleaved observation.
 
 ### Provider-native compaction
 

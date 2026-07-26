@@ -1879,7 +1879,7 @@ the parent after the delegation barrier completes. The observation is stored as 
 typed `daemon_tool_observation` transcript item and is inspect-equivalent to
 `inspect_delegation`/`delegation.status`, including per-subagent
 `outcome` and artifact paths. Provider adapters
-render it as an adjacent synthetic `inspect_delegation` tool call/result pair;
+render it as one plain user-role message carrying the observation text;
 the UI renders it as a daemon/system observation card. Use
 `inspect_delegation`/`delegation.status` to refresh/recover state or inspect
 later/running; use the per-subagent `task_prompt.md`, `final_message.md`, and
