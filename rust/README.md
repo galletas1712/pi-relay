@@ -55,17 +55,24 @@ The `--nocapture` flag is intentional: it makes each missing-database
 `SKIPPED PostgreSQL test` report visible if an ignored test is selected
 directly. Use `--include-ignored` only with a configured PostgreSQL URL.
 
-For the complete test suite, start a PostgreSQL 16 instance with a role that
-can create and drop databases, then run:
+For the complete test suite, point `PI_RELAY_TEST_DATABASE_URL` at a
+**throwaway** PostgreSQL 16 instance with a role that can create and drop
+databases. The tests create uniquely named databases and remove them
+afterwards, but they still need administrative rights on whatever server they
+are given, so do not reuse the instance backing a running deployment and never
+point the variable at a production database. Pick a port that no deployment is
+using:
 
 ```sh
-docker compose -f infra/docker-compose.yml up -d postgres
-PI_RELAY_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres \
-  cargo test --manifest-path rust/Cargo.toml --workspace -- --include-ignored --nocapture
-```
+docker run -d --name pi-relay-test-pg \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=postgres \
+  -p 127.0.0.1:55444:5432 postgres:16-alpine
 
-The tests create uniquely named databases and remove them afterward. Do not
-point `PI_RELAY_TEST_DATABASE_URL` at a production database.
+PI_RELAY_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55444/postgres \
+  cargo test --manifest-path rust/Cargo.toml --workspace -- --include-ignored --nocapture
+
+docker rm -f pi-relay-test-pg
+```
 
 The workspace fork/snapshot tests need a real btrfs filesystem. Point
 `PI_RELAY_TEST_BTRFS_ROOT` at a writable directory on one:
