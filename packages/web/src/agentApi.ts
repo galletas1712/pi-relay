@@ -254,8 +254,6 @@ export interface FollowUpResult {
 	/** True when the store matched an existing client_input_id instead of inserting. */
 	replayed: boolean;
 	queue?: QueueProjection | null;
-	active_branch?: SwitchHistoryResult | null;
-	active_branch_sync?: ActiveBranchSyncResponse | null;
 }
 
 export interface InterruptResult {

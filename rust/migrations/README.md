@@ -46,7 +46,9 @@ These files are deployment artifacts, not automatic startup migrations.
    concurrent-capable tool schemas. It does not regenerate whole prompts:
    older surrounding prose stays as rendered. Subagent prompts are left alone,
    because subagents have no delegation tools. It raises if any top-level
-   prompt still carries the old text. A rerun matches no rows.
+   prompt still carries the old text. A rerun matches no rows. Rewritten
+   sessions get a fresh `updated_at`, so the first connect after this step
+   re-warms every one of them in the background.
 
 8. Deploy matched control/runtime binaries and republish the host-owned
    workflow packages described in `rust/docs/workflow-package-update.md`.
@@ -62,9 +64,14 @@ runtime workspace root, or point tests at production.
 ## Known limitations
 
 The startup index check in `agent-store/src/postgres/schema.rs::migrate`
-verifies index **validity** (`indisvalid`/`indisready`), not **definition**. A
-valid-but-wrong index with a required name passes startup; only the one-time
-`drop index if exists` + `create` in `concurrent-delegations.sql` repairs it.
+verifies index **validity** (`indisvalid`/`indisready`), not **definition**, and
+covers only the three uniqueness-critical indexes
+(`delegations_parent_launch_key_uq`, `sessions_delegation_spawn_index_uq`,
+`delegations_parent_running_full_uq`). `concurrent-delegations.sql` rebuilds and
+validates all five it touches, adding `delegations_parent_running_idx` and
+`delegations_running_created_idx`. A valid-but-wrong index with a required name
+passes startup; only the one-time `drop index if exists` + `create` in
+`concurrent-delegations.sql` repairs it.
 
 The eight-slot read-only cap is enforced by the parent-session row lock plus the
 Rust admission check. Unlike full-writer exclusivity, it has no unique-index
