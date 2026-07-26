@@ -450,6 +450,10 @@ impl Runtime {
                 target_workspace_id,
                 workspaces,
             } => {
+                let _guard = self
+                    .workspaces
+                    .acquire_cwd_mutation_guard(&source_workspace_id)
+                    .await;
                 let (_, workspaces) = self
                     .workspaces
                     .fork_session_from_parent(
@@ -499,6 +503,10 @@ impl Runtime {
                 rel_path,
                 contents,
             } => {
+                let _guard = self
+                    .workspaces
+                    .acquire_cwd_mutation_guard(&workspace_id)
+                    .await;
                 self.workspaces
                     .write_workspace_file(&workspace_id, &rel_path, &contents)
                     .await?;

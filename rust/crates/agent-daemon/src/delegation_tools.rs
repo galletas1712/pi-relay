@@ -1,11 +1,11 @@
 use agent_core::AgentInput;
 use agent_store::{
-    Delegation, DelegationKind, DelegationProgress, DelegationStatus, DelegationSubagent,
-    DelegationSubagentOverview, QueuedInputStatus, SubagentControlPhase, SubagentControlRecord,
-    SubagentType,
+    CreateDelegationRequest, Delegation, DelegationKind, DelegationProgress, DelegationStatus,
+    DelegationSubagent, DelegationSubagentOverview, QueuedInputStatus, SubagentControlPhase,
+    SubagentControlRecord, SubagentType,
 };
 use agent_vocab::{ToolCall, ToolResultMessage, UserMessage};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::codec::from_params;
@@ -14,7 +14,7 @@ use crate::handoff::{
     delegation_dir, refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
     render_transcript_markdown, safe_handoff_path_segment, task_prompt_rel, TASK_PROMPT_FILE,
 };
-use crate::runtime::{abort_session_tasks, publish_events, SessionDriver};
+use crate::runtime::{abort_and_join_session_tasks, publish_events, SessionDriver};
 use crate::state::AppState;
 use crate::subagents::{spawn_subagent, DelegationSubagentSpawn};
 use crate::types::RpcError;
@@ -28,20 +28,185 @@ struct StartFullParams {
     /// every other unknown key instead of silently accepting stale vocabulary.
     #[serde(rename = "parent_session_id")]
     _parent_session_id: Option<String>,
+    #[serde(rename = "client_launch_id")]
+    _client_launch_id: Option<String>,
     role: String,
     prompt: String,
     workflow: Option<String>,
     label: Option<String>,
 }
 
+pub(crate) async fn materialize_delegation_launch(
+    state: &AppState,
+    delegation: &Delegation,
+) -> std::result::Result<Vec<String>, RpcError> {
+    let guard = state.repo.claim_delegation_launch(&delegation.id).await?;
+    let current = state
+        .repo
+        .get_delegation(&delegation.id)
+        .await?
+        .ok_or_else(|| RpcError::new("delegation_not_found", "delegation not found"))?;
+    let spec: DurableLaunchSpec = match serde_json::from_str(&current.launch_shape) {
+        Ok(spec) => spec,
+        Err(error) => {
+            let error = RpcError::new(
+                "invalid_delegation_launch",
+                format!("durable delegation launch is invalid: {error}"),
+            );
+            fail_delegation_launch(state, &current, &error).await?;
+            return Err(error);
+        }
+    };
+    let children = match spec {
+        DurableLaunchSpec::Full { role, prompt, .. } => {
+            vec![(role, prompt, SubagentType::Full)]
+        }
+        DurableLaunchSpec::ReadonlyFanout { tasks, .. } => tasks
+            .into_iter()
+            .map(|task| (task.role, task.prompt, SubagentType::ReadOnly))
+            .collect(),
+    };
+    if children.len() != current.expected_subagents as usize {
+        let error = RpcError::new(
+            "invalid_delegation_launch",
+            "durable delegation child count does not match expected_subagents",
+        );
+        fail_delegation_launch(state, &current, &error).await?;
+        return Err(error);
+    }
+    let existing = state.repo.delegation_spawned_indices(&current.id).await?;
+    if current.status != DelegationStatus::Running && existing.len() < children.len() {
+        if let Some((code, message)) = state.repo.delegation_launch_error(&current.id).await? {
+            return Err(RpcError::new(code, message));
+        }
+        return Err(RpcError::new(
+            "delegation_not_running",
+            "the prior launch is not running and cannot spawn missing children",
+        ));
+    }
+    let mut session_ids = Vec::with_capacity(children.len());
+    for (index, (role, prompt, subagent_type)) in children.into_iter().enumerate() {
+        let index = index as i32;
+        if let Some(session_id) = existing.get(&index) {
+            session_ids.push(session_id.clone());
+            continue;
+        }
+        match spawn_subagent(
+            state,
+            DelegationSubagentSpawn {
+                parent_session_id: current.parent_session_id.clone(),
+                role,
+                task: prompt,
+                subagent_type,
+                delegation_id: current.id.clone(),
+                spawn_index: index,
+            },
+        )
+        .await
+        {
+            Ok(spawned) => session_ids.push(spawned.started.session_id),
+            Err(error) => {
+                let reloaded = state.repo.delegation_spawned_indices(&current.id).await?;
+                if let Some(session_id) = reloaded.get(&index) {
+                    session_ids.push(session_id.clone());
+                    continue;
+                }
+                fail_delegation_launch(state, &current, &error).await?;
+                return Err(error);
+            }
+        }
+    }
+    guard.release().await?;
+    Ok(session_ids)
+}
+
+async fn fail_delegation_launch(
+    state: &AppState,
+    delegation: &Delegation,
+    error: &RpcError,
+) -> std::result::Result<(), RpcError> {
+    let (won, events) = state
+        .repo
+        .begin_delegation_teardown(
+            &delegation.parent_session_id,
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Failed,
+            "delegation_spawn_failed",
+        )
+        .await?;
+    if !won {
+        return Ok(());
+    }
+    publish_events(state, events);
+    state
+        .repo
+        .record_delegation_launch_error(
+            &delegation.id,
+            &delegation.attempt_id,
+            &error.code,
+            &error.message,
+        )
+        .await?;
+    cancel_delegation_subagents_without_reactivation(state, &delegation.id).await?;
+    state
+        .repo
+        .finish_delegation_teardown(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Failed,
+        )
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind")]
+enum DurableLaunchSpec {
+    #[serde(rename = "full")]
+    Full {
+        role: String,
+        prompt: String,
+        workflow: Option<String>,
+        label: Option<String>,
+    },
+    #[serde(rename = "readonly_fanout")]
+    ReadonlyFanout {
+        tasks: Vec<FanoutTask>,
+        workflow: Option<String>,
+        label: Option<String>,
+    },
+}
+
 fn map_delegation_create_error(error: anyhow::Error) -> RpcError {
     if error
-        .downcast_ref::<agent_store::RunningDelegationConflict>()
+        .downcast_ref::<agent_store::FullDelegationConflict>()
         .is_some()
     {
         return RpcError::new(
-            "delegation_already_running",
-            "a delegation is already running for this session; wait for it to finish before starting another",
+            "full_delegation_already_running",
+            "a full delegation is already running for this session",
+        );
+    }
+    if error
+        .downcast_ref::<agent_store::ReadonlyCapacityExceeded>()
+        .is_some()
+    {
+        return RpcError::new(
+            "readonly_delegation_capacity_exceeded",
+            format!(
+                "read-only fan-outs may reserve at most {} slots per parent until delegation terminality",
+                agent_store::MAX_RESERVED_READONLY_SLOTS
+            ),
+        );
+    }
+    if error
+        .downcast_ref::<agent_store::DelegationLaunchKeyConflict>()
+        .is_some()
+    {
+        return RpcError::new(
+            "delegation_launch_id_conflict",
+            "client_launch_id was already used for a different delegation launch",
         );
     }
     error.into()
@@ -593,7 +758,7 @@ async fn subagent_has_active_runtime(state: &AppState, subagent_id: &str) -> boo
     runtime.session.is_ready_to_continue()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FanoutTask {
     role: String,
@@ -607,6 +772,8 @@ struct StartFanoutParams {
     /// model-facing `delegate_readonly_tasks` tool.
     #[serde(rename = "parent_session_id")]
     _parent_session_id: Option<String>,
+    #[serde(rename = "client_launch_id")]
+    _client_launch_id: Option<String>,
     tasks: Vec<FanoutTask>,
     workflow: Option<String>,
     label: Option<String>,
@@ -674,44 +841,43 @@ async fn reject_if_subagent(
     Ok(())
 }
 
-/// Spawn-failure compensation: move a half-created delegation to a terminal
-/// status and interrupt any subagents already spawned for it so the parent is
-/// not stranded behind the one-delegation-per-parent guard. This is deliberately
-/// unconditional because spawn failure owns the just-created delegation row.
-/// User-visible cancellation does NOT use this helper; it uses
-/// `cancel_running_delegation` so it cannot clobber a concurrent normal
-/// completion.
-async fn terminate_delegation(state: &AppState, delegation_id: &str, status: DelegationStatus) {
-    if let Err(error) = state
+async fn teardown_delegation(
+    state: &AppState,
+    delegation: &Delegation,
+    target: DelegationStatus,
+    reason: &str,
+) -> std::result::Result<bool, RpcError> {
+    let (won, events) = state
         .repo
-        .set_delegation_status(delegation_id, status)
-        .await
-    {
-        eprintln!("failed to set delegation {delegation_id} to a terminal status: {error:#}");
+        .begin_delegation_teardown(
+            &delegation.parent_session_id,
+            &delegation.id,
+            &delegation.attempt_id,
+            target,
+            reason,
+        )
+        .await?;
+    if !won && delegation.status != DelegationStatus::Cancelling {
+        return Ok(false);
     }
-    match state.repo.list_delegation_subagents(delegation_id).await {
-        Ok(subagents) => {
-            for subagent in &subagents {
-                if let Err(error) = cancel_subagent_without_reactivation(
-                    state,
-                    &subagent.session_id,
-                    subagent.subagent_type,
-                )
-                .await
-                {
-                    eprintln!(
-                        "failed to cancel subagent {} while terminating delegation {}: {}: {}",
-                        subagent.session_id, delegation_id, error.code, error.message
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            eprintln!(
-                "failed to list subagents while terminating delegation {delegation_id}: {error:#}"
+    publish_events(state, events);
+    cancel_delegation_subagents_without_reactivation(state, &delegation.id).await?;
+    state
+        .repo
+        .finish_delegation_teardown(&delegation.id, &delegation.attempt_id, target)
+        .await?
+        .then_some(())
+        .ok_or_else(|| {
+            RpcError::new(
+                "delegation_teardown_incomplete",
+                format!(
+                    "delegation {} did not reach teardown target {}",
+                    delegation.id,
+                    target.as_str()
+                ),
             )
-        }
-    }
+        })?;
+    Ok(true)
 }
 
 fn progress_from_subagent_overview(
@@ -729,7 +895,9 @@ fn progress_from_subagent_overview(
         .count() as i32;
     let missing = delegation.expected_subagents.saturating_sub(spawned).max(0);
     let running = match delegation.status {
-        DelegationStatus::Running => spawned.saturating_sub(terminal) + missing,
+        DelegationStatus::Running | DelegationStatus::Cancelling => {
+            spawned.saturating_sub(terminal) + missing
+        }
         _ => 0,
     };
     DelegationProgress {
@@ -746,7 +914,7 @@ async fn cancel_subagent_without_reactivation(
     session_id: &str,
     subagent_type: Option<SubagentType>,
 ) -> std::result::Result<(), RpcError> {
-    abort_session_tasks(state, session_id);
+    abort_and_join_session_tasks(state, session_id).await;
     let driver = SessionDriver::acquire(state, session_id).await;
     if let Some(active) = driver.active_session().await {
         // Persist an interrupted turn boundary if the subagent has live runtime
@@ -780,9 +948,20 @@ async fn cancel_subagent_without_reactivation(
 /// Start the single full (writing) subagent of a delegation. Homogeneity and the
 /// single-full invariant are structural: the schema accepts exactly one scalar
 /// role/prompt, so no caller can mix kinds or request a second writer.
+#[cfg(test)]
 pub(crate) async fn start_full_core(
     state: &AppState,
     parent_session_id: &str,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let launch_key = format!("internal:{}", uuid::Uuid::new_v4());
+    start_full_core_with_launch_key(state, parent_session_id, &launch_key, params).await
+}
+
+async fn start_full_core_with_launch_key(
+    state: &AppState,
+    parent_session_id: &str,
+    launch_key: &str,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let params: StartFullParams = from_params(params)?;
@@ -791,57 +970,64 @@ pub(crate) async fn start_full_core(
 
     reject_if_subagent(state, parent_session_id).await?;
 
+    let launch_shape = serde_json::to_string(&DurableLaunchSpec::Full {
+        role,
+        prompt,
+        workflow: params.workflow.clone(),
+        label: params.label.clone(),
+    })
+    .expect("delegation launch shape serializes");
     let delegation = state
         .repo
-        .create_delegation(
+        .create_delegation_idempotent(CreateDelegationRequest {
             parent_session_id,
-            DelegationKind::Full,
-            params.workflow.as_deref(),
-            params.label.as_deref(),
-            1,
-        )
+            launch_key,
+            launch_shape: &launch_shape,
+            kind: DelegationKind::Full,
+            workflow: params.workflow.as_deref(),
+            label: params.label.as_deref(),
+            expected_subagents: 1,
+        })
         .await
         .map_err(map_delegation_create_error)?;
-
-    let spawned = match spawn_subagent(
-        state,
-        DelegationSubagentSpawn {
-            parent_session_id: parent_session_id.to_string(),
-            role,
-            task: prompt,
-            subagent_type: SubagentType::Full,
-            delegation_id: delegation.id.clone(),
-        },
-    )
-    .await
-    {
-        Ok(spawned) => spawned,
-        Err(error) => {
-            // The delegation row already exists; fail it so the
-            // one-delegation-per-parent guard releases rather than blocking the
-            // parent forever.
-            terminate_delegation(state, &delegation.id, DelegationStatus::Failed).await;
-            return Err(error);
-        }
-    };
-
+    let session_ids = materialize_delegation_launch(state, &delegation).await?;
     Ok(json!({
         "delegation_id": delegation.id,
-        "subagent_session_id": spawned.started.session_id,
+        "subagent_session_id": session_ids[0],
     }))
 }
 
 /// Start N read-only subagents in parallel, one per task, each in its own
 /// disposable snapshot. Homogeneity is structural: every task is forced to
 /// `read_only`, so a fan-out can never contain a writer.
+#[cfg(test)]
 pub(crate) async fn start_readonly_fanout_core(
     state: &AppState,
     parent_session_id: &str,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
+    let launch_key = format!("internal:{}", uuid::Uuid::new_v4());
+    start_readonly_fanout_core_with_launch_key(state, parent_session_id, &launch_key, params).await
+}
+
+async fn start_readonly_fanout_core_with_launch_key(
+    state: &AppState,
+    parent_session_id: &str,
+    launch_key: &str,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
     let params: StartFanoutParams = from_params(params)?;
     if params.tasks.is_empty() {
         return Err(RpcError::new("invalid_params", "tasks cannot be empty"));
+    }
+    if params.tasks.len() > agent_store::MAX_RESERVED_READONLY_SLOTS as usize {
+        return Err(RpcError::new(
+            "readonly_delegation_capacity_exceeded",
+            format!(
+                "a read-only fan-out may contain at most {} tasks",
+                agent_store::MAX_RESERVED_READONLY_SLOTS
+            ),
+        ));
     }
     let mut tasks = Vec::with_capacity(params.tasks.len());
     for task in &params.tasks {
@@ -854,43 +1040,34 @@ pub(crate) async fn start_readonly_fanout_core(
     reject_if_subagent(state, parent_session_id).await?;
 
     let expected_subagents = tasks.len();
+    let expected_subagents = i32::try_from(expected_subagents)
+        .map_err(|_| RpcError::new("invalid_params", "too many read-only tasks"))?;
+    let launch_shape = serde_json::to_string(&DurableLaunchSpec::ReadonlyFanout {
+        tasks: tasks
+            .iter()
+            .map(|(role, prompt)| FanoutTask {
+                role: role.clone(),
+                prompt: prompt.clone(),
+            })
+            .collect(),
+        workflow: params.workflow.clone(),
+        label: params.label.clone(),
+    })
+    .expect("delegation launch shape serializes");
     let delegation = state
         .repo
-        .create_delegation(
+        .create_delegation_idempotent(CreateDelegationRequest {
             parent_session_id,
-            DelegationKind::ReadonlyFanout,
-            params.workflow.as_deref(),
-            params.label.as_deref(),
-            expected_subagents as i32,
-        )
+            launch_key,
+            launch_shape: &launch_shape,
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: params.workflow.as_deref(),
+            label: params.label.as_deref(),
+            expected_subagents,
+        })
         .await
         .map_err(map_delegation_create_error)?;
-
-    let mut subagent_session_ids = Vec::with_capacity(expected_subagents);
-    for (role, prompt) in tasks {
-        match spawn_subagent(
-            state,
-            DelegationSubagentSpawn {
-                parent_session_id: parent_session_id.to_string(),
-                role,
-                task: prompt,
-                subagent_type: SubagentType::ReadOnly,
-                delegation_id: delegation.id.clone(),
-            },
-        )
-        .await
-        {
-            Ok(spawned) => subagent_session_ids.push(spawned.started.session_id),
-            Err(error) => {
-                // Tear down the subagents already spawned for this delegation
-                // and fail it, so a partial fan-out never leaves running
-                // children or blocks the parent behind the
-                // one-delegation-per-parent guard.
-                terminate_delegation(state, &delegation.id, DelegationStatus::Failed).await;
-                return Err(error);
-            }
-        }
-    }
+    let subagent_session_ids = materialize_delegation_launch(state, &delegation).await?;
 
     Ok(json!({
         "delegation_id": delegation.id,
@@ -949,20 +1126,21 @@ pub(crate) async fn cancel_core(
     if delegation.status != DelegationStatus::Running {
         return Ok(json!({ "cancelled": false }));
     }
-    let (won_cancel, events) = state
-        .repo
-        .cancel_running_delegation_and_queued_partials(
-            &delegation.parent_session_id,
-            &delegation.id,
-            &delegation.attempt_id,
-            "delegation_cancelled",
-        )
-        .await?;
-    if !won_cancel {
+    // Wait for the sole launch materializer before taking the teardown claim.
+    // This prevents cancellation from missing a child between workspace setup
+    // and durable session insertion.
+    let launch_guard = state.repo.claim_delegation_launch(&delegation.id).await?;
+    if !teardown_delegation(
+        state,
+        &delegation,
+        DelegationStatus::Cancelled,
+        "delegation_cancelled",
+    )
+    .await?
+    {
         return Ok(json!({ "cancelled": false }));
     }
-    publish_events(state, events);
-    cancel_delegation_subagents_without_reactivation(state, &delegation.id).await;
+    launch_guard.release().await?;
     let (handoff_dir, subagents) = write_cancelled_subagent_transcripts(state, &delegation).await?;
     Ok(json!({
         "cancelled": true,
@@ -972,30 +1150,35 @@ pub(crate) async fn cancel_core(
     }))
 }
 
-async fn cancel_delegation_subagents_without_reactivation(state: &AppState, delegation_id: &str) {
-    match state.repo.list_delegation_subagents(delegation_id).await {
-        Ok(subagents) => {
-            for subagent in &subagents {
-                if let Err(error) = cancel_subagent_without_reactivation(
-                    state,
-                    &subagent.session_id,
-                    subagent.subagent_type,
-                )
-                .await
-                {
-                    eprintln!(
-                        "failed to cancel subagent {} while cancelling delegation {}: {}: {}",
-                        subagent.session_id, delegation_id, error.code, error.message
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            eprintln!(
-                "failed to list subagents while cancelling delegation {delegation_id}: {error:#}"
-            )
-        }
+async fn cancel_delegation_subagents_without_reactivation(
+    state: &AppState,
+    delegation_id: &str,
+) -> std::result::Result<(), RpcError> {
+    let subagents = state.repo.list_delegation_subagents(delegation_id).await?;
+    for subagent in &subagents {
+        cancel_subagent_without_reactivation(state, &subagent.session_id, subagent.subagent_type)
+            .await?;
     }
+    Ok(())
+}
+
+pub(crate) async fn reconcile_cancelling_delegations_on_boot(
+    state: &AppState,
+) -> std::result::Result<(), RpcError> {
+    let delegations = state.repo.list_cancelling_delegations().await?;
+    for delegation in delegations {
+        let Some(target) = delegation.teardown_target else {
+            return Err(RpcError::new(
+                "delegation_teardown_incomplete",
+                format!(
+                    "cancelling delegation {} has no teardown target",
+                    delegation.id
+                ),
+            ));
+        };
+        teardown_delegation(state, &delegation, target, "boot_teardown_recovery").await?;
+    }
+    Ok(())
 }
 
 async fn write_cancelled_subagent_transcripts(
@@ -1105,6 +1288,7 @@ fn read_allowed_for_status(
     request: HandoffFileRequest<'_>,
 ) -> std::result::Result<Option<bool>, RpcError> {
     match status {
+        DelegationStatus::Cancelling => Ok(Some(false)),
         DelegationStatus::Running => match request {
             HandoffFileRequest::Normal {
                 file: TASK_PROMPT_FILE,
@@ -1170,6 +1354,10 @@ async fn read_allowed_for_request(
 
 fn unavailable_handoff_file_error(status: DelegationStatus) -> RpcError {
     match status {
+        DelegationStatus::Cancelling => RpcError::new(
+            "handoff_file_not_found",
+            "handoff files are unavailable while delegation teardown is in progress",
+        ),
         DelegationStatus::Running => RpcError::new(
             "handoff_file_not_found",
             "handoff file not found; the delegation may not have finished yet",
@@ -1325,7 +1513,9 @@ pub(crate) async fn read_handoff_file_core(
                 // final_message.md files. Do not refresh or expose normal
                 // transcript.md files here: running snapshots may have written
                 // stale normal transcripts before cancellation won.
-                DelegationStatus::Cancelled | DelegationStatus::Failed => {}
+                DelegationStatus::Cancelling
+                | DelegationStatus::Cancelled
+                | DelegationStatus::Failed => {}
             }
         }
     } else {
@@ -1385,7 +1575,14 @@ pub(crate) async fn rpc_start_full(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let parent_session_id = parent_session_id_from_params(&params)?;
-    start_full_core(state, &parent_session_id, params).await
+    let client_launch_id = required_client_launch_id(&params)?;
+    start_full_core_with_launch_key(
+        state,
+        &parent_session_id,
+        &format!("rpc:{client_launch_id}"),
+        params,
+    )
+    .await
 }
 
 pub(crate) async fn rpc_start_readonly_fanout(
@@ -1393,7 +1590,24 @@ pub(crate) async fn rpc_start_readonly_fanout(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let parent_session_id = parent_session_id_from_params(&params)?;
-    start_readonly_fanout_core(state, &parent_session_id, params).await
+    let client_launch_id = required_client_launch_id(&params)?;
+    start_readonly_fanout_core_with_launch_key(
+        state,
+        &parent_session_id,
+        &format!("rpc:{client_launch_id}"),
+        params,
+    )
+    .await
+}
+
+fn required_client_launch_id(params: &Value) -> std::result::Result<String, RpcError> {
+    trim_required(
+        params
+            .get("client_launch_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "client_launch_id",
+    )
 }
 
 pub(crate) async fn rpc_status(
@@ -1446,6 +1660,7 @@ fn list_subagent_status(
     subagent: &DelegationSubagentOverview,
 ) -> String {
     match delegation_status {
+        DelegationStatus::Cancelling => "cancelling".to_string(),
         DelegationStatus::Running => {
             if let Some(terminal_status) = &subagent.terminal_status {
                 terminal_status.clone()
@@ -1465,8 +1680,7 @@ fn list_subagent_status(
     }
 }
 
-/// Per-parent delegation list for the product Agents outline: a bounded
-/// newest-first page with compact subagent rows. (The model tool surface has no list.)
+/// Per-parent delegation list: every active row plus bounded terminal history.
 pub(crate) async fn rpc_list(
     state: &AppState,
     params: Value,
@@ -1488,10 +1702,31 @@ pub(crate) async fn rpc_list(
     }
     let mut delegations = state
         .repo
-        .list_parent_delegations_newest(parent_session_id, limit.saturating_add(1))
+        .list_parent_delegations_active_complete(parent_session_id, limit.saturating_add(1))
         .await?;
-    let has_more = delegations.len() > limit as usize;
-    delegations.truncate(limit as usize);
+    let terminal_count = delegations
+        .iter()
+        .filter(|delegation| {
+            !matches!(
+                delegation.status,
+                DelegationStatus::Running | DelegationStatus::Cancelling
+            )
+        })
+        .count();
+    let has_more = terminal_count > limit as usize;
+    if has_more {
+        let mut retained_terminal = 0usize;
+        delegations.retain(|delegation| {
+            if matches!(
+                delegation.status,
+                DelegationStatus::Running | DelegationStatus::Cancelling
+            ) {
+                return true;
+            }
+            retained_terminal += 1;
+            retained_terminal <= limit as usize
+        });
+    }
     let mut views = Vec::with_capacity(delegations.len());
     for delegation in &delegations {
         let subagent_rows = state
@@ -1559,9 +1794,25 @@ pub(crate) fn is_delegation_tool_name(name: &str) -> bool {
 
 /// Model-facing dispatch: run the core fn for the named delegation tool and
 /// wrap the result as a tool result message. The session id is the parent's.
+#[cfg(test)]
 pub(crate) async fn run_delegation_tool(
     state: &AppState,
     parent_session_id: &str,
+    call: &ToolCall,
+) -> ToolResultMessage {
+    run_delegation_tool_with_launch_key(
+        state,
+        parent_session_id,
+        &format!("action:{}", call.id.0),
+        call,
+    )
+    .await
+}
+
+pub(crate) async fn run_delegation_tool_with_launch_key(
+    state: &AppState,
+    parent_session_id: &str,
+    launch_key: &str,
     call: &ToolCall,
 ) -> ToolResultMessage {
     if let Err(error) = reject_if_subagent(state, parent_session_id).await {
@@ -1600,9 +1851,12 @@ pub(crate) async fn run_delegation_tool(
         );
     }
     let result = match call.tool_name.as_str() {
-        "delegate_writing_task" => start_full_core(state, parent_session_id, params).await,
+        "delegate_writing_task" => {
+            start_full_core_with_launch_key(state, parent_session_id, launch_key, params).await
+        }
         "delegate_readonly_tasks" => {
-            start_readonly_fanout_core(state, parent_session_id, params).await
+            start_readonly_fanout_core_with_launch_key(state, parent_session_id, launch_key, params)
+                .await
         }
         "inspect_delegation" => status_core(state, parent_session_id, params).await,
         "cancel_delegation" => cancel_core(state, parent_session_id, params).await,
@@ -1630,6 +1884,48 @@ pub(crate) async fn run_delegation_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_launch_spec_round_trips_canonical_child_order() {
+        let spec = DurableLaunchSpec::ReadonlyFanout {
+            tasks: vec![
+                FanoutTask {
+                    role: "reviewer".to_string(),
+                    prompt: "first".to_string(),
+                },
+                FanoutTask {
+                    role: "tester".to_string(),
+                    prompt: "second".to_string(),
+                },
+            ],
+            workflow: Some("workflow".to_string()),
+            label: None,
+        };
+        let encoded = serde_json::to_string(&spec).expect("serialize");
+        let decoded: DurableLaunchSpec = serde_json::from_str(&encoded).expect("deserialize");
+        let DurableLaunchSpec::ReadonlyFanout { tasks, .. } = decoded else {
+            panic!("fanout spec")
+        };
+        assert_eq!(tasks[0].prompt, "first");
+        assert_eq!(tasks[1].prompt, "second");
+    }
+
+    #[test]
+    fn rpc_launch_id_is_required_and_nonblank() {
+        for params in [
+            json!({}),
+            json!({"client_launch_id": ""}),
+            json!({"client_launch_id": "  "}),
+        ] {
+            let error = required_client_launch_id(&params).expect_err("invalid launch id");
+            assert_eq!(error.code, "invalid_params");
+        }
+        assert_eq!(
+            required_client_launch_id(&json!({"client_launch_id": " launch-1 "}))
+                .expect("launch id"),
+            "launch-1"
+        );
+    }
 
     #[test]
     fn delegation_tool_interception_accepts_only_canonical_names() {

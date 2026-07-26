@@ -105,7 +105,7 @@ pub(super) async fn ensure_no_running_delegation_tx(
         select exists(
             select 1
             from delegations
-            where parent_session_id=$1 and status='running'
+            where parent_session_id=$1 and status in ('running','cancelling')
         )
         "#,
     )
@@ -113,7 +113,7 @@ pub(super) async fn ensure_no_running_delegation_tx(
     .fetch_one(&mut **tx)
     .await?;
     if running {
-        return Err(crate::RunningDelegationConflict.into());
+        return Err(crate::SourceMutationConflict.into());
     }
     Ok(())
 }

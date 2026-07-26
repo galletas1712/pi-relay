@@ -52,6 +52,99 @@ tokio::task_local! {
     static IN_FLIGHT_BARRIERS: RefCell<HashSet<String>>;
 }
 
+/// Recover durable delegation launch work immediately after the global
+/// abandoned-action stale mark. A process can die after a child session and
+/// initial action commit but before registering its runner; every persisted
+/// child index is reconstructed and driven even when the delegation already has
+/// its expected child count.
+pub(crate) async fn recover_active_delegations_after_stale_mark(state: &AppState) {
+    reconcile_partial_launches_on_boot(state).await;
+
+    let running = match state.repo.list_running_delegations().await {
+        Ok(running) => running,
+        Err(error) => {
+            eprintln!("boot child recovery could not list running delegations: {error:#}");
+            return;
+        }
+    };
+    for delegation in running {
+        let children = match state.repo.delegation_spawned_indices(&delegation.id).await {
+            Ok(children) => children,
+            Err(error) => {
+                eprintln!(
+                    "boot child recovery could not inspect delegation {}: {error:#}",
+                    delegation.id
+                );
+                continue;
+            }
+        };
+        for index in 0..delegation.expected_subagents {
+            let Some(session_id) = children.get(&index) else {
+                eprintln!(
+                    "boot child recovery found missing index {index} after materialization delegation={}",
+                    delegation.id
+                );
+                continue;
+            };
+            let driver = SessionDriver::acquire(state, session_id).await;
+            let recovered = async {
+                if state
+                    .repo
+                    .pending_actions_for_dispatch(session_id)
+                    .await?
+                    .is_empty()
+                {
+                    driver.recover_if_needed().await?;
+                } else {
+                    driver.ensure_active_loaded_preserving_open_turn().await?;
+                }
+                driver.dispatch_ready_actions().await?;
+                Ok::<(), RpcError>(())
+            }
+            .await;
+            if let Err(error) = recovered {
+                eprintln!(
+                    "boot child recovery failed delegation={} session={session_id}: {}: {}",
+                    delegation.id, error.code, error.message
+                );
+            }
+        }
+    }
+}
+
+async fn reconcile_partial_launches_on_boot(state: &AppState) {
+    let running = match state.repo.list_running_delegations().await {
+        Ok(running) => running,
+        Err(error) => {
+            eprintln!("boot launch sweep could not list running delegations: {error:#}");
+            return;
+        }
+    };
+    for delegation in running {
+        let spawned = match state.repo.list_delegation_subagents(&delegation.id).await {
+            Ok(spawned) => spawned.len(),
+            Err(error) => {
+                eprintln!(
+                    "boot launch sweep could not inspect delegation {}: {error:#}",
+                    delegation.id
+                );
+                continue;
+            }
+        };
+        if spawned >= delegation.expected_subagents as usize {
+            continue;
+        }
+        if let Err(error) =
+            crate::delegation_tools::materialize_delegation_launch(state, &delegation).await
+        {
+            eprintln!(
+                "boot launch recovery failed delegation={}: {}: {}",
+                delegation.id, error.code, error.message
+            );
+        }
+    }
+}
+
 /// Barrier entry point. Establishes the per-task re-entrancy set on the
 /// outermost call, then runs the guarded barrier; nested calls (a sibling tail
 /// recovery re-firing this delegation's barrier) reuse the existing set.

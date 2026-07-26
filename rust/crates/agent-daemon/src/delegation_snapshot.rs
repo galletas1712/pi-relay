@@ -38,7 +38,9 @@ async fn inspectable_handoff_artifacts(
         // point the cancellation CAS wins. Failed delegations represent startup
         // failures, not a normal barrier result. In both cases inspection must
         // not materialize normal per-subagent handoff files.
-        DelegationStatus::Cancelled | DelegationStatus::Failed => Ok((dir, Vec::new())),
+        DelegationStatus::Cancelling | DelegationStatus::Cancelled | DelegationStatus::Failed => {
+            Ok((dir, Vec::new()))
+        }
     }
 }
 
@@ -186,9 +188,9 @@ pub(crate) async fn build_delegation_snapshot(
                     .map(str::to_string)
                     .unwrap_or_else(|| delegation.status.as_str().to_string())
             }
-            DelegationStatus::Cancelled | DelegationStatus::Failed => {
-                delegation.status.as_str().to_string()
-            }
+            DelegationStatus::Cancelling
+            | DelegationStatus::Cancelled
+            | DelegationStatus::Failed => delegation.status.as_str().to_string(),
         };
         let has_active_work = running_work_state
             .as_ref()
@@ -273,7 +275,7 @@ pub(crate) fn subagent_wakeup_observation(
         })
         .unwrap_or_else(|| format!("Subagent {subagent_id} finished."));
     let summary = format!(
-        "{subagent_summary} Delegation {delegation_id} ({kind}){label} is still {status}: {terminal} terminal, {running} running, {failed} failed."
+        "{subagent_summary} Delegation {delegation_id} ({kind}){label} is still {status}: {terminal} terminal, {running} running, {failed} failed. This snapshot applies only to {delegation_id}; other delegations may still be active. Inspect only for explicit refresh/recovery, never as a polling loop."
     );
     let tool_call_id = short_delegation_subagent_observation_call_id(delegation, subagent_id);
     Ok(DaemonToolObservation::inspect_delegation(
@@ -369,7 +371,7 @@ pub(crate) fn completion_wakeup_observation(
     let failed = snapshot_progress_count(snapshot, "failed");
     let ok = terminal.saturating_sub(failed);
     let summary = format!(
-        "Delegation {delegation_id} ({kind}){label} completed with status {status}: {ok} ok, {failed} failed."
+        "Delegation {delegation_id} ({kind}){label} completed with status {status}: {ok} ok, {failed} failed. This snapshot applies only to {delegation_id}; other delegations may still be active."
     );
     let tool_call_id = short_delegation_observation_call_id(delegation);
     Ok(DaemonToolObservation::inspect_delegation(
@@ -406,7 +408,7 @@ mod tests {
                 "task_prompt_file": "child_1/task_prompt.md",
                 "transcript_file": "child_1/transcript.md",
             }],
-            "handoff_dir": "/tmp/.pi-handoff/delegation_1",
+            "handoff_dir": ".pi-handoff/delegation_1",
         });
         let delegation = Delegation {
             id: "delegation_1".to_string(),
@@ -416,6 +418,8 @@ mod tests {
             kind: agent_store::DelegationKind::ReadonlyFanout,
             status: DelegationStatus::Done,
             attempt_id: "attempt-1".to_string(),
+            launch_shape: "{}".to_string(),
+            teardown_target: None,
             expected_subagents: 1,
         };
 
@@ -455,7 +459,7 @@ mod tests {
                 "failed": 0,
             },
             "subagents": [],
-            "handoff_dir": "/tmp/.pi-handoff/delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
+            "handoff_dir": ".pi-handoff/delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
         });
         let delegation = Delegation {
             id: "delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52".to_string(),
@@ -465,6 +469,8 @@ mod tests {
             kind: agent_store::DelegationKind::ReadonlyFanout,
             status: DelegationStatus::Done,
             attempt_id: "62847e1a-b705-48ee-899b-b062ccdf38f6".to_string(),
+            launch_shape: "{}".to_string(),
+            teardown_target: None,
             expected_subagents: 4,
         };
 
@@ -504,7 +510,7 @@ mod tests {
                 "final_message_file": "child/final_message.md",
                 "outcome": "approved",
             }],
-            "handoff_dir": "/tmp/.pi-handoff/delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
+            "handoff_dir": ".pi-handoff/delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
         });
         let delegation = Delegation {
             id: "delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52".to_string(),
@@ -514,6 +520,8 @@ mod tests {
             kind: agent_store::DelegationKind::ReadonlyFanout,
             status: DelegationStatus::Running,
             attempt_id: "62847e1a-b705-48ee-899b-b062ccdf38f6".to_string(),
+            launch_shape: "{}".to_string(),
+            teardown_target: None,
             expected_subagents: 3,
         };
 

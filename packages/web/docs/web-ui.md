@@ -8,6 +8,13 @@ for the runtime it drives, and [agent-daemon](../../../rust/docs/modules/agent-d
 The UI is operational, not marketing-shaped: a dense three-pane layout, compact rows, small controls,
 and transcript-first interaction.
 
+`delegation.list` always returns every active (`running` or `cancelling`)
+delegation, followed by the newest terminal history up to the requested limit.
+The collapsed Run Board renders all active rows and applies its default
+three-row limit only to terminal history. `has_more` refers only to omitted
+terminal history, so polling and reconnect cannot lose an older active card.
+Cancellation and progress remain delegation-ID scoped.
+
 ```
 +----------------+----------------------------------+--------------+
 | Sidebar        | Chat pane                        | Inspector    |

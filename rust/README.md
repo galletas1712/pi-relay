@@ -4,6 +4,11 @@ Personal-use Rust agent runtime and control plane. It provides durable
 PostgreSQL-backed sessions, resume/switch/compaction, host-side workspace
 tools and MCP routes, bounded delegation, and the React web client.
 
+Concurrent-delegation production upgrades use the one-time, fail-closed
+procedure in [`migrations/README.md`](migrations/README.md). Back up Postgres
+and the runtime workspace root and stop the old control/runtime before applying
+it; never reset volumes or workspace roots.
+
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) - overview and crate map.
@@ -61,6 +66,14 @@ PI_RELAY_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres
 
 The tests create uniquely named databases and remove them afterward. Do not
 point `PI_RELAY_TEST_DATABASE_URL` at a production database.
+
+The workspace fork/snapshot tests need a real btrfs filesystem. Point
+`PI_RELAY_TEST_BTRFS_ROOT` at a writable directory on one:
+
+```sh
+PI_RELAY_TEST_BTRFS_ROOT=/var/lib/pi-relay-test \
+  cargo test --manifest-path rust/Cargo.toml -p agent-runtime -- --include-ignored --nocapture
+```
 
 The frontend's checked-in `package-lock.json` is the canonical reproducible
 install for npm-based development:

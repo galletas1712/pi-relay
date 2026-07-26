@@ -1,5 +1,11 @@
 # agent-daemon
 
+Model delegation launches use the durable tool-action row ID as their
+parent-scoped idempotency key; websocket starts require `client_launch_id`.
+One parent may run one full delegation and bounded read-only fan-outs
+concurrently. Wakeups, steering, cancellation, handoffs, and recovery remain
+delegation-ID scoped.
+
 > Part of the [Rust Agent Stack](../architecture.md) | [Design decisions](../design-decisions.md)
 
 `pi-agentd` is a thin websocket JSON-RPC control plane backed by Postgres. It accepts websocket connections, routes JSON-RPC requests to handlers, serializes per-session work behind a driver lock, recovers crashed sessions before first touch, dispatches model and tool actions to background tasks, and replays events to reconnecting clients. It owns no durable state of its own: Postgres ([agent-store](./agent-store.md)) is authoritative, and the daemon holds only process-local projections needed to drive in-flight work. The full method contract is in [websocket-rpc](../websocket-rpc.md); this doc describes the module split and runtime mechanics.
@@ -46,7 +52,7 @@ delegation_tools.rs     delegation tool surface (delegate_writing_task /
                    cancel_delegation / steer_subagent / interrupt_subagent)
                    plus delegation.* web RPCs
                    (start_full / start_readonly_fanout / status / cancel /
-                   steer_subagent / list) + homogeneity/one-delegation-per-parent guards
+                   steer_subagent / list) + kind-aware bounded admission
 delegation_runner.rs    delegation barrier: all-terminal detect, attempt-fenced finish CAS,
                    idempotent handoff write, one steer to the parent; boot
                    crash sweep
@@ -124,7 +130,8 @@ top-level parent sessions, the provider compacts only transcript/model history
 text). After the provider returns, the daemon appends a fresh
 `## Delegation state at compaction time` section to the stored compaction
 summary. The ledger lists every delegation row for that parent session across
-all statuses (`running`, `done`, `done_with_failures`, `cancelled`, `failed`),
+all statuses (`running`, `cancelling`, `done`, `done_with_failures`,
+`cancelled`, `failed`),
 with bounded subagent/progress details, `outcome` control data when
 available, and artifact paths. It does not refresh artifacts or inline
 transcript or final-message bodies. A `running` entry is a point-in-time compaction fact, not a
@@ -161,11 +168,17 @@ does not own session durability.
 ### Accept and routing
 
 `main` parses config, connects Postgres, and migrates. Before stale-action
-cleanup it deterministically reconciles durable selected-subagent controls,
-then recovers durable post-compaction dispatch intents. This ordering lets an
+cleanup it deterministically reconciles durable selected-subagent controls and
+recovers durable post-compaction dispatch intents. It then stales claimed
+process-owned abandoned actions while preserving unclaimed pending actions for
+children of running delegations, materializes every missing child index, and
+reconstructs/drives every existing child index. Materialization happens exactly
+once per boot, in that pass, because the following delegation crash sweep
+iterates the child set it produced. The last phase recovers initial
+work committed just before a launch crash. The action claim CAS makes repeated
+recovery scans no-ops after the first runner wins. This ordering also lets an
 already-committed exact-child interrupt settle its captured generation before
-any resumed model runner is registered; the following stale sweep protects
-either class if recovery remains retryable. Each accepted TCP stream is
+any resumed model runner is registered. Each accepted TCP stream is
 upgraded to a websocket and handled in its own task. The connection loop
 multiplexes two sources: inbound request frames and the shared event broadcast.
 
@@ -186,7 +199,18 @@ Every handler that touches session state calls `SessionDriver::acquire`, which f
 
 `recover_if_needed` runs at the start of read and input handlers. If the session is already loaded in `active`, it is a no-op. Otherwise it resets abandoned `consuming` inputs, then short-circuits if the persisted active leaf is already a turn boundary. Only when the stored tail is an open turn does it rebuild the `AgentSession` from the stored snapshot, persist any newly closed entries via `recover_session`, and, if the session is ready to continue, drive it. Source-mutating handlers (delete, configure with model change, history.switch, turn.resume, compaction.request) and the source-snapshotting `history.fork` handler instead call `ensure_idle_for_source_mutation`, which recovers and then rejects with `session_busy` if any work is in flight. Both `history.switch` and `history.fork` also reject while any delegation for the source session is running. Their store transactions lock the source session row before rechecking that invariant; delegation creation locks the same parent row before checking and inserting its running record, so the idle-only contract is race-safe.
 
-Fork keeps the source driver lock across the current-cwd clone and store transaction, clones only a project session's owned managed cwd, and creates an independent top-level session with the complete transcript forest and an exact switch-valid active boundary. Daemon-managed local/MCP tool futures hold the per-cwd mutation guard for their lifetime. Fork and read-only subagent snapshotting acquire the same exact-cwd guard while holding the parent driver and wait for an active tool future to finish. Full subagents share the parent cwd and are not snapshot-guarded. Cancellation does not hold the parent driver: it wins the delegation cancellation transition and aborts or interrupts child work, dropping the daemon-managed tool future and its cwd guard. Delegation artifacts live under `.pi-handoff`, which is excluded from every fork/read-only clone.
+Fork keeps the source driver lock across the current-cwd clone and store transaction, clones only a project session's owned managed cwd, and creates an independent top-level session with the complete transcript forest and an exact switch-valid active boundary. Daemon-managed local/MCP tool futures hold the per-cwd mutation guard for their lifetime. Fork and read-only subagent snapshotting acquire the same exact-cwd guard while holding the parent driver and wait for an active tool future to finish. Full subagents share the parent cwd and are not snapshot-guarded. Cancellation does not hold the parent driver: its store transaction locks the
+parent, delegation, and child sessions in that order; claims
+`running -> cancelling`; and cancels all queued/consuming child mailbox rows.
+Ordinary child follow-ups take the same lock order and reject any delegation
+that is not `running`. The daemon then joins child tasks/runtime work before the
+store permits the terminal transition, dropping daemon-managed tool futures and
+their cwd guards. Read-only forks and `history.fork` take a btrfs subvolume
+snapshot of the parent cwd, which has no exclude facility, then remove
+`.pi-handoff` from the child cwd immediately, under the same per-cwd mutation
+guard. A forked session therefore does not inherit the source session's
+delegation artifacts. Delegation snapshots expose `handoff_dir` relative to the
+session cwd; artifact file fields are relative to that directory.
 
 ### Driving the loop
 

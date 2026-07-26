@@ -10,6 +10,11 @@ shapes, and filesystem/network behavior live here. The daemon builds one
 declarations from it on every model request, and dispatches each tool call back
 through it.
 
+Delegation tool descriptions expose concurrent launch semantics: at most one
+full writer, up to eight read-only slots reserved by immutable fan-outs until
+delegation terminality, same-response launch batches, and no polling. Read-only means workspace
+snapshot isolation only; remote tools may still mutate external systems.
+
 ## Responsibilities
 
 - Define the `AgentTool` trait and the canonical builtin tools.

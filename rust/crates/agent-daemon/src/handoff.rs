@@ -358,7 +358,7 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
 
     if matches!(
         delegation.status,
-        DelegationStatus::Cancelled | DelegationStatus::Failed
+        DelegationStatus::Cancelling | DelegationStatus::Cancelled | DelegationStatus::Failed
     ) {
         return Ok((dir, Vec::new()));
     }
@@ -373,14 +373,15 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         let transcript = render_transcript_markdown(&history);
         let status = terminal_subagent_status(&history);
         let outcome = extract_outcome(&final_message);
+        // Cancelling/cancelled/failed returned early above; only running and the
+        // successful terminal statuses reach here.
         let include_final_content = match delegation.status {
             DelegationStatus::Running => {
                 crate::delegation_tools::load_subagent_work_state(state, &subagent.session_id)
                     .await?
                     .is_completion_terminal()
             }
-            DelegationStatus::Done | DelegationStatus::DoneWithFailures => true,
-            DelegationStatus::Cancelled | DelegationStatus::Failed => false,
+            _ => true,
         };
 
         let has_task_prompt = refresh_task_prompt_artifact_if_present(

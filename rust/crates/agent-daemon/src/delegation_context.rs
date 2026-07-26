@@ -112,6 +112,7 @@ fn append_compaction_status_note(out: &mut String, status: DelegationStatus) {
         DelegationStatus::Running => {
             "running at compaction time; point-in-time only; await later completion observation or inspect_delegation"
         }
+        DelegationStatus::Cancelling => "cancelling at compaction time; teardown is still active",
         DelegationStatus::Done => "completed before compaction",
         DelegationStatus::DoneWithFailures => "completed with failures before compaction",
         DelegationStatus::Cancelled => "cancelled before compaction",
@@ -202,7 +203,9 @@ fn subagent_status(
         DelegationStatus::Done | DelegationStatus::DoneWithFailures => {
             delegation_status.as_str().to_string()
         }
-        DelegationStatus::Cancelled | DelegationStatus::Failed => delegation_status.to_string(),
+        DelegationStatus::Cancelling | DelegationStatus::Cancelled | DelegationStatus::Failed => {
+            delegation_status.to_string()
+        }
     }
 }
 
@@ -384,6 +387,8 @@ mod tests {
             kind: DelegationKind::ReadonlyFanout,
             status,
             attempt_id: "attempt".to_string(),
+            launch_shape: "{}".to_string(),
+            teardown_target: None,
             expected_subagents: 1,
         }
     }

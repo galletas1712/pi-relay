@@ -47,7 +47,8 @@ pub(crate) use outputs::{
     agent_input_from_queued_priority, attach_dispatch_config, collect_runtime_outputs,
 };
 pub(crate) use tasks::{
-    abort_session_tasks, register_auxiliary_task, session_has_live_tasks, take_tasks,
+    abort_and_join_session_tasks, abort_session_tasks, register_auxiliary_task,
+    session_has_live_tasks, take_tasks,
 };
 
 pub(crate) async fn recover_post_compaction_dispatches_on_boot(
@@ -290,7 +291,6 @@ impl SessionDriver {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) async fn ensure_active_loaded_preserving_open_turn(
         &self,
     ) -> std::result::Result<(), RpcError> {

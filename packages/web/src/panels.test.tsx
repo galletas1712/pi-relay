@@ -19,7 +19,7 @@ function delegation(overrides: Partial<Delegation> = {}): Delegation {
 		workflow: null,
 		label: "review",
 		progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 0 },
-		handoff_dir: "/workspace/.pi-handoff/delegation-1",
+		handoff_dir: ".pi-handoff/delegation-1",
 		subagents: [
 			{
 				id: "child-1",
@@ -112,47 +112,51 @@ function renderRunBoardList({
 }
 
 describe("Inspector run board delegation list", () => {
-	it("shows bounded newest-first delegations by default and all loaded delegations in expanded mode", () => {
+	it("collapses terminal history but always shows every running or cancelling delegation", () => {
+		const delegations = [
+			delegation({ delegation_id: "terminal-1", label: "terminal task 1", status: "done" }),
+			delegation({ delegation_id: "active-1", label: "active task 1", status: "running" }),
+			delegation({ delegation_id: "terminal-2", label: "terminal task 2", status: "failed" }),
+			delegation({ delegation_id: "cancelling", label: "cancelling task", status: "cancelling" }),
+			delegation({ delegation_id: "terminal-3", label: "terminal task 3", status: "cancelled" }),
+			delegation({ delegation_id: "active-2", label: "active task 2", status: "running" }),
+			delegation({ delegation_id: "terminal-4", label: "terminal task 4", status: "done" }),
+			delegation({ delegation_id: "terminal-5", label: "terminal task 5", status: "done_with_failures" }),
+		];
+
+		const collapsed = renderRunBoardList({ delegations });
+		expect(collapsed).toContain("active task 1");
+		expect(collapsed).toContain("active task 2");
+		expect(collapsed).toContain("cancelling task");
+		expect(collapsed).toContain("terminal task 1");
+		expect(collapsed).toContain("terminal task 3");
+		expect(collapsed).not.toContain("terminal task 4");
+		expect(collapsed).not.toContain("terminal task 5");
+		expect(collapsed).toContain("See more (2)");
+
+		const expanded = renderRunBoardList({ delegations, showAllDelegations: true });
+		expect(expanded).toContain("terminal task 4");
+		expect(expanded).toContain("terminal task 5");
+	});
+
+	it("applies the default limit only to terminal history", () => {
 		const delegations = Array.from({ length: 5 }, (_, index) =>
 			delegation({
-				delegation_id: `delegation-${index + 1}`,
-				label: `task ${index + 1}`,
-				handoff_dir: `/workspace/.pi-handoff/delegation-${index + 1}`,
-				subagents: [
-					{
-						id: `child-${index + 1}`,
-						status: "done",
-						activity: "idle",
-						role: "reviewer",
-						subagent_type: "read_only",
-						task_prompt_file: `child-${index + 1}/task_prompt.md`,
-						final_message_file: `child-${index + 1}/final_message.md`,
-						transcript_file: `child-${index + 1}/transcript.md`,
-						outcome: "approved",
-					},
-				],
+				delegation_id: `terminal-${index + 1}`,
+				label: `terminal task ${index + 1}`,
+				status: "done",
 			}),
 		);
 
-		// Input is the backend's newest-first delegation page. The collapsed
-		// Agents outline keeps the first three loaded rows and hides older rows.
 		const collapsed = renderRunBoardList({ delegations });
-		expect(collapsed).toContain("task 1");
-		expect(collapsed).toContain("task 2");
-		expect(collapsed).toContain("task 3");
-		expect(collapsed).not.toContain("task 4");
-		expect(collapsed).not.toContain("task 5");
+		expect(collapsed).toContain("terminal task 1");
+		expect(collapsed).toContain("terminal task 3");
+		expect(collapsed).not.toContain("terminal task 4");
 		expect(collapsed).toContain("See more (2)");
-		expect(collapsed).not.toContain("Show fewer");
 
 		const expanded = renderRunBoardList({ delegations, showAllDelegations: true });
-		expect(expanded).toContain("task 1");
-		expect(expanded).toContain("task 2");
-		expect(expanded).toContain("task 3");
-		expect(expanded).toContain("task 4");
-		expect(expanded).toContain("task 5");
+		expect(expanded).toContain("terminal task 5");
 		expect(expanded).toContain("Show fewer");
-		expect(expanded).not.toContain("See more");
 	});
 
 	it("uses server paging metadata without inventing expansion for a complete short page", () => {

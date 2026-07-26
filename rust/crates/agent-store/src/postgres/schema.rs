@@ -171,13 +171,19 @@ create index if not exists events_session_id_idx on events(session_id, id);
 create table if not exists delegations (
     id text primary key,
     parent_session_id text not null references sessions(id) on delete cascade,
+    launch_key text not null,
+    launch_shape text not null,
     workflow text null,
     label text null,
     kind text not null,
     status text not null,
     attempt_id text not null,
+    teardown_target text null,
+    launch_error jsonb null,
     expected_subagents integer not null default 1
         constraint delegations_expected_subagents_positive check (expected_subagents > 0),
+    constraint delegations_full_expected_subagents_one
+        check (kind <> 'full' or expected_subagents = 1),
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
@@ -186,11 +192,18 @@ create index if not exists delegations_parent_created_idx on delegations(parent_
 
 create index if not exists delegations_parent_running_idx
     on delegations(parent_session_id)
-    where status='running';
+    where status in ('running','cancelling');
+
+create unique index if not exists delegations_parent_launch_key_uq
+    on delegations(parent_session_id, launch_key);
+
+create unique index if not exists delegations_parent_running_full_uq
+    on delegations(parent_session_id)
+    where status in ('running','cancelling') and kind='full';
 
 create index if not exists delegations_running_created_idx
     on delegations(created_at, id)
-    where status='running';
+    where status in ('running','cancelling');
 
 create index if not exists delegations_completed_repair_idx
     on delegations(updated_at, id)
@@ -199,6 +212,10 @@ create index if not exists delegations_completed_repair_idx
 -- `sessions` and `delegations` reference each other, so this side of the cycle
 -- is added after both canonical tables exist.
 alter table sessions add column if not exists delegation_id text null references delegations(id);
+
+create unique index if not exists sessions_delegation_spawn_index_uq
+    on sessions(delegation_id, (metadata->>'delegation_spawn_index'))
+    where delegation_id is not null and metadata ? 'delegation_spawn_index';
 
 alter table queued_inputs add column if not exists provider_config jsonb null;
 alter table actions add column if not exists provider_config jsonb null;
@@ -210,5 +227,28 @@ create index if not exists sessions_delegation_created_idx
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {
     sqlx::raw_sql(SCHEMA_SQL).execute(pool).await?;
+    let invalid: Vec<String> = sqlx::query_scalar(
+        r#"
+        select c.relname
+        from pg_class c
+        join pg_index i on i.indexrelid=c.oid
+        where c.relname = any($1)
+          and (not i.indisvalid or not i.indisready)
+        order by c.relname
+        "#,
+    )
+    .bind([
+        "delegations_parent_launch_key_uq",
+        "sessions_delegation_spawn_index_uq",
+        "delegations_parent_running_full_uq",
+    ])
+    .fetch_all(pool)
+    .await?;
+    if !invalid.is_empty() {
+        anyhow::bail!(
+            "invalid required delegation index(es): {}; run the one-time concurrent-delegations migration while old processes are stopped",
+            invalid.join(", ")
+        );
+    }
     Ok(())
 }

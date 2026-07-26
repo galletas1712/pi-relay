@@ -44,9 +44,8 @@ pub type MaterializeProgressSink = tokio::sync::mpsc::Sender<WorkspaceMaterializ
 /// mutation.
 type KeyedLocks<K> = Arc<Mutex<HashMap<K, Arc<Mutex<()>>>>>;
 
-// `.pi-handoff` is a sibling of the workspace dirs under the cwd root. It is
-// owned by the daemon for delegation artifact files; it is never a workspace,
-// never snapshotted into an RO fork.
+// `.pi-handoff` is a daemon-owned child of the cwd root rather than a workspace.
+// Read-only forks remove it immediately after taking the guarded snapshot.
 
 #[derive(Clone)]
 pub struct WorkspaceManager {
@@ -470,6 +469,14 @@ impl WorkspaceManager {
                         child_cwd.display()
                     )
                 })?;
+            let handoff_dir = child_cwd.join(".pi-handoff");
+            match tokio::fs::remove_dir_all(&handoff_dir).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("remove {}", handoff_dir.display()))
+                }
+            }
 
             let mut child_workspaces = Vec::with_capacity(parent_workspaces.len());
             for workspace in parent_workspaces {
@@ -1093,5 +1100,50 @@ mod tests {
         assert!(shared.contents.contains("personal-shared"));
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[ignore = "requires PI_RELAY_TEST_BTRFS_ROOT; see rust/README.md"]
+    #[tokio::test]
+    async fn fork_drops_the_parents_handoff_artifacts_from_the_child_cwd() {
+        let Ok(btrfs_root) = std::env::var("PI_RELAY_TEST_BTRFS_ROOT") else {
+            eprintln!("SKIPPED btrfs test; PI_RELAY_TEST_BTRFS_ROOT is not set");
+            return;
+        };
+        let state = PathBuf::from(btrfs_root).join(format!(
+            "pi-runtime-fork-handoff-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let manager =
+            WorkspaceManager::new(state.clone(), state.join("config"), state.join("home"));
+        manager.validate_root().await.expect("btrfs state root");
+        std::fs::create_dir_all(state.join("sessions/parent")).expect("parent session root");
+        create_session_subvolume(&manager.resolve("parent"))
+            .await
+            .expect("parent cwd subvolume");
+        write_file(
+            &manager
+                .resolve("parent")
+                .join(".pi-handoff/delegation_1/index.json"),
+            "{}",
+        );
+        write_file(&manager.resolve("parent").join("keep.txt"), "kept");
+
+        manager
+            .fork_session_from_parent("parent", &[], "child")
+            .await
+            .expect("fork parent cwd");
+
+        assert!(!manager.resolve("child").join(".pi-handoff").exists());
+        assert!(manager.resolve("child").join("keep.txt").exists());
+        assert!(manager.resolve("parent").join(".pi-handoff").exists());
+
+        for workspace_id in ["child", "parent"] {
+            manager
+                .destroy_session_workspaces(workspace_id)
+                .await
+                .expect("reclaim session subvolumes");
+        }
+        std::fs::remove_dir_all(state).ok();
     }
 }

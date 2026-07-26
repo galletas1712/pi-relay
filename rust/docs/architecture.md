@@ -26,9 +26,11 @@ lives under [`plans/`](plans/).
 4. Keep providers intentionally narrow: OpenAI/Codex and Anthropic/Claude only.
 5. Keep tools separate from the agent loop so tool sets can be customized
    without changing the FSM.
-6. Support bounded parent/child subagent delegation as **delegations**: the parent
-   runs one full (writing) subagent or a parallel fan-out of read-only
-   subagents, parks, and is resumed with a daemon-authored wakeup observation.
+6. Support bounded parent/child subagent delegation as **delegations**: each
+   delegation runs one full (writing) subagent or a parallel fan-out of
+   read-only subagents. A parent may launch one writer and independent
+   read-only fan-outs concurrently, then parks after the useful launch batch and
+   is resumed with delegation-ID-scoped daemon-authored wakeup observations.
    No generic injected-message routing layer or event bus between arbitrary
    sessions.
 
@@ -164,10 +166,11 @@ Implemented user-facing behavior:
   `interrupt_subagent`). A delegation is one **full** subagent
   (writes the parent's workspace in place) or a parallel fan-out of
   **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
-  return). The parent parks after launching a delegation and is delivered a
-  parent-scoped completion **daemon observation** containing a structured
-  snapshot equivalent to `inspect_delegation`, including per-subagent
-  `outcome` and compact handoff file references.
+  return). A parent may launch independent delegations together, then parks
+  after the useful launch batch and receives delegation-ID-scoped completion
+  **daemon observations** containing structured snapshots equivalent to
+  `inspect_delegation`, including per-subagent `outcome` and compact handoff
+  file references.
   `inspect_delegation` refreshes or recovers that same structured state
   later/running.
   Delegation subagents may emit `subagent.spawned`/`subagent.running` progress

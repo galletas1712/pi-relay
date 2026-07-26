@@ -67,8 +67,9 @@ describe("delegation triage model", () => {
 });
 
 describe("delegation control helpers", () => {
-	it("treats only running work as cancellable", () => {
+	it("treats running and cancelling work as active", () => {
 		expect(isDelegationRunning(delegation({ status: "running" }))).toBe(true);
+		expect(isDelegationRunning(delegation({ status: "cancelling" }))).toBe(true);
 		for (const status of ["done", "done_with_failures", "cancelled", "failed"] as const) {
 			expect(isDelegationRunning(delegation({ status }))).toBe(false);
 		}
@@ -76,6 +77,7 @@ describe("delegation control helpers", () => {
 
 	it("maps statuses to stable icon modifiers", () => {
 		expect(statusIconClass("running")).toBe("running");
+		expect(statusIconClass("cancelling")).toBe("running");
 		expect(statusIconClass("done")).toBe("done");
 		expect(statusIconClass("done_with_failures")).toBe("warn");
 		expect(statusIconClass("failed")).toBe("failed");

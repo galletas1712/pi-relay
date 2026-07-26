@@ -9,28 +9,44 @@ use crate::state::{AppState, RunningTask, TaskRegistrationId};
 pub(crate) struct TaskRegistrationRejected;
 
 pub(crate) fn abort_session_tasks(state: &AppState, session_id: &str) -> Vec<ActionKind> {
-    let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
-    abort_matching_tasks(&mut tasks, session_id)
+    let tasks = remove_session_tasks(
+        &mut state.tasks.lock().expect("task registry lock poisoned"),
+        session_id,
+    );
+    tasks
+        .into_iter()
+        .map(|task| {
+            task.handle.abort();
+            task.kind
+        })
+        .collect()
 }
 
-fn abort_matching_tasks(
+pub(crate) async fn abort_and_join_session_tasks(state: &AppState, session_id: &str) {
+    let tasks = remove_session_tasks(
+        &mut state.tasks.lock().expect("task registry lock poisoned"),
+        session_id,
+    );
+    for task in tasks {
+        task.handle.abort();
+        let _ = task.handle.await;
+    }
+}
+
+fn remove_session_tasks(
     tasks: &mut HashMap<String, RunningTask>,
     session_id: &str,
-) -> Vec<ActionKind> {
+) -> Vec<RunningTask> {
     tasks.retain(|_, task| !task.handle.is_finished());
     let action_row_ids = tasks
         .iter()
         .filter(|(_, task)| task.session_id == session_id)
         .map(|(action_row_id, _)| action_row_id.clone())
         .collect::<Vec<_>>();
-    let mut aborted = Vec::new();
-    for action_row_id in action_row_ids {
-        if let Some(task) = tasks.remove(&action_row_id) {
-            aborted.push(task.kind);
-            task.handle.abort();
-        }
-    }
-    aborted
+    action_row_ids
+        .into_iter()
+        .filter_map(|action_row_id| tasks.remove(&action_row_id))
+        .collect()
 }
 
 pub(crate) fn register_auxiliary_task(
@@ -233,7 +249,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn abort_matching_tasks_is_exact_session_scoped() {
+    async fn remove_session_tasks_is_exact_session_scoped() {
         let mut tasks = HashMap::new();
         for (row_id, session_id, kind) in [
             ("parent-action", "parent", ActionKind::Model),
@@ -253,14 +269,18 @@ mod tests {
             );
         }
 
+        let removed = remove_session_tasks(&mut tasks, "child-a");
         assert_eq!(
-            abort_matching_tasks(&mut tasks, "child-a"),
+            removed.iter().map(|task| task.kind).collect::<Vec<_>>(),
             vec![ActionKind::Tool]
         );
         assert!(!tasks.contains_key("child-a-action"));
         assert!(tasks.contains_key("parent-action"));
         assert!(tasks.contains_key("child-b-action"));
 
+        for task in removed {
+            task.handle.abort();
+        }
         for (_, task) in tasks {
             task.handle.abort();
         }

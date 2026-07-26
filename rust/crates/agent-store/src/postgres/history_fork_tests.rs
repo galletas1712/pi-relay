@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::{
     CreateForkRequest, DelegationKind, HistoryChanged, HistoryTarget, HistoryTargetNotTurnBoundary,
-    OutputBatch, PostgresAgentStore, RunningDelegationConflict, SessionConfig,
-    SourceMutationConflict, SwitchActiveLeafRequest, TranscriptEntryBodyMode,
+    OutputBatch, PostgresAgentStore, SessionConfig, SourceMutationConflict,
+    SwitchActiveLeafRequest, TranscriptEntryBodyMode,
 };
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(40_000);
@@ -924,7 +924,15 @@ async fn switch_and_fork_share_history_target_validation() {
 
     let delegation_config = create_session(store, project_id, "delegation-source", false).await;
     store
-        .create_delegation("delegation-source", DelegationKind::Full, None, None, 1)
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: "delegation-source",
+            launch_key: "test:blocks-source-mutation",
+            launch_shape: r#"{"kind":"full","role":"implementer","prompt":"work"}"#,
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
         .await
         .expect("running delegation creates");
     let delegation_target = HistoryTarget {
@@ -947,10 +955,10 @@ async fn switch_and_fork_share_history_target_validation() {
     .await
     .expect_err("running delegation blocks fork");
     assert!(switch_error
-        .downcast_ref::<RunningDelegationConflict>()
+        .downcast_ref::<SourceMutationConflict>()
         .is_some());
     assert!(fork_error
-        .downcast_ref::<RunningDelegationConflict>()
+        .downcast_ref::<SourceMutationConflict>()
         .is_some());
 
     db.cleanup().await;

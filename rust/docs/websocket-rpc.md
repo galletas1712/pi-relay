@@ -224,9 +224,11 @@ value jsonb not null
 updated_at timestamptz not null default now()
 ```
 
-The `PI.md` is the prompt composition template. It is not stored per session.
-Normal provider requests use the rendered prompt as the stable prefix followed
-by transcript history; the daemon does not inject a top-level
+The repository-level `PI.md` is the prompt composition template. At
+`session.start`, the daemon renders it with the materialized session context and
+persists the result as the session's immutable `sessions.system_prompt`. Normal
+provider requests use that stored prompt as the stable prefix followed by
+transcript history; the daemon does not inject a top-level
 `## Current delegations` dashboard into ordinary turns. Parent-session
 compaction inputs also exclude live delegation dashboards. After the provider
 returns a compacted summary, the daemon appends a fresh bounded
@@ -367,21 +369,19 @@ Durable parent/child subagent delegation units:
 ```text
 id text primary key
 parent_session_id text not null references sessions(id) on delete cascade
+launch_key text not null
+launch_shape text not null
 workflow text null
 label text null
 kind text not null              -- full | readonly_fanout
-status text not null            -- running | done | done_with_failures | cancelled | failed
+status text not null            -- running | cancelling | done | done_with_failures | cancelled | failed
 attempt_id text not null
+teardown_target text null       -- cancelled | failed while status=cancelling
+launch_error jsonb null         -- durable launch failure code/message
 expected_subagents integer not null default 1
 created_at timestamptz not null default now()
 updated_at timestamptz not null default now()
 ```
-
-Migration creates `sessions.delegation_id` before inspecting child links, then
-idempotently repairs legacy/default-one delegation rows to their actual linked
-child count when that count is greater than one. Intentional values greater
-than one are preserved and the positive-count constraint is enforced before
-the completion fence is used.
 
 Child sessions link back through `sessions.delegation_id`. The
 `delegations_parent_created_idx` index supports the per-parent delegation feed.
@@ -1131,6 +1131,7 @@ Response:
   "input_id": "input_...",
   "accepted": true,
   "queued": true,
+  "replayed": false,
   "queue": {
     "session_revision": 12,
     "queue_revision": 5,
@@ -1141,16 +1142,21 @@ Response:
 }
 ```
 
-Retries with the same `client_input_id` return `"replayed": true` and the same
-canonical queue object when the original ledger row is found.
+All three flags are derived from the stored row's status. `accepted` is true
+while the row is `queued`, `consuming`, or `consumed`; `queued` is true only
+while it is `queued` or `consuming`; `replayed` is true when the store matched
+an existing `client_input_id` instead of inserting a new row, and is present as
+`false` on ordinary sends. A replay returns the original `input_id` and the same
+canonical queue object.
 
 Queue snapshots in responses and events use the canonical ordering: queued
 steers first by steering/promote time, then queued follow-ups by dense
 `follow_up_position`.
 
-For backward compatibility, raw ordinary-priority
-`input.follow_up`/`session.input` can target a subagent. It is an ordinary child
-follow-up and does not provide parent/delegation control validation. Raw
+Raw ordinary-priority `input.follow_up`/`session.input` can target a subagent.
+It is an ordinary child follow-up and does not provide parent/delegation control
+validation; it is rejected with `delegation_not_running` inside the store
+transaction when the child's delegation is not `running`. Raw
 `priority = "steer"` input to a child is rejected with
 `subagent_steer_requires_parent_scope`; callers must use parent-scoped
 `delegation.steer_subagent`/`steer_subagent` for a validated child steer.
@@ -1430,8 +1436,8 @@ The child receives the source's complete committed transcript forest in source
 insertion order, preserving entry ids, parent links, typed items, turn ids,
 compaction roots/sibling branches, and opaque `provider_replay`. Its active
 leaf is exactly `leaf_id`; the fork does not synthesize transcript entries. Queued
-inputs, actions, reconnect events, delegations, and subagent relationships are
-not copied. Fork provenance is stored in
+inputs, actions, reconnect events, delegations, subagent relationships, and
+`.pi-handoff` delegation artifacts are not copied. Fork provenance is stored in
 `metadata.fork = { source_session_id, source_leaf_id }`; the child has no
 `parent_session_id` and uses the parent prompt/tool profile. The child inherits
 the source title, auto-title preference, and compaction policy, but starts
@@ -1463,9 +1469,11 @@ session list before deciding to retry.
 Workspace snapshot serialization covers daemon-managed local and MCP tool
 futures that share the exact managed cwd. `history.fork` and read-only
 delegation snapshots wait on that guard; the guard is released when a tool
-future returns or is dropped/aborted. `.pi-handoff` is excluded from clones.
-The daemon does not claim to track independently running background processes
-beyond the managed future lifetime.
+future returns or is dropped/aborted. Both take a btrfs subvolume snapshot of
+the parent cwd and then remove `.pi-handoff` from the child cwd under the same
+guard, so a fork or read-only child never sees the source session's delegation
+artifacts. The daemon does not claim to track independently running background
+processes beyond the managed future lifetime.
 
 ### `turn.resume`
 
@@ -1502,6 +1510,10 @@ retained for Handoffs/inspection only. This is separate from terminal-turn
 Delegations are the frontend-facing unit for bounded parent/child subagent work.
 A delegation is either one full (writing) subagent or a read-only fan-out. The
 websocket API only accepts the canonical `delegation.*` methods below.
+One parent may have one running or cancelling full delegation and read-only
+fan-outs totaling at most eight reserved slots. A fan-out keeps all its slots
+until delegation terminality. Start calls are replay-safe and require a
+caller-generated `client_launch_id`.
 
 ### `delegation.start_full`
 
@@ -1510,6 +1522,7 @@ Starts one full subagent that writes in the parent workspace.
 ```json
 {
   "parent_session_id": "parent-session",
+  "client_launch_id": "9f0676c8-...",
   "role": "implementer",
   "prompt": "Implement the requested change.",
   "workflow": "workflow-implement-review",
@@ -1533,6 +1546,7 @@ Starts one read-only subagent per task, each in a disposable snapshot.
 ```json
 {
   "parent_session_id": "parent-session",
+  "client_launch_id": "ea32c98b-...",
   "tasks": [
     { "role": "reviewer", "prompt": "Review the backend changes." },
     { "role": "tester", "prompt": "Run focused validation." }
@@ -1550,6 +1564,11 @@ Result:
   "subagent_session_ids": ["session_...", "session_..."]
 }
 ```
+
+Reusing a `client_launch_id` with the same request returns the original
+delegation and children. Reusing it with different launch parameters fails with
+`delegation_launch_id_conflict`. Clients must retain the ID until they receive
+the start result; generating a new ID creates new work.
 
 ### `delegation.status`
 
@@ -1603,7 +1622,7 @@ Result:
       "task_prompt_file": "session_.../task_prompt.md"
     }
   ],
-  "handoff_dir": "/.../.pi-handoff/delegation_..."
+  "handoff_dir": ".pi-handoff/delegation_..."
 }
 ```
 
@@ -1619,8 +1638,8 @@ packages; the delegation `workflow` value is an unvalidated observability label.
 
 Interrupts all running subagents in a delegation and marks the delegation
 cancelled. Terminal delegations are left unchanged and return
-`{ "cancelled": false }`. A successful cancellation returns compact
-per-subagent transcript file references relative to `handoff_dir`.
+`{ "cancelled": false }`. A successful cancellation returns a cwd-relative `handoff_dir` and compact
+per-subagent transcript file references relative to it.
 
 ```json
 {
@@ -1635,7 +1654,7 @@ Successful result:
 {
   "cancelled": true,
   "delegation_id": "delegation_...",
-  "handoff_dir": "/.../.pi-handoff/delegation_...",
+  "handoff_dir": ".pi-handoff/delegation_...",
   "subagents": [
     {
       "subagent_id": "session_...",
@@ -1751,9 +1770,15 @@ occurred before interruption remain non-transactional and are not rolled back.
 
 ### `delegation.list`
 
-Lists a bounded newest-first page of delegations for a parent session. This is
-the lightweight Agents-outline feed used by the web UI; use `delegation.status`
-for structured detail or `delegation.read_handoff_file` for Handoff content.
+Returns every active (`running` or `cancelling`) delegation for the parent,
+followed by up to `limit` newest terminal delegations. Active rows do not
+consume the terminal history limit. `has_more` is true only when terminal
+history was omitted, so active work cannot disappear behind newer terminal
+rows.
+
+This is the lightweight Agents-outline feed used by the web UI; use
+`delegation.status` for structured detail or
+`delegation.read_handoff_file` for Handoff content.
 
 ```json
 { "parent_session_id": "parent-session", "limit": 3 }

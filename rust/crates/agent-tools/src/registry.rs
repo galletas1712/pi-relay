@@ -301,7 +301,7 @@ fn load_skill_definition() -> ToolDefinition {
 fn interrupt_subagent_definition() -> ToolDefinition {
     ToolDefinition::new(
         "interrupt_subagent",
-        "Durably interrupt exactly one running subagent generation in your active delegation without cancelling its parent, siblings, or the whole delegation. This queues no instruction; replay of the same tool call returns its prior control state without interrupting newer work.",
+        "Durably interrupt exactly one running subagent generation identified by subagent session id, without cancelling its parent, siblings, or containing delegation. This queues no instruction; replay of the same tool call returns its prior control state without interrupting newer work.",
         json!({
             "type": "object",
             "properties": {
@@ -319,7 +319,7 @@ fn interrupt_subagent_definition() -> ToolDefinition {
 fn delegate_writing_task_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_writing_task",
-        "Launch the single full (writing) subagent for a delegation. It edits the workspace in place; there is exactly one full subagent at a time. End your turn after calling; completion arrives later as a daemon-authored wakeup observation with an inspect_delegation-equivalent bounded snapshot and artifact paths.",
+        "Launch one full (writing) delegation. It edits the workspace in place; at most one full delegation may be active for this parent, but independent read-only delegations may run beside it and may be launched in the same model response. After launching the useful batch, end your turn; completion arrives later as a delegation-ID-scoped daemon wakeup.",
         json!({
             "type": "object",
             "properties": {
@@ -349,13 +349,15 @@ fn delegate_writing_task_definition() -> ToolDefinition {
 fn delegate_readonly_tasks_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_readonly_tasks",
-        "Launch N read-only subagents in parallel, each in its own disposable snapshot of the workspace. Use for investigation, review, or running builds/tests; nothing they write reaches your workspace. End your turn after calling; completion arrives later as a daemon-authored wakeup observation with an inspect_delegation-equivalent bounded snapshot and artifact paths.",
+        "Launch an independent read-only fan-out, each child in its own point-in-time disposable workspace snapshot. Fan-outs may reserve up to eight read-only slots across this parent; each fan-out keeps all of its slots until the delegation is terminal. Additional fan-outs may start while read-only or full delegations run, including in the same model response, when reserved capacity remains. Workspace isolation does not prevent MCP or other remote side effects. After the useful launch batch, end your turn; never poll.",
         json!({
             "type": "object",
             "properties": {
                 "tasks": {
                     "type": "array",
                     "description": "One entry per read-only subagent to run in parallel.",
+                    "minItems": 1,
+                    "maxItems": 8,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -771,6 +773,23 @@ mod tests {
             assert!(description.contains("runtime-global"));
             assert!(!description.contains("repo/reviewer"));
         }
+    }
+
+    #[test]
+    fn delegation_tools_describe_same_response_launch_batches_without_polling() {
+        let full = delegate_writing_task_definition();
+        let readonly = delegate_readonly_tasks_definition();
+
+        assert!(full.description.contains("same model response"));
+        assert!(full.description.contains("useful batch"));
+        assert!(full.description.contains("end your turn"));
+        assert!(readonly.description.contains("same model response"));
+        assert!(readonly.description.contains("useful launch batch"));
+        assert!(readonly.description.contains("never poll"));
+
+        let interrupt = interrupt_subagent_definition();
+        assert!(interrupt.description.contains("subagent session id"));
+        assert!(!interrupt.description.contains("your active delegation"));
     }
 
     #[test]

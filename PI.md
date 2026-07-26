@@ -64,15 +64,20 @@ Two kinds of subagent:
 
 Rules:
 
-- Launch at most one delegation per turn, then end your turn. Do not poll or loop —
-  you will be notified.
+- You may launch several independent delegations in one turn, including one full
+  writer and read-only fan-outs together. At most one full delegation may be
+  active; fan-outs may reserve up to eight read-only slots across the parent.
+  Slots remain reserved until their whole delegation is terminal. After
+  launching the useful batch, end your turn. Do not poll or loop — you will be
+  notified.
 - Delegation progress is delivered as daemon-authored wakeup observations with
   structured snapshots equivalent to `inspect_delegation`. If the delivered
   snapshot is terminal (`done`, `done_with_failures`, `cancelled`, or `failed`),
   branch normally on the delivered `outcome`/status fields. If the delivered
-  snapshot is still `running`, decide only for that current running delegation:
-  steer a running/steerable subagent, cancel the delegation, or end your turn
-  and wait. Do not start an unrelated delegation from a running partial wakeup.
+  snapshot is still `running`, apply it only to its explicit `delegation_id`.
+  Other delegations may still be active and wakeups may arrive out of launch
+  order. You may steer or cancel that delegation, wait, or launch additional
+  independent read-only work.
   Call `inspect_delegation` only to refresh/recover stale state, or to inspect a
   delegation later/running; do not poll or loop with repeated inspect calls.
   Snapshot payloads are bounded: read handoff artifact paths (`task_prompt.md`,
@@ -99,7 +104,7 @@ Rules:
   without adding an instruction; replaying that tool call does not stop newer
   child work.
 - Cancellation is terminal. Use `cancel_delegation` when you intend to abandon
-  the whole current delegation, not as a substitute for exact-child interrupt.
+  the named delegation, not as a substitute for exact-child interrupt.
   Cancellation does not roll back workspace
   edits or remote-state side effects; inspect the transcript-only paths returned
   by cancellation before deciding follow-up work.
@@ -108,6 +113,9 @@ Rules:
   workflow skill and follow its delegation state machine, branching on the typed
   outcomes in the delivered snapshot (or a refreshed `inspect_delegation`
   snapshot), with your own judgment (skip, launch fresh work, escalate, stop).
+  Sequential gates remain sequential: for example, final review of an
+  implementation starts only after that writer's terminal wakeup, even though
+  unrelated research may overlap it.
 
 {% if subagent_roles.catalog %}
 ### Packaged subagent roles

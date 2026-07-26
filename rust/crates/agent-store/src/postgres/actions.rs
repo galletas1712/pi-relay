@@ -72,6 +72,16 @@ impl PostgresAgentStore {
                     payload=payload - '{POST_COMPACTION_DISPATCH_KEY}',
                     updated_at=now()
                 where {stale_actions}
+                  and not (
+                      actions.status='pending'
+                      and exists (
+                          select 1
+                          from sessions s
+                          join delegations d on d.id=s.delegation_id
+                          where s.id=actions.session_id
+                            and d.status='running'
+                      )
+                  )
                   and not exists (
                       select 1
                       from queued_inputs q
@@ -106,12 +116,15 @@ impl PostgresAgentStore {
     pub async fn post_compaction_dispatch_session_ids(&self) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar(&format!(
             r#"
-            select distinct session_id
-            from actions
-            where status in ('pending','running')
-                and kind='model'
-                and payload ? '{POST_COMPACTION_DISPATCH_KEY}'
-            order by session_id
+            select distinct a.session_id
+            from actions a
+            join sessions s on s.id=a.session_id
+            left join delegations d on d.id=s.delegation_id
+            where a.status in ('pending','running')
+                and a.kind='model'
+                and a.payload ? '{POST_COMPACTION_DISPATCH_KEY}'
+                and (s.delegation_id is null or d.status='running')
+            order by a.session_id
             "#
         ))
         .fetch_all(&self.pool)
@@ -124,41 +137,19 @@ impl PostgresAgentStore {
     ) -> Result<Vec<PostCompactionDispatchIntent>> {
         let rows = sqlx::query(&format!(
             r#"
-            select session_id, id, attempt_id
-            from actions
-            where session_id=$1
-                and status in ('pending','running')
-                and kind='model'
-                and payload ? '{POST_COMPACTION_DISPATCH_KEY}'
-            order by created_at, id
+            select a.session_id, a.id, a.attempt_id
+            from actions a
+            join sessions s on s.id=a.session_id
+            left join delegations d on d.id=s.delegation_id
+            where a.session_id=$1
+                and a.status in ('pending','running')
+                and a.kind='model'
+                and a.payload ? '{POST_COMPACTION_DISPATCH_KEY}'
+                and (s.delegation_id is null or d.status='running')
+            order by a.created_at, a.id
             "#
         ))
         .bind(session_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| PostCompactionDispatchIntent {
-                session_id: row.get("session_id"),
-                row_id: row.get("id"),
-                attempt_id: row.get("attempt_id"),
-            })
-            .collect())
-    }
-
-    pub async fn post_compaction_dispatch_intents_all(
-        &self,
-    ) -> Result<Vec<PostCompactionDispatchIntent>> {
-        let rows = sqlx::query(&format!(
-            r#"
-            select session_id, id, attempt_id
-            from actions
-            where status in ('pending','running')
-                and kind='model'
-                and payload ? '{POST_COMPACTION_DISPATCH_KEY}'
-            order by created_at, id
-            "#
-        ))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -182,9 +173,68 @@ impl PostgresAgentStore {
             .begin()
             .await
             .map_err(transient_post_compaction_claim)?;
+        let binding =
+            sqlx::query("select parent_session_id, delegation_id from sessions where id=$1")
+                .bind(&intent.session_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(transient_post_compaction_claim)?;
+        let Some(binding) = binding else {
+            tx.commit().await.map_err(transient_post_compaction_claim)?;
+            return Ok(None);
+        };
+        let parent_session_id = binding.get::<Option<String>, _>("parent_session_id");
+        let delegation_id = binding.get::<Option<String>, _>("delegation_id");
+        match delegation_id.as_deref() {
+            None => {}
+            Some(delegation_id) => {
+                let Some(parent_session_id) = parent_session_id.as_deref() else {
+                    tx.commit().await.map_err(transient_post_compaction_claim)?;
+                    return Ok(None);
+                };
+                lock_session_tx(&mut tx, parent_session_id)
+                    .await
+                    .map_err(transient_post_compaction_claim)?;
+                let status = sqlx::query_scalar::<_, String>(
+                    r#"
+                    select status
+                    from delegations
+                    where id=$1 and parent_session_id=$2
+                    for update
+                    "#,
+                )
+                .bind(delegation_id)
+                .bind(parent_session_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(transient_post_compaction_claim)?;
+                if status.as_deref() != Some("running") {
+                    tx.commit().await.map_err(transient_post_compaction_claim)?;
+                    return Ok(None);
+                }
+            }
+        }
         lock_session_tx(&mut tx, &intent.session_id)
             .await
             .map_err(transient_post_compaction_claim)?;
+        let binding_is_current: bool = sqlx::query_scalar(
+            r#"
+            select parent_session_id is not distinct from $2
+               and delegation_id is not distinct from $3
+            from sessions
+            where id=$1
+            "#,
+        )
+        .bind(&intent.session_id)
+        .bind(parent_session_id.as_deref())
+        .bind(delegation_id.as_deref())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(transient_post_compaction_claim)?;
+        if !binding_is_current {
+            tx.commit().await.map_err(transient_post_compaction_claim)?;
+            return Ok(None);
+        }
         let Some(row) = sqlx::query(&format!(
             r#"
             select a.status, a.kind, a.action_id, a.turn_id, a.payload,
@@ -407,16 +457,19 @@ impl PostgresAgentStore {
             select min(
                 greatest(
                     coalesce(
-                        (payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint,
+                        (a.payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint,
                         0
                     ) - (extract(epoch from clock_timestamp()) * 1000)::bigint,
                     0
                 )
             )
-            from actions
-            where status in ('pending','running')
-                and kind='model'
-                and payload ? '{POST_COMPACTION_DISPATCH_KEY}'
+            from actions a
+            join sessions s on s.id=a.session_id
+            left join delegations d on d.id=s.delegation_id
+            where a.status in ('pending','running')
+                and a.kind='model'
+                and a.payload ? '{POST_COMPACTION_DISPATCH_KEY}'
+                and (s.delegation_id is null or d.status='running')
             "#,
         ))
         .fetch_one(&self.pool)

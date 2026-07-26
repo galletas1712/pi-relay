@@ -3139,25 +3139,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			if (result.queued) {
 				invalidateSessionList(projectId);
-			} else {
-				if (result.active_branch_sync) {
-					const overview = {
-						...result.active_branch_sync.overview,
-						active_leaf_id: result.active_branch_sync.active_leaf_id,
-					};
-					commitSelectedSnapshot(overview);
-					lastEventIds.current.set(sessionId, Math.max(lastEventIds.current.get(sessionId) ?? 0, overview.last_event_id));
-				} else if (result.active_branch) {
-					updateSelectedCache((current) =>
-						applySwitchResultToCache(
-							current.sessionId === sessionId ? current : selectedCacheRef.current,
-							result.active_branch!,
-						),
-					);
-					if (result.active_branch.last_event_id !== undefined) {
-						lastEventIds.current.set(sessionId, result.active_branch.last_event_id);
-					}
-				}
 			}
 			if (selectedRef.current === sessionId) {
 				await refreshSelectedSessionState(sessionId);
@@ -3166,7 +3147,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		[
 			api,
 			assertServerMutationAllowed,
-			commitSelectedSnapshot,
 			invalidateSessionList,
 			patchSelectedSnapshot,
 			refreshSelectedSessionState,

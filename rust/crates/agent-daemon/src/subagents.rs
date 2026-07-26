@@ -23,6 +23,7 @@ pub(crate) struct DelegationSubagentSpawn {
     pub(crate) task: String,
     pub(crate) subagent_type: SubagentType,
     pub(crate) delegation_id: String,
+    pub(crate) spawn_index: i32,
 }
 
 fn select_subagent_provider(
@@ -43,6 +44,7 @@ impl From<DelegationSubagentSpawn> for SubagentSpawnRequest {
             metadata: json!({}),
             subagent_type: spawn.subagent_type,
             delegation_id: Some(spawn.delegation_id),
+            spawn_index: Some(spawn.spawn_index),
         }
     }
 }
@@ -56,6 +58,7 @@ pub(crate) struct SubagentSpawnRequest {
     metadata: Value,
     subagent_type: SubagentType,
     delegation_id: Option<String>,
+    spawn_index: Option<i32>,
 }
 
 pub(crate) struct SpawnedSubagent {
@@ -126,7 +129,13 @@ pub(crate) async fn spawn_subagent(
         }
     };
     let child_metadata = subagent_metadata(
-        request.metadata,
+        match (request.metadata, request.spawn_index) {
+            (Value::Object(mut metadata), Some(index)) => {
+                metadata.insert("delegation_spawn_index".to_string(), json!(index));
+                Value::Object(metadata)
+            }
+            (metadata, _) => metadata,
+        },
         &resolved_role_name,
         &request.task,
         &role.file_path,
@@ -187,7 +196,7 @@ pub(crate) async fn spawn_subagent(
     let task = request.task;
     let initial_task = child_initial_task_message(&request.parent_session_id, &task);
     let subagent_type = request.subagent_type;
-    let started = start_prepared_session(
+    let started = match start_prepared_session(
         state,
         PreparedSessionStart {
             session_id: child_session_id.clone(),
@@ -201,7 +210,34 @@ pub(crate) async fn spawn_subagent(
             dispatch_mode: PreparedSessionDispatchMode::Deferred,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(started) => started,
+        Err(error) => {
+            if subagent_type == SubagentType::ReadOnly {
+                if let Err(cleanup_error) = state
+                    .runtime_hosts
+                    .destroy_workspace_for_runtime(&parent_config.runtime_id, &workspace_id)
+                    .await
+                {
+                    eprintln!(
+                        "failed to clean up unpersisted child workspace {workspace_id}: {cleanup_error:#}"
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
+    #[cfg(test)]
+    if state
+        .fail_subagent_after_start_before_dispatch
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(RpcError::new(
+            "injected_post_start_failure",
+            "injected failure after child/action commit and before dispatch",
+        ));
+    }
     require_known_subagent(state, &request.parent_session_id, &child_session_id).await?;
 
     let parent_events = match subagent_parent_spawn_events(
@@ -413,11 +449,6 @@ async fn cleanup_failed_spawn(
     reason: &str,
 ) {
     state.active.lock().await.remove(child_session_id);
-    if let Err(delete_error) = state.repo.delete_session(child_session_id).await {
-        eprintln!(
-            "failed to clean up child session {child_session_id} after {reason}: {delete_error:#}"
-        );
-    }
     // A full subagent shares the parent's session root/cwd in place; its
     // session dir was never created, so tearing it down would delete the
     // parent's durable workspace. Only a forked read-only child owns a private
@@ -435,6 +466,11 @@ async fn cleanup_failed_spawn(
                 );
             }
         }
+    }
+    if let Err(delete_error) = state.repo.delete_session(child_session_id).await {
+        eprintln!(
+            "failed to clean up child session {child_session_id} after {reason}: {delete_error:#}"
+        );
     }
     state
         .provider_connections

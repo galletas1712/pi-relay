@@ -97,7 +97,22 @@ async fn main() -> Result<()> {
         fail_subagent_control_reload_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(
             false,
         )),
+        #[cfg(test)]
+        fail_subagent_after_start_before_dispatch: Arc::new(AtomicBool::new(false)),
     };
+
+    // Teardown owns every child of a cancelling delegation. Finish it before
+    // controls, action recovery, post-compaction recovery, or any other child
+    // driver can run. Fail startup closed if even one teardown cannot finish.
+    delegation_tools::reconcile_cancelling_delegations_on_boot(&state)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "boot cancelling-delegation reconciliation failed: {}: {}",
+                error.code,
+                error.message
+            )
+        })?;
 
     // Combined controls capture an exact unfinished child action generation.
     // Reconcile them before post-compaction recovery so a committed interrupt
@@ -162,17 +177,15 @@ async fn main() -> Result<()> {
     if stale_actions > 0 {
         eprintln!("marked {stale_actions} abandoned action(s) stale");
     }
+    delegation_runner::recover_active_delegations_after_stale_mark(&state).await;
 
     // Complete any delegation that crashed mid-barrier: a `running` delegation whose
     // subagents are all terminal is finished (handoff + wakeup observation)
     // exactly once via the same attempt-fenced CAS the live barrier uses.
     //
-    // This runs AFTER the global stale-mark above, but that ordering is safe:
-    // delegation terminality is transcript-boundary based, independent of action
-    // status, so a subagent stale-marked mid-turn is still NON-terminal. The
-    // sweep recovers each subagent to a boundary first, so a resumable mid-turn
-    // child re-establishes live work (delegation stays running) instead of being
-    // abandoned as a failure.
+    // This runs after every active delegation child was reconstructed/driven
+    // from its durable tail above, so a resumable mid-turn child has live work
+    // again instead of being abandoned as a failure.
     delegation_runner::sweep_running_delegations_on_boot(&state).await;
     spawn_pending_subagent_control_sweeper(&state);
     match state.repo.sessions_with_active_queued_inputs().await {
@@ -1401,49 +1414,6 @@ pub(crate) async fn enqueue_session_input(
         expected_params["expected_active_leaf_id"] = expected_active_leaf_id;
     }
 
-    if let Some(client_input_id) = client_input_id.as_deref() {
-        if let Some(record) = state
-            .repo
-            .find_client_input(&session_id, client_input_id)
-            .await?
-        {
-            let queue = state
-                .repo
-                .queue_state(&session_id)
-                .await
-                .map(rpc_views::queue_state)?;
-            if perf_logging_enabled() {
-                let total_ms = started_at.elapsed().as_millis();
-                eprintln!(
-                    "perf input.follow_up session={session_id} priority={priority} replay=true total_ms={total_ms}",
-                );
-            }
-            if matches!(
-                record.status,
-                QueuedInputStatus::Queued | QueuedInputStatus::Consuming
-            ) && !state.repo.has_unfinished_actions(&session_id).await?
-            {
-                subagents::publish_subagent_parent_running_if_child(state, &session_id).await;
-                spawn_drive_until_blocked(state, session_id.clone(), "input.follow_up.replay");
-            }
-            return Ok(json!({
-                "input_id": record.input_id,
-                "accepted": matches!(
-                    record.status,
-                    QueuedInputStatus::Queued
-                        | QueuedInputStatus::Consuming
-                        | QueuedInputStatus::Consumed
-                ),
-                "queued": matches!(
-                    record.status,
-                    QueuedInputStatus::Queued | QueuedInputStatus::Consuming
-                ),
-                "replayed": true,
-                "queue": queue,
-            }));
-        }
-    }
-
     let expected_active_leaf_id = parse_expected_active_leaf_id(&expected_params)?;
     let queued = state
         .repo
@@ -1459,22 +1429,40 @@ pub(crate) async fn enqueue_session_input(
     if let Some(event) = queued.event {
         publish_events(state, vec![event]);
     }
+    let is_active = matches!(
+        queued.status,
+        QueuedInputStatus::Queued | QueuedInputStatus::Consuming
+    );
     let has_running = state.repo.has_unfinished_actions(&session_id).await?;
-    if !has_running {
+    if is_active && !has_running {
         subagents::publish_subagent_parent_running_if_child(state, &session_id).await;
-        spawn_drive_until_blocked(state, session_id.clone(), "input.follow_up");
+        spawn_drive_until_blocked(
+            state,
+            session_id.clone(),
+            if queued.replayed {
+                "input.follow_up.replay"
+            } else {
+                "input.follow_up"
+            },
+        );
     }
     if perf_logging_enabled() {
         let total_ms = started_at.elapsed().as_millis();
         eprintln!(
             "perf input.follow_up session={session_id} priority={priority} queued=true background_drive={} total_ms={total_ms}",
-            !has_running,
+            is_active && !has_running,
         );
     }
     Ok(json!({
         "input_id": queued.input_id,
-        "accepted": true,
-        "queued": true,
+        "accepted": matches!(
+            queued.status,
+            QueuedInputStatus::Queued
+                | QueuedInputStatus::Consuming
+                | QueuedInputStatus::Consumed
+        ),
+        "queued": is_active,
+        "replayed": queued.replayed,
         "queue": queued.queue.map(rpc_views::queue_state),
     }))
 }

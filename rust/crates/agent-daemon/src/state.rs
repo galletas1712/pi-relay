@@ -58,4 +58,6 @@ pub(crate) struct AppState {
     pub(crate) subagent_control_committed: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     pub(crate) fail_subagent_control_reload_after_commit: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) fail_subagent_after_start_before_dispatch: Arc<AtomicBool>,
 }
