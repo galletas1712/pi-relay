@@ -660,7 +660,7 @@ mod tests {
         assert!(contract.contains("Do not call `delegate_writing_task`"));
         assert!(contract.contains("`delegate_readonly_tasks`"));
         assert!(contract.contains("`cancel_delegation`"));
-        assert!(contract.contains("`cancel_delegation`"));
+        assert!(!contract.contains("inspect_delegation"));
         assert!(contract.contains("`steer_subagent`"));
         assert!(contract.contains("final message/report is the durable handoff"));
         assert!(contract.contains("read-only subagent"));

@@ -112,7 +112,7 @@ Delegation completion wakeups are rendered as provider-neutral daemon
 observations. The durable transcript entry is a typed
 `daemon_tool_observation`, not an ordinary user message and not a fake assistant
 tool choice. It records the daemon-authored `delegation_status` observation
-with a stable local tool-call id, arguments, status, concise summary, and bounded
+with arguments, status, concise summary, and bounded
 snapshot JSON. Provider adapters render this typed item as one plain user-role
 message carrying the daemon-authored observation text; the UI
 renders it as a daemon/system observation card.
@@ -137,10 +137,12 @@ all statuses (`running`, `cancelling`, `done`, `done_with_failures`,
 `cancelled`, `failed`),
 with bounded subagent/progress details, `outcome` control data when
 available, and artifact paths. It does not refresh artifacts or inline
-transcript or final-message bodies. A `running` entry is a point-in-time compaction fact, not a
+transcript or final-message bodies. A `running` entry is a point-in-time
+compaction fact, not a
 final outcome; later completion observations provide fresh state, and the
 ledger's `handoff_dir` and per-subagent file references can be read directly
-with ordinary file tools. If older ledger text remains in prior summaries, the newly appended
+with ordinary file tools. If older ledger text remains in prior summaries, the
+newly appended
 ledger supersedes it by being the latest section. Subagent compactions do not
 receive or append the parent ledger, sibling subagent state, or `## Current
 delegations` information; subagents summarize only their own role contract,

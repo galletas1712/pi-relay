@@ -247,8 +247,9 @@ fn snapshot_progress_count(snapshot: &Value, key: &str) -> usize {
 ///
 /// This is represented as a daemon-authored observation rather than a
 /// fabricated assistant tool call. It deliberately carries the whole delegation
-/// snapshot, instead of directing the parent to a root artifact file. Compact handoff file references are present in the
-/// snapshot; transcript contents are not inlined.
+/// snapshot, instead of directing the parent to a root artifact file. Compact
+/// handoff file references are present in the snapshot; transcript contents are
+/// not inlined.
 pub(crate) fn completion_wakeup_observation(
     snapshot: &Value,
 ) -> std::result::Result<DaemonToolObservation, RpcError> {

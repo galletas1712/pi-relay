@@ -1077,6 +1077,7 @@ async fn start_readonly_fanout_core_with_launch_key(
 /// required. `handoff_dir` is the directory the daemon renders per-subagent
 /// `final_message.md` / `transcript.md` / `task_prompt.md` into.
 fn launch_view(delegation_id: &str, session_ids: &[String], roles: &[&str]) -> Value {
+    debug_assert_eq!(session_ids.len(), roles.len());
     let subagents = session_ids
         .iter()
         .zip(roles)

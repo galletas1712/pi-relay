@@ -5,7 +5,8 @@
 //! and an exhaustive, greppable `transcript.md` — under
 //! `<parent.workspace_id>/.pi-handoff/<delegation_id>/`. The daemon wakeup
 //! observation carries the structured control-flow snapshot; these files remain
-//! transcript/detail artifacts only. Postgres transcript history is the durable source of truth:
+//! transcript/detail artifacts only. Postgres transcript history is the durable
+//! source of truth:
 //! these artifact files are derived from `active_branch` (Ui body mode) and can
 //! be re-rendered after an RO subagent's filesystem snapshot is destroyed or a
 //! daemon crash leaves publication incomplete.

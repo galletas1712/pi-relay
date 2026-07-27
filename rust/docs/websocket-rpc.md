@@ -1827,7 +1827,8 @@ done/done_with_failures delegations also expose per-subagent `final_message.md`.
 Cancelled delegations expose the transcript-only cancellation artifact path
 reported in the delegation snapshot, for example
 `cancelled/<subagent_id>.transcript.md`. The structured delegation snapshot
-comes from `delegation.status`, not from a handoff root artifact file. Raw task prompts, full final messages, and full transcript bodies
+comes from `delegation.status`, not from a handoff root artifact file. Raw task
+prompts, full final messages, and full transcript bodies
 are never inlined in delegation snapshots, daemon observations, or compaction
 ledgers; use this RPC to read an artifact body explicitly when detail is needed.
 

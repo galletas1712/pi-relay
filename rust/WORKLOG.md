@@ -45,6 +45,33 @@
 - `rust/migrations/drop-daemon-observation-call-id.sql` strips the retired key
   from durable rows. It is optional and unordered: serde ignores the unknown
   field, so old rows deserialize and render either way.
+- No transcript migration is required for the model's own historical
+  `inspect_delegation` calls, which live in transcripts as plaintext
+  `tool_use`/`function_call` items and are re-serialized on every request.
+  Verified live against both configured providers with a request whose history
+  names a tool absent from the `tools` array: Anthropic `/v1/messages`
+  (`claude-haiku-4-5`) and OpenAI Codex `/backend-api/codex/responses`
+  (`gpt-5.4-mini`) each returned 200 for the absent tool both as the latest tool
+  turn and buried in an older turn, with a passing control (history naming a
+  tool that *is* in `tools`) proving the probes meaningful. The code agrees: the
+  render path does no registry lookup (`openai_wire_tool_name` is a pure string
+  match with an `other => other` fallthrough, and replay validation only
+  requires `call_id`/`name` to be present strings), and `ToolError::UnknownTool`
+  fires on dispatch only, never on replay.
+- The `scripts/migrate_shell_to_bash.py` precedent (WORKLOG 2026-05-14) does not
+  apply here. That was a **rename**: stale `shell` names had to keep routing to
+  a working successor. This is a **removal** with no successor, and providers
+  demonstrably tolerate the orphaned name, so rewriting durable jsonb would buy
+  nothing and risk real data loss.
+- A session interrupted mid-turn with an unanswered `inspect_delegation` call at
+  the tail also resumes cleanly: the registry's `UnknownTool` surfaces through
+  `runtime_hosts::execute` as a `RuntimeCommandError`, which
+  `runtime/tool.rs` turns into an error `ToolResultMessage` for that call. The
+  turn continues with a tool error, it does not fail.
+- Follow-up (outside this repo): the runtime-host role prompts
+  `~/.config/pi-relay/runtime/subagent-roles/{tester,reviewer,explore}/SKILL.md`
+  still tell subagents to branch on "a refreshed `inspect_delegation` snapshot"
+  and need that sentence removed.
 
 ## 2026-07-26
 

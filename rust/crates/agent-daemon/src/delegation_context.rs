@@ -181,10 +181,7 @@ async fn append_subagents(
         .saturating_sub(shown)
         .max(subagents.len().saturating_sub(shown));
     if omitted > 0 {
-        out.push_str(&format!(
-            "  - ... {} more subagent(s) omitted from compaction ledger; list handoff_dir to see them all.\n",
-            omitted
-        ));
+        out.push_str(&omitted_subagents_line(delegation.status, omitted));
     }
     Ok(())
 }
@@ -221,6 +218,18 @@ fn transcript_file_for(status: DelegationStatus, subagent_id: &str) -> Option<St
         DelegationStatus::Failed => None,
         _ => Some(format!("{subagent_id}/transcript.md")),
     }
+}
+
+/// The overflow line for subagents the ledger could not show. Pointing the
+/// parent at `handoff_dir` only helps when that directory actually holds a file
+/// per subagent: `Cancelling` and `Failed` publish nothing at all (see
+/// `refresh_delegation_handoff_artifacts`), so the directory may not even exist.
+fn omitted_subagents_line(status: DelegationStatus, omitted: usize) -> String {
+    let hint = match status {
+        DelegationStatus::Cancelling | DelegationStatus::Failed => "",
+        _ => "; list handoff_dir to see them all",
+    };
+    format!("  - ... {omitted} more subagent(s) omitted from compaction ledger{hint}.\n")
 }
 
 fn final_message_relevant(status: DelegationStatus) -> bool {
@@ -352,10 +361,7 @@ pub(crate) fn test_ledger_from_snapshots(
             .saturating_sub(shown)
             .max(subagents.len().saturating_sub(shown));
         if omitted > 0 {
-            out.push_str(&format!(
-                "  - ... {} more subagent(s) omitted from compaction ledger; list handoff_dir to see them all.\n",
-                omitted
-            ));
+            out.push_str(&omitted_subagents_line(delegation.status, omitted));
         }
     }
     Ok(out.trim_end().to_string())
