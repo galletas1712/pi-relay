@@ -12,7 +12,9 @@
 //! every destination directory is created with `mkdirat` and opened with
 //! `openat(O_NOFOLLOW)` against the directory fd above it, and files with
 //! `openat(O_CREAT | O_EXCL | O_NOFOLLOW)`, so a symlink planted in the target
-//! tree is unlinked and replaced rather than written through. Order is the
+//! tree is unlinked and replaced rather than written through — that unlink is
+//! also what breaks a planted hardlink, and the create is retried because the
+//! unlink-then-create pair is a gap a racing creator can win. Order is the
 //! sorted relative path, so a truncated copy is reproducible.
 
 use std::collections::BinaryHeap;
@@ -119,6 +121,7 @@ fn copy_artifact_tree_blocking(
         copied: CopiedArtifacts::default(),
         bytes: 0,
         examined: 0,
+        stopped: false,
     };
     copy_dir(source_fd, Path::new(""), 0, &mut walk)?;
     Ok(Some(walk.copied))
@@ -142,11 +145,22 @@ struct Walk {
     /// tree of a million empty directories from stalling the walk — and with it
     /// the parent's cwd mutation guard — for minutes.
     examined: usize,
+    /// Set when a bound ended the walk, so the enclosing directories stop too.
+    /// Distinct from `truncated`, which only says the manifest is incomplete: a
+    /// directory with more entries than the walk could afford to list is
+    /// truncated without the walk stopping.
+    stopped: bool,
 }
 
 impl Walk {
     fn budget(&self) -> usize {
         MAX_ARTIFACT_FILES.saturating_sub(self.examined)
+    }
+
+    /// End the walk here and report the manifest as incomplete.
+    fn stop(&mut self) {
+        self.stopped = true;
+        self.copied.truncated = true;
     }
 
     /// The target directory for `relative`, creating and opening each component
@@ -157,7 +171,7 @@ impl Walk {
         if self.target_base_fd.is_none() {
             let root = open_target_dir(rustix::fs::CWD, &path_cstring(&self.target_root)?)
                 .with_context(|| format!("open {}", self.target_root.display()))?;
-            self.target_base_fd = Some(self.descend(root, &self.target_rel.clone())?);
+            self.target_base_fd = Some(descend(root, &self.target_rel, &self.target_root)?);
         }
         let base = self
             .target_base_fd
@@ -165,23 +179,21 @@ impl Walk {
             .expect("target base fd")
             .try_clone()
             .context("clone artifact target dir")?;
-        self.descend(base, relative)
+        descend(base, relative, &self.target_root.join(&self.target_rel))
     }
+}
 
-    fn descend(&self, mut dir: OwnedFd, relative: &Path) -> Result<OwnedFd> {
-        for component in relative.iter() {
-            dir = create_dir_at(&dir, component).with_context(|| {
-                format!(
-                    "create artifact dir {}",
-                    self.target_root
-                        .join(&self.target_rel)
-                        .join(relative)
-                        .display()
-                )
-            })?;
-        }
-        Ok(dir)
+/// Create and open each component of `relative` below `dir`. `display` is what
+/// `dir` is called in errors; the component that actually failed is named, not
+/// the deepest one the caller asked for.
+fn descend(mut dir: OwnedFd, relative: &Path, display: &Path) -> Result<OwnedFd> {
+    let mut walked = display.to_path_buf();
+    for component in relative.iter() {
+        walked.push(component);
+        dir = create_dir_at(&dir, component)
+            .with_context(|| format!("create artifact dir {}", walked.display()))?;
     }
+    Ok(dir)
 }
 
 /// Copy the contents of the already-opened directory `source` into the target
@@ -194,12 +206,16 @@ impl Walk {
 /// us.
 fn copy_dir(source: OwnedFd, relative: &Path, depth: usize, walk: &mut Walk) -> Result<()> {
     let DirNames { names, overflowed } = read_dir_names(&source, walk.budget())?;
+    // A directory holding more entries than the walk could still afford to
+    // examine is itself a truncation, even if nothing in it was copyable. The
+    // walk carries on with the names it did get, so this is not a `stop`.
+    walk.copied.truncated |= overflowed;
     // Opened on the first file actually copied, so an empty source directory
     // creates nothing in the target.
     let mut target_dir = None;
 
     for name in names {
-        if walk.copied.truncated {
+        if walk.stopped {
             return Ok(());
         }
         // Every entry costs the same against the bound whether it is copied,
@@ -207,7 +223,7 @@ fn copy_dir(source: OwnedFd, relative: &Path, depth: usize, walk: &mut Walk) -> 
         // `skipped` is written into the parent's durable workspace just like
         // `files`.
         if walk.examined >= MAX_ARTIFACT_FILES {
-            walk.copied.truncated = true;
+            walk.stop();
             return Ok(());
         }
         walk.examined += 1;
@@ -240,7 +256,7 @@ fn copy_dir(source: OwnedFd, relative: &Path, depth: usize, walk: &mut Walk) -> 
         } else if file_type(&metadata) == FileType::RegularFile {
             let size = metadata.st_size as u64;
             if walk.bytes + size > MAX_ARTIFACT_BYTES {
-                walk.copied.truncated = true;
+                walk.stop();
                 return Ok(());
             }
             let dir = match &target_dir {
@@ -260,9 +276,6 @@ fn copy_dir(source: OwnedFd, relative: &Path, depth: usize, walk: &mut Walk) -> 
             walk.copied.skipped.push(display);
         }
     }
-    // A directory holding more entries than the walk could still afford to
-    // examine is itself a truncation, even if nothing in it was copyable.
-    walk.copied.truncated |= overflowed;
     Ok(())
 }
 
@@ -336,8 +349,14 @@ fn create_dir_at(dir: &OwnedFd, name: &OsStr) -> Result<OwnedFd> {
         Err(rustix::io::Errno::EXIST) => {}
         Err(error) => return Err(error.into()),
     }
-    if let Ok(existing) = open_target_dir(dir.as_fd(), &name) {
-        return Ok(existing);
+    // Only the errnos that mean "the name exists but is not a directory" take
+    // the destroy-and-replace path. Anything else — a directory we are not
+    // allowed to open, an fd table that is full — is an error, not a licence to
+    // unlink what is there.
+    match open_target_dir(dir.as_fd(), &name) {
+        Ok(existing) => return Ok(existing),
+        Err(rustix::io::Errno::NOTDIR) | Err(rustix::io::Errno::LOOP) => {}
+        Err(error) => return Err(error.into()),
     }
     rustix::fs::unlinkat(dir.as_fd(), name.as_c_str(), rustix::fs::AtFlags::empty())?;
     rustix::fs::mkdirat(dir.as_fd(), name.as_c_str(), DIR_MODE)?;
@@ -345,21 +364,29 @@ fn create_dir_at(dir: &OwnedFd, name: &OsStr) -> Result<OwnedFd> {
 }
 
 /// Create `name` under `dir` for writing. Any existing name — a leftover from an
-/// earlier handback, or a symlink planted in the target — is removed rather than
-/// written through; `unlinkat` never follows, so this cannot reach outside the
-/// target tree, and `O_EXCL` then refuses anything that reappears.
+/// earlier handback, or a symlink or hardlink planted in the target — is removed
+/// rather than written through; `unlinkat` never follows, so this cannot reach
+/// outside the target tree, and `O_EXCL` then refuses anything that reappeared
+/// in the gap. Unlink and create are therefore two steps, and a creator racing
+/// them can win the gap, so the pair is retried a bounded number of times before
+/// giving up.
 fn create_file_at(dir: &OwnedFd, name: &OsStr) -> Result<OwnedFd> {
+    const ATTEMPTS: usize = 8;
+
     let name = target_name(name)?;
-    match rustix::fs::unlinkat(dir.as_fd(), name.as_c_str(), rustix::fs::AtFlags::empty()) {
-        Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-        Err(error) => return Err(error.into()),
+    for _ in 0..ATTEMPTS {
+        match rustix::fs::unlinkat(dir.as_fd(), name.as_c_str(), rustix::fs::AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+        match rustix::fs::openat(dir.as_fd(), name.as_c_str(), TARGET_FILE_FLAGS, FILE_MODE) {
+            Ok(file) => return Ok(file),
+            // Something recreated the name between the unlink and the open.
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(error) => return Err(error.into()),
+        }
     }
-    Ok(rustix::fs::openat(
-        dir.as_fd(),
-        name.as_c_str(),
-        TARGET_FILE_FLAGS,
-        FILE_MODE,
-    )?)
+    anyhow::bail!("the name was recreated by another writer {ATTEMPTS} times running")
 }
 
 fn target_name(name: &OsStr) -> Result<CString> {
@@ -542,6 +569,103 @@ mod tests {
             std::fs::read_to_string(target.join("sub/x.txt")).expect("read"),
             "child"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A hardlink planted in the target points at an inode outside the tree that
+    /// no `O_NOFOLLOW` can detect. Only the `unlinkat` before the create breaks
+    /// it, which is why the create is not a plain `O_TRUNC` open.
+    #[tokio::test]
+    async fn a_hardlink_in_the_target_leaves_the_outside_file_untouched() {
+        let root = temp_root("target-hardlink");
+        let source = root.join("src");
+        let target = root.join("dst");
+        let outside = root.join("outside");
+        write(&outside.join("victim.txt"), "innocent");
+        write(&source.join("victim.txt"), "child");
+        std::fs::create_dir_all(&target).expect("target");
+        std::fs::hard_link(outside.join("victim.txt"), target.join("victim.txt"))
+            .expect("hard link");
+
+        let copied = copy(&root).await.expect("present");
+
+        assert_eq!(copied.files.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim.txt")).expect("read"),
+            "innocent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("victim.txt")).expect("read"),
+            "child"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Unlink and create are two steps, so a creator racing them wins the gap
+    /// often enough to abort whole handbacks — one lost create fails the copy.
+    /// Without the retry ~3% of the calls below come back `EEXIST`.
+    #[test]
+    fn a_racing_creator_never_defeats_the_create() {
+        let root = temp_root("create-race");
+        let dir = open_target_dir(rustix::fs::CWD, &path_cstring(&root).expect("cstring"))
+            .expect("open dir");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let racer = std::thread::spawn({
+            let (path, stop) = (root.join("contended.txt"), stop.clone());
+            move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::fs::write(&path, "racer").ok();
+                    // A racer that never pauses is not a race, it is starvation:
+                    // it can beat every retry to the name and no bound survives
+                    // that. This much is enough to lose ~3% of the creates below
+                    // to `EEXIST` without the retry.
+                    std::thread::sleep(std::time::Duration::from_micros(10));
+                }
+            }
+        });
+
+        for _ in 0..2000 {
+            create_file_at(&dir, OsStr::new("contended.txt")).expect("create");
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        racer.join().expect("join");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A directory the copy cannot open is an error, not something to unlink.
+    /// Treating every `openat` failure as "the name is not a directory" reported
+    /// whatever the unlink then failed with — `EISDIR` here — instead of the
+    /// `EACCES` that actually stopped the copy, and for a name that unlink does
+    /// succeed on it would have destroyed it.
+    #[tokio::test]
+    async fn an_unopenable_target_directory_is_an_error_and_is_not_unlinked() {
+        let root = temp_root("target-unopenable");
+        let source = root.join("src");
+        let target = root.join("dst");
+        write(&source.join("sub/x.txt"), "child");
+        std::fs::create_dir_all(target.join("sub")).expect("target");
+        std::fs::set_permissions(
+            target.join("sub"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("chmod");
+
+        let error = copy_artifact_tree(&source, &root, Path::new("dst"))
+            .await
+            .expect_err("permission denied");
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("create artifact dir") && error.contains("Permission denied"),
+            "unexpected error: {error}"
+        );
+        assert!(target.join("sub").is_dir());
+        std::fs::set_permissions(
+            target.join("sub"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod");
         std::fs::remove_dir_all(root).ok();
     }
 
