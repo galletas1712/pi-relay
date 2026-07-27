@@ -134,6 +134,7 @@ async fn oauth_route_is_immediately_login_required_without_blocking_healthy_rout
             profile: agent_prompt::PromptProfile::Parent,
             cwd: PathBuf::from("/unused"),
             has_project: false,
+            parent_session_id: None,
             workspaces: Vec::new(),
             agents_md: String::new(),
             tools: Vec::new(),

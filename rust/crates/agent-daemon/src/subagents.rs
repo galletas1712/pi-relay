@@ -128,6 +128,9 @@ pub(crate) async fn spawn_subagent(
                 .await?
         }
     };
+    // The child's metadata must be assigned before `child_system_prompt`, and
+    // is load-bearing for prompt *content*: `PI.md` gates the subagent contract
+    // and write-durability wording on `parent_session_id` / `subagent_type`.
     let child_metadata = subagent_metadata(
         match (request.metadata, request.spawn_index) {
             (Value::Object(mut metadata), Some(index)) => {
@@ -141,6 +144,7 @@ pub(crate) async fn spawn_subagent(
         &role.file_path,
         &parent_config.metadata,
         request.subagent_type,
+        &request.parent_session_id,
     );
     let selected_role_provider = request.provider.is_none() && role.provider.is_some();
     let mut child_config = SessionConfig {
@@ -188,8 +192,6 @@ pub(crate) async fn spawn_subagent(
             file_path: &role.file_path,
             content: &role.content,
             skills: &role.skills,
-            parent_session_id: &request.parent_session_id,
-            subagent_type: request.subagent_type,
         },
     )
     .await?;
@@ -485,6 +487,7 @@ fn subagent_metadata(
     role_file_path: &PathBuf,
     parent_metadata: &Value,
     subagent_type: SubagentType,
+    parent_session_id: &str,
 ) -> Value {
     let mut metadata = match metadata {
         Value::Object(map) => Value::Object(map),
@@ -513,6 +516,7 @@ fn subagent_metadata(
     map.insert("subagent".to_string(), json!(true));
     map.insert("prompt_profile".to_string(), json!("subagent"));
     map.insert("subagent_type".to_string(), json!(subagent_type.as_str()));
+    map.insert("parent_session_id".to_string(), json!(parent_session_id));
     map.insert("role_name".to_string(), json!(role_name));
     map.insert("task".to_string(), json!(task));
     map.insert("role_file_path".to_string(), json!(role_file_path));
@@ -527,38 +531,12 @@ Use the delegated task, role instructions, workspace/project context, and any fi
     )
 }
 
-fn subagent_workspace_semantics(subagent_type: SubagentType) -> &'static str {
-    match subagent_type {
-        SubagentType::Full => {
-            "You are a full subagent. Your filesystem edits are made in the parent workspace in place and affect what the parent will see."
-        }
-        SubagentType::ReadOnly => {
-            "You are a read-only subagent. Writes under your session cwd stay in a disposable snapshot and do not reach the parent — except `./.pi-handoff/`, whose contents are copied to the parent when you finish. Put files you want to hand back there (bounded: 200 files / 32 MiB). Absolute runtime-host paths are shared and must be treated as read-only."
-        }
-    }
-}
-
-fn subagent_contract_text(parent_session_id: &str, subagent_type: SubagentType) -> String {
-    let workspace_semantics = subagent_workspace_semantics(subagent_type);
-    format!(
-        "# Subagent contract\n\n\
-You are a child agent spawned by parent session `{parent_session_id}`.\n\
-The parent can inspect your transcript, send follow-up messages, interrupt you, and decide whether to merge your filesystem changes.\n\
-Keep your own context focused on the delegated task. Do not assume your changes are merged automatically.\n\
-You cannot spawn nested delegations. Do not call `delegate_writing_task`, `delegate_readonly_tasks`, `cancel_delegation`, or `steer_subagent`; those parent orchestration tools are unavailable to subagents.\n\
-Answer only the delegated task. Your final message/report is the durable handoff to the parent, so include the evidence, changed files, commands, risks, and follow-up work the parent needs.\n\
-{workspace_semantics}"
-    )
-}
-
 struct ChildPromptRole<'a> {
     name: &'a str,
     description: &'a str,
     file_path: &'a PathBuf,
     content: &'a str,
     skills: &'a [crate::provider_runtime::ResolvedPreloadedSkill],
-    parent_session_id: &'a str,
-    subagent_type: SubagentType,
 }
 
 async fn child_system_prompt(
@@ -567,7 +545,6 @@ async fn child_system_prompt(
     role: ChildPromptRole<'_>,
 ) -> std::result::Result<String, RpcError> {
     let base = render_pi_prompt(state, config).await?;
-    let contract = subagent_contract_text(role.parent_session_id, role.subagent_type);
     let preloaded = role
         .skills
         .iter()
@@ -582,7 +559,7 @@ async fn child_system_prompt(
         .collect::<Vec<_>>()
         .join("\n\n");
     Ok(format!(
-        "{base}\n\n{contract}\n\n\
+        "{base}\n\n\
 # Subagent role\n\n\
 Role: `{}`\n\
 Description: {}\n\n\
@@ -601,6 +578,9 @@ SKILL.md: `{}`\n\n\
 mod tests {
     use super::*;
 
+    /// The metadata this asserts is load-bearing for prompt *content*:
+    /// `prompt_profile`, `subagent_type`, and `parent_session_id` are what
+    /// `PI.md` gates the subagent contract and write-durability wording on.
     #[test]
     fn subagent_metadata_marks_session_hidden() {
         let metadata = subagent_metadata(
@@ -610,6 +590,7 @@ mod tests {
             &PathBuf::from("/tmp/reviewer/SKILL.md"),
             &json!({ "harness": true, "auto_title_disabled": true }),
             SubagentType::ReadOnly,
+            "session_parent",
         );
         assert_eq!(
             metadata,
@@ -621,6 +602,7 @@ mod tests {
                 "subagent": true,
                 "prompt_profile": "subagent",
                 "subagent_type": "read_only",
+                "parent_session_id": "session_parent",
                 "role_name": "reviewer",
                 "task": "Review this",
                 "role_file_path": "/tmp/reviewer/SKILL.md",
@@ -636,36 +618,6 @@ mod tests {
         assert!(message.contains("Parent session: `parent`"));
         assert!(message.contains("Inspect the repo."));
         assert!(message.contains("A subagent runs with fresh context"));
-    }
-
-    #[test]
-    fn subagent_workspace_semantics_distinguish_full_and_read_only() {
-        let full = subagent_workspace_semantics(SubagentType::Full);
-        assert!(full.contains("full subagent"));
-        assert!(full.contains("parent workspace in place"));
-        assert!(full.contains("affect what the parent will see"));
-
-        let read_only = subagent_workspace_semantics(SubagentType::ReadOnly);
-        assert!(read_only.contains("read-only subagent"));
-        assert!(read_only.contains("disposable snapshot"));
-        assert!(read_only.contains("do not reach the parent"));
-        assert!(read_only.contains("`./.pi-handoff/`"));
-        assert!(read_only.contains("200 files / 32 MiB"));
-    }
-
-    #[test]
-    fn subagent_contract_forbids_nested_delegation() {
-        let contract = subagent_contract_text("parent-session", SubagentType::ReadOnly);
-
-        assert!(contract.contains("parent session `parent-session`"));
-        assert!(contract.contains("cannot spawn nested delegations"));
-        assert!(contract.contains("Do not call `delegate_writing_task`"));
-        assert!(contract.contains("`delegate_readonly_tasks`"));
-        assert!(contract.contains("`cancel_delegation`"));
-        assert!(!contract.contains("inspect_delegation"));
-        assert!(contract.contains("`steer_subagent`"));
-        assert!(contract.contains("final message/report is the durable handoff"));
-        assert!(contract.contains("read-only subagent"));
     }
 
     #[test]

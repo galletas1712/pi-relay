@@ -46,7 +46,8 @@ provider_runtime/  provider selection, model metadata scheduling, model/web-tool
                    (MCP snapshot reconstruction from the persisted session manifest)
 subagents.rs       delegation subagent spawn core: role resolution, full vs
                    read-only workspace handling, role-local model selection,
-                   child prompt + lifecycle events
+                   child prompt (rendered PI.md + role SKILL.md + preloaded
+                   skills) + lifecycle events
 delegation_tools.rs     delegation tool surface (delegate_writing_task /
                    delegate_readonly_tasks / cancel_delegation /
                    steer_subagent / interrupt_subagent)

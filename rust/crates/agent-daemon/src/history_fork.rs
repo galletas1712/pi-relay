@@ -115,6 +115,7 @@ fn fork_metadata(
         "hidden",
         "subagent",
         "subagent_type",
+        "parent_session_id",
         "role_name",
         "task",
         "role_file_path",
