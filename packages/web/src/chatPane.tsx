@@ -41,7 +41,7 @@ export interface ChatPaneProps {
 	onResumeTurn: (entryId: string) => void;
 	onExpandTurn?: (turnId: string) => void;
 	onCollapseTurn?: (turnId: string) => void;
-	onOpenSystemPrompt?: () => void;
+	transcriptStartContent?: ReactNode;
 	loadingTurnId?: string | null;
 	hasOlderTurns?: boolean;
 	loadingOlderTurns?: boolean;
@@ -83,7 +83,7 @@ export const ChatPane = memo(function ChatPane({
 	onResumeTurn,
 	onExpandTurn,
 	onCollapseTurn,
-	onOpenSystemPrompt,
+	transcriptStartContent,
 	loadingTurnId,
 	hasOlderTurns,
 	loadingOlderTurns,
@@ -140,7 +140,7 @@ export const ChatPane = memo(function ChatPane({
 				remoteReadBlockedReason={remoteReadBlockedReason}
 				onExpandTurn={onExpandTurn}
 				onCollapseTurn={onCollapseTurn}
-				onOpenSystemPrompt={onOpenSystemPrompt}
+				transcriptStartContent={transcriptStartContent}
 				loadingTurnId={loadingTurnId}
 				hasOlderTurns={hasOlderTurns}
 				loadingOlderTurns={loadingOlderTurns}

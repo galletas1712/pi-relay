@@ -100,10 +100,7 @@ import { formatWorkspacePreparationStatus } from "./workspaceMaterializeProgress
 import { findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
 import { stopSession } from "./stopSession.ts";
-import {
-	SystemPromptDialog,
-	type SystemPromptDialogState,
-} from "./systemPromptDialog.tsx";
+import { SystemPromptDisclosure } from "./systemPromptDisclosure.tsx";
 import {
 	mergeSnapshotIntoSessionList,
 	patchSessionListEventSummary,
@@ -250,11 +247,6 @@ type HistoryDialogState = {
 	loading: boolean;
 	submitting: boolean;
 	error: string | null;
-};
-
-type PromptDialogState = SystemPromptDialogState & {
-	generation: number;
-	sessionId: string;
 };
 
 type DeleteDialogState = {
@@ -421,8 +413,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [renameValue, setRenameValue] = useState("");
 	const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
 	const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
-	const [promptDialog, setPromptDialog] = useState<PromptDialogState | null>(null);
-	const nextPromptDialogGenerationRef = useRef(0);
 	const [mcpLoginDialog, setMcpLoginDialog] = useState<{
 		server: string;
 		login: McpLoginResult;
@@ -1474,7 +1464,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			current?.sessionId === sessionId ? current : null
 		);
 		setHistoryDialog((current) => current?.sessionId === sessionId ? current : null);
-		setPromptDialog((current) => current?.sessionId === sessionId ? current : null);
 		selectedRef.current = sessionId;
 		setConversationSessionId(sessionId);
 		setShowAllDelegations(false);
@@ -3717,51 +3706,23 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		[api, hasRunningDelegations],
 	);
 
-	const openSystemPrompt = useCallback(async () => {
-		const sessionId = selectedRef.current;
-		if (!sessionId || selectedCacheRef.current.snapshot?.session_id !== sessionId) {
+	const loadSystemPrompt = useCallback(async (sessionId: string) => {
+		if (
+			selectedRef.current !== sessionId ||
+			selectedCacheRef.current.snapshot?.session_id !== sessionId
+		) {
 			throw new Error("system prompt requires a selected session");
 		}
 		assertServerReadAllowed();
-		const generation = ++nextPromptDialogGenerationRef.current;
-		setPromptDialog({
-			generation,
-			sessionId,
-			loading: true,
-			template: "",
-			rendered: null,
-			view: "rendered",
-			error: null,
+		const prompt = await queryClient.fetchQuery({
+			queryKey: queryKeys.systemPrompt(sessionId),
+			queryFn: () => {
+				assertServerReadAllowed();
+				return api.getSystemPrompt(sessionId);
+			},
+			staleTime: 0,
 		});
-		try {
-			const next = await queryClient.fetchQuery({
-				queryKey: queryKeys.systemPrompt(sessionId),
-				queryFn: () => {
-					assertServerReadAllowed();
-					return api.getSystemPrompt(sessionId);
-				},
-				staleTime: 0,
-			});
-			setPromptDialog((current) =>
-				current?.generation === generation && current.sessionId === sessionId ? {
-				...current,
-				loading: false,
-				template: next.template,
-				rendered: next.rendered,
-				view: next.rendered ? "rendered" : "template",
-				error: null,
-			} : current);
-		} catch (error) {
-			setPromptDialog((current) =>
-				current?.generation === generation && current.sessionId === sessionId ? {
-				...current,
-				loading: false,
-				template: "",
-				rendered: null,
-				view: "template",
-				error: errorMessage(error),
-			} : current);
-		}
+		return prompt.rendered;
 	}, [api, assertServerReadAllowed, queryClient, selectedCacheRef]);
 
 	const executeSlash = useCallback(
@@ -4360,9 +4321,15 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						onResumeTurn={handleResumeTurn}
 						onExpandTurn={expandTurn}
 						onCollapseTurn={collapseTurn}
-						onOpenSystemPrompt={
+						transcriptStartContent={
 							loadedSnapshot?.session_id === selectedId
-								? () => void openSystemPrompt().catch(reportActionError)
+								? (
+										<SystemPromptDisclosure
+											key={selectedId}
+											loadPrompt={() => loadSystemPrompt(selectedId)}
+											remoteReadBlockedReason={connectionRemoteActionBlockedReason}
+										/>
+									)
 								: undefined
 						}
 						loadingTurnId={loadingTurnId ?? autoLoadingTurnId}
@@ -4588,15 +4555,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						});
 					}}
 					mutationBlockedReason={connectionRemoteActionBlockedReason}
-				/>
-			) : null}
-
-			{promptDialog ? (
-				<SystemPromptDialog
-					state={promptDialog}
-					onChangeView={(view) => setPromptDialog((current) => (current ? { ...current, view } : current))}
-					onClose={() => setPromptDialog(null)}
-					returnFocusFallbackRef={composerDialogReturnFocusRef}
 				/>
 			) : null}
 

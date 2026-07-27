@@ -475,9 +475,11 @@ chat is purely composer state. Legacy UI selection migration uses
 retired `piRelayTranscriptScroll:v1` key is removed defensively.
 
 At the true start of a durable session transcript, **See system prompt** fetches
-that session's persisted rendered `PI.md` prompt and source template through
-`system.prompt`. The control remains hidden while older turn pages are available
-and does not appear in unsaved new-session state.
+that session's persisted rendered prompt through `system.prompt` and expands it
+inline before the first user message. The control becomes **Hide system prompt**
+while expanded. The UI ignores the response's source-template field. The
+control remains hidden while older turn pages are available and does not appear
+in unsaved new-session state.
 
 ### Slash commands
 

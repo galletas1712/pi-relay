@@ -237,7 +237,7 @@ export const MessageList = memo(function MessageList({
 	turnCards,
 	onExpandTurn,
 	onCollapseTurn,
-	onOpenSystemPrompt,
+	transcriptStartContent,
 	loadingTurnId,
 	hasOlderTurns,
 	loadingOlderTurns,
@@ -268,7 +268,7 @@ export const MessageList = memo(function MessageList({
 	turnCards?: TurnCardView[] | null;
 	onExpandTurn?: (turnId: string) => void;
 	onCollapseTurn?: (turnId: string) => void;
-	onOpenSystemPrompt?: () => void;
+	transcriptStartContent?: ReactNode;
 	loadingTurnId?: string | null;
 	hasOlderTurns?: boolean;
 	loadingOlderTurns?: boolean;
@@ -832,19 +832,7 @@ export const MessageList = memo(function MessageList({
 							) : null}
 						</div>
 					) : null}
-					{!hasOlderTurns && onOpenSystemPrompt ? (
-						<div className="turn-detail-toggle-row transcript-start-control">
-							<button
-								type="button"
-								className="link-button"
-								disabled={!!remoteReadBlockedReason}
-								onClick={onOpenSystemPrompt}
-							>
-								See system prompt
-							</button>
-							<ConnectionBlockedReason reason={remoteReadBlockedReason} />
-						</div>
-					) : null}
+					{!hasOlderTurns ? transcriptStartContent : null}
 					{shouldUseTurnCards
 						? (
 								<>
@@ -1816,7 +1804,7 @@ export const markdownComponents: Components = {
 	}
 };
 
-const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
+export const AssistantMarkdown = memo(function AssistantMarkdown({ text }: { text: string }) {
 	return (
 		<div className="assistant-markdown">
 			<ReactMarkdown
@@ -1835,7 +1823,7 @@ const AssistantTextBlock = memo(function AssistantTextBlock({ node }: { node: Ex
 		<div className="message-row assistant-row">
 			<div className={`assistant-block phase-${node.phase} ${node.copyText ? "has-copy" : ""}`}>
 				<div className="assistant-content">
-					{node.text ? <MarkdownText text={node.text} /> : null}
+					{node.text ? <AssistantMarkdown text={node.text} /> : null}
 				</div>
 				{node.copyText ? <AssistantCopyButton text={node.copyText} /> : null}
 			</div>

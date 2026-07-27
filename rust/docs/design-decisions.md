@@ -90,9 +90,10 @@ have dedicated UI controls, without adding a second frontend command model.
   selected user message as that child's composer draft.
 - `/compact` requests context compaction.
 
-The transcript-start **See system prompt** control calls `system.prompt` to show
-the selected session's rendered PI.md prompt and source template. It is
-unavailable before a durable session exists.
+The transcript-start **See system prompt** control calls `system.prompt` and
+expands the selected session's persisted rendered prompt inline before its
+first user message. The web UI ignores the source template returned by the RPC.
+The control is unavailable before a durable session exists.
 
 Model selection is not a slash command. The web top bar exposes the small model
 picker and provider-specific reasoning effort picker. Provider/model identity may

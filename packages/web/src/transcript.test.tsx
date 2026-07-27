@@ -412,7 +412,7 @@ describe("MessageList session loading guard", () => {
 				hasSession
 				sessionId="session_a"
 				entriesSessionId="session_a"
-				onOpenSystemPrompt={() => {}}
+				transcriptStartContent={<div>See system prompt</div>}
 			/>,
 		);
 		const pagedTail = renderToStaticMarkup(
@@ -425,7 +425,7 @@ describe("MessageList session loading guard", () => {
 				sessionId="session_a"
 				entriesSessionId="session_a"
 				hasOlderTurns
-				onOpenSystemPrompt={() => {}}
+				transcriptStartContent={<div>See system prompt</div>}
 			/>,
 		);
 
@@ -443,7 +443,7 @@ describe("MessageList session loading guard", () => {
 				hasSession
 				sessionId="session_a"
 				entriesSessionId="session_a"
-				onOpenSystemPrompt={() => {}}
+				transcriptStartContent={<div>See system prompt</div>}
 			/>,
 		);
 		const unsaved = renderToStaticMarkup(
@@ -453,7 +453,7 @@ describe("MessageList session loading guard", () => {
 				isRunning={false}
 				serverTimeMs={null}
 				hasSession={false}
-				onOpenSystemPrompt={() => {}}
+				transcriptStartContent={<div>See system prompt</div>}
 			/>,
 		);
 
