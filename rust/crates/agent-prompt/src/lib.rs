@@ -517,7 +517,8 @@ mod tests {
         assert!(rendered.contains("disposable copy"));
         assert!(rendered.contains("Apart from `./.pi-handoff/` (below), nothing you write"));
         assert!(rendered.contains("do not create branches on, push to"));
-        assert!(rendered.contains("disposable snapshot and do not reach the"));
+        assert!(rendered
+            .contains("disposable snapshot and do not reach the\nparent, except as noted below."));
         assert!(rendered.contains("`./.pi-handoff/`"));
     }
 

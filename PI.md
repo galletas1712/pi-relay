@@ -23,7 +23,7 @@ Local folder workspace subdirectories are private copies for this session. Treat
 The only artifacts that you can put in the current working directory directly are those that shouldn't end up in the repo.
 Typically these are things like uv/python virtual environments, etc that are host/user/session specific, as well as any temporary artifacts.
 {% else %}
-Every workspace subdirectory here is a disposable copy. Apart from `./.pi-handoff/` (below), nothing you write under this cwd reaches anyone else, so do not create branches on, push to, or otherwise mutate any remote — those side effects are real and would outlive this session.
+Every workspace subdirectory here is a disposable copy. {% if capabilities.has_handoff_dir %}Apart from `./.pi-handoff/` (below), nothing{% else %}Nothing{% endif %} you write under this cwd reaches anyone else, so do not create branches on, push to, or otherwise mutate any remote — those side effects are real and would outlive this session.
 {% endif %}
 {% endif %}
 
@@ -99,7 +99,8 @@ Your filesystem edits are made in the parent workspace in place and affect what
 the parent will see.
 {% else %}
 Writes under your session cwd stay in a disposable snapshot and do not reach the
-parent. Absolute runtime-host paths are shared and must be treated as read-only.
+parent, except as noted below. Absolute runtime-host paths are shared and must
+be treated as read-only.
 {% endif %}
 {% if capabilities.has_handoff_dir %}
 To hand a file back rather than describing it, write it under `./.pi-handoff/`
