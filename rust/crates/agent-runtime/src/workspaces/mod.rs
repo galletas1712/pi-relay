@@ -1,3 +1,4 @@
+mod artifacts;
 mod config;
 mod git;
 mod instantiate;
@@ -12,15 +13,16 @@ use std::{
 };
 
 use agent_runtime_protocol::{
-    InstructionScope, ProjectWorkspace, RawInstructionFile, RawSkillFile, RuntimeContext,
-    SessionWorkspace, SkillKind, SkillOrigin, WorkspaceKind, WorkspaceMaterializePhase,
-    WorkspaceMaterializeProgress,
+    CopiedArtifacts, InstructionScope, ProjectWorkspace, RawInstructionFile, RawSkillFile,
+    RuntimeContext, SessionWorkspace, SkillKind, SkillOrigin, WorkspaceKind,
+    WorkspaceMaterializePhase, WorkspaceMaterializeProgress,
 };
 use anyhow::{bail, Context, Result};
 use futures_util::future::try_join_all;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
+use self::artifacts::copy_artifact_tree;
 pub use self::config::validate_workspace_dir;
 use self::config::{
     branch_component, path_component, read_workspace_base_config, required_git_field,
@@ -42,7 +44,9 @@ pub type MaterializeProgressSink = tokio::sync::mpsc::Sender<WorkspaceMaterializ
 type KeyedLocks<K> = Arc<Mutex<HashMap<K, Arc<Mutex<()>>>>>;
 
 // `.pi-handoff` is a daemon-owned child of the cwd root rather than a workspace.
-// Read-only forks remove it immediately after taking the guarded snapshot.
+// A fork replaces the parent's copy with an empty directory: in a read-only
+// child that directory is the artifact staging tree, whose contents are copied
+// back to the parent before the child's subvolume is reclaimed.
 
 #[derive(Clone)]
 pub struct WorkspaceManager {
@@ -75,15 +79,9 @@ impl WorkspaceManager {
     /// Resolve a cwd-relative path, rejecting anything that is absolute or
     /// escapes the session cwd.
     fn safe_workspace_path(&self, workspace_id: &str, rel_path: &str) -> Result<PathBuf> {
-        let cwd = self.resolve(workspace_id);
-        let mut path = cwd.clone();
-        for component in Path::new(rel_path).components() {
-            match component {
-                std::path::Component::Normal(part) => path.push(part),
-                _ => bail!("workspace file path must be relative and normal: {rel_path}"),
-            }
-        }
-        Ok(path)
+        Ok(self
+            .resolve(workspace_id)
+            .join(safe_relative_path(rel_path)?))
     }
 
     /// Write a control-generated file (e.g. a delegation handoff artifact) into
@@ -100,6 +98,28 @@ impl WorkspaceManager {
         }
         tokio::fs::write(&path, contents.as_bytes()).await?;
         Ok(())
+    }
+
+    /// Copy a bounded, symlink-free subtree between two session cwds on this
+    /// runtime. Both sides are rejected unless every component is normal, so
+    /// neither can escape its cwd; the target is then created and opened one
+    /// component at a time from the cwd, so a symlink staged anywhere along it
+    /// cannot redirect the copy either. The same workspace on both sides is
+    /// rejected so a full (in-place) subagent can never be routed here. `None`
+    /// means the source subtree does not exist.
+    pub async fn copy_workspace_subtree(
+        &self,
+        source_workspace_id: &str,
+        source_rel: &str,
+        target_workspace_id: &str,
+        target_rel: &str,
+    ) -> Result<Option<CopiedArtifacts>> {
+        if source_workspace_id == target_workspace_id {
+            bail!("artifact copy source and target must be different sessions");
+        }
+        let source = self.safe_workspace_path(source_workspace_id, source_rel)?;
+        let target_rel = safe_relative_path(target_rel)?;
+        copy_artifact_tree(&source, &self.resolve(target_workspace_id), &target_rel).await
     }
 
     pub async fn read_workspace_file(
@@ -469,6 +489,10 @@ impl WorkspaceManager {
                     return Err(error).with_context(|| format!("remove {}", handoff_dir.display()))
                 }
             }
+            // Left empty for the child to stage artifacts it wants handed back.
+            tokio::fs::create_dir(&handoff_dir)
+                .await
+                .with_context(|| format!("create {}", handoff_dir.display()))?;
 
             let mut child_workspaces = Vec::with_capacity(parent_workspaces.len());
             for workspace in parent_workspaces {
@@ -858,6 +882,18 @@ async fn collect_skill_dir(
     Ok(())
 }
 
+/// Reject a workspace-relative path that is absolute or escapes the session cwd.
+fn safe_relative_path(rel_path: &str) -> Result<PathBuf> {
+    let mut path = PathBuf::new();
+    for component in Path::new(rel_path).components() {
+        match component {
+            std::path::Component::Normal(part) => path.push(part),
+            _ => bail!("workspace file path must be relative and normal: {rel_path}"),
+        }
+    }
+    Ok(path)
+}
+
 fn local_branch(session_id: &str, workspace_dir: &str) -> String {
     format!(
         "pi/session/{}/{}",
@@ -1149,7 +1185,7 @@ mod tests {
 
     #[ignore = "requires PI_RELAY_TEST_BTRFS_ROOT; see rust/README.md"]
     #[tokio::test]
-    async fn fork_drops_the_parents_handoff_artifacts_from_the_child_cwd() {
+    async fn fork_replaces_parent_handoff_artifacts_with_an_empty_staging_dir() {
         let Ok(btrfs_root) = std::env::var("PI_RELAY_TEST_BTRFS_ROOT") else {
             eprintln!("SKIPPED btrfs test; PI_RELAY_TEST_BTRFS_ROOT is not set");
             return;
@@ -1179,9 +1215,93 @@ mod tests {
             .await
             .expect("fork parent cwd");
 
-        assert!(!manager.resolve("child").join(".pi-handoff").exists());
+        let child_handoff = manager.resolve("child").join(".pi-handoff");
+        assert!(child_handoff.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&child_handoff)
+                .expect("read child handoff dir")
+                .count(),
+            0
+        );
         assert!(manager.resolve("child").join("keep.txt").exists());
         assert!(manager.resolve("parent").join(".pi-handoff").exists());
+
+        for workspace_id in ["child", "parent"] {
+            manager
+                .destroy_session_workspaces(workspace_id)
+                .await
+                .expect("reclaim session subvolumes");
+        }
+        std::fs::remove_dir_all(state).ok();
+    }
+
+    #[ignore = "requires PI_RELAY_TEST_BTRFS_ROOT; see rust/README.md"]
+    #[tokio::test]
+    async fn copy_workspace_subtree_hands_child_artifacts_to_the_parent() {
+        let Ok(btrfs_root) = std::env::var("PI_RELAY_TEST_BTRFS_ROOT") else {
+            eprintln!("SKIPPED btrfs test; PI_RELAY_TEST_BTRFS_ROOT is not set");
+            return;
+        };
+        let state = PathBuf::from(btrfs_root).join(format!(
+            "pi-runtime-artifacts-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let manager =
+            WorkspaceManager::new(state.clone(), state.join("config"), state.join("home"));
+        manager.validate_root().await.expect("btrfs state root");
+        for workspace_id in ["parent", "child"] {
+            std::fs::create_dir_all(state.join(format!("sessions/{workspace_id}")))
+                .expect("session root");
+            create_session_subvolume(&manager.resolve(workspace_id))
+                .await
+                .expect("cwd subvolume");
+        }
+        write_file(
+            &manager.resolve("child").join(".pi-handoff/report/notes.md"),
+            "handed back",
+        );
+
+        let copied = manager
+            .copy_workspace_subtree(
+                "child",
+                ".pi-handoff",
+                "parent",
+                ".pi-handoff/delegation_1/child/artifacts",
+            )
+            .await
+            .expect("copy artifacts")
+            .expect("staging dir present");
+
+        assert_eq!(
+            copied
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["report/notes.md"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                manager
+                    .resolve("parent")
+                    .join(".pi-handoff/delegation_1/child/artifacts/report/notes.md")
+            )
+            .expect("read copied artifact"),
+            "handed back"
+        );
+        assert!(manager
+            .copy_workspace_subtree("child", "../escape", "parent", "ok")
+            .await
+            .is_err());
+        assert!(manager
+            .copy_workspace_subtree("child", ".pi-handoff", "parent", "../escape")
+            .await
+            .is_err());
+        assert!(manager
+            .copy_workspace_subtree("parent", ".pi-handoff", "parent", "copy")
+            .await
+            .is_err());
 
         for workspace_id in ["child", "parent"] {
             manager

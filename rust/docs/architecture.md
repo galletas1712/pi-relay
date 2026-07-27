@@ -165,7 +165,8 @@ Implemented user-facing behavior:
   `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). A delegation is one **full** subagent
   (writes the parent's workspace in place) or a parallel fan-out of
   **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
-  return). A parent may launch independent delegations together, then parks
+  return; files a child stages in its own `.pi-handoff/` are copied to the
+  parent's handoff dir first). A parent may launch independent delegations together, then parks
   after the useful launch batch and receives delegation-ID-scoped completion
   **daemon observations** containing the structured delegation snapshot,
   including per-subagent `outcome` and compact handoff file references. The
@@ -189,7 +190,8 @@ Not implemented by design:
   once the websocket path became Postgres-only.
 - Cross-subagent workspace merging. There is one durable workspace with a single
   writer in time; read-only subagents are isolated in throwaway snapshots and
-  never merged back.
+  never merged back — they hand files back only through the bounded
+  `.pi-handoff/` staging tree.
 - Daemon-executed workflow graphs/DSLs and a workflow variable store. Workflow
   control flow lives in ordinary parent-interpreted skills published by the runtime.
 

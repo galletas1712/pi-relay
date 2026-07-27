@@ -349,7 +349,7 @@ fn delegate_writing_task_definition() -> ToolDefinition {
 fn delegate_readonly_tasks_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_readonly_tasks",
-        "Launch an independent read-only fan-out, each child in its own point-in-time disposable workspace snapshot. Up to eight read-only slots exist across this parent, and a fan-out keeps all of its slots until the whole delegation is terminal. Further fan-outs may start beside running delegations, including in the same model response, while capacity remains. Workspace isolation does not prevent MCP or other remote side effects. Returns the delegation id, the handoff directory holding this delegation's artifacts, and each subagent's id and role. After the useful launch batch, end your turn; never poll.",
+        "Launch an independent read-only fan-out, each child in its own point-in-time disposable workspace snapshot. Up to eight read-only slots exist across this parent, and a fan-out keeps all of its slots until the whole delegation is terminal. Further fan-outs may start beside running delegations, including in the same model response, while capacity remains. Workspace isolation does not prevent MCP or other remote side effects. Returns the delegation id, the handoff directory holding this delegation's artifacts, and each subagent's id and role. A child can hand files back by staging them in its own `./.pi-handoff/`; they land under the delegation handoff dir in your workspace. After the useful launch batch, end your turn; never poll.",
         json!({
             "type": "object",
             "properties": {

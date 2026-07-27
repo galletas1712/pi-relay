@@ -1469,10 +1469,20 @@ Workspace snapshot serialization covers daemon-managed local and MCP tool
 futures that share the exact managed cwd. `history.fork` and read-only
 delegation snapshots wait on that guard; the guard is released when a tool
 future returns or is dropped/aborted. Both take a btrfs subvolume snapshot of
-the parent cwd and then remove `.pi-handoff` from the child cwd under the same
-guard, so a fork or read-only child never sees the source session's delegation
-artifacts. The daemon does not claim to track independently running background
-processes beyond the managed future lifetime.
+the parent cwd and then replace the child cwd's `.pi-handoff` with an empty
+directory under the same guard, so a fork or read-only child never sees the
+source session's delegation artifacts. In a read-only child that empty directory
+is the artifact staging tree: whatever the child writes there is copied to
+`<parent cwd>/.pi-handoff/<delegation_id>/<subagent_id>/artifacts/` — bounded at
+200 examined entries and 32 MiB, at most 16 path segments deep, regular files
+only, every entry resolved through the directory fd the walk already holds and
+every target directory and file created below a held target fd, so neither a
+rename racing the walk nor a symlink planted in the target can redirect a copy
+outside the tree — immediately before its snapshot is reclaimed. Full (writing)
+subagents work in the parent's cwd in place and are never copied from or torn
+down. The daemon does not claim
+to track independently running background processes beyond the managed future
+lifetime.
 
 ### `turn.resume`
 
@@ -1620,7 +1630,10 @@ Result:
       "outcome": "approved",
       "final_message_file": "session_.../final_message.md",
       "transcript_file": "session_.../transcript.md",
-      "task_prompt_file": "session_.../task_prompt.md"
+      "task_prompt_file": "session_.../task_prompt.md",
+      "artifact_files": ["notes.md", "report/data.csv"],
+      "artifact_files_omitted": 0,
+      "artifacts_truncated": false
     }
   ],
   "handoff_dir": ".pi-handoff/delegation_..."
@@ -1826,11 +1839,17 @@ delegations expose per-subagent `transcript.md`; terminal
 done/done_with_failures delegations also expose per-subagent `final_message.md`.
 Cancelled delegations expose the transcript-only cancellation artifact path
 reported in the delegation snapshot, for example
-`cancelled/<subagent_id>.transcript.md`. The structured delegation snapshot
-comes from `delegation.status`, not from a handoff root artifact file. Raw task
-prompts, full final messages, and full transcript bodies
-are never inlined in delegation snapshots, daemon observations, or compaction
-ledgers; use this RPC to read an artifact body explicitly when detail is needed.
+`cancelled/<subagent_id>.transcript.md`. Files a read-only subagent handed back
+are readable under every status as `artifacts/<path>`, listed in full by
+`artifacts.json` and sampled by `artifact_files` in the snapshot (with
+`artifact_files_omitted` counting the rest). Names the reader could not resolve
+— not valid UTF-8, or not equal to their own trim — are never copied; they
+appear in the manifest's `skipped`, so every listed path exists on disk and is
+readable. The structured delegation snapshot comes from `delegation.status`,
+not from a handoff root artifact file. Raw task prompts, full final messages, and
+full transcript bodies are never inlined in delegation snapshots, daemon
+observations, or compaction ledgers; use this RPC to read an artifact body
+explicitly when detail is needed.
 
 Allowed `file` values are exactly:
 
@@ -1839,6 +1858,9 @@ Allowed `file` values are exactly:
 - `transcript.md` with matching `subagent_id`
 - `cancelled/<subagent_id>.transcript.md` (the `subagent_id` parameter is
   optional, but if present it must match the path)
+- `artifacts.json` with matching `subagent_id`
+- `artifacts/<path>` with matching `subagent_id`, where every path segment is a
+  plain name (at most 16 segments, 512 bytes)
 
 ```json
 {

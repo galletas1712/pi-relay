@@ -4,11 +4,17 @@ use serde_json::{json, Value};
 
 use crate::delegation_tools::load_subagent_work_state;
 use crate::handoff::{
-    delegation_dir, refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
-    safe_handoff_path_segment, task_prompt_rel, SubagentArtifact,
+    delegation_dir, read_handed_back_artifacts, refresh_delegation_handoff_artifacts,
+    refresh_task_prompt_artifact_if_present, safe_handoff_path_segment, task_prompt_rel,
+    SubagentArtifact,
 };
 use crate::state::AppState;
 use crate::types::RpcError;
+
+/// A handback can carry up to 200 paths of up to 512 bytes each, per subagent,
+/// so the snapshot inlines only a sample and reports the rest as a count. The
+/// full list is always in the child's `artifacts.json`.
+const MAX_INLINE_ARTIFACT_FILES: usize = 10;
 
 pub(crate) fn progress_view(progress: DelegationProgress) -> Value {
     json!({
@@ -199,6 +205,17 @@ pub(crate) async fn build_delegation_snapshot(
             && subagent.subagent_type.is_some()
             && completion_terminal_status.is_none()
             && has_active_work;
+        // Read from the manifest rather than the artifact refresh: cancelled
+        // and failed delegations publish no per-subagent artifacts but may
+        // still have handed files back.
+        let handed_back = read_handed_back_artifacts(
+            state,
+            runtime_id,
+            workspace_id,
+            &handoff_dir_path,
+            &subagent.session_id,
+        )
+        .await?;
         subagent_views.push(json!({
             "id": subagent.session_id,
             "role": subagent.role,
@@ -211,6 +228,9 @@ pub(crate) async fn build_delegation_snapshot(
             "final_message_file": final_message_file,
             "transcript_file": transcript_file,
             "task_prompt_file": task_prompt_file,
+            "artifact_files": handed_back.files.iter().take(MAX_INLINE_ARTIFACT_FILES).collect::<Vec<_>>(),
+            "artifact_files_omitted": handed_back.files.len().saturating_sub(MAX_INLINE_ARTIFACT_FILES),
+            "artifacts_truncated": handed_back.truncated,
         }));
     }
     let expected_count = delegation.expected_subagents.max(0) as usize;

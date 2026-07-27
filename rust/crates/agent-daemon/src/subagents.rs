@@ -533,7 +533,7 @@ fn subagent_workspace_semantics(subagent_type: SubagentType) -> &'static str {
             "You are a full subagent. Your filesystem edits are made in the parent workspace in place and affect what the parent will see."
         }
         SubagentType::ReadOnly => {
-            "You are a read-only subagent. Writes under your session cwd stay in a disposable snapshot and do not reach the parent. Absolute runtime-host paths are shared and must be treated as read-only."
+            "You are a read-only subagent. Writes under your session cwd stay in a disposable snapshot and do not reach the parent — except `./.pi-handoff/`, whose contents are copied to the parent when you finish. Put files you want to hand back there (bounded: 200 files / 32 MiB). Absolute runtime-host paths are shared and must be treated as read-only."
         }
     }
 }
@@ -649,6 +649,8 @@ mod tests {
         assert!(read_only.contains("read-only subagent"));
         assert!(read_only.contains("disposable snapshot"));
         assert!(read_only.contains("do not reach the parent"));
+        assert!(read_only.contains("`./.pi-handoff/`"));
+        assert!(read_only.contains("200 files / 32 MiB"));
     }
 
     #[test]

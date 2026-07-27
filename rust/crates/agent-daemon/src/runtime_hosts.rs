@@ -7,9 +7,9 @@ use agent_mcp_types::{
     McpSessionSelection, McpToolView,
 };
 use agent_runtime_protocol::{
-    read_frame, write_frame, ControlToRuntime, RuntimeCommand, RuntimeCommandError,
-    RuntimeCommandResult, RuntimeHello, RuntimeRecord, RuntimeToControl, SelectedWorkspace,
-    WorkspaceMaterializeProgress, HEARTBEAT_TIMEOUT_SECS,
+    read_frame, write_frame, ControlToRuntime, CopiedArtifacts, RuntimeCommand,
+    RuntimeCommandError, RuntimeCommandResult, RuntimeHello, RuntimeRecord, RuntimeToControl,
+    SelectedWorkspace, WorkspaceMaterializeProgress, HEARTBEAT_TIMEOUT_SECS,
 };
 use agent_store::PostgresAgentStore;
 use agent_tools::ProviderTool;
@@ -537,6 +537,34 @@ impl RuntimeRegistry {
         .map(|_| ())
     }
 
+    /// Copy a bounded, symlink-free subtree from one session cwd to another on
+    /// the same runtime. `None` means the source subtree does not exist.
+    pub(crate) async fn copy_workspace_subtree(
+        &self,
+        runtime_id: &str,
+        source_workspace_id: &str,
+        source_rel_path: &str,
+        target_workspace_id: &str,
+        target_rel_path: &str,
+    ) -> Result<Option<CopiedArtifacts>> {
+        match self
+            .execute(
+                runtime_id,
+                RuntimeCommand::CopyWorkspaceSubtree {
+                    source_workspace_id: source_workspace_id.to_string(),
+                    source_rel_path: source_rel_path.to_string(),
+                    target_workspace_id: target_workspace_id.to_string(),
+                    target_rel_path: target_rel_path.to_string(),
+                },
+                None,
+            )
+            .await?
+        {
+            RuntimeCommandResult::CopiedSubtree { artifacts } => Ok(artifacts),
+            _ => Err(anyhow!("runtime returned the wrong subtree-copy result")),
+        }
+    }
+
     pub(crate) async fn read_workspace_file(
         &self,
         runtime_id: &str,
@@ -916,6 +944,28 @@ pub(crate) mod test_support {
                     contents: std::fs::read_to_string(&path).ok(),
                 })
             }
+            RuntimeCommand::CopyWorkspaceSubtree {
+                source_workspace_id,
+                source_rel_path,
+                target_workspace_id,
+                target_rel_path,
+            } => {
+                if source_workspace_id == target_workspace_id {
+                    return Err(RuntimeCommandError::new(
+                        "invalid_request",
+                        "artifact copy source and target must be different sessions",
+                    ));
+                }
+                let source = fake_workspace_dir(dirs, &source_workspace_id)
+                    .await
+                    .join(&source_rel_path);
+                let target = fake_workspace_dir(dirs, &target_workspace_id)
+                    .await
+                    .join(&target_rel_path);
+                Ok(RuntimeCommandResult::CopiedSubtree {
+                    artifacts: fake_copy_tree(&source, &target),
+                })
+            }
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,
@@ -994,6 +1044,60 @@ pub(crate) mod test_support {
                 "mcp_unsupported",
                 "fake runtime does not implement MCP",
             )),
+        }
+    }
+
+    /// Mirrors the runtime's curated artifact walk closely enough for daemon
+    /// orchestration tests: regular files only, sorted, symlinks skipped.
+    ///
+    /// Deliberately not a faithful double: the real walker's file/byte/depth
+    /// bounds, name filtering, and lazy target-dir creation are unmodelled and
+    /// are covered by `agent-runtime`'s own tests. Do not use this to reason
+    /// about bound regressions.
+    fn fake_copy_tree(
+        source: &std::path::Path,
+        target: &std::path::Path,
+    ) -> Option<CopiedArtifacts> {
+        if !source.is_dir() {
+            return None;
+        }
+        let mut copied = CopiedArtifacts::default();
+        fake_copy_dir(source, target, std::path::Path::new(""), &mut copied);
+        Some(copied)
+    }
+
+    fn fake_copy_dir(
+        source: &std::path::Path,
+        target: &std::path::Path,
+        relative: &std::path::Path,
+        copied: &mut CopiedArtifacts,
+    ) {
+        std::fs::create_dir_all(target).expect("fake artifact dir");
+        let mut entries: Vec<_> = std::fs::read_dir(source)
+            .expect("fake artifact read_dir")
+            .map(|entry| entry.expect("fake artifact entry"))
+            .collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let file_type = entry.file_type().expect("fake artifact file type");
+            let child_relative = relative.join(entry.file_name());
+            let path = child_relative.to_string_lossy().to_string();
+            if file_type.is_symlink() || !(file_type.is_dir() || file_type.is_file()) {
+                copied.skipped.push(path);
+            } else if file_type.is_dir() {
+                fake_copy_dir(
+                    &entry.path(),
+                    &target.join(entry.file_name()),
+                    &child_relative,
+                    copied,
+                );
+            } else {
+                let bytes = std::fs::copy(entry.path(), target.join(entry.file_name()))
+                    .expect("fake artifact copy");
+                copied
+                    .files
+                    .push(agent_runtime_protocol::CopiedArtifactFile { path, bytes });
+            }
         }
     }
 

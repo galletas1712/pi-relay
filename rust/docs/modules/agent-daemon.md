@@ -58,6 +58,8 @@ delegation_runner.rs    delegation barrier: all-terminal detect, attempt-fenced 
                    crash sweep
 handoff.rs         renders per-subagent task_prompt.md / final_message.md /
                    transcript.md from durable delegation/session state
+subagent_artifacts.rs   copies a terminal read-only subagent's staged
+                   .pi-handoff/ tree to the parent, then reclaims its snapshot
 ```
 
 `config.rs` resolves the general configuration root as
@@ -210,11 +212,22 @@ Ordinary child follow-ups take the same lock order and reject any delegation
 that is not `running`. The daemon then joins child tasks/runtime work before the
 store permits the terminal transition, dropping daemon-managed tool futures and
 their cwd guards. Read-only forks and `history.fork` take a btrfs subvolume
-snapshot of the parent cwd, which has no exclude facility, then remove
-`.pi-handoff` from the child cwd immediately, under the same per-cwd mutation
-guard. A forked session therefore does not inherit the source session's
-delegation artifacts. Delegation snapshots expose `handoff_dir` relative to the
-session cwd; artifact file fields are relative to that directory.
+snapshot of the parent cwd, which has no exclude facility, then replace the
+child cwd's `.pi-handoff` with an empty directory, under the same per-cwd
+mutation guard. A forked session therefore does not inherit the source session's
+delegation artifacts. In a read-only subagent that empty directory is the
+artifact staging tree: when the child reaches its terminal idle (or is
+cancelled), `subagent_artifacts::reclaim_read_only_subagent` copies it into
+`<parent cwd>/.pi-handoff/<delegation_id>/<subagent_id>/artifacts/` and writes an
+`artifacts.json` manifest, and only then destroys the child subvolume. The copy
+is bounded (200 entries examined, 32 MiB, `truncated` in the manifest), takes
+regular files only, and follows a symlink on neither side: entries are resolved
+through the directory fd the walk holds, and target directories and files are
+created below a held target fd. A copy failure is logged and teardown still
+runs, so a bad artifact tree neither blocks a delegation nor leaks a subvolume.
+Full subagents write the parent cwd in place and are never copied from or torn
+down. Delegation snapshots expose `handoff_dir` relative to the session cwd;
+artifact file fields are relative to that directory.
 
 ### Driving the loop
 

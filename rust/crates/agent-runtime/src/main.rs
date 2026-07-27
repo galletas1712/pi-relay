@@ -522,6 +522,32 @@ impl Runtime {
                     .await?;
                 Ok(RuntimeCommandResult::FileContents { contents })
             }
+            RuntimeCommand::CopyWorkspaceSubtree {
+                source_workspace_id,
+                source_rel_path,
+                target_workspace_id,
+                target_rel_path,
+            } => {
+                // Only the target (parent) cwd is guarded: the source is a
+                // terminal read-only child with no tool futures left, while the
+                // parent may be mid-fork of a sibling. Holding exactly one guard
+                // also makes deadlock with `ForkSession` (which holds the parent
+                // guard) impossible — this copy simply waits.
+                let _guard = self
+                    .workspaces
+                    .acquire_cwd_mutation_guard(&target_workspace_id)
+                    .await;
+                let artifacts = self
+                    .workspaces
+                    .copy_workspace_subtree(
+                        &source_workspace_id,
+                        &source_rel_path,
+                        &target_workspace_id,
+                        &target_rel_path,
+                    )
+                    .await?;
+                Ok(RuntimeCommandResult::CopiedSubtree { artifacts })
+            }
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,

@@ -17,6 +17,7 @@ mod runtime;
 mod runtime_hosts;
 mod session_start;
 mod state;
+mod subagent_artifacts;
 mod subagents;
 mod types;
 mod workspace_selection;

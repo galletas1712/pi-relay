@@ -198,6 +198,13 @@ export interface DelegationSubagent {
 	final_message_file?: string | null;
 	transcript_file?: string | null;
 	task_prompt_file?: string | null;
+	/** Files a read-only subagent staged in its own `.pi-handoff/` and handed
+	 * back; read with `delegation.read_handoff_file` as `artifacts/<path>`.
+	 * Sampled: `artifact_files_omitted` counts the rest, all of which are
+	 * listed in the subagent's `artifacts.json`. */
+	artifact_files?: string[] | null;
+	artifact_files_omitted?: number;
+	artifacts_truncated?: boolean;
 }
 
 export interface Delegation {
@@ -219,7 +226,8 @@ export interface DelegationListResult {
 }
 
 export type CancellationTranscriptFileName = `cancelled/${string}.transcript.md`;
-export type HandoffFileName = "task_prompt.md" | "final_message.md" | "transcript.md" | CancellationTranscriptFileName;
+export type ArtifactFileName = "artifacts.json" | `artifacts/${string}`;
+export type HandoffFileName = "task_prompt.md" | "final_message.md" | "transcript.md" | CancellationTranscriptFileName | ArtifactFileName;
 
 export interface ReadHandoffFileResult {
 	delegation_id: string;

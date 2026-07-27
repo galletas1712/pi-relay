@@ -912,7 +912,6 @@ fn progress_from_subagent_overview(
 async fn cancel_subagent_without_reactivation(
     state: &AppState,
     session_id: &str,
-    subagent_type: Option<SubagentType>,
 ) -> std::result::Result<(), RpcError> {
     abort_and_join_session_tasks(state, session_id).await;
     let driver = SessionDriver::acquire(state, session_id).await;
@@ -933,15 +932,9 @@ async fn cancel_subagent_without_reactivation(
         }
     }
     state.active.lock().await.remove(session_id);
-    if subagent_type == Some(SubagentType::ReadOnly) {
-        if let Err(error) = state
-            .runtime_hosts
-            .destroy_session_workspaces(session_id)
-            .await
-        {
-            eprintln!("failed to destroy read-only subagent workspace {session_id}: {error:#}");
-        }
-    }
+    // Artifacts are agent-authored files, not transcript-derived prose, so a
+    // cancelled child still hands back what it staged.
+    crate::subagent_artifacts::reclaim_read_only_subagent(state, session_id).await;
     Ok(())
 }
 
@@ -1171,8 +1164,7 @@ async fn cancel_delegation_subagents_without_reactivation(
 ) -> std::result::Result<(), RpcError> {
     let subagents = state.repo.list_delegation_subagents(delegation_id).await?;
     for subagent in &subagents {
-        cancel_subagent_without_reactivation(state, &subagent.session_id, subagent.subagent_type)
-            .await?;
+        cancel_subagent_without_reactivation(state, &subagent.session_id).await?;
     }
     Ok(())
 }
@@ -1240,24 +1232,70 @@ struct ReadHandoffFileParams {
     file: String,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum HandoffFileRequest<'a> {
-    Normal { subagent_id: &'a str, file: &'a str },
-    CancelledTranscript { subagent_id: &'a str },
+    Normal {
+        subagent_id: &'a str,
+        file: &'a str,
+    },
+    CancelledTranscript {
+        subagent_id: &'a str,
+    },
+    /// The manifest of files a read-only subagent handed back.
+    ArtifactManifest {
+        subagent_id: &'a str,
+    },
+    /// One handed-back artifact. `relative` is reassembled from validated
+    /// segments, never from caller input.
+    Artifact {
+        subagent_id: &'a str,
+        relative: String,
+    },
 }
 
 impl HandoffFileRequest<'_> {
     fn subagent_id(&self) -> &str {
         match self {
-            Self::Normal { subagent_id, .. } | Self::CancelledTranscript { subagent_id } => {
-                subagent_id
-            }
+            Self::Normal { subagent_id, .. }
+            | Self::CancelledTranscript { subagent_id }
+            | Self::ArtifactManifest { subagent_id }
+            | Self::Artifact { subagent_id, .. } => subagent_id,
         }
+    }
+
+    /// Handed-back artifacts are agent-authored files, not transcript-derived
+    /// prose, so they are readable under every status including cancellation.
+    fn is_artifact(&self) -> bool {
+        matches!(self, Self::ArtifactManifest { .. } | Self::Artifact { .. })
     }
 }
 
+/// A handed-back artifact path is bounded in both depth and length so a caller
+/// cannot turn a read into an unbounded path join.
+const MAX_ARTIFACT_PATH_SEGMENTS: usize = 16;
+const MAX_ARTIFACT_PATH_LEN: usize = 512;
+
+/// Validate every segment of a caller-supplied artifact path and reassemble the
+/// path from the validated segments.
+fn safe_artifact_path(relative: &str) -> std::result::Result<String, RpcError> {
+    let reject = |message: &str| RpcError::new("invalid_params", message.to_string());
+    if relative.is_empty() || relative.len() > MAX_ARTIFACT_PATH_LEN {
+        return Err(reject("artifact path is empty or too long"));
+    }
+    let segments = relative
+        .split('/')
+        .map(|segment| safe_path_segment(segment, "artifact path"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if segments.len() > MAX_ARTIFACT_PATH_SEGMENTS {
+        return Err(reject("artifact path is too deep"));
+    }
+    Ok(segments.join("/"))
+}
+
 /// Resolve the closed handoff file vocabulary. Normal files live under
-/// `<subagent_id>/{task_prompt.md,final_message.md,transcript.md}`. Cancelled
+/// `<subagent_id>/{task_prompt.md,final_message.md,transcript.md}`. A read-only
+/// subagent's handed-back files live under `<subagent_id>/artifacts/` and are
+/// listed by `<subagent_id>/artifacts.json`. Cancelled
 /// delegations expose the transcript-only cancellation artifact via
 /// `cancelled/<subagent_id>.transcript.md`; a previously published terminal-child
 /// `final_message.md` may also remain readable after cancellation, but normal
@@ -1273,7 +1311,22 @@ fn parse_handoff_file_request<'a>(
             })?;
             Ok(HandoffFileRequest::Normal { subagent_id, file })
         }
+        "artifacts.json" => {
+            let subagent_id = subagent_id.ok_or_else(|| {
+                RpcError::new("invalid_params", format!("{file} requires a subagent_id"))
+            })?;
+            Ok(HandoffFileRequest::ArtifactManifest { subagent_id })
+        }
         relative => {
+            if let Some(rest) = relative.strip_prefix("artifacts/") {
+                let subagent_id = subagent_id.ok_or_else(|| {
+                    RpcError::new("invalid_params", format!("{file} requires a subagent_id"))
+                })?;
+                return Ok(HandoffFileRequest::Artifact {
+                    subagent_id,
+                    relative: safe_artifact_path(rest)?,
+                });
+            }
             if let Some(rest) = relative.strip_prefix("cancelled/") {
                 if let Some(relative_subagent_id) = rest.strip_suffix(".transcript.md") {
                     safe_path_segment(relative_subagent_id, "subagent_id")?;
@@ -1291,7 +1344,7 @@ fn parse_handoff_file_request<'a>(
             Err(RpcError::new(
                 "invalid_params",
                 format!(
-                    "file must be one of task_prompt.md | final_message.md | transcript.md | cancelled/<subagent_id>.transcript.md, got {relative}"
+                    "file must be one of task_prompt.md | final_message.md | transcript.md | artifacts.json | artifacts/<path> | cancelled/<subagent_id>.transcript.md, got {relative}"
                 ),
             ))
         }
@@ -1300,8 +1353,13 @@ fn parse_handoff_file_request<'a>(
 
 fn read_allowed_for_status(
     status: DelegationStatus,
-    request: HandoffFileRequest<'_>,
+    request: &HandoffFileRequest<'_>,
 ) -> std::result::Result<Option<bool>, RpcError> {
+    if request.is_artifact() {
+        return Ok(Some(true));
+    }
+    // Every status arm stays exhaustive over `HandoffFileRequest`, so a new
+    // variant is a compile error rather than a silent inheritance of a default.
     match status {
         DelegationStatus::Cancelling => Ok(Some(false)),
         DelegationStatus::Running => match request {
@@ -1322,10 +1380,16 @@ fn read_allowed_for_status(
                 format!("unsupported handoff file {file}"),
             )),
             HandoffFileRequest::CancelledTranscript { .. } => Ok(Some(false)),
+            HandoffFileRequest::ArtifactManifest { .. } | HandoffFileRequest::Artifact { .. } => {
+                Ok(Some(true))
+            }
         },
         DelegationStatus::Done | DelegationStatus::DoneWithFailures => match request {
             HandoffFileRequest::Normal { .. } => Ok(Some(true)),
             HandoffFileRequest::CancelledTranscript { .. } => Ok(Some(false)),
+            HandoffFileRequest::ArtifactManifest { .. } | HandoffFileRequest::Artifact { .. } => {
+                Ok(Some(true))
+            }
         },
         DelegationStatus::Cancelled => match request {
             HandoffFileRequest::Normal {
@@ -1342,13 +1406,20 @@ fn read_allowed_for_status(
                 ..
             } => Ok(Some(false)),
             HandoffFileRequest::Normal { .. } => Ok(Some(false)),
+            HandoffFileRequest::ArtifactManifest { .. } | HandoffFileRequest::Artifact { .. } => {
+                Ok(Some(true))
+            }
         },
         DelegationStatus::Failed => match request {
             HandoffFileRequest::Normal {
                 file: TASK_PROMPT_FILE,
                 ..
             } => Ok(Some(true)),
-            _ => Ok(Some(false)),
+            HandoffFileRequest::Normal { .. } => Ok(Some(false)),
+            HandoffFileRequest::CancelledTranscript { .. } => Ok(Some(false)),
+            HandoffFileRequest::ArtifactManifest { .. } | HandoffFileRequest::Artifact { .. } => {
+                Ok(Some(true))
+            }
         },
     }
 }
@@ -1356,7 +1427,7 @@ fn read_allowed_for_status(
 async fn read_allowed_for_request(
     state: &AppState,
     delegation: &Delegation,
-    request: HandoffFileRequest<'_>,
+    request: &HandoffFileRequest<'_>,
 ) -> std::result::Result<bool, RpcError> {
     match read_allowed_for_status(delegation.status, request)? {
         Some(allowed) => Ok(allowed),
@@ -1392,13 +1463,10 @@ fn unavailable_handoff_file_error(status: DelegationStatus) -> RpcError {
 }
 
 fn validate_member_subagent(
-    request: HandoffFileRequest<'_>,
+    request: &HandoffFileRequest<'_>,
     members: &[DelegationSubagent],
 ) -> std::result::Result<(), RpcError> {
-    let subagent_id = match request {
-        HandoffFileRequest::Normal { subagent_id, .. }
-        | HandoffFileRequest::CancelledTranscript { subagent_id } => subagent_id,
-    };
+    let subagent_id = request.subagent_id();
     if members
         .iter()
         .any(|member| member.session_id == subagent_id)
@@ -1427,7 +1495,7 @@ fn safe_path_segment(segment: &str, field: &str) -> std::result::Result<String, 
 /// can never traverse out of the handoff subtree.
 fn resolve_handoff_file_path(
     delegation_id: &str,
-    request: HandoffFileRequest<'_>,
+    request: &HandoffFileRequest<'_>,
 ) -> std::result::Result<String, RpcError> {
     let delegation_segment = safe_path_segment(delegation_id, "delegation_id")?;
     let dir = delegation_dir(&delegation_segment);
@@ -1442,6 +1510,22 @@ fn resolve_handoff_file_path(
         HandoffFileRequest::CancelledTranscript { subagent_id } => {
             format!(
                 "{dir}/cancelled/{}.transcript.md",
+                safe_path_segment(subagent_id, "subagent_id")?
+            )
+        }
+        HandoffFileRequest::ArtifactManifest { subagent_id } => {
+            format!(
+                "{dir}/{}/artifacts.json",
+                safe_path_segment(subagent_id, "subagent_id")?
+            )
+        }
+        // `relative` was reassembled from validated segments at parse time.
+        HandoffFileRequest::Artifact {
+            subagent_id,
+            relative,
+        } => {
+            format!(
+                "{dir}/{}/artifacts/{relative}",
                 safe_path_segment(subagent_id, "subagent_id")?
             )
         }
@@ -1468,10 +1552,13 @@ pub(crate) async fn read_handoff_file_core(
     // A read may only target a subagent that belongs to this delegation;
     // otherwise a caller could probe arbitrary `<delegation>/<segment>/` paths.
     let members = state.repo.list_delegation_subagents(&delegation.id).await?;
-    validate_member_subagent(request, &members)?;
+    validate_member_subagent(&request, &members)?;
 
-    if read_allowed_for_request(state, &delegation, request).await? {
-        if matches!(
+    if read_allowed_for_request(state, &delegation, &request).await? {
+        if request.is_artifact() {
+            // Artifacts were copied out of the child's snapshot; nothing to
+            // re-render from Postgres.
+        } else if matches!(
             request,
             HandoffFileRequest::Normal {
                 file: TASK_PROMPT_FILE,
@@ -1537,7 +1624,7 @@ pub(crate) async fn read_handoff_file_core(
         return Err(unavailable_handoff_file_error(delegation.status));
     }
     let parent_config = state.repo.load_session_config(parent_session_id).await?;
-    let rel_path = resolve_handoff_file_path(&delegation.id, request)?;
+    let rel_path = resolve_handoff_file_path(&delegation.id, &request)?;
     // Traversal is prevented by the segment validation above plus the runtime's
     // own workspace-relative path check; the file lives on the session's runtime.
     let content = state
@@ -2030,7 +2117,7 @@ mod tests {
     fn resolves_subagent_file_under_subagent_dir() {
         let path = resolve_handoff_file_path(
             "delegation-1",
-            HandoffFileRequest::Normal {
+            &HandoffFileRequest::Normal {
                 subagent_id: "child-9",
                 file: "final_message.md",
             },
@@ -2042,10 +2129,73 @@ mod tests {
     #[test]
     fn resolves_cancelled_transcript_under_cancelled_dir() {
         let request = parse_handoff_file_request(None, "cancelled/child-9.transcript.md").unwrap();
-        let path = resolve_handoff_file_path("delegation-1", request).unwrap();
+        let path = resolve_handoff_file_path("delegation-1", &request).unwrap();
         assert_eq!(
             path,
             ".pi-handoff/delegation-1/cancelled/child-9.transcript.md"
+        );
+    }
+
+    #[test]
+    fn resolves_handed_back_artifacts_under_the_artifacts_dir() {
+        let manifest = parse_handoff_file_request(Some("child-9"), "artifacts.json").unwrap();
+        assert_eq!(
+            resolve_handoff_file_path("delegation-1", &manifest).unwrap(),
+            ".pi-handoff/delegation-1/child-9/artifacts.json"
+        );
+        let artifact =
+            parse_handoff_file_request(Some("child-9"), "artifacts/report/data.csv").unwrap();
+        assert_eq!(
+            resolve_handoff_file_path("delegation-1", &artifact).unwrap(),
+            ".pi-handoff/delegation-1/child-9/artifacts/report/data.csv"
+        );
+    }
+
+    #[test]
+    fn artifact_reads_are_allowed_under_every_status() {
+        let request = parse_handoff_file_request(Some("child"), "artifacts/notes.md").unwrap();
+        for status in [
+            DelegationStatus::Running,
+            DelegationStatus::Cancelling,
+            DelegationStatus::Cancelled,
+            DelegationStatus::Failed,
+            DelegationStatus::Done,
+            DelegationStatus::DoneWithFailures,
+        ] {
+            assert_eq!(
+                read_allowed_for_status(status, &request).unwrap(),
+                Some(true),
+                "artifacts must be readable under {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_traversal_and_shapeless_artifact_paths() {
+        for evil in [
+            "artifacts/",
+            "artifacts/../secret",
+            "artifacts/..",
+            "artifacts//notes.md",
+            "artifacts/./notes.md",
+            "artifacts//",
+            "artifacts/a/../../b",
+        ] {
+            let error = parse_handoff_file_request(Some("child"), evil).unwrap_err();
+            assert_eq!(error.code, "invalid_params", "{evil} must be rejected");
+        }
+        let deep = format!("artifacts/{}", vec!["a"; 17].join("/"));
+        assert_eq!(
+            parse_handoff_file_request(Some("child"), &deep)
+                .unwrap_err()
+                .code,
+            "invalid_params"
+        );
+        assert_eq!(
+            parse_handoff_file_request(None, "artifacts/notes.md")
+                .unwrap_err()
+                .code,
+            "invalid_params"
         );
     }
 
@@ -2066,7 +2216,7 @@ mod tests {
         for evil in ["..", "../other", "a/b", "/etc", "delegation/../..", "."] {
             let error = resolve_handoff_file_path(
                 evil,
-                HandoffFileRequest::Normal {
+                &HandoffFileRequest::Normal {
                     subagent_id: "child",
                     file: "transcript.md",
                 },
@@ -2084,7 +2234,7 @@ mod tests {
         for evil in ["..", "../x", "a/b", "/abs"] {
             let error = resolve_handoff_file_path(
                 "delegation-1",
-                HandoffFileRequest::Normal {
+                &HandoffFileRequest::Normal {
                     subagent_id: evil,
                     file: "transcript.md",
                 },

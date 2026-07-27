@@ -19,6 +19,7 @@
 
 use std::path::{Component, Path};
 
+use agent_runtime_protocol::CopiedArtifacts;
 use agent_store::{Delegation, DelegationStatus, HistoryTree};
 use agent_vocab::{
     AssistantMessage, ContentBlock, ToolResultStatus, TranscriptItem, TurnOutcome, UserMessage,
@@ -331,6 +332,44 @@ pub(crate) async fn refresh_task_prompt_artifact_if_present(
 /// relative to the session cwd so runtime-side file tools can read it.
 pub(crate) fn delegation_dir(delegation_id: &str) -> String {
     format!("{HANDOFF_DIR}/{delegation_id}")
+}
+
+/// What a read-only subagent handed back, as recorded by
+/// `<delegation dir>/<subagent_id>/artifacts.json` when its snapshot was
+/// reclaimed. Absent or unparsable manifests read as "nothing handed back":
+/// the manifest is a convenience index, not a source of truth.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HandedBackArtifacts {
+    pub(crate) files: Vec<String>,
+    pub(crate) truncated: bool,
+}
+
+pub(crate) async fn read_handed_back_artifacts(
+    state: &AppState,
+    runtime_id: &str,
+    workspace_id: &str,
+    delegation_rel_dir: &str,
+    session_id: &str,
+) -> std::result::Result<HandedBackArtifacts, RpcError> {
+    let session_segment = safe_handoff_path_segment(session_id, "subagent_id")?;
+    let Some(manifest) = state
+        .runtime_hosts
+        .read_workspace_file(
+            runtime_id,
+            workspace_id,
+            &format!("{delegation_rel_dir}/{session_segment}/artifacts.json"),
+        )
+        .await?
+    else {
+        return Ok(HandedBackArtifacts::default());
+    };
+    let Ok(manifest) = serde_json::from_str::<CopiedArtifacts>(&manifest) else {
+        return Ok(HandedBackArtifacts::default());
+    };
+    Ok(HandedBackArtifacts {
+        files: manifest.files.into_iter().map(|file| file.path).collect(),
+        truncated: manifest.truncated,
+    })
 }
 
 /// Refresh per-subagent handoff artifacts from durable Postgres transcripts.
