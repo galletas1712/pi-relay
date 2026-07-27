@@ -13,6 +13,13 @@ use anyhow::{Context, Result};
 
 const MAX_ARTIFACT_FILES: usize = 200;
 const MAX_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+/// The walk is recursive, so an agent-authored `mkdir -p a/a/a/...` chain would
+/// otherwise overflow the runtime's stack — a hard `abort()`, not a catchable
+/// panic. Both bounds match the read vocabulary (`MAX_ARTIFACT_PATH_SEGMENTS`
+/// and `MAX_ARTIFACT_PATH_LEN` in the daemon), so nothing is ever copied that a
+/// later `read_handoff_file` would refuse to name.
+const MAX_ARTIFACT_DEPTH: usize = 16;
+const MAX_ARTIFACT_PATH_LEN: usize = 512;
 
 /// Copy every regular file under `source` into `target`, preserving relative
 /// paths. Directories in `target` are created lazily, so an empty source tree
@@ -41,14 +48,17 @@ fn copy_artifact_tree_blocking(source: &Path, target: &Path) -> Result<Option<Co
     }
     let mut copied = CopiedArtifacts::default();
     let mut bytes = 0u64;
-    copy_dir(source, target, Path::new(""), &mut copied, &mut bytes)?;
+    copy_dir(source, target, Path::new(""), 0, &mut copied, &mut bytes)?;
     Ok(Some(copied))
 }
 
+/// `depth` is the number of path segments already walked, so an entry of this
+/// directory sits at `depth + 1`.
 fn copy_dir(
     source: &Path,
     target: &Path,
     relative: &Path,
+    depth: usize,
     copied: &mut CopiedArtifacts,
     bytes: &mut u64,
 ) -> Result<()> {
@@ -65,16 +75,35 @@ fn copy_dir(
         if copied.truncated {
             return Ok(());
         }
+        // `skipped` is written into the parent's durable workspace just like
+        // `files`, so the two share one bound.
+        if copied.files.len() + copied.skipped.len() >= MAX_ARTIFACT_FILES {
+            copied.truncated = true;
+            return Ok(());
+        }
         let child_source = source.join(&name);
         let child_target = target.join(&name);
         let child_relative = relative.join(&name);
         let display = child_relative.to_string_lossy().to_string();
         // `file_type` comes from `read_dir` and never follows symlinks, so a
         // symlinked directory is recorded as skipped rather than traversed.
-        if file_type.is_symlink() || !(file_type.is_dir() || file_type.is_file()) {
+        // Entries past the depth/length bounds are skipped for the same reason:
+        // they are recorded, never followed.
+        if file_type.is_symlink()
+            || !(file_type.is_dir() || file_type.is_file())
+            || depth + 1 > MAX_ARTIFACT_DEPTH
+            || display.len() > MAX_ARTIFACT_PATH_LEN
+        {
             copied.skipped.push(display);
         } else if file_type.is_dir() {
-            copy_dir(&child_source, &child_target, &child_relative, copied, bytes)?;
+            copy_dir(
+                &child_source,
+                &child_target,
+                &child_relative,
+                depth + 1,
+                copied,
+                bytes,
+            )?;
         } else {
             let size = std::fs::symlink_metadata(&child_source)
                 .with_context(|| format!("inspect artifact {}", child_source.display()))?
@@ -236,6 +265,61 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a.bin"]
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn stops_at_the_depth_bound_instead_of_overflowing_the_stack() {
+        let root = temp_root("depth");
+        let source = root.join("src");
+        let target = root.join("dst");
+        let mut deep = source.clone();
+        for _ in 0..2000 {
+            deep = deep.join("d");
+        }
+        write(&deep.join("buried.txt"), "buried");
+        write(&source.join("top.txt"), "top");
+
+        let copied = copy_artifact_tree(&source, &target)
+            .await
+            .expect("copy")
+            .expect("present");
+
+        assert_eq!(
+            copied
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["top.txt"]
+        );
+        assert_eq!(
+            copied.skipped,
+            vec!["d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d/d".to_string()]
+        );
+        assert!(!copied.truncated);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn skipped_entries_count_against_the_file_bound() {
+        let root = temp_root("skip-bound");
+        let source = root.join("src");
+        let target = root.join("dst");
+        std::fs::create_dir_all(&source).expect("source");
+        for index in 0..(MAX_ARTIFACT_FILES + 10) {
+            std::os::unix::fs::symlink(root.join("nowhere"), source.join(format!("l{index:04}")))
+                .expect("symlink");
+        }
+
+        let copied = copy_artifact_tree(&source, &target)
+            .await
+            .expect("copy")
+            .expect("present");
+
+        assert!(copied.truncated);
+        assert_eq!(copied.skipped.len(), MAX_ARTIFACT_FILES);
+        assert!(copied.files.is_empty());
         std::fs::remove_dir_all(root).ok();
     }
 

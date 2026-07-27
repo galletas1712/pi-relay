@@ -1474,10 +1474,12 @@ directory under the same guard, so a fork or read-only child never sees the
 source session's delegation artifacts. In a read-only child that empty directory
 is the artifact staging tree: whatever the child writes there is copied to
 `<parent cwd>/.pi-handoff/<delegation_id>/<subagent_id>/artifacts/` — bounded at
-200 files and 32 MiB, regular files only, symlinks never followed — immediately
+200 files and 32 MiB, at most 16 path segments deep, regular files only,
+symlinks never followed — immediately
 before its snapshot is reclaimed. Full (writing) subagents work in the parent's
-cwd in place and are never copied from or torn down. The daemon does not claim to track independently running background
-processes beyond the managed future lifetime.
+cwd in place and are never copied from or torn down. The daemon does not claim
+to track independently running background processes beyond the managed future
+lifetime.
 
 ### `turn.resume`
 
@@ -1838,10 +1840,10 @@ are readable under every status as `artifacts/<path>`, listed by
 `artifacts.json` and by `artifact_files` in the snapshot; a non-UTF-8 artifact
 fails this RPC, and the parent agent reads it from its own cwd instead. The
 structured delegation snapshot comes from `delegation.status`, not from a
-handoff root artifact file. Raw task prompts, full final messages, and full
-transcript bodies
-are never inlined in delegation snapshots, daemon observations, or compaction
-ledgers; use this RPC to read an artifact body explicitly when detail is needed.
+handoff root artifact file. Raw task prompts, full final messages, and
+full transcript bodies are never inlined in delegation snapshots, daemon
+observations, or compaction ledgers; use this RPC to read an artifact body
+explicitly when detail is needed.
 
 Allowed `file` values are exactly:
 

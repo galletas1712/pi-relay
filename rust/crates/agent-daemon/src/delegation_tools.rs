@@ -1262,6 +1262,12 @@ impl HandoffFileRequest<'_> {
             | Self::Artifact { subagent_id, .. } => subagent_id,
         }
     }
+
+    /// Handed-back artifacts are agent-authored files, not transcript-derived
+    /// prose, so they are readable under every status including cancellation.
+    fn is_artifact(&self) -> bool {
+        matches!(self, Self::ArtifactManifest { .. } | Self::Artifact { .. })
+    }
 }
 
 /// A handed-back artifact path is bounded in both depth and length so a caller
@@ -1349,14 +1355,11 @@ fn read_allowed_for_status(
     status: DelegationStatus,
     request: &HandoffFileRequest<'_>,
 ) -> std::result::Result<Option<bool>, RpcError> {
-    // Handed-back artifacts are agent-authored files, not transcript-derived
-    // prose, so they are readable under every status including cancellation.
-    if matches!(
-        request,
-        HandoffFileRequest::ArtifactManifest { .. } | HandoffFileRequest::Artifact { .. }
-    ) {
+    if request.is_artifact() {
         return Ok(Some(true));
     }
+    // Every status arm stays exhaustive over `HandoffFileRequest`, so a new
+    // variant is a compile error rather than a silent inheritance of a default.
     match status {
         DelegationStatus::Cancelling => Ok(Some(false)),
         DelegationStatus::Running => match request {
@@ -1377,12 +1380,16 @@ fn read_allowed_for_status(
                 format!("unsupported handoff file {file}"),
             )),
             HandoffFileRequest::CancelledTranscript { .. } => Ok(Some(false)),
-            _ => unreachable!("artifact reads returned above"),
+            HandoffFileRequest::ArtifactManifest { .. } | HandoffFileRequest::Artifact { .. } => {
+                Ok(Some(true))
+            }
         },
         DelegationStatus::Done | DelegationStatus::DoneWithFailures => match request {
             HandoffFileRequest::Normal { .. } => Ok(Some(true)),
             HandoffFileRequest::CancelledTranscript { .. } => Ok(Some(false)),
-            _ => unreachable!("artifact reads returned above"),
+            HandoffFileRequest::ArtifactManifest { .. } | HandoffFileRequest::Artifact { .. } => {
+                Ok(Some(true))
+            }
         },
         DelegationStatus::Cancelled => match request {
             HandoffFileRequest::Normal {
@@ -1399,14 +1406,20 @@ fn read_allowed_for_status(
                 ..
             } => Ok(Some(false)),
             HandoffFileRequest::Normal { .. } => Ok(Some(false)),
-            _ => unreachable!("artifact reads returned above"),
+            HandoffFileRequest::ArtifactManifest { .. } | HandoffFileRequest::Artifact { .. } => {
+                Ok(Some(true))
+            }
         },
         DelegationStatus::Failed => match request {
             HandoffFileRequest::Normal {
                 file: TASK_PROMPT_FILE,
                 ..
             } => Ok(Some(true)),
-            _ => Ok(Some(false)),
+            HandoffFileRequest::Normal { .. } => Ok(Some(false)),
+            HandoffFileRequest::CancelledTranscript { .. } => Ok(Some(false)),
+            HandoffFileRequest::ArtifactManifest { .. } | HandoffFileRequest::Artifact { .. } => {
+                Ok(Some(true))
+            }
         },
     }
 }
@@ -1542,10 +1555,7 @@ pub(crate) async fn read_handoff_file_core(
     validate_member_subagent(&request, &members)?;
 
     if read_allowed_for_request(state, &delegation, &request).await? {
-        if matches!(
-            request,
-            HandoffFileRequest::ArtifactManifest { .. } | HandoffFileRequest::Artifact { .. }
-        ) {
+        if request.is_artifact() {
             // Artifacts were copied out of the child's snapshot; nothing to
             // re-render from Postgres.
         } else if matches!(

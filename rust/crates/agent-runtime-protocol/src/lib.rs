@@ -271,7 +271,8 @@ pub enum RuntimeCommandResult {
 
 /// What a `CopyWorkspaceSubtree` actually copied. `truncated` is set when the
 /// walk stopped at a file-count or byte bound; `skipped` records entries that
-/// were not regular files (symlinks, sockets, fifos) and were never followed.
+/// were not copied and never followed — non-regular files (symlinks, sockets,
+/// fifos) and entries past the path depth or length bound.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CopiedArtifacts {
     pub files: Vec<CopiedArtifactFile>,
