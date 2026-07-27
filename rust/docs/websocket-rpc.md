@@ -2200,8 +2200,8 @@ Verify:
 1. Call `system.prompt` with a real `session_id`.
 2. Verify the response contains the repo-level `PI.md` template and a rendered
    prompt for the requested session.
-3. In the web UI, type `/system` and verify the same prompt preview is displayed
-   read-only.
+3. In the web UI, select **See system prompt** at the transcript start and
+   verify the same prompt preview is displayed read-only.
 
 
 ### 3. Image Input Persistence

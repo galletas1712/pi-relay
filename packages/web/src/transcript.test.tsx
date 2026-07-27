@@ -402,6 +402,65 @@ describe("turn jump navigation", () => {
 });
 
 describe("MessageList session loading guard", () => {
+	it("shows the system prompt control before the first user content only when the oldest page is loaded", () => {
+		const oldestPage = renderToStaticMarkup(
+			<MessageList
+				entries={[userEntry("entry_1", "first user message")]}
+				activeLeafId="entry_1"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onOpenSystemPrompt={() => {}}
+			/>,
+		);
+		const pagedTail = renderToStaticMarkup(
+			<MessageList
+				entries={[userEntry("entry_1", "later user message")]}
+				activeLeafId="entry_1"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				hasOlderTurns
+				onOpenSystemPrompt={() => {}}
+			/>,
+		);
+
+		expect(oldestPage.indexOf("See system prompt")).toBeLessThan(oldestPage.indexOf("first user message"));
+		expect(pagedTail).not.toContain("See system prompt");
+	});
+
+	it("shows the system prompt control for a loaded durable empty session, but not new-session state", () => {
+		const durable = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				activeLeafId={null}
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onOpenSystemPrompt={() => {}}
+			/>,
+		);
+		const unsaved = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				activeLeafId={null}
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession={false}
+				onOpenSystemPrompt={() => {}}
+			/>,
+		);
+
+		expect(durable).toContain("See system prompt");
+		expect(unsaved).not.toContain("See system prompt");
+	});
+
 	it("shows a loading state instead of stale entries when entries belong to another session", () => {
 		const html = renderToStaticMarkup(
 			<MessageList

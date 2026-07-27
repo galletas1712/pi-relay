@@ -13,7 +13,7 @@ import {
 	remoteActionBlockedReason,
 	WAITING_FOR_CONNECTION,
 } from "./connectionRecovery.tsx";
-import { COMMANDS } from "./slash.ts";
+import { COMMANDS, findCommand } from "./slash.ts";
 
 beforeAll(() => {
 	class ResizeObserver {
@@ -45,7 +45,6 @@ describe("connection policy", () => {
 		for (const [text, expected] of [
 			["plain text", true],
 			["/compact", true],
-			["/system", true],
 			["/help", false],
 			["/export", false],
 			["/switch", true],
@@ -143,6 +142,8 @@ describe("representative component gates", () => {
 		expect((screen.getByRole("option", { name: /export/i }) as HTMLButtonElement).disabled).toBe(false);
 		expect((screen.getByRole("option", { name: /switch/i }) as HTMLButtonElement).disabled).toBe(true);
 		expect((screen.getByRole("option", { name: /compact/i }) as HTMLButtonElement).disabled).toBe(true);
+		expect(screen.queryByRole("option", { name: /system/i })).toBeNull();
+		expect(findCommand("system")).toBeUndefined();
 	});
 });
 

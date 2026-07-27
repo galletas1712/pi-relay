@@ -474,6 +474,11 @@ chat is purely composer state. Legacy UI selection migration uses
 `piRelayUiResume:v1`; transcript scroll position is not persisted, and the
 retired `piRelayTranscriptScroll:v1` key is removed defensively.
 
+At the true start of a durable session transcript, **See system prompt** fetches
+that session's persisted rendered `PI.md` prompt and source template through
+`system.prompt`. The control remains hidden while older turn pages are available
+and does not appear in unsaved new-session state.
+
 ### Slash commands
 
 Slash commands (`slash.ts`) are thin wrappers over RPCs that lack a dedicated control. Autocomplete is shallow: it shows
@@ -485,7 +490,6 @@ Enter on an exact command submits.
 | `/switch` | Opens the same-session history picker (idle only). User-message targets restore the full original message into the composer; turn/compaction targets just become the active leaf. |
 | `/fork` | Opens the same picker for a managed project session (idle only). It clones the current workspace—not historical files—into an independent top-level child. A user-message target becomes the new child's composer draft. |
 | `/compact` | Requests context compaction (`compaction.request`). |
-| `/system` | Shows the selected session's rendered `PI.md` prompt and source template (`system.prompt`). Requires a durable session. |
 | `/export` | Exports the current branch's assistant/user messages, fetching active-branch bodies for the export view. |
 
 Switch and fork never accept raw transcript ids from the web UI; the picker is

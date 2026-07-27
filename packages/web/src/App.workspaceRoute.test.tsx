@@ -71,6 +71,101 @@ afterEach(() => {
 });
 
 describe("App workspace route identity integration", () => {
+	it("fetches and opens the selected session system prompt from the transcript start", async () => {
+		const api = createRouteApi();
+		vi.mocked(api.getSystemPrompt).mockResolvedValue({
+			template: "Template source",
+			rendered: "Rendered **persisted prompt**",
+		});
+		const mounted = renderRouteApp(
+			api,
+			new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1"),
+		);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+
+		expect(api.getSystemPrompt).toHaveBeenCalledWith("root-1");
+		expect(await screen.findByRole("dialog", { name: "PI.md" })).toBeTruthy();
+		expect(screen.getByText("persisted prompt")).toBeTruthy();
+		await user.click(screen.getByRole("button", { name: "Template" }));
+		expect(screen.getByText("Template source")).toBeTruthy();
+
+		await mounted.dispose();
+	});
+
+	it("closes a pending prompt on navigation and ignores its late response after opening the next session", async () => {
+		const first = deferred<{ template: string; rendered: string | null }>();
+		const second = deferred<{ template: string; rendered: string | null }>();
+		const api = createRouteApi();
+		vi.mocked(api.getSystemPrompt).mockImplementation((sessionId) =>
+			sessionId === "root-1" ? first.promise : second.promise);
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+		expect(screen.getByText("Loading PI.md…")).toBeTruthy();
+
+		await act(async () =>
+			browser.navigate("/w/host/run/legacy-root/conversation/legacy-root"),
+		);
+		await waitFor(() => expect(screen.queryByRole("dialog", { name: "PI.md" })).toBeNull());
+		await waitFor(() =>
+			expect(document.querySelector(".log-session")?.textContent).toBe("Legacy root"),
+		);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+		await act(async () => second.resolve({
+			template: "Second template",
+			rendered: "Second rendered prompt",
+		}));
+		expect(await screen.findByText("Second rendered prompt")).toBeTruthy();
+
+		await act(async () => first.resolve({
+			template: "Stale template",
+			rendered: "Stale rendered prompt",
+		}));
+		expect(screen.getByText("Second rendered prompt")).toBeTruthy();
+		expect(screen.queryByText("Stale rendered prompt")).toBeNull();
+
+		await mounted.dispose();
+	});
+
+	it("ignores a stale prompt error while the next session prompt is pending", async () => {
+		const first = deferred<{ template: string; rendered: string | null }>();
+		const second = deferred<{ template: string; rendered: string | null }>();
+		const api = createRouteApi();
+		vi.mocked(api.getSystemPrompt).mockImplementation((sessionId) =>
+			sessionId === "root-1" ? first.promise : second.promise);
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+		await act(async () =>
+			browser.navigate("/w/host/run/legacy-root/conversation/legacy-root"),
+		);
+		await waitFor(() =>
+			expect(document.querySelector(".log-session")?.textContent).toBe("Legacy root"),
+		);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+
+		await act(async () => first.reject(new Error("stale prompt failed")));
+		expect(screen.getByText("Loading PI.md…")).toBeTruthy();
+		expect(screen.queryByText("stale prompt failed")).toBeNull();
+
+		await act(async () => second.resolve({
+			template: "Current template",
+			rendered: "Current rendered prompt",
+		}));
+		expect(await screen.findByText("Current rendered prompt")).toBeTruthy();
+
+		await mounted.dispose();
+	});
+
 	it("shows workspace and MCP setup in the central pane and keeps both controls functional", async () => {
 		const api = createRouteApi();
 		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));

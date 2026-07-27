@@ -578,7 +578,7 @@ Implementation slices:
 **Header/session actions**
 
 - Add one actions Menu exposing **History**, **Export**, **Instructions** (current PI.md), and **Context Summary** where current data supports it.
-- Retain `/switch`, `/export`, `/system`, `/compact`, and `/help` for expert users (`packages/web/src/slash.ts:12-18`).
+- Retain `/switch`, `/export`, `/compact`, and `/help` for expert users (`packages/web/src/slash.ts`).
 - Do not claim Context Summary exists if only raw compaction markers are available; either derive it from an explicit current summary field or show an unavailable state until the contract exists.
 - Use task-centered copy in primary UI:
   - Execution rather than Run Board;

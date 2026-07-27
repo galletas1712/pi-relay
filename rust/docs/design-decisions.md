@@ -89,8 +89,10 @@ have dedicated UI controls, without adding a second frontend command model.
   clones the current workspace into an independent child, and restores a
   selected user message as that child's composer draft.
 - `/compact` requests context compaction.
-- `/system` shows the selected session's rendered PI.md prompt and source
-  template. It is unavailable before a durable session exists.
+
+The transcript-start **See system prompt** control calls `system.prompt` to show
+the selected session's rendered PI.md prompt and source template. It is
+unavailable before a durable session exists.
 
 Model selection is not a slash command. The web top bar exposes the small model
 picker and provider-specific reasoning effort picker. Provider/model identity may
@@ -162,7 +164,7 @@ workspaces are materialized, the daemon renders it with the session's
 workspace, tool, and skill context and persists the result as the immutable
 `sessions.system_prompt`. Provider calls use that stored prompt, so repository
 template edits cannot introduce prompt drift within a session. The
-session-scoped `/system` interface returns the selected session's persisted
+session-scoped `system.prompt` RPC returns the selected session's persisted
 prompt together with the current repository template; it does not re-render or
 mutate the session prompt.
 

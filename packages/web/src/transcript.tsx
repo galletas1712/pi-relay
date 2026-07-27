@@ -237,6 +237,7 @@ export const MessageList = memo(function MessageList({
 	turnCards,
 	onExpandTurn,
 	onCollapseTurn,
+	onOpenSystemPrompt,
 	loadingTurnId,
 	hasOlderTurns,
 	loadingOlderTurns,
@@ -267,6 +268,7 @@ export const MessageList = memo(function MessageList({
 	turnCards?: TurnCardView[] | null;
 	onExpandTurn?: (turnId: string) => void;
 	onCollapseTurn?: (turnId: string) => void;
+	onOpenSystemPrompt?: () => void;
 	loadingTurnId?: string | null;
 	hasOlderTurns?: boolean;
 	loadingOlderTurns?: boolean;
@@ -828,6 +830,19 @@ export const MessageList = memo(function MessageList({
 									<ConnectionBlockedReason reason={remoteReadBlockedReason} />
 								</>
 							) : null}
+						</div>
+					) : null}
+					{!hasOlderTurns && onOpenSystemPrompt ? (
+						<div className="turn-detail-toggle-row transcript-start-control">
+							<button
+								type="button"
+								className="link-button"
+								disabled={!!remoteReadBlockedReason}
+								onClick={onOpenSystemPrompt}
+							>
+								See system prompt
+							</button>
+							<ConnectionBlockedReason reason={remoteReadBlockedReason} />
 						</div>
 					) : null}
 					{shouldUseTurnCards
