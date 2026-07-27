@@ -502,6 +502,7 @@ mod tests {
         assert!(rendered.contains("## Subagent contract"));
         assert!(rendered.contains("spawned by parent session `session_parent`"));
         assert!(rendered.contains("parent workspace in place"));
+        assert!(rendered.contains("cannot spawn nested delegations"));
         assert!(!rendered.contains(".pi-handoff"));
         assert!(!rendered.contains("## Subagent delegation"));
     }

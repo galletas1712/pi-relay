@@ -90,6 +90,8 @@ The parent can inspect your transcript, send follow-up messages, interrupt you,
 and decide whether to merge your filesystem changes.
 Keep your own context focused on the delegated task. Do not assume your changes
 are merged automatically.
+You cannot spawn nested delegations; the parent orchestration tools are not in
+your toolset.
 Answer only the delegated task. Your final message/report is the durable handoff
 to the parent, so include the evidence, changed files, commands, risks, and
 follow-up work the parent needs.
