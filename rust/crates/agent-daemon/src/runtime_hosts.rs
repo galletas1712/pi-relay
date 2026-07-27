@@ -1049,6 +1049,11 @@ pub(crate) mod test_support {
 
     /// Mirrors the runtime's curated artifact walk closely enough for daemon
     /// orchestration tests: regular files only, sorted, symlinks skipped.
+    ///
+    /// Deliberately not a faithful double: the real walker's file/byte/depth
+    /// bounds, name filtering, and lazy target-dir creation are unmodelled and
+    /// are covered by `agent-runtime`'s own tests. Do not use this to reason
+    /// about bound regressions.
     fn fake_copy_tree(
         source: &std::path::Path,
         target: &std::path::Path,

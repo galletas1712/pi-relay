@@ -120,6 +120,7 @@ dependencies = [
  "agent-vocab",
  "anyhow",
  "futures-util",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

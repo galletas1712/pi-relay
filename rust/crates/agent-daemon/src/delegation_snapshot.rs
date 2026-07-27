@@ -11,6 +11,11 @@ use crate::handoff::{
 use crate::state::AppState;
 use crate::types::RpcError;
 
+/// A handback can carry up to 200 paths of up to 512 bytes each, per subagent,
+/// so the snapshot inlines only a sample and reports the rest as a count. The
+/// full list is always in the child's `artifacts.json`.
+const MAX_INLINE_ARTIFACT_FILES: usize = 10;
+
 pub(crate) fn progress_view(progress: DelegationProgress) -> Value {
     json!({
         "expected": progress.expected,
@@ -223,7 +228,8 @@ pub(crate) async fn build_delegation_snapshot(
             "final_message_file": final_message_file,
             "transcript_file": transcript_file,
             "task_prompt_file": task_prompt_file,
-            "artifact_files": handed_back.files,
+            "artifact_files": handed_back.files.iter().take(MAX_INLINE_ARTIFACT_FILES).collect::<Vec<_>>(),
+            "artifact_files_omitted": handed_back.files.len().saturating_sub(MAX_INLINE_ARTIFACT_FILES),
             "artifacts_truncated": handed_back.truncated,
         }));
     }

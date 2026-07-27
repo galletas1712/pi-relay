@@ -74,17 +74,6 @@ async fn copy_artifacts_to_parent(state: &AppState, session_id: &str) -> anyhow:
         // The child staged nothing; leave no empty manifest behind.
         return Ok(());
     }
-    if artifacts.truncated {
-        state
-            .runtime_hosts
-            .write_workspace_file(
-                &parent.runtime_id,
-                &parent.workspace_id,
-                &format!("{dir}/{child_segment}/artifacts/TRUNCATED.md"),
-                "This handback hit the artifact bounds (200 files / 32 MiB) and is incomplete.\n",
-            )
-            .await?;
-    }
     state
         .runtime_hosts
         .write_workspace_file(

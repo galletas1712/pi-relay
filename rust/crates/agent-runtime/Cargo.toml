@@ -16,6 +16,7 @@ agent-tools = { workspace = true }
 agent-vocab = { workspace = true }
 anyhow = { workspace = true }
 futures-util = { workspace = true }
+rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

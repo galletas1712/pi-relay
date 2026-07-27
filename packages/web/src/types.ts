@@ -199,8 +199,11 @@ export interface DelegationSubagent {
 	transcript_file?: string | null;
 	task_prompt_file?: string | null;
 	/** Files a read-only subagent staged in its own `.pi-handoff/` and handed
-	 * back; read with `delegation.read_handoff_file` as `artifacts/<path>`. */
+	 * back; read with `delegation.read_handoff_file` as `artifacts/<path>`.
+	 * Sampled: `artifact_files_omitted` counts the rest, all of which are
+	 * listed in the subagent's `artifacts.json`. */
 	artifact_files?: string[] | null;
+	artifact_files_omitted?: number;
 	artifacts_truncated?: boolean;
 }
 

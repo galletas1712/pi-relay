@@ -1474,8 +1474,10 @@ directory under the same guard, so a fork or read-only child never sees the
 source session's delegation artifacts. In a read-only child that empty directory
 is the artifact staging tree: whatever the child writes there is copied to
 `<parent cwd>/.pi-handoff/<delegation_id>/<subagent_id>/artifacts/` — bounded at
-200 files and 32 MiB, at most 16 path segments deep, regular files only,
-symlinks never followed — immediately
+200 files and 32 MiB, at most 16 path segments deep, regular files only, every
+entry resolved through the directory fd the walk already holds so a rename
+racing the walk can only skip an entry, never redirect a copy outside the tree —
+immediately
 before its snapshot is reclaimed. Full (writing) subagents work in the parent's
 cwd in place and are never copied from or torn down. The daemon does not claim
 to track independently running background processes beyond the managed future
@@ -1629,6 +1631,7 @@ Result:
       "transcript_file": "session_.../transcript.md",
       "task_prompt_file": "session_.../task_prompt.md",
       "artifact_files": ["notes.md", "report/data.csv"],
+      "artifact_files_omitted": 0,
       "artifacts_truncated": false
     }
   ],
@@ -1836,11 +1839,13 @@ done/done_with_failures delegations also expose per-subagent `final_message.md`.
 Cancelled delegations expose the transcript-only cancellation artifact path
 reported in the delegation snapshot, for example
 `cancelled/<subagent_id>.transcript.md`. Files a read-only subagent handed back
-are readable under every status as `artifacts/<path>`, listed by
-`artifacts.json` and by `artifact_files` in the snapshot; a non-UTF-8 artifact
-fails this RPC, and the parent agent reads it from its own cwd instead. The
-structured delegation snapshot comes from `delegation.status`, not from a
-handoff root artifact file. Raw task prompts, full final messages, and
+are readable under every status as `artifacts/<path>`, listed in full by
+`artifacts.json` and sampled by `artifact_files` in the snapshot (with
+`artifact_files_omitted` counting the rest). Names the reader could not resolve
+— not valid UTF-8, or not equal to their own trim — are never copied; they
+appear in the manifest's `skipped`, so every listed path exists on disk and is
+readable. The structured delegation snapshot comes from `delegation.status`,
+not from a handoff root artifact file. Raw task prompts, full final messages, and
 full transcript bodies are never inlined in delegation snapshots, daemon
 observations, or compaction ledgers; use this RPC to read an artifact body
 explicitly when detail is needed.
