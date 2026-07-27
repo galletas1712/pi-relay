@@ -69,7 +69,7 @@
   `runtime/tool.rs` turns into an error `ToolResultMessage` for that call. The
   turn continues with a tool error, it does not fail.
 - Follow-up (outside this repo): the runtime-host role prompts
-  `~/.config/pi-relay/runtime/subagent-roles/{tester,reviewer,explore}/SKILL.md`
+  `~/.config/pi-relay/runtime/subagent-roles/{tester,reviewer}/SKILL.md`
   still tell subagents to branch on "a refreshed `inspect_delegation` snapshot"
   and need that sentence removed.
 

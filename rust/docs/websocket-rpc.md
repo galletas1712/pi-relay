@@ -1881,8 +1881,8 @@ typed `daemon_tool_observation` transcript item and carries the same snapshot as
 `delegation.status`, including per-subagent `outcome` and artifact paths.
 Provider adapters render it as one plain user-role message carrying the
 observation text; the UI renders it as a daemon/system observation card. Clients
-use `delegation.status` to refresh or inspect a running delegation; the model has
-no inspection tool and reads the per-subagent `task_prompt.md`,
+use `delegation.status` to refresh or inspect a running delegation; the model
+has no inspection tool and reads the per-subagent `task_prompt.md`,
 `final_message.md`, and `transcript.md` files under the launch result's
 `handoff_dir` for extra detail.
 

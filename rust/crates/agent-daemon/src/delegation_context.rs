@@ -221,9 +221,10 @@ fn transcript_file_for(status: DelegationStatus, subagent_id: &str) -> Option<St
 }
 
 /// The overflow line for subagents the ledger could not show. Pointing the
-/// parent at `handoff_dir` only helps when that directory actually holds a file
-/// per subagent: `Cancelling` and `Failed` publish nothing at all (see
-/// `refresh_delegation_handoff_artifacts`), so the directory may not even exist.
+/// parent at `handoff_dir` only helps when that directory actually holds a
+/// current file per subagent: `Cancelling` and `Failed` publish nothing at all
+/// (see `refresh_delegation_handoff_artifacts`), so it holds at best whatever a
+/// prior `Running` refresh left behind, and often nothing.
 fn omitted_subagents_line(status: DelegationStatus, omitted: usize) -> String {
     let hint = match status {
         DelegationStatus::Cancelling | DelegationStatus::Failed => "",

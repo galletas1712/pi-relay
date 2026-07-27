@@ -112,10 +112,10 @@ Delegation completion wakeups are rendered as provider-neutral daemon
 observations. The durable transcript entry is a typed
 `daemon_tool_observation`, not an ordinary user message and not a fake assistant
 tool choice. It records the daemon-authored `delegation_status` observation
-with arguments, status, concise summary, and bounded
-snapshot JSON. Provider adapters render this typed item as one plain user-role
-message carrying the daemon-authored observation text; the UI
-renders it as a daemon/system observation card.
+with arguments, status, concise summary, and bounded snapshot JSON. Provider
+adapters render this typed item as one plain user-role message carrying the
+daemon-authored observation text; the UI renders it as a daemon/system
+observation card.
 
 The snapshot never inlines full transcript bodies or raw subagent task prompts.
 Task prompts are materialized as per-subagent `task_prompt.md` handoff files,
@@ -123,9 +123,9 @@ final messages are exposed through `final_message.md` file references, and
 `outcome` stays inline because workflows branch on it.
 
 Normal top-level parent model requests do not receive a daemon-generated
-delegation dashboard. They are transcript-driven: durable delegate tool results
-and typed wakeup observations already live in history, so the provider input stays as stable
-PI/system prompt plus transcript history.
+delegation dashboard. They are transcript-driven: durable delegate tool results and
+typed wakeup observations already live in history, so the provider input stays
+as stable PI/system prompt plus transcript history.
 
 Compaction is the special case, but the live ledger is not a provider input. For
 top-level parent sessions, the provider compacts only transcript/model history
@@ -134,16 +134,14 @@ text). After the provider returns, the daemon appends a fresh
 `## Delegation state at compaction time` section to the stored compaction
 summary. The ledger lists every delegation row for that parent session across
 all statuses (`running`, `cancelling`, `done`, `done_with_failures`,
-`cancelled`, `failed`),
-with bounded subagent/progress details, `outcome` control data when
-available, and artifact paths. It does not refresh artifacts or inline
-transcript or final-message bodies. A `running` entry is a point-in-time
-compaction fact, not a
-final outcome; later completion observations provide fresh state, and the
-ledger's `handoff_dir` and per-subagent file references can be read directly
-with ordinary file tools. If older ledger text remains in prior summaries, the
-newly appended
-ledger supersedes it by being the latest section. Subagent compactions do not
+`cancelled`, `failed`), with bounded subagent/progress details, `outcome`
+control data when available, and artifact paths. It does not refresh artifacts
+or inline transcript or final-message bodies. A `running` entry is a
+point-in-time compaction fact, not a final outcome; later completion
+observations provide fresh state, and the ledger's `handoff_dir` and
+per-subagent file references can be read directly with ordinary file tools. If
+older ledger text remains in prior summaries, the newly appended ledger
+supersedes it by being the latest section. Subagent compactions do not
 receive or append the parent ledger, sibling subagent state, or `## Current
 delegations` information; subagents summarize only their own role contract,
 delegated task, transcript/model history, and tool results/facts.
