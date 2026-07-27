@@ -27,7 +27,7 @@ with cancelled as (
         origin = coalesce(origin, '{}'::jsonb)
             || jsonb_build_object(
                    'cancelled_at', now()::text,
-                   'cancelled_reason', 'partial_delegation_wakeups_removed'
+                   'cancel_reason', 'partial_delegation_wakeups_removed'
                )
     where priority = 'steer'
       and status in ('queued', 'consuming')

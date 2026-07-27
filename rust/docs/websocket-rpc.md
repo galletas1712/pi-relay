@@ -387,8 +387,7 @@ Child sessions link back through `sessions.delegation_id`. The
 `delegations_parent_created_idx` index supports the per-parent delegation feed.
 The completion runner uses `attempt_id` as an idempotency fence and queues a
 deterministic parent daemon wakeup observation keyed as
-`delegation-steer:<delegation_id>:<attempt_id>` (the key name is retained for
-idempotency compatibility).
+`delegation-steer:<delegation_id>:<attempt_id>`.
 
 ### `events`
 

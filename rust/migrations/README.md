@@ -19,15 +19,15 @@ window in which a stale partial is replayed into a parent transcript.
    often zero):
 
    ```sql
-   select q.session_id,
-          q.status,
+   select session_id,
+          status,
           count(*) as rows,
-          min(q.created_at) as oldest
-   from queued_inputs q
-   where q.priority = 'steer'
-     and q.status in ('queued', 'consuming')
-     and q.content->>'type' = 'daemon_tool_observation'
-     and q.client_input_id ~ '^delegation-steer:[^:]+:[^:]+:[^:]+$'
+          min(created_at) as oldest
+   from queued_inputs
+   where priority = 'steer'
+     and status in ('queued', 'consuming')
+     and content->>'type' = 'daemon_tool_observation'
+     and client_input_id ~ '^delegation-steer:[^:]+:[^:]+:[^:]+$'
    group by 1, 2
    order by 1, 2;
    ```
