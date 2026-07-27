@@ -177,9 +177,9 @@ transport used by the `openai` kind. Requests using either retired name are
 rejected at decode time.
 
 `prompt_cache.key` maps to `ModelRequest::prompt_cache_key` and is sent on the
-OpenAI request path. `max_tokens` is optional; when present it is emitted as
-OpenAI `max_output_tokens`, and when omitted the daemon does not set an OpenAI
-output cap.
+OpenAI request path. `max_tokens` is optional and applies to `claude` sessions
+only: the Codex backend rejects `max_output_tokens`, so OpenAI requests never
+carry an output cap.
 
 `reasoning_effort` defaults to `medium`. The shared wire vocabulary is `none`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; decoding any other

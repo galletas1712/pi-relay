@@ -440,10 +440,10 @@ stay before volatile conversation-specific state. The daemon does not include a
 timestamp in dynamic context because that would churn the prompt for little
 value.
 
-The daemon also no longer imposes a default OpenAI/Codex output-token cap.
-`provider.max_tokens` remains an optional explicit cap if a particular session
-needs one; OpenAI requests emit it as `max_output_tokens` and otherwise omit the
-field. Anthropic's Messages API does require `max_tokens`, so its provider uses
+The daemon imposes no OpenAI/Codex output-token cap, and cannot: the Codex
+backend rejects `max_output_tokens` with `400 Unsupported parameter`, so the
+adapter never sends it. `provider.max_tokens` therefore applies to Anthropic
+sessions only. Anthropic's Messages API does require `max_tokens`, so its provider uses
 API-discovered/static per-model ceilings and clamps explicit limits to that
 ceiling. With no explicit limit it requests at most 64k: enough headroom for
 high-effort work without making an ordinary turn reserve the full 128k supported
