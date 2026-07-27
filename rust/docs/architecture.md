@@ -175,9 +175,9 @@ Implemented user-facing behavior:
   later/running.
   Delegation subagents may emit `subagent.spawned`/`subagent.running` progress
   events, but parent-visible completion is the delegation wakeup observation and
-  handoff, not a per-child idle event: exactly one wakeup per delegation. Reusable patterns are ordinary
-  **workflow skills** (`SKILL.md` + `LoadSkill`), not a DSL. Web/inspector RPCs use the canonical
-  `delegation.*` client API. See
+  handoff, not a per-child idle event: exactly one wakeup per delegation.
+  Reusable patterns are ordinary **workflow skills** (`SKILL.md` + `LoadSkill`),
+  not a DSL. Web/inspector RPCs use the canonical `delegation.*` client API. See
   [agent-daemon](modules/agent-daemon.md).
 
 Not implemented by design:

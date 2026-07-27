@@ -26,6 +26,7 @@ window in which a stale partial is replayed into a parent transcript.
    from queued_inputs q
    where q.priority = 'steer'
      and q.status in ('queued', 'consuming')
+     and q.content->>'type' = 'daemon_tool_observation'
      and q.client_input_id ~ '^delegation-steer:[^:]+:[^:]+:[^:]+$'
    group by 1, 2
    order by 1, 2;

@@ -82,15 +82,17 @@ snapshot destroyed on return. Delegation subagents may emit
 `subagent.spawned`/`subagent.running` progress events; an individual child
 reaching terminal produces no parent-visible wakeup. Their terminal hook fires a
 single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
-terminal, so the parent is woken exactly once, at delegation terminal status. After the DB finish CAS wins, the runner writes the handoff directory
+terminal, so the parent is woken exactly once, at delegation terminal status.
+After the DB finish CAS wins, the runner writes the handoff directory
 and then enqueues one `InputPriority::Steer` daemon observation to the parent.
 That observation includes the same structured snapshot shape as
 `inspect_delegation`, with `outcome` and compact handoff file
 references.
-Completion is that typed wakeup observation/handoff, not a parent-visible per-child idle event. The
-runner never decides the next delegation — the parent does, guided by workflow
-skills. Cancellation is terminal and exports transcript-only files for the
-cancelled subagents instead of running the normal completion handoff.
+Completion is that typed wakeup observation/handoff, not a parent-visible
+per-child idle event. The runner never decides the next delegation — the parent
+does, guided by workflow skills. Cancellation is terminal and exports
+transcript-only files for the cancelled subagents instead of running the normal
+completion handoff.
 
 Interrupting child controls are durable and generation-fenced. The captured
 generation is the active turn plus its complete deterministic unfinished
