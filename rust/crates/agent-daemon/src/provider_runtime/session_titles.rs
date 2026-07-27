@@ -209,10 +209,10 @@ async fn generate_session_title(
     .await?;
     let cache_prefix_len = model_request.transcript.len();
     model_request.transcript_cache_prefix_len = Some(cache_prefix_len);
-    // No max_output_tokens: the OpenAI/Codex `/responses` backend rejects that
-    // parameter for some models (e.g. gpt-5.6-sol returns HTTP 400
-    // "Unsupported parameter: max_output_tokens"). The short-title prompt plus
-    // TITLE_MAX_CHARS truncation already bound the output.
+    // No generation limit: the Codex `/responses` backend rejects
+    // `max_output_tokens` outright, so the OpenAI adapter never sends one. The
+    // short-title prompt plus TITLE_MAX_CHARS truncation already bound the
+    // output.
     model_request.reasoning_effort = ReasoningEffort::Low;
     model_request
         .transcript

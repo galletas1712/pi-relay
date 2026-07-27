@@ -443,16 +443,16 @@ value.
 The daemon imposes no OpenAI/Codex output-token cap, and cannot: the Codex
 backend rejects `max_output_tokens` with `400 Unsupported parameter`, so the
 adapter never sends it. `provider.max_tokens` therefore applies to Anthropic
-sessions only. Anthropic's Messages API does require `max_tokens`, so its provider uses
-API-discovered/static per-model ceilings and clamps explicit limits to that
-ceiling. With no explicit limit it requests at most 64k: enough headroom for
-high-effort work without making an ordinary turn reserve the full 128k supported
-by Opus 5, Sonnet 5, Fable 5, and Opus 4.8. Model discovery is cached and has a
-conservative static fallback, so an API outage never removes known UI options or
-turns off proactive compaction for known models. Discovery refreshes are
-single-flight per model. A transient refresh failure backs off for one minute
-while preserving stale last-known-good metadata instead of replacing it with a
-less authoritative fallback.
+sessions only. Anthropic's Messages API does require `max_tokens`, so its
+provider uses API-discovered/static per-model ceilings and clamps explicit
+limits to that ceiling. With no explicit limit it requests at most 64k: enough
+headroom for high-effort work without making an ordinary turn reserve the full
+128k supported by Opus 5, Sonnet 5, Fable 5, and Opus 4.8. Model discovery is
+cached and has a conservative static fallback, so an API outage never removes
+known UI options or turns off proactive compaction for known models. Discovery
+refreshes are single-flight per model. A transient refresh failure backs off for
+one minute while preserving stale last-known-good metadata instead of replacing
+it with a less authoritative fallback.
 
 Fable classifier refusals are successful HTTP responses but not successful model
 turns. A `stop_reason: "refusal"` discards all partial assistant/replay output,

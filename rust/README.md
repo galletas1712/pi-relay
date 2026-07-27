@@ -216,14 +216,15 @@ runtime_bind = "127.0.0.1:8786" # optional; this is the default
 kind = "openai"
 model = "gpt-5.6-sol"
 reasoning_effort = "high"
-max_tokens = 32768
 prompt_cache = { key = "my-parent-cache" }
 ```
 
 The root schema is exactly `database_url`, optional `bind`, optional
 `runtime_bind`, and optional `default_parent_model`. The provider object keeps
 the normal `kind`, `model`, `reasoning_effort`, optional `max_tokens`, and
-optional `prompt_cache` fields. If `default_parent_model` is omitted, the
+optional `prompt_cache` fields. `max_tokens` applies to `claude` providers
+only; the Codex backend rejects an output cap, so the OpenAI adapter never
+sends one and the value is ignored. If `default_parent_model` is omitted, the
 built-in parent policy is OpenAI `gpt-5.6-sol` with `high` reasoning. A new
 parent session uses an explicit `session.start.provider`, otherwise
 `default_parent_model`, otherwise that built-in policy.
@@ -276,7 +277,8 @@ skills:
 
 Each immediate role directory must contain a valid `SKILL.md` whose frontmatter
 name exactly matches the directory name. `kind` and `model` must appear
-together; `reasoning_effort` and `max_tokens` are optional. `skills` may name
+together; `reasoning_effort` and `max_tokens` are optional, and `max_tokens` is
+ignored for `kind: openai` roles for the same reason as in daemon config. `skills` may name
 only global packages from `$HOME/.agents/skills`; project and workflow packages
 cannot be role preloads. A child uses an explicit spawn override, then its role
 provider, then the parent provider. An unavailable role provider retains the
