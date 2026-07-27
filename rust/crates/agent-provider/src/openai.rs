@@ -2568,7 +2568,7 @@ fn responses_body_with_metadata(
     let prompt_cache_key = request
         .prompt_cache_key
         .unwrap_or_else(|| session_id.to_string());
-    let mut body = json!({
+    Ok(json!({
         "model": request.model,
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
         "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
@@ -2583,11 +2583,7 @@ fn responses_body_with_metadata(
         "include": [RESPONSES_REASONING_INCLUDE],
         "prompt_cache_key": prompt_cache_key,
         "service_tier": OPENAI_PRIORITY_SERVICE_TIER,
-    });
-    if let Some(max_output_tokens) = request.max_tokens {
-        body["max_output_tokens"] = json!(max_output_tokens);
-    }
-    Ok(body)
+    }))
 }
 
 // The compaction endpoint is unary, so keep streaming-only `/responses` fields
@@ -4197,7 +4193,9 @@ mod tests {
         assert!(body.get("prompt_cache_retention").is_none());
         assert_eq!(body["include"][0], RESPONSES_REASONING_INCLUDE);
         assert_eq!(body["tool_choice"], "auto");
-        assert_eq!(body["max_output_tokens"], 2048);
+        // The Codex backend rejects `max_output_tokens` outright, so an
+        // explicit session cap must never reach the wire.
+        assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["instructions"], "static system");
         assert_eq!(body["input"][0]["role"], "user");

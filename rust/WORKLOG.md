@@ -1,5 +1,20 @@
 # Rust Rewrite Worklog
 
+## 2026-07-27
+
+### Stopped Sending `max_output_tokens` To The Codex Backend
+
+- `POST https://chatgpt.com/backend-api/codex/responses` answers
+  `400 {"detail":"Unsupported parameter: max_output_tokens"}`. That is the only
+  endpoint pi-relay's OpenAI adapter ever targets — `base_url` is hardcoded to
+  the Codex backend and there is no API-key transport — so any session with
+  `provider.max_tokens` set (daemon `default_parent_model`, a per-session
+  config, or a subagent role's `max_tokens:` frontmatter) failed every turn.
+- `responses_body_with_metadata` no longer emits the field. `max_tokens` is now
+  Anthropic-only; the Messages API requires it and clamps it to the discovered
+  model ceiling. Docs updated to say so instead of describing the old
+  emit-when-set behaviour.
+
 ## 2026-07-26
 
 ### Delegation Wakeups Render As Plain User Messages

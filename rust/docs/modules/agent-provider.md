@@ -37,8 +37,8 @@ compaction state.
 - `transcript: Vec<ModelTranscriptEntry>` — each entry is a `TranscriptItem` plus its `provider_replay: Vec<ProviderReplayItem>`
 - `tool_profile: ProviderToolProfile` — `None | CustomDefinitions | OpenAiCoding | AnthropicCoding`
 - `tools: Vec<ProviderTool>` — empty falls back to the builtin registry for the profile
-- `max_tokens: Option<u32>` — emitted as OpenAI `max_output_tokens` when set;
-  omitted when unset
+- `max_tokens: Option<u32>` — Anthropic only; the Codex backend rejects
+  `max_output_tokens`, so the OpenAI adapter never emits it
 - `reasoning_effort: ReasoningEffort` — default `Medium`
 - `prompt_cache_key: Option<String>` — explicit cache-cohort override
 - `session_id: Option<String>` — Codex `thread_id` analog; doubles as cache cohort + routing headers
@@ -142,7 +142,7 @@ reasoning.effort    = <exact catalog-supported ReasoningEffort>
 prompt_cache_key    = <cohort key>
 ```
 
-`store = false` makes every request stateless, so reasoning must be replayed from sidecars (see below). There is **no daemon-enforced output-token cap**: `max_output_tokens` is omitted unless `ModelRequest.max_tokens` supplies an explicit value.
+`store = false` makes every request stateless, so reasoning must be replayed from sidecars (see below). There is **no output-token cap on this path at all**: the Codex backend rejects `max_output_tokens` (`400 Unsupported parameter`), so the adapter never sends it and `ModelRequest.max_tokens` is ignored here.
 
 The catalog's resolved input window is
 `context_window.or(max_context_window)`: current/default wins over maximum.
