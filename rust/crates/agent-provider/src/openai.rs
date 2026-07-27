@@ -36,7 +36,6 @@ use crate::{
 
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
 const OPENAI_PRIORITY_SERVICE_TIER: &str = "priority";
-const OPENAI_MAX_CALL_ID_LEN: usize = 64;
 
 // Header names: byte-for-byte aligned with Codex CLI's
 // `~/codex/codex-rs/login/src/auth/default_client.rs` and
@@ -1882,58 +1881,10 @@ fn reconcile_openai_added_item(index: usize, added: &Value, done: &Value) -> Pro
     reconcile_openai_item_identity(index, "added", added, "done", done)
 }
 
-fn response_daemon_tool_call_item(observation: &agent_vocab::DaemonToolObservation) -> Value {
-    let call_id = openai_daemon_observation_call_id(observation);
-    json!({
-        "type": "function_call",
-        "call_id": call_id,
-        "name": openai_wire_tool_name(&observation.tool_name),
-        "arguments": observation.args_json,
-    })
-}
-
-fn response_daemon_tool_result_item(
-    observation: &agent_vocab::DaemonToolObservation,
-) -> ProviderResult<Value> {
-    let call_id = openai_daemon_observation_call_id(observation);
-    Ok(json!({
-        "type": "function_call_output",
-        "call_id": call_id,
-        "output": observation.result_text()?,
-    }))
-}
-
 #[cfg(test)]
 fn compact_body(request: ProviderCompactionRequest, session_id: &str) -> ProviderResult<Value> {
     let metadata = test_openai_model_metadata(&request.model);
     compact_body_with_metadata(request, session_id, &metadata)
-}
-
-fn openai_daemon_observation_call_id(observation: &agent_vocab::DaemonToolObservation) -> String {
-    let original = observation.tool_call_id.as_str();
-    if original.len() <= OPENAI_MAX_CALL_ID_LEN {
-        return original.to_string();
-    }
-
-    // Old stored delegation wakeups used
-    // `call_inspect_delegation_<delegation_uuid>_<attempt_uuid>`, which can be
-    // >100 chars. The OpenAI Responses API rejects call_id >64. Do not mutate
-    // durable transcript data here; render a deterministic provider-local id
-    // and use it for both the synthetic call and output so historical broken
-    // sessions can replay.
-    let mut hasher = Sha256::new();
-    hasher.update(observation.tool_name.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(observation.args_json.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(original.as_bytes());
-    let digest = hasher.finalize();
-    let mut suffix = String::with_capacity(32);
-    for byte in digest.iter().take(16) {
-        use std::fmt::Write as _;
-        let _ = write!(&mut suffix, "{byte:02x}");
-    }
-    format!("call_daemon_{suffix}")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2758,8 +2709,11 @@ pub(crate) fn transcript_to_response_items(
                 responses.push(response_tool_result_item(result));
             }
             TranscriptItem::DaemonToolObservation(observation) => {
-                responses.push(response_daemon_tool_call_item(observation));
-                responses.push(response_daemon_tool_result_item(observation)?);
+                responses.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": observation.render_text()? }],
+                }));
             }
             TranscriptItem::TurnStarted { .. }
             | TranscriptItem::ToolCallStarted { .. }
@@ -4557,7 +4511,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_tool_observation_renders_as_openai_synthetic_tool_pair() {
+    fn daemon_tool_observation_renders_as_openai_user_message() {
         let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
             ToolCallId::new("call_delegation_1_attempt_1"),
             "delegation_1",
@@ -4578,24 +4532,16 @@ mod tests {
         )
         .expect("transcript should render");
 
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0]["type"], "function_call");
-        assert_eq!(items[0]["call_id"], "call_delegation_1_attempt_1");
-        assert_eq!(items[0]["name"], "inspect_delegation");
-        assert_eq!(
-            items[0]["arguments"],
-            "{\"delegation_id\":\"delegation_1\"}"
-        );
-        assert!(items[0].get("id").is_none());
-        assert!(items[0].get("status").is_none());
-        assert_eq!(items[1]["type"], "function_call_output");
-        assert_eq!(items[1]["call_id"], "call_delegation_1_attempt_1");
-        assert!(items[1].get("id").is_none());
-        assert!(items[1].get("status").is_none());
-        assert!(items[1]["output"]
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(items[0]["content"][0]["type"], "input_text");
+        let text = items[0]["content"][0]["text"]
             .as_str()
-            .expect("json output")
-            .contains("\"delegation_id\": \"delegation_1\""));
+            .expect("observation text");
+        assert!(text.starts_with("Daemon observation: inspect_delegation"));
+        assert!(text.contains("1 ok, 0 failed"));
+        assert!(text.contains("\"delegation_id\": \"delegation_1\""));
     }
 
     #[test]
@@ -4630,46 +4576,13 @@ mod tests {
         )
         .expect("transcript should render");
 
+        assert_eq!(items.len(), 3);
         assert_eq!(items[0]["type"], "function_call");
         assert_eq!(items[0]["call_id"], "call_1");
         assert_eq!(items[1]["type"], "function_call_output");
         assert_eq!(items[1]["call_id"], "call_1");
-        assert_eq!(items[2]["type"], "function_call");
-        assert_eq!(items[2]["call_id"], "call_delegation_1_attempt_1");
-        assert_eq!(items[3]["type"], "function_call_output");
-        assert_eq!(items[3]["call_id"], "call_delegation_1_attempt_1");
-    }
-
-    #[test]
-    fn legacy_long_daemon_observation_call_ids_are_shortened_for_openai() {
-        let legacy_id = "call_inspect_delegation_delegation_6d17ff90_6e46_4c3f_88ad_d92d77350d52_62847e1a_b705_48ee_899b_b062ccdf38f6";
-        assert!(legacy_id.len() > OPENAI_MAX_CALL_ID_LEN);
-        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
-            ToolCallId::new(legacy_id),
-            "delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
-            Some("Delegation completed".to_string()),
-            json!({
-                "delegation_id": "delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
-                "status": "done",
-            }),
-        );
-
-        let items = transcript_to_response_items(
-            &crate::PromptSections::default(),
-            &[TranscriptItem::DaemonToolObservation(observation).into()],
-        )
-        .expect("transcript should render");
-
-        assert_eq!(items.len(), 2);
-        let call_id = items[0]["call_id"].as_str().expect("call id");
-        assert!(call_id.starts_with("call_daemon_"));
-        assert!(call_id.len() <= OPENAI_MAX_CALL_ID_LEN);
-        assert_eq!(items[1]["call_id"], call_id);
-        assert_ne!(call_id, legacy_id);
-        assert_eq!(
-            items[0]["arguments"],
-            "{\"delegation_id\":\"delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52\"}"
-        );
+        assert_eq!(items[2]["type"], "message");
+        assert_eq!(items[2]["role"], "user");
     }
 
     #[test]

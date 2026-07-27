@@ -1,5 +1,27 @@
 # Rust Rewrite Worklog
 
+## 2026-07-26
+
+### Delegation Wakeups Render As Plain User Messages
+
+- Provider adapters now render `TranscriptItem::DaemonToolObservation` as one
+  plain user-role message built from `DaemonToolObservation::render_text()`:
+  a single OpenAI `message`/`input_text` item, or a single Anthropic
+  `role: "user"` `text` block. Previously each wakeup was expanded into a
+  synthetic `inspect_delegation` call/result pair, which manufactured wire
+  traffic naming a tool the model never called and pinned the tool into the
+  registry purely so historical transcripts stayed renderable.
+- Deleted `DaemonToolObservation::as_tool_call`/`as_tool_result`,
+  `response_daemon_tool_call_item`, `response_daemon_tool_result_item`,
+  `openai_daemon_observation_call_id`, `OPENAI_MAX_CALL_ID_LEN`, and
+  `anthropic_daemon_tool_use_id`. `render_text` is now the sole owner of the
+  model-visible form, shared with handoff markdown.
+- No migration: the durable `daemon_tool_observation` jsonb is unchanged, so
+  existing sessions pick up the new rendering on their next request. Old
+  provider compaction checkpoints still embed the synthetic call as opaque
+  ciphertext; that is bounded to each session's newest checkpoint and clears on
+  its next compaction.
+
 ## 2026-07-09
 
 ### Pinned Codex Client Version Bump 0.142.3 -> 0.144.0

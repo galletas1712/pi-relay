@@ -420,14 +420,12 @@ local call id, arguments, status, summary, and bounded JSON snapshot. This keeps
 internal transcript semantics honest: the daemon observed delegation state; the
 assistant did not choose a tool call.
 
-Provider adapters render that typed item in the provider-native synthetic
-tool-call/result shape only at request construction time. OpenAI receives an
-adjacent `function_call` plus `function_call_output` pair without
-provider-generated-looking ids/status. Anthropic receives an adjacent assistant
-`tool_use` message plus user `tool_result` message with a deterministic
-`toolu_...` id. The UI renders the same item as a daemon/system observation, not
-as a user bubble and not as a model-selected tool run. Text fallback rendering is
-kept for unsupported contexts and diagnostics.
+Provider adapters render that typed item as a single plain user-role message
+carrying the daemon-authored observation text: one OpenAI `message`/`input_text`
+item, or one Anthropic `role: "user"` `text` block. The wire body therefore never
+names a tool the model did not call. The UI renders the same item as a
+daemon/system observation, not as a user bubble and not as a model-selected tool
+run.
 
 Delegation snapshots avoid context-heavy payloads: raw subagent task prompts,
 final-message prose, and transcript bodies are not inlined. Long bodies are

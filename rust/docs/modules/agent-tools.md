@@ -176,9 +176,9 @@ workspaces, not immutable conversations. Delegation subagents may produce
 `subagent.spawned`/`subagent.running` progress events, but delegation completion
 arrives later as a daemon-authored parent observation containing an
 `inspect_delegation`-equivalent snapshot plus artifact paths, not as a per-child
-idle event. Provider adapters render that typed observation as a synthetic
-`inspect_delegation` tool call/result pair while keeping the transcript semantics
-daemon-authored.
+idle event. Provider adapters render that typed observation as one plain
+user-role message carrying the daemon-authored observation text, so no assistant
+tool call is manufactured on the wire.
 
 Their internal delegation types, handoff `delegation_id`, and web/inspector RPC methods
 (`delegation.start_full`, `delegation.start_readonly_fanout`, `delegation.status`,

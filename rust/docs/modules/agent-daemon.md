@@ -109,10 +109,9 @@ observations. The durable transcript entry is a typed
 `daemon_tool_observation`, not an ordinary user message and not a fake assistant
 tool choice. It records the daemon-authored `inspect_delegation` observation
 with a stable local tool-call id, arguments, status, concise summary, and bounded
-snapshot JSON. Provider adapters translate this typed item into adjacent
-synthetic tool call/result pairs for OpenAI and Anthropic request bodies; the UI
-renders it as a daemon/system observation card. A text fallback renderer remains
-available for diagnostics and unsupported contexts.
+snapshot JSON. Provider adapters render this typed item as one plain user-role
+message carrying the daemon-authored observation text; the UI
+renders it as a daemon/system observation card.
 
 The snapshot never inlines full transcript bodies or raw subagent task prompts.
 Task prompts are materialized as per-subagent `task_prompt.md` handoff files,

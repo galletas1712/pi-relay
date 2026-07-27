@@ -2,14 +2,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::ids::ToolCallId;
-use crate::message::{ToolCall, ToolResultMessage, ToolResultStatus};
+use crate::message::ToolResultStatus;
 
 /// A daemon-authored tool observation that should be durable in the transcript
 /// but must not imply the model chose a tool call.
 ///
-/// Provider adapters that support synthetic historical observations render this
-/// typed item as an adjacent tool call/result pair. The internal transcript
-/// remains honest: the daemon authored the observation, not the assistant.
+/// Provider adapters render this typed item as a plain user-role message built
+/// from [`DaemonToolObservation::render_text`]. The internal transcript remains
+/// honest: the daemon authored the observation, not the assistant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonToolObservation {
     pub tool_call_id: ToolCallId,
@@ -63,23 +63,6 @@ impl DaemonToolObservation {
 
     pub fn result_text(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(&self.result_json)
-    }
-
-    pub fn as_tool_call(&self) -> ToolCall {
-        ToolCall {
-            id: self.tool_call_id.clone(),
-            tool_name: self.tool_name.clone(),
-            args_json: self.args_json.clone(),
-        }
-    }
-
-    pub fn as_tool_result(&self) -> Result<ToolResultMessage, serde_json::Error> {
-        Ok(ToolResultMessage {
-            tool_call_id: self.tool_call_id.clone(),
-            tool_name: self.tool_name.clone(),
-            output: self.result_text()?,
-            status: self.status.clone(),
-        })
     }
 
     pub fn render_text(&self) -> Result<String, serde_json::Error> {
@@ -194,26 +177,5 @@ mod tests {
         assert!(
             text.contains("inspect_delegation({\"delegation_id\":\"delegation_\\\"quoted\\\"\"})")
         );
-    }
-
-    #[test]
-    fn converts_to_canonical_tool_call_and_result() {
-        let observation = DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("call_delegation_1_attempt_1"),
-            "delegation_1",
-            None,
-            json!({ "ok": true }),
-        );
-
-        let call = observation.as_tool_call();
-        let result = observation.as_tool_result().expect("result text");
-
-        assert_eq!(call.id.as_str(), "call_delegation_1_attempt_1");
-        assert_eq!(call.tool_name, "inspect_delegation");
-        assert_eq!(call.args_json, "{\"delegation_id\":\"delegation_1\"}");
-        assert_eq!(result.tool_call_id.as_str(), "call_delegation_1_attempt_1");
-        assert_eq!(result.tool_name, "inspect_delegation");
-        assert_eq!(result.status, ToolResultStatus::Success);
-        assert!(result.output.contains("\"ok\": true"));
     }
 }
