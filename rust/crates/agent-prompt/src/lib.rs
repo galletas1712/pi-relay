@@ -515,6 +515,7 @@ mod tests {
 
         assert!(!rendered.contains("push that branch to the configured remote"));
         assert!(rendered.contains("disposable copy"));
+        assert!(rendered.contains("Apart from `./.pi-handoff/` (below), nothing you write"));
         assert!(rendered.contains("do not create branches on, push to"));
         assert!(rendered.contains("disposable snapshot and do not reach the"));
         assert!(rendered.contains("`./.pi-handoff/`"));

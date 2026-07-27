@@ -16,6 +16,14 @@
 -- whose `subagent_type` is `read_only`, so a parent or full subagent that
 -- legitimately publishes branches is untouched.
 --
+-- The match is anchored on the preceding template sentence rather than on the
+-- push instruction alone. `replace()` is global, so an unanchored pattern would
+-- also rewrite a prompt that merely *quotes* the house rule — project
+-- instructions reach the prompt verbatim via `{{ project.agents_md }}`. The
+-- anchored pattern can only match the rendered `## Workspace` block, and the
+-- `where` filter and the post-condition use that same pattern so a quoted copy
+-- neither triggers a rewrite nor aborts the transaction.
+--
 -- Nothing is *added*. The new `## Subagent contract` section and the
 -- `./.pi-handoff/` promise are deliberately not injected: those sessions ran on
 -- code that makes no such guarantee, and a capability claim the runtime cannot
@@ -29,24 +37,22 @@ lock table sessions in access exclusive mode;
 
 do $migration$
 declare
+    sentence constant text :=
+'modify files in the Git workspace subdirectory directly. Before publishing changes, create a new descriptive branch and push that branch to the configured remote.';
+    kept constant text := 'modify files in the Git workspace subdirectory directly.';
     rewritten integer;
 begin
     update sessions
-    set system_prompt = replace(
-        system_prompt,
-' Before publishing changes, create a new descriptive branch and push that branch to the configured remote.',
-''
-    ),
-        updated_at = now()
+    set system_prompt = replace(system_prompt, sentence, kept)
     where subagent_type = 'read_only'
-      and system_prompt like '%push that branch to the configured remote%';
+      and position(sentence in system_prompt) > 0;
     get diagnostics rewritten = row_count;
     raise notice 'rewrote % read-only subagent prompt(s)', rewritten;
 
     if exists (
         select 1 from sessions
         where subagent_type = 'read_only'
-          and system_prompt like '%push that branch to the configured remote%'
+          and position(sentence in system_prompt) > 0
     ) then
         raise exception 'a read-only subagent prompt still instructs a remote push';
     end if;
