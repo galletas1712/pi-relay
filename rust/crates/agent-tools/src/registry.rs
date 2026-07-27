@@ -307,7 +307,7 @@ fn interrupt_subagent_definition() -> ToolDefinition {
             "properties": {
                 "subagent_id": {
                     "type": "string",
-                    "description": "The exact target subagent session id shown in delegation inspection."
+                    "description": "The exact target subagent session id returned by the launch tool or carried in a daemon wakeup."
                 }
             },
             "required": ["subagent_id"],
@@ -319,7 +319,7 @@ fn interrupt_subagent_definition() -> ToolDefinition {
 fn delegate_writing_task_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_writing_task",
-        "Launch one full (writing) delegation. It edits the workspace in place; at most one full delegation may be active for this parent, though read-only delegations may run beside it, including in the same model response. After launching the useful batch, end your turn; completion arrives later as a delegation-ID-scoped daemon wakeup.",
+        "Launch one full (writing) delegation. It edits the workspace in place; at most one full delegation may be active for this parent, though read-only delegations may run beside it, including in the same model response. Returns the delegation id, the handoff directory holding this delegation's artifacts, and the subagent's id and role. After launching the useful batch, end your turn; completion arrives later as a delegation-ID-scoped daemon wakeup.",
         json!({
             "type": "object",
             "properties": {
@@ -349,7 +349,7 @@ fn delegate_writing_task_definition() -> ToolDefinition {
 fn delegate_readonly_tasks_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_readonly_tasks",
-        "Launch an independent read-only fan-out, each child in its own point-in-time disposable workspace snapshot. Up to eight read-only slots exist across this parent, and a fan-out keeps all of its slots until the whole delegation is terminal. Further fan-outs may start beside running delegations, including in the same model response, while capacity remains. Workspace isolation does not prevent MCP or other remote side effects. After the useful launch batch, end your turn; never poll.",
+        "Launch an independent read-only fan-out, each child in its own point-in-time disposable workspace snapshot. Up to eight read-only slots exist across this parent, and a fan-out keeps all of its slots until the whole delegation is terminal. Further fan-outs may start beside running delegations, including in the same model response, while capacity remains. Workspace isolation does not prevent MCP or other remote side effects. Returns the delegation id, the handoff directory holding this delegation's artifacts, and each subagent's id and role. After the useful launch batch, end your turn; never poll.",
         json!({
             "type": "object",
             "properties": {
@@ -389,24 +389,6 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
     )
 }
 
-fn inspect_delegation_definition() -> ToolDefinition {
-    ToolDefinition::new(
-        "inspect_delegation",
-        "Inspect a delegation and its subagents, including status, progress, outcome, and artifact file references. Full final messages and transcripts are available through referenced handoff files, not inlined.",
-        json!({
-            "type": "object",
-            "properties": {
-                "delegation_id": {
-                    "type": "string",
-                    "description": "The delegation id returned by delegate_writing_task / delegate_readonly_tasks."
-                }
-            },
-            "required": ["delegation_id"],
-            "additionalProperties": false
-        }),
-    )
-}
-
 fn cancel_delegation_definition() -> ToolDefinition {
     ToolDefinition::new(
         "cancel_delegation",
@@ -434,7 +416,7 @@ fn steer_subagent_definition() -> ToolDefinition {
             "properties": {
                 "subagent_id": {
                     "type": "string",
-                    "description": "The target subagent session id shown in delegation inspection."
+                    "description": "The target subagent session id returned by the launch tool or carried in a daemon wakeup."
                 },
                 "message": {
                     "type": "string",
@@ -476,12 +458,6 @@ impl ToolExtension for FirstPartyToolExtension {
             "delegate_readonly_tasks",
             "delegation",
             delegate_readonly_tasks_definition(),
-        );
-        register_runtime_tool(
-            registry,
-            "inspect_delegation",
-            "delegation",
-            inspect_delegation_definition(),
         );
         register_runtime_tool(
             registry,
@@ -671,7 +647,6 @@ mod tests {
                 "cancel_delegation",
                 "delegate_readonly_tasks",
                 "delegate_writing_task",
-                "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
                 "steer_subagent",
@@ -686,7 +661,6 @@ mod tests {
                 "cancel_delegation",
                 "delegate_readonly_tasks",
                 "delegate_writing_task",
-                "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
                 "steer_subagent",
@@ -719,7 +693,6 @@ mod tests {
                 "cancel_delegation",
                 "delegate_readonly_tasks",
                 "delegate_writing_task",
-                "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
                 "steer_subagent",
@@ -734,7 +707,6 @@ mod tests {
                 "cancel_delegation",
                 "delegate_readonly_tasks",
                 "delegate_writing_task",
-                "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
                 "steer_subagent",
@@ -932,7 +904,6 @@ mod tests {
         for expected in [
             "delegate_writing_task",
             "delegate_readonly_tasks",
-            "inspect_delegation",
             "cancel_delegation",
             "steer_subagent",
             "interrupt_subagent",

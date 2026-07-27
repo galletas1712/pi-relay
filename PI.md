@@ -56,9 +56,9 @@ yourself until it returns.
 Delegations reach a terminal status of `done`, `done_with_failures`, `cancelled`,
 or `failed`; branch on the outcome fields the wakeup delivers. You are woken
 exactly once per delegation, at terminal status, so mid-flight `steer_subagent`
-is only possible from the launching turn or after an explicit
-`inspect_delegation` — usually because a human asked you to intervene. When you
-are awake mid-flight and a running subagent needs a correction or more context,
+is only possible from the launching turn or from a turn a human started —
+you are not woken to poll. When you are awake mid-flight and a running
+subagent needs a correction or more context,
 prefer `steer_subagent` over cancelling and restarting. Cancellation is terminal
 and does not roll back workspace edits or remote-state side effects, so inspect
 the transcript-only paths it returns before deciding what to do next.

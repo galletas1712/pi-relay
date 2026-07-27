@@ -5354,7 +5354,6 @@ mod tests {
                 "cancel_delegation",
                 "delegate_readonly_tasks",
                 "delegate_writing_task",
-                "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
                 "steer_subagent",
@@ -5397,23 +5396,21 @@ mod tests {
         assert!(body["tools"][2].get("type").is_none());
         assert_eq!(body["tools"][3]["name"], "delegate_writing_task");
         assert!(body["tools"][3].get("type").is_none());
-        assert_eq!(body["tools"][4]["name"], "inspect_delegation");
+        assert_eq!(body["tools"][4]["name"], "interrupt_subagent");
         assert!(body["tools"][4].get("type").is_none());
-        assert_eq!(body["tools"][5]["name"], "interrupt_subagent");
+        assert_eq!(body["tools"][5]["name"], "LoadSkill");
         assert!(body["tools"][5].get("type").is_none());
-        assert_eq!(body["tools"][6]["name"], "LoadSkill");
+        assert_eq!(body["tools"][6]["name"], "steer_subagent");
         assert!(body["tools"][6].get("type").is_none());
-        assert_eq!(body["tools"][7]["name"], "steer_subagent");
-        assert!(body["tools"][7].get("type").is_none());
-        assert_eq!(body["tools"][8]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][8]["name"], "str_replace_based_edit_tool");
-        assert_eq!(body["tools"][9]["name"], "web_fetch");
+        assert_eq!(body["tools"][7]["type"], "text_editor_20250728");
+        assert_eq!(body["tools"][7]["name"], "str_replace_based_edit_tool");
+        assert_eq!(body["tools"][8]["name"], "web_fetch");
+        assert!(body["tools"][8].get("type").is_none());
+        assert_eq!(body["tools"][9]["name"], "web_search");
         assert!(body["tools"][9].get("type").is_none());
-        assert_eq!(body["tools"][10]["name"], "web_search");
-        assert!(body["tools"][10].get("type").is_none());
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
-        for index in 0..11 {
+        for index in 0..10 {
             assert!(
                 body["tools"][index].get("cache_control").is_none(),
                 "tool {index} should not carry cache_control"
@@ -7483,8 +7480,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
 
     #[test]
     fn daemon_tool_observation_renders_as_anthropic_user_message() {
-        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("call_delegation_1_attempt_1"),
+        let observation = agent_vocab::DaemonToolObservation::delegation_status(
             "delegation_1",
             Some("Delegation delegation_1 completed with status done: 1 ok, 0 failed.".to_string()),
             json!({
@@ -7509,9 +7505,39 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         let text = messages[0]["content"][0]["text"]
             .as_str()
             .expect("observation text");
-        assert!(text.starts_with("Daemon observation: inspect_delegation"));
+        assert!(text.starts_with("Daemon observation: delegation_status"));
         assert!(text.contains("1 ok, 0 failed"));
         assert!(text.contains("\"delegation_id\": \"delegation_1\""));
+    }
+
+    /// Historical transcripts name the retired `inspect_delegation` tool. They
+    /// must still render, and as ordinary user text rather than a `tool_use`
+    /// block for a tool that is no longer in the tools array.
+    #[test]
+    fn historical_inspect_delegation_observation_renders_as_anthropic_user_message() {
+        let observation: agent_vocab::DaemonToolObservation = serde_json::from_value(json!({
+            "tool_call_id": "call_inspect_delegation_deadbeef",
+            "tool_name": "inspect_delegation",
+            "args_json": "{\"delegation_id\":\"delegation_1\"}",
+            "result_json": { "delegation_id": "delegation_1", "status": "done" },
+            "status": "Success",
+            "summary": "Delegation delegation_1 completed",
+        }))
+        .expect("historical observation deserializes");
+
+        let messages = transcript_to_messages(
+            &crate::PromptSections::default(),
+            &[TranscriptItem::DaemonToolObservation(observation).into()],
+        )
+        .expect("messages render");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["type"], "text");
+        assert!(messages[0]["content"][0]["text"]
+            .as_str()
+            .expect("observation text")
+            .starts_with("Daemon observation: inspect_delegation"));
     }
 
     #[test]
@@ -7521,8 +7547,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
             tool_name: "read".to_string(),
             args_json: "{\"path\":\"README.md\"}".to_string(),
         };
-        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("call_delegation_1_attempt_1"),
+        let observation = agent_vocab::DaemonToolObservation::delegation_status(
             "delegation_1",
             None,
             json!({ "delegation_id": "delegation_1", "status": "done" }),

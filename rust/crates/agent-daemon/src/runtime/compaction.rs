@@ -783,7 +783,6 @@ mod tests {
                     status: ToolResultStatus::Success,
                 }),
                 TranscriptItem::DaemonToolObservation(DaemonToolObservation::new(
-                    ToolCallId::from_u64(8),
                     "delegate",
                     "{}",
                     serde_json::json!({"output": "generated observation"}),

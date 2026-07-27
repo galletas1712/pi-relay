@@ -4464,17 +4464,15 @@ mod tests {
         assert_eq!(body["tools"][4]["type"], "function");
         assert_eq!(body["tools"][4]["name"], "delegate_writing_task");
         assert_eq!(body["tools"][5]["type"], "function");
-        assert_eq!(body["tools"][5]["name"], "inspect_delegation");
+        assert_eq!(body["tools"][5]["name"], "interrupt_subagent");
         assert_eq!(body["tools"][6]["type"], "function");
-        assert_eq!(body["tools"][6]["name"], "interrupt_subagent");
+        assert_eq!(body["tools"][6]["name"], "LoadSkill");
         assert_eq!(body["tools"][7]["type"], "function");
-        assert_eq!(body["tools"][7]["name"], "LoadSkill");
+        assert_eq!(body["tools"][7]["name"], "steer_subagent");
         assert_eq!(body["tools"][8]["type"], "function");
-        assert_eq!(body["tools"][8]["name"], "steer_subagent");
+        assert_eq!(body["tools"][8]["name"], "web_fetch");
         assert_eq!(body["tools"][9]["type"], "function");
-        assert_eq!(body["tools"][9]["name"], "web_fetch");
-        assert_eq!(body["tools"][10]["type"], "function");
-        assert_eq!(body["tools"][10]["name"], "web_search");
+        assert_eq!(body["tools"][9]["name"], "web_search");
     }
 
     #[test]
@@ -4510,8 +4508,7 @@ mod tests {
 
     #[test]
     fn daemon_tool_observation_renders_as_openai_user_message() {
-        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("call_delegation_1_attempt_1"),
+        let observation = agent_vocab::DaemonToolObservation::delegation_status(
             "delegation_1",
             Some("Delegation delegation_1 completed with status done: 1 ok, 0 failed.".to_string()),
             json!({
@@ -4537,9 +4534,39 @@ mod tests {
         let text = items[0]["content"][0]["text"]
             .as_str()
             .expect("observation text");
-        assert!(text.starts_with("Daemon observation: inspect_delegation"));
+        assert!(text.starts_with("Daemon observation: delegation_status"));
         assert!(text.contains("1 ok, 0 failed"));
         assert!(text.contains("\"delegation_id\": \"delegation_1\""));
+    }
+
+    /// Historical transcripts name the retired `inspect_delegation` tool. They
+    /// must still render, and as ordinary user text rather than a call to a tool
+    /// that is no longer in the tools array.
+    #[test]
+    fn historical_inspect_delegation_observation_renders_as_openai_user_message() {
+        let observation: agent_vocab::DaemonToolObservation = serde_json::from_value(json!({
+            "tool_call_id": "call_inspect_delegation_deadbeef",
+            "tool_name": "inspect_delegation",
+            "args_json": "{\"delegation_id\":\"delegation_1\"}",
+            "result_json": { "delegation_id": "delegation_1", "status": "done" },
+            "status": "Success",
+            "summary": "Delegation delegation_1 completed",
+        }))
+        .expect("historical observation deserializes");
+
+        let items = transcript_to_response_items(
+            &crate::PromptSections::default(),
+            &[TranscriptItem::DaemonToolObservation(observation).into()],
+        )
+        .expect("transcript should render");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[0]["role"], "user");
+        assert!(items[0]["content"][0]["text"]
+            .as_str()
+            .expect("observation text")
+            .starts_with("Daemon observation: inspect_delegation"));
     }
 
     #[test]
@@ -4549,8 +4576,7 @@ mod tests {
             tool_name: "read".to_string(),
             args_json: "{\"path\":\"README.md\"}".to_string(),
         };
-        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("call_delegation_1_attempt_1"),
+        let observation = agent_vocab::DaemonToolObservation::delegation_status(
             "delegation_1",
             None,
             json!({ "delegation_id": "delegation_1", "status": "done" }),

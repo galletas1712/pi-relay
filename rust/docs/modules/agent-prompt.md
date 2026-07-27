@@ -50,7 +50,7 @@ Input types the caller fills in:
 Use `{{ tools.aliases.edit | default(value="Edit") }}` instead of editing files through the shell.
 ```
 
-The registered builtin tools and their aliases are owned by the daemon tool registry, not this crate. Current tools: `edit` (rendered as `apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). See [agent-tools](./agent-tools.md) and [websocket-rpc](../websocket-rpc.md) (`tools.list`).
+The registered builtin tools and their aliases are owned by the daemon tool registry, not this crate. Current tools: `edit` (rendered as `apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). See [agent-tools](./agent-tools.md) and [websocket-rpc](../websocket-rpc.md) (`tools.list`).
 
 ## How it works
 
@@ -169,7 +169,7 @@ done_with_failures, cancelled, failed) with bounded progress/subagent fields, `o
 control data when available, and artifact paths. It deliberately does not inline
 full transcripts or final-message prose, or refresh handoff artifacts. Running entries are
 point-in-time facts; summaries must not assume they completed before a later
-completion observation or refreshed `inspect_delegation`. Future compactions summarize
+completion observation. Future compactions summarize
 prior summary text normally, including any older point-in-time ledgers, then
 append a fresh ledger again. The latest appended ledger supersedes older ledger
 text by position.

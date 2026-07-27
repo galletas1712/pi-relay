@@ -85,15 +85,13 @@ impl TranscriptItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::ToolCallId;
     use crate::message::ToolResultStatus;
     use serde_json::json;
 
     #[test]
     fn daemon_tool_observation_transcript_item_round_trips_with_type_tag() {
         let item = TranscriptItem::DaemonToolObservation(DaemonToolObservation {
-            tool_call_id: ToolCallId::new("call_delegation_1_attempt_1"),
-            tool_name: "inspect_delegation".to_string(),
+            tool_name: "delegation_status".to_string(),
             args_json: "{\"delegation_id\":\"delegation_1\"}".to_string(),
             result_json: json!({ "delegation_id": "delegation_1", "status": "done" }),
             status: ToolResultStatus::Success,
@@ -102,10 +100,36 @@ mod tests {
 
         let value = serde_json::to_value(&item).expect("serialize");
         assert_eq!(value["type"], "daemon_tool_observation");
-        assert_eq!(value["tool_name"], "inspect_delegation");
+        assert_eq!(value["tool_name"], "delegation_status");
 
         let round_trip: TranscriptItem = serde_json::from_value(value).expect("deserialize");
         assert_eq!(round_trip, item);
         assert_eq!(round_trip.turn_id(), None);
+    }
+
+    /// Rows written before `tool_call_id` was retired still carry the key.
+    /// They must deserialize (serde ignores it) and render unchanged, so the
+    /// one-time cleanup migration stays optional.
+    #[test]
+    fn daemon_tool_observation_transcript_item_ignores_retired_tool_call_id() {
+        let stored = json!({
+            "type": "daemon_tool_observation",
+            "tool_call_id": "call_inspect_delegation_deadbeef",
+            "tool_name": "inspect_delegation",
+            "args_json": "{\"delegation_id\":\"delegation_1\"}",
+            "result_json": { "delegation_id": "delegation_1", "status": "done" },
+            "status": "Success",
+            "summary": "Delegation delegation_1 completed",
+        });
+
+        let item: TranscriptItem = serde_json::from_value(stored).expect("deserialize old row");
+        let TranscriptItem::DaemonToolObservation(observation) = &item else {
+            panic!("expected a daemon observation");
+        };
+
+        assert_eq!(observation.tool_name, "inspect_delegation");
+        let text = observation.render_text().expect("observation renders");
+        assert!(text.starts_with("Daemon observation: inspect_delegation"));
+        assert!(text.contains("Summary: Delegation delegation_1 completed"));
     }
 }

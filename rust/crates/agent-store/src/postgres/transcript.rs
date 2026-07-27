@@ -1740,8 +1740,7 @@ mod tests {
         entry(
             id,
             parent_id,
-            TranscriptItem::DaemonToolObservation(DaemonToolObservation::inspect_delegation(
-                ToolCallId::new("call_delegation_1_attempt_1"),
+            TranscriptItem::DaemonToolObservation(DaemonToolObservation::delegation_status(
                 "delegation_1",
                 Some("Delegation delegation_1 completed".to_string()),
                 json!({
@@ -2301,7 +2300,7 @@ mod tests {
         assert_eq!(card.daemon_observations[0].id, "entry_daemon");
         match &card.daemon_observations[0].item {
             TranscriptItem::DaemonToolObservation(observation) => {
-                assert_eq!(observation.tool_name, "inspect_delegation");
+                assert_eq!(observation.tool_name, "delegation_status");
                 assert_eq!(
                     observation.summary.as_deref(),
                     Some("Delegation delegation_1 completed")

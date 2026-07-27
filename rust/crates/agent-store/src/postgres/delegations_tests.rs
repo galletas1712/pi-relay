@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use agent_session::{ModelContext, SessionAction, TranscriptStorageNode};
 use agent_vocab::{
     ActionId, AssistantItem, AssistantMessage, DaemonToolObservation, ProviderConfig, ProviderKind,
-    ReasoningEffort, ToolCallId, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+    ReasoningEffort, TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -1606,8 +1606,7 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
         "delegation-steer:{}:{}",
         delegation.id, delegation.attempt_id
     );
-    let observation = DaemonToolObservation::inspect_delegation(
-        ToolCallId::new("call_finish_delegation"),
+    let observation = DaemonToolObservation::delegation_status(
         &delegation.id,
         Some("done".to_string()),
         json!({ "delegation_id": delegation.id, "status": "done" }),
@@ -2183,8 +2182,7 @@ async fn cancel_running_delegation_leaves_parent_queue_untouched() {
         create_delegation(&db, "parent", DelegationKind::ReadonlyFanout, None, None, 2)
             .await
             .expect("create delegation");
-    let observation = DaemonToolObservation::inspect_delegation(
-        ToolCallId::new("call_atomic_cancel"),
+    let observation = DaemonToolObservation::delegation_status(
         &delegation.id,
         Some("Delegation observation".to_string()),
         json!({
@@ -2660,8 +2658,7 @@ async fn enqueue_delegation_observation_event_uses_minimal_payload_and_queue_pro
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
-    let observation = DaemonToolObservation::inspect_delegation(
-        ToolCallId::new("call_delegation_1_attempt_1"),
+    let observation = DaemonToolObservation::delegation_status(
         "delegation_1",
         Some("Delegation delegation_1 completed with status done".to_string()),
         json!({

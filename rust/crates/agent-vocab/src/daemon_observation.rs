@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::ids::ToolCallId;
 use crate::message::ToolResultStatus;
 
 /// A daemon-authored tool observation that should be durable in the transcript
@@ -12,7 +11,6 @@ use crate::message::ToolResultStatus;
 /// honest: the daemon authored the observation, not the assistant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonToolObservation {
-    pub tool_call_id: ToolCallId,
     pub tool_name: String,
     pub args_json: String,
     pub result_json: Value,
@@ -23,7 +21,6 @@ pub struct DaemonToolObservation {
 
 impl DaemonToolObservation {
     pub fn new(
-        tool_call_id: ToolCallId,
         tool_name: impl Into<String>,
         args_json: impl Into<String>,
         result_json: Value,
@@ -31,7 +28,6 @@ impl DaemonToolObservation {
         summary: Option<String>,
     ) -> Self {
         Self {
-            tool_call_id,
             tool_name: tool_name.into(),
             args_json: args_json.into(),
             result_json,
@@ -40,16 +36,17 @@ impl DaemonToolObservation {
         }
     }
 
-    pub fn inspect_delegation(
-        tool_call_id: ToolCallId,
+    /// The daemon's observation of one delegation's state. `tool_name` is the
+    /// observation subject, not an invocable tool: the model has no delegation
+    /// inspection tool.
+    pub fn delegation_status(
         delegation_id: impl Into<String>,
         summary: Option<String>,
         snapshot: Value,
     ) -> Self {
         let delegation_id = delegation_id.into();
         Self {
-            tool_call_id,
-            tool_name: "inspect_delegation".to_string(),
+            tool_name: "delegation_status".to_string(),
             args_json: json!({ "delegation_id": delegation_id }).to_string(),
             result_json: snapshot,
             status: ToolResultStatus::Success,
@@ -57,16 +54,8 @@ impl DaemonToolObservation {
         }
     }
 
-    pub fn args_value(&self) -> Result<Value, serde_json::Error> {
-        serde_json::from_str(&self.args_json)
-    }
-
-    pub fn result_text(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(&self.result_json)
-    }
-
     pub fn render_text(&self) -> Result<String, serde_json::Error> {
-        daemon_observation_fallback_text(
+        daemon_observation_text(
             &self.tool_name,
             &self.args_json,
             self.summary.as_deref(),
@@ -75,7 +64,10 @@ impl DaemonToolObservation {
     }
 }
 
-fn daemon_observation_fallback_text(
+/// The model-visible form of a daemon observation: a plain, self-describing
+/// text block that names the daemon as its author. Both provider adapters and
+/// the handoff markdown render observations through this.
+fn daemon_observation_text(
     tool_name: &str,
     args_json: &str,
     summary: Option<&str>,
@@ -92,12 +84,10 @@ fn daemon_observation_fallback_text(
     text.push_str(
         "This message was authored by the pi-relay daemon, not by an assistant tool call.\n",
     );
-    text.push_str("It records daemon-observed state equivalent to `");
-    text.push_str(tool_name);
-    text.push('(');
+    text.push_str("It records daemon-observed state for ");
     text.push_str(&args_inline);
-    text.push_str(")` at observation time.\n");
-    text.push_str("Full transcript contents and large prompts/messages are not inlined; artifact paths in the snapshot point to files to inspect only if needed.");
+    text.push_str(" at observation time; there is no tool to re-run it.\n");
+    text.push_str("Full transcript contents and large prompts/messages are not inlined; artifact paths in the snapshot point to files to read with ordinary file tools only if needed.");
     if let Some(summary) = summary.filter(|summary| !summary.trim().is_empty()) {
         text.push_str("\n\nSummary: ");
         text.push_str(summary.trim());
@@ -115,8 +105,7 @@ mod tests {
 
     #[test]
     fn daemon_tool_observation_round_trips() {
-        let observation = DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("call_delegation_1_attempt_1"),
+        let observation = DaemonToolObservation::delegation_status(
             "delegation_1",
             Some("completed with status done: 1 ok, 0 failed".to_string()),
             json!({
@@ -127,8 +116,7 @@ mod tests {
 
         let value = serde_json::to_value(&observation).expect("serialize");
 
-        assert_eq!(value["tool_call_id"], "call_delegation_1_attempt_1");
-        assert_eq!(value["tool_name"], "inspect_delegation");
+        assert_eq!(value["tool_name"], "delegation_status");
         assert_eq!(value["status"], "Success");
         assert_eq!(value["args_json"], "{\"delegation_id\":\"delegation_1\"}");
         let round_trip: DaemonToolObservation = serde_json::from_value(value).expect("deserialize");
@@ -136,9 +124,8 @@ mod tests {
     }
 
     #[test]
-    fn inspect_delegation_observation_renders_as_daemon_authored_text() {
-        let observation = DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("call_delegation_1_attempt_1"),
+    fn delegation_observation_renders_as_daemon_authored_text() {
+        let observation = DaemonToolObservation::delegation_status(
             "delegation_1",
             Some("completed with status done: 1 ok, 0 failed".to_string()),
             json!({
@@ -153,20 +140,41 @@ mod tests {
 
         let text = observation.render_text().expect("observation renders");
 
-        assert!(text.starts_with("Daemon observation: inspect_delegation"));
+        assert!(text.starts_with("Daemon observation: delegation_status"));
         assert!(text.contains("not by an assistant tool call"));
-        assert!(text
-            .contains("equivalent to `inspect_delegation({\"delegation_id\":\"delegation_1\"})`"));
+        assert!(text.contains("state for {\"delegation_id\":\"delegation_1\"}"));
+        assert!(text.contains("there is no tool to re-run it"));
         assert!(text.contains("large prompts/messages are not inlined"));
         assert!(text.contains("Snapshot JSON follows"));
         assert!(text.contains("\"delegation_id\": \"delegation_1\""));
         assert!(text.contains("\"transcript_file\""));
     }
 
+    /// Historical transcripts carry observations named after the retired
+    /// `inspect_delegation` tool and a `tool_call_id` field that no longer
+    /// exists. They must still deserialize and render.
     #[test]
-    fn subject_id_is_escaped_in_inline_equivalent_call() {
-        let observation = DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("call_quoted"),
+    fn historical_inspect_delegation_observation_still_renders() {
+        let observation: DaemonToolObservation = serde_json::from_value(json!({
+            "tool_call_id": "call_inspect_delegation_deadbeef",
+            "tool_name": "inspect_delegation",
+            "args_json": "{\"delegation_id\":\"delegation_1\"}",
+            "result_json": { "delegation_id": "delegation_1", "status": "done" },
+            "status": "Success",
+            "summary": "Delegation delegation_1 completed",
+        }))
+        .expect("historical observation deserializes");
+
+        let text = observation.render_text().expect("observation renders");
+
+        assert!(text.starts_with("Daemon observation: inspect_delegation"));
+        assert!(text.contains("Summary: Delegation delegation_1 completed"));
+        assert!(text.contains("\"status\": \"done\""));
+    }
+
+    #[test]
+    fn subject_id_is_escaped_in_rendered_args() {
+        let observation = DaemonToolObservation::delegation_status(
             "delegation_\"quoted\"",
             None,
             json!({ "delegation_id": "delegation_\"quoted\"" }),
@@ -174,8 +182,6 @@ mod tests {
 
         let text = observation.render_text().expect("observation renders");
 
-        assert!(
-            text.contains("inspect_delegation({\"delegation_id\":\"delegation_\\\"quoted\\\"\"})")
-        );
+        assert!(text.contains("state for {\"delegation_id\":\"delegation_\\\"quoted\\\"\"}"));
     }
 }

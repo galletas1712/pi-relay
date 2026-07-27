@@ -15,6 +15,37 @@
   model ceiling. Docs updated to say so instead of describing the old
   emit-when-set behaviour.
 
+### Retired The Model-Facing `inspect_delegation` Tool
+
+- Removed `inspect_delegation` from the tool registry, the parent-profile tool
+  filter, and the model-facing delegation dispatch. Nothing the model can do
+  polls delegation state any more; completion and per-child terminal wakeups are
+  the only parent-visible delegation signal.
+- The daemon-side snapshot builder and the `delegation.status` websocket RPC are
+  unchanged — the web UI still polls them through `status_core`.
+- `delegate_writing_task` / `delegate_readonly_tasks` now return the complete
+  launch handle: `{delegation_id, handoff_dir, subagents: [{id, role}]}`. A
+  parent locates artifacts and addresses children without a second call. The
+  `delegation.start_full` / `delegation.start_readonly_fanout` RPCs share the
+  shape; `subagent_session_id`/`subagent_session_ids` are gone.
+- New daemon observations are named `delegation_status` instead of the retired
+  tool. `tool_name` remains a durable field and old rows deserialize and render
+  unchanged; adapter tests cover an old-shaped `inspect_delegation` observation
+  on both providers. No migration: the field is free-form.
+- Compaction ledger text no longer instructs the model to call a tool that does
+  not exist; it points at the `handoff_dir` and per-subagent file references the
+  ledger already carries.
+- Deleted `DaemonToolObservation::tool_call_id` outright. It only ever keyed the
+  synthetic tool call/result pair the adapters used to manufacture, so it lost
+  its last consumer when wakeups became plain user messages. Its derivation
+  (`short_delegation_observation_call_id`, the `sha2` dependency in
+  `agent-daemon`) and the dead `args_value`/`result_text` accessors went with
+  it, and `daemon_observation_fallback_text` is now `daemon_observation_text`
+  — it is the rendering, not a fallback.
+- `rust/migrations/drop-daemon-observation-call-id.sql` strips the retired key
+  from durable rows. It is optional and unordered: serde ignores the unknown
+  field, so old rows deserialize and render either way.
+
 ## 2026-07-26
 
 ### Delegation Wakeups Render As Plain User Messages

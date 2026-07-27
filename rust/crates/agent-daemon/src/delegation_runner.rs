@@ -275,7 +275,7 @@ async fn publish_completed_delegation(
     let mut completed_delegation = delegation.clone();
     completed_delegation.status = status;
     let snapshot = build_delegation_snapshot(state, &completed_delegation).await?;
-    let observation = completion_wakeup_observation(&snapshot, &completed_delegation)?;
+    let observation = completion_wakeup_observation(&snapshot)?;
     state
         .repo
         .enqueue_delegation_observation(

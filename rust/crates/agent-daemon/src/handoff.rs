@@ -3,9 +3,9 @@
 //! On the delegation barrier, for every subagent (success or failure) the daemon
 //! renders two files from the durable Postgres transcript — `final_message.md`
 //! and an exhaustive, greppable `transcript.md` — under
-//! `<parent.workspace_id>/.pi-handoff/<delegation_id>/`. `inspect_delegation` is the
-//! structured control-flow snapshot; the files remain transcript/detail
-//! artifacts only. Postgres transcript history is the durable source of truth:
+//! `<parent.workspace_id>/.pi-handoff/<delegation_id>/`. The daemon wakeup
+//! observation carries the structured control-flow snapshot; these files remain
+//! transcript/detail artifacts only. Postgres transcript history is the durable source of truth:
 //! these artifact files are derived from `active_branch` (Ui body mode) and can
 //! be re-rendered after an RO subagent's filesystem snapshot is destroyed or a
 //! daemon crash leaves publication incomplete.

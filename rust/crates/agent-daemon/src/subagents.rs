@@ -545,7 +545,7 @@ fn subagent_contract_text(parent_session_id: &str, subagent_type: SubagentType) 
 You are a child agent spawned by parent session `{parent_session_id}`.\n\
 The parent can inspect your transcript, send follow-up messages, interrupt you, and decide whether to merge your filesystem changes.\n\
 Keep your own context focused on the delegated task. Do not assume your changes are merged automatically.\n\
-You cannot spawn nested delegations. Do not call `delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, or `steer_subagent`; those parent orchestration tools are unavailable to subagents.\n\
+You cannot spawn nested delegations. Do not call `delegate_writing_task`, `delegate_readonly_tasks`, `cancel_delegation`, or `steer_subagent`; those parent orchestration tools are unavailable to subagents.\n\
 Answer only the delegated task. Your final message/report is the durable handoff to the parent, so include the evidence, changed files, commands, risks, and follow-up work the parent needs.\n\
 {workspace_semantics}"
     )
@@ -659,7 +659,7 @@ mod tests {
         assert!(contract.contains("cannot spawn nested delegations"));
         assert!(contract.contains("Do not call `delegate_writing_task`"));
         assert!(contract.contains("`delegate_readonly_tasks`"));
-        assert!(contract.contains("`inspect_delegation`"));
+        assert!(contract.contains("`cancel_delegation`"));
         assert!(contract.contains("`cancel_delegation`"));
         assert!(contract.contains("`steer_subagent`"));
         assert!(contract.contains("final message/report is the durable handoff"));

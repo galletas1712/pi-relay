@@ -4839,7 +4839,6 @@ fn tool_names(result: &serde_json::Value) -> Vec<String> {
 fn assert_delegation_tools_visible(names: &[String]) {
     assert!(names.contains(&"delegate_writing_task".to_string()));
     assert!(names.contains(&"delegate_readonly_tasks".to_string()));
-    assert!(names.contains(&"inspect_delegation".to_string()));
     assert!(names.contains(&"cancel_delegation".to_string()));
     assert!(names.contains(&"steer_subagent".to_string()));
     assert!(names.contains(&"interrupt_subagent".to_string()));
@@ -4849,7 +4848,6 @@ fn assert_delegation_tools_hidden(names: &[String]) {
     assert!(names.contains(&"LoadSkill".to_string()));
     assert!(!names.contains(&"delegate_writing_task".to_string()));
     assert!(!names.contains(&"delegate_readonly_tasks".to_string()));
-    assert!(!names.contains(&"inspect_delegation".to_string()));
     assert!(!names.contains(&"cancel_delegation".to_string()));
     assert!(!names.contains(&"steer_subagent".to_string()));
     assert!(!names.contains(&"interrupt_subagent".to_string()));
@@ -5165,7 +5163,7 @@ async fn parent_delegation_observations(
         .iter()
         .filter_map(|entry| match &entry.item {
             TranscriptItem::DaemonToolObservation(observation)
-                if observation.tool_name == "inspect_delegation"
+                if observation.tool_name == "delegation_status"
                     && observation
                         .args_json
                         .contains(&format!("\"delegation_id\":\"{delegation_id}\"")) =>
@@ -5201,7 +5199,7 @@ async fn parent_completion_snapshot(
     observations[0].result_json.clone()
 }
 
-async fn inspect_delegation_snapshot(env: &TestEnv, delegation_id: &str) -> serde_json::Value {
+async fn delegation_status_snapshot(env: &TestEnv, delegation_id: &str) -> serde_json::Value {
     status_core(
         &env.state,
         "parent",
@@ -5383,7 +5381,6 @@ async fn parent_model_context_does_not_inject_current_delegations() {
         .collect::<Vec<_>>();
     assert!(parent_tool_names.contains(&"delegate_writing_task"));
     assert!(parent_tool_names.contains(&"delegate_readonly_tasks"));
-    assert!(parent_tool_names.contains(&"inspect_delegation"));
     assert!(parent_tool_names.contains(&"cancel_delegation"));
     assert!(parent_tool_names.contains(&"steer_subagent"));
 
@@ -5702,7 +5699,6 @@ async fn subagent_model_context_does_not_get_parent_delegation_summary() {
     assert!(subagent_tool_names.contains(&"Bash"));
     assert!(!subagent_tool_names.contains(&"delegate_writing_task"));
     assert!(!subagent_tool_names.contains(&"delegate_readonly_tasks"));
-    assert!(!subagent_tool_names.contains(&"inspect_delegation"));
     assert!(!subagent_tool_names.contains(&"cancel_delegation"));
     assert!(!subagent_tool_names.contains(&"steer_subagent"));
 
@@ -6619,8 +6615,8 @@ async fn model_facing_delegation_tools_reject_subagent_sessions() {
         &env.state,
         "impl_busy",
         &ToolCall {
-            id: ToolCallId::new("call_inspect_from_subagent"),
-            tool_name: "inspect_delegation".to_string(),
+            id: ToolCallId::new("call_cancel_from_subagent"),
+            tool_name: "cancel_delegation".to_string(),
             args_json: json!({ "delegation_id": delegation.id }).to_string(),
         },
     )
@@ -6776,7 +6772,7 @@ async fn running_read_only_snapshot_reports_steerable_only_when_accepted() {
         )
         .await
         .expect("set subagent title");
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     let snapshot_subagents = snapshot["subagents"].as_array().expect("subagents");
     let busy = snapshot_subagents
         .iter()
@@ -6872,7 +6868,7 @@ async fn queued_work_on_boundary_subagent_reports_running_and_steerable() {
         .await
         .expect("queue steer");
 
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["status"], "running");
     assert_eq!(snapshot["progress"]["terminal"], 0);
     assert_eq!(snapshot["progress"]["running"], 1);
@@ -6907,7 +6903,7 @@ async fn queued_work_on_boundary_subagent_reports_running_and_steerable() {
         )
         .await
         .expect("mark queued input consumed");
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["progress"]["terminal"], 1);
     let subagent = &snapshot["subagents"].as_array().unwrap()[0];
     assert_eq!(subagent["status"], "done");
@@ -7705,7 +7701,7 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     assert!(transcript.contains("keep working"));
     assert!(transcript.contains("## Assistant"));
     assert!(transcript.contains("working..."));
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
     assert_eq!(snapshot["status"], "cancelled");
     assert_eq!(subagent["status"], "cancelled");
@@ -8139,15 +8135,15 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
         1
     );
 
-    // Handoff: inspect_delegation is the control-flow snapshot; the
+    // Handoff: the wakeup snapshot is the control-flow view; the
     // handoff dir contains per-subagent files for EVERY subagent (incl. failed)
     // but no delegation-root index.json.
     let root = handoff_root(&env, &delegation.id);
     assert!(!root.join("index.json").exists());
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     let wakeup_observation =
         published_parent_completion_observation(&env, "parent", &delegation).await;
-    assert_eq!(wakeup_observation.tool_name, "inspect_delegation");
+    assert_eq!(wakeup_observation.tool_name, "delegation_status");
     assert_eq!(
         wakeup_observation.args_json,
         format!("{{\"delegation_id\":\"{}\"}}", delegation.id)
@@ -8226,7 +8222,7 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
-async fn inspect_delegation_refreshes_artifacts_from_postgres() {
+async fn delegation_status_refreshes_artifacts_from_postgres() {
     let Some(env) = test_env().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -8282,7 +8278,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         !root.exists(),
         "inspection should be the first artifact writer in this test"
     );
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["status"], "running");
     assert_eq!(snapshot["progress"]["expected"], 2);
     assert_eq!(snapshot["progress"]["spawned"], 2);
@@ -8379,7 +8375,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         "stale local final message",
     )
     .expect("overwrite final message artifact");
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["progress"]["terminal"], 1);
     let refreshed = std::fs::read_to_string(root.join("done_child").join("transcript.md")).unwrap();
     assert!(refreshed.contains("Found the answer."));
@@ -8513,7 +8509,7 @@ async fn failed_delegation_does_not_publish_normal_handoff_on_inspect_or_read() 
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_failed").await;
     tear_down_delegation(&env, &delegation, DelegationStatus::Failed).await;
 
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
     assert_eq!(snapshot["status"], "failed");
     assert_eq!(subagent["status"], "failed");
@@ -8677,7 +8673,7 @@ async fn missing_task_metadata_omits_task_prompt_handoff_metadata() {
     assert_eq!(listed_subagent["task_prompt_file"], serde_json::Value::Null);
     assert!(listed_subagent.get("task_prompt_path").is_none());
 
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     let subagent = &snapshot["subagents"].as_array().unwrap()[0];
     assert_eq!(subagent["task_prompt_file"], serde_json::Value::Null);
     assert!(subagent.get("task_prompt_path").is_none());
@@ -8796,7 +8792,7 @@ async fn out_of_set_outcome_is_recorded_verbatim() {
     complete_delegation_if_ready(&env.state, &delegation.id)
         .await
         .expect("barrier");
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["status"], "done");
     assert_eq!(snapshot["subagents"][0]["outcome"], "ship_it_immediately");
 
@@ -9451,7 +9447,7 @@ fn assert_minimal_wakeup_event_payload(payload: &serde_json::Value, client_input
     let payload_text = payload.to_string();
     assert!(!payload_text.contains("completed"));
     assert!(!payload_text.contains("implemented"));
-    assert!(!payload_text.contains("inspect_delegation"));
+    assert!(!payload_text.contains("delegation_status"));
     assert!(!payload_text.contains("subagents"));
 }
 
@@ -9625,7 +9621,7 @@ async fn boot_repair_publishes_handoff_and_wakeup_observation_after_finish_claim
     assert!(!root.join("index.json").exists());
     assert!(root.join("impl").join("final_message.md").exists());
     assert!(root.join("impl").join("transcript.md").exists());
-    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot = delegation_status_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["status"], "done");
     assert_eq!(
         wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
