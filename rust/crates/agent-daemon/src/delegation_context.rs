@@ -6,6 +6,9 @@ use crate::state::AppState;
 
 const MAX_SUBAGENTS_PER_DELEGATION: usize = 8;
 const MAX_OUTCOME_CHARS: usize = 120;
+/// An artifact path can be 512 bytes, and three inlined ones would otherwise be
+/// 1.5 kB of the ledger's budget. The full paths are in `artifacts.json`.
+const MAX_ARTIFACT_NAME_CHARS: usize = 80;
 
 /// Build the compaction-only delegation ledger for a top-level parent session.
 ///
@@ -193,7 +196,12 @@ async fn append_subagents(
                 inline_code(&subagent.session_id),
             ));
             if handed_back.files.len() <= 3 {
-                out.push_str(&format!(": {}", handed_back.files.join(", ")));
+                let names = handed_back
+                    .files
+                    .iter()
+                    .map(|file| truncate_chars(file, MAX_ARTIFACT_NAME_CHARS))
+                    .collect::<Vec<_>>();
+                out.push_str(&format!(": {}", names.join(", ")));
             }
             if handed_back.truncated {
                 out.push_str("; artifacts_truncated: true");

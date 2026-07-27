@@ -70,8 +70,11 @@ async fn copy_artifacts_to_parent(state: &AppState, session_id: &str) -> anyhow:
     else {
         return Ok(());
     };
-    if artifacts.files.is_empty() && artifacts.skipped.is_empty() {
-        // The child staged nothing; leave no empty manifest behind.
+    if artifacts.files.is_empty() && artifacts.skipped.is_empty() && !artifacts.truncated {
+        // The child staged nothing; leave no empty manifest behind. A truncated
+        // handback still gets one even with both lists empty — a single file
+        // over the whole byte budget produces exactly that, and the parent needs
+        // to be told the handback happened and was cut short.
         return Ok(());
     }
     state

@@ -79,15 +79,9 @@ impl WorkspaceManager {
     /// Resolve a cwd-relative path, rejecting anything that is absolute or
     /// escapes the session cwd.
     fn safe_workspace_path(&self, workspace_id: &str, rel_path: &str) -> Result<PathBuf> {
-        let cwd = self.resolve(workspace_id);
-        let mut path = cwd.clone();
-        for component in Path::new(rel_path).components() {
-            match component {
-                std::path::Component::Normal(part) => path.push(part),
-                _ => bail!("workspace file path must be relative and normal: {rel_path}"),
-            }
-        }
-        Ok(path)
+        Ok(self
+            .resolve(workspace_id)
+            .join(safe_relative_path(rel_path)?))
     }
 
     /// Write a control-generated file (e.g. a delegation handoff artifact) into
@@ -107,10 +101,12 @@ impl WorkspaceManager {
     }
 
     /// Copy a bounded, symlink-free subtree between two session cwds on this
-    /// runtime. Both sides resolve through `safe_workspace_path`, so neither can
-    /// escape its cwd; the same workspace on both sides is rejected so a full
-    /// (in-place) subagent can never be routed here. `None` means the source
-    /// subtree does not exist.
+    /// runtime. Both sides are rejected unless every component is normal, so
+    /// neither can escape its cwd; the target is then created and opened one
+    /// component at a time from the cwd, so a symlink staged anywhere along it
+    /// cannot redirect the copy either. The same workspace on both sides is
+    /// rejected so a full (in-place) subagent can never be routed here. `None`
+    /// means the source subtree does not exist.
     pub async fn copy_workspace_subtree(
         &self,
         source_workspace_id: &str,
@@ -122,8 +118,8 @@ impl WorkspaceManager {
             bail!("artifact copy source and target must be different sessions");
         }
         let source = self.safe_workspace_path(source_workspace_id, source_rel)?;
-        let target = self.safe_workspace_path(target_workspace_id, target_rel)?;
-        copy_artifact_tree(&source, &target).await
+        let target_rel = safe_relative_path(target_rel)?;
+        copy_artifact_tree(&source, &self.resolve(target_workspace_id), &target_rel).await
     }
 
     pub async fn read_workspace_file(
@@ -884,6 +880,18 @@ async fn collect_skill_dir(
         );
     }
     Ok(())
+}
+
+/// Reject a workspace-relative path that is absolute or escapes the session cwd.
+fn safe_relative_path(rel_path: &str) -> Result<PathBuf> {
+    let mut path = PathBuf::new();
+    for component in Path::new(rel_path).components() {
+        match component {
+            std::path::Component::Normal(part) => path.push(part),
+            _ => bail!("workspace file path must be relative and normal: {rel_path}"),
+        }
+    }
+    Ok(path)
 }
 
 fn local_branch(session_id: &str, workspace_dir: &str) -> String {

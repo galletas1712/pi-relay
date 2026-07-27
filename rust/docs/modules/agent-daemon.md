@@ -220,8 +220,10 @@ artifact staging tree: when the child reaches its terminal idle (or is
 cancelled), `subagent_artifacts::reclaim_read_only_subagent` copies it into
 `<parent cwd>/.pi-handoff/<delegation_id>/<subagent_id>/artifacts/` and writes an
 `artifacts.json` manifest, and only then destroys the child subvolume. The copy
-is bounded (200 files, 32 MiB, `truncated` in the manifest), takes regular files
-only, and never follows a symlink. A copy failure is logged and teardown still
+is bounded (200 entries examined, 32 MiB, `truncated` in the manifest), takes
+regular files only, and follows a symlink on neither side: entries are resolved
+through the directory fd the walk holds, and target directories and files are
+created below a held target fd. A copy failure is logged and teardown still
 runs, so a bad artifact tree neither blocks a delegation nor leaks a subvolume.
 Full subagents write the parent cwd in place and are never copied from or torn
 down. Delegation snapshots expose `handoff_dir` relative to the session cwd;

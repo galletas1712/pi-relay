@@ -1474,12 +1474,13 @@ directory under the same guard, so a fork or read-only child never sees the
 source session's delegation artifacts. In a read-only child that empty directory
 is the artifact staging tree: whatever the child writes there is copied to
 `<parent cwd>/.pi-handoff/<delegation_id>/<subagent_id>/artifacts/` — bounded at
-200 files and 32 MiB, at most 16 path segments deep, regular files only, every
-entry resolved through the directory fd the walk already holds so a rename
-racing the walk can only skip an entry, never redirect a copy outside the tree —
-immediately
-before its snapshot is reclaimed. Full (writing) subagents work in the parent's
-cwd in place and are never copied from or torn down. The daemon does not claim
+200 examined entries and 32 MiB, at most 16 path segments deep, regular files
+only, every entry resolved through the directory fd the walk already holds and
+every target directory and file created below a held target fd, so neither a
+rename racing the walk nor a symlink planted in the target can redirect a copy
+outside the tree — immediately before its snapshot is reclaimed. Full (writing)
+subagents work in the parent's cwd in place and are never copied from or torn
+down. The daemon does not claim
 to track independently running background processes beyond the managed future
 lifetime.
 
