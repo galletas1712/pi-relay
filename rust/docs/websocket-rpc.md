@@ -387,8 +387,7 @@ Child sessions link back through `sessions.delegation_id`. The
 `delegations_parent_created_idx` index supports the per-parent delegation feed.
 The completion runner uses `attempt_id` as an idempotency fence and queues a
 deterministic parent daemon wakeup observation keyed as
-`delegation-steer:<delegation_id>:<attempt_id>` (the key name is retained for
-idempotency compatibility).
+`delegation-steer:<delegation_id>:<attempt_id>`.
 
 ### `events`
 
@@ -1535,7 +1534,8 @@ Result:
 ```json
 {
   "delegation_id": "delegation_...",
-  "subagent_session_id": "session_..."
+  "handoff_dir": ".pi-handoff/delegation_...",
+  "subagents": [{ "id": "session_...", "role": "implementer" }]
 }
 ```
 
@@ -1561,7 +1561,11 @@ Result:
 ```json
 {
   "delegation_id": "delegation_...",
-  "subagent_session_ids": ["session_...", "session_..."]
+  "handoff_dir": ".pi-handoff/delegation_...",
+  "subagents": [
+    { "id": "session_...", "role": "reviewer" },
+    { "id": "session_...", "role": "tester" }
+  ]
 }
 ```
 
@@ -1582,13 +1586,10 @@ accepted for that child: the delegation is running, the child is a delegation
 member, the child has queued/unfinished/runtime work, and it is not
 completion-terminal.
 
-Daemon wakeup observations also carry this same snapshot. A terminal snapshot is
-the normal completion/cancellation handoff. A still-`running` snapshot is a
-partial fan-out decision point: at most one queued/consuming partial wakeup is
-active per delegation attempt, and it appears only after the expected fan-out
-members exist. The parent should steer a running/steerable child, cancel the
-delegation, or wait; final completion cancels stale queued partial wakeups before
-publishing the terminal wakeup.
+Daemon wakeup observations also carry this same snapshot. A parent receives
+exactly one wakeup per delegation, at terminal status; an individual child
+reaching terminal never wakes the parent. Mid-flight steering is parent-initiated
+via `steer_subagent`; the model has no delegation inspection tool.
 
 ```json
 {
@@ -1824,10 +1825,10 @@ delegations expose per-subagent `task_prompt.md`. Normal running/done
 delegations expose per-subagent `transcript.md`; terminal
 done/done_with_failures delegations also expose per-subagent `final_message.md`.
 Cancelled delegations expose the transcript-only cancellation artifact path
-reported by `inspect_delegation`, for example
+reported in the delegation snapshot, for example
 `cancelled/<subagent_id>.transcript.md`. The structured delegation snapshot
-comes from `delegation.status`/`inspect_delegation`, not from a handoff root
-artifact file. Raw task prompts, full final messages, and full transcript bodies
+comes from `delegation.status`, not from a handoff root artifact file. Raw task
+prompts, full final messages, and full transcript bodies
 are never inlined in delegation snapshots, daemon observations, or compaction
 ledgers; use this RPC to read an artifact body explicitly when detail is needed.
 
@@ -1876,14 +1877,14 @@ parent-scoped `subagent.spawned` and `subagent.running` progress events. These
 are progress hints only. Parent-visible delegation completion is not a per-child
 `subagent.idle`; it is one `InputPriority::Steer` daemon observation queued to
 the parent after the delegation barrier completes. The observation is stored as a
-typed `daemon_tool_observation` transcript item and is inspect-equivalent to
-`inspect_delegation`/`delegation.status`, including per-subagent
-`outcome` and artifact paths. Provider adapters
-render it as one plain user-role message carrying the observation text;
-the UI renders it as a daemon/system observation card. Use
-`inspect_delegation`/`delegation.status` to refresh/recover state or inspect
-later/running; use the per-subagent `task_prompt.md`, `final_message.md`, and
-`transcript.md` files for extra detail.
+typed `daemon_tool_observation` transcript item and carries the same snapshot as
+`delegation.status`, including per-subagent `outcome` and artifact paths.
+Provider adapters render it as one plain user-role message carrying the
+observation text; the UI renders it as a daemon/system observation card. Clients
+use `delegation.status` to refresh or inspect a running delegation; the model
+has no inspection tool and reads the per-subagent `task_prompt.md`,
+`final_message.md`, and `transcript.md` files under the launch result's
+`handoff_dir` for extra detail.
 
 `subagent.idle` remains an event type for non-delegation subagent compatibility
 (for example, defensive dispatch-failure compensation). When emitted, idle
@@ -1982,8 +1983,8 @@ for editing). Callers may pass `session_id` so the daemon can derive the actual
 session profile; if omitted, parent/global behavior is preserved. Parent/default
 sessions see the registered builtins (`edit`, `bash`, `web_search`, `web_fetch`,
 `LoadSkill`) plus delegation tools (`delegate_writing_task`,
-`delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`,
-`steer_subagent`, `interrupt_subagent`). Structurally subagent sessions get the filtered subagent
+`delegate_readonly_tasks`, `cancel_delegation`, `steer_subagent`,
+`interrupt_subagent`). Structurally subagent sessions get the filtered subagent
 surface without delegation tools. `prompt_profile` may be supplied only as a
 fallback when no `session_id` is available. There are no `read`/`write` tools.
 Each returned entry carries `name`, `description`, `input_schema`,

@@ -162,22 +162,20 @@ Implemented user-facing behavior:
   provider paths, with prompt-cache shaping on both.
 - Subagent delegation runs as **delegations** through provider-visible delegation
   tools (`delegate_writing_task`, `delegate_readonly_tasks`,
-  `inspect_delegation`, `cancel_delegation`, `steer_subagent`,
-  `interrupt_subagent`). A delegation is one **full** subagent
+  `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). A delegation is one **full** subagent
   (writes the parent's workspace in place) or a parallel fan-out of
   **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
   return). A parent may launch independent delegations together, then parks
   after the useful launch batch and receives delegation-ID-scoped completion
-  **daemon observations** containing structured snapshots equivalent to
-  `inspect_delegation`, including per-subagent `outcome` and compact handoff
-  file references.
-  `inspect_delegation` refreshes or recovers that same structured state
-  later/running.
+  **daemon observations** containing the structured delegation snapshot,
+  including per-subagent `outcome` and compact handoff file references. The
+  launch tools return the delegation id, its `handoff_dir`, and each subagent's
+  id and role, so a parent locates artifacts without any follow-up call.
   Delegation subagents may emit `subagent.spawned`/`subagent.running` progress
   events, but parent-visible completion is the delegation wakeup observation and
-  handoff, not a per-child idle event. Reusable patterns are ordinary
-  **workflow skills** (`SKILL.md` + `LoadSkill`), not a DSL. Web/inspector RPCs use the canonical
-  `delegation.*` client API. See
+  handoff, not a per-child idle event: exactly one wakeup per delegation.
+  Reusable patterns are ordinary **workflow skills** (`SKILL.md` + `LoadSkill`),
+  not a DSL. Web/inspector RPCs use the canonical `delegation.*` client API. See
   [agent-daemon](modules/agent-daemon.md).
 
 Not implemented by design:

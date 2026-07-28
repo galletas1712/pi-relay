@@ -15,6 +15,64 @@
   model ceiling. Docs updated to say so instead of describing the old
   emit-when-set behaviour.
 
+### Retired The Model-Facing `inspect_delegation` Tool
+
+- Removed `inspect_delegation` from the tool registry, the parent-profile tool
+  filter, and the model-facing delegation dispatch. Nothing the model can do
+  polls delegation state any more; completion and per-child terminal wakeups are
+  the only parent-visible delegation signal.
+- The daemon-side snapshot builder and the `delegation.status` websocket RPC are
+  unchanged — the web UI still polls them through `status_core`.
+- `delegate_writing_task` / `delegate_readonly_tasks` now return the complete
+  launch handle: `{delegation_id, handoff_dir, subagents: [{id, role}]}`. A
+  parent locates artifacts and addresses children without a second call. The
+  `delegation.start_full` / `delegation.start_readonly_fanout` RPCs share the
+  shape; `subagent_session_id`/`subagent_session_ids` are gone.
+- New daemon observations are named `delegation_status` instead of the retired
+  tool. `tool_name` remains a durable field and old rows deserialize and render
+  unchanged; adapter tests cover an old-shaped `inspect_delegation` observation
+  on both providers. No migration: the field is free-form.
+- Compaction ledger text no longer instructs the model to call a tool that does
+  not exist; it points at the `handoff_dir` and per-subagent file references the
+  ledger already carries.
+- Deleted `DaemonToolObservation::tool_call_id` outright. It only ever keyed the
+  synthetic tool call/result pair the adapters used to manufacture, so it lost
+  its last consumer when wakeups became plain user messages. Its derivation
+  (`short_delegation_observation_call_id`, the `sha2` dependency in
+  `agent-daemon`) and the dead `args_value`/`result_text` accessors went with
+  it, and `daemon_observation_fallback_text` is now `daemon_observation_text`
+  — it is the rendering, not a fallback.
+- `rust/migrations/drop-daemon-observation-call-id.sql` strips the retired key
+  from durable rows. It is optional and unordered: serde ignores the unknown
+  field, so old rows deserialize and render either way.
+- No transcript migration is required for the model's own historical
+  `inspect_delegation` calls, which live in transcripts as plaintext
+  `tool_use`/`function_call` items and are re-serialized on every request.
+  Verified live against both configured providers with a request whose history
+  names a tool absent from the `tools` array: Anthropic `/v1/messages`
+  (`claude-haiku-4-5`) and OpenAI Codex `/backend-api/codex/responses`
+  (`gpt-5.4-mini`) each returned 200 for the absent tool both as the latest tool
+  turn and buried in an older turn, with a passing control (history naming a
+  tool that *is* in `tools`) proving the probes meaningful. The code agrees: the
+  render path does no registry lookup (`openai_wire_tool_name` is a pure string
+  match with an `other => other` fallthrough, and replay validation only
+  requires `call_id`/`name` to be present strings), and `ToolError::UnknownTool`
+  fires on dispatch only, never on replay.
+- The `scripts/migrate_shell_to_bash.py` precedent (WORKLOG 2026-05-14) does not
+  apply here. That was a **rename**: stale `shell` names had to keep routing to
+  a working successor. This is a **removal** with no successor, and providers
+  demonstrably tolerate the orphaned name, so rewriting durable jsonb would buy
+  nothing and risk real data loss.
+- A session interrupted mid-turn with an unanswered `inspect_delegation` call at
+  the tail also resumes cleanly: the registry's `UnknownTool` surfaces through
+  `runtime_hosts::execute` as a `RuntimeCommandError`, which
+  `runtime/tool.rs` turns into an error `ToolResultMessage` for that call. The
+  turn continues with a tool error, it does not fail.
+- Follow-up (outside this repo): the runtime-host role prompts
+  `~/.config/pi-relay/runtime/subagent-roles/{tester,reviewer}/SKILL.md`
+  still tell subagents to branch on "a refreshed `inspect_delegation` snapshot"
+  and need that sentence removed.
+
 ## 2026-07-26
 
 ### Delegation Wakeups Render As Plain User Messages
@@ -36,6 +94,26 @@
   provider compaction checkpoints still embed the synthetic call as opaque
   ciphertext; that is bounded to each session's newest checkpoint and clears on
   its next compaction.
+
+### One Wakeup Per Delegation (Breaking)
+
+- Removed partial (per-child) delegation wakeups outright, with no compatibility
+  flag. A parent is now woken exactly once per delegation, at terminal status; a
+  child reaching terminal mid-fan-out produces no parent-visible event. Deleted
+  the store's partial enqueue/cancel paths, the runner's partial publisher, its
+  post-consumption chaining, its boot republication, and the per-child
+  observation builder. `persist_active_outputs_with_control` no longer does a
+  `get_delegation` round-trip on every parent persist.
+- Behavioural consequence: the parent can no longer be pushed a decision point
+  mid-fan-out. `inspect_delegation` / `steer_subagent` still work, but the parent
+  must already be awake to use them, so mid-flight steering is now
+  human-initiated. Running-delegation handoff artifacts are refreshed only on an
+  explicit inspection, so a completed child's `final_message.md` survives
+  cancellation only if the parent inspected first; cancellation still exports
+  transcript-only artifacts for every child.
+- Requires the one-shot `rust/migrations/single-delegation-wakeup.sql`, run with
+  the daemon stopped, after a `pg_dump`, between stopping the old binary and
+  starting the new one. See `rust/migrations/README.md`.
 
 ## 2026-07-09
 

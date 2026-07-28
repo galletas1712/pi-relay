@@ -39,10 +39,9 @@ See [agent-tools](../modules/agent-tools.md) for the full registry. In brief:
   no backend; web_fetch does a bounded HTTP fetch).
 - **LoadSkill** activates a named skill.
 - **Delegation tools** (`delegate_writing_task`, `delegate_readonly_tasks`,
-  `inspect_delegation`, `cancel_delegation`) are uniform JSON tools handled by
-  the stage runtime; stage completion is reported later via a daemon-authored
-  wakeup observation containing an `inspect_delegation`-equivalent bounded
-  snapshot and handoff artifact paths.
+  `cancel_delegation`) are uniform JSON tools handled by the stage runtime;
+  stage completion is reported later via a daemon-authored wakeup observation
+  containing a bounded delegation snapshot and handoff artifact paths.
 
 Tools are registered through `ToolDescriptor` / `ProviderTool` in
 `agent-tools/src/registry.rs`, which already separates the model-visible

@@ -416,10 +416,14 @@ older ledger text by position. Subagent compaction omits parent/sibling
 delegation state entirely, because subagents do not orchestrate the delegation
 tree.
 
+A delegation produces exactly one parent wakeup, at terminal status;
+mid-flight steering is parent-initiated (`steer_subagent`) and never
+daemon-pushed.
+
 Delegation completion wakeups are daemon-authored observations, not
 assistant-authored decisions. The durable transcript stores them as a typed
-`daemon_tool_observation` item with an `inspect_delegation` tool name, stable
-local call id, arguments, status, summary, and bounded JSON snapshot. This keeps
+`daemon_tool_observation` item with a `delegation_status` observation name,
+arguments, status, summary, and bounded JSON snapshot. This keeps
 internal transcript semantics honest: the daemon observed delegation state; the
 assistant did not choose a tool call.
 

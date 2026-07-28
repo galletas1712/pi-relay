@@ -242,8 +242,8 @@ requires no client response. Tool-name canonicalization is confined to the
 separate semantic transcript/UI projection. Corrupt raw replay fails request
 construction rather than being silently dropped.
 
-Daemon-authored observations, such as delegation completion wakeups carrying an
-`inspect_delegation`-equivalent snapshot, are not provider replay and are not
+Daemon-authored observations, such as delegation completion wakeups carrying the
+delegation snapshot, are not provider replay and are not
 stored as fake assistant choices. The durable transcript item is
 `daemon_tool_observation`; provider adapters render it as a single plain
 user-role message while building a request:
@@ -377,6 +377,6 @@ Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire â
   provider, and retries exactly once inside that provider call. The provider
   surfaces the status through either `ProviderError::ModelCatalog` or the
   ordinary HTTP error path.
-- Registered builtin tools (from [agent-tools](./agent-tools.md)): `edit` (`apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). There are no `read`/`write` tools.
+- Registered builtin tools (from [agent-tools](./agent-tools.md)): `edit` (`apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). There are no `read`/`write` tools.
 - Sending OpenAI-profile tools to Anthropic (or vice versa) is a hard `ProviderError::Provider`; the profile must match the provider.
 - Wire details (RPC methods, how the daemon calls these adapters) live in [websocket-rpc](../websocket-rpc.md); the React client that drives sessions is documented in the [web UI](../../../packages/web/docs/web-ui.md) doc.

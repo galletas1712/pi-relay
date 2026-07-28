@@ -243,8 +243,7 @@ describe("MessageList daemon observations", () => {
 						timestamp_ms: 2,
 						item: {
 							type: "daemon_tool_observation",
-							tool_call_id: "call_inspect_delegation_delegation_1_attempt_1",
-							tool_name: "inspect_delegation",
+							tool_name: "delegation_status",
 							args_json: "{\"delegation_id\":\"delegation_1\"}",
 							result_json: { delegation_id: "delegation_1", status: "done", outcome: "approved" },
 							status: "Success",
@@ -274,8 +273,7 @@ describe("MessageList daemon observations", () => {
 			timestamp_ms: 2,
 			item: {
 				type: "daemon_tool_observation",
-				tool_call_id: "call_inspect_delegation_delegation_1_attempt_1",
-				tool_name: "inspect_delegation",
+				tool_name: "delegation_status",
 				args_json: "{\"delegation_id\":\"delegation_1\"}",
 				result_json: { delegation_id: "delegation_1", status: "done", outcome: "approved" },
 				status: "Success",

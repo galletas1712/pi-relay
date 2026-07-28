@@ -783,7 +783,7 @@ struct StartFanoutParams {
 #[serde(deny_unknown_fields)]
 struct DelegationIdParams {
     /// Present for websocket `delegation.status`/`delegation.cancel`, absent for
-    /// model-facing `inspect_delegation`/`cancel_delegation`.
+    /// the model-facing `cancel_delegation` tool.
     #[serde(rename = "parent_session_id")]
     _parent_session_id: Option<String>,
     delegation_id: String,
@@ -971,7 +971,7 @@ async fn start_full_core_with_launch_key(
     reject_if_subagent(state, parent_session_id).await?;
 
     let launch_shape = serde_json::to_string(&DurableLaunchSpec::Full {
-        role,
+        role: role.clone(),
         prompt,
         workflow: params.workflow.clone(),
         label: params.label.clone(),
@@ -991,10 +991,7 @@ async fn start_full_core_with_launch_key(
         .await
         .map_err(map_delegation_create_error)?;
     let session_ids = materialize_delegation_launch(state, &delegation).await?;
-    Ok(json!({
-        "delegation_id": delegation.id,
-        "subagent_session_id": session_ids[0],
-    }))
+    Ok(launch_view(&delegation.id, &session_ids, &[&role]))
 }
 
 /// Start N read-only subagents in parallel, one per task, each in its own
@@ -1068,11 +1065,29 @@ async fn start_readonly_fanout_core_with_launch_key(
         .await
         .map_err(map_delegation_create_error)?;
     let subagent_session_ids = materialize_delegation_launch(state, &delegation).await?;
+    let roles = tasks
+        .iter()
+        .map(|(role, _)| role.as_str())
+        .collect::<Vec<_>>();
+    Ok(launch_view(&delegation.id, &subagent_session_ids, &roles))
+}
 
-    Ok(json!({
-        "delegation_id": delegation.id,
-        "subagent_session_ids": subagent_session_ids,
-    }))
+/// The complete launch handle: everything a caller needs to locate this
+/// delegation's artifacts and address its children, so no follow-up call is
+/// required. `handoff_dir` is the directory the daemon renders per-subagent
+/// `final_message.md` / `transcript.md` / `task_prompt.md` into.
+fn launch_view(delegation_id: &str, session_ids: &[String], roles: &[&str]) -> Value {
+    debug_assert_eq!(session_ids.len(), roles.len());
+    let subagents = session_ids
+        .iter()
+        .zip(roles)
+        .map(|(id, role)| json!({ "id": id, "role": role }))
+        .collect::<Vec<_>>();
+    json!({
+        "delegation_id": delegation_id,
+        "handoff_dir": delegation_dir(delegation_id),
+        "subagents": subagents,
+    })
 }
 
 async fn load_delegation_for_parent(
@@ -1785,7 +1800,6 @@ pub(crate) fn is_delegation_tool_name(name: &str) -> bool {
         name,
         "delegate_writing_task"
             | "delegate_readonly_tasks"
-            | "inspect_delegation"
             | "cancel_delegation"
             | "steer_subagent"
             | "interrupt_subagent"
@@ -1858,7 +1872,6 @@ pub(crate) async fn run_delegation_tool_with_launch_key(
             start_readonly_fanout_core_with_launch_key(state, parent_session_id, launch_key, params)
                 .await
         }
-        "inspect_delegation" => status_core(state, parent_session_id, params).await,
         "cancel_delegation" => cancel_core(state, parent_session_id, params).await,
         "steer_subagent" => steer_subagent_core(state, parent_session_id, params).await,
         "interrupt_subagent" => interrupt_subagent_core(state, parent_session_id, params).await,
@@ -1932,7 +1945,6 @@ mod tests {
         for name in [
             "delegate_writing_task",
             "delegate_readonly_tasks",
-            "inspect_delegation",
             "cancel_delegation",
             "steer_subagent",
             "interrupt_subagent",

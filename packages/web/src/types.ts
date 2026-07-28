@@ -265,7 +265,6 @@ export interface ToolCall {
 }
 
 export interface DaemonToolObservation {
-	tool_call_id: string;
 	tool_name: string;
 	args_json: string;
 	result_json: unknown;

@@ -720,27 +720,8 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok((false, Vec::new()));
         }
-        let mut events =
+        let events =
             cancel_active_delegation_child_inputs_tx(&mut tx, delegation_id, reason).await?;
-        let input_ids = cancel_active_partial_delegation_wakeups_tx(
-            &mut tx,
-            parent_session_id,
-            delegation_id,
-            attempt_id,
-            reason,
-        )
-        .await?;
-        events.extend(
-            partial_wakeup_cancellation_events_tx(
-                &mut tx,
-                parent_session_id,
-                delegation_id,
-                attempt_id,
-                reason,
-                input_ids,
-            )
-            .await?,
-        );
         tx.commit().await?;
         Ok((true, events))
     }
@@ -812,64 +793,6 @@ impl PostgresAgentStore {
                 error.get("message")?.as_str()?.to_string(),
             ))
         }))
-    }
-
-    /// Whether a delegation has spawned the full subagent set promised by its
-    /// expected-count fence. Partial observations must respect this just like
-    /// final completion does: otherwise a very fast first child could wake the
-    /// parent with a snapshot that omits siblings that have not been inserted
-    /// yet.
-    pub async fn delegation_spawned_expected_subagents(&self, delegation_id: &str) -> Result<bool> {
-        let (spawned, expected): (i64, i32) = sqlx::query_as(
-            r#"
-            select
-                (select count(*) from sessions where delegation_id=$1) as spawned,
-                expected_subagents as expected
-            from delegations
-            where id=$1
-            "#,
-        )
-        .bind(delegation_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(spawned == i64::from(expected))
-    }
-
-    /// Cancel active daemon-authored partial wakeups for a delegation attempt.
-    ///
-    /// Partial wakeups are parent decision points. If the parent cancels the
-    /// delegation, or if final completion wins before the parent consumes an
-    /// older partial, any queued/consuming partial for the same attempt is stale
-    /// and must not be observed after terminal status. Already-consumed rows are
-    /// left alone because they have reached the transcript.
-    pub async fn cancel_queued_partial_delegation_wakeups(
-        &self,
-        parent_session_id: &str,
-        delegation_id: &str,
-        attempt_id: &str,
-        reason: &str,
-    ) -> Result<Vec<EventFrame>> {
-        let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, parent_session_id).await?;
-        let input_ids = cancel_active_partial_delegation_wakeups_tx(
-            &mut tx,
-            parent_session_id,
-            delegation_id,
-            attempt_id,
-            reason,
-        )
-        .await?;
-        let events = partial_wakeup_cancellation_events_tx(
-            &mut tx,
-            parent_session_id,
-            delegation_id,
-            attempt_id,
-            reason,
-            input_ids,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(events)
     }
 
     /// Claim the delegation barrier's terminal status transition.
@@ -1819,78 +1742,6 @@ impl PostgresAgentStore {
         Ok(SubagentBoundaryInterruptResult::Applied { interrupted })
     }
 
-    /// Enqueue a partial parent wakeup only if the delegation attempt is still
-    /// running and no other active partial wakeup for the same attempt is
-    /// already queued or being consumed.
-    ///
-    /// The active-partial check is inside the same transaction as the insert and
-    /// is protected by the parent session row lock plus the delegation row lock.
-    /// This is intentionally broader than idempotency for one child id: if two
-    /// terminal children race, exactly one queued/consuming partial decision
-    /// point may exist for `(parent_session_id, delegation_id, attempt_id)`.
-    pub async fn enqueue_partial_delegation_observation_if_running(
-        &self,
-        parent_session_id: &str,
-        delegation_id: &str,
-        attempt_id: &str,
-        observation: &DaemonToolObservation,
-        client_input_id: &str,
-    ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, parent_session_id).await?;
-        let status = sqlx::query_scalar::<_, String>(
-            r#"
-            select status
-            from delegations
-            where id=$1
-                and parent_session_id=$2
-                and attempt_id=$3
-            for update
-            "#,
-        )
-        .bind(delegation_id)
-        .bind(parent_session_id)
-        .bind(attempt_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if status.as_deref() != Some(DelegationStatus::Running.as_str()) {
-            tx.commit().await?;
-            return Ok(false);
-        }
-
-        let prefix = partial_delegation_wakeup_client_input_prefix(delegation_id, attempt_id);
-        let active_partial_exists: bool = sqlx::query_scalar(
-            r#"
-            select exists(
-                select 1
-                from queued_inputs
-                where session_id=$1
-                    and priority='steer'
-                    and status in ('queued', 'consuming')
-                    and left(client_input_id, char_length($2)) = $2
-            )
-            "#,
-        )
-        .bind(parent_session_id)
-        .bind(&prefix)
-        .fetch_one(&mut *tx)
-        .await?;
-        if active_partial_exists {
-            tx.commit().await?;
-            return Ok(false);
-        }
-
-        let inserted = enqueue_steer_content_tx(
-            &mut tx,
-            parent_session_id,
-            QueuedInputContent::daemon_tool_observation(observation.clone()),
-            client_input_id,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(inserted)
-    }
-
     /// Enqueue a typed daemon-authored observation that wakes the parent in the
     /// same way as a deterministic completion wakeup, without storing daemon
     /// facts as human/user message text.
@@ -2066,74 +1917,6 @@ impl PostgresAgentStore {
     }
 }
 
-async fn cancel_active_partial_delegation_wakeups_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    parent_session_id: &str,
-    delegation_id: &str,
-    attempt_id: &str,
-    reason: &str,
-) -> Result<Vec<String>> {
-    let prefix = partial_delegation_wakeup_client_input_prefix(delegation_id, attempt_id);
-    let input_ids = sqlx::query_scalar::<_, String>(
-        r#"
-        update queued_inputs
-        set status='cancelled',
-            follow_up_position=null,
-            updated_at=now(),
-            origin=coalesce(origin, '{}'::jsonb)
-                || jsonb_build_object(
-                    'cancelled_at', now()::text,
-                    'cancelled_reason', $3
-                )
-        where session_id=$1
-            and priority='steer'
-            and status in ('queued', 'consuming')
-            and content->>'type' = 'daemon_tool_observation'
-            and left(client_input_id, char_length($2)) = $2
-        returning id
-        "#,
-    )
-    .bind(parent_session_id)
-    .bind(&prefix)
-    .bind(reason)
-    .fetch_all(&mut **tx)
-    .await?;
-    Ok(input_ids)
-}
-
-async fn partial_wakeup_cancellation_events_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    parent_session_id: &str,
-    delegation_id: &str,
-    attempt_id: &str,
-    reason: &str,
-    input_ids: Vec<String>,
-) -> Result<Vec<EventFrame>> {
-    if input_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    bump_revisions_tx(tx, parent_session_id, true, false).await?;
-    let queue = queue_state_tx(tx, parent_session_id).await?;
-    let event = insert_event_tx(
-        tx,
-        parent_session_id,
-        EventType::InputCancelled,
-        queue_event_payload(
-            &queue,
-            json!({
-                "input_ids": input_ids,
-                "priority": InputPriority::Steer,
-                "status": QueuedInputStatus::Cancelled,
-                "reason": reason,
-                "delegation_id": delegation_id,
-                "attempt_id": attempt_id,
-            }),
-        ),
-    )
-    .await?;
-    Ok(vec![event])
-}
-
 async fn enqueue_steer_content_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     parent_session_id: &str,
@@ -2189,10 +1972,6 @@ async fn enqueue_steer_content_tx(
     )
     .await?;
     Ok(true)
-}
-
-fn partial_delegation_wakeup_client_input_prefix(delegation_id: &str, attempt_id: &str) -> String {
-    format!("delegation-steer:{delegation_id}:{attempt_id}:")
 }
 
 fn row_to_delegation(row: &sqlx::postgres::PgRow) -> Result<Delegation> {

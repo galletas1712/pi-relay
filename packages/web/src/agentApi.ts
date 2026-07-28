@@ -58,8 +58,8 @@ export interface AgentApi {
 	deleteProject(projectId: string): Promise<DeleteProjectResult>;
 	listSessions(limit?: number, projectId?: string | null): Promise<SessionSummary[]>;
 	listDelegations(parentSessionId: string, limit?: number): Promise<DelegationListResult>;
-	startFullDelegation(params: StartFullDelegationParams): Promise<StartFullDelegationResult>;
-	startReadonlyDelegationFanout(params: StartReadonlyDelegationFanoutParams): Promise<StartReadonlyDelegationFanoutResult>;
+	startFullDelegation(params: StartFullDelegationParams): Promise<DelegationLaunchResult>;
+	startReadonlyDelegationFanout(params: StartReadonlyDelegationFanoutParams): Promise<DelegationLaunchResult>;
 	cancelDelegation(parentSessionId: string, delegationId: string): Promise<{ cancelled: boolean }>;
 	readHandoffFile(params: ReadHandoffFileParams): Promise<ReadHandoffFileResult>;
 	steerSubagent(params: SteerSubagentParams): Promise<SteerSubagentResult>;
@@ -198,9 +198,10 @@ export interface StartFullDelegationParams {
 	label?: string | null;
 }
 
-export interface StartFullDelegationResult {
+export interface DelegationLaunchResult {
 	delegation_id: string;
-	subagent_session_id: string;
+	handoff_dir: string;
+	subagents: { id: string; role: string }[];
 }
 
 export interface StartReadonlyDelegationFanoutParams {
@@ -209,11 +210,6 @@ export interface StartReadonlyDelegationFanoutParams {
 	tasks: { role: string; prompt: string }[];
 	workflow?: string | null;
 	label?: string | null;
-}
-
-export interface StartReadonlyDelegationFanoutResult {
-	delegation_id: string;
-	subagent_session_ids: string[];
 }
 
 export interface ReadHandoffFileParams {
@@ -512,8 +508,8 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	startFullDelegation(params: StartFullDelegationParams): Promise<StartFullDelegationResult> {
-		return this.client.request<StartFullDelegationResult>("delegation.start_full", {
+	startFullDelegation(params: StartFullDelegationParams): Promise<DelegationLaunchResult> {
+		return this.client.request<DelegationLaunchResult>("delegation.start_full", {
 			parent_session_id: params.parentSessionId,
 			client_launch_id: params.clientLaunchId,
 			role: params.role,
@@ -523,8 +519,8 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	startReadonlyDelegationFanout(params: StartReadonlyDelegationFanoutParams): Promise<StartReadonlyDelegationFanoutResult> {
-		return this.client.request<StartReadonlyDelegationFanoutResult>("delegation.start_readonly_fanout", {
+	startReadonlyDelegationFanout(params: StartReadonlyDelegationFanoutParams): Promise<DelegationLaunchResult> {
+		return this.client.request<DelegationLaunchResult>("delegation.start_readonly_fanout", {
 			parent_session_id: params.parentSessionId,
 			client_launch_id: params.clientLaunchId,
 			tasks: params.tasks,

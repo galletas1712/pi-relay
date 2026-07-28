@@ -48,8 +48,8 @@ subagents.rs       delegation subagent spawn core: role resolution, full vs
                    read-only workspace handling, role-local model selection,
                    child prompt + lifecycle events
 delegation_tools.rs     delegation tool surface (delegate_writing_task /
-                   delegate_readonly_tasks / inspect_delegation /
-                   cancel_delegation / steer_subagent / interrupt_subagent)
+                   delegate_readonly_tasks / cancel_delegation /
+                   steer_subagent / interrupt_subagent)
                    plus delegation.* web RPCs
                    (start_full / start_readonly_fanout / status / cancel /
                    steer_subagent / list) + kind-aware bounded admission
@@ -75,21 +75,25 @@ definitions (`$XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml`) and OAuth credentials
 live on each runtime host (see `agent-runtime`), not in the control plane.
 
 Subagent work runs as **delegations** (`delegate_writing_task` /
-`delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation` /
-`steer_subagent` / `interrupt_subagent`). Full subagents
+`delegate_readonly_tasks` / `cancel_delegation` / `steer_subagent` /
+`interrupt_subagent`). Full subagents
 reuse the parent's workspace dirs in place; read-only subagents get a forked
 snapshot destroyed on return. Delegation subagents may emit
-`subagent.spawned`/`subagent.running` progress events; their terminal hook fires
-a single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
-terminal. After the DB finish CAS wins, the runner writes the handoff directory
+`subagent.spawned`/`subagent.running` progress events; an individual child
+reaching terminal produces no parent-visible wakeup. Their terminal hook fires a
+single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
+terminal, so the parent is woken exactly once, at delegation terminal status.
+After the DB finish CAS wins, the runner writes the handoff directory
 and then enqueues one `InputPriority::Steer` daemon observation to the parent.
-That observation includes the same structured snapshot shape as
-`inspect_delegation`, with `outcome` and compact handoff file
-references.
-Completion is that typed wakeup observation/handoff, not a parent-visible per-child idle event. The
-runner never decides the next delegation — the parent does, guided by workflow
-skills. Cancellation is terminal and exports transcript-only files for the
-cancelled subagents instead of running the normal completion handoff.
+That observation carries the full delegation snapshot, with `outcome` and
+compact handoff file references. The launch tools return the delegation id, its
+`handoff_dir`, and each subagent's id and role, so the parent can locate
+artifacts and address children without a follow-up call.
+Completion is that typed wakeup observation/handoff, not a parent-visible
+per-child idle event. The runner never decides the next delegation — the parent
+does, guided by workflow skills. Cancellation is terminal and exports
+transcript-only files for the cancelled subagents instead of running the normal
+completion handoff.
 
 Interrupting child controls are durable and generation-fenced. The captured
 generation is the active turn plus its complete deterministic unfinished
@@ -107,11 +111,11 @@ duplicate waiters.
 Delegation completion wakeups are rendered as provider-neutral daemon
 observations. The durable transcript entry is a typed
 `daemon_tool_observation`, not an ordinary user message and not a fake assistant
-tool choice. It records the daemon-authored `inspect_delegation` observation
-with a stable local tool-call id, arguments, status, concise summary, and bounded
-snapshot JSON. Provider adapters render this typed item as one plain user-role
-message carrying the daemon-authored observation text; the UI
-renders it as a daemon/system observation card.
+tool choice. It records the daemon-authored `delegation_status` observation
+with arguments, status, concise summary, and bounded snapshot JSON. Provider
+adapters render this typed item as one plain user-role message carrying the
+daemon-authored observation text; the UI renders it as a daemon/system
+observation card.
 
 The snapshot never inlines full transcript bodies or raw subagent task prompts.
 Task prompts are materialized as per-subagent `task_prompt.md` handoff files,
@@ -119,9 +123,9 @@ final messages are exposed through `final_message.md` file references, and
 `outcome` stays inline because workflows branch on it.
 
 Normal top-level parent model requests do not receive a daemon-generated
-delegation dashboard. They are transcript-driven: durable delegate tool results
-and typed wakeup observations already live in history, so the provider input stays as stable
-PI/system prompt plus transcript history.
+delegation dashboard. They are transcript-driven: durable delegate tool results and
+typed wakeup observations already live in history, so the provider input stays
+as stable PI/system prompt plus transcript history.
 
 Compaction is the special case, but the live ledger is not a provider input. For
 top-level parent sessions, the provider compacts only transcript/model history
@@ -130,13 +134,14 @@ text). After the provider returns, the daemon appends a fresh
 `## Delegation state at compaction time` section to the stored compaction
 summary. The ledger lists every delegation row for that parent session across
 all statuses (`running`, `cancelling`, `done`, `done_with_failures`,
-`cancelled`, `failed`),
-with bounded subagent/progress details, `outcome` control data when
-available, and artifact paths. It does not refresh artifacts or inline
-transcript or final-message bodies. A `running` entry is a point-in-time compaction fact, not a
-final outcome; later completion observations or `inspect_delegation` provide fresh
-state. If older ledger text remains in prior summaries, the newly appended
-ledger supersedes it by being the latest section. Subagent compactions do not
+`cancelled`, `failed`), with bounded subagent/progress details, `outcome`
+control data when available, and artifact paths. It does not refresh artifacts
+or inline transcript or final-message bodies. A `running` entry is a
+point-in-time compaction fact, not a final outcome; later completion
+observations provide fresh state, and the ledger's `handoff_dir` and
+per-subagent file references can be read directly with ordinary file tools. If
+older ledger text remains in prior summaries, the newly appended ledger
+supersedes it by being the latest section. Subagent compactions do not
 receive or append the parent ledger, sibling subagent state, or `## Current
 delegations` information; subagents summarize only their own role contract,
 delegated task, transcript/model history, and tool results/facts.

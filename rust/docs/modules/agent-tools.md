@@ -71,7 +71,6 @@ semantics justify it.
 | `LoadSkill`  | `LoadSkill` (JSON function)               | `LoadSkill` (JSON client tool)                  | `skill_loader`     | runtime-handled (no registry executor) |
 | `delegate_writing_task` | `delegate_writing_task` (JSON function) | `delegate_writing_task` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 | `delegate_readonly_tasks` | `delegate_readonly_tasks` (JSON function) | `delegate_readonly_tasks` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
-| `inspect_delegation` | `inspect_delegation` (JSON function) | `inspect_delegation` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 | `cancel_delegation` | `cancel_delegation` (JSON function) | `cancel_delegation` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 | `steer_subagent` | `steer_subagent` (JSON function) | `steer_subagent` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 | `interrupt_subagent` | `interrupt_subagent` (JSON function) | `interrupt_subagent` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
@@ -148,17 +147,17 @@ intercepts it and resolves the current runtime catalog.
 
 ### delegation tools
 
-`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`,
-`cancel_delegation`, `steer_subagent`, and `interrupt_subagent` are
+`delegate_writing_task`, `delegate_readonly_tasks`, `cancel_delegation`,
+`steer_subagent`, and `interrupt_subagent` are
 provider-visible JSON tools registered by
 `FirstPartyToolExtension`, but they have no registry executor. The daemon
 runtime intercepts them and dispatches to the delegation engine in
 `delegation_tools.rs`.
 `delegate_writing_task` launches the single full/writing delegation subagent;
 `delegate_readonly_tasks` launches a homogeneous fan-out of read-only
-subagents; `inspect_delegation` returns the canonical structured state/outcome
-snapshot (with task/final/transcript artifact paths, not inline full prompts or
-transcripts);
+subagents. Both return the delegation id, its `handoff_dir`, and each
+subagent's id and role, which is everything a parent needs to address children
+and read artifacts; there is no delegation-inspection tool.
 `cancel_delegation` cancels an existing whole delegation; `steer_subagent`
 queues an additional instruction to one running subagent without interruption
 by default. With `interrupt: true`, its durable control row blocks the child
@@ -174,8 +173,8 @@ dispatching it as a steer. Read-only
 subagents have disposable
 workspaces, not immutable conversations. Delegation subagents may produce
 `subagent.spawned`/`subagent.running` progress events, but delegation completion
-arrives later as a daemon-authored parent observation containing an
-`inspect_delegation`-equivalent snapshot plus artifact paths, not as a per-child
+arrives later as a daemon-authored parent observation containing the delegation
+snapshot plus artifact paths, not as a per-child
 idle event. Provider adapters render that typed observation as one plain
 user-role message carrying the daemon-authored observation text, so no assistant
 tool call is manufactured on the wire.

@@ -184,7 +184,6 @@ fn tool_allowed_for_profile(tool: &ProviderTool, profile: PromptProfile) -> bool
         tool.canonical_name.as_str(),
         "delegate_writing_task"
             | "delegate_readonly_tasks"
-            | "inspect_delegation"
             | "cancel_delegation"
             | "steer_subagent"
             | "interrupt_subagent"
@@ -488,7 +487,6 @@ repo rules"
         assert_eq!(parent_spec_names, parent_provider_names);
         assert!(parent_spec_names.contains(&"delegate_writing_task".to_string()));
         assert!(parent_spec_names.contains(&"delegate_readonly_tasks".to_string()));
-        assert!(parent_spec_names.contains(&"inspect_delegation".to_string()));
         assert!(parent_spec_names.contains(&"cancel_delegation".to_string()));
         assert!(parent_spec_names.contains(&"steer_subagent".to_string()));
         assert!(parent_spec_names.contains(&"interrupt_subagent".to_string()));
@@ -507,7 +505,6 @@ repo rules"
         assert!(subagent_spec_names.contains(&"LoadSkill".to_string()));
         assert!(!subagent_spec_names.contains(&"delegate_writing_task".to_string()));
         assert!(!subagent_spec_names.contains(&"delegate_readonly_tasks".to_string()));
-        assert!(!subagent_spec_names.contains(&"inspect_delegation".to_string()));
         assert!(!subagent_spec_names.contains(&"cancel_delegation".to_string()));
         assert!(!subagent_spec_names.contains(&"steer_subagent".to_string()));
         assert!(!subagent_spec_names.contains(&"interrupt_subagent".to_string()));

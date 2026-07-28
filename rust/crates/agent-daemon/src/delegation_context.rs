@@ -20,10 +20,10 @@ const MAX_OUTCOME_CHARS: usize = 120;
 /// and tool results. Parent sessions own orchestration state, and nested
 /// delegations are currently rejected.
 ///
-/// This is intentionally much lighter than `inspect_delegation`: it uses
-/// bounded DB reads plus existing artifact path conventions and never refreshes
-/// or inlines transcript artifacts. The parent can call `inspect_delegation`
-/// after compaction for fresh structured state and artifact publication.
+/// The ledger uses bounded DB reads plus existing artifact path conventions and
+/// never refreshes or inlines transcript artifacts. It carries each delegation's
+/// `handoff_dir` and per-subagent file references, so a parent that needs detail
+/// reads those files with ordinary file tools.
 pub(crate) async fn compaction_delegation_ledger(
     state: &AppState,
     session_id: &str,
@@ -96,7 +96,7 @@ fn ledger_header() -> String {
         "Point-in-time compaction ledger for this parent session. It lists every delegation row for the parent session, including running, done, done_with_failures, cancelled, and failed statuses. Per-subagent control-flow details and artifact file references are bounded. Full transcript and final-message contents are not inlined.\n\n",
     );
     out.push_str(
-        "This section is appended after provider compaction so fresh delegation facts cross the compaction boundary. Distinguish delegations that completed, were cancelled, or failed before compaction from delegations that were still running at compaction time. A running delegation entry is only a point-in-time fact: do not assume it completed; wait for a later completion observation or call `inspect_delegation`.\n",
+        "This section is appended after provider compaction so fresh delegation facts cross the compaction boundary. Distinguish delegations that completed, were cancelled, or failed before compaction from delegations that were still running at compaction time. A running delegation entry is only a point-in-time fact: do not assume it completed; wait for a later completion observation. Read the referenced handoff files with ordinary file tools when you need detail.\n",
     );
     out
 }
@@ -110,7 +110,7 @@ fn empty_compaction_delegation_ledger() -> String {
 fn append_compaction_status_note(out: &mut String, status: DelegationStatus) {
     let note = match status {
         DelegationStatus::Running => {
-            "running at compaction time; point-in-time only; await later completion observation or inspect_delegation"
+            "running at compaction time; point-in-time only; await a later completion observation"
         }
         DelegationStatus::Cancelling => "cancelling at compaction time; teardown is still active",
         DelegationStatus::Done => "completed before compaction",
@@ -181,10 +181,7 @@ async fn append_subagents(
         .saturating_sub(shown)
         .max(subagents.len().saturating_sub(shown));
     if omitted > 0 {
-        out.push_str(&format!(
-            "  - ... {} more subagent(s) omitted from compaction ledger; call `inspect_delegation`.\n",
-            omitted
-        ));
+        out.push_str(&omitted_subagents_line(delegation.status, omitted));
     }
     Ok(())
 }
@@ -221,6 +218,19 @@ fn transcript_file_for(status: DelegationStatus, subagent_id: &str) -> Option<St
         DelegationStatus::Failed => None,
         _ => Some(format!("{subagent_id}/transcript.md")),
     }
+}
+
+/// The overflow line for subagents the ledger could not show. Pointing the
+/// parent at `handoff_dir` only helps when that directory actually holds a
+/// current file per subagent: `Cancelling` and `Failed` publish nothing at all
+/// (see `refresh_delegation_handoff_artifacts`), so it holds at best whatever a
+/// prior `Running` refresh left behind, and often nothing.
+fn omitted_subagents_line(status: DelegationStatus, omitted: usize) -> String {
+    let hint = match status {
+        DelegationStatus::Cancelling | DelegationStatus::Failed => "",
+        _ => "; list handoff_dir to see them all",
+    };
+    format!("  - ... {omitted} more subagent(s) omitted from compaction ledger{hint}.\n")
 }
 
 fn final_message_relevant(status: DelegationStatus) -> bool {
@@ -352,10 +362,7 @@ pub(crate) fn test_ledger_from_snapshots(
             .saturating_sub(shown)
             .max(subagents.len().saturating_sub(shown));
         if omitted > 0 {
-            out.push_str(&format!(
-                "  - ... {} more subagent(s) omitted from compaction ledger; call `inspect_delegation`.\n",
-                omitted
-            ));
+            out.push_str(&omitted_subagents_line(delegation.status, omitted));
         }
     }
     Ok(out.trim_end().to_string())
