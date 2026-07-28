@@ -100,10 +100,7 @@ import { formatWorkspacePreparationStatus } from "./workspaceMaterializeProgress
 import { findCommand, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
 import { stopSession } from "./stopSession.ts";
-import {
-	SystemPromptDialog,
-	type SystemPromptDialogState,
-} from "./systemPromptDialog.tsx";
+import { SystemPromptDisclosure } from "./systemPromptDisclosure.tsx";
 import {
 	mergeSnapshotIntoSessionList,
 	patchSessionListEventSummary,
@@ -416,7 +413,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const [renameValue, setRenameValue] = useState("");
 	const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
 	const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
-	const [promptDialog, setPromptDialog] = useState<SystemPromptDialogState | null>(null);
 	const [mcpLoginDialog, setMcpLoginDialog] = useState<{
 		server: string;
 		login: McpLoginResult;
@@ -3710,6 +3706,25 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		[api, hasRunningDelegations],
 	);
 
+	const loadSystemPrompt = useCallback(async (sessionId: string) => {
+		if (
+			selectedRef.current !== sessionId ||
+			selectedCacheRef.current.snapshot?.session_id !== sessionId
+		) {
+			throw new Error("system prompt requires a selected session");
+		}
+		assertServerReadAllowed();
+		const prompt = await queryClient.fetchQuery({
+			queryKey: queryKeys.systemPrompt(sessionId),
+			queryFn: () => {
+				assertServerReadAllowed();
+				return api.getSystemPrompt(sessionId);
+			},
+			staleTime: 0,
+		});
+		return prompt.rendered;
+	}, [api, assertServerReadAllowed, queryClient, selectedCacheRef]);
+
 	const executeSlash = useCallback(
 		async (
 			parsed: ParsedSlash,
@@ -3717,7 +3732,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			submittedSnapshot: SessionSnapshot | null,
 		) => {
 			const name = parsed.name;
-			const args = parsed.args;
 			if (!name || name === "help") {
 				composerHandleRef.current?.setValue("/");
 				requestAnimationFrame(() => composerHandleRef.current?.focus());
@@ -3725,42 +3739,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			if (!findCommand(name)) {
 				throw new Error(`unknown command: /${name}`);
-			}
-			if (name === "system") {
-				if (args) {
-					throw new Error("/system is read-only; edit PI.md in the repo to change the prompt");
-				}
-				if (!submittedSessionId || submittedSnapshot?.session_id !== submittedSessionId) {
-					throw new Error("/system requires a selected session");
-				}
-				assertServerReadAllowed();
-				setPromptDialog({ loading: true, template: "", rendered: null, view: "rendered", error: null });
-				try {
-					const next = await queryClient.fetchQuery({
-						queryKey: queryKeys.systemPrompt(submittedSessionId),
-						queryFn: () => {
-							assertServerReadAllowed();
-							return api.getSystemPrompt(submittedSessionId);
-						},
-						staleTime: 0,
-					});
-					setPromptDialog((current) => current ? {
-						loading: false,
-						template: next.template,
-						rendered: next.rendered,
-						view: next.rendered ? "rendered" : "template",
-						error: null,
-					} : current);
-				} catch (error) {
-					setPromptDialog((current) => current ? {
-						loading: false,
-						template: "",
-						rendered: null,
-						view: "template",
-						error: errorMessage(error),
-					} : current);
-				}
-				return;
 			}
 
 			if (!submittedSessionId || submittedSnapshot?.session_id !== submittedSessionId) {
@@ -3804,7 +3782,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[api, assertConnectionReadAllowed, assertServerMutationAllowed, assertServerReadAllowed, commitSelectedSnapshot, openHistoryDialog, queryClient],
+		[api, assertConnectionReadAllowed, assertServerMutationAllowed, assertServerReadAllowed, commitSelectedSnapshot, openHistoryDialog],
 	);
 
 	const submitComposer = useCallback(
@@ -4343,6 +4321,17 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						onResumeTurn={handleResumeTurn}
 						onExpandTurn={expandTurn}
 						onCollapseTurn={collapseTurn}
+						transcriptStartContent={
+							loadedSnapshot?.session_id === selectedId
+								? (
+										<SystemPromptDisclosure
+											key={selectedId}
+											loadPrompt={() => loadSystemPrompt(selectedId)}
+											remoteReadBlockedReason={connectionRemoteActionBlockedReason}
+										/>
+									)
+								: undefined
+						}
 						loadingTurnId={loadingTurnId ?? autoLoadingTurnId}
 						hasOlderTurns={selectedCache.sessionId === selectedId && selectedCache.turnHasMoreBefore}
 						loadingOlderTurns={loadingOlderTurns}
@@ -4566,15 +4555,6 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						});
 					}}
 					mutationBlockedReason={connectionRemoteActionBlockedReason}
-				/>
-			) : null}
-
-			{promptDialog ? (
-				<SystemPromptDialog
-					state={promptDialog}
-					onChangeView={(view) => setPromptDialog((current) => (current ? { ...current, view } : current))}
-					onClose={() => setPromptDialog(null)}
-					returnFocusFallbackRef={composerDialogReturnFocusRef}
 				/>
 			) : null}
 

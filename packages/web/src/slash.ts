@@ -14,7 +14,6 @@ export const COMMANDS: SlashCommandInfo[] = [
 	{ name: "fork", description: "Fork this session at a historical boundary." },
 	{ name: "switch", description: "Switch branches or edit a historical message." },
 	{ name: "compact", description: "Request context compaction." },
-	{ name: "system", description: "Show PI.md prompt template." },
 	{ name: "export", description: "Export assistant messages from the current branch." }
 ];
 

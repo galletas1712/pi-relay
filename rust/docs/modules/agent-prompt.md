@@ -152,7 +152,7 @@ compaction call:
 The prompt is rendered exactly once, at `session.start`, after project
 workspaces are materialized (so AGENTS.md and skills are present on disk). The
 rendered string is persisted in `SessionConfig.system_prompt` and is the
-session's immutable global prompt. The `/system` RPC (`system.prompt`) returns
+session's immutable global prompt. The `system.prompt` RPC returns
 that persisted prompt together with the current repository `PI.md` template; it
 does not regenerate or mutate the session prompt.
 

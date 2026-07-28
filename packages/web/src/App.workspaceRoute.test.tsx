@@ -71,6 +71,110 @@ afterEach(() => {
 });
 
 describe("App workspace route identity integration", () => {
+	it("expands only the rendered system prompt inline before the first user message, then hides it", async () => {
+		const api = createRouteApi();
+		vi.mocked(api.getSystemPrompt).mockResolvedValue({
+			template: "Template source",
+			rendered: "Rendered **persisted prompt**",
+		});
+		const mounted = renderRouteApp(
+			api,
+			new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1"),
+		);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+
+		expect(api.getSystemPrompt).toHaveBeenCalledWith("root-1");
+		const prompt = await screen.findByText("persisted prompt");
+		const transcript = screen.getByRole("region", { name: "Conversation transcript" });
+		expect(transcript.contains(prompt)).toBe(true);
+		expect(prompt.closest(".transcript-system-prompt")).toBeTruthy();
+		expect(screen.queryByRole("dialog")).toBeNull();
+		expect(screen.queryByText("Template source")).toBeNull();
+
+		await user.click(screen.getByRole("button", { name: "Hide system prompt" }));
+		expect(screen.queryByText("persisted prompt")).toBeNull();
+		expect(screen.getByRole("button", { name: "See system prompt" })).toBeTruthy();
+
+		await mounted.dispose();
+	});
+
+	it("removes a pending inline prompt on navigation and ignores its late response in the next session", async () => {
+		const first = deferred<{ template: string; rendered: string | null }>();
+		const second = deferred<{ template: string; rendered: string | null }>();
+		const api = createRouteApi();
+		vi.mocked(api.getSystemPrompt).mockImplementation((sessionId) =>
+			sessionId === "root-1" ? first.promise : second.promise);
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+		expect(screen.getByText("Loading system prompt…")).toBeTruthy();
+
+		await act(async () =>
+			browser.navigate("/w/host/run/legacy-root/conversation/legacy-root"),
+		);
+		await waitFor(() => expect(screen.queryByText("Loading system prompt…")).toBeNull());
+		await waitFor(() =>
+			expect(document.querySelector(".log-session")?.textContent).toBe("Legacy root"),
+		);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+		await act(async () => second.resolve({
+			template: "Second template",
+			rendered: "Second rendered prompt",
+		}));
+		expect(await screen.findByText("Second rendered prompt")).toBeTruthy();
+
+		await act(async () => first.resolve({
+			template: "Stale template",
+			rendered: "Stale rendered prompt",
+		}));
+		expect(screen.getByText("Second rendered prompt")).toBeTruthy();
+		expect(screen.queryByText("Stale rendered prompt")).toBeNull();
+		expect(screen.queryByText("Second template")).toBeNull();
+		expect(screen.queryByText("Stale template")).toBeNull();
+		expect(screen.queryByRole("dialog")).toBeNull();
+
+		await mounted.dispose();
+	});
+
+	it("ignores a stale prompt error while the next session prompt is pending", async () => {
+		const first = deferred<{ template: string; rendered: string | null }>();
+		const second = deferred<{ template: string; rendered: string | null }>();
+		const api = createRouteApi();
+		vi.mocked(api.getSystemPrompt).mockImplementation((sessionId) =>
+			sessionId === "root-1" ? first.promise : second.promise);
+		const browser = new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1");
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+		await act(async () =>
+			browser.navigate("/w/host/run/legacy-root/conversation/legacy-root"),
+		);
+		await waitFor(() =>
+			expect(document.querySelector(".log-session")?.textContent).toBe("Legacy root"),
+		);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+
+		await act(async () => first.reject(new Error("stale prompt failed")));
+		expect(screen.getByText("Loading system prompt…")).toBeTruthy();
+		expect(screen.queryByText("stale prompt failed")).toBeNull();
+
+		await act(async () => second.resolve({
+			template: "Current template",
+			rendered: "Current rendered prompt",
+		}));
+		expect(await screen.findByText("Current rendered prompt")).toBeTruthy();
+
+		await mounted.dispose();
+	});
+
 	it("shows workspace and MCP setup in the central pane and keeps both controls functional", async () => {
 		const api = createRouteApi();
 		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));

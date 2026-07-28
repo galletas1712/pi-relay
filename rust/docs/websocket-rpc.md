@@ -2195,13 +2195,15 @@ Verify:
 - Initial subscribe with `after_event_id: null` does not replay historical
   events; it only attaches to future live events.
 
-### 2. PI.md Prompt Preview
+### 2. Persisted System Prompt
 
 1. Call `system.prompt` with a real `session_id`.
 2. Verify the response contains the repo-level `PI.md` template and a rendered
    prompt for the requested session.
-3. In the web UI, type `/system` and verify the same prompt preview is displayed
-   read-only.
+3. In the web UI, select **See system prompt** at the transcript start and
+   verify the rendered prompt expands inline before the first user message.
+   Verify the source template is not displayed and **Hide system prompt**
+   collapses the rendered prompt.
 
 
 ### 3. Image Input Persistence
