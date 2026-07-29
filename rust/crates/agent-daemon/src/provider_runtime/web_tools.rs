@@ -204,10 +204,7 @@ fn build_web_sidecar_request(
             ))],
             tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![tool],
-            max_tokens: match config.provider.kind {
-                ProviderKind::OpenAi => None,
-                ProviderKind::Claude => config.provider.max_tokens,
-            },
+            max_tokens: config.provider.max_tokens,
             reasoning_effort: config.provider.reasoning_effort,
             prompt_cache_key: None,
             session_id: None,
@@ -493,23 +490,6 @@ mod tests {
         let second = web_sidecar_session_id("session", "call_b");
 
         assert_ne!(first, second);
-    }
-
-    #[test]
-    fn openai_web_sidecars_use_provider_default_generation_limit() {
-        let call = test_web_search_call();
-
-        for max_tokens in [None, Some(4_096)] {
-            let request = build_web_sidecar_request(
-                &test_session_config(ProviderKind::OpenAi, max_tokens),
-                "session",
-                &call,
-                openai_web_search_tool(),
-                "rust".to_string(),
-            );
-
-            assert_eq!(request.request.max_tokens, None);
-        }
     }
 
     #[test]

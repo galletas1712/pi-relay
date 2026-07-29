@@ -2,6 +2,20 @@
 
 ## 2026-07-27
 
+### `max_tokens` Is Anthropic-Only Everywhere It Is Described
+
+- The daemon-config example in `rust/README.md` still set `max_tokens` on an
+  `openai` provider, which is now silently discarded; dropped it and said which
+  providers the field applies to, in both the daemon-config and role-frontmatter
+  sections. Role frontmatter still accepts and validates it — a hard error would
+  break existing role skills for no gain — so the note is the whole fix.
+- The web sidecar dropped `max_tokens` for `ProviderKind::OpenAi` itself. The
+  adapter can no longer send the field at all, so a second kind-switched
+  enforcement point is a place for the two to drift; deleted it and its test.
+- `provider-api-support.md`'s maximum-output row asserts a live observation, so
+  its evidence tag now says so, and `session_titles.rs` no longer says the
+  backend rejects the parameter "for some models".
+
 ### Stopped Sending `max_output_tokens` To The Codex Backend
 
 - `POST https://chatgpt.com/backend-api/codex/responses` answers
