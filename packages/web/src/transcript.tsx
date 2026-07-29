@@ -101,6 +101,14 @@ function bottomScrollTop(node: ScrollMetrics): number {
 	return Math.max(0, node.scrollHeight - node.clientHeight);
 }
 
+function snapshotScrollMetrics(node: ScrollMetrics): ScrollMetrics {
+	return {
+		clientHeight: node.clientHeight,
+		scrollHeight: node.scrollHeight,
+		scrollTop: node.scrollTop,
+	};
+}
+
 export function adjacentTurnJumpTargetId(
 	targets: readonly TurnJumpTargetPosition[],
 	scrollTop: number,
@@ -280,6 +288,7 @@ export const MessageList = memo(function MessageList({
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const contentRef = useRef<HTMLDivElement | null>(null);
 	const shouldStickToBottomRef = useRef(true);
+	const lastScrollMetricsRef = useRef<ScrollMetrics | null>(null);
 	const activeScrollIdentityRef = useRef<ActiveTranscriptScrollIdentity>({
 		sessionKey: null,
 		leafId: null,
@@ -310,6 +319,7 @@ export const MessageList = memo(function MessageList({
 		if (!node) return;
 		node.scrollTop = bottomScrollTop(node);
 		shouldStickToBottomRef.current = true;
+		lastScrollMetricsRef.current = snapshotScrollMetrics(node);
 	}, []);
 
 	const clearPointerScrollbarIntent = useCallback((expected?: PointerScrollbarIntent) => {
@@ -419,6 +429,7 @@ export const MessageList = memo(function MessageList({
 		const targetRect = target.getBoundingClientRect();
 		scroller.scrollTop = Math.max(0, scroller.scrollTop + targetRect.top - scrollerRect.top);
 		shouldStickToBottomRef.current = false;
+		lastScrollMetricsRef.current = snapshotScrollMetrics(scroller);
 		cancelOlderTurnsPreservation();
 	}, [cancelOlderTurnsPreservation]);
 
@@ -438,7 +449,16 @@ export const MessageList = memo(function MessageList({
 		) {
 			finishPointerScrollbarIntent(pointerIntent);
 		}
-		shouldStickToBottomRef.current = isScrolledAtBottom(event.currentTarget);
+		const currentMetrics = snapshotScrollMetrics(event.currentTarget);
+		const previousMetrics = lastScrollMetricsRef.current;
+		const layoutChangedWhilePinned =
+			previousMetrics !== null &&
+			Math.abs(currentMetrics.scrollTop - previousMetrics.scrollTop) <= STICKY_BOTTOM_EPSILON_PX &&
+			(previousMetrics.clientHeight !== currentMetrics.clientHeight ||
+				previousMetrics.scrollHeight !== currentMetrics.scrollHeight) &&
+			isScrolledAtBottom(previousMetrics);
+		shouldStickToBottomRef.current = layoutChangedWhilePinned || isScrolledAtBottom(currentMetrics);
+		lastScrollMetricsRef.current = currentMetrics;
 	}, [finishPointerScrollbarIntent]);
 
 	const handleScrollKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {

@@ -3319,7 +3319,8 @@ pre {
 	color: var(--foreground);
 	outline: 0;
 	padding: 11px 12px;
-	font-size: var(--text-lg);
+	/* iOS Safari zooms focused text controls below 16px. */
+	font-size: var(--text-xl);
 	line-height: 1.45;
 	overflow-y: hidden;
 }
