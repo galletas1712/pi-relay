@@ -69,6 +69,10 @@ import {
 	type PanelMode,
 } from "./panelLayout.ts";
 import {
+	PanelGestureController,
+	type PanelGestureAction,
+} from "./panelGesture.ts";
+import {
 	initialRouteResult,
 	projectMismatchUnavailable,
 	routeConversationSessionId,
@@ -459,6 +463,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const mobileSidebarToggleRef = useRef<HTMLButtonElement | null>(null);
 	const sidebarNewSessionButtonRef = useRef<HTMLButtonElement | null>(null);
 	const sidebarWidthRef = useRef(sidebarWidth);
+	const panelGestureRef = useRef<PanelGestureController | null>(null);
+	if (!panelGestureRef.current) panelGestureRef.current = new PanelGestureController();
+	const panelOpenStateRef = useRef({ sidebarOpen, rightOpen });
+	panelOpenStateRef.current = { sidebarOpen, rightOpen };
 	const sidebarResizeRef = useRef<{
 		pointerId: number;
 		startX: number;
@@ -3926,6 +3934,59 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const handleToggleSidebar = useCallback(() => {
 		setSidebarOpen((open) => !open);
 	}, []);
+	const handlePanelGestureAction = useCallback((action: PanelGestureAction) => {
+		switch (action) {
+			case "open-sidebar":
+				setSidebarOpen(true);
+				break;
+			case "open-inspector":
+				setRightOpen(true);
+				break;
+			case "close-sidebar":
+				setSidebarOpen(false);
+				break;
+			case "close-inspector":
+				setRightOpen(false);
+				break;
+		}
+	}, []);
+	const handlePanelGesturePointerDown = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			if (!panelGestureRef.current?.start(event, panelModeRef.current)) return;
+			try {
+				event.currentTarget.setPointerCapture(event.pointerId);
+			} catch {
+				panelGestureRef.current?.cancel(event.pointerId);
+			}
+		},
+		[],
+	);
+	const handlePanelGesturePointerMove = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			if (panelGestureRef.current?.move(event).preventDefault) event.preventDefault();
+		},
+		[],
+	);
+	const handlePanelGesturePointerEnd = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			const action = panelGestureRef.current?.end(
+				event,
+				panelModeRef.current,
+				panelOpenStateRef.current,
+			);
+			if (action) handlePanelGestureAction(action);
+			if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+				event.currentTarget.releasePointerCapture(event.pointerId);
+			}
+		},
+		[handlePanelGestureAction],
+	);
+	const handlePanelGestureCancel = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			panelGestureRef.current?.cancel(event.pointerId);
+		},
+		[],
+	);
 	const handleCloseDrawers = useCallback(() => {
 		if (panelModeRef.current !== "wide") setSidebarOpen(false);
 		if (panelModeRef.current === "compact") setRightOpen(false);
@@ -3963,6 +4024,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		const syncPanelsToViewport = () => {
 			const nextMode = panelModeForViewport();
 			if (nextMode === panelModeRef.current) return;
+			panelGestureRef.current?.reset();
 			panelModeRef.current = nextMode;
 			setPanelMode(nextMode);
 			if (nextMode !== "wide") {
@@ -3981,6 +4043,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		syncPanelsToViewport();
 		return () => {
 			for (const query of queries) query.removeEventListener("change", syncPanelsToViewport);
+		};
+	}, []);
+	useEffect(() => {
+		const cancelPanelGesture = () => panelGestureRef.current?.reset();
+		window.addEventListener("blur", cancelPanelGesture);
+		return () => {
+			window.removeEventListener("blur", cancelPanelGesture);
+			panelGestureRef.current?.reset();
 		};
 	}, []);
 	const applySidebarWidth = useCallback((width: number, persist = false) => {
@@ -4165,7 +4235,16 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const appStyle = { "--sidebar-width": `${sidebarWidth}px` } as CSSProperties;
 
 	return (
-		<div ref={appShellRef} className={appClassName} style={appStyle}>
+		<div
+			ref={appShellRef}
+			className={appClassName}
+			style={appStyle}
+			onPointerDown={handlePanelGesturePointerDown}
+			onPointerMove={handlePanelGesturePointerMove}
+			onPointerUp={handlePanelGesturePointerEnd}
+			onPointerCancel={handlePanelGestureCancel}
+			onLostPointerCapture={handlePanelGestureCancel}
+		>
 			<div className="mobile-topbar">
 				<button
 					ref={mobileSidebarToggleRef}

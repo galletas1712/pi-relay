@@ -3669,6 +3669,18 @@ pre {
 }
 
 @media (max-width: 899px) {
+	/* Keep vertical transcript scrolling native while allowing the app shell
+	 * to recognize horizontal panel swipes instead of the browser claiming
+	 * them. */
+	.log-pane,
+	.workspace-route-state,
+	.chat-dock,
+	.sidebar,
+	.inspector,
+	.drawer-scrim {
+		touch-action: pan-y;
+	}
+
 	.app-shell {
 		grid-template-columns: minmax(0, 1fr);
 	}
