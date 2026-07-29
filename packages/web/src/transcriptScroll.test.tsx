@@ -507,6 +507,25 @@ describe("MessageList latest-on-entry scrolling", () => {
 		expect(scroller.scrollTop).toBe(275);
 	});
 
+	it("uses the existing sticky-bottom state for the boundary buttons", () => {
+		const current = entry("current", null, "current");
+		render(<MessageList {...props({ entries: [current], activeLeafId: current.id })} />);
+		const scroller = messageScroller();
+		const geometry = mockScrollGeometry(scroller, 100, 1000);
+
+		fireEvent.click(screen.getByRole("button", { name: "Jump to top" }));
+		expect(scroller.scrollTop).toBe(0);
+		geometry.height = 1100;
+		activeResizeObserver().trigger();
+		expect(scroller.scrollTop).toBe(0);
+
+		fireEvent.click(screen.getByRole("button", { name: "Jump to bottom" }));
+		expect(scroller.scrollTop).toBe(1000);
+		geometry.height = 1200;
+		activeResizeObserver().trigger();
+		expect(scroller.scrollTop).toBe(1100);
+	});
+
 	it("keeps a pinned transcript at the bottom when its viewport shrinks", () => {
 		const current = entry("current", null, "current");
 		render(<MessageList {...props({ entries: [current], activeLeafId: current.id })} />);
