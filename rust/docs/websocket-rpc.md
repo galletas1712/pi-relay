@@ -1973,8 +1973,12 @@ refreshes never overwrite an existing session's tool inspector.
 
 Requires a `provider` parameter (`"openai"` or `"claude"`) and returns the
 model-visible tool definitions for that provider, because the tool surface is
-provider-shaped (e.g. OpenAI `apply_patch` vs Anthropic `text_editor_20250728`
-for editing). Callers may pass `session_id` so the daemon can derive the actual
+provider-shaped (OpenAI custom `apply_patch` vs Anthropic JSON
+`str_replace_based_edit_tool` for editing). Every returned first-party
+model-facing input schema includes required `call_description`; OpenAI's
+freeform patch schema expresses it as a required grammar header. Selected MCP
+schemas retain their exact server-owned shapes and are excluded for now.
+Callers may pass `session_id` so the daemon can derive the actual
 session profile; if omitted, parent/global behavior is preserved. Parent/default
 sessions see the registered builtins (`edit`, `bash`, `web_search`, `web_fetch`,
 `LoadSkill`) plus delegation tools (`delegate_writing_task`,
@@ -1992,6 +1996,7 @@ tools. These entries use `kind: "mcp_tool"` and add observational `source`, raw
 `mcp.inventory` exclusively owns New Session discovery. Health is not part of
 provider declarations or the persisted prompt. Exact provider declarations,
 not this inspector response or PI.md prose, determine what a model may call.
+MCP rows match the persisted manifest declarations and fingerprints.
 
 Full and read-only delegation children inherit the parent's exact MCP manifest;
 only parent-specific first-party delegation tools are filtered from child
@@ -2305,7 +2310,7 @@ descendant rows are preserved, and non-boundary switch fails with
 Use `harness.model.complete` to request real tools:
 
 - `edit` success and missing-target error (`apply_patch` for OpenAI,
-  `text_editor_20250728` for Anthropic).
+  `str_replace_based_edit_tool` for Anthropic).
 - `bash` success, non-zero exit, malformed args, and timeout.
 - Multiple tool calls in one assistant response.
 
@@ -2409,7 +2414,7 @@ contains the original image block.
 
 Run only when `ANTHROPIC_API_KEY` is present. Create a session with
 `provider.kind = "claude"` and ask the model to use the `edit`
-tool (`text_editor_20250728`) or `bash`. Verify provider-requested tool calls,
+tool (`str_replace_based_edit_tool`) or `bash`. Verify provider-requested tool calls,
 real tool results, a second model request containing those results, and a final
 assistant message.
 

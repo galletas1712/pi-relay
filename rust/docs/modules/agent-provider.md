@@ -69,6 +69,14 @@ daemon's model-dispatch loop retries every ordinary-turn `ProviderError` up to
 five attempts; the provider crate does not classify status codes as retryable
 or non-retryable.
 
+Provider adapters normalize function/client tool calls to JSON `ToolCall`
+arguments. OpenAI custom `apply_patch` output is additionally split from its
+required `call_description:` header into
+`{"call_description": ..., "input": ...}` while preserving custom replay and
+result kinds. The daemon's main-agent completion wrapper then validates all new
+non-MCP normalized calls; MCP and sidecar-hosted/provider-owned calls are
+outside that first-party client-tool admission boundary.
+
 - `is_context_overflow()` — status `413`, or messages matching `prompt is too long` / `context_length_exceeded` / `context …(length|window|too large|exceed|maximum)`. A bare 400 is *not* treated as overflow (Anthropic `count_tokens` returns 400 for unsupported server tools).
 - `retry_diagnostic()` — returns status / timeout / reqwest diagnostic details that the daemon records after retry exhaustion.
 
@@ -377,6 +385,6 @@ Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire �
   provider, and retries exactly once inside that provider call. The provider
   surfaces the status through either `ProviderError::ModelCatalog` or the
   ordinary HTTP error path.
-- Registered builtin tools (from [agent-tools](./agent-tools.md)): `edit` (`apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). There are no `read`/`write` tools.
+- Registered builtin tools (from [agent-tools](./agent-tools.md)): `edit` (custom `apply_patch` for OpenAI, JSON `str_replace_based_edit_tool` for Anthropic), `bash` (uniform JSON `Bash`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). There are no `read`/`write` tools.
 - Sending OpenAI-profile tools to Anthropic (or vice versa) is a hard `ProviderError::Provider`; the profile must match the provider.
 - Wire details (RPC methods, how the daemon calls these adapters) live in [websocket-rpc](../websocket-rpc.md); the React client that drives sessions is documented in the [web UI](../../../packages/web/docs/web-ui.md) doc.

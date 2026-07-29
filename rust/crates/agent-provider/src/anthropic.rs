@@ -5373,7 +5373,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_body_renders_anthropic_native_coding_tools() {
+    fn messages_body_renders_anthropic_client_coding_tools() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
@@ -5405,8 +5405,12 @@ mod tests {
         assert!(body["tools"][6].get("type").is_none());
         assert_eq!(body["tools"][7]["name"], "steer_subagent");
         assert!(body["tools"][7].get("type").is_none());
-        assert_eq!(body["tools"][8]["type"], "text_editor_20250728");
+        assert!(body["tools"][8].get("type").is_none());
         assert_eq!(body["tools"][8]["name"], "str_replace_based_edit_tool");
+        assert_eq!(
+            body["tools"][8]["input_schema"]["properties"]["call_description"]["type"],
+            "string"
+        );
         assert_eq!(body["tools"][9]["name"], "web_fetch");
         assert!(body["tools"][9].get("type").is_none());
         assert_eq!(body["tools"][10]["name"], "web_search");

@@ -10,6 +10,7 @@ use crate::error::{ToolError, ToolResult};
 use crate::tools::{
     ApplyPatchTool, BashTool, TextEditorTool, WebFetchTool, WebSearchTool, APPLY_PATCH_LARK_GRAMMAR,
 };
+use crate::CALL_DESCRIPTION_KEY;
 
 #[async_trait]
 pub trait AgentTool: Send + Sync {
@@ -298,6 +299,36 @@ fn load_skill_definition() -> ToolDefinition {
     )
 }
 
+fn with_call_description(mut definition: ToolDefinition) -> ToolDefinition {
+    let schema = definition
+        .input_schema
+        .as_object_mut()
+        .expect("first-party tool input schema must be an object");
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("first-party tool input schema properties must be an object");
+    assert!(
+        !properties.contains_key(CALL_DESCRIPTION_KEY),
+        "call_description is reserved by pi-relay"
+    );
+    properties.insert(
+        CALL_DESCRIPTION_KEY.to_string(),
+        json!({
+            "type": "string",
+            "description": "One short sentence explaining this exact invocation.",
+            "minLength": 1,
+            "pattern": "^[^\\r\\n]+$",
+        }),
+    );
+    schema
+        .get_mut("required")
+        .and_then(Value::as_array_mut)
+        .expect("first-party tool input schema required must be an array")
+        .push(json!(CALL_DESCRIPTION_KEY));
+    definition
+}
+
 fn interrupt_subagent_definition() -> ToolDefinition {
     ToolDefinition::new(
         "interrupt_subagent",
@@ -516,6 +547,7 @@ fn register_runtime_tool(
     prompt_alias: &str,
     definition: ToolDefinition,
 ) {
+    let definition = with_call_description(definition);
     registry.register_tool(
         ToolDescriptor::new(canonical_name)
             .prompt_alias(prompt_alias)
@@ -538,7 +570,7 @@ fn register_uniform<T: AgentTool + Clone + 'static>(
     prompt_alias: &str,
     tool: T,
 ) {
-    let definition = tool.definition();
+    let definition = with_call_description(tool.definition());
     registry.register_tool(
         ToolDescriptor::new(canonical_name)
             .prompt_alias(prompt_alias)
@@ -556,23 +588,18 @@ fn register_uniform<T: AgentTool + Clone + 'static>(
 }
 
 fn register_edit(registry: &mut ToolRegistry) {
-    let claude_definition = TextEditorTool.definition();
+    let claude_definition = with_call_description(TextEditorTool.definition());
     registry.register_tool(
         ToolDescriptor::new("Edit")
             .prompt_alias("edit")
             .provider(ProviderKind::OpenAi, openai_apply_patch_tool())
             .provider(
                 ProviderKind::Claude,
-                ProviderTool::new(
+                ProviderTool::anthropic_client(&ToolDefinition::new(
                     "str_replace_based_edit_tool",
                     claude_definition.description,
                     claude_definition.input_schema,
-                    json!({
-                        "type": "text_editor_20250728",
-                        "name": "str_replace_based_edit_tool",
-                    }),
-                    ToolExecution::LocalJson,
-                ),
+                )),
             )
             .executor(ProviderKind::OpenAi, ApplyPatchTool)
             .executor(ProviderKind::Claude, TextEditorTool),
@@ -580,12 +607,18 @@ fn register_edit(registry: &mut ToolRegistry) {
 }
 
 fn openai_apply_patch_tool() -> ProviderTool {
+    let grammar = format!(
+        "start: call_description begin_patch hunk+ end_patch\ncall_description: \"{CALL_DESCRIPTION_KEY}: \" /[^\\r\\n]+/ LF\n{}",
+        APPLY_PATCH_LARK_GRAMMAR
+            .strip_prefix("start: begin_patch hunk+ end_patch\n")
+            .expect("apply_patch grammar start rule")
+    );
     let input_schema = json!({
         "type": "custom",
         "format": {
             "type": "grammar",
             "syntax": "lark",
-            "definition": APPLY_PATCH_LARK_GRAMMAR,
+            "definition": grammar,
         },
     });
     ProviderTool::new(
@@ -595,11 +628,11 @@ fn openai_apply_patch_tool() -> ProviderTool {
         json!({
             "type": "custom",
             "name": "apply_patch",
-            "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+            "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON. Begin with a `call_description: ` header containing one short sentence, followed by the raw patch.",
             "format": {
                 "type": "grammar",
                 "syntax": "lark",
-                "definition": APPLY_PATCH_LARK_GRAMMAR,
+                "definition": grammar,
             },
         }),
         ToolExecution::LocalFreeformText,
@@ -806,7 +839,7 @@ mod tests {
         assert_eq!(tool.input_schema["type"], "object");
         assert_eq!(
             tool.input_schema["required"],
-            json!(["subagent_id", "message"])
+            json!(["subagent_id", "message", CALL_DESCRIPTION_KEY])
         );
         assert_eq!(tool.input_schema["additionalProperties"], false);
         assert_eq!(
@@ -832,7 +865,10 @@ mod tests {
 
         assert_eq!(tool.canonical_name, "interrupt_subagent");
         assert_eq!(tool.execution, ToolExecution::LocalJson);
-        assert_eq!(tool.input_schema["required"], json!(["subagent_id"]));
+        assert_eq!(
+            tool.input_schema["required"],
+            json!(["subagent_id", CALL_DESCRIPTION_KEY])
+        );
         assert_eq!(tool.input_schema["additionalProperties"], false);
         assert!(tool.input_schema["properties"].get("message").is_none());
     }
@@ -855,44 +891,51 @@ mod tests {
         assert_eq!(openai_edit.execution, ToolExecution::LocalFreeformText);
         assert_eq!(openai_edit.input_schema["type"], "custom");
         assert_eq!(openai_edit.input_schema["format"]["syntax"], "lark");
+        let grammar = openai_edit.input_schema["format"]["definition"]
+            .as_str()
+            .unwrap();
+        assert!(grammar.starts_with("start: call_description begin_patch"));
+        assert!(grammar.contains("call_description: \"call_description: \" /[^\\r\\n]+/ LF"));
         assert_eq!(claude_edit.name, "str_replace_based_edit_tool");
         assert_eq!(claude_edit.execution, ToolExecution::LocalJson);
         assert_eq!(claude_edit.input_schema["type"], "object");
         assert!(claude_edit.input_schema["properties"]
             .get("command")
             .is_some());
+        assert!(claude_edit.declaration.get("type").is_none());
+        assert!(
+            claude_edit.declaration["input_schema"]["properties"][CALL_DESCRIPTION_KEY]
+                .get("maxLength")
+                .is_none()
+        );
     }
 
     #[test]
-    fn web_tools_are_local_json_tools_for_each_provider() {
+    fn registered_first_party_json_tools_require_call_descriptions() {
         let registry = ToolRegistry::with_builtin_tools();
-        let openai_web = registry
-            .provider_tools_for_provider(ProviderKind::OpenAi)
-            .into_iter()
-            .find(|tool| tool.canonical_name == "WebSearch")
-            .expect("OpenAI WebSearch tool");
-        let claude_web = registry
-            .provider_tools_for_provider(ProviderKind::Claude)
-            .into_iter()
-            .find(|tool| tool.canonical_name == "WebSearch")
-            .expect("Claude WebSearch tool");
-        let claude_fetch = registry
-            .provider_tools_for_provider(ProviderKind::Claude)
-            .into_iter()
-            .find(|tool| tool.canonical_name == "WebFetch")
-            .expect("Claude WebFetch tool");
-
-        assert_eq!(openai_web.name, "web_search");
-        assert_eq!(openai_web.execution, ToolExecution::LocalJson);
-        assert_eq!(openai_web.input_schema["type"], "object");
-        assert!(openai_web.input_schema["properties"].get("query").is_some());
-        assert_eq!(claude_web.name, "web_search");
-        assert_eq!(claude_web.execution, ToolExecution::LocalJson);
-        assert!(claude_web.declaration.get("type").is_none());
-        assert_eq!(claude_fetch.name, "web_fetch");
-        assert_eq!(claude_fetch.execution, ToolExecution::LocalJson);
-        assert_eq!(claude_fetch.input_schema["type"], "object");
-        assert!(claude_fetch.input_schema["properties"].get("url").is_some());
+        for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
+            for tool in registry.provider_tools_for_provider(provider) {
+                if tool.execution == ToolExecution::LocalFreeformText {
+                    continue;
+                }
+                assert!(
+                    tool.input_schema["properties"][CALL_DESCRIPTION_KEY]
+                        .get("maxLength")
+                        .is_none(),
+                    "{}",
+                    tool.name
+                );
+                assert!(tool.input_schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(CALL_DESCRIPTION_KEY)));
+                let declaration_schema = match provider {
+                    ProviderKind::OpenAi => &tool.declaration["parameters"],
+                    ProviderKind::Claude => &tool.declaration["input_schema"],
+                };
+                assert_eq!(declaration_schema, &tool.input_schema);
+            }
+        }
     }
 
     #[test]
@@ -913,7 +956,7 @@ mod tests {
         assert_eq!(openai_edit.declaration["name"], "apply_patch");
         assert_eq!(openai_edit.execution, ToolExecution::LocalFreeformText);
         assert_eq!(claude_edit.name, "str_replace_based_edit_tool");
-        assert_eq!(claude_edit.declaration["type"], "text_editor_20250728");
+        assert!(claude_edit.declaration.get("type").is_none());
         assert_eq!(
             claude_edit.declaration["name"],
             "str_replace_based_edit_tool"

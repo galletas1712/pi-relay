@@ -2,6 +2,7 @@ use agent_mcp_types::McpSessionSnapshot;
 use agent_provider::{ModelRequest, ModelResponse, ProviderToolProfile};
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
+use agent_tools::admit_new_tool_calls;
 use agent_vocab::TurnId;
 use anyhow::Result;
 
@@ -26,12 +27,34 @@ pub(crate) async fn run_model(
     config: &SessionConfig,
     session_id: &str,
     request: ModelRequest,
+    snapshot: &McpSessionSnapshot,
 ) -> Result<ModelResponse> {
     #[cfg(test)]
     if let Some(result) = injected_model_result(config, session_id) {
-        return result;
+        return result.and_then(|response| admit_model_response(response, snapshot));
     }
-    complete_model_request(state, config, session_id, request).await
+    admit_model_response(
+        complete_model_request(state, config, session_id, request).await?,
+        snapshot,
+    )
+}
+
+fn admit_model_response(
+    mut response: ModelResponse,
+    snapshot: &McpSessionSnapshot,
+) -> Result<ModelResponse> {
+    let mcp_tool_names = snapshot
+        .manifest()
+        .tools
+        .iter()
+        .map(|tool| tool.exposed_name.clone())
+        .collect();
+    admit_new_tool_calls(&mut response.assistant, &mcp_tool_names).map_err(|error| {
+        anyhow::Error::new(agent_provider::ProviderError::Provider(format!(
+            "invalid model tool call: {error}"
+        )))
+    })?;
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -86,6 +109,7 @@ fn injected_model_result(
                     id: ToolCallId::from_u64(1),
                     tool_name: "Bash".to_string(),
                     args_json: serde_json::json!({
+                        "call_description": "Run the injected test command.",
                         "command": config
                             .metadata
                             .pointer("/fault_injection/tool_command")

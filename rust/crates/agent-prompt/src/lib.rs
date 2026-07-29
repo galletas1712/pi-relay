@@ -428,6 +428,7 @@ mod tests {
         assert!(!rendered.contains("Packaged subagent roles"));
         assert!(!rendered.contains("delegate_readonly_tasks"));
         assert!(!rendered.contains("delegate_writing_task"));
+        assert!(rendered.contains("Every pi-relay-owned tool call must include `call_description`"));
     }
 
     #[test]

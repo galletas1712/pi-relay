@@ -2,7 +2,7 @@ use agent_core::AgentInput;
 use agent_runtime_protocol::{RuntimeCommand, RuntimeCommandResult};
 use agent_session::SessionAction;
 use agent_store::{ActionStatus, ActionUpdate};
-use agent_tools::{limit_tool_output, ToolContext};
+use agent_tools::{limit_tool_output, tool_call_for_execution, ToolContext};
 use agent_vocab::{ToolResultMessage, ToolResultStatus};
 use serde_json::json;
 
@@ -32,6 +32,11 @@ pub(super) async fn run_tool_turn(
         .manifest()
         .tool(&tool_call.tool_name)
         .is_some();
+    let execution_call = if is_mcp_tool {
+        tool_call.clone()
+    } else {
+        tool_call_for_execution(&tool_call)
+    };
     state
         .runtime_hosts
         .ensure_session(
@@ -50,7 +55,7 @@ pub(super) async fn run_tool_turn(
             .execute_mcp_tool(
                 &dispatch.config.runtime_id,
                 dispatch.mcp_snapshot.manifest().clone(),
-                tool_call.clone(),
+                execution_call.clone(),
             )
             .await
         {
@@ -81,7 +86,7 @@ pub(super) async fn run_tool_turn(
                 )
                 .await
             {
-                Ok(runtime_context) => load_skill_result(&runtime_context.skills, &tool_call),
+                Ok(runtime_context) => load_skill_result(&runtime_context.skills, &execution_call),
                 Err(error) => ToolResultMessage::error(
                     tool_call.id.clone(),
                     tool_call.tool_name.clone(),
@@ -99,7 +104,7 @@ pub(super) async fn run_tool_turn(
             &state,
             &dispatch.config,
             &session_id,
-            &tool_call,
+            &execution_call,
             &tool_context,
         )
         .await
@@ -108,7 +113,7 @@ pub(super) async fn run_tool_turn(
             &state,
             &session_id,
             &format!("action:{}", dispatch.row_id),
-            &tool_call,
+            &execution_call,
         )
         .await
     } else {
@@ -119,7 +124,7 @@ pub(super) async fn run_tool_turn(
                 RuntimeCommand::ExecuteTool {
                     workspace_id: dispatch.config.workspace_id.clone(),
                     provider: dispatch.config.provider.kind,
-                    tool_call: tool_call.clone(),
+                    tool_call: execution_call,
                 },
                 None,
             )

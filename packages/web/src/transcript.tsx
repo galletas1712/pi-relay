@@ -1793,6 +1793,7 @@ function toolRunItemFromPendingAction(action: PendingAction): ToolRunItem | null
 	const input = parseToolInput(argsJson) ?? (payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null);
 	const prettyName = prettyToolName(toolName);
 	const editPreview = editToolPreview(toolName, input);
+	const callDescription = toolName.startsWith("mcp__") ? null : stringValue(input?.call_description)?.trim() || null;
 	return {
 		source: "local",
 		key: `pending-${action.action_row_id}`,
@@ -1800,7 +1801,7 @@ function toolRunItemFromPendingAction(action: PendingAction): ToolRunItem | null
 		id,
 		rawName: toolName,
 		prettyName: editPreview ? "Edit" : prettyName,
-		title: editPreview?.header ?? formatDisplayHeader(prettyName, inputSummaryFromInput(toolName, input)),
+		title: callDescription ?? editPreview?.header ?? formatDisplayHeader(prettyName, inputSummaryFromInput(toolName, input)),
 		statusKind: "running",
 		statusLabel: "running",
 		argsJson,
@@ -1830,6 +1831,9 @@ function localToolRunItem(
 	const statusKind = !result ? "running" : result.status === "Success" ? "success" : "error";
 	const editPreview = editToolPreview(part.item.tool_name, input, result);
 	const prettyName = prettyToolName(part.item.tool_name);
+	const callDescription = part.item.tool_name.startsWith("mcp__")
+		? null
+		: stringValue(input?.call_description)?.trim() || null;
 	return {
 		source: "local",
 		key: `local-${entryId}-${part.item.id}`,
@@ -1837,7 +1841,7 @@ function localToolRunItem(
 		id: part.item.id,
 		rawName: part.item.tool_name,
 		prettyName: editPreview ? "Edit" : prettyName,
-		title: editPreview?.header ?? formatDisplayHeader(prettyName, inputSummaryFromInput(part.item.tool_name, input)),
+		title: callDescription ?? editPreview?.header ?? formatDisplayHeader(prettyName, inputSummaryFromInput(part.item.tool_name, input)),
 		statusKind,
 		statusLabel: result ? result.status.toLowerCase() : "running",
 		argsJson: part.item.args_json,
