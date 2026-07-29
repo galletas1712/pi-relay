@@ -35,6 +35,7 @@ describe("AgentApi MCP wire format", () => {
 				],
 			},
 		});
+
 		expect(calls[0]).toEqual({
 			method: "mcp.inventory",
 			params: { provider: "openai", runtime_id: "runtime-local" },
@@ -62,6 +63,48 @@ describe("AgentApi MCP wire format", () => {
 				timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS,
 			},
 		});
+	});
+
+	it("returns session-aware inventory and sends additions through the shared selection shape", async () => {
+		const calls: RpcCall[] = [];
+		const api = createAgentApi(fakeClient(calls));
+
+		await api.getMcpInventory("openai", "runtime-local", "session-1");
+		await api.addMcpTools({
+			sessionId: "session-1",
+			sessionRevision: 7,
+			selection: {
+				inventoryRevision: "inventory-2",
+				servers: [
+					{ server: "workspace", tools: ["write", "search"] },
+					{ server: "archive", tools: ["zeta", "alpha"] },
+				],
+			},
+		});
+
+		expect(calls).toEqual([
+			{
+				method: "mcp.inventory",
+				params: {
+					provider: "openai",
+					runtime_id: "runtime-local",
+					session_id: "session-1",
+				},
+			},
+			{
+				method: "mcp.add",
+				params: {
+					session_id: "session-1",
+					session_revision: 7,
+					inventory_revision: "inventory-2",
+					servers: [
+						{ server: "archive", tools: ["alpha", "zeta"] },
+						{ server: "workspace", tools: ["search", "write"] },
+					],
+				},
+				options: { timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
+			},
+		]);
 	});
 
 	it("maps the sanitized MCP OAuth lifecycle without browser storage", async () => {

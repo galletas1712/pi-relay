@@ -234,6 +234,196 @@ async fn session_manifest_persists_atomically_reloads_and_children_reuse_it() {
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
+async fn additive_mcp_update_is_atomic_and_fenced() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    create_session(&db.store, "add-mcp", &config(None), None, None).await;
+    let before = db
+        .store
+        .session_snapshot("add-mcp")
+        .await
+        .expect("snapshot loads");
+    let binding = McpSessionManifestBinding {
+        manifest_fingerprint: "manifest-added".to_string(),
+        manifest: json!({ "manifest": "added" }),
+    };
+
+    let result = db
+        .store
+        .add_session_mcp(
+            "add-mcp",
+            before.session_revision,
+            None,
+            &binding,
+            "rerendered prompt",
+        )
+        .await
+        .expect("MCP tools add");
+
+    let loaded = db
+        .store
+        .load_session_config("add-mcp")
+        .await
+        .expect("updated config loads");
+    assert_eq!(loaded.mcp_manifest, Some(binding.clone()));
+    assert_eq!(loaded.system_prompt, "rerendered prompt");
+    assert_eq!(result.session_revision, before.session_revision + 1);
+    assert_eq!(result.queue_revision, before.queue_revision);
+    assert_eq!(result.transcript_revision, before.transcript_revision);
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .map(|event| event.event)
+            .collect::<Vec<_>>(),
+        [crate::EventType::McpToolsAdded]
+    );
+    let rejected = McpSessionManifestBinding {
+        manifest_fingerprint: "rejected".to_string(),
+        manifest: json!({ "manifest": "rejected" }),
+    };
+    for (revision, fingerprint) in [
+        (before.session_revision, None),
+        (result.session_revision, Some("wrong")),
+    ] {
+        let error = db
+            .store
+            .add_session_mcp(
+                "add-mcp",
+                revision,
+                fingerprint,
+                &rejected,
+                "rejected prompt",
+            )
+            .await
+            .expect_err("stale fence is rejected");
+        assert!(error
+            .downcast_ref::<crate::SessionConfigChanged>()
+            .is_some());
+    }
+
+    let mut orphan_config = config(None);
+    orphan_config.system_prompt = "sentinel role prompt".to_string();
+    create_session(
+        &db.store,
+        "orphan-subagent-add",
+        &orphan_config,
+        None,
+        Some(SubagentType::ReadOnly),
+    )
+    .await;
+    let orphan_revision = db
+        .store
+        .session_snapshot("orphan-subagent-add")
+        .await
+        .expect("orphan-like subagent snapshot loads")
+        .session_revision;
+    let error = db
+        .store
+        .add_session_mcp(
+            "orphan-subagent-add",
+            orphan_revision,
+            None,
+            &rejected,
+            "rejected prompt",
+        )
+        .await
+        .expect_err("durable subagent marker is rejected");
+    assert!(error.downcast_ref::<crate::RootSessionRequired>().is_some());
+    let orphan_loaded = db
+        .store
+        .load_session_config("orphan-subagent-add")
+        .await
+        .expect("orphan-like subagent config loads");
+    assert_eq!(orphan_loaded.mcp_manifest, None);
+    assert_eq!(orphan_loaded.system_prompt, "sentinel role prompt");
+
+    create_session(&db.store, "parent-add", &config(None), None, None).await;
+    for (session_id, blocker) in [
+        ("child-add", "parent"),
+        ("queued-add", "queue"),
+        ("delegating-add", "delegation"),
+    ] {
+        create_session(
+            &db.store,
+            session_id,
+            &config(None),
+            (blocker == "parent").then_some("parent-add"),
+            (blocker == "parent").then_some(SubagentType::Full),
+        )
+        .await;
+        let revision = db
+            .store
+            .session_snapshot(session_id)
+            .await
+            .expect("snapshot loads")
+            .session_revision;
+        if blocker == "queue" {
+            sqlx::query(
+                r#"
+                insert into queued_inputs (
+                    id, session_id, priority, content, status, client_input_id
+                ) values (
+                    $1, $2, 'follow_up',
+                    '{"type":"user_message","content":{"content":[{"type":"text","text":"queued"}]}}',
+                    'queued', $1
+                )
+                "#,
+            )
+            .bind(format!("{session_id}-input"))
+            .bind(session_id)
+            .execute(&db.store.pool)
+            .await
+            .expect("queued blocker inserts");
+        } else if blocker == "delegation" {
+            sqlx::query(
+                r#"
+                insert into delegations (
+                    id, parent_session_id, launch_key, launch_shape, kind, status,
+                    attempt_id, expected_subagents
+                ) values ($1, $2, $1, $1, 'full', 'running', $1, 1)
+                "#,
+            )
+            .bind(format!("{session_id}-delegation"))
+            .bind(session_id)
+            .execute(&db.store.pool)
+            .await
+            .expect("delegation blocker inserts");
+        }
+        let error = db
+            .store
+            .add_session_mcp(session_id, revision, None, &rejected, "rejected prompt")
+            .await
+            .expect_err("fenced session is rejected");
+        if blocker == "parent" {
+            assert!(error.downcast_ref::<crate::RootSessionRequired>().is_some());
+        } else {
+            assert!(error
+                .downcast_ref::<crate::SourceMutationConflict>()
+                .is_some());
+        }
+        let loaded = db
+            .store
+            .load_session_config(session_id)
+            .await
+            .expect("config loads");
+        assert_eq!(loaded.mcp_manifest, None);
+        assert_eq!(loaded.system_prompt, "prompt");
+    }
+    let loaded = db
+        .store
+        .load_session_config("add-mcp")
+        .await
+        .expect("successful config remains");
+    assert_eq!(loaded.mcp_manifest, Some(binding));
+    assert_eq!(loaded.system_prompt, "rerendered prompt");
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
 async fn child_manifest_mismatch_rolls_back_session_and_manifest_install() {
     let Some(db) = test_store().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");

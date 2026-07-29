@@ -48,6 +48,7 @@ describe("connection policy", () => {
 			["/help", false],
 			["/export", false],
 			["/switch", true],
+			["/mcp", true],
 		] as const) {
 			expect(composerTextNeedsConnection(text)).toBe(expected);
 		}
@@ -141,6 +142,7 @@ describe("representative component gates", () => {
 		expect((screen.getByRole("option", { name: /help/i }) as HTMLButtonElement).disabled).toBe(false);
 		expect((screen.getByRole("option", { name: /export/i }) as HTMLButtonElement).disabled).toBe(false);
 		expect((screen.getByRole("option", { name: /switch/i }) as HTMLButtonElement).disabled).toBe(true);
+		expect((screen.getByRole("option", { name: /mcp/i }) as HTMLButtonElement).disabled).toBe(true);
 		expect((screen.getByRole("option", { name: /compact/i }) as HTMLButtonElement).disabled).toBe(true);
 		expect(screen.queryByRole("option", { name: /system/i })).toBeNull();
 		expect(findCommand("system")).toBeUndefined();

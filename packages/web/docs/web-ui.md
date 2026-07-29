@@ -48,7 +48,7 @@ projects        queryKeys.projects      snapshot (head/revisions/queue/metadata)
 session lists   queryKeys.sessions(pid) activeBranchEntryIds + entriesById
 tools           queryKeys.tools(kind)   tree* (compact topology for /switch)
 mcp auth status queryKeys.mcpStatus(runtimeId)
-mcp inventory   queryKeys.mcpInventory(provider, runtimeId)
+mcp inventory   queryKeys.mcpInventory(provider, runtimeId, sessionId?)
 system prompt   queryKeys.systemPrompt  turnCardsById/turnOrder/turnDetailsById
 ```
 
@@ -444,10 +444,14 @@ MCP selection clears after definite creation success or an explicit New
 Session reset. Changing the draft provider kind clears selection visibly;
 reasoning-effort changes within the same provider retain it.
 
-Existing-session tools use immutable `tools.list(session_id)` data and are not
-overwritten by New Session inventory refresh. Full and read-only children
-inherit the exact parent MCP set. Read-only filesystem status does not restrict
-side effects performed by remote MCP servers.
+Submitting `/mcp` from a fully loaded, idle, delegation-quiet top-level
+session opens the existing-session picker. Persisted raw identities are
+selected and locked; the request contains additions only. The daemon remains
+authoritative for root/idle/delegation checks and unions the complete selection.
+Success closes the dialog, then session/tool/inventory refresh is best effort;
+`mcp.tools_added` also refreshes those views. Stale session or inventory
+conflicts reseed the open picker. Existing children retain their own MCP set;
+future children inherit the updated parent.
 
 Pending and transcript cards for pi-relay-owned tools use `call_description`
 as their visible title when present. Historical calls without it keep the
@@ -498,6 +502,7 @@ Enter on an exact command submits.
 | --- | --- |
 | `/switch` | Opens the same-session history picker (idle only). User-message targets restore the full original message into the composer; turn/compaction targets just become the active leaf. |
 | `/fork` | Opens the same picker for a managed project session (idle only). It clones the current workspace—not historical files—into an independent top-level child. A user-message target becomes the new child's composer draft. |
+| `/mcp` | Opens the additive MCP tool picker for a fully loaded, idle, delegation-quiet top-level session. |
 | `/compact` | Requests context compaction (`compaction.request`). |
 | `/export` | Exports the current branch's assistant/user messages, fetching active-branch bodies for the export view. |
 

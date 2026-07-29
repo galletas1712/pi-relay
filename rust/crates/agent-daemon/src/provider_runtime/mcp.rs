@@ -1,15 +1,69 @@
 use std::collections::HashMap;
 
-use agent_mcp_types::{McpSessionManifest, McpSessionSnapshot};
+use agent_mcp_types::{
+    McpServerSelection, McpSessionManifest, McpSessionSelection, McpSessionSnapshot,
+};
 use agent_prompt::PromptProfile;
-use agent_store::SessionConfig;
+use agent_store::{McpSessionManifestBinding, SessionConfig};
 use agent_vocab::ProviderKind;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::state::AppState;
+use crate::types::RpcError;
 
-use super::prompt::provider_tools_for_session;
+use super::prompt::{provider_tools_for_session, render_pi_prompt};
+
+pub(crate) async fn author_session_mcp_and_prompt(
+    state: &AppState,
+    mut config: SessionConfig,
+    selection: Option<McpSessionSelection>,
+) -> std::result::Result<SessionConfig, RpcError> {
+    config.mcp_manifest =
+        if let Some(selection) = selection.filter(|selection| !selection.servers.is_empty()) {
+            let manifest = state
+                .runtime_hosts
+                .mcp_select(
+                    &config.runtime_id,
+                    selection,
+                    first_party_toolsets(state, super::prompt::prompt_profile(&config)),
+                )
+                .await
+                .map_err(crate::mcp_auth::map_runtime_mcp_error)?;
+            Some(McpSessionManifestBinding {
+                manifest_fingerprint: manifest.manifest_fingerprint.clone(),
+                manifest: serde_json::to_value(&manifest)
+                    .map_err(anyhow::Error::from)
+                    .map_err(RpcError::from)?,
+            })
+        } else {
+            None
+        };
+    config.system_prompt = render_pi_prompt(state, &config).await?;
+    Ok(config)
+}
+
+pub(crate) fn selected_mcp_tools(
+    config: &SessionConfig,
+) -> anyhow::Result<Vec<McpServerSelection>> {
+    let snapshot = mcp_snapshot_for_session(config)?;
+    let mut selected = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for tool in &snapshot.manifest().tools {
+        selected
+            .entry(tool.server_id.clone())
+            .or_default()
+            .push(tool.raw_name.clone());
+    }
+    let mut servers = selected
+        .into_iter()
+        .map(|(server, mut tools)| {
+            tools.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+            McpServerSelection { server, tools }
+        })
+        .collect::<Vec<_>>();
+    servers.sort_by(|left, right| left.server.encode_utf16().cmp(right.server.encode_utf16()));
+    Ok(servers)
+}
 
 pub(crate) fn mcp_snapshot_for_session(config: &SessionConfig) -> Result<McpSessionSnapshot> {
     let Some(binding) = &config.mcp_manifest else {

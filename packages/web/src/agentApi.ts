@@ -25,10 +25,10 @@ import type {
 	HandoffFileName,
 	ToolListing,
 	McpInventory,
+	McpSelection,
 	McpLoginResult,
 	McpLogoutResult,
 	McpStatus,
-	StartSessionMcpSelection,
 	TranscriptEntriesResult,
 	TranscriptEntry,
 	TranscriptTreeIndex,
@@ -65,7 +65,8 @@ export interface AgentApi {
 	steerSubagent(params: SteerSubagentParams): Promise<SteerSubagentResult>;
 	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse>;
 	listTools(provider: string, sessionId?: string | null): Promise<ToolListing[]>;
-	getMcpInventory(provider: string, runtimeId: string): Promise<McpInventory>;
+	getMcpInventory(provider: string, runtimeId: string, sessionId?: string | null): Promise<McpInventory>;
+	addMcpTools(params: AddMcpToolsParams): Promise<AddMcpToolsResult>;
 	getMcpStatus(runtimeId: string): Promise<McpStatus>;
 	loginMcp(server: string, runtimeId: string): Promise<McpLoginResult>;
 	completeMcpLogin(server: string, loginId: string, callbackUrl: string, runtimeId: string): Promise<{ completed: true }>;
@@ -96,6 +97,20 @@ export interface AgentApi {
 	reorderQueuedFollowUps(sessionId: string, inputIds: string[], expectedQueueRevision?: number | null): Promise<ReorderQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
+}
+
+export interface AddMcpToolsParams {
+	sessionId: string;
+	sessionRevision: number;
+	selection: McpSelection;
+}
+
+export interface AddMcpToolsResult {
+	session_id: string;
+	manifest_fingerprint: string;
+	session_revision: number;
+	queue_revision: number;
+	transcript_revision: number;
 }
 
 export interface HistoryTargetsOptions {
@@ -171,7 +186,7 @@ export interface StartSessionParams {
 	content: ContentBlock[];
 	/** Subset of the project's workspaces to materialize, with optional per-session git branch overrides. Omit for all. */
 	workspaces?: StartSessionWorkspace[] | null;
-	mcp?: StartSessionMcpSelection;
+	mcp?: McpSelection;
 	onProgress?: (progress: WorkspaceMaterializeProgress) => void;
 }
 
@@ -385,6 +400,18 @@ class AgentApiClient implements AgentApi {
 		return this.client.connect();
 	}
 
+	addMcpTools(params: AddMcpToolsParams): Promise<AddMcpToolsResult> {
+		return this.client.request<AddMcpToolsResult>(
+			"mcp.add",
+			{
+				session_id: params.sessionId,
+				session_revision: params.sessionRevision,
+				...mcpSelectionWire(params.selection),
+			},
+			{ timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
+		);
+	}
+
 	async listRuntimes(): Promise<Runtime[]> {
 		const result = await this.client.request<{ runtimes: Runtime[] }>("runtime.list");
 		return result.runtimes;
@@ -398,10 +425,11 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	getMcpInventory(provider: string, runtimeId: string): Promise<McpInventory> {
+	getMcpInventory(provider: string, runtimeId: string, sessionId?: string | null): Promise<McpInventory> {
 		return this.client.request<McpInventory>("mcp.inventory", {
 			provider,
 			runtime_id: runtimeId,
+			...(sessionId ? { session_id: sessionId } : {}),
 		});
 	}
 
@@ -663,15 +691,7 @@ class AgentApiClient implements AgentApi {
 				priority: params.priority,
 				content: params.content,
 				...(params.mcp?.servers.length
-					? { mcp: {
-							inventory_revision: params.mcp.inventoryRevision,
-							servers: [...params.mcp.servers].sort((left, right) =>
-								left.server < right.server ? -1 : left.server > right.server ? 1 : 0
-							).map((server) => ({
-								server: server.server,
-								tools: [...server.tools].sort(),
-							})),
-						} }
+					? { mcp: mcpSelectionWire(params.mcp) }
 					: {}),
 				workspaces: params.workspaces == null
 					? undefined
@@ -788,4 +808,17 @@ class AgentApiClient implements AgentApi {
 		});
 		return result.items;
 	}
+}
+
+function mcpSelectionWire(selection: McpSelection) {
+	return {
+		inventory_revision: selection.inventoryRevision,
+		servers: selection.servers
+			.map((server) => ({
+				server: server.server,
+				tools: [...server.tools].sort(),
+			}))
+			.sort((left, right) =>
+				left.server < right.server ? -1 : left.server > right.server ? 1 : 0),
+	};
 }

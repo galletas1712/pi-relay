@@ -2328,6 +2328,16 @@ pre {
 	box-shadow: var(--elev-modal);
 }
 
+.mcp-add-dialog {
+	width: min(620px, calc(100vw - 48px));
+}
+
+.mcp-add-dialog-body {
+	min-height: 0;
+	flex: 1 1 auto;
+	overflow-y: auto;
+}
+
 .error-text {
 	margin: 0;
 	color: var(--destructive);

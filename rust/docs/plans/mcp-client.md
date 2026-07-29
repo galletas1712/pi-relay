@@ -26,17 +26,16 @@ protocol implementation.
 
 ## Objective
 
-MCP selection happens only while creating a new session. The client chooses a
-bounded subset of operator-allowed tools from a dedicated inventory, and the
-daemon validates that selection against a semantic revision before creating the
-session. The resulting MCP-only manifest is content addressed, persisted
-transactionally with the session, and frozen for that session and every child.
+MCP selection happens while creating a session and may grow later through the
+idle-only `mcp.add` RPC. The client chooses a bounded subset of operator-allowed
+tools from a dedicated inventory, and the daemon validates it against a
+semantic revision. MCP-only manifests are content addressed and persisted
+transactionally with the rendered system prompt.
 
 `ToolRegistry` remains first-party and static. Provider requests combine the
-session profile's first-party declarations with the exact persisted MCP
-declarations. No later inventory refresh, reconnect, configuration change, or
-`tools/list_changed` notification can mutate an existing session's prompt,
-declarations, routes, or selected names.
+session profile's first-party declarations with the persisted MCP declarations.
+Inventory refresh, reconnect, configuration change, and `tools/list_changed`
+notifications do not mutate sessions automatically.
 
 Transports are operator-configured local stdio or generic remote Streamable
 HTTP using the Rust `rmcp` SDK. The existing process cleanup, environment
@@ -48,7 +47,7 @@ catalog.
 
 ### Approved design
 
-- [x] Replace the turn-scoped invariant with one immutable MCP-only manifest per
+- [x] Replace turn-scoped manifests with one content-addressed MCP binding per
   durable session.
 - [x] Make omitted or empty selection explicitly MCP-free; legacy sessions with
   no binding never fall back to current inventory.
@@ -176,7 +175,7 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
   context, traces, and metrics. Internal status exposes only unsupported,
   unknown, login-required, reauthentication-required, OAuth-ready, bearer, or
   non-OAuth distinctions. Local logout cancels a pending login, removes
-  in-memory/file credentials, closes the route, and leaves frozen manifests
+  in-memory/file credentials, closes the route, and leaves persisted manifests
   unchanged; it does not perform remote revocation, matching Codex.
 
 #### OAuth Stage 4: sanitized RPC and New Session UX
@@ -196,7 +195,7 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
   selection. Sanitized status is independent from inventory, so
   login-required/pending/unsupported servers remain visible without tools.
   Successful login refreshes inventory but never silently selects tools or
-  changes an existing frozen session.
+  changes an existing session automatically.
 - [x] Add public RPC lifecycle coverage for generic static-client login,
   pending polling, manual full-callback completion, ready inventory, logout,
   sanitized errors, and manifest invariance. Existing `agent-mcp` integration
@@ -208,7 +207,7 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
 
 1. OAuth config may affect semantic route identity. Credentials, DCR output,
    and ephemeral authorization state never do.
-2. MCP session manifests remain credential-free. They contain only the frozen
+2. MCP session manifests remain credential-free. They contain only the persisted
    selected declarations and semantic route fingerprints already described
    below; no OAuth config object, endpoint, scope, client information, token,
    or credential-store key is added.
@@ -218,10 +217,10 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
    of credentials. Calls resolve through the runtime-owned route and credential
    repository under the same no-replay and exact-contract checks.
 5. Discovery and login are bounded runtime operations proxied by the control
-   plane. They cannot mutate a frozen manifest, replay an MCP operation, or
+   plane. They cannot mutate a persisted manifest, replay an MCP operation, or
    inject server-provided text into model context.
 
-### MCP inventory and frozen manifests
+### MCP inventory and persisted manifests
 
 - [x] Refactor `McpCatalogManifest`/`McpTurnSnapshot` into MCP-only
   `McpSessionManifest`/`McpSessionSnapshot`.
@@ -242,7 +241,7 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
   created before this schema.
 - [x] Delete turn bindings, legacy-zero materialization, action MCP columns, and
   MCP-specific claim/bind machinery; restore ordinary action claiming/events.
-- [x] Load the frozen session snapshot for model requests, retries, token
+- [x] Load the persisted session snapshot for model requests, retries, token
   counting, title generation, compaction, recovery, `tools.list`, and tool calls.
 - [x] Copy the exact parent's MCP manifest binding into every full/read-only
   child creation transaction.
@@ -253,7 +252,7 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
 
 - [x] Add typed `mcp.inventory` request/response and a distinct web query key.
 - [x] Add typed `session.start.mcp` serialization; omission means no MCP.
-- [x] Make `tools.list(session_id)` use only the frozen session manifest and
+- [x] Make `tools.list(session_id)` use only the persisted session manifest and
   make no-session results first-party-only.
 - [x] Add pure selection grouping, tri-state, toggling, deterministic payload,
   revision reconciliation, and estimate-total functions.
@@ -278,6 +277,8 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
 - [x] Treat healthy zero-tool servers as non-selectable and omit phantom
   selection warnings/readiness, while keeping both setup disclosures
   viewport-bounded and rederiving workspace controls when kind changes.
+- [x] Reuse that picker for `/mcp`, locking persisted raw identities and sending
+  only additions. The daemon unions and reauthors the complete current set.
 
 ### Tests, documentation, and validation
 
@@ -287,7 +288,7 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
   legacy-null behavior,
   and exact child inheritance.
 - [x] Add daemon public-RPC tests for inventory/start fencing, prompt omission
-  and names, frozen later work, session `tools.list`, and child inheritance.
+  and names, stable later work, session `tools.list`, and child inheritance.
 - [x] Add web pure-state, API serialization, and static
   markup/accessibility/omission tests.
 - [x] Update websocket RPC, architecture/store/web UI docs, README, and config
@@ -302,12 +303,12 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
 
 ## Exact invariants
 
-1. **Session selection only.** The agent has no discovery or mutation tools.
-   Selection is accepted only by `session.start`. An omitted or empty MCP field
-   creates an MCP-free session.
-2. **Immutable session manifest.** A selected session references exactly one
-   content-addressed MCP-only manifest for its whole lifetime. Existing
-   sessions never adopt inventory refreshes or `tools/list_changed`.
+1. **Control-plane selection only.** The agent has no discovery or mutation
+   tools. Selection is accepted by `session.start` and idle-only additive
+   `mcp.add`. An omitted or empty start field creates an MCP-free session.
+2. **Explicit mutation.** A session references one content-addressed MCP-only
+   manifest at a time and never adopts inventory changes automatically.
+   `mcp.add` reauthors its complete old-plus-new raw selection.
 3. **Provider declarations are authoritative.** The manifest stores exact
    ordered OpenAI and Anthropic MCP declarations. Every request prepends the
    appropriate stable first-party profile. PI.md contains only a compact list
@@ -326,11 +327,11 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
    newer route or automatically replay a possibly side-effecting call. This
    also disables `rmcp` transparent stale-session reinitialization because it
    replays the in-flight request.
-7. **Exact inheritance.** Full and read-only children reuse the parent's exact
-   MCP manifest. Their first-party profile still removes parent-only delegation
-   tools. Read-only describes filesystem access only and does not constrain
-   remote MCP side effects.
-8. **Byte stability.** Retries clone a built request. Later turns, count calls,
+7. **Exact inheritance at creation.** Full and read-only children reuse the
+   parent's current manifest when created. Existing children retain their own
+   binding. Their first-party profile still removes parent-only delegation
+   tools. Read-only describes filesystem access only.
+8. **Byte stability between mutations.** Retries clone a built request. Later turns, count calls,
    title sidecars, compaction, recovery, and resumed work rebuild only from the
    persisted system prompt and manifest. Compaction never rewrites the prompt.
 9. **Bounds.** Config, inventory, selection, declarations, schemas, arguments,
@@ -338,7 +339,7 @@ No server name, issuer, endpoint, client ID, or scope is built into pi-relay.
    through operator allowlists, per-tool selection, and context caps—not model
    discovery.
 10. **Static registry.** MCP names never enter `ToolRegistry`; dispatch checks
-    the frozen MCP snapshot before first-party execution.
+    the persisted MCP snapshot before first-party execution.
 
 ## Wire contracts
 
@@ -373,6 +374,10 @@ provider and is labelled by the UI as approximate MCP context added, never as
 total context. Inventory can report unavailable servers, but only a healthy,
 fully refreshed server can be selected for a new binding.
 
+For `/mcp`, `session_id` makes the response include `selected_servers` and
+`session_revision`. The target must be a top-level session and its
+provider/runtime must match the request.
+
 ### `session.start.mcp`
 
 ```json
@@ -399,6 +404,16 @@ Errors:
   identities.
 - `mcp_unavailable`: a selected server cannot currently validate its full
   catalog.
+
+### `mcp.add`
+
+The request uses the same selection fields plus `session_id` and
+`session_revision`, but `servers` contains additions only. The daemon unions
+persisted raw identities, authors the complete canonical manifest through the
+`session.start` path, and rerenders the prompt. The store atomically installs
+the manifest and prompt after locking and rechecking root scope, idle work,
+delegations, revision, and old fingerprint; it advances `session_revision` and
+emits `mcp.tools_added`.
 
 ## Manifest and persistence
 
@@ -452,7 +467,7 @@ Provider arrays are:
 
 ```text
 stable first-party declarations for this session profile
-+ frozen MCP declarations from McpSessionSnapshot
++ persisted MCP declarations from McpSessionSnapshot
 ```
 
 The persisted PI.md includes a section only for selected sessions:
@@ -468,15 +483,15 @@ or fingerprints. The summary is fully rendered or selection is rejected for
 exceeding its bound; it is never silently truncated.
 
 `tools.list(session_id)` combines the session profile's first-party tools with
-the frozen manifest. Without a session it returns first-party tools only;
-`mcp.inventory` exclusively owns new-session discovery.
+the persisted manifest. Without a session it returns first-party tools only;
+`mcp.inventory` owns selection discovery.
 
 ## Subagents
 
-Both model-facing and RPC delegation load/copy the parent's exact manifest
-binding. Full and every read-only sibling therefore have byte-identical MCP
-declarations and routes, while their provider arrays use the subagent
-first-party profile. A parent with no binding creates MCP-free children.
+Both model-facing and RPC delegation copy the parent's current manifest binding
+at child creation. Existing children do not change after a parent addition.
+Their provider arrays use the subagent first-party profile. A parent with no
+binding creates MCP-free children.
 
 There is no `subagents` config field, audience enum, or exposure filtering.
 Read-only subagents can invoke remote tools with side effects because read-only
@@ -489,7 +504,8 @@ the inherited MCP set at parent session creation.
 admission. Reconnect/refresh updates only the global New Session inventory,
 revision, and health. Publication happens after bounded full-catalog
 validation. Existing manifests and provider-visible bytes do not change.
-Refresh attempts are single-flight per route. A waiter consumes the completed
+Explicit `mcp.add` is the only existing-session manifest mutation. Refresh
+attempts are single-flight per route. A waiter consumes the completed
 attempt generation instead of immediately starting another attempt; unrelated
 healthy route selection does not wait for a coherent unavailable route.
 Streamable HTTP may reconnect its auxiliary server-event SSE stream, but never

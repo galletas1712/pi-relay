@@ -184,8 +184,11 @@ import {
 	type WorkspaceConfiguration,
 } from "./newSessionSetup.tsx";
 import { McpOAuthDialog } from "./mcpOAuthDialog.tsx";
+import { McpAddDialog } from "./mcpAddDialog.tsx";
 import {
 	clearMcpServerSelection,
+	mcpSelectionFromServers,
+	mcpSelectionPayload,
 	mcpSelectionForProviderChange,
 	mcpSelectionPayloadForProvider,
 	reconcileMcpSelection,
@@ -256,6 +259,12 @@ type HistoryDialogState = {
 type DeleteDialogState = {
 	session: SessionListItem;
 	deleting: boolean;
+};
+
+type McpAddTarget = {
+	sessionId: string;
+	runtimeId: string;
+	providerKind: ProviderConfig["kind"];
 };
 
 export interface AppProps {
@@ -425,6 +434,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		runtimeId: string;
 	} | null>(null);
 	const [mcpAuthBusyServer, setMcpAuthBusyServer] = useState<string | null>(null);
+	const [mcpAddTarget, setMcpAddTarget] = useState<McpAddTarget | null>(null);
+	const [mcpAddSelection, setMcpAddSelection] = useState<McpSelectionState>(new Map());
+	const [mcpAddSubmitting, setMcpAddSubmitting] = useState(false);
+	const [mcpPromptGeneration, setMcpPromptGeneration] = useState(0);
 	const mcpLoginContextRef = useRef("");
 	const {
 		cache: selectedCache,
@@ -967,6 +980,37 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		enabled: connection === "open" && routeRemoteReadsEnabled,
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
+	const mcpAddInventoryQuery = useQuery({
+		queryKey: queryKeys.mcpInventory(
+			mcpAddTarget?.providerKind ?? "",
+			mcpAddTarget?.runtimeId ?? "",
+			mcpAddTarget?.sessionId ?? null,
+		),
+		queryFn: () => {
+			assertServerReadAllowed();
+			return api.getMcpInventory(
+				mcpAddTarget!.providerKind,
+				mcpAddTarget!.runtimeId,
+				mcpAddTarget!.sessionId,
+			);
+		},
+		enabled:
+			connection === "open" &&
+			routeRemoteReadsEnabled &&
+			!!mcpAddTarget,
+	});
+	const mcpAddLockedSelection = useMemo(
+		() => mcpSelectionFromServers(mcpAddInventoryQuery.data?.selected_servers),
+		[mcpAddInventoryQuery.data?.selected_servers],
+	);
+	useEffect(() => {
+		if (!mcpAddInventoryQuery.data) return;
+		setMcpAddSelection(mcpAddLockedSelection);
+	}, [
+		mcpAddInventoryQuery.data?.revision,
+		mcpAddInventoryQuery.data?.session_revision,
+		mcpAddLockedSelection,
+	]);
 	// MCP servers live on the session's runtime, so scope the picker to the
 	// runtime the new session will use: the project's runtime, or an online host
 	// runtime.
@@ -2652,6 +2696,18 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					void queryClient.invalidateQueries({ queryKey: delegationQueryPrefix(delegationParentSessionId) });
 				}
 			}
+			if (event.event === "mcp.tools_added") {
+				void queryClient.invalidateQueries({ queryKey: ["tools"] });
+				void queryClient.invalidateQueries({
+					predicate: ({ queryKey }) =>
+						queryKey.length === 4 &&
+						queryKey[0] === "mcp-inventory" &&
+						queryKey[3] === event.session_id,
+				});
+				if (event.session_id === selectedRef.current) {
+					setMcpPromptGeneration((generation) => generation + 1);
+				}
+			}
 
 			if (event.session_id === selectedRef.current) {
 				if (event.event === "model.error") pushErrorNotice(modelErrorNotice(event.data));
@@ -2950,6 +3006,101 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		setRenameSessionId(session.session_id);
 		setRenameValue(sessionTitle(session));
 	}, []);
+
+	const openMcpAddDialog = useCallback((snapshot: SessionSnapshot) => {
+		if (snapshot.parent_session_id) {
+			throw new Error("/mcp requires a top-level session");
+		}
+		if (snapshot.activity !== "idle") {
+			throw new Error("stop the active turn before adding MCP tools");
+		}
+		const listedSession = allKnownSessions.find(
+			(session) => session.session_id === snapshot.session_id,
+		);
+		const targetHasRunningDelegations =
+			listedSession?.has_running_delegations === true ||
+			(
+				snapshot.session_id === delegationParentSessionId &&
+				delegations.some(isDelegationRunning)
+			);
+		if (targetHasRunningDelegations) {
+			throw new Error("wait for running delegations to finish before adding MCP tools");
+		}
+		setMcpAddSelection(new Map());
+		setMcpAddTarget({
+			sessionId: snapshot.session_id,
+			runtimeId: snapshot.runtime_id,
+			providerKind: snapshot.provider.kind,
+		});
+	}, [allKnownSessions, delegationParentSessionId, delegations]);
+
+	const closeMcpAddDialog = useCallback(() => {
+		if (mcpAddSubmitting) return;
+		setMcpAddTarget(null);
+	}, [mcpAddSubmitting]);
+
+	const addMcpTools = useCallback(async () => {
+		const inventory = mcpAddInventoryQuery.data;
+		if (!mcpAddTarget || !inventory || inventory.session_revision === undefined) return;
+		const target = mcpAddTarget;
+		const selection = mcpSelectionPayload(
+			inventory,
+			mcpAddSelection,
+			mcpAddLockedSelection,
+		);
+		if (!selection) return;
+		assertServerMutationAllowed();
+		setMcpAddSubmitting(true);
+		try {
+			await api.addMcpTools({
+				sessionId: target.sessionId,
+				sessionRevision: inventory.session_revision,
+				selection,
+			});
+			setMcpAddTarget(null);
+			if (selectedRef.current === target.sessionId) {
+				setMcpPromptGeneration((generation) => generation + 1);
+			}
+			void Promise.all([
+				queryClient.invalidateQueries({
+					queryKey: queryKeys.mcpInventory(
+						target.providerKind,
+						target.runtimeId,
+						target.sessionId,
+					),
+					exact: true,
+				}),
+				queryClient.invalidateQueries({
+					queryKey: queryKeys.tools(
+						target.providerKind,
+						target.sessionId,
+					),
+				}),
+				selectedRef.current === target.sessionId
+					? refreshSelectedSessionState(target.sessionId)
+					: Promise.resolve(null),
+			]).catch((error: unknown) => {
+				pushErrorNotice(`MCP tools were added, but refresh failed: ${errorMessage(error)}`);
+			});
+		} catch (error) {
+			if (isMcpAddRefreshConflict(error)) {
+				await mcpAddInventoryQuery.refetch().catch(() => undefined);
+			}
+			throw error;
+		} finally {
+			setMcpAddSubmitting(false);
+		}
+	}, [
+		api,
+		assertServerMutationAllowed,
+		mcpAddInventoryQuery.data,
+		mcpAddLockedSelection,
+		mcpAddSelection,
+		mcpAddTarget,
+		queryClient,
+		pushErrorNotice,
+		refreshSelectedSessionState,
+	]);
 
 	const closeRenameDialog = useCallback(() => {
 		setRenameSessionId(null);
@@ -3761,6 +3912,11 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				openHistoryDialog(submittedSnapshot, name);
 				return;
 			}
+			if (name === "mcp") {
+				assertConnectionReadAllowed();
+				openMcpAddDialog(submittedSnapshot);
+				return;
+			}
 			if (name === "export") {
 				const cachedEntries =
 					selectedCacheRef.current.sessionId === sessionId
@@ -3790,7 +3946,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[api, assertConnectionReadAllowed, assertServerMutationAllowed, assertServerReadAllowed, commitSelectedSnapshot, openHistoryDialog],
+		[api, assertConnectionReadAllowed, assertServerMutationAllowed, assertServerReadAllowed, commitSelectedSnapshot, openHistoryDialog, openMcpAddDialog],
 	);
 
 	const submitComposer = useCallback(
@@ -4404,7 +4560,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 							loadedSnapshot?.session_id === selectedId
 								? (
 										<SystemPromptDisclosure
-											key={selectedId}
+											key={`${selectedId}:${mcpPromptGeneration}`}
 											loadPrompt={() => loadSystemPrompt(selectedId)}
 											remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 										/>
@@ -4604,6 +4760,28 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				/>
 			) : null}
 
+			{mcpAddTarget ? (
+				<McpAddDialog
+					inventory={mcpAddInventoryQuery.data ?? null}
+					selection={mcpAddSelection}
+					lockedSelection={mcpAddLockedSelection}
+					loading={mcpAddInventoryQuery.isFetching || mcpAddSubmitting}
+					error={
+						mcpAddInventoryQuery.error
+							? errorMessage(mcpAddInventoryQuery.error)
+							: null
+					}
+					onChange={setMcpAddSelection}
+					onRetry={() => void mcpAddInventoryQuery.refetch()}
+					onClose={closeMcpAddDialog}
+					onSubmit={() => void addMcpTools().catch((error: unknown) => {
+						pushErrorNotice(errorMessage(error));
+					})}
+					mutationBlockedReason={connectionRemoteActionBlockedReason}
+					returnFocusFallbackRef={composerDialogReturnFocusRef}
+				/>
+			) : null}
+
 			{deleteDialog ? (
 				<DeleteSessionDialog
 					session={deleteDialog.session}
@@ -4737,6 +4915,11 @@ function isSessionNotFoundError(error: unknown): boolean {
 
 function isHistoryChangedError(error: unknown): boolean {
 	return errorMessage(error).startsWith("history_changed:");
+}
+
+function isMcpAddRefreshConflict(error: unknown): boolean {
+	return ["session_changed", "mcp_inventory_changed"]
+		.some((code) => isRpcErrorCode(error, code));
 }
 
 function modelErrorNotice(data: Record<string, unknown>): string {

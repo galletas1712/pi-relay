@@ -38,11 +38,12 @@ sending the same websocket frames a frontend would send.
    turn outcomes, not session statuses.
 
 5. History writes and snapshots are idle-only.
-   `history.switch`, `history.fork`, `session.configure`, and
+   `history.switch`, `history.fork`, `session.configure`, `mcp.add`, and
    `compaction.request` fail with
    `session_busy` while work is active or queued. Here idle means there are no
    unfinished actions and no queued inputs waiting to become transcript. The two
    history operations additionally require every delegation for the source
+   session to be terminal. `mcp.add` also requires every delegation for the
    session to be terminal. A frontend should interrupt/cancel the relevant
    work, wait for idle, then retry.
 
@@ -226,7 +227,9 @@ updated_at timestamptz not null default now()
 
 The repository-level `PI.md` is the prompt composition template. At
 `session.start`, the daemon renders it with the materialized session context and
-persists the result as the session's immutable `sessions.system_prompt`. Normal
+persists the result in `sessions.system_prompt`. A successful idle-only
+`mcp.add` fully rerenders and atomically replaces this prompt with the updated
+MCP manifest. Normal
 provider requests use that stored prompt as the stable prefix followed by
 transcript history; the daemon does not inject a top-level
 `## Current delegations` dashboard into ordinary turns. Parent-session
@@ -605,11 +608,11 @@ revision, `mcp_selection_invalid` for unknown/duplicate/disallowed identities,
 and `mcp_unavailable` when a selected server cannot be validated. The client
 must refresh/reconcile and must not silently select newly published tools.
 
-The selected MCP manifest is frozen for the whole durable session. Later
-configuration refreshes, reconnects, and `tools/list_changed` notifications
-affect only New Session inventory. A retry with the same stable `session_id`
-returns the existing session before consulting current inventory and cannot
-replace its binding.
+The selected MCP manifest is stable between explicit additions. Inventory
+refreshes, reconnects, and `tools/list_changed` notifications never mutate a
+session automatically. `mcp.add` reauthors the current complete selected set
+from the latest inventory. A retry of `session.start` with the same stable
+`session_id` still returns the existing session before consulting inventory.
 
 For project sessions the daemon snapshots the project's current
 `workspaces` into the new session row and assigns a per-session `outer_cwd`;
@@ -1012,6 +1015,47 @@ views. Responses and `session.configured` events include `provider`,
 `metadata`, and `activity` so clients can patch cached summaries and selected
 snapshots.
 
+### `mcp.add`
+
+Adds MCP tools to an existing idle top-level session. The web frontend opens
+this flow only through `/mcp`; there is no sidebar action.
+
+```json
+{
+  "session_id": "s1",
+  "session_revision": 12,
+  "inventory_revision": "sha256...",
+  "servers": [{
+    "server": "workspace",
+    "tools": ["new_tool"]
+  }]
+}
+```
+
+`servers` contains additions only. The daemon unions persisted raw identities
+and passes the complete selection through the same current-inventory authoring
+path as `session.start`; duplicate/already-selected additions are invalid.
+
+The daemon and store both require a root session with no active work or
+running/cancelling delegation. Missing, subordinate, busy, and stale targets
+return `session_not_found`, `root_session_required`, `session_busy`, and
+`session_changed`. Under the session-row lock, the store fences the old
+revision/fingerprint and atomically installs the new canonical manifest plus
+fully rerendered prompt. Only `session_revision` advances, and one
+`mcp.tools_added` event is emitted. Post-commit event cleanup is best effort.
+
+Response:
+
+```json
+{
+  "session_id": "s1",
+  "manifest_fingerprint": "sha256...",
+  "session_revision": 13,
+  "queue_revision": 4,
+  "transcript_revision": 9
+}
+```
+
 ### `session.sync_active_branch`
 
 Cheap incremental reconciliation of the selected session's active branch.
@@ -1043,7 +1087,7 @@ deleted hidden subagent tree. A missing session is `session_not_found`.
 ### `system.prompt`
 
 Returns the repo-level `PI.md` prompt composition template and the rendered
-prompt for an existing session's frozen config. `session_id` is required; the
+prompt for an existing session's current persisted config. `session_id` is required; the
 RPC does not preview project prompts before the project workspaces have been
 materialized by `session.start`.
 
@@ -1945,7 +1989,7 @@ completion is only through `mcp.complete`.
 ### `mcp.inventory`
 
 Requires `provider: "openai" | "claude"` and `runtime_id`, and returns the
-bounded configured New Session inventory for that runtime:
+bounded configured selection inventory for that runtime:
 
 ```json
 {
@@ -1963,11 +2007,24 @@ bounded configured New Session inventory for that runtime:
 }
 ```
 
+Pass `session_id` for the existing-session picker. The target must be
+structurally top-level and match the provider/runtime. The response additionally
+carries the durable raw selection and freshness fence:
+
+```json
+{
+  "selected_servers": [{
+    "server": "workspace",
+    "tools": ["read_file"]
+  }],
+  "session_revision": 12
+}
+```
+
 The inventory and per-server revisions are semantic hashes; health is excluded.
 `context_token_estimate` is computed from that provider's exact declaration
 JSON and estimates additional MCP declaration context only, not total model
-context. The frontend has a distinct provider-keyed inventory cache; inventory
-refreshes never overwrite an existing session's tool inspector.
+context. Inventory refreshes never overwrite a session automatically.
 
 ### `tools.list`
 
@@ -1989,16 +2046,17 @@ fallback when no `session_id` is available. There are no `read`/`write` tools.
 Each returned entry carries `name`, `description`, `input_schema`,
 `canonical_name`, `prompt_alias`, `execution`, and `kind: "local_tool"`.
 
-With a `session_id`, the response also includes only that session's frozen MCP
+With a `session_id`, the response also includes that session's current MCP
 tools. These entries use `kind: "mcp_tool"` and add observational `source`, raw
 `server`/`raw_name`, `manifest_fingerprint`, `contract_fingerprint`, and
 `health` fields. Without `session_id`, `tools.list` is first-party-only;
-`mcp.inventory` exclusively owns New Session discovery. Health is not part of
+`mcp.inventory` owns MCP discovery and selection. Health is not part of
 provider declarations or the persisted prompt. Exact provider declarations,
 not this inspector response or PI.md prose, determine what a model may call.
 MCP rows match the persisted manifest declarations and fingerprints.
 
-Full and read-only delegation children inherit the parent's exact MCP manifest;
+Full and read-only delegation children inherit the parent's current MCP
+manifest when the child is created;
 only parent-specific first-party delegation tools are filtered from child
 profiles. Read-only status constrains the child's local filesystem view, not
 remote MCP side effects.
@@ -2066,6 +2124,7 @@ Current event names:
 ```text
 session.created
 session.configured
+mcp.tools_added
 input.accepted
 input.queued
 input.consumed
@@ -2358,6 +2417,8 @@ Verify:
 - `/switch` is idle-only. Switching to a user-message target restores that
   historical text into the composer; switching to a completed turn or
   compaction root changes the active leaf inside the same session.
+- `/mcp` opens the additive MCP picker for a fully loaded, idle,
+  delegation-quiet top-level session.
 - `/new`, `/retry`, `/continue`, `/rename`, `/archive`, `/unarchive`,
   `/tree` are not part of the user-facing slash surface.
 - Crashed and interrupted terminal model turns show Retry/Continue actions that

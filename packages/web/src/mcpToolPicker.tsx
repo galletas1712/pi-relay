@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, Plug } from "lucide-react";
 import {
 	mcpSelectionTotals,
 	clearMcpServerSelection,
+	inventoryWithSelection,
 	serverSelectionState,
 	toggleServer,
 	toggleTool,
@@ -25,12 +26,14 @@ function MixedCheckbox({
 export const McpToolPicker = memo(function McpToolPicker({
 	inventory,
 	selection,
+	lockedSelection = new Map(),
 	onChange,
 	disabled,
 	inventoryReady = true,
 	open: controlledOpen,
 	onOpenChange,
 	authStatus = [],
+	authStatusRequired = true,
 	authStatusReady = true,
 	onLogin,
 	onLogout,
@@ -39,12 +42,14 @@ export const McpToolPicker = memo(function McpToolPicker({
 }: {
 	inventory: McpInventory;
 	selection: McpSelectionState;
+	lockedSelection?: McpSelectionState;
 	onChange: (selection: McpSelectionState) => void;
 	disabled?: boolean;
 	inventoryReady?: boolean;
 	open?: boolean;
 	onOpenChange?: (open: boolean) => void;
 	authStatus?: McpAuthServerStatus[];
+	authStatusRequired?: boolean;
 	authStatusReady?: boolean;
 	onLogin?: (server: string) => void;
 	onLogout?: (server: string) => void;
@@ -55,15 +60,16 @@ export const McpToolPicker = memo(function McpToolPicker({
 	const [internalOpen, setInternalOpen] = useState(false);
 	const open = controlledOpen ?? internalOpen;
 	const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
-	const inventoryByServer = new Map(inventory.servers.map((server) => [server.server, server]));
+	const pickerInventory = inventoryWithSelection(inventory, lockedSelection);
+	const inventoryByServer = new Map(pickerInventory.servers.map((server) => [server.server, server]));
 	const authByServer = new Map(authStatus.map((status) => [status.server, status]));
 	const serverIds = [...new Set([
 		...authStatus.map((status) => status.server),
-		...inventory.servers.map((server) => server.server),
+		...pickerInventory.servers.map((server) => server.server),
 	])].sort();
 	if (!serverIds.length) return null;
 	const panelId = `${idPrefix}-mcp-panel`;
-	const total = mcpSelectionTotals(inventory, selection);
+	const total = mcpSelectionTotals(pickerInventory, selection);
 	const selectionStatus = mcpSelectionStatus(total.tools, total.contextTokens);
 	const setOpen = (nextOpen: boolean) => {
 		if (controlledOpen === undefined) setInternalOpen(nextOpen);
@@ -122,15 +128,18 @@ export const McpToolPicker = memo(function McpToolPicker({
 					{serverIds.map((serverId, serverIndex) => {
 						const server = inventoryByServer.get(serverId) ?? missingInventoryServer(serverId);
 						const auth = authByServer.get(serverId);
-						const state = serverSelectionState(inventory, selection, server.server);
+						const state = serverSelectionState(pickerInventory, selection, server.server);
 						const isExpanded = expanded.has(server.server);
 						const selected = selection.get(server.server);
 						const selectionReady =
-							authStatusReady &&
-							!!auth &&
-							(auth.auth_kind !== "oauth" || auth.auth_state === "ready");
+							!authStatusRequired ||
+							(authStatusReady &&
+								!!auth &&
+								(auth.auth_kind !== "oauth" || auth.auth_state === "ready"));
+						const locked = lockedSelection.get(server.server);
+						const hasEditableTools = server.tools.some((tool) => !locked?.has(tool.raw_name));
 						const canToggleServer =
-							server.tools.length > 0 &&
+							hasEditableTools &&
 							(!!selected?.size ||
 								(selectionReady && inventoryReady && server.health === "healthy"));
 						const contextTokens = server.tools
@@ -172,8 +181,8 @@ export const McpToolPicker = memo(function McpToolPicker({
 														selectionReady &&
 															inventoryReady &&
 															server.health === "healthy"
-															? toggleServer(inventory, selection, server.server)
-															: clearMcpServerSelection(selection, server.server),
+															? toggleServer(pickerInventory, selection, server.server, lockedSelection)
+															: clearMcpServerSelection(selection, server.server, lockedSelection),
 													)}
 											/>
 											<span>{server.server}</span>
@@ -301,14 +310,16 @@ export const McpToolPicker = memo(function McpToolPicker({
 													checked={selected?.has(tool.raw_name) ?? false}
 													disabled={
 														disabled ||
+														locked?.has(tool.raw_name) ||
 														(!selectionReady && !selected?.has(tool.raw_name)) ||
 														(!inventoryReady && !selected?.has(tool.raw_name)) ||
 														(server.health !== "healthy" && !selected?.has(tool.raw_name))
 													}
-													onChange={() => onChange(toggleTool(selection, server.server, tool.raw_name))}
+													onChange={() => onChange(toggleTool(selection, server.server, tool.raw_name, lockedSelection))}
 												/>
 												<span>
 													<strong>{tool.raw_name}</strong>
+													{locked?.has(tool.raw_name) ? <small>Already selected</small> : null}
 													{tool.description ? <small>{tool.description}</small> : null}
 												</span>
 												<small>About {contextTokensLabel(tool.context_token_estimate)}</small>

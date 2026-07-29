@@ -99,6 +99,12 @@ events(id bigserial, session_id, type, payload jsonb, created_at)
   in one transaction. `NULL` is explicitly MCP-free, including pre-schema
   sessions; it never means "use current inventory". Child sessions copy the
   parent's exact fingerprint in their own creation transaction.
+- Additive MCP updates lock the session row, recheck that it has no structural
+  parent, no active actions/queue, and no running/cancelling delegation, verify
+  expected session revision and old fingerprint, collision-check/install the
+  new manifest, and update the fingerprint plus fully rerendered system prompt
+  in one transaction. Missing rows and subordinate rows use typed store errors.
+  Only `session_revision` advances and one `mcp.tools_added` event is emitted.
 
 The persistence-facing vocabularies (`ProviderKind`, `InputPriority`,
 `QueuedInputStatus`, `ActionKind`, `ActionStatus`, `SessionActivity`,

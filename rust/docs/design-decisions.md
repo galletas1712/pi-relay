@@ -162,9 +162,13 @@ switch picker.
 
 The repository-level `PI.md` is the system-prompt template. After project
 workspaces are materialized, the daemon renders it with the session's
-workspace, tool, and skill context and persists the result as the immutable
-`sessions.system_prompt`. Provider calls use that stored prompt, so repository
-template edits cannot introduce prompt drift within a session. The
+workspace, tool, and skill context and persists the result in
+`sessions.system_prompt`. Provider calls use that stored prompt. An idle
+top-level session's `mcp.add` fully rerenders the prompt while atomically
+installing the additive MCP manifest, so current repository
+template/instruction/skill edits may become visible at that explicit mutation
+point. Structurally subordinate sessions are rejected rather than attempting
+to reconstruct their role/delegation prompt suffix. The
 session-scoped `system.prompt` RPC returns the selected session's persisted
 prompt together with the current repository template; it does not re-render or
 mutate the session prompt.

@@ -50,6 +50,35 @@ function oauthStatus(
 }
 
 describe("McpToolPicker", () => {
+	it("renders seeded existing tools selected and locked while sharing normal add toggles", async () => {
+		const onChange = vi.fn();
+		const locked = new Map([["workspace", new Set(["read"])]]);
+		render(
+			<McpToolPicker
+				inventory={INVENTORY}
+				selection={locked}
+				lockedSelection={locked}
+				onChange={onChange}
+				authStatusRequired={false}
+				open
+			/>,
+		);
+		await userEvent.click(screen.getByRole("button", { name: "expand workspace tools" }));
+
+		const existing = screen.getByRole<HTMLInputElement>("checkbox", { name: /read/i });
+		expect(existing.checked).toBe(true);
+		expect(existing.disabled).toBe(true);
+		expect(screen.getByText("Already selected")).toBeTruthy();
+		const addition = screen.getByRole<HTMLInputElement>("checkbox", { name: /write/i });
+		expect(addition.disabled).toBe(false);
+		await userEvent.click(addition);
+		expect(onChange).toHaveBeenCalledWith(
+			new Map([
+				["workspace", new Set(["read", "write"])],
+			]),
+		);
+	});
+
 	it("omits markup when there are no configured servers", () => {
 		expect(renderToStaticMarkup(
 			<McpToolPicker inventory={{ revision: "empty", servers: [] }} selection={new Map()} onChange={() => {}} />,

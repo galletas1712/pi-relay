@@ -335,6 +335,121 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
+	it("adds MCP tools, closes on acknowledgement, and invalidates the prompt despite refresh failure", async () => {
+		const api = createRouteApi({ runningRootDelegation: false });
+		vi.mocked(api.getSystemPrompt)
+			.mockResolvedValueOnce({
+				template: "Old template",
+				rendered: "Old loaded prompt",
+			})
+			.mockResolvedValue({
+				template: "New template",
+				rendered: "New loaded prompt",
+			});
+		vi.mocked(api.addMcpTools).mockResolvedValue({
+			session_id: "root-1",
+			manifest_fingerprint: "manifest-2",
+			session_revision: 2,
+			queue_revision: 1,
+			transcript_revision: 1,
+		});
+		const mounted = renderRouteApp(
+			api,
+			new FakeWorkspaceBrowser("/w/host/run/root-1/conversation/root-1"),
+		);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+		expect(await screen.findByText("Old loaded prompt")).toBeTruthy();
+		await user.type(await screen.findByRole("textbox"), "/mcp");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		expect(await screen.findByRole("heading", { name: "Add MCP tools" })).toBeTruthy();
+		await waitFor(() =>
+			expect(api.getMcpInventory).toHaveBeenCalledWith(
+				"openai",
+				"runtime-test",
+				"root-1",
+			),
+		);
+		await user.click(screen.getByRole("button", { name: /^MCP tools/ }));
+		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
+		api.getSession.mockRejectedValueOnce(new Error("snapshot refresh failed"));
+		await user.click(screen.getByRole("button", { name: "Add tools" }));
+
+		await waitFor(() => expect(api.addMcpTools).toHaveBeenCalledWith({
+			sessionId: "root-1",
+			sessionRevision: 1,
+			selection: {
+				inventoryRevision: "inventory-1",
+				servers: [{ server: "workspace", tools: ["write"] }],
+			},
+		}));
+		await waitFor(() =>
+			expect(screen.queryByRole("heading", { name: "Add MCP tools" })).toBeNull(),
+		);
+		expect(screen.queryByText("Old loaded prompt")).toBeNull();
+		expect(screen.getByRole("button", { name: "See system prompt" })).toBeTruthy();
+		await waitFor(() =>
+			expect(screen.getByText(/MCP tools were added, but refresh failed/)).toBeTruthy(),
+		);
+
+		await user.click(screen.getByRole("button", { name: "See system prompt" }));
+		expect(await screen.findByText("New loaded prompt")).toBeTruthy();
+		await act(async () => api.emitEvent({
+			event_id: 2,
+			event: "mcp.tools_added",
+			session_id: "root-1",
+			data: { session_revision: 2 },
+		}));
+		expect(screen.queryByText("New loaded prompt")).toBeNull();
+
+		await mounted.dispose();
+	});
+
+	it.each([
+		{
+			label: "subagent",
+			url: "/w/host/run/root-1/conversation/child-1",
+			options: { runningRootDelegation: false },
+			error: "/mcp requires a top-level session",
+		},
+		{
+			label: "busy root",
+			url: "/w/host/run/root-1/conversation/root-1",
+			options: {
+				runningRootDelegation: false,
+				activities: new Map([["root-1", "running" as const]]),
+			},
+			error: "stop the active turn before adding MCP tools",
+		},
+		{
+			label: "root with a running delegation",
+			url: "/w/host/run/root-1/conversation/root-1",
+			options: { runningRootDelegation: true },
+			error: "wait for running delegations to finish before adding MCP tools",
+		},
+	])("rejects /mcp for a $label and restores the slash draft", async ({ url, options, error }) => {
+		const api = createRouteApi(options);
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser(url));
+		const user = userEvent.setup();
+
+		await open(api);
+		const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
+		await user.type(composer, "/mcp");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		expect(await screen.findByText(error)).toBeTruthy();
+		await waitFor(() => expect(composer.value).toBe("/mcp"));
+		expect(screen.queryByRole("heading", { name: "Add MCP tools" })).toBeNull();
+		expect(
+			api.getMcpInventory.mock.calls.some(([, , sessionId]) => typeof sessionId === "string"),
+		).toBe(false);
+
+		await mounted.dispose();
+	});
+
 	it("retains a forked user-message draft when popstate wins a delayed RPC race", async () => {
 		const fork = deferred<ReturnType<typeof forkResult>>();
 		const browser = new FakeWorkspaceBrowser(
@@ -2610,6 +2725,7 @@ type RouteApi = AgentApi & {
 	listSessions: ApiSpy;
 	listTools: ApiSpy;
 	getMcpInventory: ApiSpy;
+	addMcpTools: ApiSpy;
 	getMcpStatus: ApiSpy;
 	loginMcp: ApiSpy;
 	cancelMcpLogin: ApiSpy;
@@ -2640,6 +2756,7 @@ function createRouteApi(
 			entries: TranscriptEntry[];
 		}>;
 		noMcpConfiguration?: boolean;
+		activities?: Map<string, SessionSnapshot["activity"]>;
 	} = {},
 ): RouteApi {
 	let open = false;
@@ -2697,16 +2814,24 @@ function createRouteApi(
 			throw new RpcRequestError("session_not_found", "session not found", {});
 		}
 		if (sessionId === "root-1") {
-			return snapshot(
+			return {
+				...snapshot(
 				"root-1",
 				null,
 				null,
 				"Root one",
 				options.activeLeafIds?.get(sessionId) ??
 					(options.historySessionIds?.has(sessionId) ? "entry-active" : null),
-			);
+				),
+				activity: options.activities?.get(sessionId) ?? "idle",
+			};
 		}
-		if (sessionId === "child-1") return snapshot("child-1", "root-1", null, "Child one");
+		if (sessionId === "child-1") {
+			return {
+				...snapshot("child-1", "root-1", null, "Child one"),
+				activity: options.activities?.get(sessionId) ?? "idle",
+			};
+		}
 		if (sessionId === "child-a") return snapshot("child-a", "root-1", null, "Child A");
 		if (sessionId === "fork-child") {
 			return snapshot("fork-child", null, "project-1", "Fork child");
@@ -2781,8 +2906,23 @@ function createRouteApi(
 			summaries.filter((session) => session.project_id === projectId)),
 		listDelegations,
 		listTools: vi.fn(async () => []),
-		getMcpInventory: vi.fn(async () =>
-			options.noMcpConfiguration ? { revision: "empty", servers: [] } : mcpInventory()),
+		getMcpInventory: vi.fn(async (
+			_provider: string,
+			_runtimeId: string,
+			sessionId?: string | null,
+		) => {
+			const inventory = options.noMcpConfiguration
+				? { revision: "empty", servers: [] }
+				: mcpInventory();
+			return sessionId
+				? {
+						...inventory,
+						session_revision: 1,
+						selected_servers: [{ server: "workspace", tools: ["read"] }],
+					}
+				: inventory;
+		}),
+		addMcpTools: mutation(),
 		getMcpStatus: vi.fn(async () => ({
 			servers: options.noMcpConfiguration ? [] : [{
 				server: "workspace",

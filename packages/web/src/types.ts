@@ -418,6 +418,8 @@ export interface McpInventoryServer {
 export interface McpInventory {
 	revision: string;
 	servers: McpInventoryServer[];
+	selected_servers?: McpServerSelection[];
+	session_revision?: number;
 }
 
 export type McpAuthKind = "none" | "bearer" | "oauth";
@@ -456,9 +458,14 @@ export interface McpLogoutResult {
 	result: "removed" | "not_found";
 }
 
-export interface StartSessionMcpSelection {
+export interface McpServerSelection {
+	server: string;
+	tools: string[];
+}
+
+export interface McpSelection {
 	inventoryRevision: string;
-	servers: { server: string; tools: string[] }[];
+	servers: McpServerSelection[];
 }
 
 export type NoticeTone = "info" | "success" | "error";

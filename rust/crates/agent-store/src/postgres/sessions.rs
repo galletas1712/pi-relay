@@ -4,8 +4,10 @@ use serde_json::{json, Map, Value};
 use sqlx::Row;
 
 use crate::{
-    AcceptedInput, EventFrame, EventType, InputPriority, OutputBatch, PersistedAction,
-    SessionActivity, SessionConfig, SessionSummary, SessionWorkspace, SubagentType,
+    AcceptedInput, AddSessionMcpResult, EventFrame, EventType, InputPriority,
+    McpSessionManifestBinding, OutputBatch, PersistedAction, RootSessionRequired, SessionActivity,
+    SessionConfig, SessionConfigChanged, SessionNotFound, SessionSummary, SessionWorkspace,
+    SubagentType, VersionedSessionConfig,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 
@@ -14,9 +16,10 @@ use super::mcp::install_session_manifest_tx;
 use super::outputs::persist_outputs_tx;
 use super::queue::bump_revisions_tx;
 use super::sql::{
-    action_is_unfinished, ensure_no_active_work_tx, freeze_legacy_routes_tx, lock_session_tx,
-    queued_input_is_active, session_activity,
+    action_is_unfinished, ensure_no_active_work_tx, ensure_no_running_delegation_tx,
+    freeze_legacy_routes_tx, lock_session_tx, queued_input_is_active, session_activity,
 };
+use super::transcript::session_state_for_event_tx;
 use super::PostgresAgentStore;
 
 fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -148,6 +151,71 @@ impl PostgresAgentStore {
         .await?;
         tx.commit().await?;
         Ok(vec![event])
+    }
+
+    pub async fn add_session_mcp(
+        &self,
+        session_id: &str,
+        expected_session_revision: i64,
+        expected_manifest_fingerprint: Option<&str>,
+        binding: &McpSessionManifestBinding,
+        system_prompt: &str,
+    ) -> Result<AddSessionMcpResult> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
+        let current: (i64, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "select session_revision, mcp_manifest_fingerprint, parent_session_id, subagent_type from sessions where id=$1",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if current.2.is_some() || current.3.is_some() {
+            return Err(RootSessionRequired.into());
+        }
+        ensure_no_active_work_tx(&mut tx, session_id).await?;
+        ensure_no_running_delegation_tx(&mut tx, session_id).await?;
+        if current.0 != expected_session_revision
+            || current.1.as_deref() != expected_manifest_fingerprint
+        {
+            return Err(SessionConfigChanged.into());
+        }
+        install_session_manifest_tx(&mut tx, binding).await?;
+        sqlx::query(
+            r#"
+            update sessions
+            set mcp_manifest_fingerprint=$2,
+                system_prompt=$3,
+                updated_at=now()
+            where id=$1
+            "#,
+        )
+        .bind(session_id)
+        .bind(&binding.manifest_fingerprint)
+        .bind(system_prompt)
+        .execute(&mut *tx)
+        .await?;
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
+        let state = session_state_for_event_tx(&mut tx, session_id).await?;
+        let event = insert_event_tx(
+            &mut tx,
+            session_id,
+            EventType::McpToolsAdded,
+            json!({
+                "manifest_fingerprint": binding.manifest_fingerprint,
+                "session_revision": state.session_revision,
+                "queue_revision": state.queue_revision,
+                "transcript_revision": state.transcript_revision,
+                "activity": state.activity,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(AddSessionMcpResult {
+            session_revision: state.session_revision,
+            queue_revision: state.queue_revision,
+            transcript_revision: state.transcript_revision,
+            events: vec![event],
+        })
     }
 
     pub async fn update_session_metadata(
@@ -426,7 +494,7 @@ impl PostgresAgentStore {
     pub async fn delete_session(&self, session_id: &str) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         if let Err(error) = lock_session_tx(&mut tx, session_id).await {
-            if error.to_string().starts_with("session not found:") {
+            if error.downcast_ref::<SessionNotFound>().is_some() {
                 tx.commit().await?;
                 return Ok(false);
             }
@@ -562,6 +630,13 @@ impl PostgresAgentStore {
     }
 
     pub async fn load_session_config(&self, session_id: &str) -> Result<SessionConfig> {
+        Ok(self.load_versioned_session_config(session_id).await?.config)
+    }
+
+    pub async fn load_versioned_session_config(
+        &self,
+        session_id: &str,
+    ) -> Result<VersionedSessionConfig> {
         let row = sqlx::query(
             r#"
             select
@@ -572,6 +647,9 @@ impl PostgresAgentStore {
                 s.system_prompt,
                 s.provider_config,
                 s.metadata,
+                s.session_revision,
+                s.parent_session_id,
+                s.subagent_type,
                 s.mcp_manifest_fingerprint,
                 m.manifest as mcp_manifest
             from sessions s
@@ -583,25 +661,33 @@ impl PostgresAgentStore {
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await?
-        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-        Ok(SessionConfig {
-            project_id: row.get("project_id"),
-            runtime_id: row.get("runtime_id"),
-            workspace_id: row.get("workspace_id"),
-            workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
-                row.get::<Value, _>("workspaces"),
-            )?,
-            system_prompt: row.get("system_prompt"),
-            provider: serde_json::from_value(row.get("provider_config"))?,
-            metadata: row.get("metadata"),
-            mcp_manifest: row
-                .get::<Option<String>, _>("mcp_manifest_fingerprint")
-                .map(|manifest_fingerprint| crate::McpSessionManifestBinding {
-                    manifest_fingerprint,
-                    manifest: row
-                        .get::<Option<Value>, _>("mcp_manifest")
-                        .expect("MCP manifest foreign key must resolve"),
-                }),
+        .ok_or_else(|| anyhow::Error::new(SessionNotFound))?;
+        Ok(VersionedSessionConfig {
+            config: SessionConfig {
+                project_id: row.get("project_id"),
+                runtime_id: row.get("runtime_id"),
+                workspace_id: row.get("workspace_id"),
+                workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
+                    row.get::<Value, _>("workspaces"),
+                )?,
+                system_prompt: row.get("system_prompt"),
+                provider: serde_json::from_value(row.get("provider_config"))?,
+                metadata: row.get("metadata"),
+                mcp_manifest: row
+                    .get::<Option<String>, _>("mcp_manifest_fingerprint")
+                    .map(|manifest_fingerprint| crate::McpSessionManifestBinding {
+                        manifest_fingerprint,
+                        manifest: row
+                            .get::<Option<Value>, _>("mcp_manifest")
+                            .expect("MCP manifest foreign key must resolve"),
+                    }),
+            },
+            session_revision: row.get("session_revision"),
+            parent_session_id: row.get("parent_session_id"),
+            subagent_type: row
+                .get::<Option<String>, _>("subagent_type")
+                .map(|raw| raw.parse::<SubagentType>().map_err(|error| anyhow!(error)))
+                .transpose()?,
         })
     }
 
