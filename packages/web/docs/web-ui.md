@@ -158,7 +158,11 @@ entry stream.
   in its segment.
 - Crashed or interrupted terminal turns expose a Continue/Retry action inline that calls `turn.resume`.
 - Turn-start, graceful turn-finish, and tool-call-start bookkeeping entries are not rendered as messages.
-- Turn-jump controls page between turn anchors. Entering a root or subagent
+- Transcript navigation controls page through currently rendered transcript
+  stops: the system-prompt prelude when the oldest page is loaded, visible
+  summary/detail blocks, and assistant response endpoints. Expanding details
+  adds stops and collapsing them removes those hidden stops; duration/status
+  metadata remains visible without becoming a stop. Entering a root or subagent
   conversation—through direct load, navigation, Back/Forward, or a transcript
   branch switch—waits for the matching rendered canonical turn page and
   initializes once at latest/bottom. A successful branch-switch destination is

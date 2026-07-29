@@ -1100,10 +1100,6 @@ pre {
 	margin: 0 auto var(--space-4);
 }
 
-.turn-jump-target {
-	display: block;
-}
-
 .turn-jump-controls {
 	position: absolute;
 	right: max(16px, env(safe-area-inset-right, 0px));

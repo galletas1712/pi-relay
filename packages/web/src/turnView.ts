@@ -161,14 +161,6 @@ export function modelStepTitle(step: Pick<ModelStepView, "phase" | "turnId">): s
 	}
 }
 
-export function terminalModelStep(turn: TurnView): ModelStepView | null {
-	for (let index = turn.modelSteps.length - 1; index >= 0; index -= 1) {
-		const step = turn.modelSteps[index];
-		if (step.phase === "final_answer") return step;
-	}
-	return turn.modelSteps.at(-1) ?? null;
-}
-
 export function userMessageExportText(entry: UserTranscriptEntry): string {
 	return contentBlocksToText(entry.item.content).trim();
 }
