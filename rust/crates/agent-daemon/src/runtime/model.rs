@@ -316,7 +316,14 @@ async fn run_model_for_action_with_retries(
                 "action attempt is no longer running",
             ));
         }
-        let result = run_model(state, &dispatch.config, session_id, request.clone()).await;
+        let result = run_model(
+            state,
+            &dispatch.config,
+            session_id,
+            request.clone(),
+            &dispatch.mcp_snapshot,
+        )
+        .await;
         match result {
             Ok(response) => {
                 return Ok(Ok(CompletedModelResponse {

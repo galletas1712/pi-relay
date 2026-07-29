@@ -21,6 +21,10 @@ snapshot isolation only; remote tools may still mutate external systems.
 - Map each canonical tool to one provider-facing form per `ProviderKind`
   (a `ProviderTool`: model-visible name, schema, and the exact JSON sent on the
   wire).
+- Decorate canonical first-party declarations with the final model-visible
+  `call_description` contract during registry construction.
+- Validate and normalize new model tool calls, and strip model-only metadata
+  from an execution clone.
 - Canonicalize provider wire names back to internal names for execution.
 - Carry the per-call `ToolContext` (session cwd + timeout).
 - Bound tool output with a character-budget approximation before it re-enters
@@ -51,6 +55,11 @@ snapshot isolation only; remote tools may still mutate external systems.
 - `tool_display` — replay-display labels (pretty name + a one-line input
   summary) for transcript rendering.
 - `limit_tool_output*` — output bounding (see Notes).
+- `admit_new_tool_calls` / `tool_call_for_execution` — enforce the
+  trimmed, nonblank, single-line description only on newly returned non-MCP
+  main-agent calls, then remove it from a cloned first-party dispatch payload.
+  Frozen MCP names are used only as an exemption set, and MCP declarations and
+  arguments remain server-owned and unchanged.
 
 ## Registered tools
 
@@ -64,7 +73,7 @@ semantics justify it.
 
 | Canonical    | OpenAI form                               | Anthropic form                                  | prompt_alias       | Executor                         |
 |--------------|-------------------------------------------|-------------------------------------------------|--------------------|----------------------------------|
-| `Edit`       | `apply_patch` (custom Lark grammar)       | `str_replace_based_edit_tool` (`text_editor_20250728`) | `edit`      | `ApplyPatchTool` / `TextEditorTool` |
+| `Edit`       | `apply_patch` (custom Lark grammar)       | `str_replace_based_edit_tool` (JSON client tool) | `edit`      | `ApplyPatchTool` / `TextEditorTool` |
 | `Bash`       | `Bash` (JSON function)                    | `Bash` (JSON client tool)                       | `shell`            | `BashTool`                       |
 | `WebSearch`  | `web_search` (JSON function)              | `web_search` (JSON client tool)                 | `web_search`       | `WebSearchTool`                  |
 | `WebFetch`   | `web_fetch` (JSON function)               | `web_fetch` (JSON client tool)                  | `web_fetch`        | `WebFetchTool`                   |
@@ -76,29 +85,32 @@ semantics justify it.
 | `steer_subagent` | `steer_subagent` (JSON function) | `steer_subagent` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 | `interrupt_subagent` | `interrupt_subagent` (JSON function) | `interrupt_subagent` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 
-There are no `read`/`write` tools. File reads go through `Edit`'s `view`
-command (Anthropic) or through `Bash` (`cat`, `sed`, `rg`, …) on OpenAI.
+`FirstPartyToolExtension` decorates JSON definitions once in
+`register_runtime_tool` / `register_uniform`; `register_edit` constructs the
+provider-shaped final declarations directly. Other registry extensions,
+including MCP, are not decorated. There are no `read`/`write` tools.
 
-### edit — provider-native
+### edit — provider-shaped
 
 The only tool where the two providers see structurally different schemas,
-because both providers are trained on a specific edit surface and paraphrasing
-either as a generic function tool would discard that prior.
+while retaining the existing operation names and execution semantics.
 
 - **OpenAI** — `apply_patch`, an OpenAI `custom` tool whose input is a Lark
-  grammar (`APPLY_PATCH_LARK_GRAMMAR`, re-exported from the crate root). The
-  model emits a raw `*** Begin Patch … *** End Patch` body, not JSON
-  (`LocalFreeformText`), so large diffs escape JSON-string quoting.
+  grammar based on `APPLY_PATCH_LARK_GRAMMAR`. The model emits a required
+  `call_description: ...` header followed by the raw
+  `*** Begin Patch … *** End Patch` body (`LocalFreeformText`), so large diffs
+  escape JSON-string quoting. Admission stores both the description and raw
+  patch as JSON while replay keeps the custom provider item.
   `ApplyPatchTool` parses the patch in-process — Add / Delete / Update (with
   optional `*** Move to:`) — applies hunks by exact-substring match against file
   contents, and returns a compact `A`/`D`/`M`/`R` change summary. No external
   `apply_patch` binary is spawned; a missing file or unmatched hunk is an error
   `ToolResult`.
-- **Anthropic** — `str_replace_based_edit_tool` declared as
-  `text_editor_20250728`. `TextEditorTool` implements `view` (file or directory
-  listing, optional `view_range`), `create`, `str_replace` (first occurrence;
-  missing target is `EditTargetNotFound`), and `insert`. `undo_edit` is not
-  offered.
+- **Anthropic** — `str_replace_based_edit_tool` is a normal client JSON tool.
+  It uses the existing editor operation schema plus `call_description`.
+  `TextEditorTool` implements `view` (file or directory listing, optional
+  `view_range`), `create`, `str_replace` (first occurrence; missing target is
+  `EditTargetNotFound`), and `insert`. `undo_edit` is not offered.
 
 ### bash — uniform custom function
 

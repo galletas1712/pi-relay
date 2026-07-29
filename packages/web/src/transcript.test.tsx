@@ -598,6 +598,68 @@ describe("ToolOutput", () => {
 });
 
 describe("MessageList tool use cards", () => {
+	it("prefers call_description titles while retaining historical command fallbacks", () => {
+		const described = {
+			type: "tool_call" as const,
+			id: "call_1",
+			tool_name: "Bash",
+			args_json: "{\"call_description\":\"Inspect the checked-out files.\",\"command\":\"ls -la\"}"
+		};
+		const historical = {
+			type: "tool_call" as const,
+			id: "call_2",
+			tool_name: "Bash",
+			args_json: "{\"command\":\"pwd\"}"
+		};
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[
+					turnStartedEntry("start", 1, 1),
+					userEntryWithParent("user", "start", "inspect"),
+					assistantToolEntry("assistant", "user", [described, historical])
+				]}
+				activeLeafId="assistant"
+				isRunning
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain("Inspect the checked-out files.");
+		expect(html).not.toContain("Bash: Inspect the checked-out files.");
+		expect(html).toContain("Bash: pwd");
+		expect(html).not.toContain("Bash: ls -la");
+	});
+
+	it("does not present an MCP operational call_description as a relay explanation", () => {
+		const mcpCall = {
+			type: "tool_call" as const,
+			id: "call_mcp",
+			tool_name: "mcp__fixture__operate",
+			args_json: "{\"call_description\":\"server operation mode\",\"value\":7}"
+		};
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[
+					turnStartedEntry("start", 1, 1),
+					userEntryWithParent("user", "start", "operate"),
+					assistantToolEntry("assistant", "user", [mcpCall])
+				]}
+				activeLeafId="assistant"
+				isRunning
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain('<span class="tool-run-item-title">mcp__fixture__operate</span>');
+		expect(html).not.toContain('<span class="tool-run-item-title">server operation mode</span>');
+	});
+
 	it("renders a single tool directly instead of a grouped Used 1 tool header", () => {
 		const bashTool = { type: "tool_call" as const, id: "call_1", tool_name: "Bash", args_json: "{\"command\":\"ls\"}" };
 		const html = renderToStaticMarkup(
@@ -833,7 +895,7 @@ describe("MessageList tool use cards", () => {
 				payload: {
 					id: "call_pending",
 					tool_name: "Bash",
-					args_json: "{\"command\":\"npm test\"}",
+					args_json: "{\"call_description\":\"Run the web test suite.\",\"command\":\"npm test\"}",
 				},
 			},
 		];
@@ -878,7 +940,9 @@ describe("MessageList tool use cards", () => {
 			/>
 		);
 
-		expect(html).toContain("Bash: npm test");
+		expect(html).toContain("Run the web test suite.");
+		expect(html).not.toContain("Bash: Run the web test suite.");
+		expect(html).not.toContain("Bash: npm test");
 		expect(html).toContain("running");
 	});
 });

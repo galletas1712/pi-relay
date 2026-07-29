@@ -449,6 +449,13 @@ overwritten by New Session inventory refresh. Full and read-only children
 inherit the exact parent MCP set. Read-only filesystem status does not restrict
 side effects performed by remote MCP servers.
 
+Pending and transcript cards for pi-relay-owned tools use `call_description`
+as their visible title when present. Historical calls without it keep the
+existing command/path-derived fallback. MCP tools keep the existing summary
+because a server-owned operational argument may coincidentally be named
+`call_description`. Operational arguments and edit previews remain available
+in the detail view.
+
 ### Queue pane
 
 When follow-ups are queued, a pane above the composer (`QueuedInputPane`) lists them with row-level controls:
