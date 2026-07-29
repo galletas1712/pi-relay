@@ -506,6 +506,29 @@ describe("MessageList latest-on-entry scrolling", () => {
 		activeResizeObserver().trigger();
 		expect(scroller.scrollTop).toBe(275);
 	});
+
+	it("keeps a pinned transcript at the bottom when its viewport shrinks", () => {
+		const current = entry("current", null, "current");
+		render(<MessageList {...props({ entries: [current], activeLeafId: current.id })} />);
+		const scroller = messageScroller();
+		const geometry = mockScrollGeometry(scroller, 100, 1000);
+		scroller.scrollTop = 900;
+		fireEvent.scroll(scroller);
+
+		// A composer resize can cause Safari to dispatch a scroll event after
+		// the viewport shrinks but before ResizeObserver corrects the bottom.
+		geometry.viewportHeight = 80;
+		fireEvent.scroll(scroller);
+		activeResizeObserver().trigger();
+		expect(scroller.scrollTop).toBe(920);
+
+		scroller.scrollTop = 300;
+		fireEvent.scroll(scroller);
+		geometry.viewportHeight = 60;
+		fireEvent.scroll(scroller);
+		activeResizeObserver().trigger();
+		expect(scroller.scrollTop).toBe(300);
+	});
 });
 
 describe("MessageList older-page anchoring", () => {
@@ -1125,9 +1148,9 @@ function messageScroller(): HTMLDivElement {
 }
 
 function mockScrollGeometry(node: HTMLElement, clientHeight: number, initialHeight: number) {
-	const geometry = { height: initialHeight };
+	const geometry = { height: initialHeight, viewportHeight: clientHeight };
 	Object.defineProperties(node, {
-		clientHeight: { configurable: true, get: () => clientHeight },
+		clientHeight: { configurable: true, get: () => geometry.viewportHeight },
 		scrollHeight: { configurable: true, get: () => geometry.height },
 	});
 	return geometry;
