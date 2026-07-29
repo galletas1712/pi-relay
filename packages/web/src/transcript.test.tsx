@@ -372,6 +372,38 @@ describe("turn jump navigation", () => {
 		expect(adjacentTurnJumpTargetId(targets, 321, "next")).toBe("turn_3");
 	});
 
+	it("jumps to the current assistant endpoint, then the next assistant endpoint", () => {
+		const assistantEndpoints = targets.map((target, index) => ({
+			...target,
+			endBottom: target.bottom + 180 + index * 40,
+		}));
+
+		expect(adjacentTurnJumpTargetId(assistantEndpoints, 0, "next", 200, "end")).toBe("turn_1");
+		expect(adjacentTurnJumpTargetId(assistantEndpoints, 180, "next", 200, "end")).toBe("turn_2");
+		expect(adjacentTurnJumpTargetId(assistantEndpoints, 600, "next", 200, "end")).toBe("turn_3");
+	});
+
+	it("keeps the current assistant endpoint as the boundary target while it streams", () => {
+		expect(
+			adjacentTurnJumpTargetId(
+				[{ id: "turn_1", top: 0, bottom: 80, endBottom: 1_000 }],
+				0,
+				"next",
+				400,
+				"end",
+			),
+		).toBe("turn_1");
+		expect(
+			adjacentTurnJumpTargetId(
+				[{ id: "turn_1", top: 0, bottom: 80, endBottom: 1_000 }],
+				600,
+				"next",
+				400,
+				"end",
+			),
+		).toBeNull();
+	});
+
 	it("renders pinned controls and DOM anchors when there are multiple turns", () => {
 		const html = renderToStaticMarkup(
 			<MessageList
@@ -392,6 +424,8 @@ describe("turn jump navigation", () => {
 		);
 
 		expect(html).toContain("turn-jump-controls");
+		expect(html).toContain("aria-label=\"Jump to top\"");
+		expect(html).toContain("aria-label=\"Jump to bottom\"");
 		expect(html).toContain("aria-label=\"Jump to previous turn\"");
 		expect(html).toContain("aria-label=\"Jump to next turn\"");
 		expect(html).toContain("data-turn-jump-target-id=\"turn_1\"");

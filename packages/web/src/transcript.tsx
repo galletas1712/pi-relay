@@ -11,7 +11,19 @@ import {
 	type ReactNode,
 	type UIEvent,
 } from "react";
-import { AlertTriangle, Check, ChevronDown, ChevronUp, Copy, Loader2, Plus, RotateCcw, Terminal } from "lucide-react";
+import {
+	AlertTriangle,
+	ArrowDownToLine,
+	ArrowUpToLine,
+	Check,
+	ChevronDown,
+	ChevronUp,
+	Copy,
+	Loader2,
+	Plus,
+	RotateCcw,
+	Terminal,
+} from "lucide-react";
 import rehypeRaw from "rehype-raw";
 import rehypeHighlight from "rehype-highlight";
 import ReactMarkdown from "react-markdown";
@@ -21,7 +33,7 @@ import { branchEntriesFor } from "./historyTargets.ts";
 import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { MermaidBlock } from "./mermaidBlock.tsx";
 import { contentBlocksToText, firstLine } from "./text.ts";
-import { assistantMessageText, buildTurnViews } from "./turnView.ts";
+import { assistantMessageText, buildTurnViews, terminalModelStep } from "./turnView.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
 import type { AssistantItem, NoticeTone, PendingAction, TranscriptEntry, TranscriptItem, TurnCard } from "./types.ts";
 
@@ -77,7 +89,8 @@ export interface TurnCardView {
 
 type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
 type TurnJumpDirection = "previous" | "next";
-type TurnJumpTarget = { id: string; nodeKey?: string };
+type TurnJumpEdge = "start" | "end";
+type TurnJumpTarget = { id: string; nodeKey?: string; endNodeKey?: string };
 const STICKY_BOTTOM_EPSILON_PX = 1;
 const TURN_JUMP_EPSILON_PX = 2;
 const ACTIVE_SESSION_SCROLL_KEY = "__active_session__";
@@ -91,6 +104,7 @@ export interface TurnJumpTargetPosition {
 	id: string;
 	top: number;
 	bottom: number;
+	endBottom?: number;
 }
 
 export function isScrolledAtBottom(node: ScrollMetrics): boolean {
@@ -113,7 +127,8 @@ export function adjacentTurnJumpTargetId(
 	targets: readonly TurnJumpTargetPosition[],
 	scrollTop: number,
 	direction: TurnJumpDirection,
-	viewportHeight = 0
+	viewportHeight = 0,
+	edge: TurnJumpEdge = "start",
 ): string | null {
 	const orderedTargets = [...targets].sort((left, right) => left.top - right.top);
 	if (direction === "previous") {
@@ -128,6 +143,24 @@ export function adjacentTurnJumpTargetId(
 			return currentTarget.id;
 		}
 		return orderedTargets[currentIndex - 1]?.id ?? null;
+	}
+	if (edge === "end") {
+		const viewportBottom = scrollTop + viewportHeight;
+		let currentIndex = -1;
+		for (const [index, target] of orderedTargets.entries()) {
+			if (target.top > scrollTop + TURN_JUMP_EPSILON_PX) break;
+			currentIndex = index;
+		}
+		if (currentIndex === -1) return orderedTargets[0]?.id ?? null;
+		const currentTarget = orderedTargets[currentIndex];
+		const currentEnd = currentTarget.endBottom ?? currentTarget.bottom;
+		// Mirror previous-turn navigation around the assistant endpoint:
+		// visit the current turn while its endpoint is clipped below the
+		// viewport, then advance to the next turn once that endpoint is
+		// visible. A jump aligns the endpoint with the viewport bottom, so the
+		// next click necessarily advances.
+		if (currentEnd > viewportBottom + TURN_JUMP_EPSILON_PX) return currentTarget.id;
+		return orderedTargets[currentIndex + 1]?.id ?? null;
 	}
 	for (const target of orderedTargets) {
 		if (target.top > scrollTop + TURN_JUMP_EPSILON_PX) return target.id;
@@ -348,6 +381,15 @@ export const MessageList = memo(function MessageList({
 		cancelOlderTurnsPreservationForRequest(null);
 	}, [cancelOlderTurnsPreservationForRequest]);
 
+	const scrollToTop = useCallback(() => {
+		const node = scrollRef.current;
+		if (!node) return;
+		node.scrollTop = 0;
+		shouldStickToBottomRef.current = false;
+		lastScrollMetricsRef.current = snapshotScrollMetrics(node);
+		cancelOlderTurnsPreservation();
+	}, [cancelOlderTurnsPreservation]);
+
 	const finishPointerScrollbarIntent = useCallback((intent: PointerScrollbarIntent) => {
 		if (pointerScrollbarIntentRef.current !== intent) return;
 		const viewportMoved = intent.scroller.scrollTop !== intent.initialScrollTop;
@@ -408,6 +450,14 @@ export const MessageList = memo(function MessageList({
 		const scroller = scrollRef.current;
 		if (!scroller) return [];
 		const scrollerRect = scroller.getBoundingClientRect();
+		const endBottomById = new Map<string, number>();
+		for (const target of scroller.querySelectorAll<HTMLElement>("[data-turn-jump-end-id]")) {
+			const id = target.dataset.turnJumpEndId;
+			if (!id) continue;
+			const targetRect = target.getBoundingClientRect();
+			const endBottom = scroller.scrollTop + targetRect.bottom - scrollerRect.top;
+			if (Number.isFinite(endBottom)) endBottomById.set(id, endBottom);
+		}
 		return Array.from(scroller.querySelectorAll<HTMLElement>("[data-turn-jump-target-id]"))
 			.flatMap((target) => {
 				const id = target.dataset.turnJumpTargetId;
@@ -415,19 +465,26 @@ export const MessageList = memo(function MessageList({
 				const targetRect = target.getBoundingClientRect();
 				const top = scroller.scrollTop + targetRect.top - scrollerRect.top;
 				const bottom = scroller.scrollTop + targetRect.bottom - scrollerRect.top;
-				return Number.isFinite(top) && Number.isFinite(bottom) ? [{ id, top, bottom }] : [];
+				return Number.isFinite(top) && Number.isFinite(bottom)
+					? [{ id, top, bottom, endBottom: endBottomById.get(id) }]
+					: [];
 			})
 			.sort((left, right) => left.top - right.top);
 	}, []);
 
-	const scrollToTurnJumpTarget = useCallback((targetId: string) => {
+	const scrollToTurnJumpTarget = useCallback((targetId: string, edge: TurnJumpEdge) => {
 		const scroller = scrollRef.current;
 		if (!scroller) return;
-		const target = turnJumpTargetNode(scroller, targetId);
+		const target = turnJumpTargetNode(scroller, targetId, edge);
 		if (!target) return;
 		const scrollerRect = scroller.getBoundingClientRect();
 		const targetRect = target.getBoundingClientRect();
-		scroller.scrollTop = Math.max(0, scroller.scrollTop + targetRect.top - scrollerRect.top);
+		scroller.scrollTop = Math.max(
+			0,
+			edge === "start"
+				? scroller.scrollTop + targetRect.top - scrollerRect.top
+				: scroller.scrollTop + targetRect.bottom - scrollerRect.bottom,
+		);
 		shouldStickToBottomRef.current = false;
 		lastScrollMetricsRef.current = snapshotScrollMetrics(scroller);
 		cancelOlderTurnsPreservation();
@@ -436,8 +493,15 @@ export const MessageList = memo(function MessageList({
 	const jumpToAdjacentTurn = useCallback((direction: TurnJumpDirection) => {
 		const scroller = scrollRef.current;
 		if (!scroller) return;
-		const targetId = adjacentTurnJumpTargetId(collectTurnJumpTargetPositions(), scroller.scrollTop, direction, scroller.clientHeight);
-		if (targetId) scrollToTurnJumpTarget(targetId);
+		const edge = direction === "previous" ? "start" : "end";
+		const targetId = adjacentTurnJumpTargetId(
+			collectTurnJumpTargetPositions(),
+			scroller.scrollTop,
+			direction,
+			scroller.clientHeight,
+			edge,
+		);
+		if (targetId) scrollToTurnJumpTarget(targetId, edge);
 	}, [collectTurnJumpTargetPositions, scrollToTurnJumpTarget]);
 
 	const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
@@ -714,7 +778,11 @@ export const MessageList = memo(function MessageList({
 		() => new Map(fallbackTurnJumpTargets.flatMap((target) => target.nodeKey ? [[target.nodeKey, target.id]] : [])),
 		[fallbackTurnJumpTargets],
 	);
-	const showTurnJumpControls = turnJumpTargets.length > 1;
+	const fallbackEndTargetIdByNodeKey = useMemo(
+		() => new Map(fallbackTurnJumpTargets.flatMap((target) => target.endNodeKey ? [[target.endNodeKey, target.id]] : [])),
+		[fallbackTurnJumpTargets],
+	);
+	const showTurnJumpControls = turnJumpTargets.length > 0;
 	const loadOlderTurns = useCallback(() => {
 		if (!onLoadOlderTurns || !scrollSessionKey || pendingOlderTurnsLoadRef.current !== null) return;
 		const node = scrollRef.current;
@@ -884,6 +952,7 @@ export const MessageList = memo(function MessageList({
 											onCollapseTurn={onCollapseTurn}
 											loadingTurnId={loadingTurnId}
 											turnJumpTargetId={turn.card.id}
+											turnJumpEndId={turn.card.id}
 											transcriptAnchorId={turn.card.id}
 										/>
 									))}
@@ -891,6 +960,7 @@ export const MessageList = memo(function MessageList({
 							)
 						: visibleDisplayNodes.map((node) => {
 								const targetId = fallbackTargetIdByNodeKey.get(node.key);
+								const endTargetId = fallbackEndTargetIdByNodeKey.get(node.key);
 								const view = (
 									<TranscriptDisplayNodeView
 										key={node.key}
@@ -907,8 +977,13 @@ export const MessageList = memo(function MessageList({
 										onToggleCompaction={toggleCompaction}
 									/>
 								);
-								return targetId ? (
-									<div key={node.key} className="turn-jump-target" data-turn-jump-target-id={targetId}>
+								return targetId || endTargetId ? (
+									<div
+										key={node.key}
+										className="turn-jump-target"
+										data-turn-jump-target-id={targetId}
+										data-turn-jump-end-id={endTargetId}
+									>
 										{view}
 									</div>
 								) : (
@@ -920,32 +995,57 @@ export const MessageList = memo(function MessageList({
 					) : null}
 				</div>
 			</div>
-			<TurnJumpControls visible={showTurnJumpControls} onJump={jumpToAdjacentTurn} />
+			<TurnJumpControls
+				visible={showTurnJumpControls}
+				onJump={jumpToAdjacentTurn}
+				onJumpToTop={scrollToTop}
+				onJumpToBottom={scrollToBottom}
+			/>
 		</div>
 	);
 });
 
 function buildFallbackTurnJumpTargets(turns: TurnView[], displayNodes: TranscriptDisplayNode[]): TurnJumpTarget[] {
-	const firstDisplayNodeByEntryId = new Map<string, { node: TranscriptDisplayNode; index: number }>();
-	for (const [index, node] of displayNodes.entries()) {
-		const entryId = nodeLeafId(node);
-		if (!firstDisplayNodeByEntryId.has(entryId)) firstDisplayNodeByEntryId.set(entryId, { node, index });
-	}
 	const targets: TurnJumpTarget[] = [];
 	for (const [index, turn] of turns.entries()) {
-		let firstDisplayNode: { node: TranscriptDisplayNode; index: number } | undefined;
-		for (const entry of turn.entries) {
-			const displayNode = firstDisplayNodeByEntryId.get(entry.id);
-			if (displayNode && (!firstDisplayNode || displayNode.index < firstDisplayNode.index)) firstDisplayNode = displayNode;
-		}
-		if (firstDisplayNode) targets.push({ id: `turn-${index}-${firstDisplayNode.node.key}`, nodeKey: firstDisplayNode.node.key });
+		const turnEntryIds = new Set(turn.entries.map((entry) => entry.id));
+		const turnNodes = displayNodes
+			.map((node, nodeIndex) => ({ node, nodeIndex }))
+			.filter(({ node }) => displayNodeEntryIds(node).some((entryId) => turnEntryIds.has(entryId)));
+		const firstDisplayNode = turnNodes[0];
+		if (!firstDisplayNode) continue;
+		const terminalAssistantId = terminalModelStep(turn)?.entry.id ?? null;
+		const terminalAssistantNodes = turnNodes.filter(({ node }) =>
+			terminalAssistantId !== null && displayNodeEntryIds(node).includes(terminalAssistantId),
+		);
+		const assistantNodes = terminalAssistantNodes.length > 0
+			? terminalAssistantNodes
+			: turnNodes.filter(({ node }) => node.type === "assistant_text" || node.type === "tool_group");
+		const endDisplayNode = assistantNodes.at(-1) ?? turnNodes.at(-1)!;
+		targets.push({
+			id: `turn-${index}-${firstDisplayNode.node.key}`,
+			nodeKey: firstDisplayNode.node.key,
+			endNodeKey: endDisplayNode.node.key,
+		});
 	}
 	return targets;
 }
 
-function turnJumpTargetNode(scroller: HTMLDivElement, targetId: string): HTMLElement | null {
-	return Array.from(scroller.querySelectorAll<HTMLElement>("[data-turn-jump-target-id]"))
-		.find((target) => target.dataset.turnJumpTargetId === targetId) ?? null;
+function displayNodeEntryIds(node: TranscriptDisplayNode): string[] {
+	if (node.type === "tool_group") return node.items.map((item) => item.entryId);
+	if ("entry" in node) return [node.entry.id];
+	return [];
+}
+
+function turnJumpTargetNode(scroller: HTMLDivElement, targetId: string, edge: TurnJumpEdge): HTMLElement | null {
+	const selector = edge === "start" ? "[data-turn-jump-target-id]" : "[data-turn-jump-end-id]";
+	const datasetKey = edge === "start" ? "turnJumpTargetId" : "turnJumpEndId";
+	return Array.from(scroller.querySelectorAll<HTMLElement>(selector))
+		.find((target) => target.dataset[datasetKey] === targetId) ??
+		(edge === "end"
+			? Array.from(scroller.querySelectorAll<HTMLElement>("[data-turn-jump-target-id]"))
+				.find((target) => target.dataset.turnJumpTargetId === targetId) ?? null
+			: null);
 }
 
 function transcriptAnchorNode(scroller: HTMLElement, anchorId: string): HTMLElement | null {
@@ -1013,13 +1113,26 @@ function cssPixels(value: string | undefined): number {
 const TurnJumpControls = memo(function TurnJumpControls({
 	visible,
 	onJump,
+	onJumpToTop,
+	onJumpToBottom,
 }: {
 	visible: boolean;
 	onJump: (direction: TurnJumpDirection) => void;
+	onJumpToTop: () => void;
+	onJumpToBottom: () => void;
 }) {
 	if (!visible) return null;
 	return (
 		<div className="turn-jump-controls" aria-label="Turn navigation">
+			<button
+				type="button"
+				className="turn-jump-button"
+				aria-label="Jump to top"
+				title="Top"
+				onClick={onJumpToTop}
+			>
+				<ArrowUpToLine size={18} />
+			</button>
 			<button
 				type="button"
 				className="turn-jump-button"
@@ -1037,6 +1150,15 @@ const TurnJumpControls = memo(function TurnJumpControls({
 				onClick={() => onJump("next")}
 			>
 				<ChevronDown size={18} />
+			</button>
+			<button
+				type="button"
+				className="turn-jump-button"
+				aria-label="Jump to bottom"
+				title="Bottom"
+				onClick={onJumpToBottom}
+			>
+				<ArrowDownToLine size={18} />
 			</button>
 		</div>
 	);
@@ -1274,6 +1396,7 @@ const TurnCardRow = memo(function TurnCardRow({
 	onCollapseTurn,
 	loadingTurnId,
 	turnJumpTargetId,
+	turnJumpEndId,
 	transcriptAnchorId,
 }: {
 	turn: TurnCardView;
@@ -1288,6 +1411,7 @@ const TurnCardRow = memo(function TurnCardRow({
 	onCollapseTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
 	turnJumpTargetId?: string;
+	turnJumpEndId?: string;
 	transcriptAnchorId?: string;
 }) {
 	const card = turn.card;
@@ -1311,6 +1435,9 @@ const TurnCardRow = memo(function TurnCardRow({
 	};
 	const summaryUserMessages = isExpanded ? [] : visibleUserMessages;
 	const summaryDaemonObservations = isExpanded ? [] : card.daemon_observations ?? [];
+	const hasAssistantSummary =
+		(card.status === "compacted" && !!card.summary) ||
+		card.assistant_message?.item.type === "assistant_message";
 	let detailRows: ReactNode = null;
 	if (detailEntries) {
 		const toolIndex = indexToolEntries(detailEntries);
@@ -1340,6 +1467,7 @@ const TurnCardRow = memo(function TurnCardRow({
 		<div
 			className={["turn-summary", turn.isCurrent ? "current" : null, card.status, isExpanded ? "expanded" : null].filter(Boolean).join(" ")}
 			data-turn-jump-target-id={rootTurnJumpTargetId}
+			data-turn-jump-end-id={!hasAssistantSummary ? turnJumpEndId : undefined}
 			data-transcript-anchor-id={transcriptAnchorId}
 		>
 			{summaryUserMessages.map((entry) =>
@@ -1389,7 +1517,7 @@ const TurnCardRow = memo(function TurnCardRow({
 					) : null}
 				</div>
 			) : null}
-			<TurnSummaryAssistant turn={turn} />
+			<TurnSummaryAssistant turn={turn} turnJumpEndId={turnJumpEndId} />
 			<TurnDuration card={card} />
 		</div>
 	);
@@ -1404,24 +1532,32 @@ function turnDetailDisplayNodesBeforeLatestAssistant(displayNodes: TranscriptDis
 	});
 }
 
-const TurnSummaryAssistant = memo(function TurnSummaryAssistant({ turn }: { turn: TurnCardView }) {
+const TurnSummaryAssistant = memo(function TurnSummaryAssistant({
+	turn,
+	turnJumpEndId,
+}: {
+	turn: TurnCardView;
+	turnJumpEndId?: string;
+}) {
 	const card = turn.card;
 	if (card.status === "compacted" && card.summary) {
-		return <div className="turn-card-assistant">{card.summary}</div>;
+		return <div className="turn-card-assistant" data-turn-jump-end-id={turnJumpEndId}>{card.summary}</div>;
 	}
 	if (card.assistant_message?.item.type !== "assistant_message") return null;
 	const text = assistantMessageText(card.assistant_message.item);
 	return (
-		<AssistantTextBlock
-			node={{
-				type: "assistant_text",
-				key: `${card.assistant_message.id}-turn-card`,
-				entry: card.assistant_message as AssistantMessageEntry,
-				text,
-				copyText: text,
-				phase: card.status === "completed" && card.outcome === "Graceful" ? "final_answer" : turn.isCurrent ? "running" : "unknown",
-			}}
-		/>
+		<div data-turn-jump-end-id={turnJumpEndId}>
+			<AssistantTextBlock
+				node={{
+					type: "assistant_text",
+					key: `${card.assistant_message.id}-turn-card`,
+					entry: card.assistant_message as AssistantMessageEntry,
+					text,
+					copyText: text,
+					phase: card.status === "completed" && card.outcome === "Graceful" ? "final_answer" : turn.isCurrent ? "running" : "unknown",
+				}}
+			/>
+		</div>
 	);
 });
 
