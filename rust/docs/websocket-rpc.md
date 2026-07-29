@@ -387,8 +387,7 @@ Child sessions link back through `sessions.delegation_id`. The
 `delegations_parent_created_idx` index supports the per-parent delegation feed.
 The completion runner uses `attempt_id` as an idempotency fence and queues a
 deterministic parent daemon wakeup observation keyed as
-`delegation-steer:<delegation_id>:<attempt_id>` (the key name is retained for
-idempotency compatibility).
+`delegation-steer:<delegation_id>:<attempt_id>`.
 
 ### `events`
 
@@ -1582,13 +1581,10 @@ accepted for that child: the delegation is running, the child is a delegation
 member, the child has queued/unfinished/runtime work, and it is not
 completion-terminal.
 
-Daemon wakeup observations also carry this same snapshot. A terminal snapshot is
-the normal completion/cancellation handoff. A still-`running` snapshot is a
-partial fan-out decision point: at most one queued/consuming partial wakeup is
-active per delegation attempt, and it appears only after the expected fan-out
-members exist. The parent should steer a running/steerable child, cancel the
-delegation, or wait; final completion cancels stale queued partial wakeups before
-publishing the terminal wakeup.
+Daemon wakeup observations also carry this same snapshot. A parent receives
+exactly one wakeup per delegation, at terminal status; an individual child
+reaching terminal never wakes the parent. Mid-flight steering is parent-initiated
+via `inspect_delegation` / `steer_subagent`.
 
 ```json
 {
