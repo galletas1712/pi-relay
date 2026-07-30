@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assistantMessageText, buildTurnViews, terminalModelStep } from "./turnView.ts";
+import { assistantMessageText, buildTurnViews } from "./turnView.ts";
 import type { AssistantItem, TranscriptEntry, TranscriptItem } from "./types.ts";
 
 describe("buildTurnViews", () => {
@@ -24,7 +24,6 @@ describe("buildTurnViews", () => {
 			["assistant-final", "final_answer"]
 		]);
 		expect(turn.modelSteps[0].toolResults.map((result) => result.id)).toEqual(["tool-result"]);
-		expect(terminalModelStep(turn)?.entry.id).toBe("assistant-final");
 	});
 
 	it("keeps multiple user inputs in the containing turn instead of pairing nearest user", () => {

@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import {
-	adjacentTurnJumpTargetId,
+	adjacentTranscriptNavigationTarget,
 	assistantRenderParts,
 	deriveTranscriptDisplayNodes,
 	editToolPreview,
@@ -346,62 +346,22 @@ describe("isScrolledAtBottom", () => {
 });
 
 describe("turn jump navigation", () => {
-	const targets = [
-		{ id: "turn_1", top: 0, bottom: 80 },
-		{ id: "turn_2", top: 320, bottom: 400 },
-		{ id: "turn_3", top: 980, bottom: 1060 },
+	const stops = [
+		{ id: "turn_1-user", top: 0, bottom: 80 },
+		{ id: "turn_1-assistant", top: 120, bottom: 500 },
+		{ id: "turn_2-user", top: 520, bottom: 600 },
 	];
 
-	it("jumps to the nearest previous turn beginning before the current scroll position", () => {
-		expect(adjacentTurnJumpTargetId(targets, 700, "previous")).toBe("turn_2");
+	it("visits the current assistant endpoint before the next rendered stop", () => {
+		expect(adjacentTranscriptNavigationTarget(stops, 0, "next", 200)).toEqual({ id: "turn_1-assistant", edge: "start" });
+		expect(adjacentTranscriptNavigationTarget(stops, 120, "next", 200)).toEqual({ id: "turn_1-assistant", edge: "end" });
+		expect(adjacentTranscriptNavigationTarget(stops, 400, "next", 200)).toEqual({ id: "turn_2-user", edge: "start" });
 	});
 
-	it("jumps to the current turn user message when it is clipped above the viewport", () => {
-		expect(adjacentTurnJumpTargetId(targets, 350, "previous", 400)).toBe("turn_2");
-	});
-
-	it("jumps to the previous turn user message when the current user message is fully visible", () => {
-		expect(adjacentTurnJumpTargetId(targets, 320, "previous", 400)).toBe("turn_1");
-	});
-
-	it("jumps past the current turn when already at its beginning", () => {
-		expect(adjacentTurnJumpTargetId(targets, 320, "previous")).toBe("turn_1");
-	});
-
-	it("jumps to the next turn beginning after the current scroll position", () => {
-		expect(adjacentTurnJumpTargetId(targets, 321, "next")).toBe("turn_3");
-	});
-
-	it("jumps to the current assistant endpoint, then the next assistant endpoint", () => {
-		const assistantEndpoints = targets.map((target, index) => ({
-			...target,
-			endBottom: target.bottom + 180 + index * 40,
-		}));
-
-		expect(adjacentTurnJumpTargetId(assistantEndpoints, 0, "next", 200, "end")).toBe("turn_1");
-		expect(adjacentTurnJumpTargetId(assistantEndpoints, 180, "next", 200, "end")).toBe("turn_2");
-		expect(adjacentTurnJumpTargetId(assistantEndpoints, 600, "next", 200, "end")).toBe("turn_3");
-	});
-
-	it("keeps the current assistant endpoint as the boundary target while it streams", () => {
-		expect(
-			adjacentTurnJumpTargetId(
-				[{ id: "turn_1", top: 0, bottom: 80, endBottom: 1_000 }],
-				0,
-				"next",
-				400,
-				"end",
-			),
-		).toBe("turn_1");
-		expect(
-			adjacentTurnJumpTargetId(
-				[{ id: "turn_1", top: 0, bottom: 80, endBottom: 1_000 }],
-				600,
-				"next",
-				400,
-				"end",
-			),
-		).toBeNull();
+	it("returns to a clipped current stop before moving to the previous stop", () => {
+		expect(adjacentTranscriptNavigationTarget(stops, 300, "previous", 200)).toEqual({ id: "turn_1-assistant", edge: "start" });
+		expect(adjacentTranscriptNavigationTarget(stops, 120, "previous", 200)).toEqual({ id: "turn_1-user", edge: "start" });
+		expect(adjacentTranscriptNavigationTarget(stops, 0, "previous", 200)).toBeNull();
 	});
 
 	it("renders pinned controls and DOM anchors when there are multiple turns", () => {
@@ -428,10 +388,109 @@ describe("turn jump navigation", () => {
 		expect(html).toContain("aria-label=\"Jump to bottom\"");
 		expect(html).toContain("aria-label=\"Jump to previous turn\"");
 		expect(html).toContain("aria-label=\"Jump to next turn\"");
-		expect(html).toContain("data-turn-jump-target-id=\"turn_1\"");
-		expect(html).toContain("data-turn-jump-target-id=\"turn_2\"");
+		expect(html).toContain('data-transcript-nav-stop="user-turn_1-user_1"');
+		expect(html).toContain('data-transcript-nav-stop="assistant-turn_1"');
 		expect(html).toContain("turn-summary completed expanded");
 		expect(html).toContain("Hide details");
+	});
+
+	it("walks rendered stops in order and visits a long assistant endpoint before later content", () => {
+		const stops = [
+			{ id: "system-prompt", top: 0, bottom: 40 },
+			{ id: "user", top: 60, bottom: 110 },
+			{ id: "assistant", top: 120, bottom: 500 },
+			{ id: "next-user", top: 520, bottom: 570 },
+		];
+
+		expect(adjacentTranscriptNavigationTarget(stops, 0, "next", 100)).toEqual({ id: "user", edge: "start" });
+		expect(adjacentTranscriptNavigationTarget(stops, 60, "next", 100)).toEqual({ id: "assistant", edge: "start" });
+		expect(adjacentTranscriptNavigationTarget(stops, 120, "next", 100)).toEqual({ id: "assistant", edge: "end" });
+		expect(adjacentTranscriptNavigationTarget(stops, 400, "next", 100)).toEqual({ id: "next-user", edge: "start" });
+	});
+
+	it("walks visible stops in reverse without exposing absent system prompts", () => {
+		const stops = [
+			{ id: "user", top: 60, bottom: 110 },
+			{ id: "assistant", top: 120, bottom: 500 },
+		];
+
+		expect(adjacentTranscriptNavigationTarget(stops, 200, "previous", 100)).toEqual({ id: "assistant", edge: "start" });
+		expect(adjacentTranscriptNavigationTarget(stops, 120, "previous", 100)).toEqual({ id: "user", edge: "start" });
+		expect(adjacentTranscriptNavigationTarget(stops, 0, "previous", 100)).toBeNull();
+	});
+
+	it("marks only rendered system prompt, fallback nodes, and card blocks as navigation stops", () => {
+		const withPrompt = renderToStaticMarkup(
+			<MessageList
+				entries={[userEntry("entry_1", "first user message")]}
+				activeLeafId="entry_1"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				transcriptStartContent={<div>See system prompt</div>}
+			/>,
+		);
+		const withoutPrompt = renderToStaticMarkup(
+			<MessageList
+				entries={[userEntry("entry_1", "first user message")]}
+				activeLeafId="entry_1"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				hasOlderTurns
+				transcriptStartContent={<div>See system prompt</div>}
+			/>,
+		);
+		const collapsed = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[{ card: turnCard("turn_1", 1, "first"), entries: null, expanded: false, isCurrent: false }]}
+				activeLeafId="finish_1"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>,
+		);
+		const expanded = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[{
+					card: turnCard("turn_1", 1, "first"),
+					entries: [
+						userEntryWithParent("user_1", "start_1", "first"),
+						assistantEntry("detail-assistant", "user_1", "intermediate"),
+					],
+					expanded: true,
+					isCurrent: false,
+				}]}
+				activeLeafId="finish_1"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>,
+		);
+
+		expect(withPrompt.match(/data-transcript-nav-stop=/g)).toHaveLength(2);
+		expect(withPrompt).toContain('data-transcript-nav-stop="system-prompt"');
+		expect(withoutPrompt).not.toContain("data-transcript-nav-stop=\"system-prompt\"");
+		expect(collapsed.match(/data-transcript-nav-stop=/g)).toEqual([
+			"data-transcript-nav-stop=",
+			"data-transcript-nav-stop=",
+		]);
+		expect(collapsed).toContain('data-transcript-nav-stop="user-turn_1-user_1"');
+		expect(collapsed).toContain('data-transcript-nav-stop="assistant-turn_1"');
+		expect(expanded).toContain('data-transcript-nav-stop="detail-turn_1-user_1"');
+		expect(expanded).toContain('data-transcript-nav-stop="detail-turn_1-detail-assistant-item-0"');
+		expect(expanded).toContain('data-transcript-nav-stop="assistant-turn_1"');
+		expect(expanded).not.toContain('data-transcript-nav-stop="user-turn_1-user_1"');
 	});
 });
 
@@ -813,6 +872,7 @@ describe("MessageList tool use cards", () => {
 		expect(html).not.toContain("Bash: date");
 		expect(html).toContain("Show details");
 		expect(html).toContain("Worked for 6s");
+		expect(html).not.toContain('data-transcript-nav-stop="duration-turn_1"');
 	});
 
 	it("keeps the latest tool-only assistant message visible in expanded turn details", () => {
@@ -1147,6 +1207,32 @@ describe("MessageList Working indicator", () => {
 		);
 
 		expect(html).toContain("Show details");
+	});
+
+	it("renders non-Graceful fallback status rows with resume actions without making them stops", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[
+					turnStartedEntry("start", 1, 1),
+					userEntryWithParent("user", "start", "do it"),
+					assistantEntry("assistant", "user", "partial"),
+					turnFinishedEntry("finish", "assistant", 1, "Crashed"),
+				]}
+				activeLeafId="finish"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onResumeTurn={() => {}}
+			/>,
+		);
+
+		expect(html).toContain("turn 1 crashed");
+		expect(html).toContain("Retry");
+		expect(html.match(/data-transcript-nav-stop=/g)).toHaveLength(2);
+		expect(html).not.toContain('data-transcript-nav-stop="fallback-finish"');
+		expect(html).not.toContain("data-turn-jump");
 	});
 
 	it("omits the Working… row when the session is idle", () => {

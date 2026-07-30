@@ -1,4 +1,5 @@
 import {
+	Fragment,
 	memo,
 	useCallback,
 	useEffect,
@@ -33,7 +34,7 @@ import { branchEntriesFor } from "./historyTargets.ts";
 import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { MermaidBlock } from "./mermaidBlock.tsx";
 import { contentBlocksToText, firstLine } from "./text.ts";
-import { assistantMessageText, buildTurnViews, terminalModelStep } from "./turnView.ts";
+import { assistantMessageText, buildTurnViews } from "./turnView.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
 import type { AssistantItem, NoticeTone, PendingAction, TranscriptEntry, TranscriptItem, TurnCard } from "./types.ts";
 
@@ -90,7 +91,6 @@ export interface TurnCardView {
 type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
 type TurnJumpDirection = "previous" | "next";
 type TurnJumpEdge = "start" | "end";
-type TurnJumpTarget = { id: string; nodeKey?: string; endNodeKey?: string };
 const STICKY_BOTTOM_EPSILON_PX = 1;
 const TURN_JUMP_EPSILON_PX = 2;
 const ACTIVE_SESSION_SCROLL_KEY = "__active_session__";
@@ -100,12 +100,16 @@ const EMPTY_TOOL_INDEX: ToolIndex = { results: new Map(), calls: new Set() };
 const EMPTY_TURN_VIEWS: TurnView[] = [];
 const EMPTY_DISPLAY_NODES: TranscriptDisplayNode[] = [];
 
-export interface TurnJumpTargetPosition {
+export interface TranscriptNavigationStopPosition {
 	id: string;
 	top: number;
 	bottom: number;
-	endBottom?: number;
 }
+
+export type TranscriptNavigationTarget = {
+	id: string;
+	edge: TurnJumpEdge;
+};
 
 export function isScrolledAtBottom(node: ScrollMetrics): boolean {
 	return node.scrollHeight - node.scrollTop - node.clientHeight <= STICKY_BOTTOM_EPSILON_PX;
@@ -123,53 +127,46 @@ function snapshotScrollMetrics(node: ScrollMetrics): ScrollMetrics {
 	};
 }
 
-export function adjacentTurnJumpTargetId(
-	targets: readonly TurnJumpTargetPosition[],
+export function adjacentTranscriptNavigationTarget(
+	stops: readonly TranscriptNavigationStopPosition[],
 	scrollTop: number,
 	direction: TurnJumpDirection,
-	viewportHeight = 0,
-	edge: TurnJumpEdge = "start",
-): string | null {
-	const orderedTargets = [...targets].sort((left, right) => left.top - right.top);
-	if (direction === "previous") {
-		let currentIndex = -1;
-		for (const [index, target] of orderedTargets.entries()) {
-			if (target.top > scrollTop + TURN_JUMP_EPSILON_PX) break;
-			currentIndex = index;
-		}
-		if (currentIndex === -1) return null;
-		const currentTarget = orderedTargets[currentIndex];
-		if (!turnJumpTargetIsFullyVisible(currentTarget, scrollTop, viewportHeight) && currentTarget.top < scrollTop - TURN_JUMP_EPSILON_PX) {
-			return currentTarget.id;
-		}
-		return orderedTargets[currentIndex - 1]?.id ?? null;
-	}
-	if (edge === "end") {
-		const viewportBottom = scrollTop + viewportHeight;
-		let currentIndex = -1;
-		for (const [index, target] of orderedTargets.entries()) {
-			if (target.top > scrollTop + TURN_JUMP_EPSILON_PX) break;
-			currentIndex = index;
-		}
-		if (currentIndex === -1) return orderedTargets[0]?.id ?? null;
-		const currentTarget = orderedTargets[currentIndex];
-		const currentEnd = currentTarget.endBottom ?? currentTarget.bottom;
-		// Mirror previous-turn navigation around the assistant endpoint:
-		// visit the current turn while its endpoint is clipped below the
-		// viewport, then advance to the next turn once that endpoint is
-		// visible. A jump aligns the endpoint with the viewport bottom, so the
-		// next click necessarily advances.
-		if (currentEnd > viewportBottom + TURN_JUMP_EPSILON_PX) return currentTarget.id;
-		return orderedTargets[currentIndex + 1]?.id ?? null;
-	}
-	for (const target of orderedTargets) {
-		if (target.top > scrollTop + TURN_JUMP_EPSILON_PX) return target.id;
-	}
-	return null;
-}
+	viewportHeight: number,
+): TranscriptNavigationTarget | null {
+	const orderedStops = [...stops]
+		.filter((stop) => stop.bottom > stop.top)
+		.sort((left, right) => left.top - right.top || left.bottom - right.bottom);
+	if (orderedStops.length === 0) return null;
 
-function turnJumpTargetIsFullyVisible(target: TurnJumpTargetPosition, scrollTop: number, viewportHeight: number): boolean {
-	return target.top >= scrollTop - TURN_JUMP_EPSILON_PX && target.bottom <= scrollTop + viewportHeight + TURN_JUMP_EPSILON_PX;
+	let currentIndex = -1;
+	for (const [index, stop] of orderedStops.entries()) {
+		if (stop.top > scrollTop + TURN_JUMP_EPSILON_PX) break;
+		currentIndex = index;
+	}
+
+	if (direction === "previous") {
+		if (currentIndex === -1) return null;
+		const current = orderedStops[currentIndex];
+		// A stop clipped above the viewport is the first reverse-navigation
+		// destination. Once its start is visible, continue to the prior stop.
+		if (current.top < scrollTop - TURN_JUMP_EPSILON_PX) {
+			return { id: current.id, edge: "start" };
+		}
+		const previous = orderedStops[currentIndex - 1];
+		return previous ? { id: previous.id, edge: "start" } : null;
+	}
+
+	if (currentIndex === -1) return { id: orderedStops[0].id, edge: "start" };
+	const current = orderedStops[currentIndex];
+	const viewportBottom = scrollTop + viewportHeight;
+	// Down navigation first visits the current block's endpoint when its
+	// rendered content extends below the viewport. This is what keeps a long
+	// assistant response from being skipped on the way to the next turn.
+	if (current.bottom > viewportBottom + TURN_JUMP_EPSILON_PX) {
+		return { id: current.id, edge: "end" };
+	}
+	const next = orderedStops[currentIndex + 1];
+	return next ? { id: next.id, edge: "start" } : null;
 }
 
 interface ActiveTranscriptScrollIdentity {
@@ -446,42 +443,35 @@ export const MessageList = memo(function MessageList({
 		ownerWindow.addEventListener("blur", handleWindowBlur);
 	}, [clearPointerScrollbarIntent, finishPointerScrollbarIntent]);
 
-	const collectTurnJumpTargetPositions = useCallback((): TurnJumpTargetPosition[] => {
+	const collectTranscriptNavigationStops = useCallback((): TranscriptNavigationStopPosition[] => {
 		const scroller = scrollRef.current;
 		if (!scroller) return [];
 		const scrollerRect = scroller.getBoundingClientRect();
-		const endBottomById = new Map<string, number>();
-		for (const target of scroller.querySelectorAll<HTMLElement>("[data-turn-jump-end-id]")) {
-			const id = target.dataset.turnJumpEndId;
-			if (!id) continue;
-			const targetRect = target.getBoundingClientRect();
-			const endBottom = scroller.scrollTop + targetRect.bottom - scrollerRect.top;
-			if (Number.isFinite(endBottom)) endBottomById.set(id, endBottom);
-		}
-		return Array.from(scroller.querySelectorAll<HTMLElement>("[data-turn-jump-target-id]"))
+		return Array.from(scroller.querySelectorAll<HTMLElement>("[data-transcript-nav-stop]"))
 			.flatMap((target) => {
-				const id = target.dataset.turnJumpTargetId;
+				const id = target.dataset.transcriptNavStop;
 				if (!id) return [];
 				const targetRect = target.getBoundingClientRect();
 				const top = scroller.scrollTop + targetRect.top - scrollerRect.top;
 				const bottom = scroller.scrollTop + targetRect.bottom - scrollerRect.top;
 				return Number.isFinite(top) && Number.isFinite(bottom)
-					? [{ id, top, bottom, endBottom: endBottomById.get(id) }]
+					? [{ id, top, bottom }]
 					: [];
 			})
+			.filter((target) => target.bottom > target.top)
 			.sort((left, right) => left.top - right.top);
 	}, []);
 
-	const scrollToTurnJumpTarget = useCallback((targetId: string, edge: TurnJumpEdge) => {
+	const scrollToTranscriptNavigationTarget = useCallback((target: TranscriptNavigationTarget) => {
 		const scroller = scrollRef.current;
 		if (!scroller) return;
-		const target = turnJumpTargetNode(scroller, targetId, edge);
-		if (!target) return;
+		const stop = transcriptNavigationStopNode(scroller, target.id);
+		if (!stop) return;
 		const scrollerRect = scroller.getBoundingClientRect();
-		const targetRect = target.getBoundingClientRect();
+		const targetRect = stop.getBoundingClientRect();
 		scroller.scrollTop = Math.max(
 			0,
-			edge === "start"
+			target.edge === "start"
 				? scroller.scrollTop + targetRect.top - scrollerRect.top
 				: scroller.scrollTop + targetRect.bottom - scrollerRect.bottom,
 		);
@@ -490,19 +480,17 @@ export const MessageList = memo(function MessageList({
 		cancelOlderTurnsPreservation();
 	}, [cancelOlderTurnsPreservation]);
 
-	const jumpToAdjacentTurn = useCallback((direction: TurnJumpDirection) => {
+	const jumpToAdjacentTranscriptStop = useCallback((direction: TurnJumpDirection) => {
 		const scroller = scrollRef.current;
 		if (!scroller) return;
-		const edge = direction === "previous" ? "start" : "end";
-		const targetId = adjacentTurnJumpTargetId(
-			collectTurnJumpTargetPositions(),
+		const target = adjacentTranscriptNavigationTarget(
+			collectTranscriptNavigationStops(),
 			scroller.scrollTop,
 			direction,
 			scroller.clientHeight,
-			edge,
 		);
-		if (targetId) scrollToTurnJumpTarget(targetId, edge);
-	}, [collectTurnJumpTargetPositions, scrollToTurnJumpTarget]);
+		if (target) scrollToTranscriptNavigationTarget(target);
+	}, [collectTranscriptNavigationStops, scrollToTranscriptNavigationTarget]);
 
 	const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
 		if (pendingLatestSessionKeyRef.current === activeScrollIdentityRef.current.sessionKey) return;
@@ -766,23 +754,9 @@ export const MessageList = memo(function MessageList({
 		() => (isRunning ? turnCards?.find((turn) => turn.isCurrent)?.card.start_timestamp_ms ?? runningTurnStartMs(visibleEntries) : null),
 		[isRunning, turnCards, visibleEntries],
 	);
-	const fallbackTurnJumpTargets = useMemo(
-		() => buildFallbackTurnJumpTargets(turnViews, visibleDisplayNodes),
-		[turnViews, visibleDisplayNodes],
-	);
-	const turnJumpTargets = useMemo<TurnJumpTarget[]>(
-		() => shouldUseTurnCards ? turnCards!.map((turn) => ({ id: turn.card.id })) : fallbackTurnJumpTargets,
-		[fallbackTurnJumpTargets, shouldUseTurnCards, turnCards],
-	);
-	const fallbackTargetIdByNodeKey = useMemo(
-		() => new Map(fallbackTurnJumpTargets.flatMap((target) => target.nodeKey ? [[target.nodeKey, target.id]] : [])),
-		[fallbackTurnJumpTargets],
-	);
-	const fallbackEndTargetIdByNodeKey = useMemo(
-		() => new Map(fallbackTurnJumpTargets.flatMap((target) => target.endNodeKey ? [[target.endNodeKey, target.id]] : [])),
-		[fallbackTurnJumpTargets],
-	);
-	const showTurnJumpControls = turnJumpTargets.length > 0;
+	const showTurnJumpControls = shouldUseTurnCards
+		? turnCards!.length > 0
+		: visibleDisplayNodes.some((node) => node.type !== "turn_finished");
 	const loadOlderTurns = useCallback(() => {
 		if (!onLoadOlderTurns || !scrollSessionKey || pendingOlderTurnsLoadRef.current !== null) return;
 		const node = scrollRef.current;
@@ -920,7 +894,11 @@ export const MessageList = memo(function MessageList({
 							) : null}
 						</div>
 					) : null}
-					{!hasOlderTurns ? transcriptStartContent : null}
+					{!hasOlderTurns && transcriptStartContent != null ? (
+						<div data-transcript-nav-stop="system-prompt">
+							{transcriptStartContent}
+						</div>
+					) : null}
 					{shouldUseTurnCards
 						? (
 								<>
@@ -951,16 +929,12 @@ export const MessageList = memo(function MessageList({
 											onExpandTurn={onExpandTurn}
 											onCollapseTurn={onCollapseTurn}
 											loadingTurnId={loadingTurnId}
-											turnJumpTargetId={turn.card.id}
-											turnJumpEndId={turn.card.id}
 											transcriptAnchorId={turn.card.id}
 										/>
 									))}
 								</>
 							)
 						: visibleDisplayNodes.map((node) => {
-								const targetId = fallbackTargetIdByNodeKey.get(node.key);
-								const endTargetId = fallbackEndTargetIdByNodeKey.get(node.key);
 								const view = (
 									<TranscriptDisplayNodeView
 										key={node.key}
@@ -977,17 +951,13 @@ export const MessageList = memo(function MessageList({
 										onToggleCompaction={toggleCompaction}
 									/>
 								);
-								return targetId || endTargetId ? (
+								return node.type === "turn_finished" ? <Fragment key={node.key}>{view}</Fragment> : (
 									<div
 										key={node.key}
-										className="turn-jump-target"
-										data-turn-jump-target-id={targetId}
-										data-turn-jump-end-id={endTargetId}
+										data-transcript-nav-stop={`fallback-${node.key}`}
 									>
 										{view}
 									</div>
-								) : (
-									view
 								);
 							})}
 					{isRunning && workingStartMs != null && serverTimeMs != null ? (
@@ -997,7 +967,7 @@ export const MessageList = memo(function MessageList({
 			</div>
 			<TurnJumpControls
 				visible={showTurnJumpControls}
-				onJump={jumpToAdjacentTurn}
+				onJump={jumpToAdjacentTranscriptStop}
 				onJumpToTop={scrollToTop}
 				onJumpToBottom={scrollToBottom}
 			/>
@@ -1005,47 +975,9 @@ export const MessageList = memo(function MessageList({
 	);
 });
 
-function buildFallbackTurnJumpTargets(turns: TurnView[], displayNodes: TranscriptDisplayNode[]): TurnJumpTarget[] {
-	const targets: TurnJumpTarget[] = [];
-	for (const [index, turn] of turns.entries()) {
-		const turnEntryIds = new Set(turn.entries.map((entry) => entry.id));
-		const turnNodes = displayNodes
-			.map((node, nodeIndex) => ({ node, nodeIndex }))
-			.filter(({ node }) => displayNodeEntryIds(node).some((entryId) => turnEntryIds.has(entryId)));
-		const firstDisplayNode = turnNodes[0];
-		if (!firstDisplayNode) continue;
-		const terminalAssistantId = terminalModelStep(turn)?.entry.id ?? null;
-		const terminalAssistantNodes = turnNodes.filter(({ node }) =>
-			terminalAssistantId !== null && displayNodeEntryIds(node).includes(terminalAssistantId),
-		);
-		const assistantNodes = terminalAssistantNodes.length > 0
-			? terminalAssistantNodes
-			: turnNodes.filter(({ node }) => node.type === "assistant_text" || node.type === "tool_group");
-		const endDisplayNode = assistantNodes.at(-1) ?? turnNodes.at(-1)!;
-		targets.push({
-			id: `turn-${index}-${firstDisplayNode.node.key}`,
-			nodeKey: firstDisplayNode.node.key,
-			endNodeKey: endDisplayNode.node.key,
-		});
-	}
-	return targets;
-}
-
-function displayNodeEntryIds(node: TranscriptDisplayNode): string[] {
-	if (node.type === "tool_group") return node.items.map((item) => item.entryId);
-	if ("entry" in node) return [node.entry.id];
-	return [];
-}
-
-function turnJumpTargetNode(scroller: HTMLDivElement, targetId: string, edge: TurnJumpEdge): HTMLElement | null {
-	const selector = edge === "start" ? "[data-turn-jump-target-id]" : "[data-turn-jump-end-id]";
-	const datasetKey = edge === "start" ? "turnJumpTargetId" : "turnJumpEndId";
-	return Array.from(scroller.querySelectorAll<HTMLElement>(selector))
-		.find((target) => target.dataset[datasetKey] === targetId) ??
-		(edge === "end"
-			? Array.from(scroller.querySelectorAll<HTMLElement>("[data-turn-jump-target-id]"))
-				.find((target) => target.dataset.turnJumpTargetId === targetId) ?? null
-			: null);
+function transcriptNavigationStopNode(scroller: HTMLDivElement, stopId: string): HTMLElement | null {
+	return Array.from(scroller.querySelectorAll<HTMLElement>("[data-transcript-nav-stop]"))
+		.find((target) => target.dataset.transcriptNavStop === stopId) ?? null;
 }
 
 function transcriptAnchorNode(scroller: HTMLElement, anchorId: string): HTMLElement | null {
@@ -1395,8 +1327,6 @@ const TurnCardRow = memo(function TurnCardRow({
 	onExpandTurn,
 	onCollapseTurn,
 	loadingTurnId,
-	turnJumpTargetId,
-	turnJumpEndId,
 	transcriptAnchorId,
 }: {
 	turn: TurnCardView;
@@ -1410,8 +1340,6 @@ const TurnCardRow = memo(function TurnCardRow({
 	onExpandTurn?: (turnId: string) => void;
 	onCollapseTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
-	turnJumpTargetId?: string;
-	turnJumpEndId?: string;
 	transcriptAnchorId?: string;
 }) {
 	const card = turn.card;
@@ -1426,8 +1354,6 @@ const TurnCardRow = memo(function TurnCardRow({
 	const visibleUserMessages = card.user_messages.filter(
 		(entry) => entry.item.type !== "user_message" || !entry.item.replayed_after_compaction,
 	);
-	const firstUserMessageId = visibleUserMessages.at(0)?.id ?? null;
-	const rootTurnJumpTargetId = isExpanded || !firstUserMessageId ? turnJumpTargetId : undefined;
 	const detailLabel = isExpanded ? "Hide details" : isLoading ? "Loading…" : "Show details";
 	const onToggleDetails = () => {
 		if (isExpanded) onCollapseTurn?.(card.id);
@@ -1435,9 +1361,6 @@ const TurnCardRow = memo(function TurnCardRow({
 	};
 	const summaryUserMessages = isExpanded ? [] : visibleUserMessages;
 	const summaryDaemonObservations = isExpanded ? [] : card.daemon_observations ?? [];
-	const hasAssistantSummary =
-		(card.status === "compacted" && !!card.summary) ||
-		card.assistant_message?.item.type === "assistant_message";
 	let detailRows: ReactNode = null;
 	if (detailEntries) {
 		const toolIndex = indexToolEntries(detailEntries);
@@ -1447,45 +1370,50 @@ const TurnCardRow = memo(function TurnCardRow({
 			turn.card,
 		);
 		const resumeEntryIdByNode = new Map(displayNodes.map((node) => [node.key, nodeLeafId(node)]));
-		detailRows = displayNodes.map((node) => (
-			<TranscriptDisplayNodeView
-				key={node.key}
-				node={node}
-				toolIndex={toolIndex}
-				isActiveLeaf={nodeLeafId(node) === activeLeafId}
-				isRunning={isRunning}
-				onResumeTurn={onResumeTurn}
-				resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
-				resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
-				compactionHiddenCount={0}
-				compactionExpanded
-				onToggleCompaction={() => {}}
-			/>
-		));
+		detailRows = displayNodes.map((node) => {
+			const view = (
+				<TranscriptDisplayNodeView
+					node={node}
+					toolIndex={toolIndex}
+					isActiveLeaf={nodeLeafId(node) === activeLeafId}
+					isRunning={isRunning}
+					onResumeTurn={onResumeTurn}
+					resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
+					resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
+					compactionHiddenCount={0}
+					compactionExpanded
+					onToggleCompaction={() => {}}
+				/>
+			);
+			return node.type === "turn_finished" ? <Fragment key={node.key}>{view}</Fragment> : (
+				<div key={node.key} data-transcript-nav-stop={`detail-${card.id}-${node.key}`}>
+					{view}
+				</div>
+			);
+		});
 	}
 	return (
 		<div
 			className={["turn-summary", turn.isCurrent ? "current" : null, card.status, isExpanded ? "expanded" : null].filter(Boolean).join(" ")}
-			data-turn-jump-target-id={rootTurnJumpTargetId}
-			data-turn-jump-end-id={!hasAssistantSummary ? turnJumpEndId : undefined}
 			data-transcript-anchor-id={transcriptAnchorId}
 		>
 			{summaryUserMessages.map((entry) =>
 				entry.item.type === "user_message" ? (
-					<UserBubble
-						key={entry.id}
-						entryId={entry.id}
-						item={entry.item}
-						turnJumpTargetId={entry.id === firstUserMessageId ? turnJumpTargetId : undefined}
-					/>
+					<div key={entry.id} data-transcript-nav-stop={`user-${card.id}-${entry.id}`}>
+						<UserBubble
+							entryId={entry.id}
+							item={entry.item}
+						/>
+					</div>
 				) : null,
 			)}
 			{summaryDaemonObservations.map((entry) =>
 				entry.item.type === "daemon_tool_observation" ? (
-					<DaemonObservationSystemMessage
-						key={entry.id}
-						entry={entry as TranscriptEntry & { item: Extract<TranscriptItem, { type: "daemon_tool_observation" }> }}
-					/>
+					<div key={entry.id} data-transcript-nav-stop={`daemon-${card.id}-${entry.id}`}>
+						<DaemonObservationSystemMessage
+							entry={entry as TranscriptEntry & { item: Extract<TranscriptItem, { type: "daemon_tool_observation" }> }}
+						/>
+					</div>
 				) : null,
 			)}
 			{detailRows}
@@ -1517,7 +1445,7 @@ const TurnCardRow = memo(function TurnCardRow({
 					) : null}
 				</div>
 			) : null}
-			<TurnSummaryAssistant turn={turn} turnJumpEndId={turnJumpEndId} />
+			<TurnSummaryAssistant turn={turn} navigationStopId={`assistant-${card.id}`} />
 			<TurnDuration card={card} />
 		</div>
 	);
@@ -1534,19 +1462,23 @@ function turnDetailDisplayNodesBeforeLatestAssistant(displayNodes: TranscriptDis
 
 const TurnSummaryAssistant = memo(function TurnSummaryAssistant({
 	turn,
-	turnJumpEndId,
+	navigationStopId,
 }: {
 	turn: TurnCardView;
-	turnJumpEndId?: string;
+	navigationStopId: string;
 }) {
 	const card = turn.card;
 	if (card.status === "compacted" && card.summary) {
-		return <div className="turn-card-assistant" data-turn-jump-end-id={turnJumpEndId}>{card.summary}</div>;
+		return (
+			<div data-transcript-nav-stop={navigationStopId}>
+				<div className="turn-card-assistant">{card.summary}</div>
+			</div>
+		);
 	}
 	if (card.assistant_message?.item.type !== "assistant_message") return null;
 	const text = assistantMessageText(card.assistant_message.item);
 	return (
-		<div data-turn-jump-end-id={turnJumpEndId}>
+		<div data-transcript-nav-stop={navigationStopId}>
 			<AssistantTextBlock
 				node={{
 					type: "assistant_text",
@@ -1569,14 +1501,12 @@ function TurnDuration({ card }: { card: TurnCard }) {
 const UserBubble = memo(function UserBubble({
 	item,
 	entryId,
-	turnJumpTargetId
 }: {
 	item: Extract<TranscriptItem, { type: "user_message" }>;
 	entryId: string;
-	turnJumpTargetId?: string;
 }) {
 	return (
-		<div className="message-row user-row" data-turn-jump-target-id={turnJumpTargetId}>
+		<div className="message-row user-row">
 			<EntryId entryId={entryId} />
 			<div className="user-bubble">{contentBlocksToText(item.content)}</div>
 		</div>

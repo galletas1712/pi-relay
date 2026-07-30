@@ -41,6 +41,98 @@ beforeAll(() => {
 	vi.stubGlobal("ResizeObserver", MockResizeObserver);
 });
 
+describe("adaptive transcript navigation", () => {
+	it("uses rendered card blocks in order and adapts after expansion", () => {
+		const firstBase = turnView("turn-1", 1);
+		const secondBase = turnView("turn-2", 2);
+		const first = {
+			...firstBase,
+			card: {
+				...firstBase.card,
+				assistant_message: entry("assistant-1", "user-1", "answer 1"),
+			},
+		};
+		const second = {
+			...secondBase,
+			card: {
+				...secondBase.card,
+				assistant_message: entry("assistant-2", "user-2", "answer 2"),
+			},
+		};
+		const view = render(
+			<MessageList
+				{...props({
+					turnCards: [first, second],
+					activeLeafId: first.card.active_leaf_id,
+					transcriptStartContent: <div>system prompt</div>,
+				})}
+			/>,
+		);
+		const scroller = messageScroller();
+		mockScrollGeometry(scroller, 100, 900);
+		mockNavigationRects(scroller, [[0, 40], [60, 110], [120, 180], [200, 250], [260, 320]]);
+
+		scroller.scrollTop = 0;
+		fireEvent.scroll(scroller);
+		fireEvent.click(screen.getByRole("button", { name: "Jump to next turn" }));
+		expect(scroller.scrollTop).toBe(60);
+		fireEvent.click(screen.getByRole("button", { name: "Jump to next turn" }));
+		expect(scroller.scrollTop).toBe(120);
+		fireEvent.click(screen.getByRole("button", { name: "Jump to next turn" }));
+		expect(scroller.scrollTop).toBe(200);
+
+		// A DOM change between clicks changes the stop order and geometry. The
+		// next click must use the newly rendered detail blocks, not stale turn
+		// metadata captured before expansion.
+		const expandedFirst = {
+			...first,
+			card: {
+				...first.card,
+				assistant_message: entry("final-assistant", "detail-user", "final answer"),
+			},
+			entries: [userEntry("detail-user", "detail"), entry("detail-assistant", "detail-user", "detail answer")],
+			expanded: true,
+		};
+		view.rerender(
+			<MessageList
+				{...props({
+					turnCards: [expandedFirst, second],
+					activeLeafId: first.card.active_leaf_id,
+					transcriptStartContent: <div>system prompt</div>,
+				})}
+			/>,
+		);
+		const expandedScroller = messageScroller();
+		mockScrollGeometry(expandedScroller, 100, 900);
+		mockNavigationRects(expandedScroller, [[0, 40], [60, 95], [100, 150], [160, 220], [240, 290], [300, 360]]);
+		expandedScroller.scrollTop = 60;
+		fireEvent.scroll(expandedScroller);
+		fireEvent.click(screen.getByRole("button", { name: "Jump to next turn" }));
+		expect(expandedScroller.scrollTop).toBe(100);
+		fireEvent.click(screen.getByRole("button", { name: "Jump to next turn" }));
+		expect(expandedScroller.scrollTop).toBe(160);
+	});
+
+	it("keeps top and bottom buttons on their existing sticky paths", () => {
+		const current = entry("current", null, "current");
+		render(<MessageList {...props({ entries: [current], activeLeafId: current.id })} />);
+		const scroller = messageScroller();
+		const geometry = mockScrollGeometry(scroller, 100, 1000);
+
+		fireEvent.click(screen.getByRole("button", { name: "Jump to top" }));
+		expect(scroller.scrollTop).toBe(0);
+		geometry.height = 1100;
+		activeResizeObserver().trigger();
+		expect(scroller.scrollTop).toBe(0);
+
+		fireEvent.click(screen.getByRole("button", { name: "Jump to bottom" }));
+		expect(scroller.scrollTop).toBe(1000);
+		geometry.height = 1200;
+		activeResizeObserver().trigger();
+		expect(scroller.scrollTop).toBe(1100);
+	});
+});
+
 afterEach(() => {
 	cleanup();
 	resizeObservers.length = 0;
@@ -1226,6 +1318,26 @@ function mockTranscriptRects(
 	return rects;
 }
 
+function mockNavigationRects(
+	scroller: HTMLElement,
+	positions: Array<[number, number]>,
+): void {
+	vi.spyOn(scroller, "getBoundingClientRect").mockImplementation(() => rect(0, scroller.clientHeight));
+	const prototypeRect = HTMLElement.prototype.getBoundingClientRect;
+	let index = 0;
+	for (const element of scroller.querySelectorAll<HTMLElement>("[data-transcript-nav-stop]")) {
+		const position = positions[index++] ?? [0, 0];
+		vi.spyOn(element, "getBoundingClientRect").mockImplementation(() => rect(
+			position[0] - scroller.scrollTop,
+			position[1] - scroller.scrollTop,
+		));
+	}
+	vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+		if (this === scroller) return rect(0, scroller.clientHeight);
+		return prototypeRect.call(this);
+	});
+}
+
 function rect(top: number, bottom: number): DOMRect {
 	return {
 		x: 0,
@@ -1252,6 +1364,15 @@ function entry(id: string, parentId: string | null, text: string): TranscriptEnt
 		parent_id: parentId,
 		timestamp_ms: 1,
 		item: { type: "assistant_message", items: [{ type: "text", text }] },
+	};
+}
+
+function userEntry(id: string, text: string): TranscriptEntry {
+	return {
+		id,
+		parent_id: null,
+		timestamp_ms: 1,
+		item: { type: "user_message", content: [{ type: "text", text }] },
 	};
 }
 
