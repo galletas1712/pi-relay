@@ -1,5 +1,14 @@
 # Rust Rewrite Worklog
 
+## 2026-07-29
+
+### Runtime Online Redrives Stuck Queued Inputs
+
+- A follow-up accepted while the runtime host was offline stayed `queued`
+  forever: boot's one-shot drive raced reconnect, and nothing re-ran when the
+  runtime Hello finally registered. Runtime online now sweeps that runtime's
+  active queued/consuming sessions through the same drive helper boot uses.
+
 ## 2026-07-27
 
 ### `max_tokens` Is Anthropic-Only Everywhere It Is Described

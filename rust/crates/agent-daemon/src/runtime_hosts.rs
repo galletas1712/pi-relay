@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_mcp_types::{
     McpAuthServerStatus, McpInventory, McpLogoutResult, McpOAuthLoginStart, McpSessionManifest,
@@ -54,11 +54,16 @@ impl From<RuntimeCommandError> for RuntimeHostError {
 /// or fail the work of a newer connection for the same runtime_id.
 static CONNECTION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// Fired after a runtime Hello is registered in the live connection map.
+/// The hook must be cheap/non-blocking (spawn any follow-up work itself).
+pub(crate) type RuntimeOnlineHook = Arc<dyn Fn(String) + Send + Sync + 'static>;
+
 #[derive(Clone)]
 pub(crate) struct RuntimeRegistry {
     repo: Arc<PostgresAgentStore>,
     connections: Arc<Mutex<HashMap<String, RuntimeConnection>>>,
     waiters: Arc<Mutex<HashMap<String, Waiter>>>,
+    on_online: Arc<StdMutex<Option<RuntimeOnlineHook>>>,
 }
 
 #[derive(Clone)]
@@ -111,7 +116,12 @@ impl RuntimeRegistry {
             repo,
             connections: Default::default(),
             waiters: Default::default(),
+            on_online: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    pub(crate) fn set_on_online(&self, hook: RuntimeOnlineHook) {
+        *self.on_online.lock().expect("runtime online hook lock") = Some(hook);
     }
 
     pub(crate) async fn listen(self, bind: String) -> Result<()> {
@@ -161,6 +171,17 @@ impl RuntimeRegistry {
                 last_heartbeat: Instant::now(),
             },
         );
+        // Redrive durable queued work that failed while this runtime was offline.
+        // Boot also sweeps queued inputs, but that can race a reconnect that
+        // arrives after the one-shot boot drive already failed.
+        if let Some(hook) = self
+            .on_online
+            .lock()
+            .expect("runtime online hook lock")
+            .clone()
+        {
+            hook(runtime_id.clone());
+        }
 
         let served = self
             .serve_connection(connection_id, &runtime_id, reader, writer, receiver)
@@ -772,6 +793,7 @@ impl RuntimeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     #[tokio::test]
     async fn dropping_runtime_command_sends_cancel() {
@@ -789,6 +811,65 @@ mod tests {
         cancellation.disarm();
         drop(cancellation);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+    #[tokio::test]
+    async fn runtime_hello_fires_on_online_hook() {
+        let Some((store, admin_url, name)) = test_runtime_store().await else {
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let registry = RuntimeRegistry::new(store);
+        let fired = Arc::new(AtomicBool::new(false));
+        let seen_id = Arc::new(StdMutex::new(None));
+        {
+            let fired = fired.clone();
+            let seen_id = seen_id.clone();
+            registry.set_on_online(Arc::new(move |runtime_id| {
+                fired.store(true, AtomicOrdering::SeqCst);
+                *seen_id.lock().expect("seen id") = Some(runtime_id);
+            }));
+        }
+        test_support::connect_test_runtime(&registry, "runtime-online-hook").await;
+        assert!(
+            fired.load(AtomicOrdering::SeqCst),
+            "Hello registration must invoke the online hook"
+        );
+        assert_eq!(
+            seen_id.lock().expect("seen id").as_deref(),
+            Some("runtime-online-hook")
+        );
+        if let Ok(admin) = sqlx::PgPool::connect(&admin_url).await {
+            let _ = sqlx::query(&format!(r#"drop database "{name}" with (force)"#))
+                .execute(&admin)
+                .await;
+            admin.close().await;
+        }
+    }
+
+    async fn test_runtime_store() -> Option<(Arc<PostgresAgentStore>, String, String)> {
+        let admin_url = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok()?;
+        let name = format!(
+            "pi_relay_runtime_online_hook_{}_{}",
+            std::process::id(),
+            CONNECTION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let admin = sqlx::PgPool::connect(&admin_url).await.ok()?;
+        sqlx::query(&format!(r#"create database "{name}""#))
+            .execute(&admin)
+            .await
+            .ok()?;
+        admin.close().await;
+        let (prefix, query) = admin_url
+            .split_once('?')
+            .map(|(prefix, query)| (prefix, format!("?{query}")))
+            .unwrap_or((admin_url.as_str(), String::new()));
+        let root = prefix.rsplit_once('/').map(|(root, _)| root)?;
+        let database_url = format!("{root}/{name}{query}");
+        let store = PostgresAgentStore::connect(&database_url).await.ok()?;
+        store.migrate().await.ok()?;
+        Some((Arc::new(store), admin_url, name))
     }
 }
 

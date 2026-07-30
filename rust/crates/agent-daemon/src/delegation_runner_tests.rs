@@ -723,6 +723,173 @@ async fn tear_down_delegation(env: &TestEnv, delegation: &Delegation, target: De
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
+async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
+    // Reproduce the stuck-queue failure mode: durable input is accepted while
+    // the runtime is offline, the one-shot drive fails, then a later Hello must
+    // redrive without another user send or control restart.
+    let admin_url = match std::env::var("PI_RELAY_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        }
+    };
+    let name = format!(
+        "pi_relay_runtime_online_redrive_{}_{}",
+        std::process::id(),
+        Uuid::new_v4().simple()
+    );
+    let admin = sqlx::PgPool::connect(&admin_url)
+        .await
+        .expect("connect admin");
+    sqlx::query(&format!(r#"create database "{name}""#))
+        .execute(&admin)
+        .await
+        .expect("create db");
+    admin.close().await;
+    let database_url = database_url_with_name(&admin_url, &name);
+    let store = PostgresAgentStore::connect(&database_url)
+        .await
+        .expect("connect store");
+    store.migrate().await.expect("migrate");
+
+    let state_dir = TempDir::new("state");
+    let cwd = TempDir::new("cwd");
+    let (events, _rx) = broadcast::channel(1024);
+    let repo = Arc::new(store);
+    let runtime_hosts = RuntimeRegistry::new(repo.clone());
+    let state = AppState {
+        repo,
+        active: Arc::new(Mutex::new(HashMap::new())),
+        session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
+        tasks: Arc::new(StdMutex::new(HashMap::new())),
+        auxiliary_tasks: Arc::new(StdMutex::new(Vec::new())),
+        task_registration_lock: Arc::new(StdMutex::new(())),
+        post_compaction_recovery_scheduled: Arc::new(AtomicBool::new(false)),
+        post_compaction_recovery_notify: Arc::new(tokio::sync::Notify::new()),
+        post_compaction_recovery_task: Arc::new(StdMutex::new(None)),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        events,
+        tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        provider_connections: ProviderConnectionRegistry::new(),
+        session_titles: SessionTitleScheduler::disabled(),
+        runtime_hosts: runtime_hosts.clone(),
+        prompt_root: cwd.path().to_path_buf(),
+        daemon_config: crate::config::DaemonConfig::default(),
+        pause_subagent_control_after_commit: Arc::new(AtomicBool::new(false)),
+        subagent_control_committed: Arc::new(tokio::sync::Notify::new()),
+        fail_subagent_control_reload_after_commit: Arc::new(AtomicBool::new(false)),
+        fail_subagent_after_start_before_dispatch: Arc::new(AtomicBool::new(false)),
+    };
+    crate::install_runtime_online_queued_redrive(&state);
+
+    let project_id = Uuid::new_v4();
+    state
+        .repo
+        .create_project(
+            project_id,
+            "runtime online redrive",
+            TEST_RUNTIME_ID,
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    let session_id = "queued_while_offline";
+    let config = SessionConfig {
+        project_id: Some(project_id),
+        runtime_id: TEST_RUNTIME_ID.to_string(),
+        workspace_id: format!("workspace_{session_id}"),
+        workspaces: Vec::new(),
+        system_prompt: String::new(),
+        provider: ProviderConfig {
+            kind: ProviderKind::OpenAi,
+            model: "gpt-5.2".to_string(),
+            reasoning_effort: ReasoningEffort::Medium,
+            max_tokens: None,
+            prompt_cache: None,
+        },
+        metadata: json!({ "created_by": "test", "harness": true }),
+        mcp_manifest: None,
+    };
+    state
+        .repo
+        .create_session(session_id, &config)
+        .await
+        .expect("create session");
+    state
+        .repo
+        .enqueue_user_input(
+            session_id,
+            InputPriority::FollowUp,
+            &UserMessage::text("drive me when runtime returns"),
+            Some("offline-client-input"),
+            None,
+        )
+        .await
+        .expect("enqueue while offline");
+
+    crate::spawn_drive_until_blocked(&state, session_id.to_string(), "test.offline_drive");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let events = state
+                .repo
+                .events_after(session_id, None)
+                .await
+                .expect("load events");
+            if events.iter().any(|event| {
+                event.event == EventType::ModelError
+                    && event.data.get("reason").and_then(|v| v.as_str())
+                        == Some("test.offline_drive")
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("offline drive records runtime unavailable");
+    assert!(
+        state
+            .repo
+            .has_queued_inputs(session_id)
+            .await
+            .expect("queue check"),
+        "failed offline drive must leave the durable queued input"
+    );
+
+    connect_test_runtime(&runtime_hosts, TEST_RUNTIME_ID).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if !state
+                .repo
+                .has_queued_inputs(session_id)
+                .await
+                .expect("queue check")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("runtime Hello redrives and consumes the stuck queued input");
+
+    drop(state_dir);
+    drop(cwd);
+    state.repo.close().await;
+    let admin = sqlx::PgPool::connect(&admin_url)
+        .await
+        .expect("reconnect admin");
+    sqlx::query(&format!(r#"drop database "{name}" with (force)"#))
+        .execute(&admin)
+        .await
+        .ok();
+    admin.close().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
 async fn empty_dispatch_stops_after_the_pending_query() {
     let Some(env) = test_env().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");

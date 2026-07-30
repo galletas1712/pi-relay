@@ -713,7 +713,23 @@ impl PostgresAgentStore {
     }
 
     pub async fn sessions_with_active_queued_inputs(&self) -> Result<Vec<String>> {
+        self.sessions_with_active_queued_inputs_for_runtime(None)
+            .await
+    }
+
+    /// Sessions with active queued/consuming input, optionally limited to one
+    /// runtime. Used by boot recovery (all runtimes) and by runtime-online
+    /// redrive (the runtime that just connected).
+    pub async fn sessions_with_active_queued_inputs_for_runtime(
+        &self,
+        runtime_id: Option<&str>,
+    ) -> Result<Vec<String>> {
         let active_queue = queued_input_is_active(Some("q"));
+        let runtime_filter = if runtime_id.is_some() {
+            "and s.runtime_id = $1"
+        } else {
+            ""
+        };
         let query = format!(
             r#"
                 select distinct q.session_id
@@ -725,10 +741,15 @@ impl PostgresAgentStore {
                         s.parent_session_id is null
                         or d.status in ('running','cancelling')
                     )
+                    {runtime_filter}
                 order by q.session_id
                 "#
         );
-        Ok(sqlx::query_scalar(&query).fetch_all(&self.pool).await?)
+        let mut query = sqlx::query_scalar(&query);
+        if let Some(runtime_id) = runtime_id {
+            query = query.bind(runtime_id);
+        }
+        Ok(query.fetch_all(&self.pool).await?)
     }
 
     pub async fn reset_abandoned_consuming_inputs(&self, session_id: &str) -> Result<()> {
@@ -1587,6 +1608,38 @@ mod tests {
             .await
             .expect("queued sessions load");
         assert_eq!(sessions, vec!["main_with_queue", "running_child"]);
+
+        let mut other_runtime = config.clone();
+        other_runtime.runtime_id = "runtime-other".to_string();
+        store
+            .create_session("other_runtime_queue", &other_runtime)
+            .await
+            .expect("other runtime session creates");
+        store
+            .enqueue_user_input(
+                "other_runtime_queue",
+                InputPriority::FollowUp,
+                &UserMessage::text("queued"),
+                Some("other-runtime-client-input"),
+                None,
+            )
+            .await
+            .expect("other runtime queue enqueues");
+
+        assert_eq!(
+            store
+                .sessions_with_active_queued_inputs_for_runtime(Some("runtime-test"))
+                .await
+                .expect("runtime-test queued sessions"),
+            vec!["main_with_queue", "running_child"]
+        );
+        assert_eq!(
+            store
+                .sessions_with_active_queued_inputs_for_runtime(Some("runtime-other"))
+                .await
+                .expect("runtime-other queued sessions"),
+            vec!["other_runtime_queue"]
+        );
 
         db.cleanup().await;
     }

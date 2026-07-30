@@ -15,7 +15,10 @@ until the daemon persists the corresponding session or action state.
 
 The runtime should be treated as independently restartable. A runtime restart
 must not be used as a substitute for database recovery: the daemon reconciles
-leased actions and session state when the control connection returns.
+leased actions and session state when the control connection returns. When a
+runtime Hello registers a live connection, the daemon also redrives sessions on
+that runtime that still hold active queued/consuming inputs, so a transient
+`runtime unavailable` failure cannot leave durable queue rows stuck forever.
 
 ## Workspace and security boundary
 
