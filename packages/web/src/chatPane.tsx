@@ -1,4 +1,6 @@
 import { memo, type ReactNode } from "react";
+import { CenterViewTabs } from "./centerViewTabs.tsx";
+import { GitView } from "./gitView.tsx";
 import { LogHeader } from "./panels.tsx";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { isArchivedSession, sessionStatusWithDelegations, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
@@ -11,10 +13,13 @@ import type {
 	TurnCardView,
 } from "./transcript.tsx";
 import type { ReasoningEffort, SessionSnapshot, TranscriptEntry } from "./types.ts";
+import type { CenterView } from "./workspaceRoute.ts";
 
 export interface ChatPaneProps {
 	session: SessionDisplayInfo | null;
 	snapshot: SessionSnapshot | null;
+	centerView: CenterView;
+	onCenterViewChange: (view: CenterView) => void;
 	entries: TranscriptEntry[];
 	turnCards?: TurnCardView[] | null;
 	transcriptLoading: boolean;
@@ -57,6 +62,8 @@ export interface ChatPaneProps {
 export const ChatPane = memo(function ChatPane({
 	session,
 	snapshot,
+	centerView,
+	onCenterViewChange,
 	entries,
 	turnCards,
 	transcriptLoading,
@@ -100,6 +107,7 @@ export const ChatPane = memo(function ChatPane({
 	return (
 		<main className="log-pane" data-slot="agent-log">
 			{routeNotice}
+			<CenterViewTabs activeView={centerView} onChange={onCenterViewChange} />
 			<ChatHeader
 				session={session}
 				snapshot={snapshot}
@@ -117,38 +125,58 @@ export const ChatPane = memo(function ChatPane({
 				onSelectSession={onSelectSession}
 				onToggleRight={onToggleRight}
 			/>
-			<MessageList
-				entries={entries}
-				turnCards={turnCards}
-				pendingActions={snapshot?.pending_actions ?? []}
-				activeLeafId={visibleActiveLeafId}
-				isRunning={snapshot?.activity === "running"}
-				serverTimeMs={snapshot?.server_time_ms ?? null}
-				hasSession={!!selectedId}
-				sessionId={selectedId}
-				entriesSessionId={snapshot?.session_id ?? null}
-				loadingSession={transcriptLoading}
-				sessionError={transcriptError}
-				sessionErrorHasUsableCache={transcriptErrorHasUsableCache}
-				retryingSession={transcriptRetrying}
-				onRetrySession={onRetryTranscript}
-				onNewSession={onNewSession}
-				emptySessionContent={emptySessionContent}
-				onResumeTurn={onResumeTurn}
-				resumingTurnId={resumingTurnId}
-				resumeBlockedReason={mutationBlockedReason}
-				remoteReadBlockedReason={remoteReadBlockedReason}
-				onExpandTurn={onExpandTurn}
-				onCollapseTurn={onCollapseTurn}
-				transcriptStartContent={transcriptStartContent}
-				loadingTurnId={loadingTurnId}
-				hasOlderTurns={hasOlderTurns}
-				loadingOlderTurns={loadingOlderTurns}
-				onLoadOlderTurns={onLoadOlderTurns}
-				destination={transcriptDestination}
-				turnPageIdentity={transcriptTurnPageIdentity}
-				onAcknowledgeDestination={onAcknowledgeTranscriptDestination}
-			/>
+			{centerView === "chat" ? (
+				<MessageList
+					entries={entries}
+					turnCards={turnCards}
+					pendingActions={snapshot?.pending_actions ?? []}
+					activeLeafId={visibleActiveLeafId}
+					isRunning={snapshot?.activity === "running"}
+					serverTimeMs={snapshot?.server_time_ms ?? null}
+					hasSession={!!selectedId}
+					sessionId={selectedId}
+					entriesSessionId={snapshot?.session_id ?? null}
+					loadingSession={transcriptLoading}
+					sessionError={transcriptError}
+					sessionErrorHasUsableCache={transcriptErrorHasUsableCache}
+					retryingSession={transcriptRetrying}
+					onRetrySession={onRetryTranscript}
+					onNewSession={onNewSession}
+					emptySessionContent={emptySessionContent}
+					onResumeTurn={onResumeTurn}
+					resumingTurnId={resumingTurnId}
+					resumeBlockedReason={mutationBlockedReason}
+					remoteReadBlockedReason={remoteReadBlockedReason}
+					onExpandTurn={onExpandTurn}
+					onCollapseTurn={onCollapseTurn}
+					transcriptStartContent={transcriptStartContent}
+					loadingTurnId={loadingTurnId}
+					hasOlderTurns={hasOlderTurns}
+					loadingOlderTurns={loadingOlderTurns}
+					onLoadOlderTurns={onLoadOlderTurns}
+					destination={transcriptDestination}
+					turnPageIdentity={transcriptTurnPageIdentity}
+					onAcknowledgeDestination={onAcknowledgeTranscriptDestination}
+				/>
+			) : centerView === "git" ? (
+				<div
+					className="center-view-panel"
+					role="tabpanel"
+					id="center-view-panel-git"
+					aria-labelledby="center-view-tab-git"
+				>
+					<GitView snapshot={snapshot} />
+				</div>
+			) : (
+				<div
+					className="center-view-panel center-view-panel-placeholder"
+					role="tabpanel"
+					id="center-view-panel-files"
+					aria-labelledby="center-view-tab-files"
+				>
+					<p className="muted">Filesystem browsing is not available yet.</p>
+				</div>
+			)}
 		</main>
 	);
 });

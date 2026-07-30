@@ -6,6 +6,7 @@
 	"description": "React websocket UI for pi-relay sessions.",
 	"scripts": {
 		"dev": "vite",
+		"github-proxy": "node --experimental-strip-types server/githubProxyStandalone.ts",
 		"build": "tsc -b && vite build",
 		"typecheck:unused": "tsc -p tsconfig.runtime.json --incremental false",
 		"test": "vitest --run",

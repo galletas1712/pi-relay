@@ -2,6 +2,9 @@ import type { UiSelection } from "./uiResume.ts";
 
 export type ExecutionView = "overview" | "activity" | "handoffs";
 
+/** Primary center-pane surface while on a Conversation destination. */
+export type CenterView = "chat" | "git" | "files";
+
 declare const routeIdBrand: unique symbol;
 
 /**
@@ -53,6 +56,7 @@ interface WorkspaceRouteBase {
 export interface ConversationRoute extends WorkspaceRouteBase {
 	readonly destination: "conversation";
 	readonly conversation: RouteConversation;
+	readonly centerView: CenterView;
 }
 
 export interface ExecutionRoute extends WorkspaceRouteBase {
@@ -169,6 +173,8 @@ interface ParsedQuery {
 }
 
 const EXECUTION_VIEWS = new Set<ExecutionView>(["overview", "activity", "handoffs"]);
+const CENTER_VIEWS = new Set<CenterView>(["chat", "git", "files"]);
+const CONVERSATION_QUERY_PARAMETERS = new Set(["view"]);
 const SUPPORTED_QUERY_PARAMETERS = new Set(["conversation", "focus", "handoff", "overview"]);
 const INVALID_ID_CHARACTERS = /[\/\\\u0000-\u001f\u007f-\u009f]/u;
 
@@ -226,6 +232,7 @@ export function parseWorkspaceRoute(input: string | WorkspaceRouteLocation): Wor
 				rootConversationRecovery,
 			);
 		}
+		const centerView = parseCenterView(query);
 		const route: ConversationRoute = {
 			destination: "conversation",
 			scope: base.scope,
@@ -234,8 +241,14 @@ export function parseWorkspaceRoute(input: string | WorkspaceRouteLocation): Wor
 				conversationSessionId === base.rootSessionId
 					? rootConversation()
 					: { kind: "agent", sessionId: conversationSessionId },
+			centerView,
 		};
-		return matchedRoute(route, location, unsupportedQueryWarnings(query, location.hash, new Set()), []);
+		return matchedRoute(
+			route,
+			location,
+			conversationQueryWarnings(query, location.hash, centerView),
+			centerViewCorrectionReasons(query, centerView),
+		);
 	}
 
 	if (suffix[0] !== "execution" || suffix.length !== 2 || !EXECUTION_VIEWS.has(suffix[1] as ExecutionView)) {
@@ -374,7 +387,9 @@ export function serializeWorkspaceRoute(route: WorkspaceRoute): string {
 	if (route.destination === "conversation") {
 		const conversationSessionId =
 			route.conversation.kind === "root" ? route.rootSessionId : route.conversation.sessionId;
-		return `${prefix}/conversation/${encodePart(conversationSessionId)}`;
+		const path = `${prefix}/conversation/${encodePart(conversationSessionId)}`;
+		if (route.centerView === "chat") return path;
+		return `${path}?view=${encodePart(route.centerView)}`;
 	}
 
 	const parameters: [string, string][] = [];
@@ -408,13 +423,18 @@ export function hostRouteScope(): WorkspaceRouteScope {
 	return { kind: "host" };
 }
 
-export function rootConversationRoute(scope: WorkspaceRouteScope, rootSessionId: string): ConversationRoute {
+export function rootConversationRoute(
+	scope: WorkspaceRouteScope,
+	rootSessionId: string,
+	centerView: CenterView = "chat",
+): ConversationRoute {
 	assertRouteScope(scope);
 	return {
 		destination: "conversation",
 		scope,
 		rootSessionId: requireRouteId(rootSessionId, "root session ID"),
 		conversation: rootConversation(),
+		centerView,
 	};
 }
 
@@ -483,6 +503,7 @@ export function selectRootRun(scope: WorkspaceRouteScope, rootSessionId: string)
 /** Conversation and Execution destination links preserve the effective conversation. */
 export function showConversation(route: WorkspaceRoute): RouteNavigation {
 	const conversation = messageRecipient(route);
+	const centerView = route.destination === "conversation" ? route.centerView : "chat";
 	const next: ConversationRoute = {
 		destination: "conversation",
 		scope: route.scope,
@@ -491,8 +512,17 @@ export function showConversation(route: WorkspaceRoute): RouteNavigation {
 			conversation.kind === "root"
 				? rootConversation()
 				: { kind: "agent", sessionId: conversation.sessionId },
+		centerView,
 	};
 	return navigation("push", next);
+}
+
+/** Switch the center pane surface without changing the open conversation. */
+export function setCenterView(route: ConversationRoute, centerView: CenterView): RouteNavigation {
+	if (route.centerView === centerView) {
+		return navigation("replace", route);
+	}
+	return navigation("replace", { ...route, centerView });
 }
 
 export function openAgentConversation(route: WorkspaceRoute, sessionId: string): RouteNavigation {
@@ -783,6 +813,7 @@ function agentConversationNavigation(
 	sessionId: string,
 ): RouteNavigation {
 	const validatedSessionId = requireRouteId(sessionId, "agent session ID");
+	const centerView = route.destination === "conversation" ? route.centerView : "chat";
 	const next: ConversationRoute = {
 		destination: "conversation",
 		scope: route.scope,
@@ -791,6 +822,7 @@ function agentConversationNavigation(
 			validatedSessionId === route.rootSessionId
 				? rootConversation()
 				: { kind: "agent", sessionId: validatedSessionId },
+		centerView,
 	};
 	return navigation("push", next);
 }
@@ -818,6 +850,56 @@ function invalidConversationWarning(
 		requestedValue,
 		message: "The requested conversation was unavailable. The root conversation is shown instead.",
 	};
+}
+
+function parseCenterView(query: ParsedQuery): CenterView {
+	const values = query.values.get("view") ?? [];
+	if (values.length === 0) return "chat";
+	if (values.length !== 1) return "chat";
+	const requested = values[0];
+	if (requested === "git" || requested === "files" || requested === "chat") {
+		return requested;
+	}
+	return "chat";
+}
+
+function conversationQueryWarnings(
+	query: ParsedQuery,
+	hash: string,
+	centerView: CenterView,
+): WorkspaceRouteWarning[] {
+	const warnings = unsupportedQueryWarnings(query, hash, CONVERSATION_QUERY_PARAMETERS);
+	const values = query.values.get("view") ?? [];
+	if (values.length === 1 && values[0] !== centerView) {
+		warnings.unshift({
+			kind: "unsupported-query",
+			persistent: false,
+			parameters: ["view"],
+			message: `The requested center view "${values[0]}" is not supported. Showing ${centerView} instead.`,
+		});
+	}
+	if (values.length > 1) {
+		warnings.unshift({
+			kind: "unsupported-query",
+			persistent: false,
+			parameters: ["view"],
+			message: "The center view query must contain exactly one view value.",
+		});
+	}
+	return warnings;
+}
+
+function centerViewCorrectionReasons(query: ParsedQuery, centerView: CenterView): RouteCorrectionReason[] {
+	const values = query.values.get("view") ?? [];
+	if (values.length === 0 && centerView === "chat") return [];
+	if (values.length === 1 && values[0] === centerView) return [];
+	return ["unsupported-query"];
+}
+
+function assertCenterView(centerView: unknown): asserts centerView is CenterView {
+	if (typeof centerView !== "string" || !CENTER_VIEWS.has(centerView as CenterView)) {
+		programmerError(`unsupported center view "${String(centerView)}"`);
+	}
 }
 
 function unsupportedQueryWarnings(
@@ -919,14 +1001,17 @@ function assertWorkspaceRoute(route: WorkspaceRoute): void {
 	assertExactKeys(
 		route,
 		destination === "conversation"
-			? ["destination", "scope", "rootSessionId", "conversation"]
+			? ["destination", "scope", "rootSessionId", "conversation", "centerView"]
 			: ["destination", "scope", "rootSessionId", "view", "conversation", "focus", "handoff"],
 		"route",
 	);
 	assertRouteScope(route.scope);
 	const rootSessionId = requireRouteId(route.rootSessionId, "root session ID");
 	assertConversation(route.conversation, rootSessionId);
-	if (destination === "conversation") return;
+	if (destination === "conversation") {
+		assertCenterView(route.centerView);
+		return;
+	}
 
 	if (!EXECUTION_VIEWS.has(route.view)) programmerError(`unsupported execution view "${String(route.view)}"`);
 	assertFocus(route.focus, rootSessionId);

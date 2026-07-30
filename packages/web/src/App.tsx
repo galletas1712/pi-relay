@@ -198,6 +198,7 @@ import {
 	openAgentConversation,
 	parseWorkspaceRoute,
 	selectRootRun,
+	setCenterView,
 	showConversation,
 	unavailableConversationRoute,
 	unavailableExecutionDetail,
@@ -4164,6 +4165,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const conversationVisible =
 		(validatedRoute?.destination === "conversation") ||
 		(workspaceRouteResult.kind === "none" && routeValidation.kind === "idle");
+	const centerView =
+		validatedRoute?.destination === "conversation" ? validatedRoute.centerView : "chat";
+	const composerVisible = conversationVisible && centerView === "chat";
 	const executionRoute =
 		validatedRoute?.destination === "execution" ? validatedRoute : null;
 	const unavailableState =
@@ -4175,6 +4179,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const routePending =
 		routeValidation.kind === "pending" &&
 		(workspaceRouteResult.kind === "route" || legacyMigrationPendingRef.current);
+	const handleCenterViewChange = useCallback(
+		(view: import("./workspaceRoute.ts").CenterView) => {
+			if (validatedRoute?.destination !== "conversation") return;
+			applyNavigation(setCenterView(validatedRoute, view));
+		},
+		[applyNavigation, validatedRoute],
+	);
 	const retryRouteValidation = useCallback(() => {
 		setRouteValidationRetry((current) => current + 1);
 	}, []);
@@ -4374,6 +4385,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				<ChatPane
 						session={selectedChatSession}
 						snapshot={loadedSnapshot}
+						centerView={centerView}
+						onCenterViewChange={handleCenterViewChange}
 						entries={loadedEntries}
 						turnCards={turnCardViews}
 						transcriptLoading={transcriptLoading}
@@ -4524,7 +4537,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					retrying={retryingConnection}
 					onRetry={retryConnection}
 				/>
-				{conversationVisible ? (
+				{composerVisible ? (
 					<Composer
 						selectedId={selectedId}
 						selectedIsSubagent={
