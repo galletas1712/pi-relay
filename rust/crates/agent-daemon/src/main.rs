@@ -70,7 +70,6 @@ async fn main() -> Result<()> {
 
     let (events, _) = broadcast::channel(1024);
     let runtime_hosts = RuntimeRegistry::new(repo.clone());
-    tokio::spawn(runtime_hosts.clone().listen(config.runtime_bind.clone()));
     let state = AppState {
         repo,
         active: Arc::new(Mutex::new(HashMap::new())),
@@ -100,6 +99,10 @@ async fn main() -> Result<()> {
         #[cfg(test)]
         fail_subagent_after_start_before_dispatch: Arc::new(AtomicBool::new(false)),
     };
+    // Install before accepting runtime connections so a Hello that races boot
+    // still redrives durable queued work that the one-shot boot sweep missed.
+    install_runtime_online_queued_redrive(&state);
+    tokio::spawn(runtime_hosts.listen(config.runtime_bind.clone()));
 
     // Teardown owns every child of a cancelling delegation. Finish it before
     // controls, action recovery, post-compaction recovery, or any other child
@@ -188,17 +191,13 @@ async fn main() -> Result<()> {
     // again instead of being abandoned as a failure.
     delegation_runner::sweep_running_delegations_on_boot(&state).await;
     spawn_pending_subagent_control_sweeper(&state);
-    match state.repo.sessions_with_active_queued_inputs().await {
+    match state
+        .repo
+        .sessions_with_active_queued_inputs_for_runtime(None)
+        .await
+    {
         Ok(session_ids) => {
-            if !session_ids.is_empty() {
-                eprintln!(
-                    "resuming {} session(s) with active queued input(s)",
-                    session_ids.len()
-                );
-            }
-            for session_id in session_ids {
-                spawn_drive_until_blocked(&state, session_id, "boot.active_queued_input");
-            }
+            resume_active_queued_inputs(&state, session_ids, "boot.active_queued_input");
         }
         Err(error) => eprintln!("failed to sweep queued inputs on boot: {error:#}"),
     }
@@ -1353,6 +1352,43 @@ pub(crate) fn spawn_drive_until_blocked(
         }
     });
     let _ = crate::runtime::register_auxiliary_task(&task_state, handle, start_tx);
+}
+
+pub(crate) fn install_runtime_online_queued_redrive(state: &AppState) {
+    let state_for_hook = state.clone();
+    state.runtime_hosts.set_on_online(Arc::new(move |runtime_id| {
+        let state = state_for_hook.clone();
+        tokio::spawn(async move {
+            match state
+                .repo
+                .sessions_with_active_queued_inputs_for_runtime(Some(&runtime_id))
+                .await
+            {
+                Ok(session_ids) => {
+                    resume_active_queued_inputs(
+                        &state,
+                        session_ids,
+                        "runtime.online.active_queued_input",
+                    );
+                }
+                Err(error) => eprintln!(
+                    "failed to sweep queued inputs after runtime {runtime_id} came online: {error:#}"
+                ),
+            }
+        });
+    }));
+}
+
+fn resume_active_queued_inputs(state: &AppState, session_ids: Vec<String>, reason: &'static str) {
+    if !session_ids.is_empty() {
+        eprintln!(
+            "resuming {} session(s) with active queued input(s) ({reason})",
+            session_ids.len()
+        );
+    }
+    for session_id in session_ids {
+        spawn_drive_until_blocked(state, session_id, reason);
+    }
 }
 
 /// Best-effort control recovery nudge that never queues behind another owner.

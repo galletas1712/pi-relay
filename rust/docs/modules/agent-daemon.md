@@ -14,6 +14,7 @@ delegation-ID scoped.
 
 - Websocket accept loop, JSON-RPC parsing/routing, and one handler per method.
 - Schema migration and stale-action sweep at startup.
+- Boot and runtime-online redrive of sessions that still hold active queued inputs.
 - Per-session serialization via `SessionDriver` locks.
 - Crash/restart recovery of open transcript tails before any read or write touches a session.
 - Live session loading, queued-input consumption, action completion, and `SessionIdle` settling.
@@ -169,20 +170,23 @@ does not own session durability.
 
 ### Accept and routing
 
-`main` parses config, connects Postgres, and migrates. Before stale-action
-cleanup it deterministically reconciles durable selected-subagent controls and
-recovers durable post-compaction dispatch intents. It then stales claimed
-process-owned abandoned actions while preserving unclaimed pending actions for
-children of running delegations, materializes every missing child index, and
-reconstructs/drives every existing child index. Materialization happens exactly
-once per boot, in that pass, because the following delegation crash sweep
-iterates the child set it produced. The last phase recovers initial
-work committed just before a launch crash. The action claim CAS makes repeated
-recovery scans no-ops after the first runner wins. This ordering also lets an
-already-committed exact-child interrupt settle its captured generation before
-any resumed model runner is registered. Each accepted TCP stream is
-upgraded to a websocket and handled in its own task. The connection loop
-multiplexes two sources: inbound request frames and the shared event broadcast.
+`main` parses config, connects Postgres, and migrates. It installs a runtime-online
+hook before accepting runtime connections so a Hello that arrives after a failed
+one-shot boot drive still redrives that runtime's active queued inputs. Before
+stale-action cleanup it deterministically reconciles durable selected-subagent
+controls and recovers durable post-compaction dispatch intents. It then stales
+claimed process-owned abandoned actions while preserving unclaimed pending
+actions for children of running delegations, materializes every missing child
+index, and reconstructs/drives every existing child index. Materialization
+happens exactly once per boot, in that pass, because the following delegation
+crash sweep iterates the child set it produced. The last phase recovers initial
+work committed just before a launch crash, then resumes sessions that still hold
+active queued inputs. The action claim CAS makes repeated recovery scans no-ops
+after the first runner wins. This ordering also lets an already-committed
+exact-child interrupt settle its captured generation before any resumed model
+runner is registered. Each accepted TCP stream is upgraded to a websocket and
+handled in its own task. The connection loop multiplexes two sources: inbound
+request frames and the shared event broadcast.
 
 ```
 TcpListener.accept -> spawn handle_socket
