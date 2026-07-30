@@ -3785,6 +3785,52 @@ pre {
 	color: var(--muted-foreground);
 }
 
+.inspect-workspace-list {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.inspect-workspace-row {
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	padding: 8px;
+}
+
+.inspect-workspace-row-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin-bottom: 4px;
+}
+
+.inspect-workspace-kind {
+	color: var(--muted-foreground);
+	font-size: var(--text-2xs);
+	font-weight: 600;
+	text-transform: uppercase;
+}
+
+.inspect-workspace-detail {
+	display: grid;
+	grid-template-columns: 56px minmax(0, 1fr);
+	gap: 8px;
+	align-items: start;
+	margin-top: 4px;
+	font-size: var(--text-xs);
+}
+
+.inspect-workspace-detail span {
+	color: var(--muted-foreground);
+}
+
+.inspect-workspace-detail code,
+.kv code {
+	overflow-wrap: anywhere;
+	font-size: var(--text-2xs);
+}
+
 .kv,
 .pending-row,
 .command-row {

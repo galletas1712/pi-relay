@@ -2,7 +2,7 @@ import { X } from "lucide-react";
 import { useState } from "react";
 import { RunBoard } from "./runBoard.tsx";
 import { COMMANDS } from "./slash.ts";
-import type { Delegation, SessionSnapshot, ToolListing } from "./types.ts";
+import type { Delegation, SessionSnapshot, SessionWorkspace, ToolListing } from "./types.ts";
 
 const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
 
@@ -120,6 +120,32 @@ export function Inspector({
 					aria-labelledby="inspector-tab-debug"
 				>
 					<section className="inspect-section">
+						<h2>Workspace</h2>
+						{snapshot ? (
+							<>
+								<div className="kv">
+									<span>session cwd</span>
+									<code title={snapshot.workspace_id}>{snapshot.workspace_id}</code>
+								</div>
+								<div className="kv">
+									<span>runtime</span>
+									<strong>{snapshot.runtime_id}</strong>
+								</div>
+								{snapshot.workspaces.length ? (
+									<div className="inspect-workspace-list">
+										{snapshot.workspaces.map((workspace) => (
+											<WorkspaceContextRow key={workspace.workspace_dir} workspace={workspace} />
+										))}
+									</div>
+								) : (
+									<p className="muted">No materialized workspaces on this session.</p>
+								)}
+							</>
+						) : (
+							<p className="muted">No session loaded.</p>
+						)}
+					</section>
+					<section className="inspect-section">
 						<h2>Session</h2>
 						{snapshot ? (
 							<>
@@ -191,6 +217,36 @@ export function Inspector({
 					</section>
 				</div>
 			)}
+		</div>
+	);
+}
+
+function WorkspaceContextRow({ workspace }: { workspace: SessionWorkspace }) {
+	const kind = workspace.kind ?? "git";
+	return (
+		<div className="inspect-workspace-row">
+			<div className="inspect-workspace-row-head">
+				<strong>{workspace.workspace_dir}</strong>
+				<span className="inspect-workspace-kind">{kind}</span>
+			</div>
+			{workspace.local_branch ? (
+				<div className="inspect-workspace-detail">
+					<span>branch</span>
+					<code>{workspace.local_branch}</code>
+				</div>
+			) : null}
+			{workspace.remote_url ? (
+				<div className="inspect-workspace-detail">
+					<span>remote</span>
+					<code>{workspace.remote_url}</code>
+				</div>
+			) : null}
+			{workspace.source_path ? (
+				<div className="inspect-workspace-detail">
+					<span>source</span>
+					<code>{workspace.source_path}</code>
+				</div>
+			) : null}
 		</div>
 	);
 }

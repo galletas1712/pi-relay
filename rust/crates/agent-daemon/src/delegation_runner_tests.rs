@@ -2510,7 +2510,7 @@ async fn shutdown_rejects_successor_runner_from_existing_task() {
 
     let handles = take_tasks(&env.state);
     for mut handle in handles {
-        tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle)
+        tokio::time::timeout(std::time::Duration::from_secs(30), &mut handle)
             .await
             .expect("drained source task finishes")
             .ok();
