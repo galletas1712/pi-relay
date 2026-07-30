@@ -5,6 +5,9 @@ export type ExecutionView = "overview" | "activity" | "handoffs";
 /** Primary center-pane surface while on a Conversation destination. */
 export type CenterView = "chat" | "git" | "files";
 
+/** Git center sub-layout: browse (sidebar list + detail) or graph (50/50 graph + detail). */
+export type GitPane = "browse" | "graph";
+
 declare const routeIdBrand: unique symbol;
 
 /**
@@ -57,6 +60,12 @@ export interface ConversationRoute extends WorkspaceRouteBase {
 	readonly destination: "conversation";
 	readonly conversation: RouteConversation;
 	readonly centerView: CenterView;
+	/** Active git sub-layout when centerView is git. Omitted means browse. */
+	readonly gitPane?: GitPane;
+	/** Selected repo workspace_dir when viewing git PRs or graph. */
+	readonly gitRepo?: string;
+	/** Selected pull request number within gitRepo. */
+	readonly selectedPrNumber?: number;
 }
 
 export interface ExecutionRoute extends WorkspaceRouteBase {
@@ -174,7 +183,8 @@ interface ParsedQuery {
 
 const EXECUTION_VIEWS = new Set<ExecutionView>(["overview", "activity", "handoffs"]);
 const CENTER_VIEWS = new Set<CenterView>(["chat", "git", "files"]);
-const CONVERSATION_QUERY_PARAMETERS = new Set(["view"]);
+const CONVERSATION_QUERY_PARAMETERS = new Set(["view", "gitPane", "repo", "pr"]);
+const GIT_PANES = new Set<GitPane>(["browse", "graph"]);
 const SUPPORTED_QUERY_PARAMETERS = new Set(["conversation", "focus", "handoff", "overview"]);
 const INVALID_ID_CHARACTERS = /[\/\\\u0000-\u001f\u007f-\u009f]/u;
 
@@ -233,6 +243,7 @@ export function parseWorkspaceRoute(input: string | WorkspaceRouteLocation): Wor
 			);
 		}
 		const centerView = parseCenterView(query);
+		const gitState = parseGitRouteState(query, centerView);
 		const route: ConversationRoute = {
 			destination: "conversation",
 			scope: base.scope,
@@ -242,12 +253,13 @@ export function parseWorkspaceRoute(input: string | WorkspaceRouteLocation): Wor
 					? rootConversation()
 					: { kind: "agent", sessionId: conversationSessionId },
 			centerView,
+			...gitState,
 		};
 		return matchedRoute(
 			route,
 			location,
-			conversationQueryWarnings(query, location.hash, centerView),
-			centerViewCorrectionReasons(query, centerView),
+			conversationQueryWarnings(query, location.hash, centerView, gitState),
+			conversationCorrectionReasons(query, centerView, gitState),
 		);
 	}
 
@@ -389,7 +401,15 @@ export function serializeWorkspaceRoute(route: WorkspaceRoute): string {
 			route.conversation.kind === "root" ? route.rootSessionId : route.conversation.sessionId;
 		const path = `${prefix}/conversation/${encodePart(conversationSessionId)}`;
 		if (route.centerView === "chat") return path;
-		return `${path}?view=${encodePart(route.centerView)}`;
+		const parameters: [string, string][] = [["view", route.centerView]];
+		if (route.centerView === "git") {
+			if (route.gitPane === "graph") parameters.push(["gitPane", "graph"]);
+			if (route.gitRepo) parameters.push(["repo", route.gitRepo]);
+			if (route.selectedPrNumber !== undefined) {
+				parameters.push(["pr", String(route.selectedPrNumber)]);
+			}
+		}
+		return `${path}?${parameters.map(([name, value]) => `${name}=${encodePart(value)}`).join("&")}`;
 	}
 
 	const parameters: [string, string][] = [];
@@ -522,7 +542,61 @@ export function setCenterView(route: ConversationRoute, centerView: CenterView):
 	if (route.centerView === centerView) {
 		return navigation("replace", route);
 	}
-	return navigation("replace", { ...route, centerView });
+	if (centerView !== "git") {
+		return navigation("replace", stripGitRouteState({ ...route, centerView }));
+	}
+	return navigation("replace", { ...stripGitRouteState(route), centerView });
+}
+
+/** Enter or leave git graph mode while staying on the git center view. */
+export function setGitPane(route: ConversationRoute, gitPane: GitPane): RouteNavigation {
+	if (route.centerView !== "git") {
+		programmerError("git pane can only be set while center view is git");
+	}
+	const next: ConversationRoute =
+		gitPane === "browse"
+			? { ...route, gitPane: undefined }
+			: { ...route, gitPane: "graph", gitRepo: route.gitRepo ?? undefined };
+	if (route.gitPane === gitPane || (gitPane === "browse" && route.gitPane === undefined)) {
+		return navigation("replace", next);
+	}
+	return navigation("replace", next);
+}
+
+/** Select a pull request within a project workspace repo. */
+export function selectGitPullRequest(
+	route: ConversationRoute,
+	selection: { workspaceDir: string; number: number },
+): RouteNavigation {
+	if (route.centerView !== "git") {
+		programmerError("git pull requests can only be selected while center view is git");
+	}
+	const next: ConversationRoute = {
+		...route,
+		gitRepo: selection.workspaceDir,
+		selectedPrNumber: selection.number,
+	};
+	if (route.gitRepo === next.gitRepo && route.selectedPrNumber === next.selectedPrNumber) {
+		return navigation("replace", next);
+	}
+	return navigation("replace", next);
+}
+
+/** Change the active repo scope for git graph mode. */
+export function setGitRepo(route: ConversationRoute, gitRepo: string): RouteNavigation {
+	if (route.centerView !== "git") {
+		programmerError("git repo can only be set while center view is git");
+	}
+	const next: ConversationRoute = { ...route, gitRepo };
+	if (route.gitRepo === gitRepo) {
+		return navigation("replace", next);
+	}
+	return navigation("replace", next);
+}
+
+export function stripGitRouteState(route: ConversationRoute): ConversationRoute {
+	const { gitPane: _gitPane, gitRepo: _gitRepo, selectedPrNumber: _selectedPrNumber, ...rest } = route;
+	return rest;
 }
 
 export function openAgentConversation(route: WorkspaceRoute, sessionId: string): RouteNavigation {
@@ -863,10 +937,40 @@ function parseCenterView(query: ParsedQuery): CenterView {
 	return "chat";
 }
 
+function parseGitRouteState(
+	query: ParsedQuery,
+	centerView: CenterView,
+): Pick<ConversationRoute, "gitPane" | "gitRepo" | "selectedPrNumber"> {
+	if (centerView !== "git") return {};
+	const gitPaneValues = query.values.get("gitPane") ?? [];
+	let gitPane: GitPane | undefined;
+	if (gitPaneValues.length === 1 && GIT_PANES.has(gitPaneValues[0] as GitPane)) {
+		const parsed = gitPaneValues[0] as GitPane;
+		gitPane = parsed === "browse" ? undefined : parsed;
+	}
+
+	const repoValues = query.values.get("repo") ?? [];
+	const gitRepo = repoValues.length === 1 && repoValues[0] ? repoValues[0] : undefined;
+
+	const prValues = query.values.get("pr") ?? [];
+	let selectedPrNumber: number | undefined;
+	if (prValues.length === 1 && prValues[0]) {
+		const parsed = Number.parseInt(prValues[0], 10);
+		if (Number.isFinite(parsed) && parsed > 0) selectedPrNumber = parsed;
+	}
+
+	return {
+		...(gitPane ? { gitPane } : {}),
+		...(gitRepo ? { gitRepo } : {}),
+		...(selectedPrNumber !== undefined ? { selectedPrNumber } : {}),
+	};
+}
+
 function conversationQueryWarnings(
 	query: ParsedQuery,
 	hash: string,
 	centerView: CenterView,
+	gitState: Pick<ConversationRoute, "gitPane" | "gitRepo" | "selectedPrNumber">,
 ): WorkspaceRouteWarning[] {
 	const warnings = unsupportedQueryWarnings(query, hash, CONVERSATION_QUERY_PARAMETERS);
 	const values = query.values.get("view") ?? [];
@@ -886,19 +990,120 @@ function conversationQueryWarnings(
 			message: "The center view query must contain exactly one view value.",
 		});
 	}
+	if (centerView !== "git") {
+		for (const parameter of ["gitPane", "repo", "pr"] as const) {
+			if ((query.values.get(parameter) ?? []).length > 0) {
+				warnings.unshift({
+					kind: "unsupported-query",
+					persistent: false,
+					parameters: [parameter],
+					message: `The ${parameter} query parameter is only supported in git view.`,
+				});
+			}
+		}
+		return warnings;
+	}
+
+	const gitPaneValues = query.values.get("gitPane") ?? [];
+	if (gitPaneValues.length > 1) {
+		warnings.unshift({
+			kind: "unsupported-query",
+			persistent: false,
+			parameters: ["gitPane"],
+			message: "The git pane query must contain exactly one value.",
+		});
+	} else if (gitPaneValues.length === 1 && gitPaneValues[0] !== (gitState.gitPane ?? "browse")) {
+		warnings.unshift({
+			kind: "unsupported-query",
+			persistent: false,
+			parameters: ["gitPane"],
+			message: `The requested git pane "${gitPaneValues[0]}" is not supported.`,
+		});
+	}
+
+	const repoValues = query.values.get("repo") ?? [];
+	if (repoValues.length > 1) {
+		warnings.unshift({
+			kind: "unsupported-query",
+			persistent: false,
+			parameters: ["repo"],
+			message: "The repo query must contain exactly one workspace directory.",
+		});
+	} else if (repoValues.length === 1 && repoValues[0] !== gitState.gitRepo) {
+		warnings.unshift({
+			kind: "unsupported-query",
+			persistent: false,
+			parameters: ["repo"],
+			message: "The requested repo value was invalid and was removed.",
+		});
+	}
+
+	const prValues = query.values.get("pr") ?? [];
+	if (prValues.length > 1) {
+		warnings.unshift({
+			kind: "unsupported-query",
+			persistent: false,
+			parameters: ["pr"],
+			message: "The pr query must contain exactly one pull request number.",
+		});
+	} else if (prValues.length === 1 && gitState.selectedPrNumber === undefined) {
+		warnings.unshift({
+			kind: "unsupported-query",
+			persistent: false,
+			parameters: ["pr"],
+			message: "The requested pull request number was invalid and was removed.",
+		});
+	}
+
 	return warnings;
 }
 
-function centerViewCorrectionReasons(query: ParsedQuery, centerView: CenterView): RouteCorrectionReason[] {
-	const values = query.values.get("view") ?? [];
-	if (values.length === 0 && centerView === "chat") return [];
-	if (values.length === 1 && values[0] === centerView) return [];
-	return ["unsupported-query"];
+function conversationCorrectionReasons(
+	query: ParsedQuery,
+	centerView: CenterView,
+	gitState: Pick<ConversationRoute, "gitPane" | "gitRepo" | "selectedPrNumber">,
+): RouteCorrectionReason[] {
+	const reasons: RouteCorrectionReason[] = [];
+	const viewValues = query.values.get("view") ?? [];
+	if (!(viewValues.length === 0 && centerView === "chat") && !(viewValues.length === 1 && viewValues[0] === centerView)) {
+		reasons.push("unsupported-query");
+	}
+	if (centerView !== "git") return reasons;
+
+	const gitPaneValues = query.values.get("gitPane") ?? [];
+	const expectedGitPane = gitState.gitPane ?? "browse";
+	if (
+		!(gitPaneValues.length === 0 && expectedGitPane === "browse") &&
+		!(gitPaneValues.length === 1 && gitPaneValues[0] === expectedGitPane)
+	) {
+		reasons.push("unsupported-query");
+	}
+
+	const repoValues = query.values.get("repo") ?? [];
+	if (!(repoValues.length === 0 && !gitState.gitRepo) && !(repoValues.length === 1 && repoValues[0] === gitState.gitRepo)) {
+		reasons.push("unsupported-query");
+	}
+
+	const prValues = query.values.get("pr") ?? [];
+	if (
+		!(prValues.length === 0 && gitState.selectedPrNumber === undefined) &&
+		!(prValues.length === 1 && gitState.selectedPrNumber !== undefined && prValues[0] === String(gitState.selectedPrNumber))
+	) {
+		reasons.push("unsupported-query");
+	}
+
+	return reasons;
 }
 
 function assertCenterView(centerView: unknown): asserts centerView is CenterView {
 	if (typeof centerView !== "string" || !CENTER_VIEWS.has(centerView as CenterView)) {
 		programmerError(`unsupported center view "${String(centerView)}"`);
+	}
+}
+
+function assertGitPane(gitPane: unknown): asserts gitPane is GitPane {
+	if (typeof gitPane !== "string" || !GIT_PANES.has(gitPane as GitPane)) {
+		programmerError(`unsupported git pane "${String(gitPane)}"`);
 	}
 }
 
@@ -1001,7 +1206,7 @@ function assertWorkspaceRoute(route: WorkspaceRoute): void {
 	assertExactKeys(
 		route,
 		destination === "conversation"
-			? ["destination", "scope", "rootSessionId", "conversation", "centerView"]
+			? ["destination", "scope", "rootSessionId", "conversation", "centerView", "gitPane", "gitRepo", "selectedPrNumber"]
 			: ["destination", "scope", "rootSessionId", "view", "conversation", "focus", "handoff"],
 		"route",
 	);
@@ -1010,6 +1215,21 @@ function assertWorkspaceRoute(route: WorkspaceRoute): void {
 	assertConversation(route.conversation, rootSessionId);
 	if (destination === "conversation") {
 		assertCenterView(route.centerView);
+		if (route.centerView !== "git") {
+			if (route.gitPane !== undefined) programmerError("gitPane is only valid when center view is git");
+			if (route.gitRepo !== undefined) programmerError("gitRepo is only valid when center view is git");
+			if (route.selectedPrNumber !== undefined) {
+				programmerError("selectedPrNumber is only valid when center view is git");
+			}
+		} else {
+			if (route.gitPane !== undefined) assertGitPane(route.gitPane);
+			if (route.gitRepo !== undefined && route.gitRepo.trim() === "") {
+				programmerError("gitRepo must be a non-empty workspace directory");
+			}
+			if (route.selectedPrNumber !== undefined && (!Number.isInteger(route.selectedPrNumber) || route.selectedPrNumber <= 0)) {
+				programmerError("selectedPrNumber must be a positive integer");
+			}
+		}
 		return;
 	}
 

@@ -1,7 +1,7 @@
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { fetchGitHubViewer, fetchOpenPullRequests, type GitHubPullRequest } from "./githubApi.ts";
 import { githubRepoLabel, parseGithubRemoteUrl } from "./parseRemote.ts";
-import type { SessionWorkspace } from "../types.ts";
+import type { ProjectWorkspace, SessionWorkspace } from "../types.ts";
 
 export const GITHUB_REFRESH_MS = 60_000;
 
@@ -13,6 +13,10 @@ export interface GitWorkspaceRepo {
 }
 
 export function gitWorkspaceRepos(workspaces: SessionWorkspace[]): GitWorkspaceRepo[] {
+	return projectWorkspaceRepos(workspaces);
+}
+
+export function projectWorkspaceRepos(workspaces: ProjectWorkspace[]): GitWorkspaceRepo[] {
 	const repos: GitWorkspaceRepo[] = [];
 	for (const workspace of workspaces) {
 		if (workspace.kind === "local" || !workspace.remote_url?.trim()) continue;
