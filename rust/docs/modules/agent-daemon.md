@@ -13,6 +13,8 @@ delegation-ID scoped.
 ## Responsibilities
 
 - Websocket accept loop, JSON-RPC parsing/routing, and one handler per method.
+- Mandatory bounded WebSocket handshake with exact browser Origin validation;
+  RPC/event state exists only afterward.
 - Schema migration and stale-action sweep at startup.
 - Boot and runtime-online redrive of sessions that still hold active queued inputs.
 - Per-session serialization via `SessionDriver` locks.
@@ -28,6 +30,7 @@ The daemon is split by responsibility, not by RPC method family (see [Daemon Mod
 
 ```
 main.rs            websocket accept + JSON-RPC routing + most RPC handlers
+browser_websocket.rs canonical Origin validation plus handshake/frame bounds
 session_start.rs   explicit session-start pipeline: workspace materialization,
                    MCP selection validation, prompt render, atomic
                    session/manifest/output persist, initial dispatch
@@ -65,8 +68,10 @@ handoff.rs         renders per-subagent task_prompt.md / final_message.md /
 `config.rs` resolves the general configuration root as
 `$XDG_CONFIG_HOME/pi-relay/agentd` or `$HOME/.config/pi-relay/agentd`. It
 parses only the required strict `config.toml` startup-policy schema: root
-`database_url`, optional frontend `bind`, optional `runtime_bind`, an optional
-default parent provider. `pi-agentd` accepts no configuration arguments.
+`database_url`, optional frontend `bind`, optional `runtime_bind`, required
+`allowed_origins`, and an optional default parent provider.
+`PI_RELAY_ALLOWED_ORIGINS` replaces the TOML list when set. `pi-agentd` accepts
+no configuration arguments.
 Invalid configuration fails startup. User instructions, workflows, roles, and
 skills are discovered by the selected runtime and returned as a typed runtime
 context; agentd never opens runtime-host paths. Runtime roles may select their
@@ -185,12 +190,15 @@ work committed just before a launch crash, then resumes sessions that still hold
 active queued inputs. The action claim CAS makes repeated recovery scans no-ops
 after the first runner wins. This ordering also lets an already-committed
 exact-child interrupt settle its captured generation before any resumed model
-runner is registered. Each accepted TCP stream is upgraded to a websocket and
-handled in its own task. The connection loop multiplexes two sources: inbound
-request frames and the shared event broadcast.
+runner is registered. Each accepted TCP stream must acquire the global
+handshake permit and finish a WebSocket upgrade with exactly one allowed
+canonical Origin within the deadline. Only then does `handle_socket` create
+event/subscription state or expose RPC
+dispatch. The connection loop multiplexes two sources: inbound request frames
+and the shared event broadcast.
 
 ```
-TcpListener.accept -> spawn handle_socket
+TcpListener.accept -> browser_websocket::accept -> spawn handle_socket
   loop select:
     reader.next  -> parse RpcRequest -> dispatch_request -> RpcResponse (id, ok, result|error)
     events_rx    -> if session subscribed and event_id past high-water, forward frame

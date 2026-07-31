@@ -1,6 +1,4 @@
 import {
-	AgentRpcClient,
-	defaultWsUrl,
 	WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS,
 	type ConnectionStatus,
 	type RpcClient,
@@ -389,7 +387,7 @@ export interface ConfigureSessionParams {
 	metadata?: Record<string, unknown>;
 }
 
-export function createAgentApi(client: RpcClient = new AgentRpcClient(defaultWsUrl())): AgentApi {
+export function createAgentApi(client: RpcClient): AgentApi {
 	return new AgentApiClient(client);
 }
 

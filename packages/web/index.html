@@ -6,22 +6,7 @@
 		<meta name="color-scheme" content="light dark" />
 		<link rel="icon" href="data:," />
 		<title>pi relay</title>
-		<script>
-			(function () {
-				try {
-					// Only an explicit user override pins a theme via a class.
-					// With no override we add no class and let the CSS
-					// `prefers-color-scheme` media query follow the system
-					// preference live (it re-evaluates when the OS theme flips
-					// while the tab is open).
-					var stored = localStorage.getItem("pi-relay-theme");
-					if (stored === "dark") document.documentElement.classList.add("dark");
-					else if (stored === "light") document.documentElement.classList.add("light");
-				} catch (_) {
-					/* localStorage may be unavailable */
-				}
-			})();
-		</script>
+		<script type="module" src="/src/theme.ts"></script>
 	</head>
 	<body>
 		<div id="root"></div>

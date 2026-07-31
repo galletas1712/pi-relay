@@ -5,22 +5,44 @@ React/Vite web client for the pi-relay Rust agent daemon (`pi-agentd`).
 ## Develop
 
 ```sh
-npm run dev:web   # from the repo root (Vite HMR; host process)
+npm run dev:web   # from the repo root
 ```
 
-Serves at `http://127.0.0.1:8788` and connects to `ws://127.0.0.1:8787` by
-default; override the daemon URL with `VITE_PI_AGENT_WS`. Start the daemon
-first - see [`../../rust/README.md`](../../rust/README.md).
+Vite is only the React/TypeScript/Tailwind bundler and loopback HMR server. It
+serves `http://127.0.0.1:8788`; when opened on loopback, a first-run browser
+gets a `Local` profile for `ws://127.0.0.1:8787`. Run `infra/dev.sh` separately
+for Postgres, `pi-agentd`, and the host `pi-runtime`.
 
-## Stack / Docker
+## Production on Cloudflare Pages
 
-The local stack (`infra/dev.sh`) serves this UI from the Compose `web` service
-(nginx), not host `vite preview`. Rebuild only the frontend without touching
-`pi-runtime` or sessions:
+Use Cloudflare Pages native Git integration with:
 
-```sh
-docker compose -f infra/docker-compose.yml up -d --build web
-```
+| Setting | Value |
+| --- | --- |
+| Root directory | repository root |
+| Build command | `npm ci && npm run build --workspace @pi-relay/web` |
+| Build output directory | `packages/web/dist` |
+
+Set no backend URL or Vite endpoint environment variables. Cloudflare
+Pages serves SPA fallback automatically because the build has no top-level
+`404.html`. Configure one stable custom domain and allowlist that exact
+serialized origin on every control host. Preview and generated Pages origins
+are intentionally rejected.
+
+The production profile URL is
+`wss://<control-node>.<tailnet>.ts.net:8443/`. The
+`packages/web/public/_headers` policy is copied into `dist`: scripts remain
+self-hosted, framing and objects are prohibited, referrers are suppressed, and
+direct WSS plus exact loopback WS destinations are allowed. Cloudflare's
+default caching policy is used.
+
+Exact Origin validation prevents unrelated webpages in honest browsers from
+opening the control WebSocket. It is not CORS and does not authenticate
+arbitrary clients: a non-browser client can forge `Origin`. Tailnet ACLs or SSH
+authorize network access. A compromised allowlisted frontend, browser, or
+device remains trusted. An HTTPS page cannot use an SSH-forwarded `ws://`
+profile because of mixed-content rules; use the loopback Vite page for SSH
+tunnels.
 
 ## Documentation
 

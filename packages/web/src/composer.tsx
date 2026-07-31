@@ -9,6 +9,7 @@ import type { QueuedInput } from "./types.ts";
 
 const NEW_SESSION_DRAFT_ID = "__new_session__";
 const COMPOSER_DRAFTS_STORAGE_KEY = "piRelayComposerDrafts:v1";
+const COMPOSER_DRAFT_STORAGE_PREFIX = "piRelayComposerDraft:v2:";
 const COMPOSER_MIN_HEIGHT_PX = 44;
 const COMPOSER_MAX_HEIGHT_PX = 180;
 
@@ -77,7 +78,7 @@ export interface ComposerHandle {
 	restoreSubmittedDraft(sessionId: string | null, value: string): void;
 }
 
-export type ComposerDraftStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+export type ComposerDraftStorage = Storage;
 
 export const Composer = memo(function Composer({
 	selectedId,
@@ -95,6 +96,7 @@ export const Composer = memo(function Composer({
 	onUpdateQueued,
 	onCancelQueued,
 	onMoveQueued,
+	storage,
 }: {
 	selectedId: string | null;
 	selectedIsSubagent: boolean;
@@ -111,10 +113,11 @@ export const Composer = memo(function Composer({
 	onUpdateQueued: (inputId: string, text: string) => void;
 	onCancelQueued: (inputId: string) => void;
 	onMoveQueued: (inputId: string, direction: "up" | "down") => void;
+	storage?: ComposerDraftStorage;
 }) {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
 	const selectedIdRef = useRef<string | null>(selectedId);
-	const draftsRef = useRef(loadComposerDrafts());
+	const draftsRef = useRef(loadComposerDrafts(storage));
 	const draftVersionsRef = useRef(new Map<string, number>());
 	const pendingSubmittedDraftsRef = useRef(new Map<string, PendingSubmittedDraft>());
 	const initialDraft = draftsRef.current.get(composerDraftKey(selectedId)) ?? "";
@@ -141,10 +144,10 @@ export const Composer = memo(function Composer({
 			draftVersionsRef.current.set(key, version);
 			if (value.trim()) draftsRef.current.set(key, value);
 			else draftsRef.current.delete(key);
-			saveComposerDrafts(draftsRef.current);
+			saveComposerDraft(key, value, storage);
 			return version;
 		},
-		[]
+		[storage]
 	);
 
 	const clearSubmittedDraft = useCallback(
@@ -583,14 +586,13 @@ export function loadComposerDrafts(storage = browserStorage()): Map<string, stri
 	const drafts = new Map<string, string>();
 	if (!storage) return drafts;
 	try {
-		const raw = storage.getItem(COMPOSER_DRAFTS_STORAGE_KEY);
-		if (!raw) return drafts;
-		const parsed = JSON.parse(raw) as unknown;
-		if (!isRecord(parsed)) return drafts;
-		const rawDrafts = parsed.drafts;
-		if (!isRecord(rawDrafts)) return drafts;
-		for (const [key, value] of Object.entries(rawDrafts)) {
-			if (key && typeof value === "string" && value.trim()) drafts.set(key, value);
+		for (let index = 0; index < storage.length; index += 1) {
+			const storageKey = storage.key(index);
+			if (!storageKey?.startsWith(COMPOSER_DRAFT_STORAGE_PREFIX)) continue;
+			const value = storage.getItem(storageKey);
+			if (value?.trim()) {
+				drafts.set(storageKey.slice(COMPOSER_DRAFT_STORAGE_PREFIX.length), value);
+			}
 		}
 	} catch {
 		return new Map();
@@ -600,25 +602,25 @@ export function loadComposerDrafts(storage = browserStorage()): Map<string, stri
 
 export function saveComposerDrafts(drafts: Map<string, string>, storage = browserStorage()): void {
 	if (!storage) return;
+	for (const [key, value] of drafts) saveComposerDraft(key, value, storage);
+}
+
+function saveComposerDraft(
+	key: string,
+	value: string,
+	storage = browserStorage(),
+): void {
+	if (!storage) return;
+	const storageKey = `${COMPOSER_DRAFT_STORAGE_PREFIX}${key}`;
 	try {
-		const entries = Array.from(drafts.entries()).filter(([key, value]) => key && value.trim());
-		if (entries.length === 0) {
-			storage.removeItem(COMPOSER_DRAFTS_STORAGE_KEY);
-			return;
-		}
-		storage.setItem(
-			COMPOSER_DRAFTS_STORAGE_KEY,
-			JSON.stringify({
-				drafts: Object.fromEntries(entries),
-				updatedAt: Date.now(),
-			}),
-		);
+		if (value.trim()) storage.setItem(storageKey, value);
+		else storage.removeItem(storageKey);
 	} catch {
 		// localStorage can be unavailable or full; draft persistence is best-effort.
 	}
 }
 
-function browserStorage(): ComposerDraftStorage | null {
+function browserStorage(): Storage | null {
 	if (typeof window === "undefined") return null;
 	try {
 		return window.localStorage ?? null;
@@ -627,11 +629,7 @@ function browserStorage(): ComposerDraftStorage | null {
 	}
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-export { COMPOSER_DRAFTS_STORAGE_KEY };
+export { COMPOSER_DRAFTS_STORAGE_KEY, COMPOSER_DRAFT_STORAGE_PREFIX };
 
 export function SlashMenu({
 	commands,

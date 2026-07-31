@@ -1,7 +1,14 @@
 # Web UI
 
-The React/Vite client in `packages/web`. It talks to the `pi-agentd` daemon over a single websocket
-([websocket-rpc](../../../rust/docs/websocket-rpc.md)) and renders a session's transcript turn-by-turn.
+The React/Vite client in `packages/web` is a backend-independent static
+application. One browser-local list holds named control-server profiles while
+each tab selects one active profile. Profiles contain only an ID, display name,
+and immutable WebSocket URL.
+The browser talks directly to that `pi-agentd` over one websocket
+([websocket-rpc](../../../rust/docs/websocket-rpc.md)); Cloudflare Pages hosts
+the production build but never selects or proxies a control server. Vite is
+used only to bundle the production assets and provide loopback HMR during local
+UI development.
 See the [Rust Agent Stack](../../../rust/docs/architecture.md) overview and [design decisions](../../../rust/docs/design-decisions.md)
 for the runtime it drives, and [agent-daemon](../../../rust/docs/modules/agent-daemon.md) for the RPC server.
 
@@ -16,6 +23,8 @@ terminal history, so polling and reconnect cannot lose an older active card.
 Cancellation and progress remain delegation-ID scoped.
 
 ```
++---------------------------------------------------------------+
+| active server + selector + Manage                              |
 +----------------+----------------------------------+--------------+
 | Sidebar        | Chat pane                        | Inspector    |
 | projects +     | header (model/effort/title)      | global cfg   |
@@ -30,6 +39,14 @@ Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar
 
 ## Responsibilities
 
+- Persist one profile list in `localStorage` and active selection in
+  `sessionStorage`. A profile's validated WebSocket URL is immutable: changing
+  an address means adding a new profile and removing the old one.
+- Treat the browser WebSocket `open` event as connected and reconnect after
+  transient loss. Profile replacement/disposal is terminal for that client.
+- Replace the complete connected-app boundary when a profile changes: close
+  the old RPC client, discard its QueryClient, unmount subscriptions/dialogs
+  and selected entities, and reset to the new profile's route root.
 - Own the websocket connection, reconnection, and event fan-out (`rpc.ts`), with a typed RPC facade (`agentApi.ts`).
 - Keep project and session-list server state in TanStack Query.
 - Keep the *selected* session's head, queue, active branch, compact transcript tree, and turn cards/details in a
@@ -39,7 +56,8 @@ Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar
 
 ## Data layer
 
-Two distinct stores, split by access pattern.
+Each profile gets an independent connected-app instance. Inside that boundary
+there are two server-state stores, split by access pattern.
 
 ```
 TanStack Query                          SelectedSessionCache (per sessionId)
@@ -84,6 +102,18 @@ The cache (`selectedSessionCache/types.ts`) is normalized:
 Reducers live in `selectedSessionCache.ts` and `selectedSessionCache/{entries,turns}.ts`. They are pure functions over
 the cache; every reducer no-ops if `cache.sessionId` does not match the incoming `session_id`, so late responses for a
 deselected session are ignored.
+
+### Profile identity and browser persistence
+
+Workspace deep links begin with `/server/<profile-id>/...`. Opening such a link
+selects that browser-local profile before parsing backend entity IDs. Switching
+profiles replaces the path with `/server/<new-profile-id>/`, so a session route
+from one daemon is never evaluated against another.
+
+Composer drafts, remembered project/session/subagent selection, and new-session
+workspace scope use profile-ID-prefixed `localStorage`. Drafts are stored per
+session key. Switching profile ID remounts the complete connected boundary;
+renaming a profile keeps its URL, routes, caches, and drafts.
 
 ### Revisions drive convergence
 
@@ -480,14 +510,14 @@ promote/edit is a benign no-op, not an error.
 
 ### Per-session composer drafts
 
-Composer text is persisted per session in `localStorage` under `piRelayComposerDrafts:v1`, keyed by `session_id`
-(new-session text uses a fixed key). Switching sessions swaps the visible draft; a failed send restores the typed text.
+Composer text is persisted per session under profile-namespaced
+`piRelayComposerDraft:v2:` keys, keyed by `session_id` (new-session text uses a
+fixed key). Switching sessions swaps the visible draft; a failed send restores the typed text.
 Submission IDs are retained in memory with the pending draft for an unchanged
 retry, but are not persisted across a full page reload.
 There are no browser-local *session* drafts — only Postgres-backed sessions appear in the sidebar, and starting a new
-chat is purely composer state. Legacy UI selection migration uses
-`piRelayUiResume:v1`; transcript scroll position is not persisted, and the
-retired `piRelayTranscriptScroll:v1` key is removed defensively.
+chat is purely composer state. Transcript scroll position is not persisted, and
+the retired `piRelayTranscriptScroll:v1` key is removed defensively.
 
 At the true start of a durable session transcript, **See system prompt** fetches
 that session's persisted rendered prompt through `system.prompt` and expands it

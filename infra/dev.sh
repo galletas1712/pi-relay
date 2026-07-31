@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
-# Run Postgres + control + web (Docker) plus pi-runtime (host process).
+# Run Postgres + control (Docker) plus pi-runtime (host process).
 #
 # The runtime is deliberately NOT dockerized: it executes each session's tools
 # in your real host environment (arbitrary local-workspace source_paths, your
 # toolchain/venvs, PATH). It runs as your login user (not root) and needs the
 # workspace btrfs mount(s) to allow unprivileged deletion of owned subvolumes
 # (`user_subvol_rm_allowed`). It dials the control runtime listener published on
-# 127.0.0.1:8786. Control, Postgres, and the static web UI stay in Docker.
+# 127.0.0.1:8786. Control and Postgres stay in Docker.
 #
-# Local access: browse http://127.0.0.1:8788/.
-# Tailnet access: pair with infra/serve.sh (Tailscale → web; nginx proxies /ws).
-# The browser derives the websocket endpoint from the page location.
+# Local UI development: run `npm run dev:web` separately.
+# Production UI: use the Cloudflare Pages deployment.
+# Tailnet control access: configure Tailscale Serve manually as documented in
+# rust/README.md, then add its WSS URL as a browser server profile.
 #
-# Static by design: no HMR, no daemon auto-restart. The agent-daemon edits this
-# repo, so an in-flight bad edit must not tear down running services.
+# No daemon auto-restart: the agent-daemon edits this repo, so an in-flight bad
+# edit must not tear down running services.
 #
 # Refresh / lifecycle:
-#   Full stack (this script): rebuilds compose services (including web) and
-#     restarts host pi-runtime. Ctrl-C stops only the host runtime; Docker
-#     services keep running (restart: unless-stopped).
-#   Frontend only (sessions stay up):
-#     docker compose -f infra/docker-compose.yml up -d --build web
+#   Backend stack (this script): starts Postgres, rebuilds control, and restarts
+#     host pi-runtime. Ctrl-C stops only the host runtime; Docker services keep
+#     running (restart: unless-stopped).
 #   Stop Docker services:
 #     docker compose -f infra/docker-compose.yml down
 set -euo pipefail
@@ -28,15 +27,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-WEB_PORT="${WEB_PORT:-8788}"
-export WEB_PORT
-
 PI_AGENTD_CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}/pi-relay/agentd"
 if [ ! -d "$PI_AGENTD_CONFIG_HOME" ]; then
   echo "missing agentd configuration: $PI_AGENTD_CONFIG_HOME" >&2
   exit 1
 fi
 export PI_AGENTD_CONFIG_HOME
+PI_RELAY_ALLOWED_ORIGINS="${PI_RELAY_ALLOWED_ORIGINS-http://127.0.0.1:8788}"
+export PI_RELAY_ALLOWED_ORIGINS
 
 # Build pi-runtime before replacing either side of the control protocol. Its
 # required policy lives at
@@ -76,7 +74,7 @@ stop_runtime() {
 stop_runtime
 
 # Deploy the matching control plane only after the runtime build succeeds.
-docker compose -f infra/docker-compose.yml up -d --build --wait --remove-orphans
+docker compose -f infra/docker-compose.yml up -d --build --wait --remove-orphans postgres control
 
 if [ -n "${XDG_CONFIG_HOME:-}" ]; then
   env HOME="$HOME" PATH="$PATH" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" "$RUNTIME_BIN" &
@@ -103,13 +101,13 @@ shutdown() {
 trap shutdown EXIT INT TERM
 
 echo "pi-relay stack up:"
-echo "  web UI:  http://127.0.0.1:${WEB_PORT}/"
 echo "  agentd:  ws://127.0.0.1:8787"
+echo "  allowed browser origins: $PI_RELAY_ALLOWED_ORIGINS"
+echo "  Local UI development: run npm run dev:web separately."
+echo "  Production UI: use the Cloudflare Pages deployment."
 echo "  Ctrl-C stops host pi-runtime only; Docker services keep running."
-echo "  Frontend-only refresh: docker compose -f infra/docker-compose.yml up -d --build web"
 
-# Keep the script attached while runtime runs. Docker web can be rebuilt
-# independently without this process exiting.
+# Keep the script attached while runtime runs.
 while true; do
   sleep 3600
 done

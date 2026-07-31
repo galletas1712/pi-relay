@@ -11,7 +11,6 @@ interface RpcResponse<T> {
 		data?: unknown;
 	};
 }
-
 interface RpcProgressFrame {
 	id: string;
 	progress: WorkspaceMaterializeProgress;
@@ -59,7 +58,6 @@ export class RpcRequestError extends Error {
 		this.name = "RpcRequestError";
 	}
 }
-
 /**
  * A request that reached the wire but whose outcome is unknown: the socket was
  * closed, replaced, or stopped answering after `ws.send`. The server may still
@@ -73,7 +71,6 @@ export class RpcTransportError extends Error {
 		this.name = "RpcTransportError";
 	}
 }
-
 export function isRpcErrorCode(error: unknown, code: string): boolean {
 	return error instanceof RpcRequestError && error.code === code;
 }
@@ -94,17 +91,17 @@ export class AgentRpcClient implements RpcClient {
 	private statusHandlers = new Set<StatusHandler>();
 	private openPromise: Promise<void> | null = null;
 	private rejectOpenPromise: ((error: Error) => void) | null = null;
-	private closedByUser = false;
+	private disposed = false;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastFrameAt = 0;
 
 	constructor(private readonly url: string) {}
 
 	connect(): Promise<void> {
+		if (this.disposed) return Promise.reject(new Error("RPC client is disposed"));
 		if (this.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
 		if (this.openPromise) return this.openPromise;
 
-		this.closedByUser = false;
 		if (this.reconnectTimer !== null) {
 			globalThis.clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
@@ -130,9 +127,6 @@ export class AgentRpcClient implements RpcClient {
 				() => {
 					if (this.ws !== ws) return;
 					this.emitStatus("error");
-					this.openPromise = null;
-					this.rejectOpenPromise = null;
-					reject(new Error(`failed to connect ${this.url}`));
 				},
 				{ once: true }
 			);
@@ -145,21 +139,20 @@ export class AgentRpcClient implements RpcClient {
 		ws.addEventListener("close", () => {
 			if (this.ws !== ws) return;
 			this.emitStatus("closed");
-			this.openPromise = null;
-			this.rejectOpenPromise = null;
+			this.rejectConnecting("websocket closed");
 			this.ws = null;
 			this.rejectPending("websocket closed");
-			if (!this.closedByUser) this.scheduleReconnect();
+			if (!this.disposed) this.scheduleReconnect();
 		});
 
 		return this.openPromise;
 	}
 
 	reconnect(): Promise<void> {
+		if (this.disposed) return Promise.reject(new Error("RPC client is disposed"));
 		// Join an automatic or user-initiated connection attempt instead of
 		// replacing its socket and creating a competing reconnect loop.
 		if (this.openPromise) return this.openPromise;
-		this.closedByUser = false;
 		if (this.reconnectTimer !== null) {
 			globalThis.clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
@@ -173,7 +166,8 @@ export class AgentRpcClient implements RpcClient {
 	}
 
 	close(): void {
-		this.closedByUser = true;
+		if (this.disposed) return;
+		this.disposed = true;
 		if (this.reconnectTimer !== null) {
 			globalThis.clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
@@ -327,28 +321,8 @@ export class AgentRpcClient implements RpcClient {
 		this.reconnectTimer = globalThis.setTimeout(() => {
 			this.reconnectTimer = null;
 			void this.connect().catch(() => {
-				if (!this.closedByUser) this.scheduleReconnect();
+				if (!this.disposed) this.scheduleReconnect();
 			});
 		}, 750);
 	}
-}
-
-export function defaultWsUrl(): string {
-	const configured = import.meta.env.VITE_PI_AGENT_WS as string | undefined;
-	return resolveWsUrl(configured, window.location);
-}
-
-export function resolveWsUrl(
-	configured: string | undefined,
-	location: Pick<Location, "hostname" | "port" | "protocol">,
-): string {
-	if (configured?.trim()) return configured;
-	if (isLoopbackHost(location.hostname)) return "ws://127.0.0.1:8787";
-	const proto = location.protocol === "https:" ? "wss:" : "ws:";
-	const port = location.port ? `:${location.port}` : "";
-	return `${proto}//${location.hostname}${port}/ws`;
-}
-
-function isLoopbackHost(hostname: string): boolean {
-	return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" || hostname === "[::1]";
 }

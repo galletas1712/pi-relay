@@ -12,7 +12,7 @@ import {
 	type RefObject,
 } from "react";
 import { ArrowUp, Bot, Menu, PanelRightOpen } from "lucide-react";
-import { createAgentApi, type AgentApi } from "./agentApi.ts";
+import { type AgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
 import { clearAcknowledgedTranscriptDestination } from "./transcript.tsx";
 import type {
@@ -268,8 +268,9 @@ type McpAddTarget = {
 };
 
 export interface AppProps {
-	api?: AgentApi;
+	api: AgentApi;
 	routeHistory?: WorkspaceRouteHistory | null;
+	entityStorage?: Storage;
 }
 
 type RememberedRouteRestore = {
@@ -343,14 +344,17 @@ function LoadingConversation() {
 	);
 }
 
-export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: AppProps = {}) {
-	const api = useMemo(() => injectedApi ?? createAgentApi(), [injectedApi]);
+export function App({
+	api,
+	routeHistory: injectedRouteHistory,
+	entityStorage,
+}: AppProps) {
 	const routeHistory = useMemo(
 		() => injectedRouteHistory === undefined ? browserWorkspaceRouteHistory() : injectedRouteHistory,
 		[injectedRouteHistory],
 	);
 	const queryClient = useQueryClient();
-	const initialUiSelection = useMemo(() => loadUiSelection(), []);
+	const initialUiSelection = useMemo(() => loadUiSelection(entityStorage), [entityStorage]);
 	const initialWorkspaceRoute = useMemo(() => initialRouteResult(routeHistory), [routeHistory]);
 	const initialSelection = useMemo(
 		() => routeInitialSelection(initialWorkspaceRoute, initialUiSelection),
@@ -396,11 +400,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		useState<string | null>(null);
 	const [newSessionSetupGeneration, setNewSessionSetupGeneration] = useState(0);
 	const [sending, setSending] = useState(false);
+	const mountLifetimeRef = useRef(new AbortController());
 	// Aborts the uncertain-start reconcile poll so it cannot outlive the view and
 	// keep writing workspace-preparation state after unmount.
 	const reconcileAbortRef = useRef<AbortController | null>(null);
 	useEffect(
 		() => () => {
+			mountLifetimeRef.current.abort();
 			reconcileAbortRef.current?.abort();
 		},
 		[],
@@ -858,9 +864,15 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		? `${selectedProjectId}\u0000${projectWorkspaceKey}`
 		: null;
 	useEffect(() => {
-		setWorkspaceScope(workspaceScopeForProject(selectedProjectId, projectWorkspacesRef.current ?? []));
+		setWorkspaceScope(
+			workspaceScopeForProject(
+				selectedProjectId,
+				projectWorkspacesRef.current ?? [],
+				entityStorage,
+			),
+		);
 		setWorkspaceScopeSourceKey(currentWorkspaceScopeSourceKey);
-	}, [currentWorkspaceScopeSourceKey, selectedProjectId]);
+	}, [currentWorkspaceScopeSourceKey, entityStorage, selectedProjectId]);
 	const workspaceConfiguration: WorkspaceConfiguration =
 		selectedProjectId === null
 			? { status: "ready", scope: null }
@@ -871,9 +883,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					: { status: "loading" };
 	const handleWorkspaceScopeChange = useCallback((scope: WorkspaceScopeEntry[]) => {
 		setWorkspaceScope(scope);
-		rememberWorkspaceScope(selectedProjectRef.current, scope);
+		rememberWorkspaceScope(selectedProjectRef.current, scope, entityStorage);
 		setNewSessionSetupGeneration((generation) => generation + 1);
-	}, []);
+	}, [entityStorage]);
 
 	const selectedSession = useMemo(
 		() => sessionItems.find((session) => session.session_id === selectedId) ?? null,
@@ -1575,7 +1587,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					: { kind: "idle" },
 			);
 			if (next.kind === "none") {
-				rememberActiveUiSelection(selectedProjectRef.current, null);
+				rememberActiveUiSelection(selectedProjectRef.current, null, entityStorage);
 			}
 			applyConversationIdentity(null);
 			return next;
@@ -1584,6 +1596,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			applyConversationIdentity,
 			applyProjectConversationIdentity,
 			routeHistory,
+			entityStorage,
 			selectedFetchCoordinator,
 		],
 	);
@@ -1594,7 +1607,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const parsed = routeHistory?.apply(navigation) ?? parseWorkspaceRoute(navigation.url);
 			if (parsed) applyParsedWorkspaceRoute(parsed);
 		},
-		[applyParsedWorkspaceRoute, routeHistory],
+		[applyParsedWorkspaceRoute, entityStorage, routeHistory],
 	);
 
 	const openRootConversation = useCallback(
@@ -1607,7 +1620,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const subagentSessionId =
 				options.restoreSubagent === false
 					? null
-					: selectedSubagentForSession(sessionId);
+					: selectedSubagentForSession(sessionId, entityStorage);
 			const navigation = subagentSessionId
 				? openAgentConversation(rootNavigation.route, subagentSessionId)
 				: rootNavigation;
@@ -1622,7 +1635,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					: null;
 			applyNavigation(navigation, rememberedRestore);
 		},
-		[applyNavigation],
+		[applyNavigation, entityStorage],
 	);
 
 	const openConversation = useCallback(
@@ -1684,13 +1697,13 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				const empty = routeHistory?.clear("push") ?? { kind: "none" as const };
 				setWorkspaceRouteResult(empty);
 				setRouteValidation({ kind: "idle" });
-				rememberActiveUiSelection(selectedProjectRef.current, null);
+				rememberActiveUiSelection(selectedProjectRef.current, null, entityStorage);
 				applyConversationIdentity(null);
 				return;
 			}
 			openConversation(sessionId);
 		},
-		[applyConversationIdentity, openConversation, routeHistory],
+		[applyConversationIdentity, entityStorage, openConversation, routeHistory],
 	);
 
 	const selectProjectSession = useCallback(
@@ -1703,10 +1716,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			const empty = routeHistory?.clear("push") ?? { kind: "none" as const };
 			setWorkspaceRouteResult(empty);
 			setRouteValidation({ kind: "idle" });
-			rememberActiveUiSelection(projectId, null);
+			rememberActiveUiSelection(projectId, null, entityStorage);
 			applyProjectConversationIdentity(projectId, null);
 		},
-		[applyProjectConversationIdentity, openRootConversation, routeHistory],
+		[applyProjectConversationIdentity, entityStorage, openRootConversation, routeHistory],
 	);
 
 	const fallbackRememberedRoot = useCallback(
@@ -1716,10 +1729,10 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		) => {
 			legacyMigrationPendingRef.current = false;
 			rememberedRouteRestoreRef.current = null;
-			rememberActiveUiSelection(restore.projectId, null);
-			rememberSelectedSession(restore.projectId, null);
+			rememberActiveUiSelection(restore.projectId, null, entityStorage);
+			rememberSelectedSession(restore.projectId, null, entityStorage);
 			if (options.parentDeleted) {
-				rememberSelectedSubagent(restore.rootSessionId, null);
+				rememberSelectedSubagent(restore.rootSessionId, null, entityStorage);
 			}
 			const empty = routeHistory?.clear("replace") ?? { kind: "none" as const };
 			applyParsedWorkspaceRoute(empty);
@@ -1730,14 +1743,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const fallbackRememberedSubagent = useCallback(
 		(restore: RememberedRouteRestore) => {
 			rememberedRouteRestoreRef.current = null;
-			rememberSelectedSubagent(restore.rootSessionId, null);
+			rememberSelectedSubagent(restore.rootSessionId, null, entityStorage);
 			const rootNavigation = selectRootRun(
 				routeScope(restore.projectId),
 				restore.rootSessionId,
 			);
 			applyNavigation({ ...rootNavigation, history: "replace" });
 		},
-		[applyNavigation],
+		[applyNavigation, entityStorage],
 	);
 
 	useEffect(() => {
@@ -1852,7 +1865,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					const rememberedSubagentId =
 						selected.parent_session_id
 							? selected.session_id
-							: selectedSubagentForSession(root.session_id);
+							: selectedSubagentForSession(root.session_id, entityStorage);
 					const resume = legacyWorkspaceResume(workspaceRouteResult, {
 						projectId: initialUiSelection.projectId,
 						sessionId: rememberedSubagentId ?? root.session_id,
@@ -2051,10 +2064,15 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					return;
 				}
 				rememberedRouteRestoreRef.current = null;
-				rememberUiSelection(routeScopeProjectId(route), route.rootSessionId);
+				rememberUiSelection(
+					routeScopeProjectId(route),
+					route.rootSessionId,
+					entityStorage,
+				);
 				rememberSelectedSubagent(
 					route.rootSessionId,
 					conversation.session_id === route.rootSessionId ? null : conversation.session_id,
+					entityStorage,
 				);
 				setRouteValidation({
 					kind: "valid",
@@ -2802,7 +2820,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			});
 			return;
 		}
-		selectProjectSession(null, selectedSessionForProject(null));
+		selectProjectSession(null, selectedSessionForProject(null, entityStorage));
 		setQuery("");
 		composerHandleRef.current?.setValue("");
 	}, [
@@ -3212,7 +3230,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				removeSessionFromKnownSessionLists(deletedSessionId, session.project_id);
 				composerHandleRef.current?.clearSession(deletedSessionId);
 			}
-			forgetDeletedSessions(deletedSessionIds);
+			forgetDeletedSessions(deletedSessionIds, entityStorage);
 
 			const activeRoute = workspaceRouteResultRef.current;
 			if (
@@ -3372,11 +3390,14 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					: undefined,
 			};
 			let result;
+			const mountSignal = mountLifetimeRef.current.signal;
 			try {
 				showWorkspacePreparation(formatWorkspacePreparationStatus(null));
 				try {
 					result = await api.startSession(params);
+					if (mountSignal.aborted) throw new DOMException("App unmounted", "AbortError");
 				} catch (error) {
+					if (mountSignal.aborted) throw error;
 					if (error instanceof RpcTransportError) {
 						showWorkspacePreparation("Checking whether the session started…");
 						reconcileAbortRef.current?.abort();
@@ -3387,6 +3408,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 							sessionId,
 							controller.signal,
 						);
+						if (mountSignal.aborted) throw error;
 						if (recovered) {
 							result = recovered;
 						} else {
@@ -3413,6 +3435,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				}
 				throw error;
 			}
+			if (mountSignal.aborted) throw new DOMException("App unmounted", "AbortError");
 			mcpSelectionRef.current = new Map();
 			setMcpSelection(new Map());
 			void queryClient.invalidateQueries({
@@ -3992,12 +4015,12 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const handleSelectProject = useCallback(
 		(projectId: string | null) => {
 			if (projectId === selectedProjectRef.current) return;
-			const rememberedSessionId = selectedSessionForProject(projectId);
+			const rememberedSessionId = selectedSessionForProject(projectId, entityStorage);
 			selectProjectSession(projectId, rememberedSessionId);
 			setQuery("");
 			if (!rememberedSessionId) composerHandleRef.current?.setValue("");
 		},
-		[selectProjectSession],
+		[entityStorage, selectProjectSession],
 	);
 	const openCreateProjectDialog = useCallback(() => {
 		setProjectDialog({
@@ -4693,6 +4716,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						queuedInputs={queuedInputs}
 						mutationBlockedReason={connectionRemoteActionBlockedReason}
 						newSessionSetupGeneration={newSessionSetupGeneration}
+						storage={entityStorage}
 						onSubmit={submitComposer}
 						onStop={handleStop}
 						onPromoteQueued={handlePromoteQueued}
@@ -4981,7 +5005,7 @@ function selectedBaseLeafId(cache: SelectedSessionCache, sessionId: string, fall
 }
 
 async function restoreTextForTarget(
-	api: ReturnType<typeof createAgentApi>,
+	api: AgentApi,
 	sessionId: string,
 	target: HistoryTargetOption,
 	targetCache: SelectedSessionCache,
