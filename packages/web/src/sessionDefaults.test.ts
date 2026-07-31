@@ -4,6 +4,7 @@ import {
 	MODEL_OPTIONS,
 	newSessionCompactionConfig,
 	providerFromModelKey,
+	providerModelKey,
 	reasoningEffortsForProvider,
 } from "./sessionDefaults.ts";
 
@@ -16,6 +17,17 @@ describe("session defaults", () => {
 		});
 	});
 
+	it("uses canonical provider:model keys as picker identities and labels", () => {
+		expect(MODEL_OPTIONS.map((option) => [option.id, option.label])).toEqual([
+			["openai:gpt-5.6-sol", "openai:gpt-5.6-sol"],
+			["openai:gpt-5.6-terra", "openai:gpt-5.6-terra"],
+			["openai:gpt-5.6-luna", "openai:gpt-5.6-luna"],
+			["claude:claude-opus-5", "claude:claude-opus-5"],
+			["claude:claude-opus-4-8", "claude:claude-opus-4-8"],
+			["claude:claude-fable-5", "claude:claude-fable-5"],
+		]);
+	});
+
 	it("exposes the picker Claude models and a Fable ZDR warning", () => {
 		const claude = MODEL_OPTIONS.filter((option) => option.provider.kind === "claude");
 		expect(claude.map((option) => option.provider.model)).toEqual([
@@ -25,7 +37,7 @@ describe("session defaults", () => {
 		]);
 		expect(claude[0]?.provider.reasoning_effort).toBe("high");
 		const fable = claude.find((option) => option.provider.model === "claude-fable-5");
-		expect(fable?.label).toBe("Claude Fable 5");
+		expect(fable?.label).toBe("claude:claude-fable-5");
 		expect(fable?.description).toBe("Explicit opt-in: not ZDR.");
 		expect(fable?.provider.reasoning_effort).toBe("high");
 		expect(`${fable?.label} ${fable?.description}`).not.toMatch(/30[- ]day|data retention/i);
@@ -46,6 +58,21 @@ describe("session defaults", () => {
 			model: "gpt-5.6-terra",
 			reasoning_effort: "xhigh",
 		});
+	});
+
+	it("resolves Claude composite model keys without leaking the picker key internally", () => {
+		const provider = providerFromModelKey("claude:claude-opus-4-8", DEFAULT_PROVIDER);
+		expect(provider).toMatchObject({
+			kind: "claude",
+			model: "claude-opus-4-8",
+			reasoning_effort: "xhigh",
+		});
+		expect(providerModelKey(provider)).toBe("claude:claude-opus-4-8");
+	});
+
+	it("keeps the current provider unchanged for an unknown model key", () => {
+		const current = { ...DEFAULT_PROVIDER, reasoning_effort: "high" as const };
+		expect(providerFromModelKey("unknown:model", current)).toEqual(current);
 	});
 
 	it("offers max reasoning for all hosted GPT-5.6 models but not older models", () => {

@@ -8,30 +8,30 @@ export interface ModelOption {
 }
 
 const HOSTED_GPT56_MODELS = [
-	{ model: "gpt-5.6-sol", label: "OpenAI GPT-5.6 Sol" },
-	{ model: "gpt-5.6-terra", label: "OpenAI GPT-5.6 Terra" },
-	{ model: "gpt-5.6-luna", label: "OpenAI GPT-5.6 Luna" }
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna"
 ] as const;
 
 export const MODEL_OPTIONS: ModelOption[] = [
-	...HOSTED_GPT56_MODELS.map(({ model, label }) => ({
+	...HOSTED_GPT56_MODELS.map((model) => ({
 		id: `openai:${model}`,
-		label,
+		label: `openai:${model}`,
 		provider: { kind: "openai" as const, model, reasoning_effort: "xhigh" as const }
 	})),
 	{
 		id: "claude:claude-opus-5",
-		label: "Claude Opus 5",
+		label: "claude:claude-opus-5",
 		provider: { kind: "claude", model: "claude-opus-5", reasoning_effort: "high" }
 	},
 	{
 		id: "claude:claude-opus-4-8",
-		label: "Claude Opus 4.8",
+		label: "claude:claude-opus-4-8",
 		provider: { kind: "claude", model: "claude-opus-4-8", reasoning_effort: "xhigh" }
 	},
 	{
 		id: "claude:claude-fable-5",
-		label: "Claude Fable 5",
+		label: "claude:claude-fable-5",
 		description: "Explicit opt-in: not ZDR.",
 		provider: { kind: "claude", model: "claude-fable-5", reasoning_effort: "high" }
 	}
@@ -71,7 +71,7 @@ export function providerFromModelKey(modelKey: string, current: ProviderConfig):
 
 export function reasoningEffortsForProvider(provider: ProviderConfig): ReasoningEffort[] {
 	if (provider.kind === "claude") return CLAUDE_REASONING_EFFORTS;
-	return HOSTED_GPT56_MODELS.some(({ model }) => model === provider.model)
+	return HOSTED_GPT56_MODELS.some((model) => model === provider.model)
 		? OPENAI_GPT56_REASONING_EFFORTS
 		: OPENAI_REASONING_EFFORTS;
 }
