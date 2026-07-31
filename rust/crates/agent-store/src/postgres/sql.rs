@@ -91,7 +91,7 @@ pub(super) async fn lock_session_tx(
         .fetch_optional(&mut **tx)
         .await?;
     if locked.is_none() {
-        anyhow::bail!("session not found: {session_id}");
+        return Err(crate::SessionNotFound.into());
     }
     Ok(())
 }

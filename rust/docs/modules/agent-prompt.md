@@ -134,7 +134,9 @@ frontmatter and hands this crate the resulting `Skill` and role lists.
 ```
 session.start (workspaces materialized)
   -> render_pi_prompt: load_pi_md(prompt_root) + render_prompt(ctx)
-  -> stored once in SessionConfig.system_prompt
+  -> stored in SessionConfig.system_prompt
+        ^
+        | idle mcp.add reauthors manifest + fully rerenders prompt
         |
         v
 model call: assemble_agent_prompt
@@ -149,12 +151,16 @@ compaction call:
      "## Delegation state at compaction time" to the stored summary
 ```
 
-The prompt is rendered exactly once, at `session.start`, after project
-workspaces are materialized (so AGENTS.md and skills are present on disk). The
-rendered string is persisted in `SessionConfig.system_prompt` and is the
-session's immutable global prompt. The `system.prompt` RPC returns
-that persisted prompt together with the current repository `PI.md` template; it
-does not regenerate or mutate the session prompt.
+The prompt is rendered at `session.start`, after project workspaces are
+materialized (so AGENTS.md and skills are present on disk). It is fully
+rerendered when an idle top-level session's `mcp.add` successfully reauthors
+the session's MCP manifest. Subordinate sessions are rejected; the daemon does
+not attempt to reconstruct their role/delegation prompt suffix. Both fields are
+persisted atomically, so the stable prompt's MCP summary and provider
+declarations stay aligned. Rerendering intentionally uses the current
+template, instructions, skills, and roles. The `system.prompt` RPC
+returns the currently persisted prompt together with the current repository
+`PI.md` template; it does not itself regenerate or mutate the prompt.
 
 ## Stable prefix vs dynamic context
 

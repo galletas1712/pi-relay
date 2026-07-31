@@ -26,7 +26,7 @@ tools and MCP routes, bounded delegation, and the React web client.
 | `agent-store` | Postgres-only session/transcript/queue/action/event persistence and recovery. | [docs/modules/agent-store.md](docs/modules/agent-store.md) |
 | `agent-provider` | `ModelProvider` plus OpenAI/Codex and Anthropic adapters. | [docs/modules/agent-provider.md](docs/modules/agent-provider.md) |
 | `agent-tools` | `AgentTool`, `ToolRegistry`, and builtins: `apply_patch` / `str_replace_based_edit_tool`, `Bash`, `web_search`, `web_fetch`, `LoadSkill`, and delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). | [docs/modules/agent-tools.md](docs/modules/agent-tools.md) |
-| `agent-mcp` | Session-scoped stdio and generic Streamable HTTP MCP clients, New Session inventory/selection, deterministic frozen manifests, and result normalization. | [docs/plans/mcp-client.md](docs/plans/mcp-client.md) |
+| `agent-mcp` | Session-scoped stdio and generic Streamable HTTP MCP clients, inventory/selection, deterministic persisted manifests, and result normalization. | [docs/plans/mcp-client.md](docs/plans/mcp-client.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch. | [docs/modules/agent-daemon.md](docs/modules/agent-daemon.md) |
 | `agent-runtime` | `pi-runtime` host worker for managed workspaces, local tools, runtime skills, and MCP. | — |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt. | [docs/modules/agent-prompt.md](docs/modules/agent-prompt.md) |
@@ -372,7 +372,7 @@ The transient, unlanded Stage 1 keys (`registration`, `client_secret_env`,
 accepted. Replace them with optional `client_id`, `scopes`, and `resource`.
 
 The tagged `transport` object is preferred. Earlier flat stdio TOML fields
-remain accepted with the same route fingerprint so existing frozen manifests
+remain accepted with the same route fingerprint so existing persisted manifests
 and configuration remain compatible.
 Bearer environment authentication remains supported. Successful static-client
 and DCR login is persisted after callback cleanup, restored across runtime
@@ -398,14 +398,14 @@ host. For a remote runtime, complete authorization in the browser, copy its
 entire failed/unreachable loopback callback URL from the address bar, and paste
 that URL into the dialog. Login IDs and authorization URLs remain in memory
 only and are never written to browser storage. Logout removes only local
-credentials; it does not remotely revoke access or rewrite existing frozen
+credentials; it does not remotely revoke access or automatically rewrite existing
 session manifests. There is no built-in or provider-specific server catalog.
 
 All configured servers appear as New Session inventory sources. Operators use
 `enabled_tools` (or explicit `allow_all_tools: true`) as the hard allowlist;
 there are no required/optional or subagent-exposure settings. Users then choose
-the exact session subset in the New Session UI. Existing sessions and all their
-full/read-only children keep that frozen subset.
+the initial session subset in the New Session UI. `/mcp` may add tools to an
+idle top-level session; existing children retain the subset they inherited.
 
 The daemon creates its schema on startup but does not run old-session
 data migrations automatically. See

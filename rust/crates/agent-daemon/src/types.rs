@@ -53,6 +53,7 @@ pub(crate) enum RpcMethod {
     SessionSyncActiveBranch,
     SessionRename,
     SessionConfigure,
+    McpAdd,
     SessionDelete,
     ProjectList,
     ProjectCreate,
@@ -106,6 +107,7 @@ impl RpcMethod {
             "session.sync_active_branch" => Some(Self::SessionSyncActiveBranch),
             "session.rename" => Some(Self::SessionRename),
             "session.configure" => Some(Self::SessionConfigure),
+            "mcp.add" => Some(Self::McpAdd),
             "session.delete" => Some(Self::SessionDelete),
             "project.list" => Some(Self::ProjectList),
             "project.create" => Some(Self::ProjectCreate),
@@ -224,6 +226,7 @@ mod tests {
             RpcMethod::parse("history.targets"),
             Some(RpcMethod::HistoryTargets)
         );
+        assert_eq!(RpcMethod::parse("mcp.add"), Some(RpcMethod::McpAdd));
         assert_eq!(RpcMethod::parse("turn.resume"), Some(RpcMethod::TurnResume));
         assert_eq!(
             RpcMethod::parse("delegation.start_full"),

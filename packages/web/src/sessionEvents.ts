@@ -8,6 +8,7 @@ export interface SessionEventRefreshPlan {
 const SESSION_LIST_REFRESH_EVENTS = new Set([
 	"session.created",
 	"session.configured",
+	"mcp.tools_added",
 	"session.idle",
 	"session.recovered",
 	"session.work_cancelled",
@@ -40,6 +41,7 @@ const SESSION_LIST_REFRESH_EVENTS = new Set([
 
 const SELECTED_SESSION_REFRESH_EVENTS = new Set([
 	"session.configured",
+	"mcp.tools_added",
 	"session.recovered",
 	"session.idle",
 	"session.work_cancelled",

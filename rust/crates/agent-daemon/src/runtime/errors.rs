@@ -1,7 +1,8 @@
 use agent_session::{HistoryOperationError, TranscriptStoreError};
 use agent_store::{
     DelegationInputClosed, ExpectedActiveLeafMismatch, HistoryChanged,
-    HistoryTargetNotTurnBoundary, QueueMutationError, SourceMutationConflict,
+    HistoryTargetNotTurnBoundary, QueueMutationError, RootSessionRequired, SessionConfigChanged,
+    SessionNotFound, SourceMutationConflict,
 };
 
 use crate::types::RpcError;
@@ -20,11 +21,23 @@ pub(crate) fn map_queued_mutation_error(error: anyhow::Error) -> RpcError {
 }
 
 pub(crate) fn map_source_mutation_error(error: anyhow::Error) -> RpcError {
+    if error.downcast_ref::<SessionNotFound>().is_some() {
+        return RpcError::new("session_not_found", "session not found");
+    }
+    if error.downcast_ref::<RootSessionRequired>().is_some() {
+        return RpcError::new(
+            "root_session_required",
+            "MCP tools can only be managed on top-level sessions",
+        );
+    }
     if let Some(error) = error.downcast_ref::<ExpectedActiveLeafMismatch>() {
         return RpcError::new("history_changed", error.to_string());
     }
     if let Some(error) = error.downcast_ref::<SourceMutationConflict>() {
         return RpcError::new("session_busy", error.to_string());
+    }
+    if let Some(error) = error.downcast_ref::<SessionConfigChanged>() {
+        return RpcError::new("session_changed", error.to_string());
     }
     if let Some(error) = error.downcast_ref::<HistoryChanged>() {
         return RpcError::new("history_changed", error.to_string());

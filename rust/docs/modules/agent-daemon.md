@@ -31,6 +31,7 @@ main.rs            websocket accept + JSON-RPC routing + most RPC handlers
 session_start.rs   explicit session-start pipeline: workspace materialization,
                    MCP selection validation, prompt render, atomic
                    session/manifest/output persist, initial dispatch
+mcp_add.rs         idle additive MCP union/authoring + atomic store call
 config.rs          strict XDG daemon startup policy and parent-model default
 types.rs           RpcRequest/Response/Error, RpcMethod parse table, DispatchAction, RuntimeSession
 state.rs           AppState: repo handle, active sessions, driver locks, task registry,
@@ -381,6 +382,16 @@ The circuit breaker lives in compaction auto-state on session metadata. Each aut
   Provider-adjacent defaults such as reasoning effort may persist while work is
   active: queued input and action route snapshots keep already accepted/open-turn
   work stable, and the active runtime is not overwritten.
+- Existing-session `mcp.inventory` and `mcp.add` require both
+  `parent_session_id` and durable `subagent_type` to be null. Subordinate IDs
+  return `root_session_required` before runtime prompt work; missing IDs return
+  `session_not_found`. `mcp.add` is an idle source mutation and also rejects a
+  running/cancelling delegation. It loads the persisted raw selection, unions
+  additions, authors the complete set through the same runtime path as
+  `session.start`, rerenders `PI.md`, and delegates the fenced atomic update to
+  the store. The store rechecks top-level scope under the session-row lock.
+  Post-commit event-buffer cleanup is best effort and cannot turn committed
+  success into an RPC failure.
 - `ProviderKind` is `{ OpenAi, Claude }`. `codex` is not a provider kind — it is the auth transport OpenAI always uses.
 - `client_input_id` makes idle-accept and busy-queue sends idempotent: a replayed id returns the prior outcome without re-enqueuing.
 - The dev harness methods (`harness.model.complete` / `harness.model.fail`) let tests resolve model actions deterministically; harness sessions skip provider dispatch and auto-compaction entirely.

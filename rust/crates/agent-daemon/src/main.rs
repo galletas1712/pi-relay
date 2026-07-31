@@ -10,6 +10,7 @@ mod delegation_tools;
 mod handoff;
 mod history;
 mod history_fork;
+mod mcp_add;
 mod mcp_auth;
 mod provider_runtime;
 mod rpc_views;
@@ -556,6 +557,7 @@ async fn dispatch_request(
         RpcMethod::SessionSyncActiveBranch => session_sync_active_branch(state, params).await,
         RpcMethod::SessionRename => session_rename(state, params).await,
         RpcMethod::SessionConfigure => session_configure(state, params).await,
+        RpcMethod::McpAdd => mcp_add::add(state, params).await,
         RpcMethod::SessionDelete => session_delete(state, params).await,
         RpcMethod::ProjectList => project_list(state).await,
         RpcMethod::ProjectCreate => project_create(state, params).await,
@@ -695,18 +697,61 @@ async fn mcp_inventory(state: &AppState, params: Value) -> std::result::Result<V
             format!("invalid provider for mcp.inventory: {error}"),
         )
     })?;
+    let session_id = match params.get("session_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(session_id)) => Some(session_id.as_str()),
+        Some(_) => {
+            return Err(RpcError::new(
+                "invalid_params",
+                "session_id must be a string or null",
+            ))
+        }
+    };
+    let session = if let Some(session_id) = session_id {
+        let versioned = mcp_add::load_root_session_config(state, session_id).await?;
+        let config = versioned.config;
+        if config.runtime_id != runtime_id || config.provider.kind != provider {
+            return Err(RpcError::new(
+                "invalid_params",
+                "MCP inventory runtime and provider must match the session",
+            ));
+        }
+        Some((session_id, config, versioned.session_revision))
+    } else {
+        None
+    };
+    let profile = match &session {
+        Some((session_id, config, _)) => {
+            effective_prompt_profile(state, config, session_id).await?
+        }
+        None => PromptProfile::Parent,
+    };
     let inventory = state
         .runtime_hosts
         .mcp_inventory(
             &runtime_id,
             provider,
-            crate::provider_runtime::first_party_toolsets(state, PromptProfile::Parent),
+            crate::provider_runtime::first_party_toolsets(state, profile),
         )
         .await
         .map_err(crate::mcp_auth::map_runtime_mcp_error)?;
-    serde_json::to_value(inventory)
+    let mut value = serde_json::to_value(inventory)
         .map_err(anyhow::Error::from)
-        .map_err(RpcError::from)
+        .map_err(RpcError::from)?;
+    if let Some((_session_id, config, session_revision)) = session {
+        value["selected_servers"] = serde_json::to_value(
+            crate::provider_runtime::selected_mcp_tools(&config).map_err(|error| {
+                RpcError::new(
+                    "corrupt_mcp_manifest",
+                    format!("stored MCP manifest failed validation: {error:#}"),
+                )
+            })?,
+        )
+        .map_err(anyhow::Error::from)
+        .map_err(RpcError::from)?;
+        value["session_revision"] = json!(session_revision);
+    }
+    Ok(value)
 }
 
 async fn tools_list_profile(

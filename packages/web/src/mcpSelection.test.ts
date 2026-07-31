@@ -4,6 +4,7 @@ import {
 	mcpSelectionPayload,
 	mcpSelectionForProviderChange,
 	mcpSelectionPayloadForProvider,
+	mcpSelectionFromServers,
 	mcpSelectedToolCount,
 	mcpSelectionTotals,
 	reconcileMcpSelection,
@@ -77,6 +78,22 @@ describe("MCP selection", () => {
 		});
 		expect(mcpSelectionPayload(INVENTORY, new Map())).toBeUndefined();
 		expect(mcpSelectionTotals(INVENTORY, selected)).toEqual({ tools: 3, contextTokens: 60 });
+	});
+
+	it("uses the same selection model and serializer for additive locked selections", () => {
+		const locked = mcpSelectionFromServers([
+			{ server: "zeta", tools: ["read"] },
+			{ server: "alpha", tools: ["search"] },
+		]);
+		const selected = toggleTool(locked, "zeta", "write", locked);
+
+		expect(toggleTool(selected, "zeta", "read", locked)).toBe(selected);
+		expect(toggleServer(INVENTORY, selected, "zeta", locked)).toEqual(locked);
+		expect(mcpSelectionPayload(INVENTORY, selected, locked)).toEqual({
+			inventoryRevision: INVENTORY.revision,
+			servers: [{ server: "zeta", tools: ["write"] }],
+		});
+		expect(mcpSelectionPayload(INVENTORY, locked, locked)).toBeUndefined();
 	});
 
 	it("clears a changed server revision without selecting new contracts", () => {

@@ -4,6 +4,7 @@ import { refreshPlanForEvent } from "./sessionEvents.ts";
 const KNOWN_SESSION_EVENTS = [
 	"session.created",
 	"session.configured",
+	"mcp.tools_added",
 	"session.recovered",
 	"session.idle",
 	"session.work_cancelled",
@@ -58,6 +59,7 @@ const LIST_ONLY_EVENTS = new Set([
 
 const SELECTED_AND_LIST_EVENTS = new Set([
 	"session.configured",
+	"mcp.tools_added",
 	"session.recovered",
 	"session.idle",
 	"session.work_cancelled",

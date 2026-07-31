@@ -21,6 +21,19 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, source_session_id).await?;
         validate_history_target_tx(&mut tx, source_session_id, target).await?;
+        let source_fingerprint: Option<String> =
+            sqlx::query_scalar("select mcp_manifest_fingerprint from sessions where id=$1")
+                .bind(source_session_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if source_fingerprint.as_deref()
+            != config
+                .mcp_manifest
+                .as_ref()
+                .map(|binding| binding.manifest_fingerprint.as_str())
+        {
+            return Err(crate::SessionConfigChanged.into());
+        }
         if let Some(binding) = &config.mcp_manifest {
             install_session_manifest_tx(&mut tx, binding).await?;
         }

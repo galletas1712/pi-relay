@@ -81,6 +81,7 @@ text_enum! {
     pub enum EventType {
         SessionCreated => "session.created",
         SessionConfigured => "session.configured",
+        McpToolsAdded => "mcp.tools_added",
         SessionRecovered => "session.recovered",
         SessionIdle => "session.idle",
         SessionWorkCancelled => "session.work_cancelled",
@@ -155,6 +156,22 @@ pub struct SessionConfig {
     /// Opaque MCP-only content-addressed manifest. `None` is explicitly
     /// MCP-free and never means "resolve the current inventory".
     pub mcp_manifest: Option<McpSessionManifestBinding>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionedSessionConfig {
+    pub config: SessionConfig,
+    pub session_revision: i64,
+    pub parent_session_id: Option<String>,
+    pub subagent_type: Option<SubagentType>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddSessionMcpResult {
+    pub session_revision: i64,
+    pub queue_revision: i64,
+    pub transcript_revision: i64,
+    pub events: Vec<EventFrame>,
 }
 
 /// Complete provider request-shaping state captured for accepted or recoverable work.
@@ -430,6 +447,42 @@ impl fmt::Display for SourceMutationConflict {
 }
 
 impl std::error::Error for SourceMutationConflict {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionConfigChanged;
+
+impl fmt::Display for SessionConfigChanged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "session configuration changed before the request was applied"
+        )
+    }
+}
+
+impl std::error::Error for SessionConfigChanged {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionNotFound;
+
+impl fmt::Display for SessionNotFound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "session not found")
+    }
+}
+
+impl std::error::Error for SessionNotFound {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootSessionRequired;
+
+impl fmt::Display for RootSessionRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "operation requires a top-level session")
+    }
+}
+
+impl std::error::Error for RootSessionRequired {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FullDelegationConflict;

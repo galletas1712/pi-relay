@@ -1,8 +1,9 @@
 import type {
 	McpAuthServerStatus,
 	McpInventory,
+	McpSelection,
+	McpServerSelection,
 	ProviderConfig,
-	StartSessionMcpSelection,
 } from "./types.ts";
 
 export type McpSelectionState = ReadonlyMap<string, ReadonlySet<string>>;
@@ -22,10 +23,13 @@ export function serverSelectionState(
 export function clearMcpServerSelection(
 	selection: McpSelectionState,
 	serverId: string,
+	locked: McpSelectionState = new Map(),
 ): McpSelectionState {
 	if (!selection.has(serverId)) return selection;
 	const next = new Map(selection);
-	next.delete(serverId);
+	const retained = locked.get(serverId);
+	if (retained?.size) next.set(serverId, retained);
+	else next.delete(serverId);
 	return next;
 }
 
@@ -33,17 +37,22 @@ export function toggleServer(
 	inventory: McpInventory,
 	selection: McpSelectionState,
 	serverId: string,
+	locked: McpSelectionState = new Map(),
 ): McpSelectionState {
 	const server = inventory.servers.find((candidate) => candidate.server === serverId);
 	if (!server) return selection;
 	if (server.tools.length === 0 && !selection.has(serverId)) return selection;
 	const next = new Map(selection);
 	if (server.health !== "healthy" || server.tools.length === 0) {
-		next.delete(serverId);
+		const retained = locked.get(serverId);
+		if (retained?.size) next.set(serverId, retained);
+		else next.delete(serverId);
 		return next;
 	}
 	if (serverSelectionState(inventory, selection, serverId) === "all") {
-		next.delete(serverId);
+		const retained = locked.get(serverId);
+		if (retained?.size) next.set(serverId, retained);
+		else next.delete(serverId);
 	} else {
 		next.set(serverId, new Set(server.tools.map((tool) => tool.raw_name)));
 	}
@@ -54,7 +63,9 @@ export function toggleTool(
 	selection: McpSelectionState,
 	serverId: string,
 	rawName: string,
+	locked: McpSelectionState = new Map(),
 ): McpSelectionState {
+	if (locked.get(serverId)?.has(rawName)) return selection;
 	const next = new Map(selection);
 	const tools = new Set(next.get(serverId) ?? []);
 	if (tools.has(rawName)) tools.delete(rawName);
@@ -82,7 +93,7 @@ export function mcpSelectionPayloadForProvider(
 	selection: McpSelectionState,
 	authStatus: McpAuthServerStatus[],
 	authStatusReady: boolean,
-): StartSessionMcpSelection | undefined {
+): McpSelection | undefined {
 	if (mcpSelectedToolCount(selection) === 0) return undefined;
 	if (
 		!inventoryReady ||
@@ -149,10 +160,56 @@ export function mcpSelectionTotals(
 export function mcpSelectionPayload(
 	inventory: McpInventory,
 	selection: McpSelectionState,
-): StartSessionMcpSelection | undefined {
+	exclude: McpSelectionState = new Map(),
+): McpSelection | undefined {
 	const servers = [...selection]
-		.map(([server, tools]) => ({ server, tools: [...tools].sort() }))
+		.map(([server, tools]) => ({
+			server,
+			tools: [...tools]
+				.filter((tool) => !exclude.get(server)?.has(tool))
+				.sort(),
+		}))
 		.filter((server) => server.tools.length)
 		.sort((left, right) => (left.server < right.server ? -1 : left.server > right.server ? 1 : 0));
 	return servers.length ? { inventoryRevision: inventory.revision, servers } : undefined;
+}
+
+export function mcpSelectionFromServers(
+	servers: readonly McpServerSelection[] = [],
+): McpSelectionState {
+	return new Map(
+		servers
+			.filter((server) => server.tools.length)
+			.map((server) => [server.server, new Set(server.tools)]),
+	);
+}
+
+export function inventoryWithSelection(
+	inventory: McpInventory,
+	selection: McpSelectionState,
+): McpInventory {
+	const byServer = new Map(inventory.servers.map((server) => [server.server, {
+		...server,
+		tools: [...server.tools],
+	}]));
+	for (const [serverId, selectedTools] of selection) {
+		const server = byServer.get(serverId) ?? {
+			server: serverId,
+			revision: "",
+			health: "unavailable" as const,
+			tools: [],
+		};
+		const known = new Set(server.tools.map((tool) => tool.raw_name));
+		for (const rawName of selectedTools) {
+			if (known.has(rawName)) continue;
+			server.tools.push({
+				raw_name: rawName,
+				description: "Selected for this session",
+				context_token_estimate: 0,
+			});
+		}
+		server.tools.sort((left, right) => left.raw_name.localeCompare(right.raw_name));
+		byServer.set(serverId, server);
+	}
+	return { ...inventory, servers: [...byServer.values()].sort((left, right) => left.server.localeCompare(right.server)) };
 }

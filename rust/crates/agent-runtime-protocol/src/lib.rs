@@ -162,14 +162,14 @@ pub enum RuntimeCommand {
         workspace_dirs: Vec<String>,
         project_key: Option<String>,
     },
-    /// Enumerate live MCP servers + tools for the new-session picker. The
+    /// Enumerate live MCP servers + tools for an MCP picker. The
     /// control-computed first-party toolsets ride along for name-collision and
     /// token-budget checks.
     McpInventory {
         provider: ProviderKind,
         first_party: HashMap<ProviderKind, Vec<ProviderTool>>,
     },
-    /// Author the session's MCP manifest against live servers at session.start.
+    /// Author a session MCP manifest against live servers.
     McpSelect {
         selection: McpSessionSelection,
         first_party: HashMap<ProviderKind, Vec<ProviderTool>>,

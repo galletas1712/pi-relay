@@ -3,8 +3,7 @@ use std::sync::Arc;
 use agent_mcp_types::McpSessionSelection;
 use agent_session::AgentSession;
 use agent_store::{
-    InputPriority, McpSessionManifestBinding, QueuedInputContent, SessionActivity, SessionConfig,
-    SubagentType,
+    InputPriority, QueuedInputContent, SessionActivity, SessionConfig, SubagentType,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
@@ -13,7 +12,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::codec::{from_params, parse_user_message};
-use crate::provider_runtime::{first_party_toolsets, render_pi_prompt, PromptProfile};
+use crate::provider_runtime::author_session_mcp_and_prompt;
 use crate::runtime::{
     agent_input_from_queued_priority, attach_dispatch_config, collect_runtime_outputs,
     publish_events, SessionDriver,
@@ -88,30 +87,7 @@ pub(crate) async fn session_start(
             .await?;
         (runtime_id, workspace_id, workspaces)
     };
-    // MCP servers run on the session's runtime, so author the manifest against
-    // that runtime's live servers (health-check + inventory-revision guard),
-    // then persist it; every later prompt/turn reads it locally.
-    let mcp_manifest =
-        if let Some(selection) = params.mcp.filter(|selection| !selection.servers.is_empty()) {
-            let manifest = state
-                .runtime_hosts
-                .mcp_select(
-                    &runtime_id,
-                    selection,
-                    first_party_toolsets(state, PromptProfile::Parent),
-                )
-                .await
-                .map_err(crate::mcp_auth::map_runtime_mcp_error)?;
-            Some(McpSessionManifestBinding {
-                manifest_fingerprint: manifest.manifest_fingerprint.clone(),
-                manifest: serde_json::to_value(&manifest)
-                    .map_err(anyhow::Error::from)
-                    .map_err(RpcError::from)?,
-            })
-        } else {
-            None
-        };
-    let mut config = SessionConfig {
+    let config = SessionConfig {
         project_id,
         runtime_id,
         workspace_id,
@@ -122,9 +98,11 @@ pub(crate) async fn session_start(
             &state.daemon_config.default_parent_model,
         ),
         metadata: parent_session_metadata(params.metadata.unwrap_or_else(|| json!({}))),
-        mcp_manifest,
+        mcp_manifest: None,
     };
-    config.system_prompt = render_pi_prompt(state, &config).await?;
+    // Creation and later additive selection share one live manifest-authoring
+    // and prompt-rendering path.
+    let config = author_session_mcp_and_prompt(state, config, params.mcp).await?;
 
     let started = start_prepared_session_with_driver(
         state,
