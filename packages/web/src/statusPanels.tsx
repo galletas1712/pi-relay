@@ -17,6 +17,7 @@ export function LogHeader({
 	onReasoningEffortChange,
 	onSelectSession,
 	rightOpen,
+	inspectorAvailable = true,
 	onToggleRight
 }: {
 	archived: boolean;
@@ -33,6 +34,7 @@ export function LogHeader({
 	onReasoningEffortChange: (value: ReasoningEffort) => void;
 	onSelectSession?: (sessionId: string) => void;
 	rightOpen: boolean;
+	inspectorAvailable?: boolean;
 	onToggleRight: () => void;
 }) {
 	const statusLabel = archived ? "archived session" : status ? `${status} session` : null;
@@ -98,7 +100,7 @@ export function LogHeader({
 					</select>
 				</label>
 			</div>
-			{rightOpen ? null : (
+			{inspectorAvailable && !rightOpen ? (
 				<button
 					className="icon-button tiny"
 					type="button"
@@ -108,7 +110,7 @@ export function LogHeader({
 				>
 					<PanelRightOpen size={14} />
 				</button>
-			)}
+			) : null}
 		</div>
 	);
 }

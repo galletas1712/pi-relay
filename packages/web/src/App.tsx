@@ -13,6 +13,8 @@ import {
 } from "react";
 import { ArrowUp, Bot, Menu, PanelRightOpen } from "lucide-react";
 import { createAgentApi, type AgentApi } from "./agentApi.ts";
+import { GitPrSidebar } from "./git/gitPrSidebar.tsx";
+import { useGitCenterState } from "./git/useGitCenterState.ts";
 import { ChatPane } from "./chatPane.tsx";
 import { clearAcknowledgedTranscriptDestination } from "./transcript.tsx";
 import type {
@@ -201,6 +203,10 @@ import {
 	openAgentConversation,
 	parseWorkspaceRoute,
 	selectRootRun,
+	selectGitPullRequest,
+	setCenterView,
+	setGitPane,
+	setGitRepo,
 	showConversation,
 	unavailableConversationRoute,
 	unavailableExecutionDetail,
@@ -4320,6 +4326,30 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const conversationVisible =
 		(validatedRoute?.destination === "conversation") ||
 		(workspaceRouteResult.kind === "none" && routeValidation.kind === "idle");
+	const centerView =
+		validatedRoute?.destination === "conversation" ? validatedRoute.centerView : "chat";
+	const gitPane =
+		validatedRoute?.destination === "conversation" && validatedRoute.centerView === "git"
+			? (validatedRoute.gitPane ?? "browse")
+			: "browse";
+	const gitRepo =
+		validatedRoute?.destination === "conversation" && validatedRoute.centerView === "git"
+			? (validatedRoute.gitRepo ?? null)
+			: null;
+	const selectedPrNumber =
+		validatedRoute?.destination === "conversation" && validatedRoute.centerView === "git"
+			? (validatedRoute.selectedPrNumber ?? null)
+			: null;
+	const gitMode = centerView === "git";
+	const gitGraphMode = gitMode && gitPane === "graph";
+	const composerVisible = conversationVisible && centerView === "chat";
+	const gitCenterState = useGitCenterState({
+		projectWorkspaces: projectWorkspaces ?? [],
+		sessionWorkspaces: loadedSnapshot?.workspaces ?? [],
+		gitRepo,
+		selectedPrNumber,
+		enabled: gitMode,
+	});
 	const executionRoute =
 		validatedRoute?.destination === "execution" ? validatedRoute : null;
 	const unavailableState =
@@ -4331,6 +4361,45 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 	const routePending =
 		routeValidation.kind === "pending" &&
 		(workspaceRouteResult.kind === "route" || legacyMigrationPendingRef.current);
+	const handleCenterViewChange = useCallback(
+		(view: import("./workspaceRoute.ts").CenterView) => {
+			if (validatedRoute?.destination !== "conversation") return;
+			applyNavigation(setCenterView(validatedRoute, view));
+		},
+		[applyNavigation, validatedRoute],
+	);
+	const handleSelectGitPull = useCallback(
+		(workspaceDir: string, number: number) => {
+			if (validatedRoute?.destination !== "conversation" || validatedRoute.centerView !== "git") return;
+			applyNavigation(selectGitPullRequest(validatedRoute, { workspaceDir, number }));
+		},
+		[applyNavigation, validatedRoute],
+	);
+	const handleSelectGitRepo = useCallback(
+		(workspaceDir: string) => {
+			if (validatedRoute?.destination !== "conversation" || validatedRoute.centerView !== "git") return;
+			applyNavigation(setGitRepo(validatedRoute, workspaceDir));
+		},
+		[applyNavigation, validatedRoute],
+	);
+	const handleOpenGitGraph = useCallback(() => {
+		if (validatedRoute?.destination !== "conversation" || validatedRoute.centerView !== "git") return;
+		const routeWithRepo =
+			gitRepo || gitCenterState.activeRepo
+				? {
+						...validatedRoute,
+						gitRepo: gitRepo ?? gitCenterState.activeRepo?.workspace.workspace_dir,
+					}
+				: validatedRoute;
+		applyNavigation(setGitPane(routeWithRepo, "graph"));
+	}, [applyNavigation, gitCenterState.activeRepo, gitRepo, validatedRoute]);
+	const handleBackFromGitGraph = useCallback(() => {
+		if (validatedRoute?.destination !== "conversation" || validatedRoute.centerView !== "git") return;
+		applyNavigation(setGitPane(validatedRoute, "browse"));
+	}, [applyNavigation, validatedRoute]);
+	useEffect(() => {
+		if (gitMode && rightOpen) setRightOpen(false);
+	}, [gitMode, rightOpen]);
 	const retryRouteValidation = useCallback(() => {
 		setRouteValidationRetry((current) => current + 1);
 	}, []);
@@ -4387,7 +4456,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 		}),
 		[],
 	);
-	const appClassName = `app-shell ${sidebarOpen ? "sidebar-open" : ""} ${rightOpen ? "inspector-open" : ""} ${sidebarResizing ? "sidebar-resizing" : ""}`;
+	const inspectorAvailable = !gitMode;
+	const appClassName = `app-shell ${sidebarOpen ? "sidebar-open" : ""} ${rightOpen && inspectorAvailable ? "inspector-open" : ""} ${sidebarResizing ? "sidebar-resizing" : ""} ${gitMode ? "git-mode" : ""} ${gitGraphMode ? "git-graph-mode" : ""}`;
 	const appStyle = { "--sidebar-width": `${sidebarWidth}px` } as CSSProperties;
 
 	return (
@@ -4402,6 +4472,9 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 			onLostPointerCapture={handlePanelGestureCancel}
 		>
 			<div className="mobile-topbar">
+				{gitGraphMode ? (
+					<div className="icon-button mobile-topbar-spacer" aria-hidden />
+				) : (
 				<button
 					ref={mobileSidebarToggleRef}
 					className="icon-button"
@@ -4412,6 +4485,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				>
 					<Menu size={17} />
 				</button>
+				)}
 				<div className="mobile-topbar-title">
 					<div className="mobile-topbar-title-main">
 						{mobileSessionStatus ? (
@@ -4438,7 +4512,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 						) : null}
 					</div>
 				</div>
-				{inspectorIsOverlay && !rightOpen ? (
+				{inspectorAvailable && inspectorIsOverlay && !rightOpen ? (
 					<button
 						className="icon-button"
 						type="button"
@@ -4455,6 +4529,20 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				<button className="drawer-scrim" type="button" aria-label="close panel" onClick={handleCloseDrawers} />
 			) : null}
 
+			{gitMode && !gitGraphMode ? (
+				<aside className="sidebar git-sidebar-shell" data-slot="git-sidebar-shell" inert={sidebarInert}>
+					<GitPrSidebar
+						bundles={gitCenterState.bundles}
+						viewerLogin={gitCenterState.viewerLogin}
+						sessionWorkspaces={loadedSnapshot?.workspaces ?? []}
+						selectedWorkspaceDir={gitRepo}
+						selectedPrNumber={selectedPrNumber}
+						authError={gitCenterState.authError}
+						onSelectPull={handleSelectGitPull}
+						onOpenGraph={handleOpenGitGraph}
+					/>
+				</aside>
+			) : gitGraphMode ? null : (
 			<Sidebar
 				projects={projects}
 				projectActiveSessionCounts={projectActiveSessionCounts}
@@ -4504,7 +4592,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				mutationBlockedReason={connectionRemoteActionBlockedReason}
 				remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 			/>
-			{panelMode === "wide" ? (
+			)}
+			{panelMode === "wide" && !gitGraphMode ? (
 				<div
 					className="sidebar-resize-handle"
 					role="separator"
@@ -4530,6 +4619,8 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				<ChatPane
 						session={selectedChatSession}
 						snapshot={loadedSnapshot}
+						centerView={centerView}
+						onCenterViewChange={handleCenterViewChange}
 						entries={loadedEntries}
 						turnCards={turnCardViews}
 						transcriptLoading={transcriptLoading}
@@ -4611,6 +4702,19 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 								</div>
 							) : null
 						}
+						gitPane={gitPane}
+						gitRepo={gitRepo}
+						selectedPrNumber={selectedPrNumber}
+						gitRepos={gitCenterState.repos}
+						gitActiveRepo={gitCenterState.activeRepo}
+						gitSelectedPull={gitCenterState.selectedPull}
+						gitActiveRepoPulls={gitCenterState.activeRepoPulls}
+						gitPullLoading={gitCenterState.bundles.some((bundle) => bundle.loading)}
+						sessionWorkspaces={loadedSnapshot?.workspaces ?? []}
+						onSelectGitRepo={handleSelectGitRepo}
+						onOpenGitGraph={handleOpenGitGraph}
+						onBackFromGitGraph={handleBackFromGitGraph}
+						inspectorAvailable={inspectorAvailable}
 					/>
 			) : executionRoute ? (
 				<main className="workspace-route-state execution-route-state" data-slot="execution-placeholder">
@@ -4680,7 +4784,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 					retrying={retryingConnection}
 					onRetry={retryConnection}
 				/>
-				{conversationVisible ? (
+				{composerVisible ? (
 					<Composer
 						selectedId={selectedId}
 						selectedIsSubagent={
@@ -4703,6 +4807,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				) : null}
 			</footer>
 
+			{inspectorAvailable ? (
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
 				{executionRoute || unavailableState ? (
 					<div className="workspace-inspector-placeholder">
@@ -4743,6 +4848,7 @@ export function App({ api: injectedApi, routeHistory: injectedRouteHistory }: Ap
 				/>
 				)}
 			</aside>
+			) : null}
 
 			{renameSessionId ? (
 				<RenameSessionDialog

@@ -48,6 +48,29 @@ describe("workspace route parser and serializer", () => {
 		expect(expectRoute(expectedUrl)).toEqual(route);
 	});
 
+	it("round-trips non-chat center views on Conversation routes", () => {
+		const route = {
+			...rootConversationRoute(HOST, "root-1"),
+			centerView: "git" as const,
+		};
+		const url = "/w/host/run/root-1/conversation/root-1?view=git";
+		expect(serializeWorkspaceRoute(route)).toBe(url);
+		expect(expectRoute(url)).toEqual(route);
+	});
+
+	it("round-trips git pane, repo, and pull request selection", () => {
+		const route = {
+			...rootConversationRoute(HOST, "root-1", "git"),
+			gitPane: "graph" as const,
+			gitRepo: "packages/web",
+			selectedPrNumber: 42,
+		};
+		const url =
+			"/w/host/run/root-1/conversation/root-1?view=git&gitPane=graph&repo=packages%2Fweb&pr=42";
+		expect(serializeWorkspaceRoute(route)).toBe(url);
+		expect(expectRoute(url)).toEqual(route);
+	});
+
 	it("safely encodes and decodes valid reserved characters in every path identifier", () => {
 		const root = rootConversationRoute(projectRouteScope("project ?#% ü"), "root ?#% ü");
 		const route = expectConversation(openAgentConversation(root, "agent ?#% ü").route);
