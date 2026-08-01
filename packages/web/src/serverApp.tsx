@@ -1,5 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { AlertCircle, Pencil, Plus, Server, Settings, Trash2 } from "lucide-react";
+import {
+	AlertCircle,
+	LockKeyhole,
+	Pencil,
+	Plus,
+	Server,
+	Settings,
+	Trash2,
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { App } from "./App.tsx";
 import { createAgentApi } from "./agentApi.ts";
@@ -7,7 +15,6 @@ import {
 	AppDialog,
 	DialogBody,
 	DialogCloseButton,
-	DialogDescription,
 	DialogHeader,
 	DialogHeading,
 	DialogTitle,
@@ -25,9 +32,9 @@ import {
 	AlertDialogAction,
 	AlertDialogCancel,
 	AlertDialogContent,
-	AlertDialogDescription,
 	AlertDialogFooter,
 	AlertDialogHeader,
+	AlertDialogMedia,
 	AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -36,14 +43,12 @@ import { Button } from "@/components/ui/button";
 import {
 	Empty,
 	EmptyContent,
-	EmptyDescription,
 	EmptyHeader,
 	EmptyMedia,
 	EmptyTitle,
 } from "@/components/ui/empty";
 import {
 	Field,
-	FieldDescription,
 	FieldGroup,
 	FieldLabel,
 } from "@/components/ui/field";
@@ -171,10 +176,6 @@ export function ServerApp({
 							<EmptyTitle>
 								<h1 id="server-setup-title">Connect a control server</h1>
 							</EmptyTitle>
-							<EmptyDescription>
-								Add the WebSocket address for the pi-relay control server you want
-								to use.
-							</EmptyDescription>
 						</EmptyHeader>
 						<EmptyContent>
 							<Button type="button" onClick={() => setManagerMode("add")}>
@@ -331,10 +332,10 @@ function ServerManagerDialog({
 		>
 			<DialogHeader>
 				<DialogHeading>
-					<DialogTitle>Control servers</DialogTitle>
-					<DialogDescription>
-						Switch or manage connections saved in this browser.
-					</DialogDescription>
+					<DialogTitle className="server-manager-title">
+						<Server aria-hidden />
+						<span>Control servers</span>
+					</DialogTitle>
 				</DialogHeading>
 				<DialogCloseButton label="Close server manager" />
 			</DialogHeader>
@@ -399,10 +400,10 @@ function ServerManagerDialog({
 				) : draft ? null : (
 					<Empty className="server-manager-empty">
 						<EmptyHeader>
+							<EmptyMedia variant="icon">
+								<Server aria-hidden />
+							</EmptyMedia>
 							<EmptyTitle>No control servers yet</EmptyTitle>
-							<EmptyDescription>
-								Add a server connection to start using pi-relay.
-							</EmptyDescription>
 						</EmptyHeader>
 					</Empty>
 				)}
@@ -414,14 +415,10 @@ function ServerManagerDialog({
 							save();
 						}}
 					>
-						<div className="server-profile-form-heading">
-							<strong>{draft.id ? "Edit server" : "Add server"}</strong>
-							<span>
-								{draft.id
-									? "Change the label used for this connection."
-									: "Save a control server connection in this browser."}
-							</span>
-						</div>
+						<strong className="server-profile-form-title">
+							{draft.id ? <Pencil aria-hidden /> : <Plus aria-hidden />}
+							{draft.id ? "Edit server" : "Add server"}
+						</strong>
 						<FieldGroup className="server-profile-fields">
 							<Field>
 								<FieldLabel htmlFor="server-profile-name">Name</FieldLabel>
@@ -437,7 +434,10 @@ function ServerManagerDialog({
 								/>
 							</Field>
 							<Field>
-								<FieldLabel htmlFor="server-profile-url">WebSocket URL</FieldLabel>
+								<FieldLabel htmlFor="server-profile-url">
+									WebSocket URL
+									{draft.id ? <LockKeyhole aria-hidden /> : null}
+								</FieldLabel>
 								<Input
 									id="server-profile-url"
 									value={draft.url}
@@ -450,12 +450,6 @@ function ServerManagerDialog({
 									readOnly={!!draft.id}
 									required
 								/>
-								{draft.id ? (
-									<FieldDescription>
-										Server URLs can’t be changed. Add a new profile to use a
-										different address.
-									</FieldDescription>
-								) : null}
 							</Field>
 						</FieldGroup>
 						<div className="server-profile-form-actions">
@@ -504,14 +498,12 @@ function ServerManagerDialog({
 					}}
 				>
 					<AlertDialogHeader>
+						<AlertDialogMedia>
+							<Trash2 aria-hidden />
+						</AlertDialogMedia>
 						<AlertDialogTitle>
-							Remove {pendingRemoval?.name ?? "server"}?
+							Remove {pendingRemoval?.name ?? "server"} from this browser?
 						</AlertDialogTitle>
-						<AlertDialogDescription>
-							This removes the connection from this browser. Saved browser state tied
-							to this profile will no longer be accessible, but data on the control
-							server is not deleted.
-						</AlertDialogDescription>
 					</AlertDialogHeader>
 					<AlertDialogFooter>
 						<AlertDialogCancel autoFocus>Cancel</AlertDialogCancel>

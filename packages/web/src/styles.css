@@ -304,6 +304,21 @@
 	margin: 0;
 }
 
+.server-manager-title,
+.server-profile-form-title {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+}
+
+.server-manager-title svg,
+.server-profile-form-title svg,
+.server-profile-fields [data-slot="field-label"] svg {
+	width: 16px;
+	height: 16px;
+	flex: 0 0 auto;
+}
+
 .server-manager-body {
 	display: flex;
 	min-height: 0;
@@ -402,20 +417,9 @@
 	padding-top: 0;
 }
 
-.server-profile-form-heading {
-	display: flex;
-	flex-direction: column;
-	gap: var(--space-1);
-}
-
-.server-profile-form-heading strong {
+.server-profile-form-title {
 	font-family: var(--font-display);
 	font-size: var(--text-md);
-}
-
-.server-profile-form-heading span {
-	color: var(--muted-foreground);
-	font-size: var(--text-sm);
 }
 
 .server-profile-fields {

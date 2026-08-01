@@ -118,7 +118,6 @@ describe("ServerApp immutable profile boundary", () => {
 
 		const url = screen.getByLabelText<HTMLInputElement>("WebSocket URL");
 		expect(url.readOnly).toBe(true);
-		expect(screen.getByText(/Server URLs can’t be changed/)).toBeTruthy();
 		const name = screen.getByLabelText("Name");
 		expect(document.activeElement).toBe(name);
 		await user.clear(name);
@@ -151,16 +150,19 @@ describe("ServerApp immutable profile boundary", () => {
 		await user.click(screen.getByRole("button", { name: "Manage control servers" }));
 		const remove = screen.getByRole("button", { name: "Remove Local" });
 		await user.click(remove);
-		let confirmation = screen.getByRole("alertdialog", { name: "Remove Local?" });
+		let confirmation = screen.getByRole("alertdialog", {
+			name: "Remove Local from this browser?",
+		});
 		const cancel = within(confirmation).getByRole("button", { name: "Cancel" });
 		expect(cancel).toBe(document.activeElement);
-		expect(confirmation.textContent).toContain("data on the control server is not deleted");
 		await user.click(cancel);
 		expect(store.current().profiles).toHaveLength(2);
 		await waitFor(() => expect(document.activeElement).toBe(remove));
 
 		await user.click(remove);
-		confirmation = screen.getByRole("alertdialog", { name: "Remove Local?" });
+		confirmation = screen.getByRole("alertdialog", {
+			name: "Remove Local from this browser?",
+		});
 		await user.click(within(confirmation).getByRole("button", { name: "Remove server" }));
 
 		await waitFor(() => expect(boundary.clients).toHaveLength(2));
