@@ -140,3 +140,8 @@ vite.config.ts.timestamp-*
 
 # Rust workspace output
 /rust/target/
+
+# Agent config — track repo skills for pi-relay workspace discovery; ignore the rest.
+.agents/*
+!.agents/skills/
+!.agents/skills/**
