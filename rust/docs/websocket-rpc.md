@@ -8,6 +8,21 @@ tools always run when requested, and there is no approval interface.
 The goal of the contract is to make every user-facing behavior testable by
 sending the same websocket frames a frontend would send.
 
+## Browser connection acceptance
+
+The daemon upgrades only requests containing exactly one `Origin` header whose
+value exactly matches a configured canonical browser serialized origin. Missing,
+duplicate, `null`, malformed, non-HTTP(S), noncanonical, and unexpected origins
+are rejected before RPC/event state exists. Handshake time and concurrency are
+bounded; upgraded frames and messages are limited to 8 MiB.
+
+This is not CORS and not arbitrary-client authentication. It prevents unrelated
+webpages in honest browsers from opening a control socket, but a non-browser
+client can forge `Origin`. Tailnet ACLs or SSH are the authorization boundary.
+WSS is required remotely and the browser client permits cleartext WS only to
+loopback. A compromised allowlisted frontend, browser, or device remains
+trusted.
+
 ## Core Decisions
 
 1. Sessions are durable rows, not opened processes.

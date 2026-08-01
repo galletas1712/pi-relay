@@ -4,7 +4,6 @@ import {
 	RPC_REQUEST_TIMEOUT_MS,
 	RpcRequestError,
 	WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS,
-	resolveWsUrl,
 } from "./rpc.ts";
 
 class FakeWebSocket {
@@ -32,10 +31,10 @@ class FakeWebSocket {
 		this.sent.push(data);
 	}
 
-	close(): void {
+	close(code = 1000): void {
 		this.closed = true;
 		this.readyState = FakeWebSocket.CLOSED;
-		this.emit("close");
+		this.emit("close", { type: "close", code } as CloseEvent);
 	}
 
 	open(): void {
@@ -78,30 +77,6 @@ afterEach(() => {
 	globalThis.WebSocket = originalWebSocket;
 	vi.useRealTimers();
 });
-
-describe("resolveWsUrl", () => {
-	it("honors an explicit VITE_PI_AGENT_WS override", () => {
-		expect(resolveWsUrl("wss://agent.example.test/ws", localLocation())).toBe("wss://agent.example.test/ws");
-	});
-
-	it("defaults local web clients to the daemon port", () => {
-		expect(resolveWsUrl(undefined, localLocation())).toBe("ws://127.0.0.1:8787");
-		expect(resolveWsUrl("", { protocol: "http:", hostname: "localhost", port: "8788" })).toBe("ws://127.0.0.1:8787");
-	});
-
-	it("uses same-origin /ws for non-local served clients", () => {
-		expect(resolveWsUrl(undefined, { protocol: "https:", hostname: "odin.smelt-anaconda.ts.net", port: "" })).toBe(
-			"wss://odin.smelt-anaconda.ts.net/ws",
-		);
-		expect(resolveWsUrl(undefined, { protocol: "http:", hostname: "example.test", port: "9000" })).toBe(
-			"ws://example.test:9000/ws",
-		);
-	});
-});
-
-function localLocation(): Pick<Location, "hostname" | "port" | "protocol"> {
-	return { protocol: "http:", hostname: "127.0.0.1", port: "8788" };
-}
 
 describe("AgentRpcClient reconnect hardening", () => {
 	it("preserves production RPC error codes for structured handling", async () => {
@@ -323,5 +298,53 @@ describe("AgentRpcClient reconnect hardening", () => {
 		await Promise.all([connect, retry]);
 		expect(client.isOpen()).toBe(true);
 		client.close();
+	});
+
+	it("resolves connect on WebSocket open and sends RPC only afterward", async () => {
+		const client = new AgentRpcClient("ws://agent.test/ws");
+		let connected = false;
+		const connect = client.connect().then(() => {
+			connected = true;
+		});
+		const request = client.request("session.list");
+		const socket = FakeWebSocket.instances[0];
+
+		socket.open();
+		await connect;
+		await Promise.resolve();
+		expect(client.isOpen()).toBe(true);
+		expect(connected).toBe(true);
+		expect(JSON.parse(socket.sent[0])).toMatchObject({ method: "session.list" });
+		socket.respond({ id: "web_1", ok: true, result: [] });
+		await expect(request).resolves.toEqual([]);
+		client.close();
+	});
+
+	it("reconnects after transient close and remains terminal after disposal", async () => {
+		const client = new AgentRpcClient("ws://agent.test/ws");
+		const firstConnect = client.connect();
+		const first = FakeWebSocket.instances[0];
+		first.open();
+		await firstConnect;
+
+		first.close();
+		await vi.advanceTimersByTimeAsync(750);
+		const second = FakeWebSocket.instances[1];
+		second.open();
+		await Promise.resolve();
+		expect(client.isOpen()).toBe(true);
+
+		client.close();
+		await expect(client.connect()).rejects.toThrow("disposed");
+
+		const duringConnect = new AgentRpcClient("ws://agent.test/ws");
+		const pending = duringConnect.connect();
+		const third = FakeWebSocket.instances[2];
+		duringConnect.close();
+		await expect(pending).rejects.toThrow("websocket closed");
+		await expect(duringConnect.request("session.list")).rejects.toThrow("disposed");
+		await vi.advanceTimersByTimeAsync(2_000);
+		expect(FakeWebSocket.instances).toHaveLength(3);
+		expect(third.closed).toBe(true);
 	});
 });

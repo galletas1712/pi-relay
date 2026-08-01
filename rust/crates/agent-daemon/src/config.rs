@@ -7,18 +7,38 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::browser_websocket::AllowedOrigins;
+
 const DAEMON_CONFIG_FILE: &str = "config.toml";
 const PRODUCT_CONFIG_DIR: &str = "pi-relay";
 const DAEMON_CONFIG_DIR: &str = "agentd";
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_RUNTIME_BIND: &str = "127.0.0.1:8786";
+const ALLOWED_ORIGINS_ENV: &str = "PI_RELAY_ALLOWED_ORIGINS";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) database_url: String,
     pub(crate) bind: String,
     pub(crate) runtime_bind: String,
+    pub(crate) allowed_origins: AllowedOrigins,
     pub(crate) daemon_config: DaemonConfig,
+}
+
+fn resolve_allowed_origins(
+    override_value: Option<std::ffi::OsString>,
+    configured: Vec<String>,
+) -> Result<AllowedOrigins> {
+    let values = match override_value {
+        Some(value) => value
+            .into_string()
+            .map_err(|_| anyhow!("{ALLOWED_ORIGINS_ENV} must be valid UTF-8"))?
+            .split(',')
+            .map(str::to_string)
+            .collect(),
+        None => configured,
+    };
+    AllowedOrigins::parse(values)
 }
 
 /// General daemon settings stored in
@@ -52,6 +72,7 @@ impl Config {
         Self::from_values(
             env::var_os("XDG_CONFIG_HOME"),
             env::var_os("HOME"),
+            env::var_os(ALLOWED_ORIGINS_ENV),
             env::args().skip(1).collect(),
         )
     }
@@ -59,6 +80,7 @@ impl Config {
     fn from_values(
         xdg_config_home: Option<std::ffi::OsString>,
         home: Option<std::ffi::OsString>,
+        allowed_origins_override: Option<std::ffi::OsString>,
         args: Vec<String>,
     ) -> Result<Self> {
         if let Some(argument) = args.first() {
@@ -69,11 +91,14 @@ impl Config {
 
         let config_root = config_root_from_env(xdg_config_home.as_deref(), home.as_deref())?;
         let policy = load_daemon_config(&config_root.join(DAEMON_CONFIG_FILE))?;
+        let allowed_origins =
+            resolve_allowed_origins(allowed_origins_override, policy.allowed_origins)?;
 
         Ok(Self {
             database_url: policy.database_url,
             bind: policy.bind,
             runtime_bind: policy.runtime_bind,
+            allowed_origins,
             daemon_config: policy.daemon_config,
         })
     }
@@ -125,6 +150,8 @@ struct DaemonConfigFile {
     #[serde(default)]
     runtime_bind: Option<String>,
     #[serde(default)]
+    allowed_origins: Vec<String>,
+    #[serde(default)]
     default_parent_model: Option<StrictProviderConfig>,
 }
 
@@ -133,6 +160,7 @@ struct DaemonStartupPolicy {
     database_url: String,
     bind: String,
     runtime_bind: String,
+    allowed_origins: Vec<String>,
     daemon_config: DaemonConfig,
 }
 
@@ -170,7 +198,6 @@ impl TryFrom<DaemonConfigFile> for DaemonStartupPolicy {
         if runtime_bind.trim().is_empty() {
             return Err(anyhow!("runtime_bind must not be blank"));
         }
-
         let default_parent_model = match value.default_parent_model {
             Some(provider) => provider_from_strict("default_parent_model", provider)?,
             None => stable_default_provider(),
@@ -179,6 +206,7 @@ impl TryFrom<DaemonConfigFile> for DaemonStartupPolicy {
             database_url,
             bind,
             runtime_bind,
+            allowed_origins: value.allowed_origins,
             daemon_config: DaemonConfig {
                 default_parent_model,
             },
@@ -229,6 +257,7 @@ mod tests {
 database_url = "postgres://example"
 bind = "127.0.0.1:9999"
 runtime_bind = "127.0.0.1:9998"
+allowed_origins = ["https://relay.example.com", "http://127.0.0.1:8788"]
 
 [default_parent_model]
 kind = "claude"
@@ -244,6 +273,10 @@ prompt_cache = { key = "parent-cache" }
         assert_eq!(loaded.database_url, "postgres://example");
         assert_eq!(loaded.bind, "127.0.0.1:9999");
         assert_eq!(loaded.runtime_bind, "127.0.0.1:9998");
+        assert_eq!(
+            loaded.allowed_origins,
+            ["https://relay.example.com", "http://127.0.0.1:8788"]
+        );
         assert_eq!(
             loaded.daemon_config.default_parent_model.kind,
             ProviderKind::Claude
@@ -278,10 +311,15 @@ prompt_cache = { key = "parent-cache" }
         let error = load_daemon_config(&config).expect_err("database URL is required");
         assert!(format!("{error:#}").contains("database_url is required"));
 
-        fs::write(&config, "database_url = \"postgres://example\"\n").expect("default config");
+        fs::write(
+            &config,
+            "database_url = \"postgres://example\"\nallowed_origins = [\"http://127.0.0.1:8788\"]\n",
+        )
+        .expect("default config");
         let loaded = load_daemon_config(&config).expect("default policy");
         assert_eq!(loaded.bind, DEFAULT_BIND);
         assert_eq!(loaded.runtime_bind, DEFAULT_RUNTIME_BIND);
+        assert_eq!(loaded.allowed_origins, ["http://127.0.0.1:8788"]);
         let default = loaded.daemon_config.default_parent_model;
         assert_eq!(default.kind, ProviderKind::OpenAi);
         assert_eq!(default.model, "gpt-5.6-sol");
@@ -294,10 +332,36 @@ prompt_cache = { key = "parent-cache" }
         let error = Config::from_values(
             None,
             Some("/home/test".into()),
+            None,
             vec!["old-config.toml".to_string()],
         )
         .expect_err("daemon rejects arguments");
         assert!(format!("{error:#}").contains("pi-agentd accepts no arguments"));
+    }
+
+    #[test]
+    fn allowed_origins_fail_closed_and_environment_replaces_toml() {
+        assert!(resolve_allowed_origins(None, Vec::new()).is_err());
+        assert!(resolve_allowed_origins(
+            Some("".into()),
+            vec!["https://relay.example.com".to_string()]
+        )
+        .is_err());
+        assert!(
+            resolve_allowed_origins(Some("https://relay.example.com,".into()), Vec::new()).is_err()
+        );
+        assert!(resolve_allowed_origins(
+            Some("https://relay.example.com,https://relay.example.com".into()),
+            Vec::new()
+        )
+        .is_err());
+        let origins = resolve_allowed_origins(
+            Some("https://override.example.com,http://127.0.0.1:8788".into()),
+            vec!["https://ignored.example.com".to_string()],
+        )
+        .expect("environment override");
+        assert!(format!("{origins:?}").contains("override.example.com"));
+        assert!(!format!("{origins:?}").contains("ignored.example.com"));
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {

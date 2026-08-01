@@ -25,6 +25,7 @@ services:
     environment:
       HOME: /root
       XDG_CONFIG_HOME: /config
+      PI_RELAY_ALLOWED_ORIGINS: ${PI_RELAY_ALLOWED_ORIGINS-http://127.0.0.1:8788}
     ports:
       - "127.0.0.1:8787:8787"
       # Runtime listener, published so the host-side pi-runtime (not dockerized;
@@ -48,16 +49,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    restart: unless-stopped
-
-  web:
-    build:
-      context: ..
-      dockerfile: infra/Dockerfile.web
-    ports:
-      - "127.0.0.1:${WEB_PORT:-8788}:80"
-    depends_on:
-      - control
     restart: unless-stopped
 
   # NOTE: pi-runtime is intentionally NOT a service here. It executes the

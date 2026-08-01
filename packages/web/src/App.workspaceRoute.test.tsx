@@ -1660,6 +1660,36 @@ describe("App workspace route identity integration", () => {
 		vi.useRealTimers();
 	});
 
+	it("does not begin uncertain-start reconciliation after unmounting a pending start", async () => {
+		const api = createRouteApi();
+		const start = deferred<never>();
+		const knownSession = vi.mocked(api.getSession).getMockImplementation()!;
+		let generatedSessionId = "";
+		let reconciliationReads = 0;
+		api.startSession.mockImplementation((params: { sessionId: string }) => {
+			generatedSessionId = params.sessionId;
+			return start.promise;
+		});
+		vi.mocked(api.getSession).mockImplementation(async (sessionId: string) => {
+			if (sessionId === generatedSessionId) reconciliationReads += 1;
+			return knownSession(sessionId);
+		});
+		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
+
+		await open(api);
+		await sendComposerText("pending start");
+		expect(api.startSession).toHaveBeenCalledOnce();
+		await mounted.dispose();
+		start.reject(new RpcTransportError("websocket closed"));
+		await act(async () => {
+			await start.promise.catch(() => undefined);
+			await Promise.resolve();
+		});
+
+		expect(reconciliationReads).toBe(0);
+		vi.useRealTimers();
+	});
+
 	it("fails closed during a retained-inventory refetch but allows deselection and an MCP-free start", async () => {
 		const refresh = deferred<McpInventory>();
 		const api = createRouteApi();

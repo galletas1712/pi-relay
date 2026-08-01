@@ -18,19 +18,6 @@ import type {
 } from "./types.ts";
 import { UI_RESUME_STORAGE_KEY } from "./uiResume.ts";
 
-const mockedApi = vi.hoisted(() => ({ current: null as AgentApi | null }));
-
-vi.mock("./agentApi.ts", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("./agentApi.ts")>();
-	return {
-		...actual,
-		createAgentApi: () => {
-			if (!mockedApi.current) throw new Error("App test API was not installed");
-			return mockedApi.current;
-		},
-	};
-});
-
 import { App } from "./App.tsx";
 
 beforeAll(() => {
@@ -63,7 +50,6 @@ afterEach(() => {
 	cleanup();
 	window.history.replaceState(null, "", "/");
 	window.localStorage.clear();
-	mockedApi.current = null;
 });
 
 describe("App connection recovery integration", () => {
@@ -820,7 +806,6 @@ function renderApp(api: ControllableApi) {
 			updatedAt: 1,
 		}),
 	);
-	mockedApi.current = api;
 	const client = new QueryClient({
 		defaultOptions: {
 			queries: {
@@ -833,7 +818,7 @@ function renderApp(api: ControllableApi) {
 	});
 	const result = render(
 		<QueryClientProvider client={client}>
-			<App />
+			<App api={api} />
 		</QueryClientProvider>,
 	);
 	return { ...result, client };

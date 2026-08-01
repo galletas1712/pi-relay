@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	COMPOSER_DRAFTS_STORAGE_KEY,
+	COMPOSER_DRAFT_STORAGE_PREFIX,
 	composerDraftKey,
 	loadComposerDrafts,
 	resolveSubmittedDraft,
@@ -30,6 +31,15 @@ describe("composer draft storage", () => {
 		saveComposerDrafts(drafts, storage);
 
 		expect(loadComposerDrafts(storage)).toEqual(drafts);
+	});
+
+	it("does not overwrite another tab's unrelated session draft", () => {
+		const storage = memoryStorage();
+		saveComposerDrafts(new Map([["session_a", "draft a"]]), storage);
+		saveComposerDrafts(new Map([["session_b", "draft b"]]), storage);
+
+		expect(storage.getItem(`${COMPOSER_DRAFT_STORAGE_PREFIX}session_a`)).toBe("draft a");
+		expect(storage.getItem(`${COMPOSER_DRAFT_STORAGE_PREFIX}session_b`)).toBe("draft b");
 	});
 
 	it("replaces both IDs after a deliberate new-session setup edit", () => {
@@ -113,7 +123,12 @@ describe("submitted composer draft guards", () => {
 function memoryStorage(): ComposerDraftStorage {
 	const data = new Map<string, string>();
 	return {
+		get length() {
+			return data.size;
+		},
+		clear: () => data.clear(),
 		getItem: (key) => data.get(key) ?? null,
+		key: (index) => Array.from(data.keys())[index] ?? null,
 		setItem: (key, value) => {
 			data.set(key, value);
 		},

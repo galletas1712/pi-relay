@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod auth;
+mod browser_websocket;
 mod codec;
 mod config;
 mod delegation_context;
@@ -22,6 +23,7 @@ mod subagents;
 mod types;
 mod workspace_selection;
 
+use crate::browser_websocket::{accept, handshake_semaphore, BrowserWebSocket};
 use crate::codec::{
     from_params, parse_assistant_message, parse_user_message, required_string, required_uuid,
     transcript_store_from_stored,
@@ -54,7 +56,7 @@ use anyhow::Result;
 use futures_util::{stream, SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Message;
@@ -65,6 +67,7 @@ const BOOT_RECOVERY_CONCURRENCY: usize = 4;
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
+    let allowed_origins = config.allowed_origins;
     let prompt_root = find_prompt_root(std::env::current_dir()?)?;
     let repo = Arc::new(PostgresAgentStore::connect(&config.database_url).await?);
     repo.migrate().await?;
@@ -204,6 +207,7 @@ async fn main() -> Result<()> {
     }
 
     let listener = TcpListener::bind(&config.bind).await?;
+    let handshakes = handshake_semaphore();
     println!("pi-agentd listening on ws://{}", config.bind);
 
     loop {
@@ -211,8 +215,15 @@ async fn main() -> Result<()> {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let state = state.clone();
+                let allowed_origins = allowed_origins.clone();
+                let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+                    continue;
+                };
                 tokio::spawn(async move {
-                    if let Err(error) = handle_socket(state, stream).await {
+                    let Some(websocket) = accept(stream, allowed_origins, permit).await else {
+                        return;
+                    };
+                    if let Err(error) = handle_socket(state, websocket).await {
                         eprintln!("websocket error: {error:#}");
                     }
                 });
@@ -368,8 +379,8 @@ async fn drain_dispatch_tasks(state: &AppState) {
     }
 }
 
-async fn handle_socket(state: AppState, stream: TcpStream) -> Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream).await?;
+async fn handle_socket(state: AppState, websocket: BrowserWebSocket) -> Result<()> {
+    let ws = websocket.into_inner();
     let (writer, mut reader) = ws.split();
     let writer = Arc::new(Mutex::new(writer));
     let mut events_rx = state.events.subscribe();

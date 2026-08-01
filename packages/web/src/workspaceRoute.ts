@@ -543,6 +543,7 @@ export interface WorkspaceRouteHistoryDependencies {
 	history: WorkspaceHistoryLike;
 	location: WorkspaceRouteLocation;
 	events: WorkspacePopstateSource;
+	ownsCurrentLocation?: () => boolean;
 }
 
 /**
@@ -591,7 +592,10 @@ export class WorkspaceRouteHistory {
 	 * dispatches application mutations.
 	 */
 	subscribe(listener: (result: WorkspaceRouteParseResult) => void): () => void {
-		const onPopstate: EventListener = () => listener(this.current());
+		const onPopstate: EventListener = () => {
+			if (this.dependencies.ownsCurrentLocation?.() === false) return;
+			listener(this.current());
+		};
 		this.dependencies.events.addEventListener("popstate", onPopstate);
 		return () => this.dependencies.events.removeEventListener("popstate", onPopstate);
 	}
@@ -599,13 +603,59 @@ export class WorkspaceRouteHistory {
 }
 
 /** Browser convenience factory; safe to import during SSR/static rendering. */
-export function browserWorkspaceRouteHistory(): WorkspaceRouteHistory | null {
+export function browserWorkspaceRouteHistory(profileId?: string): WorkspaceRouteHistory | null {
 	if (typeof window === "undefined") return null;
+	if (profileId) {
+		const prefix = `/server/${encodeURIComponent(profileId)}`;
+		return new WorkspaceRouteHistory({
+			history: {
+				get state() {
+					return window.history.state;
+				},
+				pushState(data, unused, url) {
+					window.history.pushState(data, unused, prefixWorkspaceUrl(prefix, url));
+				},
+				replaceState(data, unused, url) {
+					window.history.replaceState(data, unused, prefixWorkspaceUrl(prefix, url));
+				},
+			},
+			location: {
+				get pathname() {
+					return window.location.pathname.startsWith(`${prefix}/`)
+						? window.location.pathname.slice(prefix.length)
+						: "/";
+				},
+				get search() {
+					return window.location.search;
+				},
+				get hash() {
+					return window.location.hash;
+				},
+			},
+			events: {
+				addEventListener(_type, listener) {
+					window.addEventListener("popstate", listener);
+				},
+				removeEventListener(_type, listener) {
+					window.removeEventListener("popstate", listener);
+				},
+			},
+			ownsCurrentLocation: () => window.location.pathname.startsWith(`${prefix}/`),
+		});
+	}
 	return new WorkspaceRouteHistory({
 		history: window.history,
 		location: window.location,
 		events: window,
 	});
+}
+
+function prefixWorkspaceUrl(
+	prefix: string,
+	url: string | URL | null | undefined,
+): string | URL | null | undefined {
+	if (typeof url !== "string") return url;
+	return `${prefix}${url.startsWith("/") ? url : `/${url}`}`;
 }
 
 export type LegacyRootResolution =

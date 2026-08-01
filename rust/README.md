@@ -133,6 +133,7 @@ mkdir -p "$CONFIG_HOME"
 cat >"$CONFIG_HOME/config.toml" <<'EOF'
 database_url = "postgres://postgres:postgres@127.0.0.1:55432/pi_relay"
 bind = "127.0.0.1:8787"
+allowed_origins = ["http://127.0.0.1:8788"]
 EOF
 
 cargo run --manifest-path rust/Cargo.toml -p agent-daemon
@@ -140,6 +141,9 @@ cargo run --manifest-path rust/Cargo.toml -p agent-daemon
 
 `pi-agentd` accepts no configuration arguments. The websocket endpoint is
 `ws://127.0.0.1:8787` unless `bind` changes it in `config.toml`.
+At least one canonical `allowed_origins` entry is mandatory. Set the exact
+comma-separated `PI_RELAY_ALLOWED_ORIGINS` environment variable to replace the
+TOML list for a deployment; it is not a secret.
 
 Each runtime host has independent policy at
 `$XDG_CONFIG_HOME/pi-relay/runtime/config.toml` (or
@@ -211,6 +215,7 @@ than being deferred to a session or subagent.
 database_url = "postgres://postgres:postgres@127.0.0.1:55432/pi_relay"
 bind = "127.0.0.1:8787" # optional; this is the default
 runtime_bind = "127.0.0.1:8786" # optional; this is the default
+allowed_origins = ["https://relay.example.com", "http://127.0.0.1:8788"]
 
 [default_parent_model]
 kind = "openai"
@@ -220,14 +225,18 @@ prompt_cache = { key = "my-parent-cache" }
 ```
 
 The root schema is exactly `database_url`, optional `bind`, optional
-`runtime_bind`, and optional `default_parent_model`. The provider object keeps
-the normal `kind`, `model`, `reasoning_effort`, optional `max_tokens`, and
-optional `prompt_cache` fields. `max_tokens` applies to `claude` providers
-only; the Codex backend rejects an output cap, so the OpenAI adapter never
-sends one and the value is ignored. If `default_parent_model` is omitted, the
-built-in parent policy is OpenAI `gpt-5.6-sol` with `high` reasoning. A new
-parent session uses an explicit `session.start.provider`, otherwise
-`default_parent_model`, otherwise that built-in policy.
+`runtime_bind`, `allowed_origins`, and optional `default_parent_model`.
+`PI_RELAY_ALLOWED_ORIGINS` has simple replacement precedence over TOML; there is
+no fallback or merge. Empty entries, duplicates, invalid/noncanonical origins,
+or no origins fail before database connection, migration, or listen. The
+provider object keeps the normal `kind`, `model`,
+`reasoning_effort`, optional `max_tokens`, and optional `prompt_cache` fields.
+`max_tokens` applies to `claude` providers only; the Codex backend rejects an
+output cap, so the OpenAI adapter never sends one and the value is ignored. If
+`default_parent_model` is omitted, the built-in parent policy is OpenAI
+`gpt-5.6-sol` with `high` reasoning. A new parent session uses an explicit
+`session.start.provider`, otherwise `default_parent_model`, otherwise that
+built-in policy.
 Existing or replayed sessions retain their persisted provider and are never
 retargeted by changed defaults.
 
@@ -414,25 +423,99 @@ for the fresh-versus-existing database contract.
 
 ## Run The Web UI
 
-For day-to-day UI edits with HMR:
+`infra/dev.sh` runs only Postgres and `pi-agentd` in Compose plus the
+host-side `pi-runtime`. For local UI development, run Vite separately:
 
 ```sh
 npm run dev:web
 ```
 
-The full local stack (`infra/dev.sh`) serves the built UI from the Compose
-`web` service at `http://127.0.0.1:8788` (websocket still `ws://127.0.0.1:8787`).
-Rebuild only the frontend without restarting host `pi-runtime`:
+Vite listens on `http://127.0.0.1:8788`; only a loopback page seeds the
+first-run `Local` profile for `ws://127.0.0.1:8787`. The production build is
+hosted by Cloudflare Pages and requires explicit profile setup. Its server bar
+stores named profiles with immutable WebSocket URLs. To change an address, add
+a new profile and remove the old one. The profile list uses origin-scoped
+`localStorage`; active selection remains tab-local. Before starting the
+production control host, allowlist the stable Cloudflare custom origin and
+local Vite if both are used:
 
 ```sh
-docker compose -f infra/docker-compose.yml up -d --build web
+export PI_RELAY_ALLOWED_ORIGINS=https://relay.example.com,http://127.0.0.1:8788
+./infra/dev.sh
 ```
 
-The client uses `ws://127.0.0.1:8787` when opened on loopback and same-origin
-`/ws` when served through `infra/serve.sh` (Tailscale → nginx → agentd). The
-same build therefore works through local TCP forwarding and Tailnet access. See
-[`../packages/web/docs/web-ui.md`](../packages/web/docs/web-ui.md) for the
-client design.
+Every control host needs that exact stable custom origin. Cloudflare Pages
+preview/generated origins are intentionally rejected.
+
+### Tailnet WSS control endpoint
+
+On the control host, inspect the existing configuration before changing it:
+
+```sh
+tailscale serve status
+```
+
+The selected `CONTROL_WSS_PORT` must be unused by Serve or Funnel. The examples
+use `8443`, reserving that entire port for pi-relay and avoiding HTTPS path
+mappings on `443`. After confirming it is free, publish loopback `pi-agentd`
+through Tailscale Serve's TLS-terminated TCP mode:
+
+```sh
+tailscale serve --bg --tls-terminated-tcp=8443 tcp://127.0.0.1:8787
+# Add this browser profile:
+#   wss://<control-node>.<tailnet>.ts.net:8443/
+```
+
+Remove the listener only when `tailscale serve status` confirms it is still
+pi-relay-owned, using the matching flags:
+
+```sh
+tailscale serve --bg --tls-terminated-tcp=8443 tcp://127.0.0.1:8787 off
+```
+
+If status shows an old `443` `/pi-relay` mapping, remove only that path manually
+with `tailscale serve --https=443 --set-path=/pi-relay off`. Never use
+`tailscale serve reset`, because it removes unrelated mappings.
+
+Tailscale remains the network authorization boundary; raw control `8787`,
+runtime `8786`, and Postgres `55432` publications remain bound to
+`127.0.0.1`.
+
+### SSH loopback tunnel
+
+Forward the remote control listener onto browser-local loopback:
+
+```sh
+ssh -N -L 9876:127.0.0.1:8787 user@control-host
+# Add this browser profile:
+#   ws://127.0.0.1:9876/
+```
+
+The SSH connection remains the network authorization boundary. Do not publish
+`8787` broadly.
+
+An HTTPS page cannot open `ws://` because browsers block mixed content. Use
+the Tailnet `wss://` endpoint from Cloudflare Pages, or open the local Vite
+UI for the SSH-forwarded `ws://` profile. If a static host sends Content
+Security Policy, its `connect-src` must include the intended control
+destinations; otherwise the browser blocks the direct WebSocket before the
+daemon sees it.
+
+### Origin validation threat model
+
+The daemon requires exactly one allowlisted, canonical browser `Origin` before
+upgrade and creates no event receiver, subscription state, RPC dispatch, or
+database query for a rejected handshake. This prevents malicious unrelated
+webpages in honest browsers from connecting. It is not CORS and not
+arbitrary-client authentication: a non-browser client can forge `Origin`.
+
+Tailnet ACLs or the SSH connection authorize access. Keep raw ports loopback
+only. A compromised allowlisted frontend, service worker, browser extension,
+browser, or device remains trusted. Use the shipped CSP/no-third-party-scripts
+policy, HTTPS/WSS remotely, and one stable custom origin.
+
+See [`../packages/web/docs/web-ui.md`](../packages/web/docs/web-ui.md) for the
+client lifecycle and isolation design.
 
 
 ## Provider Credentials

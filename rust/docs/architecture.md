@@ -16,6 +16,27 @@ audited provider capability matrix is in
 [`provider-api-support.md`](provider-api-support.md). In-flight future work
 lives under [`plans/`](plans/).
 
+## Deployment topology
+
+The web build is static and has no control-plane dependency:
+
+```mermaid
+flowchart LR
+  Pages[Cloudflare Pages] --> Browser
+  Browser -->|WSS :8443| Serve[Tailscale Serve TLS termination]
+  Browser -->|or loopback WS over SSH| Agentd[pi-agentd]
+  Serve -->|raw TCP to loopback :8787| Agentd
+  Agentd --> Postgres[(Postgres)]
+  Runtime[pi-runtime] -->|loopback runtime listener| Agentd
+```
+
+The browser owns named control profiles and mounts exactly one profile-keyed
+connected app per tab. The daemon validates exactly one canonical browser
+Origin before upgrade and creates RPC/event state only after acceptance. The
+static host never selects a daemon and never proxies its WebSocket. Raw control,
+runtime, and Postgres publications in the shipped Compose stack remain
+loopback-only.
+
 ## Goals
 
 1. Keep the runtime small enough to understand and change quickly.
