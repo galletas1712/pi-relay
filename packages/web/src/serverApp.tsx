@@ -1,15 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { Server, Settings } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { AlertCircle, Pencil, Plus, Server, Settings, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { App } from "./App.tsx";
 import { createAgentApi } from "./agentApi.ts";
 import {
 	AppDialog,
 	DialogBody,
-	DialogClose,
 	DialogCloseButton,
 	DialogDescription,
-	DialogFooter,
 	DialogHeader,
 	DialogHeading,
 	DialogTitle,
@@ -22,7 +20,40 @@ import {
 	type ServerProfileSnapshot,
 } from "./serverProfiles.ts";
 import { browserWorkspaceRouteHistory } from "./workspaceRoute.ts";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+	Empty,
+	EmptyContent,
+	EmptyDescription,
+	EmptyHeader,
+	EmptyMedia,
+	EmptyTitle,
+} from "@/components/ui/empty";
+import {
+	Field,
+	FieldDescription,
+	FieldGroup,
+	FieldLabel,
+} from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import {
+	NativeSelect,
+	NativeSelectOption,
+} from "@/components/ui/native-select";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 
 type ProfileDraft = {
 	id: string | null;
@@ -42,7 +73,8 @@ export function ServerApp({
 	}, [store]);
 	const [snapshot, setSnapshot] = useState(initialSnapshot);
 	const snapshotRef = useRef(initialSnapshot);
-	const [managerOpen, setManagerOpen] = useState(false);
+	const [managerMode, setManagerMode] = useState<"browse" | "add" | null>(null);
+	const manageButtonRef = useRef<HTMLButtonElement>(null);
 	const activeProfile = snapshot.profiles.find(
 		(profile) => profile.id === snapshot.activeProfileId,
 	) ?? null;
@@ -92,36 +124,36 @@ export function ServerApp({
 	return (
 		<div className="server-app">
 			<header className="server-bar">
-				<div className="server-bar-active">
-					<Server size={14} aria-hidden />
-					<span>Server</span>
-					<strong>{activeProfile?.name ?? "Setup required"}</strong>
-					{activeProfile ? <code>{activeProfile.url}</code> : null}
-				</div>
-				<div className="server-bar-actions">
-					<label>
-						<span className="sr-only">Active server</span>
-						<select
+				<div className="server-context">
+					<Server aria-hidden />
+					{snapshot.profiles.length > 0 ? (
+						<NativeSelect
+							className="server-context-select"
 							value={snapshot.activeProfileId ?? ""}
 							onChange={(event) => selectProfile(event.target.value)}
-							aria-label="Active server"
+							aria-label="Active control server"
 						>
 							{snapshot.profiles.map((profile) => (
-								<option key={profile.id} value={profile.id}>
+								<NativeSelectOption key={profile.id} value={profile.id}>
 									{profile.name}
-								</option>
+								</NativeSelectOption>
 							))}
-						</select>
-					</label>
-					<button
-						type="button"
-						className="server-manage-button"
-						onClick={() => setManagerOpen(true)}
-					>
-						<Settings size={14} aria-hidden />
-						<span>Manage</span>
-					</button>
+						</NativeSelect>
+					) : (
+						<span className="server-context-empty">No server configured</span>
+					)}
 				</div>
+				<Button
+					ref={manageButtonRef}
+					type="button"
+					variant="ghost"
+					className="server-manage-button"
+					aria-label="Manage control servers"
+					onClick={() => setManagerMode("browse")}
+				>
+					<Settings data-icon="inline-start" aria-hidden />
+					<span>Manage</span>
+				</Button>
 			</header>
 			{activeProfile && activeRouteOwned ? (
 				<ConnectedServer
@@ -131,20 +163,35 @@ export function ServerApp({
 				/>
 			) : (
 				<section className="server-setup" aria-labelledby="server-setup-title">
-					<h1 id="server-setup-title">Control server setup</h1>
-					<p>
-						Add a control server name and WebSocket URL to begin.
-					</p>
-					<button type="button" className="primary-button" onClick={() => setManagerOpen(true)}>
-						Add control server
-					</button>
+					<Empty className="server-setup-content">
+						<EmptyHeader>
+							<EmptyMedia variant="icon">
+								<Server aria-hidden />
+							</EmptyMedia>
+							<EmptyTitle>
+								<h1 id="server-setup-title">Connect a control server</h1>
+							</EmptyTitle>
+							<EmptyDescription>
+								Add the WebSocket address for the pi-relay control server you want
+								to use.
+							</EmptyDescription>
+						</EmptyHeader>
+						<EmptyContent>
+							<Button type="button" onClick={() => setManagerMode("add")}>
+								<Plus data-icon="inline-start" aria-hidden />
+								Add control server
+							</Button>
+						</EmptyContent>
+					</Empty>
 				</section>
 			)}
-			{managerOpen ? (
+			{managerMode ? (
 				<ServerManagerDialog
 					snapshot={snapshot}
+					initialMode={managerMode}
 					onSelect={selectProfile}
-					onClose={() => setManagerOpen(false)}
+					onClose={() => setManagerMode(null)}
+					returnFocusFallbackRef={manageButtonRef}
 					store={store}
 				/>
 			) : null}
@@ -184,27 +231,58 @@ function ServerManagerDialog({
 	store,
 	onSelect,
 	onClose,
+	initialMode,
+	returnFocusFallbackRef,
 }: {
 	snapshot: ServerProfileSnapshot;
 	store: ServerProfileStore;
 	onSelect: (id: string) => void;
 	onClose: () => void;
+	initialMode: "browse" | "add";
+	returnFocusFallbackRef: RefObject<HTMLElement | null>;
 }) {
-	const [draft, setDraft] = useState<ProfileDraft | null>(null);
+	const [draft, setDraft] = useState<ProfileDraft | null>(() =>
+		initialMode === "add" ? emptyDraft() : null
+	);
+	const [pendingRemoval, setPendingRemoval] = useState<ServerProfile | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const nameInputRef = useRef<HTMLInputElement>(null);
-	const activeProfile = snapshot.profiles.find(
-		(profile) => profile.id === snapshot.activeProfileId,
-	) ?? null;
-	const startEdit = (profile?: ServerProfile) => {
+	const addButtonRef = useRef<HTMLButtonElement>(null);
+	const editorReturnFocusRef = useRef<HTMLElement | null>(null);
+	const removalReturnFocusRef = useRef<HTMLButtonElement | null>(null);
+	useEffect(() => {
+		if (!draft) return;
+		queueMicrotask(() => nameInputRef.current?.focus());
+	}, [draft?.id]);
+	const startEdit = (
+		profile: ServerProfile | undefined,
+		returnFocusTarget: HTMLElement,
+	) => {
 		setError(null);
+		editorReturnFocusRef.current = returnFocusTarget;
 		setDraft(
 			profile
 				? { id: profile.id, name: profile.name, url: profile.url }
-				: { id: null, name: "", url: "" },
+				: emptyDraft(),
 		);
 	};
-	const save = async () => {
+	const restoreEditorFocus = () => {
+		const target = editorReturnFocusRef.current;
+		editorReturnFocusRef.current = null;
+		queueMicrotask(() => {
+			if (target?.isConnected) {
+				target.focus();
+			} else {
+				addButtonRef.current?.focus();
+			}
+		});
+	};
+	const cancelEdit = () => {
+		setDraft(null);
+		setError(null);
+		restoreEditorFocus();
+	};
+	const save = () => {
 		if (!draft) return;
 		try {
 			if (draft.id) {
@@ -214,145 +292,246 @@ function ServerManagerDialog({
 			}
 			setDraft(null);
 			setError(null);
+			restoreEditorFocus();
 		} catch (caught) {
 			setError(errorMessage(caught));
 		}
 	};
-	const remove = async (profile: ServerProfile) => {
-		if (
-			!window.confirm(
-				`Remove server profile "${profile.name}"?`,
-			)
-		) {
-			return;
-		}
+	const remove = (profile: ServerProfile) => {
 		try {
 			store.remove(profile.id);
 			setDraft(null);
 			setError(null);
+			setPendingRemoval(null);
 		} catch (caught) {
 			setError(errorMessage(caught));
 		}
 	};
+	const restoreRemovalFocus = () => {
+		const target = removalReturnFocusRef.current;
+		removalReturnFocusRef.current = null;
+		queueMicrotask(() => {
+			if (target?.isConnected) {
+				target.focus();
+			} else {
+				addButtonRef.current?.focus();
+			}
+		});
+	};
 
 	return (
 		<AppDialog
-			className="server-manager-dialog"
+			className={cn(
+				"server-manager-dialog",
+				pendingRemoval && "server-manager-dialog-confirming",
+			)}
 			initialFocusRef={draft ? nameInputRef : undefined}
+			returnFocusFallbackRef={returnFocusFallbackRef}
 			onDismiss={onClose}
 		>
 			<DialogHeader>
 				<DialogHeading>
 					<DialogTitle>Control servers</DialogTitle>
 					<DialogDescription>
-						Profiles contain a name and immutable WebSocket URL.
+						Switch or manage connections saved in this browser.
 					</DialogDescription>
 				</DialogHeading>
-				<DialogCloseButton label="close server manager" />
+				<DialogCloseButton label="Close server manager" />
 			</DialogHeader>
 			<DialogBody className="server-manager-body">
-				<div className="server-profile-list">
-					{snapshot.profiles.map((profile) => (
-						<div
-							className={`server-profile-row ${profile.id === snapshot.activeProfileId ? "active" : ""}`}
-							key={profile.id}
-						>
-							<button
-								type="button"
-								className="server-profile-select"
-								onClick={() => {
-									onSelect(profile.id);
-									onClose();
-								}}
-							>
-								<strong>{profile.name}</strong>
-								<code>{profile.url}</code>
-								{profile.id === snapshot.activeProfileId ? <span>Active in this tab</span> : null}
-							</button>
-							<button
-								type="button"
-								className="secondary-button"
-								onClick={() => startEdit(profile)}
-							>
-								Edit
-							</button>
-							<button
-								type="button"
-								className="secondary-button destructive"
-								onClick={() => void remove(profile)}
-							>
-								Remove
-							</button>
-						</div>
-					))}
-				</div>
+				{snapshot.profiles.length > 0 ? (
+					<div className="server-profile-list">
+						{snapshot.profiles.map((profile) => {
+							const active = profile.id === snapshot.activeProfileId;
+							return (
+								<div
+									className="server-profile-row"
+									data-active={active || undefined}
+									key={profile.id}
+								>
+									<button
+										type="button"
+										className="server-profile-select"
+										aria-label={
+											active
+												? `${profile.name}, active control server`
+												: `Switch to ${profile.name}`
+										}
+										aria-current={active ? "true" : undefined}
+										onClick={() => {
+											onSelect(profile.id);
+											onClose();
+										}}
+									>
+										<span className="server-profile-name">
+											<strong>{profile.name}</strong>
+											{active ? <Badge variant="secondary">Active</Badge> : null}
+										</span>
+										<code>{profile.url}</code>
+									</button>
+									<div className="server-profile-actions">
+										<Button
+											type="button"
+											variant="ghost"
+											aria-label={`Edit ${profile.name}`}
+											onClick={(event) => startEdit(profile, event.currentTarget)}
+										>
+											<Pencil data-icon="inline-start" aria-hidden />
+											<span className="server-action-label">Edit</span>
+										</Button>
+										<Button
+											type="button"
+											variant="ghost"
+											aria-label={`Remove ${profile.name}`}
+											onClick={(event) => {
+												removalReturnFocusRef.current = event.currentTarget;
+												setPendingRemoval(profile);
+											}}
+										>
+											<Trash2 data-icon="inline-start" aria-hidden />
+											<span className="server-action-label">Remove</span>
+										</Button>
+									</div>
+								</div>
+							);
+						})}
+					</div>
+				) : draft ? null : (
+					<Empty className="server-manager-empty">
+						<EmptyHeader>
+							<EmptyTitle>No control servers yet</EmptyTitle>
+							<EmptyDescription>
+								Add a server connection to start using pi-relay.
+							</EmptyDescription>
+						</EmptyHeader>
+					</Empty>
+				)}
 				{draft ? (
 					<form
 						className="server-profile-form"
 						onSubmit={(event) => {
 							event.preventDefault();
-							void save();
+							save();
 						}}
 					>
-						<label className="rename-field">
-							<span>Name</span>
-							<input
-								ref={nameInputRef}
-								value={draft.name}
-								onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-								placeholder="Home control"
-								maxLength={80}
-								required
-							/>
-						</label>
-						{draft.id ? (
-							<p>
-								Address: <code>{draft.url}</code>. To use another address, add a new
-								server profile.
-							</p>
-						) : (
-							<label className="rename-field">
-								<span>WebSocket URL</span>
-								<input
+						<div className="server-profile-form-heading">
+							<strong>{draft.id ? "Edit server" : "Add server"}</strong>
+							<span>
+								{draft.id
+									? "Change the label used for this connection."
+									: "Save a control server connection in this browser."}
+							</span>
+						</div>
+						<FieldGroup className="server-profile-fields">
+							<Field>
+								<FieldLabel htmlFor="server-profile-name">Name</FieldLabel>
+								<Input
+									id="server-profile-name"
+									ref={nameInputRef}
+									value={draft.name}
+									onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+									placeholder="Home control"
+									maxLength={80}
+									autoComplete="off"
+									required
+								/>
+							</Field>
+							<Field>
+								<FieldLabel htmlFor="server-profile-url">WebSocket URL</FieldLabel>
+								<Input
+									id="server-profile-url"
 									value={draft.url}
 									onChange={(event) => setDraft({ ...draft, url: event.target.value })}
 									placeholder="wss://control.example.ts.net/"
 									inputMode="url"
+									autoCapitalize="none"
+									autoComplete="url"
+									spellCheck={false}
+									readOnly={!!draft.id}
 									required
 								/>
-							</label>
-						)}
+								{draft.id ? (
+									<FieldDescription>
+										Server URLs can’t be changed. Add a new profile to use a
+										different address.
+									</FieldDescription>
+								) : null}
+							</Field>
+						</FieldGroup>
 						<div className="server-profile-form-actions">
-							<button
+							<Button
 								type="button"
-								className="secondary-button"
-								onClick={() => {
-									setDraft(null);
-									setError(null);
-								}}
+								variant="outline"
+								onClick={cancelEdit}
 							>
 								Cancel
-							</button>
-							<button type="submit" className="primary-button">
-								{draft.id ? "Save" : "Add server"}
-							</button>
+							</Button>
+							<Button type="submit">
+								{draft.id ? "Save changes" : "Add server"}
+							</Button>
 						</div>
 					</form>
 				) : (
-					<button type="button" className="secondary-button" onClick={() => startEdit()}>
+					<Button
+						ref={addButtonRef}
+						type="button"
+						variant="outline"
+						className="server-add-button"
+						onClick={(event) => startEdit(undefined, event.currentTarget)}
+					>
+						<Plus data-icon="inline-start" aria-hidden />
 						Add server
-					</button>
+					</Button>
 				)}
-				{error ? <p className="error-text" role="alert">{error}</p> : null}
+				{error ? (
+					<Alert variant="destructive">
+						<AlertCircle aria-hidden />
+						<AlertDescription>{error}</AlertDescription>
+					</Alert>
+				) : null}
 			</DialogBody>
-			<DialogFooter>
-				<span className="server-manager-current">
-					Current: {activeProfile?.name ?? "none"}
-				</span>
-				<DialogClose className="secondary-button">Done</DialogClose>
-			</DialogFooter>
+			<AlertDialog
+				open={!!pendingRemoval}
+				onOpenChange={(open) => {
+					if (!open) setPendingRemoval(null);
+				}}
+			>
+				<AlertDialogContent
+					className="server-removal-dialog"
+					onCloseAutoFocus={(event) => {
+						event.preventDefault();
+						restoreRemovalFocus();
+					}}
+				>
+					<AlertDialogHeader>
+						<AlertDialogTitle>
+							Remove {pendingRemoval?.name ?? "server"}?
+						</AlertDialogTitle>
+						<AlertDialogDescription>
+							This removes the connection from this browser. Saved browser state tied
+							to this profile will no longer be accessible, but data on the control
+							server is not deleted.
+						</AlertDialogDescription>
+					</AlertDialogHeader>
+					<AlertDialogFooter>
+						<AlertDialogCancel autoFocus>Cancel</AlertDialogCancel>
+						<AlertDialogAction
+							variant="destructive"
+							onClick={() => {
+								if (pendingRemoval) remove(pendingRemoval);
+							}}
+						>
+							Remove server
+						</AlertDialogAction>
+					</AlertDialogFooter>
+				</AlertDialogContent>
+			</AlertDialog>
 		</AppDialog>
 	);
+}
+
+function emptyDraft(): ProfileDraft {
+	return { id: null, name: "", url: "" };
 }
 
 function createBrowserProfileStore(): ServerProfileStore {
