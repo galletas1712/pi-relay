@@ -192,12 +192,6 @@ fn role_provider_from_frontmatter(
     parsed: &ParsedSkillFile,
     skill_path: &Path,
 ) -> Result<Option<ProviderConfig>> {
-    if parsed.frontmatter.kind.is_some() {
-        return Err(anyhow!(
-            "role skill {} must use composite model `provider:model`; separate kind and model fields are not supported",
-            skill_path.display()
-        ));
-    }
     let model = parsed.frontmatter.model.as_deref();
     let Some(model) = model else {
         if parsed.frontmatter.reasoning_effort.is_some() || parsed.frontmatter.max_tokens.is_some()
@@ -452,19 +446,19 @@ mod tests {
     }
 
     #[test]
-    fn role_rejects_legacy_separate_kind_and_model_frontmatter() {
+    fn role_ignores_unsupported_kind_frontmatter() {
         let role = raw_skill(
             SkillKind::SubagentRole,
             SkillOrigin::RuntimeRole,
             None,
             "reviewer",
-            "kind: claude\nmodel: claude-opus-4-8\n",
+            "kind: claude\nmodel: claude:claude-opus-4-8\n",
         );
 
-        let error = resolve_skill_role(&[role], "reviewer").expect_err("must reject");
-        assert!(error
-            .to_string()
-            .contains("separate kind and model fields are not supported"));
+        let resolved = resolve_skill_role(&[role], "reviewer").expect("role");
+        let provider = resolved.provider.expect("provider");
+        assert_eq!(provider.kind, ProviderKind::Claude);
+        assert_eq!(provider.model, "claude-opus-4-8");
     }
 
     fn raw_skill(

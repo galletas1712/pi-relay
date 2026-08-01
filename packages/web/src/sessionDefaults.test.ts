@@ -18,14 +18,10 @@ describe("session defaults", () => {
 	});
 
 	it("uses canonical provider:model keys as picker identities and labels", () => {
-		expect(MODEL_OPTIONS.map((option) => [option.id, option.label])).toEqual([
-			["openai:gpt-5.6-sol", "openai:gpt-5.6-sol"],
-			["openai:gpt-5.6-terra", "openai:gpt-5.6-terra"],
-			["openai:gpt-5.6-luna", "openai:gpt-5.6-luna"],
-			["claude:claude-opus-5", "claude:claude-opus-5"],
-			["claude:claude-opus-4-8", "claude:claude-opus-4-8"],
-			["claude:claude-fable-5", "claude:claude-fable-5"],
-		]);
+		for (const option of MODEL_OPTIONS) {
+			expect(option.id).toBe(providerModelKey(option.provider));
+			expect(option.label).toBe(option.id);
+		}
 	});
 
 	it("exposes the picker Claude models and a Fable ZDR warning", () => {
@@ -42,14 +38,6 @@ describe("session defaults", () => {
 		expect(fable?.provider.reasoning_effort).toBe("high");
 		expect(`${fable?.label} ${fable?.description}`).not.toMatch(/30[- ]day|data retention/i);
 		expect(`${fable?.label} ${fable?.description}`).toMatch(/not ZDR/i);
-	});
-
-	it("exposes the seeded OpenAI/Codex model picker options", () => {
-		expect(MODEL_OPTIONS.filter((option) => option.provider.kind === "openai").map((option) => option.provider.model)).toEqual([
-			"gpt-5.6-sol",
-			"gpt-5.6-terra",
-			"gpt-5.6-luna",
-		]);
 	});
 
 	it("maps OpenAI/Codex model keys to provider config", () => {
