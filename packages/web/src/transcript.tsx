@@ -1723,7 +1723,7 @@ function toolRunItemFromPendingAction(action: PendingAction): ToolRunItem | null
 	const input = parseToolInput(argsJson) ?? (payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null);
 	const prettyName = prettyToolName(toolName);
 	const editPreview = editToolPreview(toolName, input);
-	const callDescription = toolName.startsWith("mcp__") ? null : stringValue(input?.call_description)?.trim() || null;
+	const callDescription = toolName === "Bash" ? stringValue(input?.call_description)?.trim() || null : null;
 	return {
 		source: "local",
 		key: `pending-${action.action_row_id}`,
@@ -1761,9 +1761,7 @@ function localToolRunItem(
 	const statusKind = !result ? "running" : result.status === "Success" ? "success" : "error";
 	const editPreview = editToolPreview(part.item.tool_name, input, result);
 	const prettyName = prettyToolName(part.item.tool_name);
-	const callDescription = part.item.tool_name.startsWith("mcp__")
-		? null
-		: stringValue(input?.call_description)?.trim() || null;
+	const callDescription = part.item.tool_name === "Bash" ? stringValue(input?.call_description)?.trim() || null : null;
 	return {
 		source: "local",
 		key: `local-${entryId}-${part.item.id}`,

@@ -2,7 +2,7 @@ use agent_core::AgentInput;
 use agent_runtime_protocol::{RuntimeCommand, RuntimeCommandResult};
 use agent_session::SessionAction;
 use agent_store::{ActionStatus, ActionUpdate};
-use agent_tools::{limit_tool_output, tool_call_for_execution, ToolContext};
+use agent_tools::{bash_call_for_execution, limit_tool_output, ToolContext};
 use agent_vocab::{ToolResultMessage, ToolResultStatus};
 use serde_json::json;
 
@@ -32,11 +32,7 @@ pub(super) async fn run_tool_turn(
         .manifest()
         .tool(&tool_call.tool_name)
         .is_some();
-    let execution_call = if is_mcp_tool {
-        tool_call.clone()
-    } else {
-        tool_call_for_execution(&tool_call)
-    };
+    let execution_call = bash_call_for_execution(&tool_call);
     state
         .runtime_hosts
         .ensure_session(

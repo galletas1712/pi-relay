@@ -753,6 +753,51 @@ describe("MessageList tool use cards", () => {
 		expect(html).not.toContain('<span class="tool-run-item-title">server operation mode</span>');
 	});
 
+	it("keeps non-Bash first-party titles on their existing fallbacks", () => {
+		const calls = [
+			{
+				type: "tool_call" as const,
+				id: "call_edit",
+				tool_name: "Edit",
+				args_json: "{\"call_description\":\"Apply the requested edit.\",\"input\":\"*** Begin Patch\\n*** Add File: tmp/example.txt\\n+hello\\n*** End Patch\\n\"}",
+			},
+			{
+				type: "tool_call" as const,
+				id: "call_web",
+				tool_name: "WebSearch",
+				args_json: "{\"call_description\":\"Search for the requested information.\",\"query\":\"rust\"}",
+			},
+			{
+				type: "tool_call" as const,
+				id: "call_delegation",
+				tool_name: "inspect_delegation",
+				args_json: "{\"call_description\":\"Inspect the delegation.\",\"delegation_id\":\"delegation_1\"}",
+			},
+		];
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[
+					turnStartedEntry("start", 1, 1),
+					userEntryWithParent("user", "start", "operate"),
+					assistantToolEntry("assistant", "user", calls),
+				]}
+				activeLeafId="assistant"
+				isRunning
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain("Edited example.txt +1");
+		expect(html).toContain('<span class="tool-run-item-title">WebSearch</span>');
+		expect(html).toContain('<span class="tool-run-item-title">inspect_delegation</span>');
+		expect(html).not.toContain("Apply the requested edit.");
+		expect(html).not.toContain("Search for the requested information.");
+		expect(html).not.toContain("Inspect the delegation.");
+	});
+
 	it("renders a single tool directly instead of a grouped Used 1 tool header", () => {
 		const bashTool = { type: "tool_call" as const, id: "call_1", tool_name: "Bash", args_json: "{\"command\":\"ls\"}" };
 		const html = renderToStaticMarkup(
@@ -992,6 +1037,16 @@ describe("MessageList tool use cards", () => {
 					args_json: "{\"call_description\":\"Run the web test suite.\",\"command\":\"npm test\"}",
 				},
 			},
+			{
+				action_row_id: "action_non_bash",
+				kind: "tool",
+				status: "running",
+				payload: {
+					id: "call_pending_web",
+					tool_name: "WebSearch",
+					args_json: "{\"call_description\":\"Search while waiting.\",\"query\":\"rust\"}",
+				},
+			},
 		];
 		const start = turnStartedEntry("start", 1, 1);
 		const user = userEntryWithParent("user", "start", "test it");
@@ -1037,6 +1092,8 @@ describe("MessageList tool use cards", () => {
 		expect(html).toContain("Run the web test suite.");
 		expect(html).not.toContain("Bash: Run the web test suite.");
 		expect(html).not.toContain("Bash: npm test");
+		expect(html).toContain('<span class="tool-run-item-title">WebSearch</span>');
+		expect(html).not.toContain("Search while waiting.");
 		expect(html).toContain("running");
 	});
 });

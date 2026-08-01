@@ -457,12 +457,12 @@ Success closes the dialog, then session/tool/inventory refresh is best effort;
 conflicts reseed the open picker. Existing children retain their own MCP set;
 future children inherit the updated parent.
 
-Pending and transcript cards for pi-relay-owned tools use `call_description`
-as their visible title when present. Historical calls without it keep the
-existing command/path-derived fallback. MCP tools keep the existing summary
-because a server-owned operational argument may coincidentally be named
-`call_description`. Operational arguments and edit previews remain available
-in the detail view.
+Pending and transcript cards for canonical `Bash` use `call_description` as
+their visible title when present. Historical Bash calls without it keep the
+existing command-derived fallback. Edit, web, delegation, unknown, and MCP
+tools keep their existing fallback summaries even when an operational argument
+is named `call_description`. Operational arguments and edit previews remain
+available in the detail view.
 
 ### Queue pane
 

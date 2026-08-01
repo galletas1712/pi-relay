@@ -2725,19 +2725,10 @@ fn response_tool_call_item(call: &ToolCall) -> Value {
             .args_value()
             .ok()
             .and_then(|value| {
-                let input = value.get("input")?.as_str()?;
-                Some(
-                    match value
-                        .get(agent_tools::CALL_DESCRIPTION_KEY)
-                        .and_then(Value::as_str)
-                    {
-                        Some(description) => format!(
-                            "{}: {description}\n{input}",
-                            agent_tools::CALL_DESCRIPTION_KEY
-                        ),
-                        None => input.to_string(),
-                    },
-                )
+                value
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
             })
             .unwrap_or_else(|| call.args_json.clone());
         json!({
@@ -3283,16 +3274,10 @@ fn parse_response_output_item(
                 .get("input")
                 .and_then(Value::as_str)
                 .expect("custom_tool_call input validated");
-            let args_json = if name == "apply_patch" {
-                agent_tools::normalize_apply_patch_input(input)
-                    .map_err(|error| ProviderError::Provider(error.to_string()))?
-            } else {
-                json!({ "input": input }).to_string()
-            };
             items.push(AssistantItem::ToolCall(ToolCall {
                 id: ToolCallId::new(call_id),
                 tool_name: crate::canonical_tool_name_for_provider(provider, name).to_string(),
-                args_json,
+                args_json: json!({ "input": input }).to_string(),
             }));
         }
         OpenAiOrdinaryItemClass::AgentMessage => {
@@ -4629,7 +4614,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
 
     #[test]
     fn responses_sse_parses_custom_and_function_calls() {
-        let sse = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"call_description: Inspect the patch parser.\n*** Begin Patch\n*** End Patch\n"}}
+        let sse = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}
 
 data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_bash","name":"Bash","arguments":"{\"command\":\"pwd\",\"timeout_ms\":120000}","status":"completed"}}
 
@@ -4644,10 +4629,6 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
         assert_eq!(
             calls[0].args_value().unwrap()["input"],
             "*** Begin Patch\n*** End Patch\n"
-        );
-        assert_eq!(
-            calls[0].args_value().unwrap()["call_description"],
-            "Inspect the patch parser."
         );
         assert_eq!(calls[1].tool_name, "Bash");
         assert_eq!(calls[1].args_value().unwrap()["command"], "pwd");
@@ -4869,7 +4850,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
                 "type": "custom_tool_call",
                 "call_id": "call_2",
                 "name": "apply_patch",
-                "input": "call_description: Apply the requested patch.\n*** Begin Patch\n*** End Patch\n",
+                "input": "*** Begin Patch\n*** End Patch\n",
             }),
             json!({
                 "type": "reasoning",
@@ -6101,7 +6082,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     }
 
     #[test]
-    fn responses_input_rebuilds_new_and_historical_custom_patch_calls() {
+    fn responses_input_rebuilds_raw_custom_patch_calls() {
         let render = |args_json: String| {
             transcript_to_response_items(
                 &PromptSections::default(),
@@ -6119,25 +6100,13 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
             .expect("replay-less custom call renders")
         };
 
-        let new_call = render(
-            json!({
-                agent_tools::CALL_DESCRIPTION_KEY: "Apply the requested patch.",
-                "input": "*** Begin Patch\n*** End Patch\n",
-            })
-            .to_string(),
-        );
-        assert_eq!(
-            new_call[0]["input"],
-            "call_description: Apply the requested patch.\n*** Begin Patch\n*** End Patch\n"
-        );
-
-        let historical = render(
+        let rendered = render(
             json!({
                 "input": "*** Begin Patch\n*** End Patch\n",
             })
             .to_string(),
         );
-        assert_eq!(historical[0]["input"], "*** Begin Patch\n*** End Patch\n");
+        assert_eq!(rendered[0]["input"], "*** Begin Patch\n*** End Patch\n");
     }
 
     #[test]

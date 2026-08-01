@@ -2737,8 +2737,6 @@ fn anthropic_stop_details(value: Option<&Value>) -> ProviderResult<Option<ModelS
 
 fn canonical_anthropic_tool_name(name: &str) -> &str {
     match name {
-        // Anthropic currently accepts `name: "Edit"` in the request but still
-        // returns its trained native text-editor name in tool_use blocks.
         "str_replace_based_edit_tool" => "Edit",
         // Server tools keep provider-native wire names in the actual Messages
         // request/replay, but pi-relay display and PI.md capabilities use the
@@ -5373,7 +5371,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_body_renders_anthropic_client_coding_tools() {
+    fn messages_body_renders_anthropic_native_coding_tools() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
@@ -5405,12 +5403,8 @@ mod tests {
         assert!(body["tools"][6].get("type").is_none());
         assert_eq!(body["tools"][7]["name"], "steer_subagent");
         assert!(body["tools"][7].get("type").is_none());
-        assert!(body["tools"][8].get("type").is_none());
+        assert_eq!(body["tools"][8]["type"], "text_editor_20250728");
         assert_eq!(body["tools"][8]["name"], "str_replace_based_edit_tool");
-        assert_eq!(
-            body["tools"][8]["input_schema"]["properties"]["call_description"]["type"],
-            "string"
-        );
         assert_eq!(body["tools"][9]["name"], "web_fetch");
         assert!(body["tools"][9].get("type").is_none());
         assert_eq!(body["tools"][10]["name"], "web_search");

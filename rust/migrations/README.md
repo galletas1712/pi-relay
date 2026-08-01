@@ -49,3 +49,33 @@ window in which a stale partial is replayed into a parent transcript.
 
 After deployment is verified, delete these one-time artifacts in a follow-up
 commit.
+
+## Bash-only call-description cleanup
+
+`bash-only-call-descriptions.sql` is a separate one-time cleanup for sessions
+written by PR #330. It removes the relay-owned `call_description` field from
+non-Bash canonical tool-call arguments in transcript entries, queued daemon
+observations, tool actions, and persisted event payloads. It also removes the
+old OpenAI `apply_patch` description header and non-Bash descriptions from
+provider-replay records. Canonical Bash arguments, MCP arguments, unknown tool
+arguments, and operational results are preserved.
+
+Run it only after taking a `pg_dump` and stopping the daemon:
+
+```sh
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f rust/migrations/bash-only-call-descriptions.sql
+```
+
+The script takes table locks, performs all updates in one transaction, and is
+safe to rerun. For each session with an actual changed row, it bumps
+`session_revision` once for each changed category. Transcript/provider-replay
+changes also bump `transcript_revision`; queued-input content changes also
+bump `queue_revision`; action/event payload changes and system-prompt changes
+only bump `session_revision`. Action and event changes share one category, so a
+session with both is bumped once for that category. The revision flags are
+collected from `UPDATE ... RETURNING` rows, so unchanged rows and unrelated
+sessions are not bumped, and rerunning the script does not bump anything again.
+Do not remove containers, volumes, databases, or workspace roots. Deploy the
+Bash-only code after the script succeeds, verify the affected sessions, and
+then delete this one-time artifact in a follow-up commit.

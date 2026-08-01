@@ -31,7 +31,7 @@ You may use the following tools to help you accomplish your tasks:
 ### Guidelines
 
 - Prefer purpose-built tools over ad hoc shell commands: use `{{ tools.aliases.edit | default(value="Edit") }}` to edit files rather than `{{ tools.aliases.shell | default(value="Bash") }}` commands.
-- Every pi-relay-owned tool call must include `call_description`: one short, single-line sentence explaining that exact invocation. Externally defined MCP tools retain their server-owned contracts and are excluded for now.
+- Canonical `Bash` tool calls must include `call_description`: one short, single-line sentence explaining that exact invocation. Other first-party tools and MCP tools keep their own argument contracts.
 
 {% if mcp.servers_markdown %}
 ### MCP

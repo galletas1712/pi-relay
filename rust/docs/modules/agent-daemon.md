@@ -228,14 +228,14 @@ session cwd; artifact file fields are relative to that directory.
 Tool actions are dispatched immediately. `spawn_claimed_dispatch` runs `run_tool_turn` in a registered background task: it marks the action running, ensures the workspace, executes the tool, feeds the `ToolResultMessage` back into the live session, drains, and re-drives. Runtime/local tools such as `LoadSkill`, the web tools (`web_search`/`web_fetch`), and delegation tools are handled in-daemon; provider-executed registry tools route through the `ToolRegistry` keyed by provider kind as appropriate. There is no approval interface — tools execute automatically.
 
 New main-agent model responses are admitted before their assistant message can
-become transcript/action state: each normalized pi-relay-owned tool call must
-carry a valid `call_description`. Historical transcript and recovered pending
-actions bypass this prospective gate. The session's frozen MCP name set is used
-only to exempt externally defined MCP calls; their server-owned arguments are
-not validated or rewritten by this policy. `run_tool_turn` clones first-party
-calls and removes the reserved field before every daemon-handled, runtime, or
-local dispatch, while MCP calls pass through unchanged. The original full
-first-party arguments remain available to events and the web UI.
+become transcript/action state: only canonical `Bash` calls must carry a valid
+`call_description` (object input, string value, nonblank, single-line, trimmed).
+Historical transcript and recovered pending actions bypass this prospective
+gate. Other first-party tools, unknown tools, and MCP calls are left to their
+own argument deserializers or server contracts. `run_tool_turn` removes the
+reserved field only from a cloned `Bash` execution payload; all other
+arguments pass through unchanged. The original Bash arguments remain available
+to events and the web UI.
 
 ### Model dispatch, retries, and auth recovery
 

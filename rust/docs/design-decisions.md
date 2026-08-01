@@ -483,12 +483,11 @@ choice.
 
 ### Provider Tool Surfaces Diverge Only When Semantics Justify It
 
-Every main-agent pi-relay-owned client tool declaration is decorated during
+Only the canonical `Bash` client-tool declaration is decorated during
 first-party registry construction with a required `call_description`: a
 trimmed, nonempty, single-line string describing that exact invocation.
-Registry tools are therefore final for requests, prompts, accounting,
-compaction, and inspection. New provider responses are admitted before
-persistence; execution strips the reserved field from a clone.
+New provider responses are admitted before persistence; execution strips the
+reserved field only from a cloned Bash payload.
 Historical transcript and recovered pending calls bypass prospective admission.
 
 Coding tools split into two posture buckets:
@@ -503,12 +502,10 @@ Coding tools split into two posture buckets:
   back, which is worse than losing the small training prior associated with
   the native tool name.
 - **Provider-shaped** for the edit tools: OpenAI's `apply_patch` remains a
-  custom Lark tool so patches escape the JSON-string ghetto; its grammar
-  requires a `call_description:` header before the raw patch. Anthropic sees a
-  normal client JSON tool named `str_replace_based_edit_tool`, using the
-  existing `view`/`create`/`str_replace`/`insert` schema plus
-  `call_description`, because the provider-native editor declaration cannot
-  carry the reserved field.
+  custom Lark tool so patches escape the JSON-string ghetto. Anthropic sees
+  the native `text_editor_20250728` declaration named
+  `str_replace_based_edit_tool`, using the existing
+  `view`/`create`/`str_replace`/`insert` schema.
 - **Local JSON wrappers** for `web_search` and `web_fetch`. The main model turn
   always sees ordinary client-executed tools, which keeps transcript replay and
   token accounting on one surface. The tool runtime can still delegate to a
@@ -520,11 +517,11 @@ prompt context and uses `&&` chaining or inline `cd` for subdirectory work.
 Any future persistent-shell runtime would add session-level cwd state
 underneath the same model-visible schema, not above it.
 
-MCP server contracts are excluded from relay call descriptions for now.
+MCP server contracts are not part of the relay call-description contract.
 Provider declarations, schemas, persisted manifests, fingerprints, inspection
 shapes, token estimates, and arguments stay canonical and unchanged. Admission
-uses the frozen snapshot's names only to exempt MCP calls from the first-party
-policy, and dispatch passes their arguments through exactly as supplied.
+does not inspect MCP names, and dispatch passes their arguments through exactly
+as supplied.
 
 ### `agent-core` Stays The FSM
 
