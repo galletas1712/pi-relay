@@ -264,8 +264,6 @@ pub(super) struct SkillFrontmatter {
     pub(super) name: String,
     pub(super) description: String,
     #[serde(default)]
-    pub(super) kind: Option<String>,
-    #[serde(default)]
     pub(super) model: Option<String>,
     #[serde(default)]
     pub(super) reasoning_effort: Option<String>,

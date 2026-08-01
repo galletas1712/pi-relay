@@ -192,30 +192,40 @@ fn role_provider_from_frontmatter(
     parsed: &ParsedSkillFile,
     skill_path: &Path,
 ) -> Result<Option<ProviderConfig>> {
-    let kind = parsed.frontmatter.kind.as_deref();
     let model = parsed.frontmatter.model.as_deref();
-    let (Some(kind), Some(model)) = (kind, model) else {
-        if kind.is_some()
-            || model.is_some()
-            || parsed.frontmatter.reasoning_effort.is_some()
-            || parsed.frontmatter.max_tokens.is_some()
+    let Some(model) = model else {
+        if parsed.frontmatter.reasoning_effort.is_some() || parsed.frontmatter.max_tokens.is_some()
         {
             return Err(anyhow!(
-                "role skill {} model policy requires both kind and model",
+                "role skill {} model policy requires model: provider:model",
                 skill_path.display()
             ));
         }
         return Ok(None);
     };
-    if model.trim().is_empty() {
+    let (provider_name, native_model) = model.split_once(':').ok_or_else(|| {
+        anyhow!(
+            "role skill {} has malformed model `{model}`; expected provider:model",
+            skill_path.display()
+        )
+    })?;
+    if model.trim() != model
+        || provider_name.trim() != provider_name
+        || native_model.trim() != native_model
+        || provider_name.is_empty()
+        || native_model.is_empty()
+        || provider_name.trim().is_empty()
+        || native_model.trim().is_empty()
+        || native_model.contains(':')
+    {
         return Err(anyhow!(
-            "role skill {} model must not be blank",
+            "role skill {} has malformed model `{model}`; expected provider:model",
             skill_path.display()
         ));
     }
-    let kind = kind.parse::<ProviderKind>().map_err(|error| {
+    let kind = provider_name.parse::<ProviderKind>().map_err(|error| {
         anyhow!(
-            "role skill {} has invalid provider kind: {error}",
+            "role skill {} has unsupported provider prefix `{provider_name}`: {error}",
             skill_path.display()
         )
     })?;
@@ -233,7 +243,7 @@ fn role_provider_from_frontmatter(
         })?;
     Ok(Some(ProviderConfig {
         kind,
-        model: model.to_string(),
+        model: native_model.to_string(),
         reasoning_effort,
         max_tokens: parsed.frontmatter.max_tokens,
         prompt_cache: None,
@@ -341,7 +351,7 @@ mod tests {
             SkillOrigin::RuntimeRole,
             None,
             "reviewer",
-            "kind: claude\nmodel: claude-opus-4-8\nreasoning_effort: high\nmax_tokens: 4096\nskills:\n  - swe\n",
+            "model: claude:claude-opus-4-8\nreasoning_effort: high\nmax_tokens: 4096\nskills:\n  - swe\n",
         );
 
         let resolved = resolve_skill_role(&[role, global.clone()], "reviewer").expect("role");
@@ -409,6 +419,46 @@ mod tests {
         );
 
         assert!(resolved_role_catalog(&[invalid]).is_empty());
+    }
+
+    #[test]
+    fn role_rejects_malformed_or_unsupported_composite_model() {
+        for (model, expected) in [
+            ("claude-opus-4-8", "expected provider:model"),
+            (":claude-opus-4-8", "expected provider:model"),
+            ("claude:   ", "expected provider:model"),
+            (" claude:claude-opus-4-8", "expected provider:model"),
+            ("claude: claude-opus-4-8", "expected provider:model"),
+            ("claude:claude-opus-4-8 ", "expected provider:model"),
+            ("claude::claude-opus-4-8", "expected provider:model"),
+            ("bogus:some-model", "unsupported provider prefix"),
+        ] {
+            let role = raw_skill(
+                SkillKind::SubagentRole,
+                SkillOrigin::RuntimeRole,
+                None,
+                "reviewer",
+                &format!("model: \"{model}\"\n"),
+            );
+            let error = resolve_skill_role(&[role], "reviewer").expect_err("must reject");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn role_ignores_unsupported_kind_frontmatter() {
+        let role = raw_skill(
+            SkillKind::SubagentRole,
+            SkillOrigin::RuntimeRole,
+            None,
+            "reviewer",
+            "kind: claude\nmodel: claude:claude-opus-4-8\n",
+        );
+
+        let resolved = resolve_skill_role(&[role], "reviewer").expect("role");
+        let provider = resolved.provider.expect("provider");
+        assert_eq!(provider.kind, ProviderKind::Claude);
+        assert_eq!(provider.model, "claude-opus-4-8");
     }
 
     fn raw_skill(

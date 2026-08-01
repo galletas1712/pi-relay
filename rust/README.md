@@ -267,8 +267,7 @@ A role-local provider policy and global skill preloads use frontmatter:
 ---
 name: reviewer
 description: Review artifacts and handoffs against the objective.
-kind: claude
-model: claude-opus-4-8
+model: claude:claude-opus-4-8
 reasoning_effort: high
 skills:
   - swe
@@ -276,9 +275,10 @@ skills:
 ```
 
 Each immediate role directory must contain a valid `SKILL.md` whose frontmatter
-name exactly matches the directory name. `kind` and `model` must appear
-together; `reasoning_effort` and `max_tokens` are optional, and `max_tokens` is
-ignored for `kind: openai` roles for the same reason as in daemon config. `skills` may name
+name exactly matches the directory name. A provider policy uses one canonical
+`model: provider:model` field (for example `model: openai:gpt-5.6-sol`);
+`reasoning_effort` and `max_tokens` are optional, and `max_tokens` is ignored
+for OpenAI roles for the same reason as in daemon config. `skills` may name
 only global packages from `$HOME/.agents/skills`; project and workflow packages
 cannot be role preloads. A child uses an explicit spawn override, then its role
 provider, then the parent provider. An unavailable role provider retains the
