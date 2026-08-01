@@ -27,29 +27,16 @@ pub(crate) async fn run_model(
     config: &SessionConfig,
     session_id: &str,
     request: ModelRequest,
-    snapshot: &McpSessionSnapshot,
 ) -> Result<ModelResponse> {
     #[cfg(test)]
     if let Some(result) = injected_model_result(config, session_id) {
-        return result.and_then(|response| admit_model_response(response, snapshot));
+        return result.and_then(admit_model_response);
     }
-    admit_model_response(
-        complete_model_request(state, config, session_id, request).await?,
-        snapshot,
-    )
+    admit_model_response(complete_model_request(state, config, session_id, request).await?)
 }
 
-fn admit_model_response(
-    mut response: ModelResponse,
-    snapshot: &McpSessionSnapshot,
-) -> Result<ModelResponse> {
-    let mcp_tool_names = snapshot
-        .manifest()
-        .tools
-        .iter()
-        .map(|tool| tool.exposed_name.clone())
-        .collect();
-    admit_new_tool_calls(&mut response.assistant, &mcp_tool_names).map_err(|error| {
+fn admit_model_response(mut response: ModelResponse) -> Result<ModelResponse> {
+    admit_new_tool_calls(&mut response.assistant).map_err(|error| {
         anyhow::Error::new(agent_provider::ProviderError::Provider(format!(
             "invalid model tool call: {error}"
         )))

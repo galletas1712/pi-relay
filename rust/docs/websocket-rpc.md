@@ -2030,11 +2030,11 @@ context. Inventory refreshes never overwrite a session automatically.
 
 Requires a `provider` parameter (`"openai"` or `"claude"`) and returns the
 model-visible tool definitions for that provider, because the tool surface is
-provider-shaped (OpenAI custom `apply_patch` vs Anthropic JSON
-`str_replace_based_edit_tool` for editing). Every returned first-party
-model-facing input schema includes required `call_description`; OpenAI's
-freeform patch schema expresses it as a required grammar header. Selected MCP
-schemas retain their exact server-owned shapes and are excluded for now.
+provider-shaped (OpenAI custom `apply_patch` vs Anthropic native
+`text_editor_20250728` for editing). Only the canonical `Bash` model-facing
+input schema includes required
+`call_description`; the OpenAI freeform patch schema remains its raw grammar.
+Selected MCP schemas retain their exact server-owned shapes.
 Callers may pass `session_id` so the daemon can derive the actual
 session profile; if omitted, parent/global behavior is preserved. Parent/default
 sessions see the registered builtins (`edit`, `bash`, `web_search`, `web_fetch`,

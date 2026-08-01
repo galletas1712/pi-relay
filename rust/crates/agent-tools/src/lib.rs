@@ -9,8 +9,7 @@ mod registry;
 mod tools;
 
 pub use call_description::{
-    admit_new_tool_calls, normalize_apply_patch_input, tool_call_for_execution,
-    CallDescriptionError, CALL_DESCRIPTION_KEY,
+    admit_new_tool_calls, bash_call_for_execution, CallDescriptionError, CALL_DESCRIPTION_KEY,
 };
 pub use context::ToolContext;
 pub use display::{tool_display, ToolDisplayInput};

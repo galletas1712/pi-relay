@@ -21,10 +21,12 @@ snapshot isolation only; remote tools may still mutate external systems.
 - Map each canonical tool to one provider-facing form per `ProviderKind`
   (a `ProviderTool`: model-visible name, schema, and the exact JSON sent on the
   wire).
-- Decorate canonical first-party declarations with the final model-visible
-  `call_description` contract during registry construction.
-- Validate and normalize new model tool calls, and strip model-only metadata
-  from an execution clone.
+- Add the final model-visible `call_description` contract only to canonical
+  `Bash` during registry construction.
+- Validate and normalize new canonical `Bash` calls, and strip its model-only
+  metadata from an execution clone.
+- Leave other first-party and MCP arguments unchanged for their own
+  deserializers or server contracts.
 - Canonicalize provider wire names back to internal names for execution.
 - Carry the per-call `ToolContext` (session cwd + timeout).
 - Bound tool output with a character-budget approximation before it re-enters
@@ -55,11 +57,10 @@ snapshot isolation only; remote tools may still mutate external systems.
 - `tool_display` — replay-display labels (pretty name + a one-line input
   summary) for transcript rendering.
 - `limit_tool_output*` — output bounding (see Notes).
-- `admit_new_tool_calls` / `tool_call_for_execution` — enforce the
-  trimmed, nonblank, single-line description only on newly returned non-MCP
-  main-agent calls, then remove it from a cloned first-party dispatch payload.
-  Frozen MCP names are used only as an exemption set, and MCP declarations and
-  arguments remain server-owned and unchanged.
+- `admit_new_tool_calls` / `bash_call_for_execution` — enforce the trimmed,
+  nonblank, single-line description only on newly returned canonical `Bash`
+  calls, then remove it from a cloned Bash dispatch payload. Other first-party
+  and MCP declarations and arguments remain unchanged.
 
 ## Registered tools
 
@@ -73,7 +74,7 @@ semantics justify it.
 
 | Canonical    | OpenAI form                               | Anthropic form                                  | prompt_alias       | Executor                         |
 |--------------|-------------------------------------------|-------------------------------------------------|--------------------|----------------------------------|
-| `Edit`       | `apply_patch` (custom Lark grammar)       | `str_replace_based_edit_tool` (JSON client tool) | `edit`      | `ApplyPatchTool` / `TextEditorTool` |
+| `Edit`       | `apply_patch` (custom Lark grammar)       | `str_replace_based_edit_tool` (`text_editor_20250728`) | `edit`      | `ApplyPatchTool` / `TextEditorTool` |
 | `Bash`       | `Bash` (JSON function)                    | `Bash` (JSON client tool)                       | `shell`            | `BashTool`                       |
 | `WebSearch`  | `web_search` (JSON function)              | `web_search` (JSON client tool)                 | `web_search`       | `WebSearchTool`                  |
 | `WebFetch`   | `web_fetch` (JSON function)               | `web_fetch` (JSON client tool)                  | `web_fetch`        | `WebFetchTool`                   |
@@ -85,29 +86,26 @@ semantics justify it.
 | `steer_subagent` | `steer_subagent` (JSON function) | `steer_subagent` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 | `interrupt_subagent` | `interrupt_subagent` (JSON function) | `interrupt_subagent` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 
-`FirstPartyToolExtension` decorates JSON definitions once in
-`register_runtime_tool` / `register_uniform`; `register_edit` constructs the
-provider-shaped final declarations directly. Other registry extensions,
-including MCP, are not decorated. There are no `read`/`write` tools.
+`FirstPartyToolExtension` decorates the canonical `Bash` JSON definition once
+in `register_bash`; all other first-party declarations retain their native
+schemas. Other registry extensions, including MCP, are not decorated. There
+are no `read`/`write` tools.
 
 ### edit — provider-shaped
 
 The only tool where the two providers see structurally different schemas,
 while retaining the existing operation names and execution semantics.
 
-- **OpenAI** — `apply_patch`, an OpenAI `custom` tool whose input is a Lark
-  grammar based on `APPLY_PATCH_LARK_GRAMMAR`. The model emits a required
-  `call_description: ...` header followed by the raw
-  `*** Begin Patch … *** End Patch` body (`LocalFreeformText`), so large diffs
-  escape JSON-string quoting. Admission stores both the description and raw
-  patch as JSON while replay keeps the custom provider item.
+- **OpenAI** — `apply_patch`, an OpenAI `custom` tool whose input is the raw
+  Lark grammar based on `APPLY_PATCH_LARK_GRAMMAR`, so large diffs escape
+  JSON-string quoting (`LocalFreeformText`).
   `ApplyPatchTool` parses the patch in-process — Add / Delete / Update (with
   optional `*** Move to:`) — applies hunks by exact-substring match against file
   contents, and returns a compact `A`/`D`/`M`/`R` change summary. No external
   `apply_patch` binary is spawned; a missing file or unmatched hunk is an error
   `ToolResult`.
-- **Anthropic** — `str_replace_based_edit_tool` is a normal client JSON tool.
-  It uses the existing editor operation schema plus `call_description`.
+- **Anthropic** — `str_replace_based_edit_tool` uses Anthropic's native
+  `text_editor_20250728` declaration and the existing editor operation schema.
   `TextEditorTool` implements `view` (file or directory listing, optional
   `view_range`), `create`, `str_replace` (first occurrence; missing target is
   `EditTargetNotFound`), and `insert`. `undo_edit` is not offered.

@@ -1,7 +1,5 @@
-use std::collections::BTreeSet;
-
 use agent_vocab::{AssistantItem, AssistantMessage, ToolCall};
-use serde_json::{json, Value};
+use serde_json::Value;
 use thiserror::Error;
 
 pub const CALL_DESCRIPTION_KEY: &str = "call_description";
@@ -24,24 +22,18 @@ pub enum CallDescriptionError {
         call_id: String,
         message: String,
     },
-    #[error(
-        "apply_patch output must begin with `call_description: ` followed by one short sentence"
-    )]
-    MissingPatchHeader,
 }
 
 /// Validate calls from one newly returned main-agent response.
 ///
-/// MCP calls are exempt by their frozen snapshot names and remain untouched.
-pub fn admit_new_tool_calls(
-    assistant: &mut AssistantMessage,
-    mcp_tool_names: &BTreeSet<String>,
-) -> Result<(), CallDescriptionError> {
+/// Only the canonical `Bash` tool has a relay-owned call-description contract.
+/// Every other tool's argument validation belongs to that tool's deserializer.
+pub fn admit_new_tool_calls(assistant: &mut AssistantMessage) -> Result<(), CallDescriptionError> {
     for item in &mut assistant.items {
         let AssistantItem::ToolCall(call) = item else {
             continue;
         };
-        if mcp_tool_names.contains(&call.tool_name) {
+        if call.tool_name != "Bash" {
             continue;
         }
         let mut arguments: Value = serde_json::from_str(&call.args_json).map_err(|error| {
@@ -100,27 +92,14 @@ fn validate_description<'a>(
     Ok(description)
 }
 
-/// Parse a new OpenAI apply_patch custom call into the persisted JSON shape.
-pub fn normalize_apply_patch_input(input: &str) -> Result<String, CallDescriptionError> {
-    let (header, patch) = input
-        .split_once('\n')
-        .ok_or(CallDescriptionError::MissingPatchHeader)?;
-    let description = header
-        .strip_prefix(&format!("{CALL_DESCRIPTION_KEY}: "))
-        .ok_or(CallDescriptionError::MissingPatchHeader)?;
-    let description = validate_description("Edit", "custom", description)?;
-    Ok(json!({
-        CALL_DESCRIPTION_KEY: description,
-        "input": patch,
-    })
-    .to_string())
-}
-
-/// Clone a persisted first-party call and remove model-only metadata.
+/// Clone a persisted Bash call and remove its model-only metadata.
 ///
 /// Missing metadata is deliberately a no-op so historical and recovered calls
 /// execute without passing through new-response admission.
-pub fn tool_call_for_execution(call: &ToolCall) -> ToolCall {
+pub fn bash_call_for_execution(call: &ToolCall) -> ToolCall {
+    if call.tool_name != "Bash" {
+        return call.clone();
+    }
     let Ok(Value::Object(mut arguments)) = serde_json::from_str(&call.args_json) else {
         return call.clone();
     };
@@ -135,6 +114,7 @@ pub fn tool_call_for_execution(call: &ToolCall) -> ToolCall {
 #[cfg(test)]
 mod tests {
     use agent_vocab::ToolCallId;
+    use serde_json::json;
 
     use super::*;
 
@@ -153,9 +133,9 @@ mod tests {
     }
 
     #[test]
-    fn admission_trims_valid_descriptions() {
+    fn admission_trims_valid_bash_descriptions() {
         let mut assistant = call(json!("  Check the workspace state.  "));
-        admit_new_tool_calls(&mut assistant, &BTreeSet::new()).expect("description is valid");
+        admit_new_tool_calls(&mut assistant).expect("description is valid");
         let AssistantItem::ToolCall(call) = &assistant.items[0] else {
             panic!("expected tool call");
         };
@@ -170,8 +150,7 @@ mod tests {
         for character in ["x", "🦀"] {
             let description = format!("  {}  ", character.repeat(161));
             let mut assistant = call(json!(description));
-            admit_new_tool_calls(&mut assistant, &BTreeSet::new())
-                .expect("any-length description is valid");
+            admit_new_tool_calls(&mut assistant).expect("any-length description is valid");
             let AssistantItem::ToolCall(call) = &assistant.items[0] else {
                 panic!("expected tool call");
             };
@@ -193,8 +172,7 @@ mod tests {
             (json!("first\nsecond"), "must be a single line"),
             (json!(42), "must be a string"),
         ] {
-            let error = admit_new_tool_calls(&mut call(description), &BTreeSet::new())
-                .expect_err("must reject");
+            let error = admit_new_tool_calls(&mut call(description)).expect_err("must reject");
             assert!(error.to_string().contains(expected), "{error}");
         }
         let mut missing = call(json!("valid"));
@@ -203,45 +181,81 @@ mod tests {
         };
         call.args_json = json!({ "command": "true" }).to_string();
         assert!(matches!(
-            admit_new_tool_calls(&mut missing, &BTreeSet::new()),
+            admit_new_tool_calls(&mut missing),
             Err(CallDescriptionError::Missing { .. })
         ));
     }
 
     #[test]
-    fn mixed_admission_preserves_mcp_arguments_and_checks_first_party_calls() {
-        let mcp_name = "mcp__fixture__operation";
-        let original_args = json!({
-            CALL_DESCRIPTION_KEY: null,
+    fn admission_rejects_non_object_bash_arguments() {
+        let mut assistant = AssistantMessage {
+            items: vec![AssistantItem::ToolCall(ToolCall {
+                id: ToolCallId::new("call_string"),
+                tool_name: "Bash".to_string(),
+                args_json: json!("not an object").to_string(),
+            })],
+        };
+        assert!(matches!(
+            admit_new_tool_calls(&mut assistant),
+            Err(CallDescriptionError::ArgumentsNotObject { .. })
+        ));
+    }
+
+    #[test]
+    fn admission_rejects_malformed_bash_json() {
+        let mut assistant = AssistantMessage {
+            items: vec![AssistantItem::ToolCall(ToolCall {
+                id: ToolCallId::new("call_invalid_json"),
+                tool_name: "Bash".to_string(),
+                args_json: "{".to_string(),
+            })],
+        };
+        assert!(matches!(
+            admit_new_tool_calls(&mut assistant),
+            Err(CallDescriptionError::InvalidJson { .. })
+        ));
+    }
+
+    #[test]
+    fn admission_leaves_non_bash_calls_unchanged() {
+        let edit_args = json!({ "input": "patch" }).to_string();
+        let mcp_args = json!({
+            CALL_DESCRIPTION_KEY: "server operation mode",
             "value": 7,
         })
         .to_string();
         let mut assistant = AssistantMessage {
             items: vec![
                 AssistantItem::ToolCall(ToolCall {
-                    id: ToolCallId::new("call_mcp"),
-                    tool_name: mcp_name.to_string(),
-                    args_json: original_args.clone(),
+                    id: ToolCallId::new("call_edit"),
+                    tool_name: "Edit".to_string(),
+                    args_json: edit_args.clone(),
                 }),
                 AssistantItem::ToolCall(ToolCall {
-                    id: ToolCallId::new("call_first_party"),
-                    tool_name: "Bash".to_string(),
-                    args_json: json!({ "command": "true" }).to_string(),
+                    id: ToolCallId::new("call_mcp"),
+                    tool_name: "mcp__fixture__operation".to_string(),
+                    args_json: mcp_args.clone(),
+                }),
+                AssistantItem::ToolCall(ToolCall {
+                    id: ToolCallId::new("call_unknown"),
+                    tool_name: "future_tool".to_string(),
+                    args_json: "not json".to_string(),
                 }),
             ],
         };
-        assert!(matches!(
-            admit_new_tool_calls(&mut assistant, &BTreeSet::from([mcp_name.to_string()])),
-            Err(CallDescriptionError::Missing { .. })
-        ));
-        let AssistantItem::ToolCall(call) = &assistant.items[0] else {
-            unreachable!()
+        admit_new_tool_calls(&mut assistant).expect("non-Bash calls are outside admission");
+        let [AssistantItem::ToolCall(edit), AssistantItem::ToolCall(mcp), AssistantItem::ToolCall(unknown)] =
+            assistant.items.as_slice()
+        else {
+            panic!("expected three tool calls");
         };
-        assert_eq!(call.args_json, original_args);
+        assert_eq!(edit.args_json, edit_args);
+        assert_eq!(mcp.args_json, mcp_args);
+        assert_eq!(unknown.args_json, "not json");
     }
 
     #[test]
-    fn execution_removes_reserved_metadata_but_accepts_historical_calls() {
+    fn execution_removes_metadata_only_from_bash() {
         let call = ToolCall {
             id: ToolCallId::new("call_1"),
             tool_name: "Bash".to_string(),
@@ -252,48 +266,26 @@ mod tests {
             .to_string(),
         };
         assert_eq!(
-            tool_call_for_execution(&call)
+            bash_call_for_execution(&call)
                 .args_value()
                 .expect("arguments parse"),
             json!({ "command": "true" })
         );
         let historical = ToolCall {
             args_json: json!({ "command": "true" }).to_string(),
+            ..call.clone()
+        };
+        assert_eq!(bash_call_for_execution(&historical), historical);
+
+        let non_bash = ToolCall {
+            tool_name: "Edit".to_string(),
+            args_json: json!({
+                CALL_DESCRIPTION_KEY: "an operational argument",
+                "input": "patch",
+            })
+            .to_string(),
             ..call
         };
-        assert_eq!(tool_call_for_execution(&historical), historical);
-    }
-
-    #[test]
-    fn patch_header_normalizes_to_description_and_raw_input() {
-        let arguments = normalize_apply_patch_input(
-            "call_description: Add the fixture file.\n*** Begin Patch\n*** End Patch\n",
-        )
-        .expect("patch input normalizes");
-        assert_eq!(
-            serde_json::from_str::<Value>(&arguments).expect("arguments parse"),
-            json!({
-                CALL_DESCRIPTION_KEY: "Add the fixture file.",
-                "input": "*** Begin Patch\n*** End Patch\n",
-            })
-        );
-        assert!(normalize_apply_patch_input("*** Begin Patch\n*** End Patch\n").is_err());
-    }
-
-    #[test]
-    fn patch_header_preserves_any_length_description() {
-        let patch = "*** Begin Patch\n*** End Patch\n";
-        let arguments = normalize_apply_patch_input(&format!(
-            "call_description:   {}  \n{patch}",
-            "🦀".repeat(161)
-        ))
-        .expect("any-length patch description is valid");
-        assert_eq!(
-            serde_json::from_str::<Value>(&arguments).expect("arguments parse"),
-            json!({
-                CALL_DESCRIPTION_KEY: "🦀".repeat(161),
-                "input": patch,
-            })
-        );
+        assert_eq!(bash_call_for_execution(&non_bash), non_bash);
     }
 }
