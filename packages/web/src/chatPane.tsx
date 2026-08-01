@@ -13,6 +13,7 @@ import type {
 import type { ReasoningEffort, SessionSnapshot, TranscriptEntry } from "./types.ts";
 
 export interface ChatPaneProps {
+	headerControls?: ReactNode;
 	session: SessionDisplayInfo | null;
 	snapshot: SessionSnapshot | null;
 	entries: TranscriptEntry[];
@@ -55,6 +56,7 @@ export interface ChatPaneProps {
 }
 
 export const ChatPane = memo(function ChatPane({
+	headerControls,
 	session,
 	snapshot,
 	entries,
@@ -101,6 +103,7 @@ export const ChatPane = memo(function ChatPane({
 		<main className="log-pane" data-slot="agent-log">
 			{routeNotice}
 			<ChatHeader
+				headerControls={headerControls}
 				session={session}
 				snapshot={snapshot}
 				hasRunningDelegations={hasRunningDelegations}
@@ -158,6 +161,7 @@ export function activeLeafIdFromEntries(entries: TranscriptEntry[]): string | nu
 }
 
 interface ChatHeaderProps {
+	headerControls?: ReactNode;
 	session: SessionDisplayInfo | null;
 	snapshot: SessionSnapshot | null;
 	hasRunningDelegations: boolean;
@@ -176,6 +180,7 @@ interface ChatHeaderProps {
 }
 
 const ChatHeader = memo(function ChatHeader({
+	headerControls,
 	session,
 	snapshot,
 	hasRunningDelegations,
@@ -202,6 +207,7 @@ const ChatHeader = memo(function ChatHeader({
 		: [reasoningEffort, ...reasoningEfforts];
 	return (
 		<LogHeader
+			headerControls={headerControls}
 			archived={archived}
 			status={session ? sessionStatusWithDelegations(snapshot?.activity ?? session.activity, hasRunningDelegations) : null}
 			title={session ? sessionTitle(session) : null}

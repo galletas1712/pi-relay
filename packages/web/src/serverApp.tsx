@@ -1,14 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	AlertCircle,
-	LockKeyhole,
 	Pencil,
 	Plus,
 	Server,
 	Settings,
 	Trash2,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { App } from "./App.tsx";
 import { createAgentApi } from "./agentApi.ts";
 import {
@@ -87,9 +86,23 @@ export function ServerApp({
 		!!activeProfile && profileIdFromPath(window.location.pathname) === activeProfile.id;
 	useEffect(() => {
 		return store.subscribe((next) => {
-			if (snapshotRef.current.activeProfileId !== next.activeProfileId) {
+			const previous = snapshotRef.current;
+			const previousActive = previous.profiles.find(
+				(profile) => profile.id === previous.activeProfileId,
+			);
+			const nextActive = next.profiles.find(
+				(profile) => profile.id === next.activeProfileId,
+			);
+			if (
+				previous.activeProfileId !== next.activeProfileId ||
+				previousActive?.url !== nextActive?.url
+			) {
 				const path = next.activeProfileId ? serverRootPath(next.activeProfileId) : "/";
-				if (profileIdFromPath(window.location.pathname) !== next.activeProfileId) {
+				const endpointChanged = previousActive?.url !== nextActive?.url;
+				if (
+					profileIdFromPath(window.location.pathname) !== next.activeProfileId ||
+					(endpointChanged && window.location.pathname !== path)
+				) {
 					try {
 						replaceBrowserPath(path);
 					} catch {
@@ -128,43 +141,19 @@ export function ServerApp({
 
 	return (
 		<div className="server-app">
-			<header className="server-bar">
-				<div className="server-context">
-					<Server aria-hidden />
-					{snapshot.profiles.length > 0 ? (
-						<NativeSelect
-							className="server-context-select"
-							value={snapshot.activeProfileId ?? ""}
-							onChange={(event) => selectProfile(event.target.value)}
-							aria-label="Active control server"
-						>
-							{snapshot.profiles.map((profile) => (
-								<NativeSelectOption key={profile.id} value={profile.id}>
-									{profile.name}
-								</NativeSelectOption>
-							))}
-						</NativeSelect>
-					) : (
-						<span className="server-context-empty">No server configured</span>
-					)}
-				</div>
-				<Button
-					ref={manageButtonRef}
-					type="button"
-					variant="ghost"
-					className="server-manage-button"
-					aria-label="Manage control servers"
-					onClick={() => setManagerMode("browse")}
-				>
-					<Settings data-icon="inline-start" aria-hidden />
-					<span>Manage</span>
-				</Button>
-			</header>
 			{activeProfile && activeRouteOwned ? (
 				<ConnectedServer
-					key={activeProfile.id}
+					key={`${activeProfile.id}:${activeProfile.url}`}
 					profile={activeProfile}
 					entityStorage={store.storageFor(activeProfile.id)}
+					headerControls={
+						<ServerHeaderControls
+							snapshot={snapshot}
+							manageButtonRef={manageButtonRef}
+							onSelect={selectProfile}
+							onManage={() => setManagerMode("browse")}
+						/>
+					}
 				/>
 			) : (
 				<section className="server-setup" aria-labelledby="server-setup-title">
@@ -203,9 +192,11 @@ export function ServerApp({
 function ConnectedServer({
 	profile,
 	entityStorage,
+	headerControls,
 }: {
 	profile: ServerProfile;
 	entityStorage: Storage;
+	headerControls: ReactNode;
 }) {
 	const queryClient = useMemo(() => createQueryClient(), []);
 	const api = useMemo(
@@ -221,9 +212,57 @@ function ConnectedServer({
 	return (
 		<QueryClientProvider client={queryClient}>
 			<TooltipProvider>
-				<App api={api} routeHistory={routeHistory} entityStorage={entityStorage} />
+				<App
+					api={api}
+					routeHistory={routeHistory}
+					entityStorage={entityStorage}
+					headerControls={headerControls}
+				/>
 			</TooltipProvider>
 		</QueryClientProvider>
+	);
+}
+
+function ServerHeaderControls({
+	snapshot,
+	manageButtonRef,
+	onSelect,
+	onManage,
+}: {
+	snapshot: ServerProfileSnapshot;
+	manageButtonRef: RefObject<HTMLButtonElement | null>;
+	onSelect: (id: string) => void;
+	onManage: () => void;
+}) {
+	return (
+		<div className="server-header-controls">
+			<NativeSelect
+				className="header-select server-context-select"
+				size="sm"
+				value={snapshot.activeProfileId ?? ""}
+				onChange={(event) => onSelect(event.target.value)}
+				aria-label="Active control server"
+				title="Control server"
+			>
+				{snapshot.profiles.map((profile) => (
+					<NativeSelectOption key={profile.id} value={profile.id}>
+						{profile.name}
+					</NativeSelectOption>
+				))}
+			</NativeSelect>
+			<Button
+				ref={manageButtonRef}
+				type="button"
+				variant="ghost"
+				size="icon-sm"
+				className="server-manage-button"
+				aria-label="Manage control servers"
+				title="Manage control servers"
+				onClick={onManage}
+			>
+				<Settings aria-hidden />
+			</Button>
+		</div>
 	);
 }
 
@@ -287,7 +326,7 @@ function ServerManagerDialog({
 		if (!draft) return;
 		try {
 			if (draft.id) {
-				store.update(draft.id, draft.name);
+				store.update(draft.id, draft.name, draft.url);
 			} else {
 				store.add(draft.name, draft.url);
 			}
@@ -434,10 +473,7 @@ function ServerManagerDialog({
 								/>
 							</Field>
 							<Field>
-								<FieldLabel htmlFor="server-profile-url">
-									WebSocket URL
-									{draft.id ? <LockKeyhole aria-hidden /> : null}
-								</FieldLabel>
+								<FieldLabel htmlFor="server-profile-url">WebSocket URL</FieldLabel>
 								<Input
 									id="server-profile-url"
 									value={draft.url}
@@ -447,7 +483,6 @@ function ServerManagerDialog({
 									autoCapitalize="none"
 									autoComplete="url"
 									spellCheck={false}
-									readOnly={!!draft.id}
 									required
 								/>
 							</Field>

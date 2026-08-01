@@ -70,12 +70,13 @@ export class ServerProfileStore {
 		return this.changed();
 	}
 
-	update(id: string, name: string): ServerProfileSnapshot {
+	update(id: string, name: string, url: string): ServerProfileSnapshot {
 		const profiles = [...this.profiles];
 		const index = this.profileIndex(id);
 		profiles[index] = {
 			...profiles[index],
 			name: validateProfileName(name),
+			url: validateServerUrl(url),
 		};
 		writeProfiles(this.profileStorage, profiles);
 		this.profiles = profiles;

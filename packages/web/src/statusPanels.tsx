@@ -1,8 +1,14 @@
 import { ArrowUp, Bot, PanelRightOpen } from "lucide-react";
+import type { ReactNode } from "react";
+import {
+	NativeSelect,
+	NativeSelectOption,
+} from "@/components/ui/native-select";
 import type { ReasoningEffort } from "./types.ts";
 import type { SessionStatus } from "./sessionList.ts";
 
 export function LogHeader({
+	headerControls,
 	archived,
 	status,
 	title,
@@ -19,6 +25,7 @@ export function LogHeader({
 	rightOpen,
 	onToggleRight
 }: {
+	headerControls?: ReactNode;
 	archived: boolean;
 	status: SessionStatus | null;
 	title: string | null;
@@ -65,38 +72,41 @@ export function LogHeader({
 				</span>
 			) : null}
 			<div className="log-controls">
-				<label className="header-select" title="Model">
-					<span className="sr-only">Model</span>
-					<select
-						value={modelValue}
-						disabled={modelDisabled}
-						title="Model"
-						aria-label="Model"
-						onChange={(event) => onModelChange(event.target.value)}
-					>
-						{modelOptions.map((option) => (
-							<option key={option.id} value={option.id} title={option.description}>
-								{option.label}
-							</option>
-						))}
-					</select>
-				</label>
-				<label className="header-select compact">
-					<span className="sr-only">Reasoning effort</span>
-					<select
-						value={reasoningEffort}
-						disabled={reasoningDisabled}
-						title="Reasoning effort"
-						aria-label="Reasoning effort"
-						onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
-					>
-						{reasoningEfforts.map((effort) => (
-							<option key={effort} value={effort}>
-								{effort}
-							</option>
-						))}
-					</select>
-				</label>
+				{headerControls}
+				<NativeSelect
+					className="header-select header-model-select"
+					size="sm"
+					value={modelValue}
+					disabled={modelDisabled}
+					title="Model"
+					aria-label="Model"
+					onChange={(event) => onModelChange(event.target.value)}
+				>
+					{modelOptions.map((option) => (
+						<NativeSelectOption
+							key={option.id}
+							value={option.id}
+							title={option.description}
+						>
+							{option.label}
+						</NativeSelectOption>
+					))}
+				</NativeSelect>
+				<NativeSelect
+					className="header-select compact header-effort-select"
+					size="sm"
+					value={reasoningEffort}
+					disabled={reasoningDisabled}
+					title="Reasoning effort"
+					aria-label="Reasoning effort"
+					onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
+				>
+					{reasoningEfforts.map((effort) => (
+						<NativeSelectOption key={effort} value={effort}>
+							{effort}
+						</NativeSelectOption>
+					))}
+				</NativeSelect>
 			</div>
 			{rightOpen ? null : (
 				<button

@@ -3,6 +3,7 @@
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useQueryClient } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentApi } from "./agentApi.ts";
 import { ServerProfileStore } from "./serverProfiles.ts";
@@ -39,7 +40,15 @@ vi.mock("./rpc.ts", async (importOriginal) => {
 vi.mock("./App.tsx", async () => {
 	const React = await import("react");
 	return {
-		App: ({ api, entityStorage }: { api: AgentApi; entityStorage: Storage }) => {
+		App: ({
+			api,
+			entityStorage,
+			headerControls,
+		}: {
+			api: AgentApi;
+			entityStorage: Storage;
+			headerControls?: ReactNode;
+		}) => {
 			const queryClient = useQueryClient();
 			if (!boundary.queryClients.includes(queryClient)) {
 				boundary.queryClients.push(queryClient);
@@ -48,7 +57,12 @@ vi.mock("./App.tsx", async () => {
 				void api.connect();
 				return () => api.close();
 			}, [api]);
-			return <div data-testid="entity-draft">{entityStorage.getItem("draft")}</div>;
+			return (
+				<>
+					<div className="log-controls">{headerControls}</div>
+					<div data-testid="entity-draft">{entityStorage.getItem("draft")}</div>
+				</>
+			);
 		},
 	};
 });
@@ -68,18 +82,20 @@ afterEach(() => {
 	vi.restoreAllMocks();
 });
 
-describe("ServerApp immutable profile boundary", () => {
-	it("keeps persistent chrome to one server context without exposing its URL", () => {
+describe("ServerApp profile boundary", () => {
+	it("places compact server controls in the existing header without exposing its URL", () => {
 		const store = localStore();
 		const { container } = render(<ServerApp store={store} />);
-		const chrome = container.querySelector<HTMLElement>("header.server-bar");
+		const controls = container.querySelector<HTMLElement>(".log-controls");
 
-		expect(chrome).toBeTruthy();
-		expect(within(chrome!).getAllByRole("combobox", { name: "Active control server" }))
+		expect(container.querySelector(".server-bar")).toBeNull();
+		expect(controls).toBeTruthy();
+		expect(within(controls!).getAllByRole("combobox", { name: "Active control server" }))
 			.toHaveLength(1);
-		expect(within(chrome!).getByRole("button", { name: "Manage control servers" }))
+		expect(within(controls!).getByRole("button", { name: "Manage control servers" }))
 			.toBeTruthy();
-		expect(chrome!.textContent).not.toContain("ws://127.0.0.1:8787/");
+		expect(controls!.textContent).not.toContain("Manage");
+		expect(controls!.textContent).not.toContain("ws://127.0.0.1:8787/");
 	});
 
 	it("replaces route, entity storage, query cache, and client when selecting another profile", async () => {
@@ -108,7 +124,7 @@ describe("ServerApp immutable profile boundary", () => {
 		expect(boundary.queryClients[1]).not.toBe(boundary.queryClients[0]);
 	});
 
-	it("keeps the URL read-only while allowing rename without remounting", async () => {
+	it("edits the URL and rebuilds the active server boundary", async () => {
 		const store = localStore();
 		const user = userEvent.setup();
 		render(<ServerApp store={store} />);
@@ -117,18 +133,28 @@ describe("ServerApp immutable profile boundary", () => {
 		await user.click(edit);
 
 		const url = screen.getByLabelText<HTMLInputElement>("WebSocket URL");
-		expect(url.readOnly).toBe(true);
+		expect(url.readOnly).toBe(false);
 		const name = screen.getByLabelText("Name");
 		expect(document.activeElement).toBe(name);
 		await user.clear(name);
 		await user.type(name, "Renamed");
+		await user.clear(url);
+		await user.type(url, "wss://renamed.example.test/");
+		window.history.replaceState(
+			null,
+			"",
+			"/server/local/w/host/run/old/conversation/old",
+		);
 		await user.click(screen.getByRole("button", { name: "Save changes" }));
 
 		await waitFor(() => expect(store.current().profiles[0].name).toBe("Renamed"));
 		expect(store.current().profiles[0].name).toBe("Renamed");
-		expect(store.current().profiles[0].url).toBe("ws://127.0.0.1:8787/");
-		expect(boundary.clients).toHaveLength(1);
-		expect(boundary.clients[0].close).not.toHaveBeenCalled();
+		expect(store.current().profiles[0].url).toBe("wss://renamed.example.test/");
+		expect(window.location.pathname).toBe("/server/local/");
+		await waitFor(() => expect(boundary.clients).toHaveLength(2));
+		expect(boundary.clients[0].close).toHaveBeenCalledOnce();
+		expect(boundary.clients[1].url).toBe("wss://renamed.example.test/");
+		expect(boundary.queryClients[1]).not.toBe(boundary.queryClients[0]);
 		await waitFor(() =>
 			expect(document.activeElement).toBe(
 				screen.getByRole("button", { name: "Edit Renamed" }),
@@ -177,7 +203,7 @@ describe("ServerApp immutable profile boundary", () => {
 		render(<ServerApp store={store} />);
 
 		expect(screen.queryByLabelText("Active control server")).toBeNull();
-		expect(screen.getByText("No server configured")).toBeTruthy();
+		expect(screen.getByRole("heading", { name: "Connect a control server" })).toBeTruthy();
 		const setup = screen.getByRole("button", { name: "Add control server" });
 		await user.click(setup);
 

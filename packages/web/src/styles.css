@@ -211,44 +211,8 @@
 	flex: 1;
 }
 
-.server-bar {
-	display: flex;
-	height: 40px;
-	flex: 0 0 40px;
-	align-items: center;
-	justify-content: space-between;
-	gap: var(--space-3);
-	border-bottom: 1px solid var(--border);
-	background: var(--card);
-	padding: 0 var(--space-3);
-	color: var(--muted-foreground);
-}
-
-.server-context {
-	display: flex;
-	min-width: 0;
-	align-items: center;
-	gap: var(--space-2);
-}
-
-.server-context > svg {
-	width: 16px;
-	height: 16px;
-	flex: 0 0 auto;
-}
-
-.server-context-select {
-	width: min(240px, 42vw);
-}
-
-.server-context-select select {
-	font-weight: 500;
-}
-
-.server-context-empty {
-	color: var(--foreground);
-	font-size: var(--text-sm);
-	font-weight: 500;
+.server-header-controls {
+	display: contents;
 }
 
 .server-manage-button {
@@ -312,8 +276,7 @@
 }
 
 .server-manager-title svg,
-.server-profile-form-title svg,
-.server-profile-fields [data-slot="field-label"] svg {
+.server-profile-form-title svg {
 	width: 16px;
 	height: 16px;
 	flex: 0 0 auto;
@@ -426,10 +389,6 @@
 	gap: var(--space-4);
 }
 
-.server-profile-fields input[readonly] {
-	color: var(--muted-foreground);
-}
-
 .server-profile-form-actions {
 	display: flex;
 	justify-content: flex-end;
@@ -458,30 +417,6 @@
 }
 
 @media (max-width: 640px) {
-	.server-bar {
-		height: 44px;
-		flex-basis: 44px;
-		padding: 0 var(--space-2);
-	}
-
-	.server-context-select {
-		width: calc(100vw - 104px);
-	}
-
-	.server-context-select select,
-	.server-manage-button {
-		min-height: 44px;
-	}
-
-	.server-manage-button {
-		width: 44px;
-		padding: 0;
-	}
-
-	.server-manage-button span {
-		display: none;
-	}
-
 	.server-setup {
 		padding: var(--space-4);
 	}
