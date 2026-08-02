@@ -1,6 +1,6 @@
-# pi-relay
+# π-relay
 
-Personal-use agent runtime with a Rust control plane/runtime, durable
+Personal-use π-relay agent runtime with a Rust control plane/runtime, durable
 PostgreSQL session storage, MCP routes, and a React web UI.
 
 ## Quick links

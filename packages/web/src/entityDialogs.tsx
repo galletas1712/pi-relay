@@ -403,7 +403,7 @@ export function ProjectDialog({
 											<input
 												value={workspace.workspace_dir}
 												onChange={(event) => updateWorkspace(index, { workspace_dir: event.target.value })}
-												placeholder={workspace.kind === "local" ? "docs" : "pi-relay"}
+												placeholder={workspace.kind === "local" ? "docs" : "π-relay"}
 												required
 												disabled={busy}
 											/>

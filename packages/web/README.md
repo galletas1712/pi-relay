@@ -1,6 +1,6 @@
-# @pi-relay/web
+# π-relay web
 
-React/Vite web client for the pi-relay Rust agent daemon (`pi-agentd`).
+React/Vite web client for the π-relay Rust agent daemon (`pi-agentd`).
 
 ## Develop
 
@@ -33,8 +33,14 @@ The production profile URL is
 `wss://<control-node>.<tailnet>.ts.net:8443/`. The
 `packages/web/public/_headers` policy is copied into `dist`: scripts remain
 self-hosted, framing and objects are prohibited, referrers are suppressed, and
-direct WSS plus exact loopback WS destinations are allowed. Cloudflare's
-default caching policy is used.
+direct WSS plus exact loopback WS destinations are allowed. Cloudflare Pages
+serves `/service-worker.js` with `Cache-Control: no-cache` so updates are
+checked promptly.
+
+The deployed app is installable as a PWA from Cloudflare Pages. Its service
+worker caches only the static application shell and static assets (documents,
+scripts, styles, fonts, images, and the manifest); it never caches WebSocket
+traffic or session/API data.
 
 Exact Origin validation prevents unrelated webpages in honest browsers from
 opening the control WebSocket. It is not CORS and does not authenticate
