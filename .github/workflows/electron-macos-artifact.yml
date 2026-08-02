@@ -1,0 +1,100 @@
+name: Electron macOS artifact
+
+"on":
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/electron-macos-artifact.yml"
+      - "packages/electron/**"
+      - "packages/web/public/icons/icon-512.png"
+      - "package.json"
+      - "package-lock.json"
+
+concurrency:
+  group: electron-macos-artifact
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Needed to remove the previous rolling artifact before uploading its replacement.
+  actions: write
+
+jobs:
+  package:
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22.12"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate Electron app
+        run: npm run validate --workspace @pi-relay/electron
+
+      - name: Build universal macOS installer
+        run: npm run package --workspace @pi-relay/electron -- --universal --publish never
+
+      - name: Create DMG checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg_count="$(find packages/electron/dist -type f -name '*.dmg' -print | wc -l | tr -d ' ')"
+          if [[ "$dmg_count" -ne 1 ]]; then
+            printf 'Expected exactly one DMG, found %s\n' "$dmg_count" >&2
+            find packages/electron/dist -type f -name '*.dmg' -print >&2
+            exit 1
+          fi
+          dmg="$(find packages/electron/dist -type f -name '*.dmg' -print -quit)"
+          shasum -a 256 "$dmg" > "$dmg.sha256"
+
+      - name: Explain distribution limitations
+        run: |
+          {
+            echo "## macOS artifact"
+            echo
+            echo "The DMG is an unsigned, non-notarized development artifact."
+            echo "macOS Gatekeeper may warn or block the first launch; users may need to approve it in Privacy & Security or use Finder's Open action."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove previous rolling artifact
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifactName = "electron-macos-dmg";
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: artifactName,
+                per_page: 100,
+              },
+            );
+
+            for (const artifact of artifacts) {
+              if (!artifact.expired && artifact.name === artifactName) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              }
+            }
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-macos-dmg
+          path: |
+            packages/electron/dist/*.dmg
+            packages/electron/dist/*.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
