@@ -3445,11 +3445,15 @@ pre {
 
 .queue-row {
 	display: grid;
-	grid-template-columns: 28px minmax(0, 1fr) auto auto;
+	grid-template-columns: minmax(0, 1fr) auto auto;
 	align-items: center;
-	gap: 9px;
+	gap: 7px;
 	border-bottom: 1px solid var(--border);
 	padding: 8px 10px;
+}
+
+.queue-row.has-reorder-handle {
+	grid-template-columns: 24px minmax(0, 1fr) auto auto;
 }
 
 .queue-row.is-dragging {
@@ -3467,8 +3471,8 @@ pre {
 
 .queue-drag-handle,
 .queue-drag-handle-slot {
-	width: 28px;
-	height: 28px;
+	width: 24px;
+	height: 24px;
 }
 
 .queue-drag-handle {
@@ -4575,23 +4579,40 @@ pre {
 	}
 
 	.queue-row {
-		grid-template-columns: 28px minmax(0, 1fr) auto;
-		gap: 7px;
+		grid-template-columns: minmax(0, 1fr) auto auto;
+		gap: 6px;
 	}
 
-	.queue-preview,
-	.queue-edit {
+	.queue-row.has-reorder-handle {
+		grid-template-columns: 24px minmax(0, 1fr) auto auto;
+	}
+
+	.queue-row:not(.has-reorder-handle) .queue-preview,
+	.queue-row:not(.has-reorder-handle) .queue-edit {
+		grid-column: 1;
+		grid-row: 1;
+		min-width: 0;
+	}
+
+	.queue-row.has-reorder-handle .queue-preview,
+	.queue-row.has-reorder-handle .queue-edit {
+		grid-column: 2;
+		grid-row: 1;
+		min-width: 0;
+	}
+
+	.queue-row:not(.has-reorder-handle) .queue-actions {
 		grid-column: 2;
 		grid-row: 1;
 	}
 
-	.queue-actions {
+	.queue-row.has-reorder-handle .queue-actions {
 		grid-column: 3;
 		grid-row: 1;
 	}
 
 	.queue-steer-button {
-		grid-column: 2 / -1;
+		grid-row: 1;
 		justify-self: end;
 	}
 
