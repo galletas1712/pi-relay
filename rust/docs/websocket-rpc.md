@@ -1693,8 +1693,12 @@ packages; the delegation `workflow` value is an unvalidated observability label.
 
 Interrupts all running subagents in a delegation and marks the delegation
 cancelled. Terminal delegations are left unchanged and return
-`{ "cancelled": false }`. A successful cancellation returns a cwd-relative `handoff_dir` and compact
-per-subagent transcript file references relative to it.
+`{ "cancelled": false }`. Cancellation success is durable and does not depend
+on runtime availability. When the parent runtime is online, the result includes
+a cwd-relative `handoff_dir` and compact per-subagent transcript file
+references relative to it. If optional artifact publication is unavailable,
+`handoff_dir` is `null` and `subagents` is empty; the durable child transcripts
+remain available after runtime recovery.
 
 ```json
 {

@@ -7,7 +7,7 @@ use crate::{
     AcceptedInput, AddSessionMcpResult, EventFrame, EventType, InputPriority,
     McpSessionManifestBinding, OutputBatch, PersistedAction, RootSessionRequired, SessionActivity,
     SessionConfig, SessionConfigChanged, SessionNotFound, SessionSummary, SessionWorkspace,
-    SubagentType, VersionedSessionConfig,
+    SubagentType, VersionedSessionConfig, WorkspaceAttachment,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 
@@ -20,6 +20,7 @@ use super::sql::{
     freeze_legacy_routes_tx, lock_session_tx, queued_input_is_active, session_activity,
 };
 use super::transcript::session_state_for_event_tx;
+use super::workspace_resources::attach_workspace_resource_tx;
 use super::PostgresAgentStore;
 
 fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -322,6 +323,44 @@ impl PostgresAgentStore {
         subagent_type: Option<SubagentType>,
         delegation_id: Option<&str>,
     ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
+        self.start_session_outputs_with_parent_and_workspace(
+            session_id,
+            config,
+            entries,
+            active_leaf_id,
+            session_events,
+            actions,
+            priority,
+            content,
+            client_input_id,
+            parent_session_id,
+            subagent_type,
+            delegation_id,
+            None,
+        )
+        .await
+    }
+
+    // Complete creation operation used by runtime-backed sessions. A private
+    // workspace generation is attached in the same transaction as identity,
+    // transcript outputs, and the accepted first input.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_session_outputs_with_parent_and_workspace(
+        &self,
+        session_id: &str,
+        config: &SessionConfig,
+        entries: &[TranscriptStorageNode],
+        active_leaf_id: Option<&str>,
+        session_events: &[SessionEvent],
+        actions: &[SessionAction],
+        priority: InputPriority,
+        content: &UserMessage,
+        client_input_id: Option<&str>,
+        parent_session_id: Option<&str>,
+        subagent_type: Option<SubagentType>,
+        delegation_id: Option<&str>,
+        workspace: Option<WorkspaceAttachment<'_>>,
+    ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
         if parent_session_id == Some(session_id) {
             return Err(anyhow!(
                 "child session id must differ from parent session id"
@@ -388,6 +427,17 @@ impl PostgresAgentStore {
         if inserted.is_none() {
             tx.commit().await?;
             return Ok((Vec::new(), Vec::new()));
+        }
+        if let Some(workspace) = workspace {
+            attach_workspace_resource_tx(
+                &mut tx,
+                session_id,
+                &config.runtime_id,
+                &config.workspace_id,
+                &config.workspaces,
+                workspace,
+            )
+            .await?;
         }
 
         let mut frames = vec![
@@ -574,6 +624,11 @@ impl PostgresAgentStore {
                     exists(select 1 from delegations d where d.parent_session_id = s.id and d.status in ('running','cancelling')) as has_running_delegations
                 from sessions s
                 where s.metadata->>'hidden' is distinct from 'true'
+                    and not exists (
+                        select 1 from workspace_resources r
+                        where r.owner_session_id=s.id and r.state='deleting'
+                          and r.cleanup_mode='delete_session'
+                    )
                     and (
                         ($2::uuid is null and s.project_id is null)
                         or ($2::uuid is not null and s.project_id=$2)

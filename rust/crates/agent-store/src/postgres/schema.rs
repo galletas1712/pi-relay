@@ -59,29 +59,40 @@ create table if not exists sessions (
     transcript_revision bigint not null default 0
 );
 
--- A read-only context fork reserves its exact runtime workspace before the
--- runtime materializes it. Rows are removed by the child-creation transaction
--- or by reconciliation after a daemon restart. This table intentionally has
--- no session foreign key: its purpose is to cover the interval before the
--- child session exists.
-create table if not exists context_fork_workspace_reservations (
-    child_session_id text primary key,
-    parent_session_id text not null,
+-- Private runtime workspaces have one durable lifecycle owner. The intended
+-- session identity exists before the remote effect, so this table deliberately
+-- does not use a session foreign key.
+create table if not exists workspace_resources (
+    workspace_id text primary key,
+    owner_session_id text not null unique,
     runtime_id text not null,
-    workspace_id text not null unique,
-    owner_id text not null,
-    state text not null default 'materializing',
-    remove_session boolean not null default true,
-    created_at timestamptz not null default now()
+    generation text not null,
+    owner_kind text not null
+        constraint workspace_resources_owner_kind_check
+        check (owner_kind in ('root','history_fork','read_only')),
+    state text not null
+        constraint workspace_resources_state_check
+        check (state in ('provisioning','ready','deleting','deleted')),
+    cleanup_mode text null
+        constraint workspace_resources_cleanup_mode_check
+        check (cleanup_mode is null or cleanup_mode in ('retain_session','delete_session')),
+    workspaces jsonb null,
+    lease_expires_at timestamptz not null,
+    retry_at timestamptz not null default now(),
+    last_error text null,
+    attached_at timestamptz null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    constraint workspace_resources_state_shape_check check (
+        (state='provisioning' and cleanup_mode is null and attached_at is null)
+        or (state='ready' and cleanup_mode is null)
+        or (state='deleting' and cleanup_mode is not null)
+        or (state='deleted' and cleanup_mode='retain_session' and attached_at is not null)
+    )
 );
 
-create index if not exists context_fork_workspace_reservations_runtime_idx
-    on context_fork_workspace_reservations(runtime_id, created_at);
-
-alter table context_fork_workspace_reservations
-    add column if not exists state text not null default 'materializing';
-alter table context_fork_workspace_reservations
-    add column if not exists remove_session boolean not null default true;
+create index if not exists workspace_resources_due_idx
+    on workspace_resources(state, retry_at, lease_expires_at);
 
 create index if not exists sessions_project_created_idx
     on sessions(project_id, created_at desc, id desc);
@@ -236,10 +247,27 @@ create index if not exists delegations_completed_repair_idx
 -- `sessions` and `delegations` reference each other, so this side of the cycle
 -- is added after both canonical tables exist.
 alter table sessions add column if not exists delegation_id text null references delegations(id);
+alter table sessions add column if not exists delegation_launch_state text not null default 'launched';
+do $$
+begin
+    if not exists (
+        select 1
+        from pg_constraint
+        where conrelid='sessions'::regclass
+          and conname='sessions_delegation_launch_state_check'
+    ) then
+        alter table sessions
+            add constraint sessions_delegation_launch_state_check
+            check (delegation_launch_state in ('launched','compensating'));
+    end if;
+end
+$$;
 
-create unique index if not exists sessions_delegation_spawn_index_uq
+create unique index if not exists sessions_delegation_launched_spawn_index_uq
     on sessions(delegation_id, (metadata->>'delegation_spawn_index'))
-    where delegation_id is not null and metadata ? 'delegation_spawn_index';
+    where delegation_id is not null
+      and delegation_launch_state='launched'
+      and metadata ? 'delegation_spawn_index';
 
 alter table queued_inputs add column if not exists provider_config jsonb null;
 alter table actions add column if not exists provider_config jsonb null;
@@ -264,6 +292,7 @@ pub(super) async fn migrate(pool: &PgPool) -> Result<()> {
     .bind([
         "delegations_parent_launch_key_uq",
         "sessions_delegation_spawn_index_uq",
+        "sessions_delegation_launched_spawn_index_uq",
         "delegations_parent_running_full_uq",
     ])
     .fetch_all(pool)

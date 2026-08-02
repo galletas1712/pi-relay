@@ -9,7 +9,10 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::prompt::{parse_runtime_skills, parse_skill_contents, ParsedSkillFile};
+use super::prompt::{
+    parse_runtime_skills, parse_skill_contents, parse_skill_contents_result, ParsedSkillFile,
+    RoleContextPolicy,
+};
 
 pub(crate) fn load_skill_result(
     runtime_raw: &[RawSkillFile],
@@ -85,12 +88,6 @@ pub(crate) struct ResolvedSkillRole {
     pub(crate) context: RoleContextPolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RoleContextPolicy {
-    Fresh,
-    Forked,
-}
-
 pub(crate) fn resolve_skill_role(
     runtime_raw: &[RawSkillFile],
     name: &str,
@@ -128,8 +125,12 @@ fn resolve_role_file(
             file.package_name
         ));
     }
-    let parsed = parse_skill_contents(&file.contents)
-        .ok_or_else(|| anyhow!("role skill {} missing valid frontmatter", file.package_name))?;
+    let parsed = parse_skill_contents_result(&file.contents).map_err(|error| {
+        anyhow!(
+            "role skill {} has invalid frontmatter: {error:#}",
+            file.package_name
+        )
+    })?;
     if parsed.name != file.package_name {
         return Err(anyhow!(
             "role skill directory {} must match SKILL.md name {}",
@@ -138,16 +139,7 @@ fn resolve_role_file(
         ));
     }
     let provider = role_provider_from_frontmatter(&parsed, Path::new(&file.path))?;
-    let context = match parsed.frontmatter.context.as_deref().unwrap_or("fresh") {
-        "fresh" => RoleContextPolicy::Fresh,
-        "forked" => RoleContextPolicy::Forked,
-        value => {
-            return Err(anyhow!(
-                "role skill {} has invalid context `{value}`; expected `fresh` or `forked`",
-                file.package_name
-            ))
-        }
-    };
+    let context = parsed.frontmatter.context;
     let skills = resolve_role_skills(runtime_raw, &parsed)?;
     Ok(ResolvedSkillRole {
         name: parsed.name,

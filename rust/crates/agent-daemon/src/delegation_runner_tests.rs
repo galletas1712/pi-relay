@@ -86,6 +86,7 @@ async fn ordinary_tool_dispatch_claims_starts_and_completes_exactly_once() {
             parent_session_id: None,
             subagent_type: None,
             delegation_id: None,
+            workspace: None,
             dispatch_mode: PreparedSessionDispatchMode::Auto,
         },
     )
@@ -1492,6 +1493,7 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
             parent_session_id: None,
             subagent_type: None,
             delegation_id: None,
+            workspace: None,
             dispatch_mode: PreparedSessionDispatchMode::Deferred,
         },
     )
@@ -3369,6 +3371,7 @@ async fn unexpected_ordinary_turn_stops_discard_partial_content_and_replay() {
                 parent_session_id: None,
                 subagent_type: None,
                 delegation_id: None,
+                workspace: None,
                 dispatch_mode: PreparedSessionDispatchMode::Deferred,
             },
         )

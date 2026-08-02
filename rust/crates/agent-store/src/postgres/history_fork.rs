@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde_json::json;
+use sqlx::{Postgres, Transaction};
 
 use crate::{
     CreateContextForkRequest, CreateForkRequest, EventType, ForkSessionResult, InputPriority,
@@ -7,14 +8,99 @@ use crate::{
 };
 
 use super::events::insert_event_tx;
-use super::history_target::validate_history_target_tx;
+use super::history_target::{branch_entry_ids_tx, validate_history_target_tx};
 use super::mcp::install_session_manifest_tx;
 use super::queue::{
     append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
 };
 use super::sql::lock_session_tx;
 use super::transcript::session_state_for_event_tx;
+use super::workspace_resources::attach_workspace_resource_tx;
 use super::PostgresAgentStore;
+
+/// A validated conversational boundary, never an executable open turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LatestCompletedTurn {
+    leaf_id: String,
+    branch_entry_ids: Vec<String>,
+}
+
+async fn latest_completed_turn_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    active_leaf_id: Option<&str>,
+) -> Result<Option<LatestCompletedTurn>> {
+    let mut active_branch = branch_entry_ids_tx(tx, session_id, active_leaf_id).await?;
+    if active_branch.is_empty() {
+        return Ok(None);
+    }
+    let leaf_id: Option<String> = sqlx::query_scalar(
+        r#"
+        select id
+        from transcript_entries
+        where session_id=$1 and id=any($2)
+          and item->>'type' in ('turn_finished','compaction_summary')
+        order by sequence desc
+        limit 1
+        "#,
+    )
+    .bind(session_id)
+    .bind(&active_branch)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten();
+    let Some(leaf_id) = leaf_id else {
+        return Ok(None);
+    };
+    let boundary_index = active_branch
+        .iter()
+        .position(|entry_id| entry_id == &leaf_id)
+        .ok_or_else(|| anyhow!("completed turn is not on the active transcript branch"))?;
+    active_branch.truncate(boundary_index + 1);
+    Ok(Some(LatestCompletedTurn {
+        leaf_id,
+        branch_entry_ids: active_branch,
+    }))
+}
+
+async fn copy_history_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    source_session_id: &str,
+    child_session_id: &str,
+    entry_ids: Option<&[String]>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        insert into transcript_entries (
+            session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id
+        )
+        select $2::text, id, parent_id, timestamp_ms, item, provider_replay, turn_id
+        from transcript_entries
+        where session_id=$1 and ($3::text[] is null or id=any($3))
+        order by sequence
+        "#,
+    )
+    .bind(source_session_id)
+    .bind(child_session_id)
+    .bind(entry_ids)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        update sessions
+        set last_user_message_timestamp_ms = (
+            select max(timestamp_ms)
+            from transcript_entries
+            where session_id=$1 and item->>'type' = 'user_message'
+        )
+        where id=$1
+        "#,
+    )
+    .bind(child_session_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
 impl PostgresAgentStore {
     pub async fn create_context_fork(
@@ -22,52 +108,30 @@ impl PostgresAgentStore {
         request: CreateContextForkRequest<'_>,
     ) -> Result<ForkSessionResult> {
         let CreateContextForkRequest {
-            source_session_id,
             child_session_id,
-            reservation_owner_id,
             config,
             parent_session_id,
             subagent_type,
             delegation_id,
             task,
+            workspace,
         } = request;
-        if source_session_id != parent_session_id {
-            return Err(anyhow::anyhow!(
-                "context fork source and parent session must match"
-            ));
-        }
         let mut tx = self.pool.begin().await?;
-        if subagent_type == crate::SubagentType::ReadOnly {
-            let Some(reservation_owner_id) = reservation_owner_id else {
-                return Err(anyhow::anyhow!(
-                    "read-only context fork requires a workspace reservation"
-                ));
-            };
-            let reservation_deleted = sqlx::query(
-                r#"
-                delete from context_fork_workspace_reservations
-                where child_session_id=$1 and parent_session_id=$2 and runtime_id=$3
-                  and workspace_id=$4 and owner_id=$5 and state='materializing'
-                "#,
-            )
-            .bind(child_session_id)
-            .bind(parent_session_id)
-            .bind(&config.runtime_id)
-            .bind(&config.workspace_id)
-            .bind(reservation_owner_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            if reservation_deleted != 1 {
-                return Err(anyhow::anyhow!(
-                    "context fork workspace reservation is missing or does not match child"
+        match (subagent_type, workspace) {
+            (crate::SubagentType::ReadOnly, None) => {
+                return Err(anyhow!(
+                    "read-only context fork requires a prepared workspace"
                 ));
             }
+            (crate::SubagentType::Full, Some(_)) => {
+                return Err(anyhow!("full subagent cannot own a private workspace"));
+            }
+            _ => {}
         }
-        lock_session_tx(&mut tx, source_session_id).await?;
+        lock_session_tx(&mut tx, parent_session_id).await?;
         let source_fingerprint: Option<String> =
             sqlx::query_scalar("select mcp_manifest_fingerprint from sessions where id=$1")
-                .bind(source_session_id)
+                .bind(parent_session_id)
                 .fetch_one(&mut *tx)
                 .await?;
         if source_fingerprint.as_deref()
@@ -80,9 +144,12 @@ impl PostgresAgentStore {
         }
         let source_leaf_id: Option<String> =
             sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
-                .bind(source_session_id)
+                .bind(parent_session_id)
                 .fetch_one(&mut *tx)
                 .await?;
+        let completed =
+            latest_completed_turn_tx(&mut tx, parent_session_id, source_leaf_id.as_deref()).await?;
+        let inherited_leaf_id = completed.as_ref().map(|turn| turn.leaf_id.as_str());
         if let Some(binding) = &config.mcp_manifest {
             install_session_manifest_tx(&mut tx, binding).await?;
         }
@@ -103,7 +170,7 @@ impl PostgresAgentStore {
         .bind(&config.runtime_id)
         .bind(&config.workspace_id)
         .bind(serde_json::to_value(&config.workspaces)?)
-        .bind(&source_leaf_id)
+        .bind(inherited_leaf_id)
         .bind(&config.system_prompt)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
@@ -118,34 +185,27 @@ impl PostgresAgentStore {
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            r#"
-            insert into transcript_entries (
-                session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id
+        if let Some(workspace) = workspace {
+            attach_workspace_resource_tx(
+                &mut tx,
+                child_session_id,
+                &config.runtime_id,
+                &config.workspace_id,
+                &config.workspaces,
+                workspace,
             )
-            select $2::text, id, parent_id, timestamp_ms, item, provider_replay, turn_id
-            from transcript_entries
-            where session_id=$1
-            order by sequence
-            "#,
+            .await?;
+        }
+        let inherited_entry_ids = completed
+            .as_ref()
+            .map(|turn| turn.branch_entry_ids.as_slice())
+            .unwrap_or_default();
+        copy_history_tx(
+            &mut tx,
+            parent_session_id,
+            child_session_id,
+            Some(inherited_entry_ids),
         )
-        .bind(source_session_id)
-        .bind(child_session_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            r#"
-            update sessions
-            set last_user_message_timestamp_ms = (
-                select max(timestamp_ms)
-                from transcript_entries
-                where session_id=$1 and item->>'type' = 'user_message'
-            )
-            where id=$1
-            "#,
-        )
-        .bind(child_session_id)
-        .execute(&mut *tx)
         .await?;
 
         let input_id = format!("input_{}", uuid::Uuid::new_v4());
@@ -177,9 +237,9 @@ impl PostgresAgentStore {
                 "project_id": config.project_id,
                 "parent_session_id": parent_session_id,
                 "provider": config.provider,
-                "source_session_id": source_session_id,
-                "source_leaf_id": source_leaf_id,
-                "active_leaf_id": source_leaf_id,
+                "source_session_id": parent_session_id,
+                "source_leaf_id": inherited_leaf_id,
+                "active_leaf_id": inherited_leaf_id,
             }),
         )
         .await?;
@@ -203,9 +263,9 @@ impl PostgresAgentStore {
         tx.commit().await?;
         Ok(ForkSessionResult {
             session_id: child_session_id.to_string(),
-            source_session_id: source_session_id.to_string(),
-            source_leaf_id: source_leaf_id.clone(),
-            active_leaf_id: source_leaf_id,
+            source_session_id: parent_session_id.to_string(),
+            source_leaf_id: inherited_leaf_id.map(str::to_string),
+            active_leaf_id: inherited_leaf_id.map(str::to_string),
             session_revision: state.session_revision,
             queue_revision: state.queue_revision,
             transcript_revision: state.transcript_revision,
@@ -220,6 +280,7 @@ impl PostgresAgentStore {
             child_session_id,
             config,
             target,
+            workspace,
         } = request;
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, source_session_id).await?;
@@ -267,35 +328,16 @@ impl PostgresAgentStore {
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            r#"
-            insert into transcript_entries (
-                session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id
-            )
-            select $2::text, id, parent_id, timestamp_ms, item, provider_replay, turn_id
-            from transcript_entries
-            where session_id=$1
-            order by sequence
-            "#,
+        attach_workspace_resource_tx(
+            &mut tx,
+            child_session_id,
+            &config.runtime_id,
+            &config.workspace_id,
+            &config.workspaces,
+            workspace,
         )
-        .bind(source_session_id)
-        .bind(child_session_id)
-        .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            r#"
-            update sessions
-            set last_user_message_timestamp_ms = (
-                select max(timestamp_ms)
-                from transcript_entries
-                where session_id=$1 and item->>'type' = 'user_message'
-            )
-            where id=$1
-            "#,
-        )
-        .bind(child_session_id)
-        .execute(&mut *tx)
-        .await?;
+        copy_history_tx(&mut tx, source_session_id, child_session_id, None).await?;
         let state = session_state_for_event_tx(&mut tx, child_session_id).await?;
         let event = insert_event_tx(
             &mut tx,

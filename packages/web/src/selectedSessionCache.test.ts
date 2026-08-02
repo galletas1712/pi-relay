@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	applyActiveBranchSyncToCache,
+	applyActionLifecycleEvent,
 	applyEntryBodies,
 	applyQueueProjection,
 	applySelectedSnapshot,
@@ -9,6 +10,7 @@ import {
 	applyTreeIndex,
 	applyTranscriptTurns,
 	applyTurnDetail,
+	captureTurnDetailRequest,
 	activeBranchEntriesForExport,
 	branchFromTree,
 	captureSelectedSessionRefresh,
@@ -43,6 +45,90 @@ const sessionId = "session_1";
 const provider: ProviderConfig = { kind: "openai", model: "gpt-5.1" };
 
 describe("selected session cache", () => {
+	it("projects parallel action completion without waiting for session idle", () => {
+		let cache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			{
+				...snapshot([]),
+				activity: "running",
+				pending_actions: [
+					{ action_row_id: "action_1", kind: "tool", status: "running", payload: { id: "call_1" } },
+					{ action_row_id: "action_2", kind: "tool", status: "running", payload: { id: "call_2" } },
+					{ action_row_id: "action_3", kind: "model", status: "running", payload: {} },
+				],
+			},
+		);
+		for (const [eventId, rowId] of [[2, "action_1"], [3, "action_2"]] as const) {
+			const applied = applyActionLifecycleEvent(cache, {
+				event_id: eventId,
+				event: "tool.completed",
+				session_id: sessionId,
+				data: {
+					action_row_id: rowId,
+					kind: "tool",
+					status: "completed",
+				},
+			});
+			expect(applied.applied).toBe(true);
+			cache = applied.cache;
+		}
+		expect(cache.snapshot?.pending_actions).toEqual([
+			{ action_row_id: "action_3", kind: "model", status: "running", payload: {} },
+		]);
+		expect(cache.snapshot?.activity).toBe("running");
+	});
+
+	it("keeps newer live entries and metadata when a stale open-turn detail resolves", () => {
+		const started = turnStartedEntry("entry_start", null, 1, 1);
+		const user = entry("entry_user", started.id, "full user", 2);
+		const staleAssistant = assistantEntry("entry_assistant", user.id, "stale", 3);
+		const liveAssistant = assistantEntry("entry_assistant", user.id, "live", 3);
+		const liveTool = entry("entry_tool", liveAssistant.id, "new tool result", 4);
+		let cache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([started, user, liveAssistant, liveTool], {
+				activeLeafId: liveTool.id,
+				transcriptRevision: 4,
+			}),
+		);
+		cache = {
+			...cache,
+			turnOrder: [started.id],
+			turnCardsById: new Map([[
+				started.id,
+				{
+					...turnCard(started.id, 1),
+					active_leaf_id: liveTool.id,
+					start_sequence: 1,
+					end_sequence: 4,
+				},
+			]]),
+		};
+		const fence = {
+			...captureTurnDetailRequest(cache, started.id, 7),
+			transcriptRevision: 3,
+			activeLeafId: staleAssistant.id,
+		};
+		const applied = applyTurnDetail(cache, {
+			session_id: sessionId,
+			active_leaf_id: staleAssistant.id,
+			session_revision: 3,
+			transcript_revision: 3,
+			card_id: started.id,
+			entries: [started, user, staleAssistant],
+		}, fence, 8);
+
+		expect(applied.applied).toBe(false);
+		expect(applied.cache.snapshot?.transcript_revision).toBe(4);
+		expect(applied.cache.snapshot?.active_leaf_id).toBe(liveTool.id);
+		expect(applied.cache.entriesById.get(liveAssistant.id)?.item).toEqual(liveAssistant.item);
+		expect(applied.cache.activeBranchEntryIds).toEqual([
+			started.id,
+			user.id,
+			liveAssistant.id,
+			liveTool.id,
+		]);
+	});
 	it("discards a staged refresh when a websocket event advances the visible cache", async () => {
 		const original = entry("entry_1", null, "original", 1);
 		const appended = entry("entry_2", original.id, "new event", 2);
@@ -838,7 +924,9 @@ describe("selected session cache", () => {
 		const stale = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant]);
 		const fresh = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant, currentAssistant]);
 
-		expect(stale).toEqual({ cache, applied: false });
+		expect(stale.applied).toBe(false);
+		expect(stale.cache.entriesById.has(started.id)).toBe(true);
+		expect(stale.cache.turnDetailsById).toBe(cache.turnDetailsById);
 		expect(fresh.applied).toBe(true);
 		expect(fresh.cache.turnDetailsById.get("entry_start")).toEqual([
 			"entry_start",

@@ -36,6 +36,28 @@ struct StartFullParams {
     label: Option<String>,
 }
 
+async fn reconcile_compensating_full_members(state: &AppState) -> Result<(), RpcError> {
+    for session_id in state.repo.compensating_full_delegation_members().await? {
+        abort_and_join_session_tasks(state, &session_id).await;
+        let events = state
+            .repo
+            .cancel_unfinished_session_work(&session_id, "failed spawn compensation")
+            .await?;
+        if !events.is_empty() {
+            publish_events(state, events);
+        }
+        if let Err(error) = state.repo.delete_session(&session_id).await {
+            eprintln!(
+                "failed-spawn compensation remains pending for full child {session_id}: {error:#}"
+            );
+        } else {
+            state.active.lock().await.remove(&session_id);
+            state.provider_connections.remove_session(&session_id).await;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn materialize_delegation_launch(
     state: &AppState,
     delegation: &Delegation,
@@ -106,11 +128,6 @@ pub(crate) async fn materialize_delegation_launch(
         {
             Ok(spawned) => session_ids.push(spawned.started.session_id),
             Err(error) => {
-                let reloaded = state.repo.delegation_spawned_indices(&current.id).await?;
-                if let Some(session_id) = reloaded.get(&index) {
-                    session_ids.push(session_id.clone());
-                    continue;
-                }
                 fail_delegation_launch(state, &current, &error).await?;
                 return Err(error);
             }
@@ -158,6 +175,29 @@ async fn fail_delegation_launch(
         )
         .await?;
     Ok(())
+}
+
+pub(crate) fn spawn_cancelling_delegation_reconciler(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(error) = reconcile_compensating_full_members(&state).await {
+                eprintln!(
+                    "full-member spawn compensation remains pending: {}: {}",
+                    error.code, error.message
+                );
+            }
+            if let Err(error) = reconcile_cancelling_delegations_on_boot(&state).await {
+                eprintln!(
+                    "cancelling-delegation reconciliation remains pending: {}: {}",
+                    error.code, error.message
+                );
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -934,10 +974,12 @@ async fn cancel_subagent_without_reactivation(
     }
     state.active.lock().await.remove(session_id);
     if subagent_type == Some(SubagentType::ReadOnly) {
-        if let Err(error) = state
-            .runtime_hosts
-            .cleanup_read_only_session(session_id, false)
-            .await
+        if let Err(error) = crate::workspace_lifecycle::request_session_cleanup(
+            state,
+            session_id,
+            agent_store::WorkspaceCleanupMode::RetainSession,
+        )
+        .await
         {
             return Err(RpcError::new(
                 "subagent_cleanup_pending",
@@ -1144,7 +1186,18 @@ pub(crate) async fn cancel_core(
         return Ok(json!({ "cancelled": false }));
     }
     launch_guard.release().await?;
-    let (handoff_dir, subagents) = write_cancelled_subagent_transcripts(state, &delegation).await?;
+    let (handoff_dir, subagents) = match write_cancelled_subagent_transcripts(state, &delegation)
+        .await
+    {
+        Ok((handoff_dir, subagents)) => (Some(handoff_dir), subagents),
+        Err(error) => {
+            eprintln!(
+                    "delegation {} cancelled, but transcript artifact publication remains unavailable: {}: {}",
+                    delegation.id, error.code, error.message
+                );
+            (None, Vec::new())
+        }
+    };
     Ok(json!({
         "cancelled": true,
         "delegation_id": delegation.id,
@@ -1158,9 +1211,20 @@ async fn cancel_delegation_subagents_without_reactivation(
     delegation_id: &str,
 ) -> std::result::Result<(), RpcError> {
     let subagents = state.repo.list_delegation_subagents(delegation_id).await?;
+    let mut first_error = None;
     for subagent in &subagents {
-        cancel_subagent_without_reactivation(state, &subagent.session_id, subagent.subagent_type)
-            .await?;
+        if let Err(error) = cancel_subagent_without_reactivation(
+            state,
+            &subagent.session_id,
+            subagent.subagent_type,
+        )
+        .await
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(())
 }
@@ -1169,17 +1233,28 @@ pub(crate) async fn reconcile_cancelling_delegations_on_boot(
     state: &AppState,
 ) -> std::result::Result<(), RpcError> {
     let delegations = state.repo.list_cancelling_delegations().await?;
+    let mut first_error = None;
     for delegation in delegations {
         let Some(target) = delegation.teardown_target else {
-            return Err(RpcError::new(
-                "delegation_teardown_incomplete",
-                format!(
-                    "cancelling delegation {} has no teardown target",
-                    delegation.id
-                ),
-            ));
+            first_error.get_or_insert_with(|| {
+                RpcError::new(
+                    "delegation_teardown_incomplete",
+                    format!(
+                        "cancelling delegation {} has no teardown target",
+                        delegation.id
+                    ),
+                )
+            });
+            continue;
         };
-        teardown_delegation(state, &delegation, target, "boot_teardown_recovery").await?;
+        if let Err(error) =
+            teardown_delegation(state, &delegation, target, "boot_teardown_recovery").await
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(())
 }

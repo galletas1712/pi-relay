@@ -1,17 +1,19 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_session::TranscriptStorageNode;
+use agent_session::{AgentSession, TranscriptStorageNode};
 use agent_vocab::{
     AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
-    ProviderReplayItem, ReasoningEffort, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+    ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, TurnId, TurnOutcome,
+    UserMessage,
 };
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
     CreateContextForkRequest, CreateForkRequest, DelegationKind, HistoryChanged, HistoryTarget,
-    HistoryTargetNotTurnBoundary, InputPriority, OutputBatch, PostgresAgentStore, SessionConfig,
-    SourceMutationConflict, SwitchActiveLeafRequest, TranscriptEntryBodyMode,
+    HistoryTargetNotTurnBoundary, OutputBatch, PostgresAgentStore, PreparedWorkspace,
+    SessionConfig, SourceMutationConflict, SwitchActiveLeafRequest, TranscriptEntryBodyMode,
+    WorkspaceOwnerKind,
 };
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(40_000);
@@ -22,326 +24,39 @@ struct TestDb {
     name: String,
 }
 
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn cleanup_pending_reservation_can_retain_existing_child_history() {
-    let Some(db) = test_store().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let store = &db.store;
-    let project_id = Uuid::new_v4();
+async fn prepare_test_workspace(
+    store: &PostgresAgentStore,
+    owner_session_id: &str,
+    config: &SessionConfig,
+    owner_kind: WorkspaceOwnerKind,
+) -> PreparedWorkspace {
+    let generation = format!("test-generation-{}", Uuid::new_v4());
     store
-        .create_project(
-            project_id,
-            "retained cleanup test",
-            "runtime-test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("project creates");
-    let parent_id = "retained-cleanup-parent";
-    let child_id = "retained-cleanup-child";
-    let config = create_session(store, project_id, parent_id, false).await;
-    let mut child_config = config.clone();
-    child_config.workspace_id = "retained-cleanup-workspace".to_string();
-    store
-        .reserve_context_fork_workspace(
-            child_id,
-            parent_id,
-            &config.runtime_id,
-            &child_config.workspace_id,
-            "retained-cleanup-owner",
-        )
-        .await
-        .expect("reservation creates");
-    store
-        .create_session(child_id, &child_config)
-        .await
-        .expect("child creates");
-    store
-        .mark_context_fork_workspace_cleanup_pending_with_policy(
-            child_id,
-            parent_id,
-            &config.runtime_id,
-            &child_config.workspace_id,
-            "retained-cleanup-owner",
-            false,
-        )
-        .await
-        .expect("cleanup state marks");
-    assert!(store
-        .complete_context_fork_workspace_cleanup(
-            child_id,
-            parent_id,
-            &config.runtime_id,
-            &child_config.workspace_id,
-            "retained-cleanup-owner",
-        )
-        .await
-        .expect("cleanup completes"));
-    assert!(store.session_exists(child_id).await.expect("child lookup"));
-    assert!(store
-        .context_fork_workspace_reservations(None, "other-owner")
-        .await
-        .expect("reservations reload")
-        .is_empty());
-    db.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn context_fork_copies_parent_and_atomically_queues_delegated_task() {
-    let Some(db) = test_store().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let store = &db.store;
-    let project_id = Uuid::new_v4();
-    store
-        .create_project(
-            project_id,
-            "context fork test",
-            "runtime-test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("project creates");
-    let source_session_id = "context-fork-source";
-    let child_config = create_session(store, project_id, source_session_id, true).await;
-    store
-        .reserve_context_fork_workspace(
-            "context-fork-child",
-            source_session_id,
-            &child_config.runtime_id,
-            &child_config.workspace_id,
-            "context-fork-test",
-        )
-        .await
-        .expect("workspace reservation creates");
-    let source_before = store
-        .load_stored_session(source_session_id)
-        .await
-        .expect("source loads");
-    let task = UserMessage::text("# Delegated task\n\nInspect this context.");
-
-    let result = store
-        .create_context_fork(CreateContextForkRequest {
-            source_session_id,
-            child_session_id: "context-fork-child",
-            reservation_owner_id: Some("context-fork-test"),
-            config: &child_config,
-            parent_session_id: source_session_id,
-            subagent_type: crate::SubagentType::ReadOnly,
-            delegation_id: None,
-            task: &task,
-        })
-        .await
-        .expect("context fork creates");
-
-    let source_after = store
-        .load_stored_session(source_session_id)
-        .await
-        .expect("source reloads");
-    let child = store
-        .load_stored_session("context-fork-child")
-        .await
-        .expect("child loads");
-    assert_eq!(source_after, source_before);
-    assert_eq!(child.entries, source_before.entries);
-    assert_eq!(child.active_leaf_id, source_before.active_leaf_id);
-    let child_config_after = store
-        .load_session_config("context-fork-child")
-        .await
-        .expect("child config loads");
-    assert_eq!(child_config_after.project_id, child_config.project_id);
-    assert_eq!(child_config_after.runtime_id, child_config.runtime_id);
-    assert_eq!(child_config_after.workspace_id, child_config.workspace_id);
-    assert_eq!(child_config_after.workspaces, child_config.workspaces);
-    assert_eq!(child_config_after.system_prompt, child_config.system_prompt);
-    assert_eq!(
-        serde_json::to_value(&child_config_after.provider).expect("provider serializes"),
-        serde_json::to_value(&child_config.provider).expect("provider serializes")
-    );
-    assert_eq!(child_config_after.metadata, child_config.metadata);
-    assert_eq!(child_config_after.mcp_manifest, child_config.mcp_manifest);
-    assert_eq!(
-        result.source_leaf_id.as_deref(),
-        source_before.active_leaf_id.as_deref()
-    );
-    let queue = store
-        .queue_state("context-fork-child")
-        .await
-        .expect("child queue loads");
-    assert_eq!(queue.queued_inputs.len(), 1);
-    assert_eq!(queue.queued_inputs[0].priority, InputPriority::FollowUp);
-    assert_eq!(
-        queue.queued_inputs[0].content.as_text(),
-        Some(task.as_text().expect("task text"))
-    );
-    assert!(store
-        .context_fork_workspace_reservations(None, "another-owner")
-        .await
-        .expect("reservations load")
-        .is_empty());
-    db.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn cleanup_pending_reservation_is_fenced_and_removes_existing_child_atomically() {
-    let Some(db) = test_store().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let store = &db.store;
-    let project_id = Uuid::new_v4();
-    store
-        .create_project(
-            project_id,
-            "cleanup reservation test",
-            "runtime-test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("project creates");
-    let parent_id = "cleanup-parent";
-    let child_id = "cleanup-child";
-    let config = create_session(store, project_id, parent_id, false).await;
-    let mut child_config = config.clone();
-    child_config.workspace_id = "cleanup-workspace".to_string();
-    store
-        .reserve_context_fork_workspace(
-            child_id,
-            parent_id,
-            &config.runtime_id,
-            &child_config.workspace_id,
-            "cleanup-owner",
-        )
-        .await
-        .expect("reservation creates");
-    store
-        .start_session_outputs_with_parent(
-            child_id,
-            &child_config,
-            &[],
-            None,
-            &[],
-            &[],
-            InputPriority::FollowUp,
-            &UserMessage::text("cleanup child task"),
-            None,
-            Some(parent_id),
-            Some(crate::SubagentType::ReadOnly),
-            None,
-        )
-        .await
-        .expect("read-only child commits");
-    store
-        .mark_context_fork_workspace_cleanup_pending(
-            child_id,
-            parent_id,
-            &config.runtime_id,
-            &child_config.workspace_id,
-            "cleanup-owner",
-        )
-        .await
-        .expect("cleanup state marks");
-    let reservations = store
-        .context_fork_workspace_reservations(None, "other-owner")
-        .await
-        .expect("reservations load");
-    assert_eq!(reservations[0].state, "cleanup_pending");
-    assert!(!store
-        .complete_context_fork_workspace_cleanup(
-            child_id,
-            parent_id,
-            &config.runtime_id,
-            &child_config.workspace_id,
-            "wrong-owner",
-        )
-        .await
-        .expect("wrong owner is fenced"));
-    assert!(store.session_exists(child_id).await.expect("child remains"));
-    assert_eq!(
-        store
-            .context_fork_workspace_reservations(None, "other-owner")
-            .await
-            .expect("reservation remains")
-            .len(),
-        1
-    );
-    assert!(store
-        .complete_context_fork_workspace_cleanup(
-            child_id,
-            parent_id,
-            &config.runtime_id,
-            &child_config.workspace_id,
-            "cleanup-owner",
-        )
-        .await
-        .expect("cleanup completes"));
-    assert!(!store.session_exists(child_id).await.expect("child lookup"));
-    assert!(store
-        .context_fork_workspace_reservations(None, "other-owner")
-        .await
-        .expect("reservations reload")
-        .is_empty());
-    db.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn materializing_reservation_with_existing_child_is_not_cleanup_pending() {
-    let Some(db) = test_store().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let store = &db.store;
-    let project_id = Uuid::new_v4();
-    store
-        .create_project(
-            project_id,
-            "materializing reservation test",
-            "runtime-test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("project creates");
-    let parent_id = "materializing-parent";
-    let child_id = "materializing-child";
-    let config = create_session(store, project_id, parent_id, false).await;
-    store
-        .reserve_context_fork_workspace(
-            child_id,
-            parent_id,
+        .begin_workspace_provisioning(
+            owner_session_id,
             &config.runtime_id,
             &config.workspace_id,
-            "materializing-owner",
+            &generation,
+            owner_kind,
+            300,
         )
         .await
-        .expect("reservation creates");
+        .expect("workspace provisioning begins");
     store
-        .create_session(child_id, &config)
+        .finish_workspace_provisioning(
+            owner_session_id,
+            &config.runtime_id,
+            &config.workspace_id,
+            &generation,
+            &config.workspaces,
+        )
         .await
-        .expect("child creates");
-    let reservations = store
-        .context_fork_workspace_reservations(None, "other-owner")
-        .await
-        .expect("reservations load");
-    assert_eq!(reservations.len(), 1);
-    assert_eq!(reservations[0].state, "materializing");
-    assert!(store.session_exists(child_id).await.expect("child lookup"));
-    db.cleanup().await;
+        .expect("workspace provisioning finishes")
 }
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
-async fn stale_materializing_read_only_child_reservation_is_adopted_and_cleaned_up() {
+async fn context_fork_excludes_in_progress_parent_delegation_tool_call() {
     let Some(db) = test_store().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -351,164 +66,391 @@ async fn stale_materializing_read_only_child_reservation_is_adopted_and_cleaned_
     store
         .create_project(
             project_id,
-            "stale materializing adoption test",
+            "completed context boundary test",
             "runtime-test",
             &[],
             json!({}),
         )
         .await
         .expect("project creates");
-    let parent_id = "adoption-parent";
-    let child_id = "adoption-child";
-    let parent_config = create_session(store, project_id, parent_id, false).await;
-    let mut child_config = parent_config.clone();
-    child_config.workspace_id = "adoption-workspace".to_string();
-    store
-        .reserve_context_fork_workspace(
-            child_id,
-            parent_id,
-            &child_config.runtime_id,
-            &child_config.workspace_id,
-            "old-daemon-owner",
-        )
-        .await
-        .expect("reservation creates");
-    store
-        .start_session_outputs_with_parent(
-            child_id,
-            &child_config,
-            &[],
-            None,
-            &[],
-            &[],
-            InputPriority::FollowUp,
-            &UserMessage::text("fresh child task"),
-            None,
-            Some(parent_id),
-            Some(crate::SubagentType::ReadOnly),
-            None,
-        )
-        .await
-        .expect("fresh read-only child commits");
-    sqlx::query(
-        "update context_fork_workspace_reservations
-         set created_at=now() - interval '10 minutes'
-         where child_session_id=$1",
-    )
-    .bind(child_id)
-    .execute(&store.pool)
-    .await
-    .expect("reservation becomes stale");
-
-    let adopted = store
-        .adopt_stale_context_fork_workspace_reservations(
-            &parent_config.runtime_id,
-            "new-daemon-owner",
-            300,
-        )
-        .await
-        .expect("stale reservation adopts");
-    assert_eq!(adopted.len(), 1);
-    assert_eq!(adopted[0].owner_id, "new-daemon-owner");
-    assert_eq!(adopted[0].state, "materializing");
-    assert!(store.session_exists(child_id).await.expect("child remains"));
-    assert!(store
-        .adopt_stale_context_fork_workspace_reservations(
-            &parent_config.runtime_id,
-            "new-daemon-owner",
-            300,
-        )
-        .await
-        .expect("repeated adoption is idempotent")
-        .is_empty());
-
-    // The new daemon can now use the ordinary terminal cleanup fence. This
-    // models successful destruction of the exact workspace before completion.
-    store
-        .mark_context_fork_workspace_cleanup_pending(
-            child_id,
-            parent_id,
-            &parent_config.runtime_id,
-            &child_config.workspace_id,
-            "new-daemon-owner",
-        )
-        .await
-        .expect("adopted reservation enters cleanup");
-    assert!(store
-        .complete_context_fork_workspace_cleanup(
-            child_id,
-            parent_id,
-            &parent_config.runtime_id,
-            &child_config.workspace_id,
-            "new-daemon-owner",
-        )
-        .await
-        .expect("adopted reservation cleans up"));
-    assert!(!store.session_exists(child_id).await.expect("child removed"));
-    assert!(store
-        .context_fork_workspace_reservations(None, "another-owner")
-        .await
-        .expect("reservations reload")
-        .is_empty());
-    db.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn context_fork_transaction_rollback_keeps_workspace_reservation() {
-    let Some(db) = test_store().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
+    let parent_id = "context-open-delegation-parent";
+    let config = create_session(store, project_id, parent_id, true).await;
+    let delegation_call = ToolCall {
+        id: ToolCallId::new("call_delegate_in_progress"),
+        tool_name: "delegate_readonly_fanout".to_string(),
+        args_json: r#"{"tasks":[{"role":"reviewer","prompt":"inspect"}]}"#.to_string(),
     };
-    let store = &db.store;
-    let project_id = Uuid::new_v4();
     store
-        .create_project(
-            project_id,
-            "context fork rollback test",
-            "runtime-test",
-            &[],
-            json!({}),
+        .persist_outputs(
+            parent_id,
+            OutputBatch::new(
+                &[
+                    entry(
+                        "open-start",
+                        Some("finish"),
+                        TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+                    ),
+                    entry(
+                        "open-user",
+                        Some("open-start"),
+                        TranscriptItem::UserMessage(UserMessage::text("delegate this")),
+                    ),
+                    entry(
+                        "open-assistant",
+                        Some("open-user"),
+                        TranscriptItem::AssistantMessage(AssistantMessage {
+                            items: vec![AssistantItem::ToolCall(delegation_call)],
+                        }),
+                    ),
+                ],
+                Some("open-assistant"),
+                &[],
+                &[],
+            ),
         )
         .await
-        .expect("project creates");
-    let source_session_id = "context-fork-rollback-source";
-    let child_config = create_session(store, project_id, source_session_id, true).await;
-    let child_session_id = "context-fork-rollback-child";
-    store
-        .reserve_context_fork_workspace(
-            child_session_id,
-            source_session_id,
-            &child_config.runtime_id,
-            &child_config.workspace_id,
-            "context-fork-rollback-test",
-        )
-        .await
-        .expect("workspace reservation creates");
-    store
-        .create_session(child_session_id, &child_config)
-        .await
-        .expect("duplicate child setup creates");
-    let task = UserMessage::text("rollback");
-    assert!(store
+        .expect("open delegation turn persists");
+
+    let task = UserMessage::text("inspect the completed conversation");
+    let result = store
         .create_context_fork(CreateContextForkRequest {
-            source_session_id,
-            child_session_id,
-            reservation_owner_id: Some("context-fork-rollback-test"),
-            config: &child_config,
-            parent_session_id: source_session_id,
-            subagent_type: crate::SubagentType::ReadOnly,
+            child_session_id: "context-open-delegation-child",
+            config: &config,
+            parent_session_id: parent_id,
+            subagent_type: crate::SubagentType::Full,
             delegation_id: None,
             task: &task,
+            workspace: None,
         })
         .await
-        .is_err());
-    let reservations = store
-        .context_fork_workspace_reservations(None, "other-owner")
+        .expect("context fork commits");
+
+    assert_eq!(result.active_leaf_id.as_deref(), Some("finish"));
+    let stored = store
+        .load_stored_session("context-open-delegation-child")
         .await
-        .expect("reservations load");
-    assert_eq!(reservations.len(), 1);
-    assert_eq!(reservations[0].child_session_id, child_session_id);
+        .expect("child loads");
+    assert_eq!(stored.active_leaf_id.as_deref(), Some("finish"));
+    assert!(stored
+        .entries
+        .iter()
+        .all(|entry| !entry.id.starts_with("open-")));
+    let child = AgentSession::from_stored_session(stored).expect("child history rehydrates");
+    assert!(child
+        .model_context()
+        .transcript_items()
+        .iter()
+        .all(|item| !matches!(
+            item,
+            TranscriptItem::AssistantMessage(message)
+                if message
+                    .tool_calls()
+                    .any(|call| call.tool_name.starts_with("delegate_"))
+        )));
+    let queue = store
+        .queue_state("context-open-delegation-child")
+        .await
+        .expect("delegated task queued");
+    assert_eq!(queue.queued_inputs.len(), 1);
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn private_workspace_cleanup_routes_root_full_and_read_only_sessions() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "workspace routing test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+
+    let mut root_config = session_config(project_id);
+    root_config.workspace_id = "workspace-root-private".to_string();
+    let root_workspace = prepare_test_workspace(
+        store,
+        "workspace-root-session",
+        &root_config,
+        WorkspaceOwnerKind::Root,
+    )
+    .await;
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            "workspace-root-session",
+            &root_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("root"),
+            None,
+            None,
+            None,
+            None,
+            Some(root_workspace.attachment()),
+        )
+        .await
+        .expect("root session attaches");
+
+    let mut full_config = root_config.clone();
+    full_config.metadata = json!({ "delegation_spawn_index": 0 });
+    store
+        .start_session_outputs_with_parent(
+            "workspace-full-child",
+            &full_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("full"),
+            None,
+            Some("workspace-root-session"),
+            Some(crate::SubagentType::Full),
+            None,
+        )
+        .await
+        .expect("full child creates");
+    assert!(!store
+        .request_session_workspace_cleanup(
+            "workspace-full-child",
+            crate::WorkspaceCleanupMode::DeleteSession,
+        )
+        .await
+        .expect("full cleanup routes"));
+    assert!(store
+        .delete_session("workspace-full-child")
+        .await
+        .expect("full identity deletes"));
+    assert!(store
+        .session_exists("workspace-root-session")
+        .await
+        .expect("root remains"));
+
+    let mut read_only_config = root_config.clone();
+    read_only_config.workspace_id = "workspace-read-only-private".to_string();
+    let read_only_workspace = prepare_test_workspace(
+        store,
+        "workspace-read-only-child",
+        &read_only_config,
+        WorkspaceOwnerKind::ReadOnly,
+    )
+    .await;
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            "workspace-read-only-child",
+            &read_only_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("readonly"),
+            None,
+            Some("workspace-root-session"),
+            Some(crate::SubagentType::ReadOnly),
+            None,
+            Some(read_only_workspace.attachment()),
+        )
+        .await
+        .expect("read-only child attaches");
+    assert!(store
+        .request_session_workspace_cleanup(
+            "workspace-read-only-child",
+            crate::WorkspaceCleanupMode::RetainSession,
+        )
+        .await
+        .expect("read-only cleanup intent persists"));
+    let read_only_claim = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("read-only cleanup claims")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == "workspace-read-only-child")
+        .expect("read-only resource claimed");
+    assert!(store
+        .complete_workspace_cleanup(&read_only_claim)
+        .await
+        .expect("read-only cleanup completes"));
+    assert!(store
+        .session_exists("workspace-read-only-child")
+        .await
+        .expect("read-only transcript retained"));
+    assert_eq!(
+        store
+            .workspace_resource_for_session("workspace-read-only-child")
+            .await
+            .expect("read-only tombstone loads")
+            .expect("read-only tombstone exists")
+            .state,
+        crate::WorkspaceResourceState::Deleted
+    );
+    assert!(store
+        .request_session_workspace_cleanup(
+            "workspace-read-only-child",
+            crate::WorkspaceCleanupMode::DeleteSession,
+        )
+        .await
+        .expect("retained read-only identity deletes"));
+    assert!(!store
+        .session_exists("workspace-read-only-child")
+        .await
+        .expect("read-only identity gone"));
+
+    assert!(store
+        .request_session_workspace_cleanup(
+            "workspace-root-session",
+            crate::WorkspaceCleanupMode::DeleteSession,
+        )
+        .await
+        .expect("root cleanup intent persists"));
+    let root_claim = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("root cleanup claims")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == "workspace-root-session")
+        .expect("root resource claimed");
+    assert!(store
+        .complete_workspace_cleanup(&root_claim)
+        .await
+        .expect("root cleanup completes"));
+    assert!(!store
+        .session_exists("workspace-root-session")
+        .await
+        .expect("root identity gone"));
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn workspace_reconciliation_adopts_exact_owner_and_retries_offline_cleanup() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "workspace recovery test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let mut config = session_config(project_id);
+    config.workspace_id = "workspace-recovery-private".to_string();
+    let prepared = prepare_test_workspace(
+        store,
+        "workspace-recovery-session",
+        &config,
+        WorkspaceOwnerKind::Root,
+    )
+    .await;
+    // Simulate a restart between session commit and attachment. Reconciliation
+    // adopts the exact identity immediately, without waiting for the lease or a
+    // second runtime Hello.
+    store
+        .create_session("workspace-recovery-session", &config)
+        .await
+        .expect("session commits without attachment");
+    store
+        .reconcile_workspace_resources()
+        .await
+        .expect("exact owner adopts");
+    let adopted = store
+        .workspace_resource_for_session("workspace-recovery-session")
+        .await
+        .expect("resource loads")
+        .expect("resource exists");
+    assert_eq!(adopted.state, crate::WorkspaceResourceState::Ready);
+
+    assert!(store
+        .request_workspace_cleanup_exact(
+            &prepared.owner_session_id,
+            &prepared.runtime_id,
+            &prepared.workspace_id,
+            &prepared.generation,
+            crate::WorkspaceCleanupMode::DeleteSession,
+        )
+        .await
+        .expect("cleanup persists"));
+    let claim = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("cleanup claims")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == "workspace-recovery-session")
+        .expect("resource claimed");
+    store
+        .record_workspace_cleanup_failure(&claim, "runtime unavailable")
+        .await
+        .expect("offline failure records");
+    let pending = store
+        .workspace_resource_for_session("workspace-recovery-session")
+        .await
+        .expect("pending resource loads")
+        .expect("pending resource exists");
+    assert_eq!(pending.state, crate::WorkspaceResourceState::Deleting);
+    assert!(store
+        .session_exists("workspace-recovery-session")
+        .await
+        .expect("identity retained while offline"));
+    assert!(store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("immediate duplicate claim fenced")
+        .is_empty());
+
+    store
+        .begin_workspace_provisioning(
+            "workspace-abandoned-session",
+            &config.runtime_id,
+            "workspace-abandoned-private",
+            "workspace-abandoned-generation",
+            WorkspaceOwnerKind::Root,
+            1,
+        )
+        .await
+        .expect("abandoned provisioning intent persists");
+    store
+        .reconcile_workspace_resources()
+        .await
+        .expect("quick restart reconciliation runs before lease expiry");
+    assert_eq!(
+        store
+            .workspace_resource_for_session("workspace-abandoned-session")
+            .await
+            .expect("pre-expiry resource loads")
+            .expect("pre-expiry resource exists")
+            .state,
+        crate::WorkspaceResourceState::Provisioning
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    store
+        .reconcile_workspace_resources()
+        .await
+        .expect("periodic reconciliation expires lease without another Hello");
+    let abandoned = store
+        .workspace_resource_for_session("workspace-abandoned-session")
+        .await
+        .expect("abandoned resource loads")
+        .expect("abandoned resource exists");
+    assert_eq!(abandoned.state, crate::WorkspaceResourceState::Deleting);
     db.cleanup().await;
 }
 
@@ -597,6 +539,13 @@ async fn create_fork_copies_full_forest_and_replay_without_mutating_source() {
         "first-finish".to_string(),
         "compaction".to_string(),
     ];
+    let workspace = prepare_test_workspace(
+        store,
+        "fork-child",
+        &child_config,
+        WorkspaceOwnerKind::HistoryFork,
+    )
+    .await;
 
     let result = store
         .create_fork(CreateForkRequest {
@@ -610,6 +559,7 @@ async fn create_fork_copies_full_forest_and_replay_without_mutating_source() {
                 expected_transcript_revision: Some(revision),
                 expected_active_branch_entry_ids: Some(&target_branch_ids),
             },
+            workspace: workspace.attachment(),
         })
         .await
         .expect("fork creates");
@@ -829,12 +779,20 @@ async fn fork(
     config: &SessionConfig,
     target: HistoryTarget<'_>,
 ) -> anyhow::Result<()> {
+    let workspace = prepare_test_workspace(
+        store,
+        child_session_id,
+        config,
+        WorkspaceOwnerKind::HistoryFork,
+    )
+    .await;
     store
         .create_fork(CreateForkRequest {
             source_session_id,
             child_session_id,
             config,
             target,
+            workspace: workspace.attachment(),
         })
         .await
         .map(|_| ())

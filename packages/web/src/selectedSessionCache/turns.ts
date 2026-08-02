@@ -1,5 +1,11 @@
 import { displayParentIdForEntry } from "../displayParent.ts";
-import type { TranscriptEntry, TranscriptItem, TranscriptTurnsResult, TurnCard } from "../types.ts";
+import type {
+	TranscriptEntry,
+	TranscriptItem,
+	TranscriptTurnDetailResult,
+	TranscriptTurnsResult,
+	TurnCard,
+} from "../types.ts";
 import { mergeEntryBodies, selectedEntriesFromIds, sameStringArray, uniqueStringArray } from "./entries.ts";
 import type { SelectedSessionCache } from "./types.ts";
 
@@ -161,16 +167,107 @@ export interface ApplyTurnDetailResult {
 	applied: boolean;
 }
 
-export function applyTurnDetail(cache: SelectedSessionCache, sessionId: string, turnId: string, entries: TranscriptEntry[]): ApplyTurnDetailResult {
-	if (cache.sessionId !== sessionId) return { cache, applied: false };
-	const card = cache.turnCardsById.get(turnId);
-	const lastEntryId = entries.at(-1)?.id ?? null;
-	if (!card || !lastEntryId) return { cache, applied: false };
+export interface TurnDetailRequestFence {
+	requestId: number;
+	sessionId: string;
+	cardId: string;
+	transcriptRevision: number | null;
+	activeLeafId: string | null;
+}
+
+export function captureTurnDetailRequest(
+	cache: SelectedSessionCache,
+	cardId: string,
+	requestId: number,
+): TurnDetailRequestFence {
+	return {
+		requestId,
+		sessionId: cache.sessionId ?? "",
+		cardId,
+		transcriptRevision: cache.snapshot?.transcript_revision ?? cache.turnTranscriptRevision,
+		activeLeafId: cache.snapshot?.active_leaf_id ?? cache.turnActiveLeafId,
+	};
+}
+
+export function applyTurnDetail(
+	cache: SelectedSessionCache,
+	result: TranscriptTurnDetailResult,
+	fence: TurnDetailRequestFence,
+	latestRequestId?: number,
+): ApplyTurnDetailResult;
+export function applyTurnDetail(
+	cache: SelectedSessionCache,
+	sessionId: string,
+	turnId: string,
+	entries: TranscriptEntry[],
+): ApplyTurnDetailResult;
+export function applyTurnDetail(
+	cache: SelectedSessionCache,
+	resultOrSessionId: TranscriptTurnDetailResult | string,
+	fenceOrTurnId: TurnDetailRequestFence | string,
+	latestRequestIdOrEntries?: number | TranscriptEntry[],
+): ApplyTurnDetailResult {
+	const legacy = typeof resultOrSessionId === "string";
+	const result: TranscriptTurnDetailResult = legacy
+		? {
+				session_id: resultOrSessionId,
+				card_id: fenceOrTurnId as string,
+				entries: (latestRequestIdOrEntries ?? []) as TranscriptEntry[],
+				active_leaf_id: cache.snapshot?.active_leaf_id ?? cache.turnActiveLeafId,
+				session_revision: cache.snapshot?.session_revision ?? 0,
+				transcript_revision: cache.snapshot?.transcript_revision ?? cache.turnTranscriptRevision ?? 0,
+			}
+		: resultOrSessionId;
+	const fence: TurnDetailRequestFence = legacy
+		? captureTurnDetailRequest(cache, fenceOrTurnId as string, 0)
+		: fenceOrTurnId as TurnDetailRequestFence;
+	const latestRequestId = legacy
+		? 0
+		: (latestRequestIdOrEntries as number | undefined) ?? fence.requestId;
+	if (
+		cache.sessionId !== fence.sessionId ||
+		result.session_id !== fence.sessionId ||
+		result.card_id !== fence.cardId
+	) return { cache, applied: false };
+	const entriesById = mergeEntryBodies(cache.entriesById, result.entries);
+	const historyOnly = latestRequestId !== fence.requestId;
+	const card = cache.turnCardsById.get(result.card_id);
+	const lastEntryId = result.entries.at(-1)?.id ?? null;
+	if (!card || !lastEntryId || historyOnly) {
+		return {
+			cache: entriesById === cache.entriesById ? cache : { ...cache, entriesById },
+			applied: false,
+		};
+	}
+	const currentRevision = cache.snapshot?.transcript_revision ?? cache.turnTranscriptRevision;
+	const currentLeaf = cache.snapshot?.active_leaf_id ?? cache.turnActiveLeafId;
+	const responseWasCurrentAtRequest =
+		result.transcript_revision >= (fence.transcriptRevision ?? -1) &&
+		result.active_leaf_id === fence.activeLeafId;
+	const cacheAdvanced =
+		(currentRevision ?? -1) > (fence.transcriptRevision ?? -1) ||
+		currentLeaf !== fence.activeLeafId;
 	const acceptsPartialOpenTurn = card.status === "open";
-	if (lastEntryId !== card.active_leaf_id && !acceptsPartialOpenTurn) return { cache, applied: false };
-	const entriesById = mergeEntryBodies(cache.entriesById, entries);
+	if (
+		lastEntryId !== card.active_leaf_id &&
+		!acceptsPartialOpenTurn &&
+		!(cacheAdvanced && responseWasCurrentAtRequest)
+	) {
+		return {
+			cache: entriesById === cache.entriesById ? cache : { ...cache, entriesById },
+			applied: false,
+		};
+	}
 	const turnDetailsById = new Map(cache.turnDetailsById);
-	turnDetailsById.set(turnId, extendTurnDetailEntryIds(entries.map((entry) => entry.id), card, entriesById));
+	const ids = uniqueStringArray([
+		...result.entries.map((entry) => entry.id),
+		...(cache.turnDetailsById.get(result.card_id) ?? []),
+	]).sort((left, right) => {
+		const leftSequence = entriesById.get(left)?.sequence ?? Number.MAX_SAFE_INTEGER;
+		const rightSequence = entriesById.get(right)?.sequence ?? Number.MAX_SAFE_INTEGER;
+		return leftSequence - rightSequence;
+	});
+	turnDetailsById.set(result.card_id, extendTurnDetailEntryIds(ids, card, entriesById));
 	return {
 		cache: {
 			...cache,

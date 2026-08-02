@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use agent_session::{SessionAction, SessionActionKind, SessionEvent};
 use agent_vocab::TranscriptItem;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::{Executor, Postgres, Row, Transaction};
 
@@ -320,14 +320,24 @@ pub(super) async fn insert_session_event_tx(
         ]),
         SessionEvent::ActionRequested { action } => {
             let (kind, action_id, _, payload) = action_payload(action)?;
-            let row_id = action_rows.get(&ActionKey::new(kind, action_id)).cloned();
-            let mut frames = vec![insert_event_with_activity_tx(
-                tx,
-                session_id,
-                EventType::ActionRequested,
-                json!({ "kind": kind, "action_id": action_id, "action_row_id": row_id, "payload": payload }),
-            )
-            .await?];
+            let row_id = action_rows
+                .get(&ActionKey::new(kind, action_id))
+                .ok_or_else(|| anyhow!("requested action is missing its durable row identity"))?;
+            let mut frames = vec![
+                insert_event_with_activity_tx(
+                    tx,
+                    session_id,
+                    EventType::ActionRequested,
+                    json!({
+                        "kind": kind,
+                        "action_id": action_id,
+                        "action_row_id": row_id,
+                        "status": "pending",
+                        "payload": payload
+                    }),
+                )
+                .await?,
+            ];
             let event_name = match action {
                 SessionAction::RequestModel { .. } => Some(EventType::ModelRequested),
                 SessionAction::RequestTool { .. } => Some(EventType::ToolRequested),
@@ -347,31 +357,64 @@ pub(super) async fn insert_session_event_tx(
             Ok(frames)
         }
         SessionEvent::ActionCompleted { kind, id } => {
-            let event_name = match kind {
-                SessionActionKind::Model => EventType::ModelCompleted,
-                SessionActionKind::Tool => EventType::ToolCompleted,
+            let kind = match kind {
+                SessionActionKind::Model => crate::ActionKind::Model,
+                SessionActionKind::Tool => crate::ActionKind::Tool,
             };
+            let event_name = match kind {
+                crate::ActionKind::Model => EventType::ModelCompleted,
+                crate::ActionKind::Tool => EventType::ToolCompleted,
+                crate::ActionKind::Compaction => unreachable!("session events have no compaction"),
+            };
+            let action_id = id
+                .parse::<i64>()
+                .map_err(|_| anyhow!("completed action has an invalid action id: {id}"))?;
+            let action_row_id = action_rows
+                .get(&ActionKey::new(kind, action_id))
+                .ok_or_else(|| anyhow!("completed action is missing its durable row identity"))?;
             Ok(vec![
                 insert_event_with_activity_tx(
                     tx,
                     session_id,
                     event_name,
-                    json!({ "action_id": id }),
+                    json!({
+                        "kind": kind,
+                        "action_id": id,
+                        "action_row_id": action_row_id,
+                        "status": "completed"
+                    }),
                 )
                 .await?,
             ])
         }
         SessionEvent::ActionFailed { kind, id, error } => {
-            let event_name = match kind {
-                SessionActionKind::Model => EventType::ModelError,
-                SessionActionKind::Tool => EventType::ToolError,
+            let kind = match kind {
+                SessionActionKind::Model => crate::ActionKind::Model,
+                SessionActionKind::Tool => crate::ActionKind::Tool,
             };
+            let event_name = match kind {
+                crate::ActionKind::Model => EventType::ModelError,
+                crate::ActionKind::Tool => EventType::ToolError,
+                crate::ActionKind::Compaction => unreachable!("session events have no compaction"),
+            };
+            let action_id = id
+                .parse::<i64>()
+                .map_err(|_| anyhow!("failed action has an invalid action id: {id}"))?;
+            let action_row_id = action_rows
+                .get(&ActionKey::new(kind, action_id))
+                .ok_or_else(|| anyhow!("failed action is missing its durable row identity"))?;
             Ok(vec![
                 insert_event_with_activity_tx(
                     tx,
                     session_id,
                     event_name,
-                    json!({ "action_id": id, "error": error }),
+                    json!({
+                        "kind": kind,
+                        "action_id": id,
+                        "action_row_id": action_row_id,
+                        "status": "error",
+                        "error": error
+                    }),
                 )
                 .await?,
             ])

@@ -72,6 +72,30 @@ describe("assistantRenderParts", () => {
 			]
 		});
 	});
+
+	it("does not mark a completed tool group live while its turn awaits model continuation", () => {
+		const entries = [
+			turnStartedEntry("start", 1, 1),
+			userEntryWithParent("user", "start", "run both"),
+			assistantToolEntry("assistant", "user", [
+				toolCall("call_1", "Bash"),
+				toolCall("call_2", "WebSearch"),
+			]),
+			toolResultEntry("result_1", "assistant", "call_1", "Bash", "ok"),
+			toolResultEntry("result_2", "result_1", "call_2", "WebSearch", "ok"),
+		];
+		const group = deriveTranscriptDisplayNodes(entries)
+			.find((node) => node.type === "tool_group");
+		expect(group).toMatchObject({
+			type: "tool_group",
+			turnOpen: true,
+			isLive: false,
+			items: [
+				expect.objectContaining({ statusKind: "success" }),
+				expect.objectContaining({ statusKind: "success" }),
+			],
+		});
+	});
 });
 
 describe("transcript display model", () => {
@@ -1180,7 +1204,33 @@ describe("MessageList Working indicator", () => {
 			/>
 		);
 
-		expect(html).toContain("Working (");
+		expect(html).toContain("Generating response (");
+	});
+
+	it("switches from live parallel tools to response generation before session idle", () => {
+		const now = Date.now();
+		const baseProps = {
+			entries: [turnStartedEntry("entry_turn", 1, now - 5_000)],
+			activeLeafId: "entry_turn",
+			isRunning: true,
+			serverTimeMs: now,
+			hasSession: true,
+			sessionId: "session_a",
+			entriesSessionId: "session_a",
+		};
+		const running = renderToStaticMarkup(
+			<MessageList
+				{...baseProps}
+				pendingActions={[
+					{ action_row_id: "action_1", kind: "tool", status: "running", payload: { id: "call_1", name: "Bash" } },
+					{ action_row_id: "action_2", kind: "tool", status: "running", payload: { id: "call_2", name: "WebSearch" } },
+				]}
+			/>,
+		);
+		expect(running).toContain("Working (");
+		const completed = renderToStaticMarkup(<MessageList {...baseProps} pendingActions={[]} />);
+		expect(completed).toContain("Generating response (");
+		expect(completed).not.toContain("Working (");
 	});
 
 	it("uses the current turn card start timestamp without loading turn detail", () => {
@@ -1221,7 +1271,7 @@ describe("MessageList Working indicator", () => {
 			/>
 		);
 
-		expect(html).toContain("Working (");
+		expect(html).toContain("Generating response (");
 		expect(html).toContain("do it");
 	});
 

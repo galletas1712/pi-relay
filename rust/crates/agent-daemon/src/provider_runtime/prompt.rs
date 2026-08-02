@@ -272,7 +272,15 @@ pub(super) struct SkillFrontmatter {
     #[serde(default)]
     pub(super) skills: Vec<String>,
     #[serde(default)]
-    pub(super) context: Option<String>,
+    pub(super) context: RoleContextPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RoleContextPolicy {
+    #[default]
+    Fresh,
+    Forked,
 }
 
 /// Build the skill catalog from the runtime's raw `SKILL.md` set. `None`
@@ -304,14 +312,20 @@ pub(super) fn parse_runtime_skills(raw: &[RawSkillFile]) -> Vec<Skill> {
 /// Parse `SKILL.md` contents into name/description/body. Returns `None` when the
 /// frontmatter lacks a non-empty name or description.
 pub(super) fn parse_skill_contents(raw: &str) -> Option<ParsedSkillFile> {
+    parse_skill_contents_result(raw).ok()
+}
+
+pub(super) fn parse_skill_contents_result(raw: &str) -> anyhow::Result<ParsedSkillFile> {
     let (frontmatter, body) = split_frontmatter(raw);
-    let frontmatter: SkillFrontmatter = serde_yaml::from_str(frontmatter?).ok()?;
+    let frontmatter = frontmatter.ok_or_else(|| anyhow::anyhow!("missing YAML frontmatter"))?;
+    let frontmatter: SkillFrontmatter = serde_yaml::from_str(frontmatter)
+        .map_err(|error| anyhow::anyhow!("invalid YAML frontmatter: {error}"))?;
     let name = frontmatter.name.trim().to_string();
     let description = frontmatter.description.trim().to_string();
     if name.is_empty() || description.is_empty() {
-        return None;
+        anyhow::bail!("frontmatter name and description must not be empty");
     }
-    Some(ParsedSkillFile {
+    Ok(ParsedSkillFile {
         name,
         description,
         body: body.trim().to_string(),

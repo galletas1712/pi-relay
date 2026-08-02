@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -649,24 +649,35 @@ impl PostgresAgentStore {
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
-        let query = "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and status='pending'";
+        let query = r#"
+            update actions
+            set status='running', updated_at=now()
+            where session_id=$1 and id=$2::text and attempt_id=$3::text
+              and status='pending'
+            returning kind, action_id, payload
+        "#;
         let updated = sqlx::query(query)
             .bind(session_id)
             .bind(action_row_id)
             .bind(attempt_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        if updated != 1 {
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(updated) = updated else {
             tx.commit().await?;
             return Ok(Vec::new());
-        }
+        };
         bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_with_activity_tx(
             &mut tx,
             session_id,
             event_type,
-            json!({ "action_row_id": action_row_id }),
+            json!({
+                "action_row_id": action_row_id,
+                "action_id": updated.get::<i64, _>("action_id"),
+                "kind": updated.get::<String, _>("kind"),
+                "status": "running",
+                "payload": updated.get::<Value, _>("payload"),
+            }),
         )
         .await?;
         tx.commit().await?;
@@ -732,6 +743,8 @@ impl PostgresAgentStore {
             EventType::ModelError,
             serde_json::json!({
                 "action_row_id": intent.row_id,
+                "kind": ActionKind::Model,
+                "status": ActionStatus::Error,
                 "error": error,
             }),
         )
@@ -960,6 +973,8 @@ impl PostgresAgentStore {
             EventType::ModelError,
             serde_json::json!({
                 "action_row_id": action_row_id,
+                "kind": ActionKind::Model,
+                "status": ActionStatus::Error,
                 "error": error,
             }),
         )

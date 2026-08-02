@@ -21,6 +21,7 @@ mod session_start;
 mod state;
 mod subagents;
 mod types;
+mod workspace_lifecycle;
 mod workspace_selection;
 
 use crate::browser_websocket::{accept, handshake_semaphore, BrowserWebSocket};
@@ -106,20 +107,19 @@ async fn main() -> Result<()> {
     // Install before accepting runtime connections so a Hello that races boot
     // still redrives durable queued work that the one-shot boot sweep missed.
     install_runtime_online_queued_redrive(&state);
+    workspace_lifecycle::spawn_reconciler(&state);
+    delegation_tools::spawn_cancelling_delegation_reconciler(&state);
     tokio::spawn(runtime_hosts.listen(config.runtime_bind.clone()));
 
-    // Teardown owns every child of a cancelling delegation. Finish it before
-    // controls, action recovery, post-compaction recovery, or any other child
-    // driver can run. Fail startup closed if even one teardown cannot finish.
-    delegation_tools::reconcile_cancelling_delegations_on_boot(&state)
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "boot cancelling-delegation reconciliation failed: {}: {}",
-                error.code,
-                error.message
-            )
-        })?;
+    // Logical teardown is durable. Startup must remain available while a
+    // runtime is offline; periodic recovery will retry unfinished cancellation
+    // and the workspace worker independently finishes physical cleanup.
+    if let Err(error) = delegation_tools::reconcile_cancelling_delegations_on_boot(&state).await {
+        eprintln!(
+            "boot cancelling-delegation reconciliation remains pending: {}: {}",
+            error.code, error.message
+        );
+    }
 
     // Combined controls capture an exact unfinished child action generation.
     // Reconcile them before post-compaction recovery so a committed interrupt
@@ -936,42 +936,34 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
     delete_order.reverse();
     delete_order.push(session_id.clone());
     for candidate_session_id in &delete_order {
-        // Read the exact config/type while the row still exists. Read-only
-        // children own a forked workspace; full children share the parent's
-        // workspace and must never be destroyed here.
-        let config = state.repo.load_session_config(candidate_session_id).await?;
         let subagent_type = state
             .repo
             .session_subagent_type(candidate_session_id)
             .await?;
-        let deleted = if subagent_type == Some(agent_store::SubagentType::ReadOnly) {
-            state
-                .runtime_hosts
-                .cleanup_read_only_workspace(
-                    candidate_session_id,
-                    &state
-                        .repo
-                        .session_parent_id(candidate_session_id)
-                        .await?
-                        .ok_or_else(|| {
-                            RpcError::new(
-                                "session_delete_failed",
-                                "read-only subagent has no parent",
-                            )
-                        })?,
-                    &config.runtime_id,
-                    &config.workspace_id,
-                    true,
-                )
-                .await
-                .map_err(|error| RpcError::new("session_delete_failed", format!("{error:#}")))?;
-            true
-        } else {
+        let owns_workspace = state
+            .repo
+            .workspace_resource_for_session(candidate_session_id)
+            .await?
+            .is_some();
+        let deleted = if owns_workspace {
+            crate::workspace_lifecycle::request_session_cleanup(
+                state,
+                candidate_session_id,
+                agent_store::WorkspaceCleanupMode::DeleteSession,
+            )
+            .await
+            .map_err(|error| RpcError::new("session_delete_failed", format!("{error:#}")))?
+        } else if subagent_type == Some(agent_store::SubagentType::Full) {
             state
                 .repo
                 .delete_session(candidate_session_id)
                 .await
                 .map_err(map_source_mutation_error)?
+        } else {
+            return Err(RpcError::new(
+                "session_delete_failed",
+                "private workspace has no durable ownership mapping; run the workspace migration",
+            ));
         };
         if !deleted && candidate_session_id == &session_id {
             return Err(RpcError::new("session_not_found", "session not found"));
@@ -1438,15 +1430,11 @@ pub(crate) fn install_runtime_online_queued_redrive(state: &AppState) {
     state.runtime_hosts.set_on_online(Arc::new(move |runtime_id| {
         let state = state_for_hook.clone();
         tokio::spawn(async move {
-            if let Err(error) = state
-                .runtime_hosts
-                .reconcile_context_fork_workspace_reservations(&runtime_id)
-                .await
+            if let Err(error) = crate::workspace_lifecycle::reconcile(&state, Some(&runtime_id)).await
             {
                 eprintln!(
-                    "failed to reconcile context-fork workspace reservations after runtime {runtime_id} came online: {error:#}"
+                    "failed to reconcile private workspaces after runtime {runtime_id} came online: {error:#}"
                 );
-                return;
             }
             match state
                 .repo

@@ -216,9 +216,11 @@ pub(super) async fn persist_outputs_tx(
         }));
     }
 
-    if let Some(mut update) = action_update {
-        complete_action_tx(tx, session_id, &mut update, session_events).await?;
-    }
+    let completed_action = if let Some(mut update) = action_update {
+        Some(complete_action_tx(tx, session_id, &mut update, session_events).await?)
+    } else {
+        None
+    };
 
     if let Some(input_id) = control_interrupt_input_id {
         let unfinished_actions = action_is_unfinished(Some("a"));
@@ -366,6 +368,9 @@ pub(super) async fn persist_outputs_tx(
     }
 
     let mut action_rows = HashMap::<ActionKey, String>::new();
+    if let Some((key, row_id)) = completed_action {
+        action_rows.insert(key, row_id);
+    }
     let mut dispatch = Vec::new();
     for action in actions {
         if matches!(action, SessionAction::CancelSessionWork) {
@@ -503,7 +508,7 @@ async fn complete_action_tx(
     session_id: &str,
     update: &mut ActionUpdate,
     session_events: &[SessionEvent],
-) -> Result<()> {
+) -> Result<(ActionKey, String)> {
     let explicit_status = update.status;
     let explicit_result = update.result.clone();
     let lease_owner = update
@@ -543,7 +548,7 @@ async fn complete_action_tx(
                 )
             "#
     );
-    if let Some(row) = sqlx::query(&select_query)
+    let row = sqlx::query(&select_query)
         .bind(session_id)
         .bind(&update.row_id)
         .bind(&update.attempt_id)
@@ -553,30 +558,29 @@ async fn complete_action_tx(
         .fetch_optional(&mut **tx)
         .await
         .context("load action row for completion")?
-    {
-        let row_kind = row_text(&row, "kind")?;
-        let row_action_id: i64 = row.get("action_id");
-        if !matches!(explicit_status, ActionStatus::Error) {
-            for event in session_events {
-                match event {
-                    SessionEvent::ActionCompleted { kind, id }
-                        if action_event_matches_row(row_kind, row_action_id, kind, id) =>
-                    {
-                        update.status = ActionStatus::Completed;
-                    }
-                    SessionEvent::ActionFailed { kind, id, error }
-                        if action_event_matches_row(row_kind, row_action_id, kind, id) =>
-                    {
-                        update.status = ActionStatus::Error;
-                        update.result = json!({ "error": error });
-                    }
-                    _ => {}
+        .ok_or_else(|| anyhow!("action attempt is no longer running: {}", update.row_id))?;
+    let row_kind = row_text(&row, "kind")?;
+    let row_action_id: i64 = row.get("action_id");
+    if !matches!(explicit_status, ActionStatus::Error) {
+        for event in session_events {
+            match event {
+                SessionEvent::ActionCompleted { kind, id }
+                    if action_event_matches_row(row_kind, row_action_id, kind, id) =>
+                {
+                    update.status = ActionStatus::Completed;
                 }
+                SessionEvent::ActionFailed { kind, id, error }
+                    if action_event_matches_row(row_kind, row_action_id, kind, id) =>
+                {
+                    update.status = ActionStatus::Error;
+                    update.result = json!({ "error": error });
+                }
+                _ => {}
             }
-        } else {
-            update.status = explicit_status;
-            update.result = explicit_result;
         }
+    } else {
+        update.status = explicit_status;
+        update.result = explicit_result;
     }
 
     let update_query = format!(
@@ -626,7 +630,10 @@ async fn complete_action_tx(
             update.row_id
         ));
     }
-    Ok(())
+    Ok((
+        ActionKey::new(row_kind, row_action_id),
+        update.row_id.clone(),
+    ))
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ import type { SelectedSessionCache } from "./selectedSessionCache/types.ts";
 import type {
 	ActiveBranchSyncResponse,
 	EventFrame,
+	PendingAction,
 	QueueProjection,
 	QueuedInput,
 	SessionSnapshot,
@@ -29,6 +30,7 @@ export type { SelectedSessionCache } from "./selectedSessionCache/types.ts";
 export {
 	applyTranscriptTurns,
 	applyTurnDetail,
+	captureTurnDetailRequest,
 	prependTranscriptTurns,
 	turnCardsInOrder,
 	turnDetailEntries,
@@ -57,6 +59,83 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		turnActiveLeafId: null,
 		turnHasMoreBefore: false,
 		turnBeforeEntryId: null,
+	};
+}
+
+export interface ActionLifecycleApplyResult {
+	cache: SelectedSessionCache;
+	applied: boolean;
+}
+
+const ACTION_LIFECYCLE_EVENTS = new Set([
+	"action.requested",
+	"tool.started",
+	"tool.completed",
+	"tool.error",
+	"model.completed",
+	"model.error",
+	"compaction.completed",
+	"compaction.error",
+]);
+const TERMINAL_ACTION_STATUSES = new Set(["completed", "error", "interrupted", "stale"]);
+
+/// Project authoritative action lifecycle events into the selected snapshot.
+/// The action row id is the durable identity: starts update one row and
+/// terminal events remove exactly that row without waiting for session.idle.
+export function applyActionLifecycleEvent(
+	cache: SelectedSessionCache,
+	event: EventFrame,
+): ActionLifecycleApplyResult {
+	if (
+		cache.sessionId !== event.session_id ||
+		!cache.snapshot ||
+		!ACTION_LIFECYCLE_EVENTS.has(event.event)
+	) return { cache, applied: false };
+	const rowId = typeof event.data.action_row_id === "string" ? event.data.action_row_id : null;
+	const kind = event.data.kind;
+	const status = event.data.status;
+	if (
+		!rowId ||
+		(kind !== "model" && kind !== "tool" && kind !== "compaction") ||
+		typeof status !== "string"
+	) return { cache, applied: false };
+
+	const pendingActions = cache.snapshot.pending_actions;
+	if (TERMINAL_ACTION_STATUSES.has(status)) {
+		const next = pendingActions.filter((action) => action.action_row_id !== rowId);
+		if (next.length === pendingActions.length) return { cache, applied: true };
+		return {
+			cache: {
+				...cache,
+				snapshot: { ...cache.snapshot, pending_actions: next },
+			},
+			applied: true,
+		};
+	}
+	if (status !== "pending" && status !== "blocked" && status !== "running") {
+		return { cache, applied: false };
+	}
+	const payload =
+		event.data.payload && typeof event.data.payload === "object" && !Array.isArray(event.data.payload)
+			? event.data.payload as Record<string, unknown>
+			: {};
+	const incoming: PendingAction = {
+		action_row_id: rowId,
+		kind,
+		status,
+		payload,
+	};
+	const index = pendingActions.findIndex((action) => action.action_row_id === rowId);
+	const next = [...pendingActions];
+	next[index >= 0 ? index : next.length] = index >= 0
+		? { ...pendingActions[index], ...incoming, payload: Object.keys(payload).length ? payload : pendingActions[index].payload }
+		: incoming;
+	return {
+		cache: {
+			...cache,
+			snapshot: { ...cache.snapshot, pending_actions: next },
+		},
+		applied: true,
 	};
 }
 

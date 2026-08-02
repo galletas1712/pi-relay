@@ -52,7 +52,6 @@ const SELECTED_SESSION_REFRESH_EVENTS = new Set([
 	"history.compacted",
 	"model.error",
 	"tool.error",
-	"compaction.requested",
 	"compaction.completed",
 	"compaction.error",
 ]);

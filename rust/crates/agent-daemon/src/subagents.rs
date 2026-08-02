@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use agent_store::{
-    CreateContextForkRequest, EventFrame, EventType, InputPriority, SessionConfig, SubagentType,
+    CreateContextForkRequest, EventFrame, EventType, InputPriority, PreparedWorkspace,
+    SessionActivity, SessionConfig, SubagentType, WorkspaceOwnerKind,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde_json::{json, Value};
@@ -17,10 +18,11 @@ use crate::session_start::{
 };
 use crate::state::AppState;
 use crate::types::RpcError;
+use crate::workspace_lifecycle;
 
 /// A subagent spawned as part of a delegation. The role's optional
 /// `context: forked` policy copies the parent's durable transcript at its
-/// active leaf; omitted context remains fresh.
+/// latest completed turn; omitted context remains fresh.
 pub(crate) struct DelegationSubagentSpawn {
     pub(crate) parent_session_id: String,
     pub(crate) role: String,
@@ -28,34 +30,6 @@ pub(crate) struct DelegationSubagentSpawn {
     pub(crate) subagent_type: SubagentType,
     pub(crate) delegation_id: String,
     pub(crate) spawn_index: i32,
-}
-
-async fn cleanup_materialized_context_fork(
-    state: &AppState,
-    child_session_id: &str,
-    parent_session_id: &str,
-    runtime_id: &str,
-    workspace_id: &str,
-) -> bool {
-    match state
-        .runtime_hosts
-        .cleanup_read_only_workspace(
-            child_session_id,
-            parent_session_id,
-            runtime_id,
-            workspace_id,
-            true,
-        )
-        .await
-    {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!(
-                "failed to complete cleanup for context-fork workspace {workspace_id}: {error:#}"
-            );
-            false
-        }
-    }
 }
 
 fn select_subagent_provider(
@@ -138,61 +112,30 @@ pub(crate) async fn spawn_subagent(
     let role = resolve_skill_role(&runtime_context.skills, &request.role)
         .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
     let resolved_role_name = role.name.clone();
-    let child_workspace_id = (request.subagent_type == SubagentType::ReadOnly)
-        .then(|| format!("workspace_{}", Uuid::new_v4()));
-    if request.subagent_type == SubagentType::ReadOnly {
-        let workspace_id = child_workspace_id
-            .as_ref()
-            .expect("forked read-only child workspace");
-        state
-            .runtime_hosts
-            .reserve_context_fork_workspace(
-                &child_session_id,
-                &request.parent_session_id,
-                &parent_config.runtime_id,
-                workspace_id,
-            )
-            .await?;
-    }
-
     // A full subagent is the durable workspace's single writer for its
     // delegation: it runs against the parent's dirs in place (no fork). A
     // read-only subagent forks the parent into its own disposable snapshot.
-    let (workspace_id, workspaces) = match request.subagent_type {
-        SubagentType::Full => (
-            parent_config.workspace_id.clone(),
-            parent_config.workspaces.clone(),
+    let prepared_workspace = match request.subagent_type {
+        SubagentType::Full => None,
+        SubagentType::ReadOnly => Some(
+            workspace_lifecycle::prepare_snapshot(
+                state,
+                &child_session_id,
+                WorkspaceOwnerKind::ReadOnly,
+                &parent_config,
+            )
+            .await?,
         ),
-        SubagentType::ReadOnly => {
-            match state
-                .runtime_hosts
-                .fork_session_from_parent(
-                    &request.parent_session_id,
-                    &parent_config.workspace_id,
-                    &parent_config.workspaces,
-                    child_workspace_id
-                        .as_deref()
-                        .expect("read-only child workspace reservation"),
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    cleanup_materialized_context_fork(
-                        state,
-                        &child_session_id,
-                        &request.parent_session_id,
-                        &parent_config.runtime_id,
-                        child_workspace_id
-                            .as_deref()
-                            .expect("read-only child workspace reservation"),
-                    )
-                    .await;
-                    return Err(RpcError::from(error));
-                }
-            }
-        }
     };
+    let (workspace_id, workspaces) = prepared_workspace
+        .as_ref()
+        .map(|prepared| (prepared.workspace_id.clone(), prepared.workspaces.clone()))
+        .unwrap_or_else(|| {
+            (
+                parent_config.workspace_id.clone(),
+                parent_config.workspaces.clone(),
+            )
+        });
     let child_metadata = subagent_metadata(
         match (request.metadata, request.spawn_index) {
             (Value::Object(mut metadata), Some(index)) => {
@@ -261,15 +204,8 @@ pub(crate) async fn spawn_subagent(
     {
         Ok(prompt) => prompt,
         Err(error) => {
-            if request.subagent_type == SubagentType::ReadOnly {
-                cleanup_materialized_context_fork(
-                    state,
-                    &child_session_id,
-                    &request.parent_session_id,
-                    &parent_config.runtime_id,
-                    &workspace_id,
-                )
-                .await;
+            if let Some(prepared) = &prepared_workspace {
+                workspace_lifecycle::abandon_prepared(state, prepared).await;
             }
             return Err(error);
         }
@@ -292,6 +228,7 @@ pub(crate) async fn spawn_subagent(
                     parent_session_id: Some(request.parent_session_id.clone()),
                     subagent_type: Some(subagent_type),
                     delegation_id: request.delegation_id.clone(),
+                    workspace: prepared_workspace.clone(),
                     dispatch_mode: PreparedSessionDispatchMode::Deferred,
                 },
             )
@@ -301,15 +238,15 @@ pub(crate) async fn spawn_subagent(
             let result = state
                 .repo
                 .create_context_fork(CreateContextForkRequest {
-                    source_session_id: &request.parent_session_id,
                     child_session_id: &child_session_id,
                     config: &child_config,
                     parent_session_id: &request.parent_session_id,
-                    reservation_owner_id: (subagent_type == SubagentType::ReadOnly)
-                        .then(|| state.runtime_hosts.reservation_owner_id()),
                     subagent_type,
                     delegation_id: request.delegation_id.as_deref(),
                     task: &initial_task_message,
+                    workspace: prepared_workspace
+                        .as_ref()
+                        .map(PreparedWorkspace::attachment),
                 })
                 .await
                 .map_err(RpcError::from);
@@ -319,7 +256,7 @@ pub(crate) async fn spawn_subagent(
                     Ok(StartedSession {
                         session_id: child_session_id.clone(),
                         project_id: child_config.project_id,
-                        activity: state.repo.activity(&child_session_id).await?,
+                        activity: SessionActivity::Queued,
                         replayed: false,
                         dispatches: Vec::new(),
                     })
@@ -331,78 +268,27 @@ pub(crate) async fn spawn_subagent(
     let started = match started_result {
         Ok(started) => started,
         Err(error) => {
-            if subagent_type == SubagentType::ReadOnly {
-                cleanup_materialized_context_fork(
-                    state,
-                    &child_session_id,
-                    &request.parent_session_id,
-                    &parent_config.runtime_id,
-                    &workspace_id,
-                )
-                .await;
+            if let Some(prepared) = &prepared_workspace {
+                workspace_lifecycle::abandon_prepared(state, prepared).await;
             }
             return Err(error);
         }
     };
-    if subagent_type == SubagentType::ReadOnly && !forked_context {
-        let released = match state
-            .runtime_hosts
-            .release_context_fork_workspace_reservation(
-                &child_session_id,
-                &parent_config.runtime_id,
-                &workspace_id,
-            )
-            .await
-        {
-            Ok(released) => released,
-            Err(error) => {
-                cleanup_failed_spawn(
-                    state,
-                    &child_session_id,
-                    &request.parent_session_id,
-                    &parent_config.runtime_id,
-                    &workspace_id,
-                    subagent_type,
-                    "workspace reservation release failure",
-                )
-                .await;
-                return Err(RpcError::from(error));
-            }
-        };
-        // A false result means the reservation was not ours (or was already
-        // transitioned); treating it as success would lose retry state.
-        if !released {
-            cleanup_failed_spawn(
-                state,
-                &child_session_id,
-                &request.parent_session_id,
-                &parent_config.runtime_id,
-                &workspace_id,
-                subagent_type,
-                "workspace reservation release did not match",
-            )
-            .await;
-            return Err(RpcError::new(
-                "workspace_reservation_release_failed",
-                "context fork workspace reservation was not released",
-            ));
-        }
-    }
     #[cfg(test)]
     if state
         .fail_subagent_after_start_before_dispatch
         .swap(false, std::sync::atomic::Ordering::SeqCst)
     {
-        if subagent_type == SubagentType::ReadOnly {
-            cleanup_materialized_context_fork(
-                state,
-                &child_session_id,
-                &request.parent_session_id,
-                &parent_config.runtime_id,
-                &workspace_id,
-            )
-            .await;
-        }
+        cleanup_failed_spawn(
+            state,
+            &child_session_id,
+            &request.parent_session_id,
+            &parent_config.runtime_id,
+            &workspace_id,
+            subagent_type,
+            "injected post-start failure",
+        )
+        .await;
         return Err(RpcError::new(
             "injected_post_start_failure",
             "injected failure after child/action commit and before dispatch",
@@ -452,9 +338,7 @@ pub(crate) async fn spawn_subagent(
     let child_driver = SessionDriver::acquire(state, &started.session_id).await;
     let dispatch_result = if forked_context {
         async {
-            child_driver
-                .ensure_active_loaded_preserving_open_turn()
-                .await?;
+            child_driver.ensure_active_loaded().await?;
             child_driver.drive_until_blocked().await.map(|_| ())
         }
         .await
@@ -646,43 +530,43 @@ pub(crate) async fn require_known_subagent(
 async fn cleanup_failed_spawn(
     state: &AppState,
     child_session_id: &str,
-    parent_session_id: &str,
-    runtime_id: &str,
-    workspace_id: &str,
+    _parent_session_id: &str,
+    _runtime_id: &str,
+    _workspace_id: &str,
     subagent_type: SubagentType,
     reason: &str,
 ) {
+    match state
+        .repo
+        .begin_failed_spawn_compensation(child_session_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            eprintln!(
+                "failed to persist delegation child compensation {child_session_id} after {reason}: {error:#}"
+            );
+            return;
+        }
+    }
     state.active.lock().await.remove(child_session_id);
     // A full subagent shares the parent's session root/cwd in place; its
     // session dir was never created, so tearing it down would delete the
     // parent's durable workspace. Only a forked read-only child owns a private
     // dir that is safe to reclaim.
     match subagent_type {
-        SubagentType::Full => {}
-        SubagentType::ReadOnly => {
-            // Recreate an exact cleanup reservation before destruction. The
-            // helper removes the child only after successful destruction and
-            // retains both reservation and session when retry is needed.
-            if !cleanup_materialized_context_fork(
-                state,
-                child_session_id,
-                parent_session_id,
-                runtime_id,
-                workspace_id,
-            )
-            .await
-            {
+        SubagentType::Full => {
+            if let Err(delete_error) = state.repo.delete_session(child_session_id).await {
                 eprintln!(
-                    "failed to clean up child workspace {child_session_id} after {reason}; retry state retained"
+                    "failed to clean up child session {child_session_id} after {reason}: {delete_error:#}"
                 );
             }
-            return;
         }
-    }
-    if let Err(delete_error) = state.repo.delete_session(child_session_id).await {
-        eprintln!(
-            "failed to clean up child session {child_session_id} after {reason}: {delete_error:#}"
-        );
+        SubagentType::ReadOnly => {
+            // The store operation above atomically marked the delegation member
+            // compensating and transitioned its private resource to deleting.
+        }
     }
     state
         .provider_connections

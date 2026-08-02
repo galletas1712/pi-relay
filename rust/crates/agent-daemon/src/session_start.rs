@@ -3,7 +3,8 @@ use std::sync::Arc;
 use agent_mcp_types::McpSessionSelection;
 use agent_session::AgentSession;
 use agent_store::{
-    InputPriority, QueuedInputContent, SessionActivity, SessionConfig, SubagentType,
+    InputPriority, PreparedWorkspace, QueuedInputContent, SessionActivity, SessionConfig,
+    SubagentType,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
@@ -19,6 +20,7 @@ use crate::runtime::{
 };
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
+use crate::workspace_lifecycle;
 use crate::workspace_selection::{RequestedWorkspace, WorkspaceSelection};
 use agent_runtime_protocol::WorkspaceMaterializeProgress;
 use tokio::sync::mpsc;
@@ -55,7 +57,7 @@ pub(crate) async fn session_start(
         }));
     }
 
-    let (runtime_id, workspace_id, workspaces) = if let Some(project_id) = project_id {
+    let prepared_workspace = if let Some(project_id) = project_id {
         let project = state.repo.get_project(project_id).await?;
         let selection = WorkspaceSelection::from_requested(
             params
@@ -65,28 +67,36 @@ pub(crate) async fn session_start(
         let selected = selection
             .resolve(&project.workspaces)
             .map_err(|error| RpcError::new("invalid_params", error.to_string()))?;
-        let (workspace_id, workspaces) = state
-            .runtime_hosts
-            .materialize_session(
-                &project.runtime_id,
-                project_id,
-                &project.workspaces,
-                &selected,
-                on_progress,
-            )
-            .await?;
-        (project.runtime_id, workspace_id, workspaces)
+        workspace_lifecycle::prepare_materialized(
+            state,
+            &session_id,
+            &project.runtime_id,
+            project_id,
+            &project.workspaces,
+            &selected,
+            on_progress,
+        )
+        .await?
     } else {
         let runtime_id = params
             .runtime_id
+            .as_deref()
             .ok_or_else(|| RpcError::new("runtime_required", "host sessions require runtime_id"))?;
-        state.runtime_hosts.require_available(&runtime_id).await?;
-        let (workspace_id, workspaces) = state
-            .runtime_hosts
-            .materialize_session(&runtime_id, Uuid::nil(), &[], &[], None)
-            .await?;
-        (runtime_id, workspace_id, workspaces)
+        state.runtime_hosts.require_available(runtime_id).await?;
+        workspace_lifecycle::prepare_materialized(
+            state,
+            &session_id,
+            runtime_id,
+            Uuid::nil(),
+            &[],
+            &[],
+            None,
+        )
+        .await?
     };
+    let runtime_id = prepared_workspace.runtime_id.clone();
+    let workspace_id = prepared_workspace.workspace_id.clone();
+    let workspaces = prepared_workspace.workspaces.clone();
     let config = SessionConfig {
         project_id,
         runtime_id,
@@ -102,7 +112,13 @@ pub(crate) async fn session_start(
     };
     // Creation and later additive selection share one live manifest-authoring
     // and prompt-rendering path.
-    let config = author_session_mcp_and_prompt(state, config, params.mcp).await?;
+    let config = match author_session_mcp_and_prompt(state, config, params.mcp).await {
+        Ok(config) => config,
+        Err(error) => {
+            workspace_lifecycle::abandon_prepared(state, &prepared_workspace).await;
+            return Err(error);
+        }
+    };
 
     let started = start_prepared_session_with_driver(
         state,
@@ -116,6 +132,7 @@ pub(crate) async fn session_start(
             parent_session_id: None,
             subagent_type: None,
             delegation_id: None,
+            workspace: Some(prepared_workspace),
             dispatch_mode: PreparedSessionDispatchMode::Auto,
         },
     )
@@ -156,6 +173,7 @@ pub(crate) struct PreparedSessionStart {
     pub(crate) parent_session_id: Option<String>,
     pub(crate) subagent_type: Option<SubagentType>,
     pub(crate) delegation_id: Option<String>,
+    pub(crate) workspace: Option<PreparedWorkspace>,
     pub(crate) dispatch_mode: PreparedSessionDispatchMode,
 }
 
@@ -194,6 +212,7 @@ async fn start_prepared_session_with_driver(
         parent_session_id,
         subagent_type,
         delegation_id,
+        workspace,
         dispatch_mode,
     } = request;
     let project_id = config.project_id;
@@ -217,10 +236,16 @@ async fn start_prepared_session_with_driver(
         });
     }
 
-    state
+    if let Err(error) = state
         .runtime_hosts
         .ensure_for_runtime(&config.runtime_id, &config.workspace_id, &config.workspaces)
-        .await?;
+        .await
+    {
+        if let Some(workspace) = &workspace {
+            workspace_lifecycle::abandon_prepared(state, workspace).await;
+        }
+        return Err(error.into());
+    }
 
     let mut session = AgentSession::new();
     session
@@ -236,9 +261,9 @@ async fn start_prepared_session_with_driver(
     };
     let (entries, events, actions, active_leaf_id) = collect_runtime_outputs(&mut runtime);
     let config = runtime.config.clone();
-    let (frames, persisted_actions) = state
+    let persisted = state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             &session_id,
             &config,
             &entries,
@@ -251,8 +276,18 @@ async fn start_prepared_session_with_driver(
             parent_session_id.as_deref(),
             subagent_type,
             delegation_id.as_deref(),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
-        .await?;
+        .await;
+    let (frames, persisted_actions) = match persisted {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            if let Some(workspace) = &workspace {
+                workspace_lifecycle::abandon_prepared(state, workspace).await;
+            }
+            return Err(error.into());
+        }
+    };
     runtime.persisted_active_leaf_id.clone_from(&active_leaf_id);
 
     if frames.is_empty() {
@@ -280,7 +315,10 @@ async fn start_prepared_session_with_driver(
     Ok(StartedSession {
         session_id: session_id.clone(),
         project_id,
-        activity: state.repo.activity(&session_id).await?,
+        // A new first input always persists its model action in the creation
+        // transaction. Do not add a fallible post-commit read that can turn a
+        // successful child launch into an untracked compensation path.
+        activity: SessionActivity::Running,
         replayed: false,
         dispatches,
     })

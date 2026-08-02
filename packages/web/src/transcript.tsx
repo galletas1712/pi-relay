@@ -254,7 +254,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export const MessageList = memo(function MessageList({
 	entries,
-	pendingActions,
+	pendingActions = [],
 	activeLeafId,
 	isRunning,
 	serverTimeMs,
@@ -337,6 +337,11 @@ export const MessageList = memo(function MessageList({
 	const visibleEntries = useMemo(
 		() => (hasSession ? branchEntriesFor(effectiveEntries, activeLeafId) : effectiveEntries),
 		[activeLeafId, effectiveEntries, hasSession]
+	);
+	const hasRunningTool = pendingActions.some(
+		(action) =>
+			action.kind === "tool" &&
+			(action.status === "pending" || action.status === "blocked" || action.status === "running"),
 	);
 	const transcriptContentReady =
 		!!scrollSessionKey &&
@@ -961,7 +966,11 @@ export const MessageList = memo(function MessageList({
 								);
 							})}
 					{isRunning && workingStartMs != null && serverTimeMs != null ? (
-						<WorkingIndicator startMs={workingStartMs} serverTimeMs={serverTimeMs} />
+						<WorkingIndicator
+							startMs={workingStartMs}
+							serverTimeMs={serverTimeMs}
+							label={hasRunningTool ? "Working" : "Generating response"}
+						/>
 					) : null}
 				</div>
 			</div>
@@ -1150,7 +1159,15 @@ export function runningTurnClockAnchor(
 	};
 }
 
-const WorkingIndicator = memo(function WorkingIndicator({ startMs, serverTimeMs }: { startMs: number; serverTimeMs: number }) {
+const WorkingIndicator = memo(function WorkingIndicator({
+	startMs,
+	serverTimeMs,
+	label,
+}: {
+	startMs: number;
+	serverTimeMs: number;
+	label: "Working" | "Generating response";
+}) {
 	const anchorRef = useRef<WorkingClockAnchor | null>(null);
 	const [elapsedMs, setElapsedMs] = useState(() => {
 		const stable = stableWorkingElapsedMs(anchorRef.current, startMs, serverTimeMs);
@@ -1170,7 +1187,7 @@ const WorkingIndicator = memo(function WorkingIndicator({ startMs, serverTimeMs 
 	return (
 		<div className="working-indicator">
 			<span className="working-indicator-dot" aria-hidden="true" />
-			<span className="working-indicator-label">Working ({formatElapsed(elapsedMs)})…</span>
+			<span className="working-indicator-label">{label} ({formatElapsed(elapsedMs)})…</span>
 		</div>
 	);
 });
@@ -1743,12 +1760,21 @@ function toolRunItemFromPendingAction(action: PendingAction): ToolRunItem | null
 function markLiveToolGroups(nodes: TranscriptDisplayNode[]): TranscriptDisplayNode[] {
 	const liveGroupByTurn = new Map<number | "none", string>();
 	for (const node of nodes) {
-		if (node.type !== "tool_group" || !node.turnOpen) continue;
+		if (
+			node.type !== "tool_group" ||
+			!node.turnOpen ||
+			!node.items.some((item) => item.statusKind === "running")
+		) continue;
 		liveGroupByTurn.set(node.turnId ?? "none", node.id);
 	}
 	return nodes.map((node) => {
 		if (node.type !== "tool_group" || !node.turnOpen) return node;
-		return { ...node, isLive: liveGroupByTurn.get(node.turnId ?? "none") === node.id };
+		return {
+			...node,
+			isLive:
+				node.items.some((item) => item.statusKind === "running") &&
+				liveGroupByTurn.get(node.turnId ?? "none") === node.id,
+		};
 	});
 }
 

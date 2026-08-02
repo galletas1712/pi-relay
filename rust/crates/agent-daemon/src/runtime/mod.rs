@@ -873,11 +873,12 @@ impl SessionDriver {
             .await
         {
             Ok(Some(SubagentType::ReadOnly)) => {
-                if let Err(error) = self
-                    .state
-                    .runtime_hosts
-                    .cleanup_read_only_session(&self.session_id, false)
-                    .await
+                if let Err(error) = crate::workspace_lifecycle::request_session_cleanup(
+                    &self.state,
+                    &self.session_id,
+                    agent_store::WorkspaceCleanupMode::RetainSession,
+                )
+                .await
                 {
                     eprintln!(
                         "failed to destroy read-only subagent workspace {}: {error:#}",
