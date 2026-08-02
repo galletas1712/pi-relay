@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	Inspector,
 	LogHeader,
+	projectMenuItems,
 	RunBoardDelegationList,
 	sessionMenuItems,
 	Sidebar,
@@ -344,6 +345,19 @@ describe("Sidebar session list loading states", () => {
 });
 
 describe("sidebar action menu policies", () => {
+	it("uses concise project action prose", () => {
+		const project = {
+			project_id: "project-1",
+			name: "Project one",
+			workspaces: [],
+			metadata: {},
+			created_at: "2024-01-01T00:00:00Z",
+			updated_at: "2024-01-01T00:00:00Z",
+		};
+
+		expect(projectMenuItems(project, vi.fn())[0].label).toBe("Project settings");
+	});
+
 	it("maps idle session actions, separating and styling destructive Delete", () => {
 		const onRename = vi.fn();
 		const onArchiveToggle = vi.fn();
@@ -358,20 +372,20 @@ describe("sidebar action menu policies", () => {
 		});
 
 		expect(items.map(({ id, label }) => ({ id, label }))).toEqual([
-			{ id: "rename", label: "Rename…" },
+			{ id: "rename", label: "Rename" },
 			{ id: "archive", label: "Archive" },
-			{ id: "delete", label: "Delete…" },
+			{ id: "delete", label: "Delete" },
 		]);
 		expect(items[0]).toMatchObject({ focusDestination: "dialog" });
 		expect(items[0].disabled).toBeUndefined();
 		expect(items[1]).toMatchObject({ disabled: false });
 		expect(items[1].destructive).toBeUndefined();
 		expect(items[2]).toMatchObject({
-			disabled: false,
 			destructive: true,
 			separatorBefore: true,
 			focusDestination: "dialog",
 		});
+		expect(items[2].disabled).toBeUndefined();
 
 		items[0].onSelect();
 		expect(onRename).toHaveBeenCalledTimes(1);
@@ -386,7 +400,7 @@ describe("sidebar action menu policies", () => {
 		expect(onDelete).toHaveBeenCalledTimes(1);
 	});
 
-	it("keeps Rename available and exposes visible reasons for running-session restrictions", () => {
+	it("keeps Rename available and omits idle-only actions for a running session", () => {
 		const items = sessionMenuItems({
 			archived: false,
 			canArchive: false,
@@ -396,19 +410,9 @@ describe("sidebar action menu policies", () => {
 			onDelete: vi.fn(),
 		});
 
+		expect(items).toHaveLength(1);
+		expect(items[0]).toMatchObject({ label: "Rename" });
 		expect(items[0].disabled).toBeUndefined();
-		expect(items[1]).toMatchObject({
-			label: "Archive",
-			disabled: true,
-			disabledReason: "Available when the session and its subagents are idle.",
-		});
-		expect(items[2]).toMatchObject({
-			label: "Delete…",
-			disabled: true,
-			disabledReason: "Available when the session and its subagents are idle.",
-			destructive: true,
-			separatorBefore: true,
-		});
 	});
 });
 
