@@ -3752,23 +3752,16 @@ export function App({
 	);
 
 	const reorderQueuedInput = useCallback(
-		async (inputId: string, direction: "up" | "down") => {
+		async (inputIds: string[]) => {
 			assertServerMutationAllowed();
 			const sessionId = requireSelected();
 			const cache = selectedCacheRef.current;
-			const followUps = (cache.sessionId === sessionId ? cache.snapshot?.queued_inputs : loadedSnapshot?.queued_inputs ?? [])
-				?.filter((input) => input.priority === "follow_up" && input.status === "queued") ?? [];
-			const currentIndex = followUps.findIndex((input) => input.input_id === inputId);
-			const targetIndex = direction === "up" ? currentIndex - 1 : currentIndex + 1;
-			if (currentIndex < 0 || targetIndex < 0 || targetIndex >= followUps.length) return;
-			const nextOrder = followUps.map((input) => input.input_id);
-			[nextOrder[currentIndex], nextOrder[targetIndex]] = [nextOrder[targetIndex], nextOrder[currentIndex]];
 			const queueRevision = cache.sessionId === sessionId ? cache.snapshot?.queue_revision : undefined;
-			const result = await api.reorderQueuedFollowUps(sessionId, nextOrder, queueRevision);
+			const result = await api.reorderQueuedFollowUps(sessionId, inputIds, queueRevision);
 			updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue));
 			invalidateSessionList();
 		},
-		[api, assertServerMutationAllowed, invalidateSessionList, loadedSnapshot?.queued_inputs, requireSelected, updateSelectedCache],
+		[api, assertServerMutationAllowed, invalidateSessionList, requireSelected, updateSelectedCache],
 	);
 
 	const stopActiveTurn = useCallback(async () => {
@@ -4329,9 +4322,9 @@ export function App({
 		},
 		[cancelQueuedInput, pushErrorNotice],
 	);
-	const handleMoveQueued = useCallback(
-		(inputId: string, direction: "up" | "down") => {
-			void reorderQueuedInput(inputId, direction).catch((error) => pushErrorNotice(errorMessage(error)));
+	const handleReorderQueued = useCallback(
+		(inputIds: string[]) => {
+			void reorderQueuedInput(inputIds).catch((error) => pushErrorNotice(errorMessage(error)));
 		},
 		[pushErrorNotice, reorderQueuedInput],
 	);
@@ -4722,7 +4715,7 @@ export function App({
 						onPromoteQueued={handlePromoteQueued}
 						onUpdateQueued={handleUpdateQueued}
 						onCancelQueued={handleCancelQueued}
-						onMoveQueued={handleMoveQueued}
+						onReorderQueued={handleReorderQueued}
 					/>
 				) : null}
 			</footer>

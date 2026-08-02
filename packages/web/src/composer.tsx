@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
-import { ArrowDown, ArrowUp, Check, Edit3, Loader2, Send, ShipWheel, Square, Trash2, X } from "lucide-react";
+import { Check, Edit3, GripVertical, Loader2, Send, ShipWheel, Square, Trash2, X } from "lucide-react";
 import type { ComposerSubmission } from "./composerRouting.ts";
 import { composerTextNeedsConnection, ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { randomId } from "./ids.ts";
@@ -45,6 +45,22 @@ export function resolveSubmittedDraft(
 
 export function isComposerSubmitShortcut(event: ComposerSubmitShortcutEvent): boolean {
 	return event.key === "Enter" && (event.metaKey || event.ctrlKey);
+}
+
+/**
+ * Return the queue order produced by dropping `draggedId` on `targetId`.
+ * A drop on a row inserts before that row, matching the row's top insertion marker.
+ */
+export function reorderQueuedInputsBefore(inputIds: string[], draggedId: string, targetId: string): string[] {
+	const fromIndex = inputIds.indexOf(draggedId);
+	const targetIndex = inputIds.indexOf(targetId);
+	if (fromIndex < 0 || targetIndex < 0 || fromIndex === targetIndex) return inputIds;
+
+	const nextOrder = [...inputIds];
+	nextOrder.splice(fromIndex, 1);
+	const insertionIndex = targetIndex > fromIndex ? targetIndex - 1 : targetIndex;
+	nextOrder.splice(insertionIndex, 0, draggedId);
+	return nextOrder;
 }
 
 export function submissionIdsForDraft(
@@ -95,7 +111,7 @@ export const Composer = memo(function Composer({
 	onPromoteQueued,
 	onUpdateQueued,
 	onCancelQueued,
-	onMoveQueued,
+	onReorderQueued,
 	storage,
 }: {
 	selectedId: string | null;
@@ -112,7 +128,7 @@ export const Composer = memo(function Composer({
 	onPromoteQueued: (inputId: string) => void;
 	onUpdateQueued: (inputId: string, text: string) => void;
 	onCancelQueued: (inputId: string) => void;
-	onMoveQueued: (inputId: string, direction: "up" | "down") => void;
+	onReorderQueued: (inputIds: string[]) => void;
 	storage?: ComposerDraftStorage;
 }) {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -373,7 +389,7 @@ export const Composer = memo(function Composer({
 				onPromote={onPromoteQueued}
 				onUpdate={onUpdateQueued}
 				onCancel={onCancelQueued}
-				onMove={onMoveQueued}
+				onReorder={onReorderQueued}
 			/>
 			<textarea
 				ref={textAreaRef}
@@ -430,7 +446,7 @@ export function QueuedInputPane({
 	onPromote,
 	onUpdate,
 	onCancel,
-	onMove,
+	onReorder,
 }: {
 	inputs: QueuedInput[];
 	visible: boolean;
@@ -438,10 +454,12 @@ export function QueuedInputPane({
 	onPromote: (inputId: string) => void;
 	onUpdate: (inputId: string, text: string) => void;
 	onCancel: (inputId: string) => void;
-	onMove: (inputId: string, direction: "up" | "down") => void;
+	onReorder: (inputIds: string[]) => void;
 }) {
 	const [editingId, setEditingId] = useState<string | null>(null);
 	const [editingText, setEditingText] = useState("");
+	const [draggedId, setDraggedId] = useState<string | null>(null);
+	const [dragOverId, setDragOverId] = useState<string | null>(null);
 	const followUpIds = useMemo(
 		() =>
 			inputs
@@ -449,12 +467,50 @@ export function QueuedInputPane({
 				.map((input) => input.input_id),
 		[inputs],
 	);
+	const submitReorder = useCallback(
+		(nextOrder: string[]) => {
+			if (nextOrder.every((inputId, index) => inputId === followUpIds[index])) return;
+			onReorder(nextOrder);
+		},
+		[followUpIds, onReorder],
+	);
 	useEffect(() => {
 		if (editingId && !inputs.some((input) => input.input_id === editingId)) {
 			setEditingId(null);
 			setEditingText("");
 		}
 	}, [editingId, inputs]);
+	const reorderByKeyboard = useCallback(
+		(inputId: string, direction: "up" | "down") => {
+			const currentIndex = followUpIds.indexOf(inputId);
+			const targetIndex = direction === "up" ? currentIndex - 1 : currentIndex + 1;
+			if (currentIndex < 0 || targetIndex < 0 || targetIndex >= followUpIds.length) return;
+			const nextOrder = [...followUpIds];
+			[nextOrder[currentIndex], nextOrder[targetIndex]] = [nextOrder[targetIndex], nextOrder[currentIndex]];
+			submitReorder(nextOrder);
+		},
+		[followUpIds, submitReorder],
+	);
+	const finishDrag = useCallback(() => {
+		setDraggedId(null);
+		setDragOverId(null);
+	}, []);
+	const handleDrop = useCallback(
+		(inputId: string) => {
+			if (!draggedId || draggedId === inputId) {
+				finishDrag();
+				return;
+			}
+			const nextOrder = reorderQueuedInputsBefore(followUpIds, draggedId, inputId);
+			if (nextOrder === followUpIds) {
+				finishDrag();
+				return;
+			}
+			submitReorder(nextOrder);
+			finishDrag();
+		},
+		[draggedId, finishDrag, followUpIds, submitReorder],
+	);
 	if (!visible) return null;
 	return (
 		<div className="queue-pane">
@@ -467,11 +523,55 @@ export function QueuedInputPane({
 				{inputs.map((input) => {
 					const canPromote = input.priority === "follow_up" && input.status === "queued";
 					const canMutate = canPromote;
-					const followUpIndex = followUpIds.indexOf(input.input_id);
 					const isEditing = editingId === input.input_id;
 					const preview = contentBlocksToText(input.content);
 					return (
-						<div className="queue-row" key={input.input_id}>
+						<div
+							className={`queue-row${draggedId === input.input_id ? " is-dragging" : ""}${dragOverId === input.input_id ? " is-drag-over" : ""}`}
+							key={input.input_id}
+							onDragOver={(event) => {
+								if (!draggedId || !canMutate || draggedId === input.input_id) return;
+								event.preventDefault();
+								event.dataTransfer.dropEffect = "move";
+								setDragOverId(input.input_id);
+							}}
+							onDrop={(event) => {
+								event.preventDefault();
+								handleDrop(input.input_id);
+							}}
+						>
+							{canMutate ? (
+								<button
+									className="queue-drag-handle"
+									type="button"
+									draggable={!mutationBlockedReason}
+									onDragStart={(event) => {
+										if (mutationBlockedReason) {
+											event.preventDefault();
+											return;
+										}
+										event.dataTransfer.effectAllowed = "move";
+										event.dataTransfer.setData("text/plain", input.input_id);
+										setDraggedId(input.input_id);
+										setDragOverId(null);
+									}}
+									onDragEnd={finishDrag}
+									onKeyDown={(event) => {
+										if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+										event.preventDefault();
+										if (!mutationBlockedReason) {
+											reorderByKeyboard(input.input_id, event.key === "ArrowUp" ? "up" : "down");
+										}
+									}}
+									disabled={!!mutationBlockedReason}
+									title="Drag to reorder queued follow-up"
+									aria-label={`Reorder queued follow-up: ${truncate(firstLine(preview) || "(empty)", 48)}`}
+								>
+									<GripVertical size={15} aria-hidden />
+								</button>
+							) : (
+								<span className="queue-drag-handle-slot" aria-hidden />
+							)}
 							{isEditing ? (
 								<textarea
 									className="queue-edit"
@@ -515,26 +615,6 @@ export function QueuedInputPane({
 								</div>
 							) : (
 								<div className="queue-actions">
-									<button
-										className="queue-icon-button"
-										type="button"
-										onClick={() => onMove(input.input_id, "up")}
-										disabled={!canMutate || followUpIndex <= 0 || !!mutationBlockedReason}
-										title="move queued follow-up up"
-										aria-label="move queued follow-up up"
-									>
-										<ArrowUp size={13} />
-									</button>
-									<button
-										className="queue-icon-button"
-										type="button"
-										onClick={() => onMove(input.input_id, "down")}
-										disabled={!canMutate || followUpIndex < 0 || followUpIndex >= followUpIds.length - 1 || !!mutationBlockedReason}
-										title="move queued follow-up down"
-										aria-label="move queued follow-up down"
-									>
-										<ArrowDown size={13} />
-									</button>
 									<button
 										className="queue-icon-button"
 										type="button"

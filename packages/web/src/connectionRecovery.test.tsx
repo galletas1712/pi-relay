@@ -119,7 +119,7 @@ describe("representative component gates", () => {
 				onPromoteQueued={() => undefined}
 				onUpdateQueued={() => undefined}
 				onCancelQueued={() => undefined}
-				onMoveQueued={() => undefined}
+				onReorderQueued={() => undefined}
 			/>,
 		);
 		const composer = screen.getByRole("textbox") as HTMLTextAreaElement;

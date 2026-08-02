@@ -73,7 +73,7 @@ function ComposerDialogHarness() {
 				onPromoteQueued={() => undefined}
 				onUpdateQueued={() => undefined}
 				onCancelQueued={() => undefined}
-				onMoveQueued={() => undefined}
+				onReorderQueued={() => undefined}
 			/>
 			{open ? (
 				<HistoryTargetPickerDialog

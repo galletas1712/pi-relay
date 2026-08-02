@@ -501,7 +501,9 @@ When follow-ups are queued, a pane above the composer (`QueuedInputPane`) lists 
 - promote a follow-up to steer (`input.promote_queued`),
 - edit a queued follow-up's text (`input.update_queued`),
 - cancel it (`input.cancel_queued`),
-- reorder follow-ups up/down (`input.reorder_queued_follow_ups`, sending the full ordered follow-up id list).
+- reorder follow-ups with the drag handle or with ArrowUp/ArrowDown while
+  the handle is focused; dropping on a row inserts before that row
+  (`input.reorder_queued_follow_ups`, sending the full ordered follow-up id list).
 
 Each mutation passes the cached `queue_revision` as an optimistic fence and replaces queue state from the returned
 canonical `queue` projection. Steering rows are immutable: they stay above follow-ups and expose only disabled controls.
