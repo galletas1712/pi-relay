@@ -6,7 +6,7 @@ use agent_runtime_protocol::{RawSkillFile, SkillKind, SkillOrigin};
 use agent_store::PostgresAgentStore;
 use agent_vocab::{ProviderConfig, ProviderKind, ReasoningEffort, ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::prompt::{parse_runtime_skills, parse_skill_contents, ParsedSkillFile};
@@ -29,7 +29,14 @@ fn load_skill_output(runtime_raw: &[RawSkillFile], call: &ToolCall) -> Result<St
     }
     let skills = parse_runtime_skills(runtime_raw);
     let skill = resolve_load_skill(&skills, name)?;
-    Ok(skill.file_path.display().to_string())
+    let file = runtime_raw
+        .iter()
+        .find(|file| Path::new(&file.path) == skill.file_path)
+        .ok_or_else(|| anyhow!("resolved skill is missing from the runtime catalog: {name}"))?;
+    Ok(serde_json::to_string(&LoadSkillOutput {
+        path: &file.path,
+        content: &file.contents,
+    })?)
 }
 
 fn resolve_load_skill<'a>(skills: &'a [Skill], requested_name: &str) -> Result<&'a Skill> {
@@ -52,6 +59,12 @@ fn resolve_load_skill<'a>(skills: &'a [Skill], requested_name: &str) -> Result<&
 #[serde(deny_unknown_fields)]
 struct LoadSkillArgs {
     name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LoadSkillOutput<'a> {
+    path: &'a str,
+    content: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -301,14 +314,15 @@ mod tests {
     }
 
     #[test]
-    fn load_skill_returns_only_absolute_skill_path() {
-        let skill = raw_skill(
+    fn load_skill_returns_absolute_path_and_exact_contents() {
+        let mut skill = raw_skill(
             SkillKind::Skill,
             SkillOrigin::WorkspaceProject,
             Some("repo"),
             "rust-refactor",
             "",
         );
+        skill.contents.push_str("\nSee [examples](examples.md).\n");
         let call = ToolCall {
             id: ToolCallId::new("call_1"),
             tool_name: "LoadSkill".to_string(),
@@ -318,8 +332,13 @@ mod tests {
         let result = load_skill_result(std::slice::from_ref(&skill), &call);
 
         assert_eq!(result.status, ToolResultStatus::Success);
-        assert_eq!(result.output, skill.path);
-        assert!(result.output.starts_with('/'));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.output).expect("JSON result"),
+            serde_json::json!({
+                "path": skill.path,
+                "content": skill.contents,
+            })
+        );
     }
 
     #[test]
@@ -337,9 +356,13 @@ mod tests {
             args_json: serde_json::json!({"name":"workflow-review"}).to_string(),
         };
 
+        let output = load_skill_result(std::slice::from_ref(&workflow), &call).output;
         assert_eq!(
-            load_skill_result(std::slice::from_ref(&workflow), &call).output,
-            workflow.path
+            serde_json::from_str::<serde_json::Value>(&output).expect("JSON result"),
+            serde_json::json!({
+                "path": workflow.path,
+                "content": workflow.contents,
+            })
         );
     }
 

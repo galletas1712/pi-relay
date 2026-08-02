@@ -90,5 +90,5 @@ Here is the full list of skills available to you:
 ```
 
 When a task matches one or more of these skills, call `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` with the exact skill `name` from the JSON list.
-Read the returned `SKILL.md` path before acting. Resolve relative links in that file from its enclosing directory.
+Read and follow the returned `content` before acting. Resolve its relative links from the enclosing directory of the returned `path`.
 {% endif %}

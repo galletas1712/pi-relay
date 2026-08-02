@@ -300,8 +300,8 @@ pub struct RuntimeContext {
     pub skills: Vec<RawSkillFile>,
 }
 
-/// A raw `SKILL.md` found on the session's runtime. `path` is an absolute path
-/// on that runtime host and is returned verbatim by `LoadSkill`.
+/// A raw `SKILL.md` found on the session's runtime. `LoadSkill` returns `path`
+/// as an absolute runtime-host path and `contents` as the payload's `content`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawSkillFile {
     pub kind: SkillKind,

@@ -98,8 +98,8 @@ personal `projects/.../workspaces/<ws>/AGENTS.md` with the repo
 (lowercase; whitespace becomes `-`; only `[a-z0-9_-]` kept). Personal project
 and workspace skill packages override same-named repository packages when keys
 collide (`{project_key}/{skill}` or `{workspace}/{skill}`). `LoadSkill` returns
-only the absolute `SKILL.md` path so linked sibling files remain available
-through runtime-executed filesystem tools.
+the full `SKILL.md` content with its absolute runtime-host path. The path keeps
+linked sibling files available through runtime-executed filesystem tools.
 
 The repository's local stack can start the runtime through `infra/dev.sh`.
 For a manual run:

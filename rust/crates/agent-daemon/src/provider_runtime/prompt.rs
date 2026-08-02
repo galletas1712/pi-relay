@@ -275,8 +275,8 @@ pub(super) struct SkillFrontmatter {
 
 /// Build the skill catalog from the runtime's raw `SKILL.md` set. `None`
 /// workspace entries become global (home) skills; `Some` entries become
-/// workspace skills. The `rel_path` is stashed in `file_path` as an opaque
-/// identifier so LoadSkill can match a body back to this same set.
+/// workspace skills. The runtime path is stashed in `file_path` as an opaque
+/// identifier so LoadSkill can match the selected skill back to its raw file.
 pub(super) fn parse_runtime_skills(raw: &[RawSkillFile]) -> Vec<Skill> {
     raw.iter()
         .filter(|file| file.kind == SkillKind::Skill)
