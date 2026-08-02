@@ -15,6 +15,10 @@ import {
 import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { sessionTitle, type SessionListItem } from "./sessionList.ts";
 import type { ProjectWorkspace, Runtime } from "./types.ts";
+import {
+	NativeSelect,
+	NativeSelectOption,
+} from "@/components/ui/native-select";
 
 export type WorkspaceDraft =
 	| {
@@ -345,19 +349,20 @@ export function ProjectDialog({
 					</label>
 					<label className="rename-field">
 						<span>Runtime</span>
-						<select
+						<NativeSelect
+							className="w-full"
 							value={state.runtimeId ?? ""}
 							onChange={(event) => onChange({ runtimeId: event.target.value })}
 							required
 							disabled={busy || state.mode === "edit"}
 						>
-							<option value="">Select a runtime</option>
+							<NativeSelectOption value="">Select a runtime</NativeSelectOption>
 							{runtimes.map((runtime) => (
-								<option key={runtime.runtime_id} value={runtime.runtime_id} disabled={!runtime.online}>
+								<NativeSelectOption key={runtime.runtime_id} value={runtime.runtime_id} disabled={!runtime.online}>
 									{runtime.name} ({runtime.runtime_id}){runtime.online ? "" : " — offline"}
-								</option>
+								</NativeSelectOption>
 							))}
-						</select>
+						</NativeSelect>
 					</label>
 					<div className="workspace-editor">
 						<div className="workspace-editor-head">
@@ -383,14 +388,15 @@ export function ProjectDialog({
 									<div className="workspace-row">
 										<label>
 											<span>Type</span>
-											<select
+											<NativeSelect
+												className="w-full"
 												value={workspace.kind}
 												onChange={(event) => updateWorkspace(index, { kind: event.target.value as "git" | "local" })}
 												disabled={busy}
 											>
-												<option value="git">Git repo</option>
-												<option value="local">Local folder</option>
-											</select>
+												<NativeSelectOption value="git">Git repo</NativeSelectOption>
+												<NativeSelectOption value="local">Local folder</NativeSelectOption>
+											</NativeSelect>
 										</label>
 										<label>
 											<span>Name</span>

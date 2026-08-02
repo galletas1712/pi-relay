@@ -9,6 +9,7 @@ import {
 	type CSSProperties,
 	type KeyboardEvent as ReactKeyboardEvent,
 	type PointerEvent as ReactPointerEvent,
+	type ReactNode,
 	type RefObject,
 } from "react";
 import { ArrowUp, Bot, Menu, PanelRightOpen } from "lucide-react";
@@ -271,6 +272,7 @@ export interface AppProps {
 	api: AgentApi;
 	routeHistory?: WorkspaceRouteHistory | null;
 	entityStorage?: Storage;
+	headerControls?: ReactNode;
 }
 
 type RememberedRouteRestore = {
@@ -348,6 +350,7 @@ export function App({
 	api,
 	routeHistory: injectedRouteHistory,
 	entityStorage,
+	headerControls,
 }: AppProps) {
 	const routeHistory = useMemo(
 		() => injectedRouteHistory === undefined ? browserWorkspaceRouteHistory() : injectedRouteHistory,
@@ -4551,6 +4554,7 @@ export function App({
 
 			{conversationVisible ? (
 				<ChatPane
+						headerControls={headerControls}
 						session={selectedChatSession}
 						snapshot={loadedSnapshot}
 						entries={loadedEntries}

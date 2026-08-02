@@ -52,7 +52,7 @@ describe("ServerProfileStore", () => {
 		]);
 	});
 
-	it("stores name and immutable URL with tab-local selection", () => {
+	it("stores editable names and URLs with tab-local selection", () => {
 		const store = new ServerProfileStore(
 			window.localStorage,
 			window.sessionStorage,
@@ -60,29 +60,33 @@ describe("ServerProfileStore", () => {
 			idSequence(),
 		);
 		const local = store.current().profiles[0];
-		store.update(local.id, "Renamed local");
+		store.update(local.id, "Renamed local", "ws://localhost:9876");
 		const next = store.add("Tailnet", "wss://control.tail.test/");
 		const remote = next.profiles.find((profile) => profile.name === "Tailnet")!;
 		store.select(remote.id);
 
 		expect(JSON.parse(window.localStorage.getItem(SERVER_PROFILES_STORAGE_KEY)!)).toEqual([
-			{ id: "local", name: "Renamed local", url: "ws://127.0.0.1:8787/" },
+			{ id: "local", name: "Renamed local", url: "ws://localhost:9876/" },
 			{ id: remote.id, name: "Tailnet", url: "wss://control.tail.test/" },
 		]);
 		expect(window.sessionStorage.getItem(ACTIVE_SERVER_PROFILE_STORAGE_KEY)).toBe(remote.id);
 	});
 
-	it("keeps profile-scoped state when renaming an immutable profile", () => {
+	it("keeps profile-scoped state when changing a profile", () => {
 		const store = profileStore();
 		const profile = store.add("Only", "wss://only.example.test/").profiles[0];
 		store.storageFor(profile.id).setItem("draft", "remember me");
 
-		const next = store.update(profile.id, "Renamed").profiles[0];
+		const next = store.update(
+			profile.id,
+			"Renamed",
+			"wss://renamed.example.test/",
+		).profiles[0];
 
 		expect(next).toEqual({
 			id: profile.id,
 			name: "Renamed",
-			url: profile.url,
+			url: "wss://renamed.example.test/",
 		});
 		expect(store.storageFor(profile.id).getItem("draft")).toBe("remember me");
 	});
