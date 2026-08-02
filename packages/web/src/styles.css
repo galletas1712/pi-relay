@@ -205,6 +205,15 @@
 	flex-direction: column;
 }
 
+#root.standalone-mode {
+	height: 100vh;
+}
+
+#root.standalone-mode > .server-app {
+	height: 100vh;
+	background: var(--card);
+}
+
 .server-app > .app-shell {
 	height: auto;
 	min-height: 0;
