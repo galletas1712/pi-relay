@@ -41,7 +41,7 @@ export function LogHeader({
 }) {
 	const statusLabel = archived ? "archived session" : status ? `${status} session` : null;
 	return (
-		<div className="log-header">
+		<div className={`log-header${title ? "" : " log-header-new-session"}`}>
 			{title ? (
 				<span
 					className={`session-status-icon ${archived ? "archived" : status ?? "idle"}`}
