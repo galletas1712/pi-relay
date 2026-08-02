@@ -859,6 +859,89 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
         "failed offline drive must leave the durable queued input"
     );
 
+    let parent_id = "offline_runtime_parent";
+    state
+        .repo
+        .create_session(parent_id, &config)
+        .await
+        .expect("create delegation parent");
+    let delegation = state
+        .repo
+        .create_delegation_idempotent(agent_store::CreateDelegationRequest {
+            parent_session_id: parent_id,
+            launch_key: "runtime-online-pending-child",
+            launch_shape: r#"{"kind":"full","role":"implementer","prompt":"resume"}"#,
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("create running delegation");
+    let child_id = "offline_runtime_committed_child";
+    let entries = vec![
+        TranscriptStorageNode {
+            id: "offline-child-turn".to_string(),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "offline-child-user".to_string(),
+            parent_id: Some("offline-child-turn".to_string()),
+            timestamp_ms: 2,
+            item: TranscriptItem::UserMessage(UserMessage::text("resume")),
+            provider_replay: Vec::new(),
+        },
+    ];
+    let child_action = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::from_transcript_items(
+            entries.iter().map(|entry| entry.item.clone()).collect(),
+        ),
+        context_leaf_id: Some("offline-child-user".to_string()),
+    };
+    let mut child_config = config.clone();
+    child_config.metadata = json!({
+        "created_by": "test",
+        "harness": true,
+        "delegation_spawn_index": 0,
+        "fault_injection": { "force_harness_model_dispatch": true }
+    });
+    state
+        .repo
+        .start_session_outputs_with_parent(
+            child_id,
+            &child_config,
+            &entries,
+            Some("offline-child-user"),
+            &[],
+            &[child_action],
+            InputPriority::FollowUp,
+            &UserMessage::text("resume"),
+            None,
+            Some(parent_id),
+            Some(SubagentType::Full),
+            Some(&delegation.id),
+        )
+        .await
+        .expect("commit child action while runtime is offline");
+    assert!(!state
+        .repo
+        .has_queued_inputs(child_id)
+        .await
+        .expect("child queue check"));
+    assert_eq!(
+        state
+            .repo
+            .recoverable_delegation_children_for_runtime(TEST_RUNTIME_ID)
+            .await
+            .expect("runtime child recovery query"),
+        vec![child_id.to_string()]
+    );
+
     connect_test_runtime(&runtime_hosts, TEST_RUNTIME_ID).await;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -875,6 +958,22 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
     })
     .await
     .expect("runtime Hello redrives and consumes the stuck queued input");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if state
+                .tasks
+                .lock()
+                .expect("task map")
+                .values()
+                .any(|task| task.session_id == child_id)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("runtime Hello registers the committed child action");
 
     drop(state_dir);
     drop(cwd);

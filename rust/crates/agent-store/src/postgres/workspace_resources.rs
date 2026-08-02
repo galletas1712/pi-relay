@@ -40,6 +40,40 @@ fn workspace_resource_from_row(row: sqlx::postgres::PgRow) -> Result<WorkspaceRe
     })
 }
 
+async fn prune_fenced_full_leaf_sessions_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query(
+        r#"
+        delete from sessions candidate
+        where candidate.subagent_type='full'
+          and not exists (
+              select 1 from workspace_resources own
+              where own.owner_session_id=candidate.id
+          )
+          and not exists (
+              select 1 from sessions child
+              where child.parent_session_id=candidate.id
+          )
+          and exists (
+              with recursive ancestors(id, parent_session_id) as (
+                  select parent.id, parent.parent_session_id
+                  from sessions parent
+                  where parent.id=candidate.parent_session_id
+                  union all
+                  select parent.id, parent.parent_session_id
+                  from sessions parent
+                  join ancestors child on child.parent_session_id=parent.id
+              )
+              select 1 from ancestors
+              join workspace_resources r on r.owner_session_id=ancestors.id
+              where r.state='deleting' and r.cleanup_mode='delete_session'
+          )
+        "#,
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 impl PostgresAgentStore {
     /// Persist a private workspace identity before asking a runtime to create it.
     pub async fn begin_workspace_provisioning(
@@ -186,6 +220,110 @@ impl PostgresAgentStore {
         Ok(updated.rows_affected() == 1)
     }
 
+    /// Fence an idle session tree and persist every private cleanup before any
+    /// runtime destroy can occur. Full descendants have no private side effect,
+    /// so their identities are removed in the same transaction.
+    pub async fn request_session_tree_cleanup(&self, root_session_id: &str) -> Result<Vec<String>> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, root_session_id).await?;
+        let ids = sqlx::query_scalar::<_, String>(
+            r#"
+            with recursive tree(id, depth) as (
+                select id, 0 from sessions where id=$1
+                union all
+                select child.id, parent.depth + 1
+                from sessions child join tree parent on child.parent_session_id=parent.id
+            )
+            select id from tree order by id
+            "#,
+        )
+        .bind(root_session_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query("select id from sessions where id=any($1) order by id for update")
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+        for id in &ids {
+            ensure_no_active_work_tx(&mut tx, id).await?;
+        }
+        sqlx::query(
+            r#"
+            update workspace_resources r
+            set state='deleting', cleanup_mode='delete_session',
+                retry_at=now(), last_error=null, updated_at=now()
+            where r.owner_session_id=any($1)
+              and r.state in ('provisioning','ready','deleting')
+            "#,
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+        let missing_private: Option<String> = sqlx::query_scalar(
+            r#"
+            select s.id from sessions s
+            where s.id=any($1) and s.subagent_type is distinct from 'full'
+              and not exists (
+                  select 1 from workspace_resources r where r.owner_session_id=s.id
+              )
+            limit 1
+            "#,
+        )
+        .bind(&ids)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if missing_private.is_some() {
+            return Err(anyhow!(
+                "private workspace has no durable ownership mapping; run the workspace migration"
+            ));
+        }
+        sqlx::query(
+            r#"
+            delete from sessions
+            where id=any($1)
+              and exists (
+                  select 1 from workspace_resources r
+                  where r.owner_session_id=sessions.id and r.state='deleted'
+              )
+              and not exists (
+                  select 1 from sessions child where child.parent_session_id=sessions.id
+              )
+            "#,
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            delete from workspace_resources r
+            where r.owner_session_id=any($1) and r.state='deleted'
+              and not exists (
+                  select 1 from sessions s where s.id=r.owner_session_id
+              )
+            "#,
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            delete from sessions
+            where id=any($1) and subagent_type='full'
+              and not exists (
+                  select 1 from workspace_resources r where r.owner_session_id=sessions.id
+              )
+              and not exists (
+                  select 1 from sessions child where child.parent_session_id=sessions.id
+              )
+            "#,
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ids.into_iter().filter(|id| id != root_session_id).collect())
+    }
+
     /// Request physical cleanup while preserving the session identity until an
     /// exact runtime destroy succeeds. Returns false when the session has no
     /// private workspace (for example a full subagent).
@@ -269,6 +407,7 @@ impl PostgresAgentStore {
     /// preparations whose bounded lease elapsed. Safe to run periodically.
     pub async fn reconcile_workspace_resources(&self) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        prune_fenced_full_leaf_sessions_tx(&mut tx).await?;
         sqlx::query(
             r#"
             update workspace_resources r

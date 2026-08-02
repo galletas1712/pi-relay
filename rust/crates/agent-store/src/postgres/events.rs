@@ -63,7 +63,7 @@ impl PostgresAgentStore {
 
     /// Parent-visible
     /// `subagent.idle`. Delegation members do not call this on terminal completion;
-    /// they use `claim_subagent_idle_once` below to fire cleanup/barrier work
+    /// they use `claim_subagent_terminal_once` below to fire cleanup/barrier work
     /// without surfacing a per-child idle event to the parent.
     pub async fn insert_subagent_idle_event_once(
         &self,
@@ -73,10 +73,11 @@ impl PostgresAgentStore {
         payload: Value,
     ) -> Result<Option<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("select metadata from sessions where id=$1 for update")
-            .bind(child_session_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let row =
+            sqlx::query("select metadata, subagent_type from sessions where id=$1 for update")
+                .bind(child_session_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some(row) = row else {
             tx.commit().await?;
             return Ok(None);
@@ -109,9 +110,9 @@ impl PostgresAgentStore {
     /// Claim the once-only terminal-idle gate for a child WITHOUT writing a
     /// parent-visible `SubagentIdle` row. Returns `true` exactly once per
     /// `notification_key` (the same dedup `insert_subagent_idle_event_once`
-    /// uses), so a delegation member's barrier + RO-snapshot destroy still fire
-    /// exactly once while no per-child idle ever surfaces to the parent.
-    pub async fn claim_subagent_idle_once(
+    /// uses). For read-only children the durable cleanup intent commits in the
+    /// same transaction; physical cleanup remains independently idempotent.
+    pub async fn claim_subagent_terminal_once(
         &self,
         child_session_id: &str,
         notification_key: &str,
@@ -126,6 +127,46 @@ impl PostgresAgentStore {
             return Ok(false);
         };
         let mut metadata: Value = row.get("metadata");
+        let subagent_type: Option<String> = row.get("subagent_type");
+        if subagent_type.as_deref() == Some("read_only") {
+            let resource_exists: bool = sqlx::query_scalar(
+                r#"
+                select exists(
+                    select 1 from workspace_resources r
+                    join sessions s on s.id=r.owner_session_id
+                    where r.owner_session_id=$1
+                      and s.runtime_id=r.runtime_id and s.workspace_id=r.workspace_id
+                )
+                "#,
+            )
+            .bind(child_session_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !resource_exists {
+                return Err(anyhow!(
+                    "read-only terminal session has no durable workspace ownership"
+                ));
+            }
+        }
+        sqlx::query(
+            r#"
+            update workspace_resources r
+            set state='deleting',
+                cleanup_mode=case
+                    when r.cleanup_mode='delete_session' then 'delete_session'
+                    else 'retain_session'
+                end,
+                retry_at=now(), last_error=null, updated_at=now()
+            from sessions s
+            where r.owner_session_id=$1 and s.id=$1
+              and s.subagent_type='read_only'
+              and s.runtime_id=r.runtime_id and s.workspace_id=r.workspace_id
+              and r.state in ('provisioning','ready','deleting')
+            "#,
+        )
+        .bind(child_session_id)
+        .execute(&mut *tx)
+        .await?;
         if metadata
             .get("subagent_parent_idle_notification_key")
             .and_then(Value::as_str)

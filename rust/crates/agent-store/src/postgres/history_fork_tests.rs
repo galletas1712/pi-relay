@@ -266,12 +266,23 @@ async fn private_workspace_cleanup_routes_root_full_and_read_only_sessions() {
         .await
         .expect("read-only child attaches");
     assert!(store
-        .request_session_workspace_cleanup(
-            "workspace-read-only-child",
-            crate::WorkspaceCleanupMode::RetainSession,
-        )
+        .claim_subagent_terminal_once("workspace-read-only-child", "terminal-leaf")
         .await
-        .expect("read-only cleanup intent persists"));
+        .expect("terminal marker and cleanup intent commit together"));
+    assert!(!store
+        .claim_subagent_terminal_once("workspace-read-only-child", "terminal-leaf")
+        .await
+        .expect("restart repeats terminal transition"));
+    assert_eq!(
+        store
+            .workspace_resource_for_session("workspace-read-only-child")
+            .await
+            .expect("terminal resource loads")
+            .expect("terminal resource exists")
+            .state,
+        crate::WorkspaceResourceState::Deleting,
+        "cleanup remains independently discoverable after the once marker commits"
+    );
     let read_only_claim = store
         .claim_due_workspace_deletions(None)
         .await
@@ -539,19 +550,25 @@ async fn root_cleanup_waits_for_full_and_offline_read_only_descendants() {
         .await
         .expect("read-only child attaches");
 
-    assert!(
-        store
-            .request_session_workspace_cleanup(
-                read_only_id,
-                crate::WorkspaceCleanupMode::DeleteSession,
-            )
-            .await
-            .expect("read-only cleanup becomes pending")
-    );
-    assert!(store
-        .request_session_workspace_cleanup(root_id, crate::WorkspaceCleanupMode::DeleteSession)
+    let children = store
+        .request_session_tree_cleanup(root_id)
         .await
-        .expect("root cleanup becomes pending"));
+        .expect("whole tree deletion intent commits");
+    assert_eq!(children.len(), 2);
+    let rejected = match store
+        .enqueue_user_input(
+            root_id,
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("too late"),
+            Some("tree-delete-fenced-input"),
+            None,
+        )
+        .await
+    {
+        Ok(_) => panic!("root accepted input after tree deletion commit"),
+        Err(error) => error,
+    };
+    assert!(rejected.downcast_ref::<crate::SessionDeleting>().is_some());
 
     let child_claim = store
         .claim_due_workspace_deletions(None)
@@ -579,10 +596,14 @@ async fn root_cleanup_waits_for_full_and_offline_read_only_descendants() {
         .expect("blocked root does not claim")
         .is_empty());
 
-    assert!(store
-        .delete_session(full_id)
+    store
+        .reconcile_workspace_resources()
         .await
-        .expect("unrelated full child identity progresses independently"));
+        .expect("restart reconciliation prunes fenced full leaves");
+    assert!(!store
+        .session_exists(full_id)
+        .await
+        .expect("full child lookup"));
     assert!(
         store
             .request_session_workspace_cleanup(

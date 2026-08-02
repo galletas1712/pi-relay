@@ -2682,7 +2682,7 @@ export function App({
 				const actionProjection = applyActionLifecycleEvent(selectedCacheRef.current, event);
 				if (actionProjection.applied) {
 					replaceSelectedCache(actionProjection.cache);
-					shouldSyncSelected = false;
+					if (!refreshPlan.syncSelected) shouldSyncSelected = false;
 				}
 				const queue = queueProjectionFromEvent(event);
 				if (queue) {

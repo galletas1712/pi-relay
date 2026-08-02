@@ -930,45 +930,13 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
         return Err(RpcError::new("session_not_found", "session not found"));
     }
 
-    let (child_session_ids, _drivers) =
-        lock_hidden_subagent_delete_tree(state, &session_id).await?;
+    let (_, _drivers) = lock_hidden_subagent_delete_tree(state, &session_id).await?;
 
-    let mut delete_order = child_session_ids.clone();
-    delete_order.reverse();
-    delete_order.push(session_id.clone());
-    for candidate_session_id in &delete_order {
-        let subagent_type = state
-            .repo
-            .session_subagent_type(candidate_session_id)
-            .await?;
-        let owns_workspace = state
-            .repo
-            .workspace_resource_for_session(candidate_session_id)
-            .await?
-            .is_some();
-        let deleted = if owns_workspace {
-            crate::workspace_lifecycle::request_session_cleanup(
-                state,
-                candidate_session_id,
-                agent_store::WorkspaceCleanupMode::DeleteSession,
-            )
+    let child_session_ids =
+        crate::workspace_lifecycle::request_session_tree_cleanup(state, &session_id)
             .await
-            .map_err(map_source_mutation_error)?
-        } else if subagent_type == Some(agent_store::SubagentType::Full) {
-            state
-                .repo
-                .delete_session(candidate_session_id)
-                .await
-                .map_err(map_source_mutation_error)?
-        } else {
-            return Err(RpcError::new(
-                "session_delete_failed",
-                "private workspace has no durable ownership mapping; run the workspace migration",
-            ));
-        };
-        if !deleted && candidate_session_id == &session_id {
-            return Err(RpcError::new("session_not_found", "session not found"));
-        }
+            .map_err(map_source_mutation_error)?;
+    for candidate_session_id in child_session_ids.iter().chain(std::iter::once(&session_id)) {
         state.active.lock().await.remove(candidate_session_id);
         state
             .provider_connections
@@ -1446,6 +1414,11 @@ pub(crate) fn install_runtime_online_queued_redrive(state: &AppState) {
                     "failed to reconcile private workspaces after runtime {runtime_id} came online: {error:#}"
                 );
             }
+            crate::delegation_runner::recover_delegation_children_for_runtime(
+                &state,
+                &runtime_id,
+            )
+            .await;
             match state
                 .repo
                 .sessions_with_active_queued_inputs_for_runtime(Some(&runtime_id))

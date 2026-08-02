@@ -36,6 +36,13 @@ async fn reserve(
     Ok((workspace_id, generation))
 }
 
+pub(crate) async fn request_session_tree_cleanup(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Vec<String>> {
+    state.repo.request_session_tree_cleanup(session_id).await
+}
+
 async fn mark_abandoned(
     state: &AppState,
     owner_session_id: &str,

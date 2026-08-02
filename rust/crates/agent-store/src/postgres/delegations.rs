@@ -548,6 +548,27 @@ impl PostgresAgentStore {
         rows.iter().map(row_to_delegation).collect()
     }
 
+    pub async fn recoverable_delegation_children_for_runtime(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Vec<String>> {
+        let unfinished = action_is_unfinished(Some("a"));
+        let query = format!(
+            r#"
+            select distinct s.id
+            from sessions s
+            join delegations d on d.id=s.delegation_id and d.status='running'
+            where s.runtime_id=$1
+              and exists(select 1 from actions a where a.session_id=s.id and {unfinished})
+            order by s.id
+            "#
+        );
+        Ok(sqlx::query_scalar(&query)
+            .bind(runtime_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     pub async fn list_cancelling_delegations(&self) -> Result<Vec<Delegation>> {
         let rows = sqlx::query(
             r#"

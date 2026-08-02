@@ -53,6 +53,70 @@ afterEach(() => {
 });
 
 describe("App connection recovery integration", () => {
+	it("refreshes the final dispatch error to clear running activity", async () => {
+		const api = createControllableApi();
+		api.getTranscriptTurns.mockResolvedValue({
+			...transcriptTurns(),
+			cards: [{
+				...transcriptTurns().cards[1],
+				status: "open",
+				outcome: null,
+				boundary_entry_id: null,
+				end_sequence: null,
+				timestamp_ms: null,
+				assistant_message: null,
+			}],
+		});
+		let terminal = false;
+		api.getSession.mockImplementation(async () =>
+			sessionSnapshot(terminal ? {
+				activity: "idle",
+				pending_actions: [],
+				last_event_id: 5,
+			} : {
+				activity: "running",
+				server_time_ms: 1_700_000_000_010,
+				pending_actions: [{
+					action_row_id: "action-last-model",
+					kind: "model",
+					status: "running",
+					payload: {},
+				}],
+			}),
+		);
+		const { client, unmount } = renderApp(api);
+		await emitStatus(api, "open");
+		expect(await screen.findByText(/Generating response/)).toBeTruthy();
+
+		const callsBeforeError = api.getSession.mock.calls.length;
+		terminal = true;
+		await emitEvent(api, {
+			event_id: 5,
+			event: "model.error",
+			session_id: SESSION_ID,
+			data: {
+				action_row_id: "action-last-model",
+				kind: "model",
+				status: "error",
+				action_id: "model-last",
+				attempt_id: "attempt-last",
+				payload: {},
+				error: "runtime dispatch failed",
+			},
+		});
+
+		await waitFor(() =>
+			expect(api.getSession.mock.calls.length).toBeGreaterThan(callsBeforeError),
+		);
+		await waitFor(() =>
+			expect(document.body.textContent).not.toContain("Generating response"),
+		);
+
+		unmount();
+		await client.cancelQueries();
+		client.clear();
+	});
+
 	it("owns an initial project failure through deduplicated Retry, offline state, and reconnect recovery", async () => {
 		const api = createControllableApi();
 		const retry = deferred<Project[]>();
@@ -1053,7 +1117,7 @@ function appDelegation(overrides: Partial<Delegation> = {}): Delegation {
 	};
 }
 
-function sessionSnapshot(): SessionSnapshot {
+function sessionSnapshot(overrides: Partial<SessionSnapshot> = {}): SessionSnapshot {
 	return {
 		...sessionSummary(),
 		pending_actions: [],
@@ -1063,6 +1127,7 @@ function sessionSnapshot(): SessionSnapshot {
 		transcript_revision: 2,
 		last_event_id: 4,
 		server_time_ms: 1_700_000_000_004,
+		...overrides,
 	};
 }
 
