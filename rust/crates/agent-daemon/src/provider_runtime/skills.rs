@@ -82,6 +82,13 @@ pub(crate) struct ResolvedSkillRole {
     pub(crate) content: String,
     pub(crate) provider: Option<ProviderConfig>,
     pub(crate) skills: Vec<ResolvedPreloadedSkill>,
+    pub(crate) context: RoleContextPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoleContextPolicy {
+    Fresh,
+    Forked,
 }
 
 pub(crate) fn resolve_skill_role(
@@ -131,6 +138,16 @@ fn resolve_role_file(
         ));
     }
     let provider = role_provider_from_frontmatter(&parsed, Path::new(&file.path))?;
+    let context = match parsed.frontmatter.context.as_deref().unwrap_or("fresh") {
+        "fresh" => RoleContextPolicy::Fresh,
+        "forked" => RoleContextPolicy::Forked,
+        value => {
+            return Err(anyhow!(
+                "role skill {} has invalid context `{value}`; expected `fresh` or `forked`",
+                file.package_name
+            ))
+        }
+    };
     let skills = resolve_role_skills(runtime_raw, &parsed)?;
     Ok(ResolvedSkillRole {
         name: parsed.name,
@@ -139,6 +156,7 @@ fn resolve_role_file(
         content: parsed.body,
         provider,
         skills,
+        context,
     })
 }
 
@@ -387,6 +405,34 @@ mod tests {
         assert_eq!(resolved.skills.len(), 1);
         assert_eq!(resolved.skills[0].name, "swe");
         assert_eq!(resolved.skills[0].file_path, PathBuf::from(global.path));
+        assert_eq!(resolved.context, RoleContextPolicy::Fresh);
+    }
+
+    #[test]
+    fn role_context_policy_supports_forked_and_rejects_invalid_values() {
+        let forked = raw_skill(
+            SkillKind::SubagentRole,
+            SkillOrigin::RuntimeRole,
+            None,
+            "reviewer",
+            "context: forked\n",
+        );
+        assert_eq!(
+            resolve_skill_role(&[forked], "reviewer")
+                .expect("forked role")
+                .context,
+            RoleContextPolicy::Forked
+        );
+
+        let invalid = raw_skill(
+            SkillKind::SubagentRole,
+            SkillOrigin::RuntimeRole,
+            None,
+            "reviewer",
+            "context: inherited\n",
+        );
+        let error = resolve_skill_role(&[invalid], "reviewer").expect_err("invalid context");
+        assert!(error.to_string().contains("expected `fresh` or `forked`"));
     }
 
     #[test]

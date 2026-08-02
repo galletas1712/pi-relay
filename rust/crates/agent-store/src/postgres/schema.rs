@@ -59,6 +59,30 @@ create table if not exists sessions (
     transcript_revision bigint not null default 0
 );
 
+-- A read-only context fork reserves its exact runtime workspace before the
+-- runtime materializes it. Rows are removed by the child-creation transaction
+-- or by reconciliation after a daemon restart. This table intentionally has
+-- no session foreign key: its purpose is to cover the interval before the
+-- child session exists.
+create table if not exists context_fork_workspace_reservations (
+    child_session_id text primary key,
+    parent_session_id text not null,
+    runtime_id text not null,
+    workspace_id text not null unique,
+    owner_id text not null,
+    state text not null default 'materializing',
+    remove_session boolean not null default true,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists context_fork_workspace_reservations_runtime_idx
+    on context_fork_workspace_reservations(runtime_id, created_at);
+
+alter table context_fork_workspace_reservations
+    add column if not exists state text not null default 'materializing';
+alter table context_fork_workspace_reservations
+    add column if not exists remove_session boolean not null default true;
+
 create index if not exists sessions_project_created_idx
     on sessions(project_id, created_at desc, id desc);
 

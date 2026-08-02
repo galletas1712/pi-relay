@@ -271,6 +271,8 @@ pub(super) struct SkillFrontmatter {
     pub(super) max_tokens: Option<u32>,
     #[serde(default)]
     pub(super) skills: Vec<String>,
+    #[serde(default)]
+    pub(super) context: Option<String>,
 }
 
 /// Build the skill catalog from the runtime's raw `SKILL.md` set. `None`

@@ -49,9 +49,10 @@ rpc_views.rs       response shaping (snapshots, queue state, transcript views, s
 provider_runtime/  provider selection, model metadata scheduling, model/web-tool
                    execution, compaction, token accounting
                    (MCP snapshot reconstruction from the persisted session manifest)
-subagents.rs       delegation subagent spawn core: role resolution, full vs
-                   read-only workspace handling, role-local model selection,
-                   child prompt + lifecycle events
+subagents.rs       delegation subagent spawn core: role resolution and its
+                   fresh/forked context policy, full vs read-only workspace
+                   handling, role-local model selection, child prompt +
+                   lifecycle events
 delegation_tools.rs     delegation tool surface (delegate_writing_task /
                    delegate_readonly_tasks / inspect_delegation /
                    cancel_delegation / steer_subagent / interrupt_subagent)
@@ -75,9 +76,12 @@ no configuration arguments.
 Invalid configuration fails startup. User instructions, workflows, roles, and
 skills are discovered by the selected runtime and returned as a typed runtime
 context; agentd never opens runtime-host paths. Runtime roles may select their
-model and preload reusable global skills. Unavailable role providers retain the
-stable-provider fallback. Workflow packages are ordinary loadable skills, while
-roles remain hidden from `LoadSkill`. MCP server
+model, preload reusable global skills, and set `context: forked` to copy the
+parent's durable transcript into the child while the parent is running; later
+parent turns remain private to the parent. Omitted context means fresh context.
+Unavailable role providers retain the stable-provider fallback. Workflow
+packages are ordinary loadable skills, while roles remain hidden from
+`LoadSkill`. MCP server
 definitions (`$XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml`) and OAuth credentials
 live on each runtime host (see `agent-runtime`), not in the control plane.
 

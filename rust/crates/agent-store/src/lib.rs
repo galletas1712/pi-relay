@@ -116,6 +116,30 @@ text_enum! {
     }
 }
 
+/// Atomically copy a source transcript and enqueue the first child task.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateContextForkRequest<'a> {
+    pub source_session_id: &'a str,
+    pub child_session_id: &'a str,
+    pub reservation_owner_id: Option<&'a str>,
+    pub config: &'a SessionConfig,
+    pub parent_session_id: &'a str,
+    pub subagent_type: SubagentType,
+    pub delegation_id: Option<&'a str>,
+    pub task: &'a UserMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextForkWorkspaceReservation {
+    pub child_session_id: String,
+    pub parent_session_id: String,
+    pub runtime_id: String,
+    pub workspace_id: String,
+    pub owner_id: String,
+    pub state: String,
+    pub remove_session: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryTargetRecord {
     pub entry_id: String,

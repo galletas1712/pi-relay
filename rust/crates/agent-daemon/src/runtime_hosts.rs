@@ -22,6 +22,11 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration, Instant};
 use uuid::Uuid;
 
+/// A materialization reservation is considered abandoned only after this
+/// lease. The owner identity is per daemon process, so a newer daemon can
+/// safely claim an old owner's reservation after this bounded interval.
+const STALE_MATERIALIZING_RESERVATION_SECS: i64 = 300;
+
 /// Structured runtime failure preserved through anyhow so MCP handlers can map
 /// by stable `code` (and optional `data`) instead of scraping Display text.
 #[derive(Debug, Clone)]
@@ -61,6 +66,7 @@ pub(crate) type RuntimeOnlineHook = Arc<dyn Fn(String) + Send + Sync + 'static>;
 #[derive(Clone)]
 pub(crate) struct RuntimeRegistry {
     repo: Arc<PostgresAgentStore>,
+    reservation_owner_id: String,
     connections: Arc<Mutex<HashMap<String, RuntimeConnection>>>,
     waiters: Arc<Mutex<HashMap<String, Waiter>>>,
     on_online: Arc<StdMutex<Option<RuntimeOnlineHook>>>,
@@ -114,6 +120,7 @@ impl RuntimeRegistry {
     pub(crate) fn new(repo: Arc<PostgresAgentStore>) -> Self {
         Self {
             repo,
+            reservation_owner_id: format!("daemon_{}_{}", std::process::id(), Uuid::new_v4()),
             connections: Default::default(),
             waiters: Default::default(),
             on_online: Arc::new(StdMutex::new(None)),
@@ -122,6 +129,10 @@ impl RuntimeRegistry {
 
     pub(crate) fn set_on_online(&self, hook: RuntimeOnlineHook) {
         *self.on_online.lock().expect("runtime online hook lock") = Some(hook);
+    }
+
+    pub(crate) fn reservation_owner_id(&self) -> &str {
+        &self.reservation_owner_id
     }
 
     pub(crate) async fn listen(self, bind: String) -> Result<()> {
@@ -456,6 +467,87 @@ impl RuntimeRegistry {
             .await
     }
 
+    pub(crate) async fn mark_context_fork_workspace_cleanup_pending_with_policy(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        runtime_id: &str,
+        workspace_id: &str,
+        remove_session: bool,
+    ) -> Result<()> {
+        self.repo
+            .mark_context_fork_workspace_cleanup_pending_with_policy(
+                child_session_id,
+                parent_session_id,
+                runtime_id,
+                workspace_id,
+                &self.reservation_owner_id,
+                remove_session,
+            )
+            .await
+    }
+
+    pub(crate) async fn cleanup_read_only_session(
+        &self,
+        session_id: &str,
+        remove_session: bool,
+    ) -> Result<()> {
+        if self.repo.session_subagent_type(session_id).await?
+            != Some(agent_store::SubagentType::ReadOnly)
+        {
+            return Err(anyhow!("session is not a read-only subagent: {session_id}"));
+        }
+        let config = self.repo.load_session_config(session_id).await?;
+        let parent_session_id = self
+            .repo
+            .session_parent_id(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("read-only subagent has no parent: {session_id}"))?;
+        self.cleanup_read_only_workspace(
+            session_id,
+            &parent_session_id,
+            &config.runtime_id,
+            &config.workspace_id,
+            remove_session,
+        )
+        .await
+    }
+
+    pub(crate) async fn cleanup_read_only_workspace(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        runtime_id: &str,
+        workspace_id: &str,
+        remove_session: bool,
+    ) -> Result<()> {
+        self.mark_context_fork_workspace_cleanup_pending_with_policy(
+            child_session_id,
+            parent_session_id,
+            runtime_id,
+            workspace_id,
+            remove_session,
+        )
+        .await?;
+        self.destroy_workspace_for_runtime(runtime_id, workspace_id)
+            .await?;
+        let complete = self
+            .complete_context_fork_workspace_cleanup(
+                child_session_id,
+                parent_session_id,
+                runtime_id,
+                workspace_id,
+                self.reservation_owner_id(),
+            )
+            .await?;
+        if !complete {
+            return Err(anyhow!(
+                "context fork cleanup reservation was not completed for {workspace_id}"
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn fork_session_from_parent(
         &self,
         parent_session_id: &str,
@@ -481,10 +573,159 @@ impl RuntimeRegistry {
         Ok((target_workspace_id.to_string(), workspaces))
     }
 
-    pub(crate) async fn destroy_session_workspaces(&self, session_id: &str) -> Result<()> {
-        let config = self.repo.load_session_config(session_id).await?;
-        self.destroy_workspace_for_runtime(&config.runtime_id, &config.workspace_id)
+    pub(crate) async fn reserve_context_fork_workspace(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        runtime_id: &str,
+        workspace_id: &str,
+    ) -> Result<()> {
+        self.repo
+            .reserve_context_fork_workspace(
+                child_session_id,
+                parent_session_id,
+                runtime_id,
+                workspace_id,
+                &self.reservation_owner_id,
+            )
             .await
+    }
+
+    pub(crate) async fn release_context_fork_workspace_reservation(
+        &self,
+        child_session_id: &str,
+        runtime_id: &str,
+        workspace_id: &str,
+    ) -> Result<bool> {
+        self.repo
+            .release_context_fork_workspace_reservation(
+                child_session_id,
+                runtime_id,
+                workspace_id,
+                &self.reservation_owner_id,
+            )
+            .await
+    }
+
+    pub(crate) async fn complete_context_fork_workspace_cleanup(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        runtime_id: &str,
+        workspace_id: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        self.repo
+            .complete_context_fork_workspace_cleanup(
+                child_session_id,
+                parent_session_id,
+                runtime_id,
+                workspace_id,
+                owner_id,
+            )
+            .await
+    }
+
+    pub(crate) async fn reconcile_context_fork_workspace_reservations(
+        &self,
+        runtime_id: &str,
+    ) -> Result<()> {
+        // A committed read-only child owns the workspace even if its creator
+        // died before releasing the materialization reservation. Adopt only
+        // rows whose complete child identity matches in SQL; leave them
+        // materializing so ordinary cleanup can transition them later.
+        for reservation in self
+            .repo
+            .adopt_stale_context_fork_workspace_reservations(
+                runtime_id,
+                &self.reservation_owner_id,
+                STALE_MATERIALIZING_RESERVATION_SECS,
+            )
+            .await?
+        {
+            eprintln!(
+                "adopted stale materializing workspace {} for committed read-only child {}",
+                reservation.workspace_id, reservation.child_session_id
+            );
+        }
+        // Only old-owner rows older than the bounded lease are claimed. A
+        // current daemon's materialization remains untouched, and a committed
+        // child is an explicit fence against deleting its workspace.
+        for reservation in self
+            .repo
+            .claim_stale_context_fork_workspace_reservations(
+                runtime_id,
+                &self.reservation_owner_id,
+                STALE_MATERIALIZING_RESERVATION_SECS,
+            )
+            .await?
+        {
+            if let Err(error) = self
+                .destroy_workspace_for_runtime(&reservation.runtime_id, &reservation.workspace_id)
+                .await
+            {
+                eprintln!(
+                    "failed to reconcile stale materializing workspace {}: {error:#}",
+                    reservation.workspace_id
+                );
+                continue;
+            }
+            let complete = self
+                .complete_context_fork_workspace_cleanup(
+                    &reservation.child_session_id,
+                    &reservation.parent_session_id,
+                    &reservation.runtime_id,
+                    &reservation.workspace_id,
+                    &reservation.owner_id,
+                )
+                .await?;
+            if !complete {
+                eprintln!(
+                    "stale materializing cleanup was not completed for {}",
+                    reservation.workspace_id
+                );
+            }
+        }
+        for reservation in self
+            .repo
+            .context_fork_workspace_reservations(Some(runtime_id), &self.reservation_owner_id)
+            .await?
+        {
+            if reservation.state != "cleanup_pending" {
+                // Only the explicit stale-claim query above may transition an
+                // old-owner materialization. Current-owner and fresh
+                // materializations are still in progress and remain fenced.
+                continue;
+            }
+            // Only destroy the exact workspace named by an explicitly pending
+            // reservation. Never infer cleanup from a directory listing.
+            if let Err(error) = self
+                .destroy_workspace_for_runtime(&reservation.runtime_id, &reservation.workspace_id)
+                .await
+            {
+                eprintln!(
+                    "failed to reconcile cleanup-pending workspace {}: {error:#}",
+                    reservation.workspace_id
+                );
+                continue;
+            }
+            let complete = self
+                .complete_context_fork_workspace_cleanup(
+                    &reservation.child_session_id,
+                    &reservation.parent_session_id,
+                    &reservation.runtime_id,
+                    &reservation.workspace_id,
+                    &reservation.owner_id,
+                )
+                .await?;
+            if !complete {
+                eprintln!(
+                    "cleanup-pending reconciliation was not completed for {}",
+                    reservation.workspace_id
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn destroy_workspace_for_runtime(

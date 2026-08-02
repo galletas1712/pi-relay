@@ -360,7 +360,7 @@ fn delegate_writing_task_definition() -> ToolDefinition {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "The self-contained task. The subagent starts with fresh context and only knows what you put here plus any paths you cite."
+                    "description": "The self-contained task. Context is controlled by the selected role's SKILL.md; omitted context defaults to fresh."
                 },
                 "workflow": {
                     "type": "string",
@@ -398,7 +398,7 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
                             },
                             "prompt": {
                                 "type": "string",
-                                "description": "The self-contained task for this subagent (fresh context)."
+                                "description": "The self-contained task for this subagent. Context is controlled by the selected role's SKILL.md and defaults to fresh."
                             }
                         },
                         "required": ["role", "prompt"],
