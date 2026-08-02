@@ -13,7 +13,7 @@ name: Electron macOS artifact
 
 concurrency:
   group: electron-macos-artifact
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
