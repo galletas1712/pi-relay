@@ -12,13 +12,15 @@ if (!app.requestSingleInstanceLock()) {
 	app.quit();
 } else {
 	app.on("second-instance", () => {
-		if (!mainWindow || mainWindow.isDestroyed()) {
-			createWindow();
-			return;
-		}
-		if (mainWindow.isMinimized()) mainWindow.restore();
-		if (!mainWindow.isVisible()) mainWindow.show();
-		mainWindow.focus();
+		app.whenReady().then(() => {
+			if (!mainWindow || mainWindow.isDestroyed()) {
+				createWindow();
+				return;
+			}
+			if (mainWindow.isMinimized()) mainWindow.restore();
+			if (!mainWindow.isVisible()) mainWindow.show();
+			mainWindow.focus();
+		});
 	});
 
 	app.whenReady().then(() => {
