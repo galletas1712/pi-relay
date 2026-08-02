@@ -118,10 +118,11 @@ impl PostgresAgentStore {
         notification_key: &str,
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("select metadata from sessions where id=$1 for update")
-            .bind(child_session_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let row =
+            sqlx::query("select metadata, subagent_type from sessions where id=$1 for update")
+                .bind(child_session_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some(row) = row else {
             tx.commit().await?;
             return Ok(false);
