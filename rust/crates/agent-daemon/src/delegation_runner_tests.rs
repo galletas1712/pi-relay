@@ -19,9 +19,9 @@ use agent_session::{
 use agent_store::{
     ActionKind, ActionStatus, ActionUpdate, CompactionCompletion, CompactionScope,
     CompactionTrigger, Delegation, DelegationKind, DelegationStatus, EventType, InputPriority,
-    McpSessionManifestBinding, OutputBatch, PostgresAgentStore, QueuedInputContent,
-    QueuedInputStatus, SessionConfig, SubagentControlPhase, SubagentType, TranscriptEntryBodyMode,
-    TranscriptEntryScope,
+    McpSessionManifestBinding, OutputBatch, PostgresAgentStore, PreparedWorkspace,
+    QueuedInputContent, QueuedInputStatus, SessionConfig, SubagentControlPhase, SubagentType,
+    TranscriptEntryBodyMode, TranscriptEntryScope, WorkspaceOwnerKind,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{
@@ -609,6 +609,44 @@ fn subagent_test_metadata(role: &str, subagent_type: SubagentType) -> serde_json
     })
 }
 
+async fn prepare_subagent_test_workspace(
+    env: &TestEnv,
+    session_id: &str,
+    config: &mut SessionConfig,
+    subagent_type: SubagentType,
+) -> Option<PreparedWorkspace> {
+    if subagent_type == SubagentType::Full {
+        return None;
+    }
+    config.workspace_id = format!("test-read-only-workspace-{session_id}");
+    let generation = format!("test-read-only-generation-{}", Uuid::new_v4());
+    env.state
+        .repo
+        .begin_workspace_provisioning(
+            session_id,
+            &config.runtime_id,
+            &config.workspace_id,
+            &generation,
+            WorkspaceOwnerKind::ReadOnly,
+            300,
+        )
+        .await
+        .expect("read-only test workspace provisioning begins");
+    Some(
+        env.state
+            .repo
+            .finish_workspace_provisioning(
+                session_id,
+                &config.runtime_id,
+                &config.workspace_id,
+                &generation,
+                &config.workspaces,
+            )
+            .await
+            .expect("read-only test workspace provisioning finishes"),
+    )
+}
+
 /// A parent session that opts into the harness, so any model dispatch the
 /// barrier's wakeup observation triggers stops at `pending` instead of calling
 /// a provider.
@@ -895,20 +933,43 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
             provider_replay: Vec::new(),
         },
     ];
-    let child_action = SessionAction::RequestModel {
+    let child_tool_call = ToolCall {
+        id: ToolCallId::new("offline-child-tool"),
+        tool_name: "bash".to_string(),
+        args_json: r#"{"command":"sleep 1"}"#.to_string(),
+    };
+    let child_action = SessionAction::RequestTool {
         action_id: ActionId(1),
         turn_id: TurnId(1),
-        model_context: ModelContext::from_transcript_items(
-            entries.iter().map(|entry| entry.item.clone()).collect(),
-        ),
-        context_leaf_id: Some("offline-child-user".to_string()),
+        tool_call: child_tool_call.clone(),
     };
+    let mut entries = entries;
+    entries.extend([
+        TranscriptStorageNode {
+            id: "offline-child-assistant".to_string(),
+            parent_id: Some("offline-child-user".to_string()),
+            timestamp_ms: 3,
+            item: TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(child_tool_call.clone())],
+            }),
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "offline-child-tool-started".to_string(),
+            parent_id: Some("offline-child-assistant".to_string()),
+            timestamp_ms: 4,
+            item: TranscriptItem::ToolCallStarted {
+                turn_id: TurnId(1),
+                tool_call: child_tool_call,
+            },
+            provider_replay: Vec::new(),
+        },
+    ]);
     let mut child_config = config.clone();
     child_config.metadata = json!({
         "created_by": "test",
         "harness": true,
         "delegation_spawn_index": 0,
-        "fault_injection": { "force_harness_model_dispatch": true }
     });
     state
         .repo
@@ -916,7 +977,7 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
             child_id,
             &child_config,
             &entries,
-            Some("offline-child-user"),
+            Some("offline-child-tool-started"),
             &[],
             &[child_action],
             InputPriority::FollowUp,
@@ -975,6 +1036,9 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
     .await
     .expect("runtime Hello registers the committed child action");
 
+    for handle in take_tasks(&state) {
+        handle.abort();
+    }
     drop(state_dir);
     drop(cwd);
     state.repo.close().await;
@@ -4925,11 +4989,14 @@ async fn create_terminal_subagent(
             provider_replay: Vec::new(),
         },
     ];
+    let mut config = session_config(env, project_id, subagent_test_metadata(role, subagent_type));
+    let workspace =
+        prepare_subagent_test_workspace(env, session_id, &mut config, subagent_type).await;
     env.state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             session_id,
-            &session_config(env, project_id, subagent_test_metadata(role, subagent_type)),
+            &config,
             &entries,
             Some(&leaf),
             &[],
@@ -4940,6 +5007,7 @@ async fn create_terminal_subagent(
             Some(parent_id),
             Some(subagent_type),
             Some(delegation_id),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
         .await
         .expect("create terminal subagent");
@@ -5004,15 +5072,18 @@ async fn create_running_subagent(
             provider_replay: Vec::new(),
         },
     ];
+    let mut config = session_config(
+        env,
+        project_id,
+        subagent_test_metadata(role, SubagentType::ReadOnly),
+    );
+    let workspace =
+        prepare_subagent_test_workspace(env, session_id, &mut config, SubagentType::ReadOnly).await;
     env.state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             session_id,
-            &session_config(
-                env,
-                project_id,
-                subagent_test_metadata(role, SubagentType::ReadOnly),
-            ),
+            &config,
             &entries,
             Some(&mid_turn),
             &[],
@@ -5028,6 +5099,7 @@ async fn create_running_subagent(
             Some(parent_id),
             Some(SubagentType::ReadOnly),
             Some(delegation_id),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
         .await
         .expect("create running subagent");
@@ -5059,11 +5131,14 @@ async fn create_empty_subagent(
     role: &str,
     subagent_type: SubagentType,
 ) {
+    let mut config = session_config(env, project_id, subagent_test_metadata(role, subagent_type));
+    let workspace =
+        prepare_subagent_test_workspace(env, session_id, &mut config, subagent_type).await;
     env.state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             session_id,
-            &session_config(env, project_id, subagent_test_metadata(role, subagent_type)),
+            &config,
             &[],
             None,
             &[],
@@ -5074,6 +5149,7 @@ async fn create_empty_subagent(
             Some(parent_id),
             Some(subagent_type),
             Some(delegation_id),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
         .await
         .expect("create empty delegation subagent");
@@ -5586,15 +5662,18 @@ async fn create_busy_subagent(
         model_context: ModelContext::new(),
         context_leaf_id: Some(active_leaf.clone()),
     }];
+    let mut config = session_config(env, project_id, {
+        let mut metadata = subagent_test_metadata(role, subagent_type);
+        metadata["harness"] = json!(true);
+        metadata
+    });
+    let workspace =
+        prepare_subagent_test_workspace(env, session_id, &mut config, subagent_type).await;
     env.state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             session_id,
-            &session_config(env, project_id, {
-                let mut metadata = subagent_test_metadata(role, subagent_type);
-                metadata["harness"] = json!(true);
-                metadata
-            }),
+            &config,
             &entries,
             Some(&active_leaf),
             &[],
@@ -5605,6 +5684,7 @@ async fn create_busy_subagent(
             Some(parent_id),
             Some(subagent_type),
             Some(delegation_id),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
         .await
         .expect("create busy subagent");
@@ -7919,15 +7999,18 @@ async fn steer_subagent_rejects_idle_terminal_subagent_without_reactivating_it()
             provider_replay: Vec::new(),
         },
     ];
+    let mut config = session_config(
+        &env,
+        project_id,
+        json!({ "created_by": "test", "role_name": "reviewer" }),
+    );
+    let workspace =
+        prepare_subagent_test_workspace(&env, "ro_idle", &mut config, SubagentType::ReadOnly).await;
     env.state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             "ro_idle",
-            &session_config(
-                &env,
-                project_id,
-                json!({ "created_by": "test", "role_name": "reviewer" }),
-            ),
+            &config,
             &entries,
             Some(active_leaf),
             &[],
@@ -7938,6 +8021,7 @@ async fn steer_subagent_rejects_idle_terminal_subagent_without_reactivating_it()
             Some("parent"),
             Some(SubagentType::ReadOnly),
             Some(&delegation.id),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
         .await
         .expect("create idle nonterminal subagent");

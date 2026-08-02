@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_session::{AgentSession, TranscriptStorageNode};
+use agent_session::{AgentSession, ModelContext, SessionAction, TranscriptStorageNode};
 use agent_vocab::{
-    AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
+    ActionId, AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
     ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, TurnId, TurnOutcome,
     UserMessage,
 };
@@ -341,6 +341,107 @@ async fn private_workspace_cleanup_routes_root_full_and_read_only_sessions() {
         .session_exists("workspace-root-session")
         .await
         .expect("root identity gone"));
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn deleting_workspace_cleanup_requests_are_idempotent_and_monotonic() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "workspace cleanup merge test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    create_session(store, project_id, "cleanup-merge-parent", false).await;
+
+    let session_id = "cleanup-merge-read-only";
+    let mut config = session_config(project_id);
+    config.workspace_id = "workspace-cleanup-merge-read-only".to_string();
+    let workspace =
+        prepare_test_workspace(store, session_id, &config, WorkspaceOwnerKind::ReadOnly).await;
+    let action = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::new(),
+        context_leaf_id: None,
+    };
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            session_id,
+            &config,
+            &[],
+            None,
+            &[],
+            &[action],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("read-only task"),
+            None,
+            Some("cleanup-merge-parent"),
+            Some(crate::SubagentType::ReadOnly),
+            None,
+            Some(workspace.attachment()),
+        )
+        .await
+        .expect("read-only child attaches with unfinished work");
+    assert!(store
+        .claim_subagent_terminal_once(session_id, "cleanup-merge-terminal")
+        .await
+        .expect("terminal projection requests retention"));
+
+    assert!(store
+        .request_session_workspace_cleanup(session_id, crate::WorkspaceCleanupMode::RetainSession,)
+        .await
+        .expect("repeated retention bypasses ordinary mutation eligibility"));
+    let retained = store
+        .workspace_resource_for_session(session_id)
+        .await
+        .expect("retained resource loads")
+        .expect("retained resource exists");
+    assert_eq!(retained.generation, workspace.generation);
+    assert_eq!(
+        retained.cleanup_mode,
+        Some(crate::WorkspaceCleanupMode::RetainSession)
+    );
+
+    assert!(store
+        .request_session_workspace_cleanup(session_id, crate::WorkspaceCleanupMode::DeleteSession,)
+        .await
+        .expect("delete request escalates existing cleanup"));
+    let escalated = store
+        .workspace_resource_for_session(session_id)
+        .await
+        .expect("escalated resource loads")
+        .expect("escalated resource exists");
+    assert_eq!(escalated.generation, workspace.generation);
+    assert_eq!(
+        escalated.cleanup_mode,
+        Some(crate::WorkspaceCleanupMode::DeleteSession)
+    );
+
+    assert!(store
+        .request_session_workspace_cleanup(session_id, crate::WorkspaceCleanupMode::RetainSession,)
+        .await
+        .expect("weaker repeat remains accepted"));
+    assert_eq!(
+        store
+            .workspace_resource_for_session(session_id)
+            .await
+            .expect("monotonic resource loads")
+            .expect("monotonic resource exists")
+            .cleanup_mode,
+        Some(crate::WorkspaceCleanupMode::DeleteSession)
+    );
     db.cleanup().await;
 }
 

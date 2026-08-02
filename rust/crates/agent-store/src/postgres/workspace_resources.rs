@@ -340,10 +340,9 @@ impl PostgresAgentStore {
             }
             return Err(error);
         }
-        ensure_no_active_work_tx(&mut tx, session_id).await?;
         let row = sqlx::query(
             r#"
-            select r.state
+            select r.runtime_id, r.workspace_id, r.generation, r.state
             from workspace_resources r
             join sessions s on s.id=r.owner_session_id
             where r.owner_session_id=$1 and s.runtime_id=r.runtime_id
@@ -358,21 +357,39 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok(false);
         };
+        let runtime_id: String = row.get("runtime_id");
+        let workspace_id: String = row.get("workspace_id");
+        let generation: String = row.get("generation");
         let state: WorkspaceResourceState = row
             .get::<String, _>("state")
             .parse()
             .map_err(|error: String| anyhow!(error))?;
+        // A deleting resource is already the durable mutation fence. Repeated
+        // cleanup requests only merge intent and must remain safe even while
+        // cancellation is settling the owner's previously accepted work.
+        if state != WorkspaceResourceState::Deleting {
+            ensure_no_active_work_tx(&mut tx, session_id).await?;
+        }
         if state == WorkspaceResourceState::Deleted {
             if cleanup_mode == WorkspaceCleanupMode::DeleteSession {
-                sqlx::query("delete from sessions where id=$1")
-                    .bind(session_id)
-                    .execute(&mut *tx)
-                    .await?;
                 sqlx::query(
-                    "delete from workspace_resources
-                     where owner_session_id=$1 and state='deleted'",
+                    "delete from sessions
+                     where id=$1 and runtime_id=$2 and workspace_id=$3",
                 )
                 .bind(session_id)
+                .bind(&runtime_id)
+                .bind(&workspace_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "delete from workspace_resources
+                     where owner_session_id=$1 and runtime_id=$2 and workspace_id=$3
+                       and generation=$4 and state='deleted'",
+                )
+                .bind(session_id)
+                .bind(&runtime_id)
+                .bind(&workspace_id)
+                .bind(&generation)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -384,18 +401,22 @@ impl PostgresAgentStore {
             update workspace_resources r
             set state='deleting',
                 cleanup_mode=case
-                    when r.cleanup_mode='delete_session' or $2='delete_session'
+                    when r.cleanup_mode='delete_session' or $5='delete_session'
                         then 'delete_session'
                     else 'retain_session'
                 end,
                 retry_at=now(), last_error=null, updated_at=now()
             from sessions s
             where r.owner_session_id=$1 and s.id=$1
+              and r.runtime_id=$2 and r.workspace_id=$3 and r.generation=$4
               and s.runtime_id=r.runtime_id and s.workspace_id=r.workspace_id
               and r.state in ('provisioning','ready','deleting')
             "#,
         )
         .bind(session_id)
+        .bind(&runtime_id)
+        .bind(&workspace_id)
+        .bind(&generation)
         .bind(cleanup_mode.as_str())
         .execute(&mut *tx)
         .await?;
