@@ -2,23 +2,16 @@ import { memo, useId, useState } from "react";
 import {
 	ChevronDown,
 	ChevronRight,
-	Clock3,
-	KeyRound,
 	LockKeyhole,
 	LogIn,
 	LogOut,
 	Plug,
 	RotateCcw,
 	ServerCog,
-	ShieldAlert,
-	ShieldCheck,
-	ShieldQuestion,
 	TriangleAlert,
 	Unplug,
 	UsersRound,
-	Wrench,
 	X,
-	type LucideIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -144,7 +137,6 @@ export const McpToolPicker = memo(function McpToolPicker({
 							</div>
 						) : null}
 						{serverIds.map((serverId, serverIndex) => {
-							const hasInventory = inventoryByServer.has(serverId);
 							const server = inventoryByServer.get(serverId) ?? missingInventoryServer(serverId);
 							const auth = authByServer.get(serverId);
 							const state = serverSelectionState(pickerInventory, selection, server.server);
@@ -238,24 +230,20 @@ export const McpToolPicker = memo(function McpToolPicker({
 										</div>
 										<div className="mcp-picker-server-copy">
 											<div className="mcp-picker-server-heading">
+												<ServerStatus health={server.health} auth={auth} />
 												<span className="mcp-picker-server-name" title={server.server}>
 													{server.server}
 												</span>
-												<div className="mcp-picker-server-statuses">
-													{hasInventory ? <HealthStatus health={server.health} /> : null}
-													{auth ? <AuthStatus status={auth} /> : null}
-												</div>
-											</div>
-											<div className="mcp-picker-meta">
-												<Wrench aria-hidden />
-												<span>
+												<span className="mcp-picker-meta">
+													(
 													{selectedCount > 0
 														? serverSelectionLabel(selectedCount, server.tools.length)
 														: availableToolsLabel(server.tools.length)}
+													{selectedCount > 0
+														? <> · {tokenCountLabel(contextTokens)}</>
+														: null}
+													)
 												</span>
-												{selectedCount > 0
-													? <span className="mcp-token-count">{tokenCountLabel(contextTokens)}</span>
-													: null}
 											</div>
 										</div>
 										<div className="mcp-picker-auth-actions">
@@ -263,7 +251,7 @@ export const McpToolPicker = memo(function McpToolPicker({
 												<Button
 													type="button"
 													variant="outline"
-													className="mcp-picker-auth-action min-h-11"
+													className="mcp-picker-auth-action"
 													onClick={() => onLogin?.(server.server)}
 													disabled={authActionDisabled}
 												>
@@ -277,7 +265,7 @@ export const McpToolPicker = memo(function McpToolPicker({
 												<Button
 													type="button"
 													variant="ghost"
-													className="mcp-picker-auth-action min-h-11"
+													className="mcp-picker-auth-action"
 													onClick={clearAndLogout}
 													disabled={authActionDisabled}
 												>
@@ -291,7 +279,7 @@ export const McpToolPicker = memo(function McpToolPicker({
 												<Button
 													type="button"
 													variant="ghost"
-													className="mcp-picker-auth-action min-h-11"
+													className="mcp-picker-auth-action"
 													onClick={clearAndLogout}
 													disabled={authActionDisabled}
 												>
@@ -375,84 +363,70 @@ export const McpToolPicker = memo(function McpToolPicker({
 	);
 });
 
-function HealthStatus({ health }: { health: McpInventoryServer["health"] }) {
-	const { label, Icon } = healthPresentation(health);
-	if (health === "healthy") {
-		return <span className="mcp-picker-status-quiet">{label}</span>;
-	}
+function ServerStatus({
+	health,
+	auth,
+}: {
+	health: McpInventoryServer["health"];
+	auth?: McpAuthServerStatus;
+}) {
+	const status = serverStatusPresentation(health, auth);
 	return (
-		<Badge variant="destructive">
-			<Icon data-icon="inline-start" aria-hidden />
-			{label}
-		</Badge>
+		<span
+			className="mcp-picker-status-dot"
+			data-state={status.state}
+			role="img"
+			aria-label={status.label}
+			title={status.detail}
+		/>
 	);
 }
 
-function AuthStatus({ status }: { status: McpAuthServerStatus }) {
-	const { label, detail, Icon, variant } = authPresentation(status);
-	const quiet =
-		status.auth_kind !== "oauth" ||
-		status.auth_state === "ready" ||
-		status.auth_state === "not_applicable";
-	if (quiet) {
-		return (
-			<span className="mcp-picker-status-quiet" aria-label={detail} title={detail}>
-				{label}
-			</span>
-		);
-	}
-	return (
-		<Badge variant={variant} aria-label={detail} title={detail}>
-			<Icon data-icon="inline-start" aria-hidden />
-			{label}
-		</Badge>
-	);
-}
-
-function healthPresentation(
+function serverStatusPresentation(
 	health: McpInventoryServer["health"],
-): { label: string; Icon: LucideIcon } {
-	switch (health) {
-		case "healthy": return { label: "Online", Icon: ServerCog };
-		case "unavailable": return { label: "Offline", Icon: Unplug };
-		case "revoked": return { label: "Revoked", Icon: ShieldAlert };
+	auth?: McpAuthServerStatus,
+): { state: "online" | "attention" | "offline"; label: string; detail: string } {
+	if (health === "unavailable") {
+		const detail = auth ? authStatusDetail(auth) : null;
+		return {
+			state: "offline",
+			label: detail ? `Offline, ${detail}` : "Offline",
+			detail: detail ? `MCP server is offline; ${detail}` : "MCP server is offline",
+		};
 	}
+	if (health === "revoked") {
+		return {
+			state: "offline",
+			label: "Revoked",
+			detail: "MCP server access was revoked",
+		};
+	}
+	const detail = auth ? authStatusDetail(auth) : null;
+	const authNeedsAttention =
+		auth?.auth_kind === "oauth" &&
+		auth.auth_state !== "ready" &&
+		auth.auth_state !== "not_applicable";
+	return {
+		state: authNeedsAttention ? "attention" : "online",
+		label: detail ? `Online, ${detail}` : "Online",
+		detail: detail ? `MCP server is online; ${detail}` : "MCP server is online",
+	};
 }
 
-function authPresentation(status: McpAuthServerStatus): {
-	label: string;
-	detail: string;
-	Icon: LucideIcon;
-	variant: "secondary" | "outline" | "destructive";
-} {
-	if (status.auth_kind === "none") {
-		return { label: "Open", detail: "No authentication", Icon: ShieldCheck, variant: "outline" };
-	}
-	if (status.auth_kind === "bearer") {
-		return { label: "Token", detail: "Bearer token", Icon: KeyRound, variant: "outline" };
-	}
+function authStatusDetail(status: McpAuthServerStatus): string {
+	if (status.auth_kind === "none") return "no authentication required";
+	if (status.auth_kind === "bearer") return "bearer token";
 	switch (status.auth_state) {
-		case "ready":
-			return { label: "OAuth", detail: "OAuth ready", Icon: ShieldCheck, variant: "secondary" };
-		case "login_required":
-			return { label: "Login", detail: "OAuth login required", Icon: LogIn, variant: "destructive" };
-		case "reauthentication_required":
-			return { label: "Expired", detail: "OAuth login expired", Icon: Clock3, variant: "destructive" };
-		case "authorization_pending":
-			return { label: "Pending", detail: "OAuth authorization pending", Icon: Clock3, variant: "outline" };
-		case "unsupported":
-			return { label: "Unsupported", detail: "OAuth unsupported", Icon: ShieldAlert, variant: "destructive" };
+		case "ready": return "logged in";
+		case "login_required": return "login required";
+		case "reauthentication_required": return "login expired";
+		case "authorization_pending": return "login pending";
+		case "unsupported": return "login unsupported";
 		case "unknown":
-			return {
-				label: "Unknown",
-				detail: status.failure
-					? `OAuth status unknown: ${authFailureLabel(status.failure)}`
-					: "OAuth status unknown",
-				Icon: ShieldQuestion,
-				variant: "destructive",
-			};
-		case "not_applicable":
-			return { label: "OAuth", detail: "OAuth", Icon: KeyRound, variant: "outline" };
+			return status.failure
+				? `login status unknown: ${authFailureLabel(status.failure)}`
+				: "login status unknown";
+		case "not_applicable": return "no login required";
 	}
 }
 

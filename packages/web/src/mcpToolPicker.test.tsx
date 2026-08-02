@@ -281,11 +281,11 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 
-		expect(screen.getByText("No tools")).toBeTruthy();
-		expect(screen.getByText("1 selected")).toBeTruthy();
+		expect(screen.getByText("(No tools)")).toBeTruthy();
+		expect(screen.getByText("(1 selected · 1 token)")).toBeTruthy();
 		expect(screen.queryByText("All 1 tool selected")).toBeNull();
-		expect(screen.getByText("2 selected")).toBeTruthy();
-		expect(screen.getAllByText("1 token").length).toBeGreaterThan(0);
+		expect(screen.getByText("(2 selected · 5 tokens)")).toBeTruthy();
+		expect(screen.getByText("(1 selected · 1 token)")).toBeTruthy();
 		expect(screen.getByRole("status").textContent).toBe(
 			"MCP tool selection: 3 tools selected. About 6 context tokens.",
 		);
@@ -313,12 +313,13 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 
-		expect(screen.getAllByText("1 token")).toHaveLength(2);
+		expect(screen.getByText("1 token")).toBeTruthy();
+		expect(screen.getByText(/1 \/ 2 selected · 1 token/)).toBeTruthy();
 		expect(screen.getByRole("status").textContent).toBe(
 			"MCP tool selection: 1 tool selected. About 1 context token.",
 		);
 		await userEvent.click(screen.getByRole("button", { name: "expand tokens tools" }));
-		expect(screen.getAllByText("1 token")).toHaveLength(3);
+		expect(screen.getAllByText("1 token")).toHaveLength(2);
 		expect(screen.getByText("2 tokens")).toBeTruthy();
 		expect(screen.queryByText(/1 tokens/)).toBeNull();
 	});
@@ -359,7 +360,7 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 		expect(screen.getByText("oauth")).toBeTruthy();
-		expect(screen.getByLabelText("OAuth login required")).toBeTruthy();
+		expect(screen.getByLabelText("Offline, login required")).toBeTruthy();
 		expect(screen.queryByRole("checkbox")).toBeNull();
 		await userEvent.click(screen.getByRole("button", { name: "Login" }));
 		expect(onLogin).toHaveBeenCalledWith("oauth");
@@ -390,11 +391,11 @@ describe("McpToolPicker", () => {
 				open
 			/>,
 		);
-		expect(screen.getByLabelText("OAuth ready")).toBeTruthy();
-		expect(screen.getByLabelText("OAuth authorization pending")).toBeTruthy();
-		expect(screen.getByLabelText("OAuth login expired")).toBeTruthy();
-		expect(screen.getByLabelText("OAuth unsupported")).toBeTruthy();
-		expect(screen.getByLabelText("OAuth status unknown: OAuth discovery failed")).toBeTruthy();
+		expect(screen.getByLabelText("Offline, logged in")).toBeTruthy();
+		expect(screen.getByLabelText("Offline, login pending")).toBeTruthy();
+		expect(screen.getByLabelText("Offline, login expired")).toBeTruthy();
+		expect(screen.getByLabelText("Offline, login unsupported")).toBeTruthy();
+		expect(screen.getByLabelText("Offline, login status unknown: OAuth discovery failed")).toBeTruthy();
 		expect(screen.getByText("Restart after reload")).toBeTruthy();
 	});
 
@@ -465,8 +466,8 @@ describe("McpToolPicker", () => {
 		);
 		expect(screen.getAllByRole("button", { name: "Logout" })).toHaveLength(2);
 		expect(screen.getAllByRole("button", { name: "Login" })).toHaveLength(2);
-		expect(screen.getByLabelText("Bearer token")).toBeTruthy();
-		expect(screen.getByLabelText("No authentication")).toBeTruthy();
+		expect(screen.getByLabelText("Offline, bearer token")).toBeTruthy();
+		expect(screen.getByLabelText("Offline, no authentication required")).toBeTruthy();
 	});
 
 	it("keeps combined recovery action labels stable with one neutral busy indicator", () => {

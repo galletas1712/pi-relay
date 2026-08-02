@@ -399,6 +399,11 @@
 	gap: var(--space-4);
 }
 
+.server-profile-fields [data-slot="input"] {
+	/* Keep Safari from zooming when a configuration field receives focus. */
+	font-size: 16px;
+}
+
 .server-profile-form-actions {
 	display: flex;
 	justify-content: flex-end;
