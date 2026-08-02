@@ -512,6 +512,8 @@ mod tests {
         assert!(rendered.contains("\"available_skills\""));
         assert!(rendered.contains("rust-refactor"));
         assert!(rendered.contains("repo/rust-refactor"));
+        assert!(rendered.contains("Read and follow the returned `content`"));
+        assert!(rendered.contains("enclosing directory of the returned `path`"));
         assert!(!rendered.contains("<workspace>repo</workspace>"));
         assert!(!rendered.contains("<base_dir>"));
         assert!(!rendered.contains("<location>"));

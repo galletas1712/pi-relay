@@ -150,11 +150,11 @@ table.
 
 `LoadSkill` resolves an available skill by exact model-facing name. Workspace
 skills are exposed in the prompt JSON with a prefix such as `repo/repo-build`;
-global skills use their plain name. The tool result is only the absolute
-runtime-host path to `SKILL.md`, with no JSON envelope or prose. The agent reads
-that file through runtime-executed filesystem tools and resolves relative links
-from its enclosing directory. `LoadSkill` has no registry executor; agentd
-intercepts it and resolves the current runtime catalog.
+global skills use their plain name. The tool result is JSON with the selected
+`SKILL.md`'s absolute runtime-host `path` and full `content`, both taken from
+the same runtime catalog entry without rereading the file. The agent resolves
+relative links from the path's enclosing directory. `LoadSkill` has no registry
+executor; agentd intercepts it and resolves the current runtime catalog.
 
 ### delegation tools
 

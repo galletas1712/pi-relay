@@ -293,9 +293,9 @@ cannot be role preloads. A child uses an explicit spawn override, then its role
 provider, then the parent provider. An unavailable role provider retains the
 existing stable-provider fallback.
 
-Roles stay hidden from ordinary `LoadSkill` discovery. `LoadSkill` returns only
-the absolute runtime-host path to the selected `SKILL.md`; the agent reads that
-file and resolves relative links from its enclosing directory.
+Roles stay hidden from ordinary `LoadSkill` discovery. `LoadSkill` returns a
+JSON object containing the selected `SKILL.md`'s absolute runtime-host `path`
+and full `content`. Relative links resolve from the path's enclosing directory.
 
 Optional MCP configuration is read only from an already-existing
 `$XDG_CONFIG_HOME/pi-relay/runtime/mcp.toml` on each runtime host; when it is

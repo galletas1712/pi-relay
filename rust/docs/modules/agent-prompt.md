@@ -118,8 +118,9 @@ Git and local workspaces render differently so the model knows the publish postu
 Workspace-scoped skills are exposed to the model with their workspace directory
 as a prefix (`workspace/name`); skills without a slash prefix are global.
 `LoadSkill` should be called with the exact `name` from this JSON; it returns the
-absolute runtime-host `SKILL.md` path. JSON escaping is handled by `serde_json`.
-With no skills the variable is the empty string, and
+full `SKILL.md` `content` and its absolute runtime-host `path` as JSON. Relative
+links resolve from the path's enclosing directory. JSON escaping is handled by
+`serde_json`. With no skills the variable is the empty string, and
 `PI.md` drops the entire Skills section via `{% if skills.index %}`.
 
 Skill filesystem discovery lives in `agent-runtime`. Agentd parses the returned

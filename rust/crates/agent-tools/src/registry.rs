@@ -284,7 +284,7 @@ pub(crate) fn sort_tools_by_name(tools: &mut [ProviderTool]) {
 fn load_skill_definition() -> ToolDefinition {
     ToolDefinition::new(
         "LoadSkill",
-        "Resolve an available skill name to the absolute path of its SKILL.md on the runtime host.",
+        "Load an available skill by name, returning JSON fields `path` (the absolute runtime-host SKILL.md path) and `content` (its full contents).",
         json!({
             "type": "object",
             "properties": {
@@ -797,6 +797,12 @@ mod tests {
     #[test]
     fn load_skill_schema_uses_prefixed_name_only() {
         let definition = load_skill_definition();
+        assert!(definition.description.contains("`path`"));
+        assert!(definition.description.contains("`content`"));
+        assert!(definition
+            .description
+            .contains("absolute runtime-host SKILL.md path"));
+        assert!(definition.description.contains("full contents"));
         assert!(definition.input_schema["properties"].get("name").is_some());
         assert!(definition.input_schema["properties"]
             .get("workspace")
