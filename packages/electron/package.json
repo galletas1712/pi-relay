@@ -7,9 +7,14 @@
 	"scripts": {
 		"dev": "electron .",
 		"start": "electron .",
-		"validate": "node --check src/main.mjs && node --check src/policy.mjs && node --check src/refresh.mjs",
+		"test": "vitest --run",
+		"validate": "node --check src/main.mjs && node --check src/policy.mjs && node --check src/refresh.mjs && npm test",
 		"package": "electron-builder",
 		"package:dir": "electron-builder --dir"
+	},
+	"author": {
+		"name": "Schwinn Saereesitthipitak",
+		"email": "17022745+galletas1712@users.noreply.github.com"
 	},
 	"devDependencies": {
 		"electron": "40.10.6",
@@ -25,6 +30,7 @@
 			"src/**/*",
 			"package.json"
 		],
+		"icon": "../web/public/icons/icon-512.png",
 		"directories": {
 			"output": "dist"
 		},

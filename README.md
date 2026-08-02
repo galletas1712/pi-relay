@@ -34,3 +34,6 @@ bundle the frontend or add another backend. Frontend deployments are picked up
 on the next launch or after the desktop window has been hidden for five
 minutes and returns to the foreground, so an Electron reinstall is not
 normally needed. See [desktop shell setup](packages/electron/README.md).
+
+The repository requires Node.js 22.12 or newer because the Electron workspace
+uses Electron 40.

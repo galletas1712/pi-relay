@@ -12,8 +12,12 @@ if (!app.requestSingleInstanceLock()) {
 	app.quit();
 } else {
 	app.on("second-instance", () => {
-		if (!mainWindow) return;
+		if (!mainWindow || mainWindow.isDestroyed()) {
+			createWindow();
+			return;
+		}
 		if (mainWindow.isMinimized()) mainWindow.restore();
+		if (!mainWindow.isVisible()) mainWindow.show();
 		mainWindow.focus();
 	});
 
@@ -24,7 +28,13 @@ if (!app.requestSingleInstanceLock()) {
 		createWindow();
 
 		app.on("activate", () => {
-			if (BrowserWindow.getAllWindows().length === 0) createWindow();
+			if (BrowserWindow.getAllWindows().length === 0) {
+				createWindow();
+			} else if (mainWindow) {
+				if (mainWindow.isMinimized()) mainWindow.restore();
+				if (!mainWindow.isVisible()) mainWindow.show();
+				mainWindow.focus();
+			}
 		});
 	});
 
@@ -48,31 +58,25 @@ function createWindow() {
 
 	const { webContents } = mainWindow;
 	webContents.setWindowOpenHandler(({ url }) => openExternalOrDeny(url));
-	webContents.on("will-navigate", (event, url) => {
+	const handleNavigation = (event, url) => {
 		const decision = navigationPolicy(url, appOrigin);
 		if (decision.action === "allow") return;
 		event.preventDefault();
 		if (decision.action === "external") shell.openExternal(decision.url);
-	});
+	};
+	webContents.on("will-navigate", handleNavigation);
+	webContents.on("will-redirect", handleNavigation);
 
 	mainWindow.on("hide", () => {
-		hiddenAt = Date.now();
+		markBackgrounded();
 	});
 	mainWindow.on("minimize", () => {
-		hiddenAt = Date.now();
+		markBackgrounded();
 	});
-	mainWindow.on("show", () => {
-		if (shouldRefreshOnForeground(hiddenAt, Date.now())) {
-			webContents.reloadIgnoringCache();
-		}
-		hiddenAt = null;
-	});
-	mainWindow.on("restore", () => {
-		if (shouldRefreshOnForeground(hiddenAt, Date.now())) {
-			webContents.reloadIgnoringCache();
-		}
-		hiddenAt = null;
-	});
+	mainWindow.on("blur", markBackgrounded);
+	mainWindow.on("show", refreshOnForeground);
+	mainWindow.on("restore", refreshOnForeground);
+	mainWindow.on("focus", refreshOnForeground);
 	mainWindow.on("closed", () => {
 		mainWindow = undefined;
 		hiddenAt = null;
@@ -82,11 +86,20 @@ function createWindow() {
 	webContents.loadURL(webUrl.href, { extraHeaders: "Cache-Control: no-cache\r\n" });
 }
 
+function markBackgrounded() {
+	if (hiddenAt === null) hiddenAt = Date.now();
+}
+
+function refreshOnForeground() {
+	const backgroundedAt = hiddenAt;
+	hiddenAt = null;
+	if (shouldRefreshOnForeground(backgroundedAt, Date.now())) {
+		mainWindow?.webContents.reloadIgnoringCache();
+	}
+}
+
 function openExternalOrDeny(candidate) {
 	const decision = navigationPolicy(candidate, appOrigin);
-	if (decision.action === "allow") {
-		return { action: "allow" };
-	}
 	if (decision.action === "external") {
 		shell.openExternal(decision.url);
 	}

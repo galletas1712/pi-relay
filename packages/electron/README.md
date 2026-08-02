@@ -26,7 +26,8 @@ PI_RELAY_WEB_URL=http://127.0.0.1:8788 npm run dev:electron
 
 The override must be an HTTP(S) URL. Same-origin navigation stays in the
 window. External HTTP(S) links, including OAuth links opened in a new window,
-are sent to the operating system browser; other URL schemes are denied.
+are sent to the operating system browser; same-origin popups and other URL
+schemes are denied.
 
 ## Packaging
 

@@ -29,6 +29,7 @@ export function navigationPolicy(candidate, appOrigin) {
 		return { action: "deny" };
 	}
 
+	if (url.username || url.password) return { action: "deny" };
 	if (url.origin === appOrigin && HTTP_PROTOCOLS.has(url.protocol)) {
 		return { action: "allow" };
 	}
