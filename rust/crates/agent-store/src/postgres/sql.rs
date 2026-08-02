@@ -96,6 +96,32 @@ pub(super) async fn lock_session_tx(
     Ok(())
 }
 
+/// Lock a session and reject every mutation after private-workspace deletion
+/// becomes durable. Cleanup uses the raw lock above because it owns the inverse
+/// lifecycle transition.
+pub(super) async fn lock_session_for_mutation_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    lock_session_tx(tx, session_id).await?;
+    let deleting: bool = sqlx::query_scalar(
+        r#"
+        select exists(
+            select 1
+            from workspace_resources
+            where owner_session_id=$1 and state in ('deleting','deleted')
+        )
+        "#,
+    )
+    .bind(session_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if deleting {
+        return Err(crate::SessionDeleting.into());
+    }
+    Ok(())
+}
+
 pub(super) async fn ensure_no_running_delegation_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: &str,

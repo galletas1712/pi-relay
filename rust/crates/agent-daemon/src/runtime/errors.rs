@@ -2,12 +2,15 @@ use agent_session::{HistoryOperationError, TranscriptStoreError};
 use agent_store::{
     DelegationInputClosed, ExpectedActiveLeafMismatch, HistoryChanged,
     HistoryTargetNotTurnBoundary, QueueMutationError, RootSessionRequired, SessionConfigChanged,
-    SessionNotFound, SourceMutationConflict,
+    SessionDeleting, SessionNotFound, SourceMutationConflict,
 };
 
 use crate::types::RpcError;
 
 pub(crate) fn map_queued_mutation_error(error: anyhow::Error) -> RpcError {
+    if let Some(error) = error.downcast_ref::<SessionDeleting>() {
+        return RpcError::new("session_deleting", error.to_string());
+    }
     if let Some(error) = error.downcast_ref::<QueueMutationError>() {
         return RpcError::new("input_not_found", error.to_string());
     }
@@ -21,6 +24,9 @@ pub(crate) fn map_queued_mutation_error(error: anyhow::Error) -> RpcError {
 }
 
 pub(crate) fn map_source_mutation_error(error: anyhow::Error) -> RpcError {
+    if let Some(error) = error.downcast_ref::<SessionDeleting>() {
+        return RpcError::new("session_deleting", error.to_string());
+    }
     if error.downcast_ref::<SessionNotFound>().is_some() {
         return RpcError::new("session_not_found", "session not found");
     }

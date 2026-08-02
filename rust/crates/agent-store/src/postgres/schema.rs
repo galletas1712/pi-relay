@@ -247,26 +247,10 @@ create index if not exists delegations_completed_repair_idx
 -- `sessions` and `delegations` reference each other, so this side of the cycle
 -- is added after both canonical tables exist.
 alter table sessions add column if not exists delegation_id text null references delegations(id);
-alter table sessions add column if not exists delegation_launch_state text not null default 'launched';
-do $$
-begin
-    if not exists (
-        select 1
-        from pg_constraint
-        where conrelid='sessions'::regclass
-          and conname='sessions_delegation_launch_state_check'
-    ) then
-        alter table sessions
-            add constraint sessions_delegation_launch_state_check
-            check (delegation_launch_state in ('launched','compensating'));
-    end if;
-end
-$$;
 
-create unique index if not exists sessions_delegation_launched_spawn_index_uq
+create unique index if not exists sessions_delegation_spawn_index_uq
     on sessions(delegation_id, (metadata->>'delegation_spawn_index'))
     where delegation_id is not null
-      and delegation_launch_state='launched'
       and metadata ? 'delegation_spawn_index';
 
 alter table queued_inputs add column if not exists provider_config jsonb null;
@@ -292,7 +276,6 @@ pub(super) async fn migrate(pool: &PgPool) -> Result<()> {
     .bind([
         "delegations_parent_launch_key_uq",
         "sessions_delegation_spawn_index_uq",
-        "sessions_delegation_launched_spawn_index_uq",
         "delegations_parent_running_full_uq",
     ])
     .fetch_all(pool)

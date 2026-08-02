@@ -25,7 +25,7 @@ use super::rows::row_to_stored_entry;
 use super::sessions::{
     next_auto_compaction_failure_metadata, next_compaction_success_metadata, session_metadata_tx,
 };
-use super::sql::{action_is_unfinished, lock_session_tx};
+use super::sql::{action_is_unfinished, lock_session_for_mutation_tx, lock_session_tx};
 use super::transcript::{
     branch_entries_to_leaf, insert_stored_entry_tx, model_context_from_entries,
 };
@@ -50,7 +50,7 @@ impl PostgresAgentStore {
         auto_limit_tokens: Option<usize>,
     ) -> Result<CreateCompactionResult> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let lease_owner = post_compaction_dispatch_lease.map(|lease| lease.owner_id.as_str());
         let lease_generation =
             post_compaction_dispatch_lease.map(|lease| lease.generation.to_string());
@@ -284,7 +284,7 @@ impl PostgresAgentStore {
         trigger: CompactionTrigger,
     ) -> Result<CreateCompactionResult> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let active_leaf_id: Option<String> =
             sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
                 .bind(session_id)

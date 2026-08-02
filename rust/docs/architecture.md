@@ -236,8 +236,8 @@ Three narrow owners coordinate session spawning:
 | Owner | Durable responsibility |
 | --- | --- |
 | History snapshot | A context-enabled role inherits only the active branch through the latest completed turn. Its delegated task is queued as a clean new turn; an in-progress parent delegation/tool call is never executable child state. |
-| Workspace lifecycle | `workspace_resources` records exact runtime/workspace/generation intent before materialize/fork commands. Session creation atomically attaches a ready generation. A periodic daemon reconciler adopts exact committed owners, expires abandoned provisioning leases, and retries deletion while runtimes are offline. |
-| Delegation member lifecycle | A member is either `launched` or `compensating`. Status/idempotency queries count only launched members, so failed dispatch compensation cannot satisfy a missing spawn index. Logical cancellation is durable and independent of physical workspace cleanup. |
+| Workspace lifecycle | `workspace_resources` records exact runtime/workspace/generation intent before materialize/fork commands. Session creation atomically attaches a ready generation. `deleting` is the transactional session-mutation fence. A periodic daemon reconciler adopts exact committed owners, expires abandoned provisioning leases, and retries child-before-parent deletion while runtimes are offline; one failed resource does not stop the batch. Runtime create/ensure/fork-target/destroy commands share one keyed workspace mutation guard. |
+| Delegation member lifecycle | Committing a child/session/task means the member is launched. Its unique spawn index remains durable across metadata publication or initial dispatch failures, and queue/dispatch/boot redrive resumes the committed work. Logical cancellation is durable and independent of physical workspace cleanup. |
 
 Private workspace routing is structural:
 

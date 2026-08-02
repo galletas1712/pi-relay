@@ -93,11 +93,6 @@ text_enum! {
         DeleteSession => "delete_session",
     }
 
-    pub enum DelegationMemberLaunchState {
-        Launched => "launched",
-        Compensating => "compensating",
-    }
-
     pub enum ActiveBranchSyncStatus {
         Unchanged => "unchanged",
         Extended => "extended",
@@ -552,6 +547,17 @@ impl fmt::Display for SessionNotFound {
 }
 
 impl std::error::Error for SessionNotFound {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionDeleting;
+
+impl fmt::Display for SessionDeleting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "session deletion is already pending")
+    }
+}
+
+impl std::error::Error for SessionDeleting {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootSessionRequired;

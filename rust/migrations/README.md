@@ -17,11 +17,13 @@ Safe rollout:
 4. Run:
 
    ```sh
-   psql "$DATABASE_URL" -f rust/migrations/2026-03-20-private-workspace-ownership.sql
+   psql -v ON_ERROR_STOP=1 "$DATABASE_URL" \
+     -f rust/migrations/2026-03-20-private-workspace-ownership.sql
    ```
 
-   The script is additive/backfill-only and rerunnable. Any conflicting
-   ownership mapping aborts the transaction rather than overwriting identity.
+   The script is additive/backfill-only and rerunnable while the daemon remains
+   stopped before cutover. Any conflicting ownership mapping aborts the
+   transaction rather than overwriting identity.
 5. Save the post-check output, then deploy/start the new daemon.
 
 The migration never lists runtime directories and never marks an unknown

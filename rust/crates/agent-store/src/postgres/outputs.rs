@@ -17,7 +17,7 @@ use super::action_records::{
 use super::events::{insert_event_tx, insert_session_event_tx};
 use super::queue::{bump_revisions_tx, queue_event_payload, queue_state_tx};
 use super::rows::row_text;
-use super::sql::{action_is_unfinished, lock_session_tx, QUEUED_INPUT_DISPATCH_ORDER};
+use super::sql::{action_is_unfinished, lock_session_for_mutation_tx, QUEUED_INPUT_DISPATCH_ORDER};
 use super::transcript::{insert_entry_tx, session_state_for_event_tx};
 use super::PostgresAgentStore;
 
@@ -67,7 +67,7 @@ pub(super) async fn persist_outputs_tx(
         })
     });
 
-    lock_session_tx(tx, session_id).await?;
+    lock_session_for_mutation_tx(tx, session_id).await?;
     let session_row = sqlx::query(
         r#"
             select active_leaf_id, provider_config,

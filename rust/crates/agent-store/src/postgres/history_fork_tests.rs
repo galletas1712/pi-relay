@@ -77,7 +77,7 @@ async fn context_fork_excludes_in_progress_parent_delegation_tool_call() {
     let config = create_session(store, project_id, parent_id, true).await;
     let delegation_call = ToolCall {
         id: ToolCallId::new("call_delegate_in_progress"),
-        tool_name: "delegate_readonly_fanout".to_string(),
+        tool_name: "delegate_readonly_tasks".to_string(),
         args_json: r#"{"tasks":[{"role":"reviewer","prompt":"inspect"}]}"#.to_string(),
     };
     store
@@ -330,6 +330,295 @@ async fn private_workspace_cleanup_routes_root_full_and_read_only_sessions() {
         .session_exists("workspace-root-session")
         .await
         .expect("root identity gone"));
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn deleting_offline_session_rejects_later_input_before_reconnect_cleanup() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "offline deletion admission test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let session_id = "offline-deleting-session";
+    let client_input_id = "input-after-delete";
+    let mut config = session_config(project_id);
+    config.workspace_id = "workspace-offline-deleting".to_string();
+    let workspace =
+        prepare_test_workspace(store, session_id, &config, WorkspaceOwnerKind::Root).await;
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            session_id,
+            &config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("initial input"),
+            None,
+            None,
+            None,
+            None,
+            Some(workspace.attachment()),
+        )
+        .await
+        .expect("session attaches while runtime is online");
+
+    assert!(store
+        .request_session_workspace_cleanup(session_id, crate::WorkspaceCleanupMode::DeleteSession)
+        .await
+        .expect("logical deletion persists while runtime is offline"));
+    let error = match store
+        .enqueue_user_input(
+            session_id,
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("must not be accepted"),
+            Some(client_input_id),
+            None,
+        )
+        .await
+    {
+        Ok(_) => panic!("deleting owner accepted later input"),
+        Err(error) => error,
+    };
+    assert!(error.downcast_ref::<crate::SessionDeleting>().is_some());
+    assert!(store
+        .find_client_input(session_id, client_input_id)
+        .await
+        .expect("client input lookup succeeds")
+        .is_none());
+
+    let reconnect_claim = store
+        .claim_due_workspace_deletions(Some(&config.runtime_id))
+        .await
+        .expect("runtime reconnect claims pending cleanup")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == session_id)
+        .expect("offline cleanup remains pending for reconnect");
+    assert!(store
+        .complete_workspace_cleanup(&reconnect_claim)
+        .await
+        .expect("reconnect cleanup completes"));
+    assert!(!store
+        .session_exists(session_id)
+        .await
+        .expect("deleted identity stays gone"));
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn root_cleanup_waits_for_full_and_offline_read_only_descendants() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "workspace descendant cleanup test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+
+    let root_id = "cleanup-tree-root";
+    let full_id = "cleanup-tree-full";
+    let read_only_id = "cleanup-tree-read-only";
+    let mut root_config = session_config(project_id);
+    root_config.workspace_id = "workspace-cleanup-tree-root".to_string();
+    let root_workspace =
+        prepare_test_workspace(store, root_id, &root_config, WorkspaceOwnerKind::Root).await;
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            root_id,
+            &root_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("root"),
+            None,
+            None,
+            None,
+            None,
+            Some(root_workspace.attachment()),
+        )
+        .await
+        .expect("root session attaches");
+
+    let full_delegation = store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: root_id,
+            launch_key: "cleanup-tree-full-launch",
+            launch_shape: r#"{"kind":"full","role":"implementer","prompt":"work"}"#,
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("full delegation creates");
+    let mut full_config = root_config.clone();
+    full_config.metadata = json!({ "delegation_spawn_index": 0 });
+    store
+        .start_session_outputs_with_parent(
+            full_id,
+            &full_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("full task"),
+            None,
+            Some(root_id),
+            Some(crate::SubagentType::Full),
+            Some(&full_delegation.id),
+        )
+        .await
+        .expect("full child creates");
+
+    let read_only_delegation = store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: root_id,
+            launch_key: "cleanup-tree-read-only-launch",
+            launch_shape:
+                r#"{"kind":"readonly_fanout","tasks":[{"role":"reviewer","prompt":"inspect"}]}"#,
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("read-only delegation creates");
+    let mut read_only_config = root_config.clone();
+    read_only_config.workspace_id = "workspace-cleanup-tree-read-only".to_string();
+    read_only_config.metadata = json!({ "delegation_spawn_index": 0 });
+    let read_only_workspace = prepare_test_workspace(
+        store,
+        read_only_id,
+        &read_only_config,
+        WorkspaceOwnerKind::ReadOnly,
+    )
+    .await;
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            read_only_id,
+            &read_only_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("read-only task"),
+            None,
+            Some(root_id),
+            Some(crate::SubagentType::ReadOnly),
+            Some(&read_only_delegation.id),
+            Some(read_only_workspace.attachment()),
+        )
+        .await
+        .expect("read-only child attaches");
+
+    assert!(
+        store
+            .request_session_workspace_cleanup(
+                read_only_id,
+                crate::WorkspaceCleanupMode::DeleteSession,
+            )
+            .await
+            .expect("read-only cleanup becomes pending")
+    );
+    assert!(store
+        .request_session_workspace_cleanup(root_id, crate::WorkspaceCleanupMode::DeleteSession)
+        .await
+        .expect("root cleanup becomes pending"));
+
+    let child_claim = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("eligible child cleanup claims")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == read_only_id)
+        .expect("read-only child claims before root");
+    store
+        .record_workspace_cleanup_failure(&child_claim, "runtime offline")
+        .await
+        .expect("offline child remains pending");
+    let root_resource = store
+        .workspace_resource_for_session(root_id)
+        .await
+        .expect("root resource loads")
+        .expect("root resource exists");
+    assert!(!store
+        .complete_workspace_cleanup(&root_resource)
+        .await
+        .expect("root finalization is durably blocked by descendants"));
+    assert!(store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("blocked root does not claim")
+        .is_empty());
+
+    assert!(store
+        .delete_session(full_id)
+        .await
+        .expect("unrelated full child identity progresses independently"));
+    assert!(
+        store
+            .request_session_workspace_cleanup(
+                read_only_id,
+                crate::WorkspaceCleanupMode::DeleteSession,
+            )
+            .await
+            .expect("reconnect makes offline child immediately retryable")
+    );
+    let retried_child = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("retried child cleanup claims")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == read_only_id)
+        .expect("read-only child reclaims");
+    assert!(store
+        .complete_workspace_cleanup(&retried_child)
+        .await
+        .expect("read-only child cleanup completes"));
+
+    let root_claim = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("root becomes eligible after descendants disappear")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == root_id)
+        .expect("root cleanup claims last");
+    assert!(store
+        .complete_workspace_cleanup(&root_claim)
+        .await
+        .expect("root cleanup completes"));
+    assert!(!store
+        .session_exists(root_id)
+        .await
+        .expect("root identity is gone"));
     db.cleanup().await;
 }
 

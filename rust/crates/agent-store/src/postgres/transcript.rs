@@ -20,7 +20,7 @@ use super::events::{insert_event_tx, insert_transcript_item_events_tx};
 use super::history_target::{branch_entry_ids_tx, validate_history_target_tx};
 use super::queue::bump_revisions_tx;
 use super::rows::{row_to_stored_entry, row_to_transcript_entry};
-use super::sql::{lock_session_tx, stale_unfinished_actions_for_session};
+use super::sql::{lock_session_for_mutation_tx, stale_unfinished_actions_for_session};
 use super::turn_cards::{active_branch_turn_card_page_tx, TurnCardPage};
 use super::{ensure_valid_transcript_ancestry, PostgresAgentStore};
 
@@ -1107,7 +1107,7 @@ impl PostgresAgentStore {
             missing_body_ids,
         } = request;
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         validate_history_target_tx(&mut tx, session_id, target).await?;
         sqlx::query("update sessions set active_leaf_id=$2::text, updated_at=now() where id=$1")
             .bind(session_id)
@@ -1200,7 +1200,7 @@ impl PostgresAgentStore {
         active_leaf_id: Option<&str>,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let mut inserted_records = HashMap::new();
         for entry in entries {
             if let Some(record) = insert_stored_entry_tx(&mut tx, session_id, entry).await? {

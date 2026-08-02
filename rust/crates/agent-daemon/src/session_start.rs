@@ -16,7 +16,7 @@ use crate::codec::{from_params, parse_user_message};
 use crate::provider_runtime::author_session_mcp_and_prompt;
 use crate::runtime::{
     agent_input_from_queued_priority, attach_dispatch_config, collect_runtime_outputs,
-    publish_events, SessionDriver,
+    map_source_mutation_error, publish_events, SessionDriver,
 };
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
@@ -40,6 +40,11 @@ pub(crate) async fn session_start(
 
     let driver = SessionDriver::acquire(state, &session_id).await;
     if state.repo.session_exists(&session_id).await? {
+        state
+            .repo
+            .ensure_session_mutation_eligible(&session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         let current = state.repo.load_session_config(&session_id).await?;
         state
             .runtime_hosts
@@ -218,6 +223,11 @@ async fn start_prepared_session_with_driver(
     let project_id = config.project_id;
 
     if state.repo.session_exists(&session_id).await? {
+        state
+            .repo
+            .ensure_session_mutation_eligible(&session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         let current = state.repo.load_session_config(&session_id).await?;
         state
             .runtime_hosts

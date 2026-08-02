@@ -36,28 +36,6 @@ struct StartFullParams {
     label: Option<String>,
 }
 
-async fn reconcile_compensating_full_members(state: &AppState) -> Result<(), RpcError> {
-    for session_id in state.repo.compensating_full_delegation_members().await? {
-        abort_and_join_session_tasks(state, &session_id).await;
-        let events = state
-            .repo
-            .cancel_unfinished_session_work(&session_id, "failed spawn compensation")
-            .await?;
-        if !events.is_empty() {
-            publish_events(state, events);
-        }
-        if let Err(error) = state.repo.delete_session(&session_id).await {
-            eprintln!(
-                "failed-spawn compensation remains pending for full child {session_id}: {error:#}"
-            );
-        } else {
-            state.active.lock().await.remove(&session_id);
-            state.provider_connections.remove_session(&session_id).await;
-        }
-    }
-    Ok(())
-}
-
 pub(crate) async fn materialize_delegation_launch(
     state: &AppState,
     delegation: &Delegation,
@@ -96,8 +74,7 @@ pub(crate) async fn materialize_delegation_launch(
         fail_delegation_launch(state, &current, &error).await?;
         return Err(error);
     }
-    let existing = state.repo.delegation_spawned_indices(&current.id).await?;
-    if current.status != DelegationStatus::Running && existing.len() < children.len() {
+    if current.status != DelegationStatus::Running {
         if let Some((code, message)) = state.repo.delegation_launch_error(&current.id).await? {
             return Err(RpcError::new(code, message));
         }
@@ -106,6 +83,7 @@ pub(crate) async fn materialize_delegation_launch(
             "the prior launch is not running and cannot spawn missing children",
         ));
     }
+    let existing = state.repo.delegation_spawned_indices(&current.id).await?;
     let mut session_ids = Vec::with_capacity(children.len());
     for (index, (role, prompt, subagent_type)) in children.into_iter().enumerate() {
         let index = index as i32;
@@ -184,12 +162,6 @@ pub(crate) fn spawn_cancelling_delegation_reconciler(state: &AppState) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Err(error) = reconcile_compensating_full_members(&state).await {
-                eprintln!(
-                    "full-member spawn compensation remains pending: {}: {}",
-                    error.code, error.message
-                );
-            }
             if let Err(error) = reconcile_cancelling_delegations_on_boot(&state).await {
                 eprintln!(
                     "cancelling-delegation reconciliation remains pending: {}: {}",

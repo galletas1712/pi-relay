@@ -168,7 +168,6 @@ export interface ApplyTurnDetailResult {
 }
 
 export interface TurnDetailRequestFence {
-	requestId: number;
 	sessionId: string;
 	cardId: string;
 	transcriptRevision: number | null;
@@ -178,10 +177,8 @@ export interface TurnDetailRequestFence {
 export function captureTurnDetailRequest(
 	cache: SelectedSessionCache,
 	cardId: string,
-	requestId: number,
 ): TurnDetailRequestFence {
 	return {
-		requestId,
 		sessionId: cache.sessionId ?? "",
 		cardId,
 		transcriptRevision: cache.snapshot?.transcript_revision ?? cache.turnTranscriptRevision,
@@ -193,44 +190,15 @@ export function applyTurnDetail(
 	cache: SelectedSessionCache,
 	result: TranscriptTurnDetailResult,
 	fence: TurnDetailRequestFence,
-	latestRequestId?: number,
-): ApplyTurnDetailResult;
-export function applyTurnDetail(
-	cache: SelectedSessionCache,
-	sessionId: string,
-	turnId: string,
-	entries: TranscriptEntry[],
-): ApplyTurnDetailResult;
-export function applyTurnDetail(
-	cache: SelectedSessionCache,
-	resultOrSessionId: TranscriptTurnDetailResult | string,
-	fenceOrTurnId: TurnDetailRequestFence | string,
-	latestRequestIdOrEntries?: number | TranscriptEntry[],
+	requestIsCurrent: boolean,
 ): ApplyTurnDetailResult {
-	const legacy = typeof resultOrSessionId === "string";
-	const result: TranscriptTurnDetailResult = legacy
-		? {
-				session_id: resultOrSessionId,
-				card_id: fenceOrTurnId as string,
-				entries: (latestRequestIdOrEntries ?? []) as TranscriptEntry[],
-				active_leaf_id: cache.snapshot?.active_leaf_id ?? cache.turnActiveLeafId,
-				session_revision: cache.snapshot?.session_revision ?? 0,
-				transcript_revision: cache.snapshot?.transcript_revision ?? cache.turnTranscriptRevision ?? 0,
-			}
-		: resultOrSessionId;
-	const fence: TurnDetailRequestFence = legacy
-		? captureTurnDetailRequest(cache, fenceOrTurnId as string, 0)
-		: fenceOrTurnId as TurnDetailRequestFence;
-	const latestRequestId = legacy
-		? 0
-		: (latestRequestIdOrEntries as number | undefined) ?? fence.requestId;
 	if (
 		cache.sessionId !== fence.sessionId ||
 		result.session_id !== fence.sessionId ||
 		result.card_id !== fence.cardId
 	) return { cache, applied: false };
 	const entriesById = mergeEntryBodies(cache.entriesById, result.entries);
-	const historyOnly = latestRequestId !== fence.requestId;
+	const historyOnly = !requestIsCurrent;
 	const card = cache.turnCardsById.get(result.card_id);
 	const lastEntryId = result.entries.at(-1)?.id ?? null;
 	if (!card || !lastEntryId || historyOnly) {
@@ -239,35 +207,15 @@ export function applyTurnDetail(
 			applied: false,
 		};
 	}
-	const currentRevision = cache.snapshot?.transcript_revision ?? cache.turnTranscriptRevision;
-	const currentLeaf = cache.snapshot?.active_leaf_id ?? cache.turnActiveLeafId;
-	const responseWasCurrentAtRequest =
-		result.transcript_revision >= (fence.transcriptRevision ?? -1) &&
-		result.active_leaf_id === fence.activeLeafId;
-	const cacheAdvanced =
-		(currentRevision ?? -1) > (fence.transcriptRevision ?? -1) ||
-		currentLeaf !== fence.activeLeafId;
-	const acceptsPartialOpenTurn = card.status === "open";
-	if (
-		lastEntryId !== card.active_leaf_id &&
-		!acceptsPartialOpenTurn &&
-		!(cacheAdvanced && responseWasCurrentAtRequest)
-	) {
+	const ids = activeTurnAncestry(card, entriesById);
+	if (!ids) {
 		return {
 			cache: entriesById === cache.entriesById ? cache : { ...cache, entriesById },
 			applied: false,
 		};
 	}
 	const turnDetailsById = new Map(cache.turnDetailsById);
-	const ids = uniqueStringArray([
-		...result.entries.map((entry) => entry.id),
-		...(cache.turnDetailsById.get(result.card_id) ?? []),
-	]).sort((left, right) => {
-		const leftSequence = entriesById.get(left)?.sequence ?? Number.MAX_SAFE_INTEGER;
-		const rightSequence = entriesById.get(right)?.sequence ?? Number.MAX_SAFE_INTEGER;
-		return leftSequence - rightSequence;
-	});
-	turnDetailsById.set(result.card_id, extendTurnDetailEntryIds(ids, card, entriesById));
+	turnDetailsById.set(result.card_id, ids);
 	return {
 		cache: {
 			...cache,
@@ -278,28 +226,24 @@ export function applyTurnDetail(
 	};
 }
 
-function extendTurnDetailEntryIds(entryIds: string[], card: TurnCard, entriesById: Map<string, TranscriptEntry>): string[] {
-	const ids = [...entryIds];
-	const seenIds = new Set(ids);
-	let currentLeafId = ids.at(-1) ?? null;
-	while (currentLeafId && currentLeafId !== card.active_leaf_id) {
-		const child = findOnlyDisplayChild(currentLeafId, entriesById);
-		if (!child || seenIds.has(child.id)) break;
-		ids.push(child.id);
-		seenIds.add(child.id);
-		currentLeafId = child.id;
+function activeTurnAncestry(
+	card: TurnCard,
+	entriesById: Map<string, TranscriptEntry>,
+): string[] | null {
+	const startId = card.start_entry_id ?? card.id;
+	const reversed: string[] = [];
+	const seen = new Set<string>();
+	let entryId: string | null = card.active_leaf_id;
+	while (entryId) {
+		if (seen.has(entryId)) return null;
+		seen.add(entryId);
+		const entry = entriesById.get(entryId);
+		if (!entry) return null;
+		reversed.push(entryId);
+		if (entryId === startId) return reversed.reverse();
+		entryId = displayParentIdForEntry(entry);
 	}
-	return ids;
-}
-
-function findOnlyDisplayChild(parentId: string, entriesById: Map<string, TranscriptEntry>): TranscriptEntry | null {
-	let child: TranscriptEntry | null = null;
-	for (const entry of entriesById.values()) {
-		if (displayParentIdForEntry(entry) !== parentId) continue;
-		if (child) return null;
-		child = entry;
-	}
-	return child;
+	return null;
 }
 
 export function turnCardsInOrder(cache: SelectedSessionCache): TurnCard[] {
@@ -312,6 +256,8 @@ export function turnCardsInOrder(cache: SelectedSessionCache): TurnCard[] {
 export function turnDetailEntries(cache: SelectedSessionCache, turnId: string): TranscriptEntry[] | null {
 	const ids = cache.turnDetailsById.get(turnId);
 	if (!ids) return null;
+	const card = cache.turnCardsById.get(turnId);
+	if (!card || !turnDetailCoversCard(ids, card)) return null;
 	const entries = ids.flatMap((id) => {
 		const entry = cache.entriesById.get(id);
 		return entry ? [entry] : [];

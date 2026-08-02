@@ -910,7 +910,8 @@ async fn session_rename(state: &AppState, params: Value) -> std::result::Result<
     let events = state
         .repo
         .rename_session_manually(&session_id, &title)
-        .await?;
+        .await
+        .map_err(map_source_mutation_error)?;
     let config = state.repo.load_session_config(&session_id).await?;
     replace_active_session_config(state, &session_id, config.clone()).await;
     publish_events(state, events);
@@ -952,7 +953,7 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
                 agent_store::WorkspaceCleanupMode::DeleteSession,
             )
             .await
-            .map_err(|error| RpcError::new("session_delete_failed", format!("{error:#}")))?
+            .map_err(map_source_mutation_error)?
         } else if subagent_type == Some(agent_store::SubagentType::Full) {
             state
                 .repo
@@ -1052,7 +1053,11 @@ async fn session_configure(
         metadata,
         mcp_manifest: current.mcp_manifest.clone(),
     };
-    let events = state.repo.configure_session(&session_id, &config).await?;
+    let events = state
+        .repo
+        .configure_session(&session_id, &config)
+        .await
+        .map_err(map_source_mutation_error)?;
     // Refresh non-provider session state while the active runtime retains the
     // immutable route captured for its open turn.
     replace_active_session_config(state, &session_id, config.clone()).await;
@@ -1234,6 +1239,11 @@ async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<V
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::new("session_required", "system.prompt requires session_id"))?;
+    state
+        .repo
+        .ensure_session_mutation_eligible(session_id)
+        .await
+        .map_err(map_source_mutation_error)?;
     let config = state.repo.load_session_config(session_id).await?;
     state
         .runtime_hosts

@@ -35,6 +35,7 @@ import type {
 	QueueProjection,
 	SessionSnapshot,
 	TranscriptEntry,
+	TranscriptTurnDetailResult,
 	TurnCard,
 	TranscriptTreeIndex,
 	TranscriptTreeNode,
@@ -105,7 +106,7 @@ describe("selected session cache", () => {
 			]]),
 		};
 		const fence = {
-			...captureTurnDetailRequest(cache, started.id, 7),
+			...captureTurnDetailRequest(cache, started.id),
 			transcriptRevision: 3,
 			activeLeafId: staleAssistant.id,
 		};
@@ -116,7 +117,7 @@ describe("selected session cache", () => {
 			transcript_revision: 3,
 			card_id: started.id,
 			entries: [started, user, staleAssistant],
-		}, fence, 8);
+		}, fence, false);
 
 		expect(applied.applied).toBe(false);
 		expect(applied.cache.snapshot?.transcript_revision).toBe(4);
@@ -806,9 +807,9 @@ describe("selected session cache", () => {
 		});
 		cache = applyTurnDetail(
 			cache,
-			sessionId,
-			finished.id,
-			[started, user, assistant, finished],
+			turnDetailResult(finished.id, finished.id, [started, user, assistant, finished], 2),
+			captureTurnDetailRequest(cache, finished.id),
+			true,
 		).cache;
 
 		expect(activeBranchEntriesForExport(cache).map((candidate) => candidate.id)).toEqual([
@@ -921,8 +922,24 @@ describe("selected session cache", () => {
 			]]),
 		};
 
-		const stale = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant]);
-		const fresh = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant, currentAssistant]);
+		const fence = captureTurnDetailRequest(cache, "entry_start");
+		const stale = applyTurnDetail(
+			cache,
+			turnDetailResult("entry_start", firstAssistant.id, [started, user, firstAssistant], 1),
+			fence,
+			true,
+		);
+		const fresh = applyTurnDetail(
+			cache,
+			turnDetailResult(
+				"entry_start",
+				currentAssistant.id,
+				[started, user, firstAssistant, currentAssistant],
+				1,
+			),
+			fence,
+			true,
+		);
 
 		expect(stale.applied).toBe(false);
 		expect(stale.cache.entriesById.has(started.id)).toBe(true);
@@ -936,7 +953,7 @@ describe("selected session cache", () => {
 		]);
 	});
 
-	it("accepts open turn detail responses that race with active leaf changes", () => {
+	it("hydrates an open turn through its current active ancestry after a stale response", () => {
 		const started = turnStartedEntry("entry_start", null, 1, 1);
 		const user = entry("entry_user", "entry_start", "full user message text", 2);
 		const firstAssistant = assistantEntry("entry_assistant_1", "entry_user", "partial", 3);
@@ -959,7 +976,16 @@ describe("selected session cache", () => {
 			]]),
 		};
 
-		const detail = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant]);
+		const detail = applyTurnDetail(
+			cache,
+			turnDetailResult("entry_start", firstAssistant.id, [started, user, firstAssistant], 3),
+			{
+				...captureTurnDetailRequest(cache, "entry_start"),
+				transcriptRevision: 3,
+				activeLeafId: firstAssistant.id,
+			},
+			true,
+		);
 
 		expect(detail.applied).toBe(true);
 		expect(detail.cache.turnDetailsById.get("entry_start")).toEqual([
@@ -968,6 +994,55 @@ describe("selected session cache", () => {
 			"entry_assistant_1",
 			"entry_assistant_2",
 		]);
+	});
+
+	it("uses active_leaf_id when cached sibling branches race a stale open-turn response", () => {
+		const started = turnStartedEntry("entry_start", null, 1, 1);
+		const user = entry("entry_user", started.id, "question", 2);
+		const staleAssistant = assistantEntry("entry_stale", user.id, "stale branch", 3);
+		const currentAssistant = assistantEntry("entry_current", user.id, "current branch", 4);
+		const currentTool = entry("entry_tool", currentAssistant.id, "current tool", 5);
+		let cache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([started, user, staleAssistant, currentAssistant, currentTool], {
+				activeLeafId: currentTool.id,
+				transcriptRevision: 5,
+			}),
+		);
+		cache = {
+			...cache,
+			turnOrder: [started.id],
+			turnCardsById: new Map([[
+				started.id,
+				{
+					...turnCard(started.id, 1),
+					start_entry_id: started.id,
+					active_leaf_id: currentTool.id,
+					start_sequence: 1,
+					end_sequence: 5,
+				},
+			]]),
+		};
+
+		const detail = applyTurnDetail(
+			cache,
+			turnDetailResult(started.id, staleAssistant.id, [started, user, staleAssistant], 3),
+			{
+				...captureTurnDetailRequest(cache, started.id),
+				transcriptRevision: 3,
+				activeLeafId: staleAssistant.id,
+			},
+			true,
+		);
+
+		expect(detail.applied).toBe(true);
+		expect(detail.cache.turnDetailsById.get(started.id)).toEqual([
+			started.id,
+			user.id,
+			currentAssistant.id,
+			currentTool.id,
+		]);
+		expect(detail.cache.entriesById.has(staleAssistant.id)).toBe(true);
 	});
 
 	it("prepends older transcript.turns pages without replacing the loaded tail page", () => {
@@ -1527,6 +1602,22 @@ function turnsResult(activeEntry: TranscriptEntry, revision: number): Transcript
 			active_leaf_id: activeEntry.id,
 			user_messages: [activeEntry],
 		}],
+	};
+}
+
+function turnDetailResult(
+	cardId: string,
+	activeLeafId: string,
+	entries: TranscriptEntry[],
+	transcriptRevision: number,
+): TranscriptTurnDetailResult {
+	return {
+		session_id: sessionId,
+		card_id: cardId,
+		active_leaf_id: activeLeafId,
+		session_revision: transcriptRevision,
+		transcript_revision: transcriptRevision,
+		entries,
 	};
 }
 

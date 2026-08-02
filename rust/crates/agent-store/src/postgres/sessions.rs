@@ -17,7 +17,8 @@ use super::outputs::persist_outputs_tx;
 use super::queue::bump_revisions_tx;
 use super::sql::{
     action_is_unfinished, ensure_no_active_work_tx, ensure_no_running_delegation_tx,
-    freeze_legacy_routes_tx, lock_session_tx, queued_input_is_active, session_activity,
+    freeze_legacy_routes_tx, lock_session_for_mutation_tx, lock_session_tx, queued_input_is_active,
+    session_activity,
 };
 use super::transcript::session_state_for_event_tx;
 use super::workspace_resources::attach_workspace_resource_tx;
@@ -105,6 +106,13 @@ enum TitleUpdateKind {
 }
 
 impl PostgresAgentStore {
+    pub async fn ensure_session_mutation_eligible(&self, session_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn create_session(
         &self,
         session_id: &str,
@@ -163,7 +171,7 @@ impl PostgresAgentStore {
         system_prompt: &str,
     ) -> Result<AddSessionMcpResult> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let current: (i64, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
             "select session_revision, mcp_manifest_fingerprint, parent_session_id, subagent_type from sessions where id=$1",
         )
@@ -225,7 +233,7 @@ impl PostgresAgentStore {
         metadata: &Value,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let result = sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
             .bind(session_id)
             .bind(metadata)
@@ -248,7 +256,7 @@ impl PostgresAgentStore {
 
     pub async fn reset_auto_compaction_failures(&self, session_id: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let mut metadata = session_metadata_tx(&mut tx, session_id).await?;
         let state = ensure_compaction_auto_state_object(&mut metadata);
         state.insert("consecutive_failures".to_string(), json!(0));
@@ -368,8 +376,9 @@ impl PostgresAgentStore {
         }
         let mut tx = self.pool.begin().await?;
         if let Some(parent_session_id) = parent_session_id {
+            lock_session_for_mutation_tx(&mut tx, parent_session_id).await?;
             let parent_fingerprint: Option<Option<String>> = sqlx::query_scalar(
-                "select mcp_manifest_fingerprint from sessions where id=$1::text for key share",
+                "select mcp_manifest_fingerprint from sessions where id=$1::text",
             )
             .bind(parent_session_id)
             .fetch_optional(&mut *tx)
@@ -425,6 +434,7 @@ impl PostgresAgentStore {
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_none() {
+            lock_session_for_mutation_tx(&mut tx, session_id).await?;
             tx.commit().await?;
             return Ok((Vec::new(), Vec::new()));
         }
@@ -487,7 +497,7 @@ impl PostgresAgentStore {
         update_kind: TitleUpdateKind,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let query = match update_kind {
             TitleUpdateKind::Automatic => {
                 r#"
@@ -565,7 +575,7 @@ impl PostgresAgentStore {
         config: &SessionConfig,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         freeze_legacy_routes_tx(&mut tx, session_id).await?;
         let row = sqlx::query(
             "update sessions set provider_config=$2, metadata=$3, updated_at=now() where id=$1 returning metadata",

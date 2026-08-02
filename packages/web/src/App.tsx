@@ -138,6 +138,7 @@ import {
 	type SelectedSessionCache,
 } from "./selectedSessionCache.ts";
 import { SessionListRequestCoordinator } from "./sessionListRequestCoordinator.ts";
+import { TurnDetailRequestCoordinator } from "./turnDetailRequestCoordinator.ts";
 import { useSelectedSessionStore } from "./selectedSessionStore.ts";
 import {
 	DEFAULT_PROVIDER,
@@ -523,7 +524,7 @@ export function App({
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
 	const sidebarSelectTimer = useRef<number | null>(null);
 	const autoLoadedTurnDetailRef = useRef<string | null>(null);
-	const turnDetailRequestIdRef = useRef(0);
+	const turnDetailRequestsRef = useRef(new TurnDetailRequestCoordinator());
 	const nextTranscriptDestinationIdRef = useRef(0);
 	const lastForegroundReconcileAt = useRef(Date.now());
 	const lastAwakeAt = useRef(Date.now());
@@ -2463,8 +2464,8 @@ export function App({
 				assertServerReadAllowed();
 				if (options.mode === "manual") setLoadingTurnId(cardId);
 				else setAutoLoadingTurnId(cardId);
-				const requestId = ++turnDetailRequestIdRef.current;
-				const fence = captureTurnDetailRequest(cache, card.id, requestId);
+				const request = turnDetailRequestsRef.current.begin(sessionId, card.id);
+				const fence = captureTurnDetailRequest(cache, card.id);
 				const result = await api.getTranscriptTurnDetail(sessionId, {
 					cardId: card.id,
 					leafId: card.active_leaf_id,
@@ -2480,7 +2481,7 @@ export function App({
 						current.sessionId === sessionId ? current : selectedCacheRef.current,
 						result,
 						fence,
-						turnDetailRequestIdRef.current,
+						turnDetailRequestsRef.current.isCurrent(request),
 					);
 					applied = detail.applied;
 					return detail.cache;
@@ -2546,6 +2547,7 @@ export function App({
 
 	useEffect(() => {
 		autoLoadedTurnDetailRef.current = null;
+		turnDetailRequestsRef.current.clear();
 	}, [selectedId]);
 
 	const reconcileAfterForeground = useCallback(

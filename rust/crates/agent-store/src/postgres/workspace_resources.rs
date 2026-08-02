@@ -7,10 +7,13 @@ use crate::{
     WorkspaceOwnerKind, WorkspaceResource, WorkspaceResourceState,
 };
 
+use super::sql::{ensure_no_active_work_tx, lock_session_tx};
 use super::PostgresAgentStore;
 
 const CLEANUP_RETRY_SECS: f64 = 5.0;
-const CLEANUP_CLAIM_SECS: f64 = 30.0;
+// DestroySession times out after 120 seconds. Keep one generation claimed
+// through that entire command plus fixed transport/commit grace.
+const CLEANUP_CLAIM_SECS: f64 = 130.0;
 
 fn workspace_resource_from_row(row: sqlx::postgres::PgRow) -> Result<WorkspaceResource> {
     Ok(WorkspaceResource {
@@ -192,6 +195,14 @@ impl PostgresAgentStore {
         cleanup_mode: WorkspaceCleanupMode,
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
+        if let Err(error) = lock_session_tx(&mut tx, session_id).await {
+            if error.downcast_ref::<crate::SessionNotFound>().is_some() {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        ensure_no_active_work_tx(&mut tx, session_id).await?;
         let row = sqlx::query(
             r#"
             select r.state
@@ -199,7 +210,7 @@ impl PostgresAgentStore {
             join sessions s on s.id=r.owner_session_id
             where r.owner_session_id=$1 and s.runtime_id=r.runtime_id
               and s.workspace_id=r.workspace_id
-            for update of r, s
+            for update of r
             "#,
         )
         .bind(session_id)
@@ -301,21 +312,34 @@ impl PostgresAgentStore {
     }
 
     /// Lease due deletion attempts so periodic and Hello-triggered sweeps do
-    /// not issue the same command concurrently.
+    /// not issue the same command concurrently. Parent identities remain
+    /// blocked until the concrete session tree below them is gone.
     pub async fn claim_due_workspace_deletions(
         &self,
         runtime_id: Option<&str>,
     ) -> Result<Vec<WorkspaceResource>> {
         let rows = sqlx::query(
             r#"
-            update workspace_resources
+            update workspace_resources r
             set retry_at=now() + make_interval(secs => $2), updated_at=now()
-            where workspace_id in (
-                select workspace_id
-                from workspace_resources
-                where state='deleting' and retry_at <= now()
-                  and ($1::text is null or runtime_id=$1)
-                order by retry_at, created_at
+            where r.workspace_id in (
+                select candidate.workspace_id
+                from workspace_resources candidate
+                where candidate.state='deleting' and candidate.retry_at <= now()
+                  and ($1::text is null or candidate.runtime_id=$1)
+                  and not exists (
+                      with recursive descendants(id) as (
+                          select child.id
+                          from sessions child
+                          where child.parent_session_id=candidate.owner_session_id
+                          union all
+                          select child.id
+                          from sessions child
+                          join descendants parent on child.parent_session_id=parent.id
+                      )
+                      select 1 from descendants
+                  )
+                order by candidate.retry_at, candidate.created_at
                 for update skip locked
                 limit 32
             )
@@ -381,6 +405,29 @@ impl PostgresAgentStore {
         let cleanup_mode: WorkspaceCleanupMode = cleanup_mode
             .parse()
             .map_err(|error: String| anyhow!(error))?;
+        let descendants_exist: bool = sqlx::query_scalar(
+            r#"
+                select exists(
+                    with recursive descendants(id) as (
+                        select child.id
+                        from sessions child
+                        where child.parent_session_id=$1
+                        union all
+                        select child.id
+                        from sessions child
+                        join descendants parent on child.parent_session_id=parent.id
+                    )
+                    select 1 from descendants
+                )
+                "#,
+        )
+        .bind(&resource.owner_session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if descendants_exist {
+            tx.rollback().await?;
+            return Ok(false);
+        }
         if cleanup_mode == WorkspaceCleanupMode::DeleteSession {
             sqlx::query(
                 r#"

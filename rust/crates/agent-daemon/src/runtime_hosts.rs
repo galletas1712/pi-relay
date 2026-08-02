@@ -1021,16 +1021,20 @@ pub(crate) mod test_support {
                 // The fake runtime serves only workspace skills; home skills are
                 // exercised by pure parse tests to keep results host-independent.
                 let base = fake_workspace_dir(dirs, &workspace_id).await;
-                let mut skills = ["implementer", "reviewer"]
+                let mut skills = [
+                    ("implementer", ""),
+                    ("reviewer", ""),
+                    ("forked-reviewer", "context: forked\n"),
+                ]
                     .into_iter()
-                    .map(|name| agent_runtime_protocol::RawSkillFile {
+                    .map(|(name, role_config)| agent_runtime_protocol::RawSkillFile {
                         kind: agent_runtime_protocol::SkillKind::SubagentRole,
                         origin: agent_runtime_protocol::SkillOrigin::RuntimeRole,
                         workspace: None,
                         package_name: name.to_string(),
                         path: format!("/runtime/roles/{name}/SKILL.md"),
                         contents: format!(
-                            "---\nname: {name}\ndescription: test {name} role\n---\n\nTest role."
+                            "---\nname: {name}\ndescription: test {name} role\n{role_config}---\n\nTest role."
                         ),
                     })
                     .collect::<Vec<_>>();

@@ -1,4 +1,5 @@
 -- ONE-TIME PRIVATE WORKSPACE OWNERSHIP MIGRATION
+\set ON_ERROR_STOP on
 --
 -- 1. STOP pi-agentd and every process that can create/delete sessions.
 -- 2. TAKE AND VERIFY A POSTGRES BACKUP before running this file.
@@ -7,8 +8,9 @@
 --    runtime workspace and never infers that an unknown directory is safe to
 --    delete.
 --
--- This file is rerunnable. A conflicting existing ownership row causes the
--- transaction to fail closed instead of overwriting identity.
+-- This file is rerunnable only in the stopped-daemon pre-cutover window. A
+-- conflicting existing ownership row causes the transaction to fail closed
+-- instead of overwriting identity.
 
 -- Preflight inventory: retain this output with the backup/change record.
 select
@@ -88,29 +90,6 @@ create table if not exists workspace_resources (
 
 create index if not exists workspace_resources_due_idx
     on workspace_resources(state, retry_at, lease_expires_at);
-
-alter table sessions
-    add column if not exists delegation_launch_state text not null default 'launched';
-do $$
-begin
-    if not exists (
-        select 1
-        from pg_constraint
-        where conrelid='sessions'::regclass
-          and conname='sessions_delegation_launch_state_check'
-    ) then
-        alter table sessions
-            add constraint sessions_delegation_launch_state_check
-            check (delegation_launch_state in ('launched','compensating'));
-    end if;
-end
-$$;
-
-create unique index if not exists sessions_delegation_launched_spawn_index_uq
-    on sessions(delegation_id, (metadata->>'delegation_spawn_index'))
-    where delegation_id is not null
-      and delegation_launch_state='launched'
-      and metadata ? 'delegation_spawn_index';
 
 -- Fail closed before backfill when session shapes are ambiguous.
 do $$

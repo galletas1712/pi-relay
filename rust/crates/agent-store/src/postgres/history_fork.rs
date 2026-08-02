@@ -13,7 +13,7 @@ use super::mcp::install_session_manifest_tx;
 use super::queue::{
     append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
 };
-use super::sql::lock_session_tx;
+use super::sql::lock_session_for_mutation_tx;
 use super::transcript::session_state_for_event_tx;
 use super::workspace_resources::attach_workspace_resource_tx;
 use super::PostgresAgentStore;
@@ -128,7 +128,7 @@ impl PostgresAgentStore {
             }
             _ => {}
         }
-        lock_session_tx(&mut tx, parent_session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, parent_session_id).await?;
         let source_fingerprint: Option<String> =
             sqlx::query_scalar("select mcp_manifest_fingerprint from sessions where id=$1")
                 .bind(parent_session_id)
@@ -283,7 +283,7 @@ impl PostgresAgentStore {
             workspace,
         } = request;
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, source_session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, source_session_id).await?;
         validate_history_target_tx(&mut tx, source_session_id, target).await?;
         let source_fingerprint: Option<String> =
             sqlx::query_scalar("select mcp_manifest_fingerprint from sessions where id=$1")

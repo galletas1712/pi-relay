@@ -279,38 +279,10 @@ pub(crate) async fn spawn_subagent(
         .fail_subagent_after_start_before_dispatch
         .swap(false, std::sync::atomic::Ordering::SeqCst)
     {
-        cleanup_failed_spawn(
-            state,
-            &child_session_id,
-            &request.parent_session_id,
-            &parent_config.runtime_id,
-            &workspace_id,
-            subagent_type,
-            "injected post-start failure",
-        )
-        .await;
-        return Err(RpcError::new(
-            "injected_post_start_failure",
-            "injected failure after child/action commit and before dispatch",
-        ));
-    }
-    if let Err(error) =
-        require_known_subagent(state, &request.parent_session_id, &child_session_id).await
-    {
-        cleanup_failed_spawn(
-            state,
-            &child_session_id,
-            &request.parent_session_id,
-            &parent_config.runtime_id,
-            &workspace_id,
-            subagent_type,
-            "child metadata validation failure",
-        )
-        .await;
-        return Err(error);
+        return Ok(SpawnedSubagent { started });
     }
 
-    let parent_events = match subagent_parent_spawn_events(
+    match subagent_parent_spawn_events(
         state,
         &request.parent_session_id,
         &started.session_id,
@@ -318,22 +290,12 @@ pub(crate) async fn spawn_subagent(
     )
     .await
     {
-        Ok(parent_events) => parent_events,
-        Err(error) => {
-            cleanup_failed_spawn(
-                state,
-                &started.session_id,
-                &request.parent_session_id,
-                &parent_config.runtime_id,
-                &workspace_id,
-                subagent_type,
-                "parent lifecycle event failure",
-            )
-            .await;
-            return Err(error);
-        }
-    };
-    publish_events(state, parent_events);
+        Ok(parent_events) => publish_events(state, parent_events),
+        Err(error) => eprintln!(
+            "failed to publish committed subagent launch parent={} child={}: {}: {}",
+            request.parent_session_id, started.session_id, error.code, error.message
+        ),
+    }
 
     let child_driver = SessionDriver::acquire(state, &started.session_id).await;
     let dispatch_result = if forked_context {
@@ -354,17 +316,6 @@ pub(crate) async fn spawn_subagent(
             &error,
         )
         .await;
-        cleanup_failed_spawn(
-            state,
-            &started.session_id,
-            &request.parent_session_id,
-            &parent_config.runtime_id,
-            &workspace_id,
-            subagent_type,
-            "initial dispatch failure",
-        )
-        .await;
-        return Err(error);
     }
 
     Ok(SpawnedSubagent { started })
@@ -455,11 +406,9 @@ async fn publish_subagent_parent_dispatch_failed_event(
     role: &str,
     error: &RpcError,
 ) {
-    // A delegation member's failure is owned by the delegation:
-    // delegation_tools spawn-failure compensation fails the delegation and the
-    // tool returns Err synchronously.
-    // Suppress the per-child idle so the parent never sees a per-child
-    // notification for a delegation member (matching the live idle gate).
+    // A committed delegation member remains launched and durable redrive owns
+    // its initial action. Suppress the per-child idle so the parent observes
+    // only the delegation lifecycle (matching the live idle gate).
     match state.repo.session_delegation_id(child_session_id).await {
         Ok(Some(_)) => return,
         Ok(None) => {}
@@ -506,72 +455,6 @@ pub(crate) async fn publish_subagent_parent_dispatch_failed_event_for_test(
         &RpcError::new("provider_error", "simulated initial dispatch failure"),
     )
     .await;
-}
-
-pub(crate) async fn require_known_subagent(
-    state: &AppState,
-    parent_session_id: &str,
-    child_session_id: &str,
-) -> std::result::Result<(), RpcError> {
-    let actual_parent_session_id = state
-        .repo
-        .session_parent_id(child_session_id)
-        .await?
-        .ok_or_else(|| RpcError::new("subagent_not_found", "subagent is not in scope"))?;
-    if actual_parent_session_id != parent_session_id {
-        return Err(RpcError::new(
-            "subagent_not_found",
-            "subagent is not in scope",
-        ));
-    }
-    Ok(())
-}
-
-async fn cleanup_failed_spawn(
-    state: &AppState,
-    child_session_id: &str,
-    _parent_session_id: &str,
-    _runtime_id: &str,
-    _workspace_id: &str,
-    subagent_type: SubagentType,
-    reason: &str,
-) {
-    match state
-        .repo
-        .begin_failed_spawn_compensation(child_session_id)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return,
-        Err(error) => {
-            eprintln!(
-                "failed to persist delegation child compensation {child_session_id} after {reason}: {error:#}"
-            );
-            return;
-        }
-    }
-    state.active.lock().await.remove(child_session_id);
-    // A full subagent shares the parent's session root/cwd in place; its
-    // session dir was never created, so tearing it down would delete the
-    // parent's durable workspace. Only a forked read-only child owns a private
-    // dir that is safe to reclaim.
-    match subagent_type {
-        SubagentType::Full => {
-            if let Err(delete_error) = state.repo.delete_session(child_session_id).await {
-                eprintln!(
-                    "failed to clean up child session {child_session_id} after {reason}: {delete_error:#}"
-                );
-            }
-        }
-        SubagentType::ReadOnly => {
-            // The store operation above atomically marked the delegation member
-            // compensating and transitioned its private resource to deleting.
-        }
-    }
-    state
-        .provider_connections
-        .remove_session(child_session_id)
-        .await;
 }
 
 fn subagent_metadata(

@@ -3,7 +3,6 @@ use std::panic::AssertUnwindSafe;
 use agent_session::SessionAction;
 use agent_store::{ActionKind, EventType, POST_COMPACTION_DISPATCH_LEASE_DURATION};
 use futures_util::future::FutureExt;
-use serde_json::json;
 
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
 use crate::types::{DispatchAction, RpcError};
@@ -104,15 +103,22 @@ async fn spawn_tool_dispatch(
     match spawn_claimed_dispatch(state.clone(), session_id.clone(), dispatch.clone()) {
         Ok(registration_id) => Ok(Some(registration_id)),
         Err(error) => {
-            if let Err(mark_error) = state
+            match state
                 .repo
-                .mark_action_stale(&session_id, &dispatch.row_id, &dispatch.attempt_id, None)
+                .mark_action_stale_and_event(
+                    &session_id,
+                    &dispatch.row_id,
+                    &dispatch.attempt_id,
+                    None,
+                    "failed to register tool dispatch runner",
+                )
                 .await
             {
-                eprintln!(
+                Ok(events) => publish_events(&state, events),
+                Err(mark_error) => eprintln!(
                     "failed to stale unregistered tool action {session_id}/{}: {mark_error:#}",
                     dispatch.row_id
-                );
+                ),
             }
             Err(error)
         }
@@ -157,7 +163,30 @@ pub(super) async fn spawn_model_dispatch(
             }
         }
     }
-    spawn_claimed_dispatch(state, session_id, dispatch).map(Some)
+    match spawn_claimed_dispatch(state.clone(), session_id.clone(), dispatch.clone()) {
+        Ok(registration_id) => Ok(Some(registration_id)),
+        Err(error) if !already_claimed => {
+            match state
+                .repo
+                .mark_action_stale_and_event(
+                    &session_id,
+                    &dispatch.row_id,
+                    &dispatch.attempt_id,
+                    None,
+                    "failed to register model dispatch runner",
+                )
+                .await
+            {
+                Ok(events) => publish_events(&state, events),
+                Err(mark_error) => eprintln!(
+                    "failed to stale unregistered model action {session_id}/{}: {mark_error:#}",
+                    dispatch.row_id
+                ),
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn spawn_claimed_dispatch(
@@ -165,11 +194,6 @@ fn spawn_claimed_dispatch(
     session_id: String,
     dispatch: DispatchAction,
 ) -> Result<TaskRegistrationId, TaskRegistrationRejected> {
-    let event_type = match &dispatch.action {
-        SessionAction::RequestModel { .. } => EventType::ModelError,
-        SessionAction::RequestTool { .. } => EventType::ToolError,
-        SessionAction::CancelSessionWork => unreachable!("cancel work is not dispatched"),
-    };
     prune_finished_tasks(&state);
     let action_row_id = dispatch.row_id.clone();
     let action_kind = match &dispatch.action {
@@ -313,34 +337,19 @@ fn spawn_claimed_dispatch(
                 "dispatch task failed {session_id}/{row_id}: {}: {}",
                 error.code, error.message
             );
-            let marked_stale = match task_state
-                .repo
-                .mark_action_stale(&session_id, &row_id, &attempt_id, lease.as_ref())
-                .await
-            {
-                Ok(marked_stale) => marked_stale,
-                Err(stale_error) => {
-                    eprintln!("failed to mark action stale {session_id}/{row_id}: {stale_error:#}");
-                    false
-                }
-            };
-            if !marked_stale {
-                return;
-            }
             match task_state
                 .repo
-                .insert_event(
+                .mark_action_stale_and_event(
                     &session_id,
-                    event_type,
-                    json!({
-                        "action_row_id": row_id,
-                        "error": error.message,
-                    }),
+                    &row_id,
+                    &attempt_id,
+                    lease.as_ref(),
+                    &error.message,
                 )
                 .await
             {
-                Ok(event) => {
-                    publish_events(&task_state, vec![event]);
+                Ok(events) if !events.is_empty() => {
+                    publish_events(&task_state, events);
                     if let Err(clear_error) =
                         clear_event_buffer_if_idle(&task_state, &session_id).await
                     {
@@ -350,9 +359,10 @@ fn spawn_claimed_dispatch(
                         );
                     }
                 }
-                Err(event_error) => eprintln!(
-                    "failed to record dispatch failure event {session_id}/{row_id}: {event_error:#}"
-                ),
+                Ok(_) => {}
+                Err(stale_error) => {
+                    eprintln!("failed to mark action stale {session_id}/{row_id}: {stale_error:#}");
+                }
             }
         }
     });

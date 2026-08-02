@@ -9,7 +9,9 @@ use uuid::Uuid;
 use crate::state::AppState;
 use crate::workspace_selection::SelectedWorkspace;
 
-const PROVISIONING_LEASE_SECS: i64 = 300;
+// MaterializeSession has the longest runtime command timeout at 300 seconds.
+// Keep the durable reservation through that timeout plus fixed transport grace.
+const PROVISIONING_LEASE_SECS: i64 = 310;
 const RECONCILE_INTERVAL_SECS: u64 = 2;
 
 async fn reserve(
@@ -201,17 +203,42 @@ pub(crate) async fn reconcile(state: &AppState, runtime_id: Option<&str>) -> Res
             .destroy_workspace(&resource.runtime_id, &resource.workspace_id)
             .await
         {
-            state
+            if let Err(record_error) = state
                 .repo
                 .record_workspace_cleanup_failure(&resource, &format!("{error:#}"))
-                .await?;
+                .await
+            {
+                eprintln!(
+                    "failed to record workspace cleanup failure {}: {record_error:#}",
+                    resource.workspace_id
+                );
+            }
             continue;
         }
-        if !state.repo.complete_workspace_cleanup(&resource).await? {
-            eprintln!(
-                "workspace cleanup generation changed before completion: {}",
-                resource.workspace_id
-            );
+        match state.repo.complete_workspace_cleanup(&resource).await {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "workspace cleanup generation changed before completion: {}",
+                    resource.workspace_id
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "workspace cleanup completion remains pending {}: {error:#}",
+                    resource.workspace_id
+                );
+                if let Err(record_error) = state
+                    .repo
+                    .record_workspace_cleanup_failure(&resource, &format!("{error:#}"))
+                    .await
+                {
+                    eprintln!(
+                        "failed to record workspace completion failure {}: {record_error:#}",
+                        resource.workspace_id
+                    );
+                }
+            }
         }
     }
     Ok(())

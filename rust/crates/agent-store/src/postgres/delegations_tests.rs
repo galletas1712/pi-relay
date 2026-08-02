@@ -890,7 +890,7 @@ async fn migration_creates_delegation_ledger_query_indexes() {
         where schemaname='public'
           and indexname in (
               'sessions_delegation_created_idx',
-              'sessions_delegation_launched_spawn_index_uq',
+              'sessions_delegation_spawn_index_uq',
               'delegations_parent_created_idx',
               'delegations_parent_launch_key_uq',
               'delegations_parent_running_idx',
@@ -915,112 +915,8 @@ async fn migration_creates_delegation_ledger_query_indexes() {
             "delegations_parent_running_idx".to_string(),
             "delegations_running_created_idx".to_string(),
             "sessions_delegation_created_idx".to_string(),
-            "sessions_delegation_launched_spawn_index_uq".to_string(),
+            "sessions_delegation_spawn_index_uq".to_string(),
         ]
-    );
-    db.cleanup().await;
-}
-
-#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
-#[tokio::test]
-async fn compensating_child_cannot_satisfy_or_block_a_delegation_spawn_index() {
-    let Some(db) = test_store().await else {
-        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    db.store
-        .create_project(
-            project_id,
-            "compensating launch test",
-            "runtime-test",
-            &[],
-            json!({}),
-        )
-        .await
-        .expect("create project");
-    create_session(&db, "parent", project_id).await;
-    let delegation =
-        create_delegation(&db, "parent", DelegationKind::ReadonlyFanout, None, None, 1)
-            .await
-            .expect("create delegation");
-    let mut failed_config = session_config(project_id, Some("reviewer"));
-    failed_config.metadata["delegation_spawn_index"] = json!(0);
-    db.store
-        .start_session_outputs_with_parent(
-            "failed-child",
-            &failed_config,
-            &[],
-            None,
-            &[],
-            &[],
-            InputPriority::FollowUp,
-            &UserMessage::text("failed dispatch"),
-            None,
-            Some("parent"),
-            Some(SubagentType::Full),
-            Some(&delegation.id),
-        )
-        .await
-        .expect("failed child commits");
-    assert_eq!(
-        db.store
-            .delegation_spawned_indices(&delegation.id)
-            .await
-            .expect("launched child is visible")
-            .get(&0)
-            .map(String::as_str),
-        Some("failed-child")
-    );
-    assert!(db
-        .store
-        .begin_failed_spawn_compensation("failed-child")
-        .await
-        .expect("compensation begins"));
-    let failed_metadata: serde_json::Value =
-        sqlx::query_scalar("select metadata from sessions where id='failed-child'")
-            .fetch_one(&db.store.pool)
-            .await
-            .expect("compensating child metadata loads");
-    assert_eq!(
-        failed_metadata.get("compensating_spawn_index"),
-        Some(&json!(0))
-    );
-    assert_eq!(failed_metadata.get("delegation_spawn_index"), None);
-    assert!(db
-        .store
-        .delegation_spawned_indices(&delegation.id)
-        .await
-        .expect("compensating child is hidden")
-        .is_empty());
-
-    let mut replacement_config = session_config(project_id, Some("reviewer"));
-    replacement_config.metadata["delegation_spawn_index"] = json!(0);
-    db.store
-        .start_session_outputs_with_parent(
-            "replacement-child",
-            &replacement_config,
-            &[],
-            None,
-            &[],
-            &[],
-            InputPriority::FollowUp,
-            &UserMessage::text("replacement"),
-            None,
-            Some("parent"),
-            Some(SubagentType::Full),
-            Some(&delegation.id),
-        )
-        .await
-        .expect("replacement index commits");
-    assert_eq!(
-        db.store
-            .delegation_spawned_indices(&delegation.id)
-            .await
-            .expect("replacement child is visible")
-            .get(&0)
-            .map(String::as_str),
-        Some("replacement-child")
     );
     db.cleanup().await;
 }

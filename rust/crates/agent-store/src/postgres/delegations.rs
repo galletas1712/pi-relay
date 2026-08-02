@@ -10,8 +10,8 @@ use super::queue::{
     append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
 };
 use super::sql::{
-    action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity,
-    steering_route_tx,
+    action_is_unfinished, lock_session_for_mutation_tx, lock_session_tx, queued_input_is_active,
+    session_activity, steering_route_tx,
 };
 use super::PostgresAgentStore;
 use crate::{
@@ -226,21 +226,6 @@ struct ScopedSubagentControlRequest<'a> {
 }
 
 impl PostgresAgentStore {
-    pub async fn compensating_full_delegation_members(&self) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar(
-            r#"
-            select id
-            from sessions
-            where delegation_launch_state='compensating'
-              and subagent_type='full'
-            order by updated_at, id
-            limit 100
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?)
-    }
-
     /// Admit a delegation under the parent-session row lock. Replaying the same
     /// key and shape returns the original immutable delegation.
     pub async fn create_delegation_idempotent(
@@ -270,7 +255,7 @@ impl PostgresAgentStore {
         let id = format!("delegation_{}", Uuid::new_v4());
         let attempt_id = Uuid::new_v4().to_string();
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, parent_session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, parent_session_id).await?;
         if let Some(row) = sqlx::query(
             r#"
             select id, parent_session_id, workflow, label, kind, status, attempt_id,
@@ -388,7 +373,7 @@ impl PostgresAgentStore {
             left join transcript_entries te
                 on te.session_id = s.id
                and te.id = s.active_leaf_id
-            where s.delegation_id=$1 and s.delegation_launch_state='launched'
+            where s.delegation_id=$1
             order by s.created_at, s.id
             "#
         );
@@ -484,7 +469,7 @@ impl PostgresAgentStore {
             r#"
             select id, subagent_type, metadata
             from sessions
-            where delegation_id=$1 and delegation_launch_state='launched'
+            where delegation_id=$1
             order by created_at, id
             "#,
         )
@@ -502,8 +487,7 @@ impl PostgresAgentStore {
             r#"
             select id, (metadata->>'delegation_spawn_index')::integer as spawn_index
             from sessions
-            where delegation_id=$1 and delegation_launch_state='launched'
-              and metadata ? 'delegation_spawn_index'
+            where delegation_id=$1 and metadata ? 'delegation_spawn_index'
             "#,
         )
         .bind(delegation_id)
@@ -531,7 +515,7 @@ impl PostgresAgentStore {
             r#"
             select id, subagent_type, metadata
             from sessions
-            where delegation_id=$1 and delegation_launch_state='launched'
+            where delegation_id=$1
             order by created_at, id
             limit $2
             "#,
@@ -634,7 +618,7 @@ impl PostgresAgentStore {
             left join transcript_entries te
                 on te.session_id = s.id
                and te.id = s.active_leaf_id
-            where s.delegation_id=$1 and s.delegation_launch_state='launched'
+            where s.delegation_id=$1
             "#,
         );
         let rows = sqlx::query(&query)
@@ -882,7 +866,7 @@ impl PostgresAgentStore {
                     )
                 ), false)
             from sessions s
-            where s.delegation_id=$1 and s.delegation_launch_state='launched'
+            where s.delegation_id=$1
             "#
         );
         let ready: bool = sqlx::query_scalar(&query)
@@ -1800,13 +1784,11 @@ impl PostgresAgentStore {
     ///    queued input) is correctly NON-terminal and stays in the delegation
     ///    until it is recovered to a boundary.
     pub async fn delegation_subagents_all_terminal(&self, delegation_id: &str) -> Result<bool> {
-        let session_ids: Vec<String> = sqlx::query_scalar(
-            "select id from sessions
-                 where delegation_id=$1 and delegation_launch_state='launched'",
-        )
-        .bind(delegation_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let session_ids: Vec<String> =
+            sqlx::query_scalar("select id from sessions where delegation_id=$1")
+                .bind(delegation_id)
+                .fetch_all(&self.pool)
+                .await?;
         if (session_ids.len() as i32) != self.delegation_expected_subagents(delegation_id).await? {
             return Ok(false);
         }
@@ -1829,57 +1811,6 @@ impl PostgresAgentStore {
             .fetch_one(&self.pool)
             .await
             .map_err(Into::into)
-    }
-
-    /// Exclude a committed child from successful launch/idempotency semantics
-    /// and persist private cleanup intent before any best-effort compensation.
-    pub async fn begin_failed_spawn_compensation(&self, session_id: &str) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("select delegation_id from sessions where id=$1 for update")
-            .bind(session_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let Some(row) = row else {
-            tx.commit().await?;
-            return Ok(false);
-        };
-        let delegation_id: Option<String> = row.get("delegation_id");
-        if delegation_id.is_some() {
-            sqlx::query(
-                r#"
-                update sessions
-                set delegation_launch_state='compensating',
-                    metadata=case
-                        when metadata ? 'delegation_spawn_index'
-                        then (metadata - 'delegation_spawn_index')
-                            || jsonb_build_object(
-                                'compensating_spawn_index',
-                                metadata->'delegation_spawn_index'
-                            )
-                        else metadata
-                    end,
-                    updated_at=now()
-                where id=$1
-                "#,
-            )
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        sqlx::query(
-            r#"
-            update workspace_resources
-            set state='deleting', cleanup_mode='delete_session',
-                retry_at=now(), last_error=null, updated_at=now()
-            where owner_session_id=$1
-              and state in ('provisioning','ready','deleting')
-            "#,
-        )
-        .bind(session_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(true)
     }
 
     /// Running delegations whose subagents are all terminal — the boot-sweep
@@ -1992,7 +1923,7 @@ async fn enqueue_steer_content_tx(
     content: QueuedInputContent,
     client_input_id: &str,
 ) -> Result<bool> {
-    lock_session_tx(tx, parent_session_id).await?;
+    lock_session_for_mutation_tx(tx, parent_session_id).await?;
     let route = steering_route_tx(tx, parent_session_id).await?;
     let id = format!("input_{}", Uuid::new_v4());
     let inserted = sqlx::query(

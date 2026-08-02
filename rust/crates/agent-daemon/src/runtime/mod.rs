@@ -207,6 +207,11 @@ impl SessionDriver {
     async fn load_interrupted_control_runtime(
         &self,
     ) -> std::result::Result<Arc<Mutex<RuntimeSession>>, RpcError> {
+        self.state
+            .repo
+            .ensure_session_mutation_eligible(&self.session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         let config = self
             .state
             .repo
@@ -303,6 +308,11 @@ impl SessionDriver {
         {
             return Ok(());
         }
+        self.state
+            .repo
+            .ensure_session_mutation_eligible(&self.session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         let config = self
             .state
             .repo
@@ -613,6 +623,11 @@ impl SessionDriver {
     }
 
     pub(crate) async fn recover_if_needed(&self) -> std::result::Result<(), RpcError> {
+        self.state
+            .repo
+            .ensure_session_mutation_eligible(&self.session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         self.reconcile_pending_subagent_controls().await?;
         if self
             .state
@@ -690,6 +705,11 @@ impl SessionDriver {
     }
 
     pub(crate) async fn ensure_active_loaded(&self) -> std::result::Result<(), RpcError> {
+        self.state
+            .repo
+            .ensure_session_mutation_eligible(&self.session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         if self
             .state
             .active
@@ -1277,6 +1297,11 @@ impl SessionDriver {
         if pending.is_empty() {
             return Ok(Vec::new());
         }
+        self.state
+            .repo
+            .ensure_session_mutation_eligible(&self.session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         let config = self
             .state
             .repo

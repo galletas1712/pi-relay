@@ -5027,6 +5027,232 @@ fn assert_delegation_tools_hidden(names: &[String]) {
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
+async fn delegate_tool_launches_forked_role_from_completed_parent_boundary() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    std::fs::write(
+        env.cwd.path().join("PI.md"),
+        "Test prompt for {{ session.cwd }}.\n",
+    )
+    .expect("write test PI template");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "forked role production launch",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "forked-role-parent").await;
+    let delegation_call = ToolCall {
+        id: ToolCallId::new("call_forked_role"),
+        tool_name: "delegate_writing_task".to_string(),
+        args_json: json!({
+            "role": "forked-reviewer",
+            "prompt": "Inspect the completed parent context."
+        })
+        .to_string(),
+    };
+    env.state
+        .repo
+        .persist_outputs(
+            "forked-role-parent",
+            OutputBatch::new(
+                &[
+                    TranscriptStorageNode {
+                        id: "forked-parent-start".to_string(),
+                        parent_id: None,
+                        timestamp_ms: 1,
+                        item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-parent-user".to_string(),
+                        parent_id: Some("forked-parent-start".to_string()),
+                        timestamp_ms: 2,
+                        item: TranscriptItem::UserMessage(UserMessage::text(
+                            "This completed context must be inherited.",
+                        )),
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-parent-assistant".to_string(),
+                        parent_id: Some("forked-parent-user".to_string()),
+                        timestamp_ms: 3,
+                        item: TranscriptItem::AssistantMessage(AssistantMessage {
+                            items: vec![AssistantItem::Text("Completed answer.".to_string())],
+                        }),
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-parent-finish".to_string(),
+                        parent_id: Some("forked-parent-assistant".to_string()),
+                        timestamp_ms: 4,
+                        item: TranscriptItem::TurnFinished {
+                            turn_id: TurnId(1),
+                            outcome: TurnOutcome::Graceful,
+                        },
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-delegation-start".to_string(),
+                        parent_id: Some("forked-parent-finish".to_string()),
+                        timestamp_ms: 5,
+                        item: TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-delegation-user".to_string(),
+                        parent_id: Some("forked-delegation-start".to_string()),
+                        timestamp_ms: 6,
+                        item: TranscriptItem::UserMessage(UserMessage::text(
+                            "Delegate using the forked role.",
+                        )),
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-delegation-call".to_string(),
+                        parent_id: Some("forked-delegation-user".to_string()),
+                        timestamp_ms: 7,
+                        item: TranscriptItem::AssistantMessage(AssistantMessage {
+                            items: vec![AssistantItem::ToolCall(delegation_call.clone())],
+                        }),
+                        provider_replay: Vec::new(),
+                    },
+                ],
+                Some("forked-delegation-call"),
+                &[],
+                &[SessionAction::RequestTool {
+                    action_id: ActionId(2),
+                    turn_id: TurnId(2),
+                    tool_call: delegation_call.clone(),
+                }],
+            ),
+        )
+        .await
+        .expect("parent completed and open delegation turns persist");
+    let parent_driver = SessionDriver::acquire(&env.state, "forked-role-parent").await;
+    parent_driver
+        .ensure_active_loaded_preserving_open_turn()
+        .await
+        .expect("parent open tool turn loads");
+    drop(parent_driver);
+
+    let tool_result = run_delegation_tool(&env.state, "forked-role-parent", &delegation_call).await;
+    assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Success);
+    let output: serde_json::Value =
+        serde_json::from_str(&tool_result.output).expect("delegation result JSON");
+    let child_id = output["subagent_session_id"]
+        .as_str()
+        .expect("committed child id");
+    let stored = env
+        .state
+        .repo
+        .load_stored_session(child_id)
+        .await
+        .expect("forked child durable history loads");
+    assert_eq!(
+        stored
+            .entries
+            .iter()
+            .take(4)
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "forked-parent-start",
+            "forked-parent-user",
+            "forked-parent-assistant",
+            "forked-parent-finish",
+        ]
+    );
+    assert!(stored
+        .entries
+        .iter()
+        .all(|entry| !entry.id.starts_with("forked-delegation-")));
+
+    let durable_context = AgentSession::from_stored_session(stored)
+        .expect("forked child rehydrates")
+        .model_context();
+    assert!(durable_context
+        .transcript_items()
+        .iter()
+        .any(|item| matches!(
+            item,
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            }
+        )));
+    assert!(durable_context
+        .transcript_items()
+        .iter()
+        .all(|item| !matches!(
+            item,
+            TranscriptItem::AssistantMessage(message)
+                if message.tool_calls().any(|call| call.id == delegation_call.id)
+        )));
+
+    let pending = env
+        .state
+        .repo
+        .pending_actions_for_dispatch(child_id)
+        .await
+        .expect("child initial model action loads");
+    let model_context = pending
+        .into_iter()
+        .find_map(|pending| match pending.action {
+            SessionAction::RequestModel { model_context, .. } => Some(model_context),
+            _ => None,
+        })
+        .expect("forked child has a pending first model action");
+    assert!(model_context
+        .transcript_items()
+        .iter()
+        .all(|item| !matches!(
+            item,
+            TranscriptItem::AssistantMessage(message)
+                if message.tool_calls().any(|call| call.id == delegation_call.id)
+        )));
+    let config = env
+        .state
+        .repo
+        .load_session_config(child_id)
+        .await
+        .expect("forked child config loads");
+    let provider_request = build_model_request(
+        &env.state,
+        &config,
+        child_id,
+        None,
+        model_context,
+        &mcp_snapshot_for_session(&config).expect("empty MCP snapshot"),
+    )
+    .await
+    .expect("first provider request builds without provider contact");
+    assert!(provider_request.transcript.iter().all(|entry| !matches!(
+        &entry.item,
+        TranscriptItem::AssistantMessage(message)
+            if message.tool_calls().any(|call| call.id == delegation_call.id)
+    )));
+    assert!(provider_request.transcript.iter().any(|entry| matches!(
+        entry.item,
+        TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Graceful,
+        }
+    )));
+
+    env.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
 async fn tools_list_filters_delegation_tools_for_subagent_session() {
     let Some(env) = test_env().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -9189,9 +9415,8 @@ async fn spawn_failure_leaves_no_running_delegation() {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
-    // A parent with NO project makes spawn_subagent fail with project_required,
-    // exercising the compensation path: the half-started delegation is failed so the
-    // Writer admission releases rather than stranding the parent.
+    // A parent with NO project makes spawn_subagent fail before child commit.
+    // The launch intent becomes failed so writer admission is released.
     env.state
         .repo
         .start_session_outputs(
@@ -9236,6 +9461,118 @@ async fn spawn_failure_leaves_no_running_delegation() {
         .expect("list delegations");
     assert_eq!(delegations.len(), 1);
     assert_eq!(delegations[0].status, DelegationStatus::Failed);
+
+    env.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn failed_delegation_never_replays_committed_children_as_a_successful_launch() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    std::fs::write(
+        env.cwd.path().join("PI.md"),
+        "Test prompt for {{ session.cwd }}.\n",
+    )
+    .expect("write test PI template");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "failed committed launch replay",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let launch_shape = json!({
+        "kind": "full",
+        "role": "implementer",
+        "prompt": "committed child",
+        "workflow": null,
+        "label": null
+    })
+    .to_string();
+    let delegation = env
+        .state
+        .repo
+        .create_delegation_idempotent(agent_store::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "failed-committed-launch",
+            launch_shape: &launch_shape,
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("persist launch");
+    crate::delegation_tools::materialize_delegation_launch(&env.state, &delegation)
+        .await
+        .expect("child commits");
+    assert_eq!(
+        env.state
+            .repo
+            .delegation_spawned_indices(&delegation.id)
+            .await
+            .expect("committed index loads")
+            .len(),
+        1
+    );
+    assert!(
+        env.state
+            .repo
+            .begin_delegation_teardown(
+                "parent",
+                &delegation.id,
+                &delegation.attempt_id,
+                DelegationStatus::Failed,
+                "test launch failure",
+            )
+            .await
+            .expect("failure teardown begins")
+            .0
+    );
+    env.state
+        .repo
+        .record_delegation_launch_error(
+            &delegation.id,
+            &delegation.attempt_id,
+            "initial_dispatch_failed",
+            "committed launch must be redriven",
+        )
+        .await
+        .expect("launch error persists");
+    assert!(env
+        .state
+        .repo
+        .finish_delegation_teardown(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Failed,
+        )
+        .await
+        .expect("failure teardown finishes"));
+
+    let error = crate::delegation_tools::materialize_delegation_launch(&env.state, &delegation)
+        .await
+        .expect_err("failed delegation cannot return committed children as success");
+    assert_eq!(error.code, "initial_dispatch_failed");
+    assert_eq!(error.message, "committed launch must be redriven");
+    assert_eq!(
+        env.state
+            .repo
+            .delegation_spawned_indices(&delegation.id)
+            .await
+            .expect("failed launch retains durable child index")
+            .len(),
+        1
+    );
 
     env.cleanup().await;
 }
