@@ -53,3 +53,30 @@ existing window returns to the foreground after five minutes hidden. That
 refresh revalidates the document and ignores the HTTP cache without clearing
 localStorage or service-worker state, so reinstalling the Electron binary is
 not normally required for frontend updates.
+
+## GitHub Actions artifacts
+
+The [`Electron macOS artifact`](../../.github/workflows/electron-macos-artifact.yml)
+workflow builds a universal DMG on a GitHub-hosted macOS runner. It runs
+automatically after a push to `main` changes any of the following:
+
+- `.github/workflows/electron-macos-artifact.yml`
+- `packages/electron/**`
+- `packages/web/public/icons/icon-512.png`
+- `package.json` or `package-lock.json`
+
+Frontend-only changes outside the icon path and Rust-only changes do not start
+this workflow. To build on demand from any selected ref:
+
+1. Open the repository's **Actions** tab.
+2. Select **Electron macOS artifact**.
+3. Select **Run workflow**, choose the ref, and select **Run workflow** again.
+4. Open the completed run and download the artifact whose name starts with
+   `electron-macos-dmg-`. It contains the DMG and its `.sha256` checksum file.
+
+The DMG is not signed or notarized. macOS Gatekeeper will likely warn that the
+developer cannot be verified and may quarantine or block the app on first
+launch. Use Finder's **Open** action or approve the app under **System
+Settings → Privacy & Security** if macOS offers that option. This workflow
+does not publish a GitHub Release, configure auto-updating, or provide Apple
+signing/notarization.
