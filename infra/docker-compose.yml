@@ -25,7 +25,7 @@ services:
     environment:
       HOME: /root
       XDG_CONFIG_HOME: /config
-      PI_RELAY_ALLOWED_ORIGINS: ${PI_RELAY_ALLOWED_ORIGINS-http://127.0.0.1:8788}
+      PI_RELAY_ALLOWED_ORIGINS: ${PI_RELAY_ALLOWED_ORIGINS-https://pi-relay.pages.dev}
     ports:
       - "127.0.0.1:8787:8787"
       # Runtime listener, published so the host-side pi-runtime (not dockerized;
