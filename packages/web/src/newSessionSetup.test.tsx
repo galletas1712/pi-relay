@@ -3,7 +3,7 @@
 import React from "react";
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	NewSessionSetup,
 	type WorkspaceConfiguration,
@@ -163,6 +163,14 @@ describe("NewSessionSetup readiness", () => {
 		expect(screen.queryByRole("heading", { name: "Host context only" })).toBeNull();
 	});
 
+	it("renders meaningful loading status text with the skeleton", () => {
+		render(setup({ mcpReady: false, mcpAuthStatusReady: false }));
+
+		const status = screen.getByRole("status");
+		expect(status.textContent).toContain("Loading MCP tools");
+		expect(status.querySelector(".sr-only")?.textContent).toBe("Loading MCP tools");
+	});
+
 	it("reports an unavailable selected-project workspace configuration", () => {
 		render(setup(
 			{ mcpReady: true, mcpAuthStatusReady: true },
@@ -181,7 +189,7 @@ describe("NewSessionSetup readiness", () => {
 	])("does not claim optional context is empty before all MCP data is ready", (readiness) => {
 		render(setup(readiness));
 
-		expect(screen.getByRole("status").textContent).toBe("Loading MCP tools…");
+		expect(screen.getByRole("status").textContent).toContain("Loading MCP tools");
 		expect(screen.queryByRole("heading", { name: "Host context only" })).toBeNull();
 	});
 
@@ -202,5 +210,32 @@ describe("NewSessionSetup readiness", () => {
 		expect(screen.getByRole("heading", { name: "Host context only" })).toBeTruthy();
 		expect(screen.queryByText(/Write your first message below/)).toBeNull();
 		expect(screen.queryByRole("status")).toBeNull();
+	});
+
+	it("shows the MCP error detail and keeps retry concise", async () => {
+		const onRetryMcp = vi.fn();
+		render(
+			<NewSessionSetup
+				workspaceConfiguration={{ status: "ready", scope: null }}
+				onWorkspaceScopeChange={() => {}}
+				mcpInventory={EMPTY_INVENTORY}
+				mcpSelection={new Map()}
+				onMcpSelectionChange={() => {}}
+				mcpLoading={false}
+				mcpReady={false}
+				mcpError="Discovery timed out"
+				onRetryMcp={onRetryMcp}
+				mcpAuthStatus={[]}
+				mcpAuthStatusReady
+				onMcpLogin={() => {}}
+				onMcpLogout={() => {}}
+				workspacePreparationStatus={null}
+			/>,
+		);
+
+		expect(screen.getByText("MCP unavailable")).toBeTruthy();
+		expect(screen.getByText("Discovery timed out")).toBeTruthy();
+		await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+		expect(onRetryMcp).toHaveBeenCalledOnce();
 	});
 });

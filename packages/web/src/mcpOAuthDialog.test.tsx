@@ -13,6 +13,11 @@ const LOGIN = {
 };
 
 beforeEach(() => {
+	vi.stubGlobal("ResizeObserver", class {
+		observe() {}
+		unobserve() {}
+		disconnect() {}
+	});
 	Object.defineProperty(navigator, "clipboard", {
 		configurable: true,
 		value: { writeText: vi.fn(async () => {}) },
@@ -22,6 +27,7 @@ beforeEach(() => {
 afterEach(() => {
 	cleanup();
 	vi.restoreAllMocks();
+	vi.unstubAllGlobals();
 });
 
 describe("McpOAuthDialog", () => {
@@ -37,14 +43,16 @@ describe("McpOAuthDialog", () => {
 				onCancel={onCancel}
 			/>,
 		);
-		const link = screen.getByRole("link", { name: "Open authorization page" });
+		const link = screen.getByRole("link", { name: "Authorize" });
 		expect(link.getAttribute("href")).toBe(LOGIN.authorization_url);
 		expect(link.getAttribute("target")).toBe("_blank");
 		expect(link.getAttribute("rel")).toBe("noopener noreferrer");
 		await waitFor(() => expect(document.activeElement).toBe(link));
-		expect(screen.getByText(/daemon is listening.*loopback/i)).toBeTruthy();
-		await userEvent.click(screen.getByRole("button", { name: "Copy" }));
-		expect(navigator.clipboard.writeText).toHaveBeenCalledWith(LOGIN.authorization_url);
+		expect(screen.queryByText(/daemon is listening.*loopback/i)).toBeNull();
+		await userEvent.click(screen.getByRole("button", { name: "Copy authorization URL" }));
+		await waitFor(() =>
+			expect(navigator.clipboard.writeText).toHaveBeenCalledWith(LOGIN.authorization_url)
+		);
 		await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
 		await waitFor(() => expect(onCancel).toHaveBeenCalled());
 		expect(localSet).not.toHaveBeenCalled();
@@ -78,9 +86,9 @@ describe("McpOAuthDialog", () => {
 				onCancel={async () => {}}
 			/>,
 		);
-		const input = screen.getByLabelText("Callback URL for a remote daemon");
+		const input = screen.getByLabelText(/^Remote callback URL/);
 		expect(input.getAttribute("maxlength")).toBe(String(MAX_MCP_CALLBACK_URL_LENGTH));
-		await userEvent.type(input, callbackUrl);
+		await userEvent.type(input, `  ${callbackUrl}  `);
 		await userEvent.click(screen.getByRole("button", { name: "Complete" }));
 		expect(onComplete).toHaveBeenCalledWith(callbackUrl);
 	});
@@ -103,7 +111,7 @@ describe("McpOAuthDialog", () => {
 		expect((await screen.findByRole("alert")).textContent).toContain("fixed failure");
 		const callbackUrl =
 			"http://127.0.0.1:43123/oauth/callback/0000000000000001?code=bad&state=bad";
-		await userEvent.type(screen.getByLabelText("Callback URL for a remote daemon"), callbackUrl);
+		await userEvent.type(screen.getByLabelText(/^Remote callback URL/), callbackUrl);
 		await userEvent.click(screen.getByRole("button", { name: "Complete" }));
 		expect((await screen.findByRole("alert")).textContent).toContain("fixed callback failure");
 		await userEvent.click(screen.getByRole("button", { name: "Cancel" }));

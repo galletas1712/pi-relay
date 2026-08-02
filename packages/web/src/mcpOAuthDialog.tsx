@@ -1,4 +1,26 @@
 import { useRef, useState, type RefObject } from "react";
+import { Check, Clock3, Copy, ExternalLink, MonitorSmartphone, TriangleAlert } from "lucide-react";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import {
+	Field,
+	FieldGroup,
+	FieldLabel,
+} from "@/components/ui/field";
+import {
+	InputGroup,
+	InputGroupAddon,
+	InputGroupButton,
+	InputGroupInput,
+} from "@/components/ui/input-group";
+import { Spinner } from "@/components/ui/spinner";
+import { Textarea } from "@/components/ui/textarea";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipProvider,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
 	AppDialog,
 	DialogBody,
@@ -65,92 +87,130 @@ export function McpOAuthDialog({
 			setBusyAction(null);
 		}
 	};
+	const expiration = new Date(login.expires_at_unix_seconds * 1000);
 
 	return (
-		<AppDialog
-			className="rename-dialog mcp-oauth-dialog"
-			busy={actionBlocked}
-			initialFocusRef={openLinkRef}
-			returnFocusFallbackRef={returnFocusFallbackRef}
-			onDismiss={cancel}
-		>
-			<DialogHeader>
-				<DialogHeading>
-					<DialogTitle>Log in to {server}</DialogTitle>
-					<DialogDescription>
-						The daemon is listening for this OAuth callback on its own loopback interface.
-					</DialogDescription>
-				</DialogHeading>
-				<DialogCloseButton label="cancel MCP login" disabled={actionBlocked} />
-			</DialogHeader>
-			<DialogBody className="mcp-oauth-dialog-body">
-				<a
-					ref={openLinkRef}
-					className="primary-button mcp-oauth-open"
-					href={login.authorization_url}
-					target="_blank"
-					rel="noopener noreferrer"
-				>
-					Open authorization page
-				</a>
-				<div className="mcp-oauth-url">
-					<label htmlFor="mcp-authorization-url">Authorization URL</label>
-					<div>
-						<input id="mcp-authorization-url" value={login.authorization_url} readOnly />
-						<button type="button" className="secondary-button" onClick={() => void copy()} disabled={busy}>
-							{busyAction === "copy" ? "Copying…" : copied ? "Copied" : "Copy"}
-						</button>
-					</div>
-				</div>
-				<label className="rename-field" htmlFor="mcp-callback-url">
-					<span>Callback URL for a remote daemon</span>
-					<textarea
-						id="mcp-callback-url"
-						value={callbackUrl}
-						onChange={(event) => setCallbackUrl(event.target.value)}
-						maxLength={MAX_MCP_CALLBACK_URL_LENGTH}
-						rows={3}
-						placeholder="Paste the entire http://127.0.0.1:… callback URL"
+		<TooltipProvider>
+			<AppDialog
+				className="rename-dialog mcp-oauth-dialog"
+				busy={actionBlocked}
+				initialFocusRef={openLinkRef}
+				returnFocusFallbackRef={returnFocusFallbackRef}
+				onDismiss={cancel}
+			>
+				<DialogHeader>
+					<DialogHeading>
+						<DialogTitle>Log in to {server}</DialogTitle>
+						<DialogDescription>OAuth authorization</DialogDescription>
+					</DialogHeading>
+					<time
+						className="mcp-oauth-expiration"
+						dateTime={expiration.toISOString()}
+						title={`Expires at ${expiration.toLocaleTimeString()}`}
+					>
+						<Clock3 aria-hidden />
+						Expires {expiration.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+					</time>
+					<DialogCloseButton label="cancel MCP login" disabled={actionBlocked} />
+				</DialogHeader>
+				<DialogBody className="mcp-oauth-dialog-body">
+					<Button asChild className="mcp-oauth-open">
+						<a
+							ref={openLinkRef}
+							href={login.authorization_url}
+							target="_blank"
+							rel="noopener noreferrer"
+						>
+							<ExternalLink data-icon="inline-start" aria-hidden />
+							Authorize
+						</a>
+					</Button>
+					<FieldGroup>
+						<Field>
+							<FieldLabel htmlFor="mcp-authorization-url">Authorization URL</FieldLabel>
+							<InputGroup>
+								<InputGroupInput
+									id="mcp-authorization-url"
+									className="mcp-oauth-mono"
+									value={login.authorization_url}
+									readOnly
+								/>
+								<InputGroupAddon align="inline-end">
+									<Tooltip>
+										<TooltipTrigger asChild>
+											<InputGroupButton
+												size="icon-xs"
+												aria-label={copied ? "Authorization URL copied" : "Copy authorization URL"}
+												onClick={() => void copy()}
+												disabled={busy}
+											>
+												{busyAction === "copy"
+													? <Spinner />
+													: copied
+													? <Check aria-hidden />
+													: <Copy aria-hidden />}
+											</InputGroupButton>
+										</TooltipTrigger>
+										<TooltipContent>{copied ? "Copied" : "Copy URL"}</TooltipContent>
+									</Tooltip>
+								</InputGroupAddon>
+							</InputGroup>
+						</Field>
+						<Field>
+							<FieldLabel htmlFor="mcp-callback-url">
+								Remote callback URL
+								<MonitorSmartphone
+									className="mcp-oauth-field-hint"
+									aria-hidden
+								/>
+							</FieldLabel>
+							<Textarea
+								id="mcp-callback-url"
+								className="mcp-oauth-mono"
+								value={callbackUrl}
+								onChange={(event) => setCallbackUrl(event.target.value)}
+								maxLength={MAX_MCP_CALLBACK_URL_LENGTH}
+								rows={3}
+								placeholder="http://127.0.0.1:…/callback?code=…"
+								disabled={actionBlocked}
+							/>
+						</Field>
+					</FieldGroup>
+					{error ? (
+						<Alert variant="destructive">
+							<TriangleAlert aria-hidden />
+							<AlertDescription>{error}</AlertDescription>
+						</Alert>
+					) : null}
+					{mutationBlockedReason ? (
+						<Alert variant="destructive" role="status">
+							<TriangleAlert aria-hidden />
+							<AlertDescription>{mutationBlockedReason}</AlertDescription>
+						</Alert>
+					) : null}
+				</DialogBody>
+				<DialogFooter>
+					<Button
+						type="button"
+						variant="outline"
+						onClick={cancel}
 						disabled={actionBlocked}
-					/>
-				</label>
-				<p className="muted">
-					If this browser and the daemon are on different machines, copy the entire URL from the browser after authorization and paste it here. Do not paste only the code.
-				</p>
-				<p className="muted">
-					This login expires at{" "}
-					<time dateTime={new Date(login.expires_at_unix_seconds * 1000).toISOString()}>
-						{new Date(login.expires_at_unix_seconds * 1000).toLocaleTimeString()}
-					</time>.
-				</p>
-				{error ? <p className="error-text" role="alert">{error}</p> : null}
-				{mutationBlockedReason ? (
-					<p className="error-text" role="status">{mutationBlockedReason}</p>
-				) : null}
-			</DialogBody>
-			<DialogFooter>
-				<button
-					type="button"
-					className="secondary-button"
-					onClick={cancel}
-					disabled={actionBlocked}
-				>
-					{busyAction === "cancel" ? "Cancelling…" : "Cancel"}
-				</button>
-				<button
-					type="button"
-					className="primary-button"
-					onClick={() => void run("complete", () => onComplete(callbackUrl.trim()))}
-					disabled={
-						actionBlocked ||
-						callbackUrl.trim().length === 0
-					}
-					aria-busy={busyAction === "complete"}
-				>
-					{busyAction === "complete" ? "Completing…" : "Complete"}
-				</button>
-			</DialogFooter>
-		</AppDialog>
+					>
+						{busyAction === "cancel" ? <Spinner data-icon="inline-start" /> : null}
+						Cancel
+					</Button>
+					<Button
+						type="button"
+						onClick={() => void run("complete", () => onComplete(callbackUrl.trim()))}
+						disabled={actionBlocked || callbackUrl.trim().length === 0}
+						aria-busy={busyAction === "complete"}
+					>
+						{busyAction === "complete" ? <Spinner data-icon="inline-start" /> : null}
+						Complete
+					</Button>
+				</DialogFooter>
+			</AppDialog>
+		</TooltipProvider>
 	);
 }
 
