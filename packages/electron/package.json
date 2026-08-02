@@ -9,8 +9,8 @@
 		"start": "electron .",
 		"test": "vitest --run",
 		"validate": "node --check src/main.mjs && node --check src/policy.mjs && node --check src/refresh.mjs && npm test",
-		"package": "electron-builder",
-		"package:dir": "electron-builder --dir"
+		"package": "electron-builder --mac",
+		"package:dir": "electron-builder --dir --mac"
 	},
 	"author": {
 		"name": "Schwinn Saereesitthipitak",
@@ -37,18 +37,8 @@
 		"mac": {
 			"category": "public.app-category.productivity",
 			"target": [
-				"dmg"
-			]
-		},
-		"linux": {
-			"category": "Network",
-			"target": [
-				"AppImage"
-			]
-		},
-		"win": {
-			"target": [
-				"nsis"
+				"dmg",
+				"zip"
 			]
 		}
 	}

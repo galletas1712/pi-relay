@@ -3,12 +3,13 @@
 This package is a thin Electron shell around the deployed web application. It
 does not bundle the frontend and has no backend, database, workspace, or
 session-format code. The default frontend is `https://pi-relay.pages.dev`.
+Packaging and supported desktop use are currently macOS-only.
 
 ## Prerequisites
 
 - Node.js 22.12 or newer
 - npm dependencies installed from the repository root (`npm ci`)
-- Electron's native prerequisites for the target operating system
+- macOS with Electron's native prerequisites
 
 ## Local development
 
@@ -31,14 +32,16 @@ schemes are denied.
 
 ## Packaging
 
-Build an installer for the current platform:
+Build the macOS installers:
 
 ```sh
 npm run package:electron
 ```
 
-The configured production targets are macOS DMG, Windows NSIS, and Linux
-AppImage. To validate the packaged app layout without creating an installer:
+The configured production targets are macOS DMG and ZIP. The ZIP is retained
+as the macOS distribution artifact needed for a future auto-update flow; this
+PR does not add an auto-updater or release workflow. To validate the packaged
+app layout without creating an installer:
 
 ```sh
 npm run package:electron:dir
