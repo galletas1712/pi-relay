@@ -88,8 +88,8 @@ pub async fn read_file(
 }
 
 async fn read_file_from_root(root: &Path, rel_path: &str) -> Result<ArtifactsFile> {
-    let path = safe_relative(&root, rel_path)?;
-    reject_symlink(&root, &path).await?;
+    let path = safe_relative(root, rel_path)?;
+    reject_symlink(root, &path).await?;
     let file = tokio::fs::File::open(&path)
         .await
         .with_context(|| format!("open workspace file {rel_path}"))?;
@@ -470,24 +470,20 @@ async fn bounded_command(mut command: Command, cap: usize) -> Result<BoundedOutp
             result = stdout_task.as_mut().expect("stdout task"), if stdout_task.is_some() => {
                 stdout_task = None;
                 let result = result.context("join git stdout")??;
-                if result.truncated {
-                    if !killed {
-                        child.kill().await.ok();
-                        status = Some(child.wait().await.context("wait for git inspection")?);
-                        killed = true;
-                    }
+                if result.truncated && !killed {
+                    child.kill().await.ok();
+                    status = Some(child.wait().await.context("wait for git inspection")?);
+                    killed = true;
                 }
                 stdout = Some(result);
             }
             result = stderr_task.as_mut().expect("stderr task"), if stderr_task.is_some() => {
                 stderr_task = None;
                 let result = result.context("join git stderr")??;
-                if result.truncated {
-                    if !killed {
-                        child.kill().await.ok();
-                        status = Some(child.wait().await.context("wait for git inspection")?);
-                        killed = true;
-                    }
+                if result.truncated && !killed {
+                    child.kill().await.ok();
+                    status = Some(child.wait().await.context("wait for git inspection")?);
+                    killed = true;
                 }
                 stderr = Some(result);
             }
