@@ -1,4 +1,4 @@
-name: Electron macOS artifact
+name: Electron macOS release
 
 "on":
   workflow_dispatch:
@@ -16,8 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
-  # Needed to remove the previous rolling artifact before uploading its replacement.
+  contents: write
   actions: write
 
 jobs:
@@ -53,18 +52,100 @@ jobs:
             exit 1
           fi
           dmg="$(find packages/electron/dist -type f -name '*.dmg' -print -quit)"
-          shasum -a 256 "$dmg" > "$dmg.sha256"
+          cp "$dmg" packages/electron/dist/pi-relay-macos.dmg
+          (
+            cd packages/electron/dist
+            shasum -a 256 pi-relay-macos.dmg > pi-relay-macos.dmg.sha256
+          )
 
       - name: Explain distribution limitations
         run: |
           {
-            echo "## macOS artifact"
+            echo "## macOS release"
             echo
             echo "The DMG is an unsigned, non-notarized development artifact."
             echo "macOS Gatekeeper may warn or block the first launch; users may need to approve it in Privacy & Security or use Finder's Open action."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Remove previous rolling artifact
+      - name: Publish rolling GitHub Release
+        id: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="electron-latest"
+          title="π-relay macOS (latest)"
+          repo="$GITHUB_REPOSITORY"
+          notes="$RUNNER_TEMP/electron-release-notes.md"
+
+          cat > "$notes" <<EOF
+          Rolling Electron macOS build.
+
+          - Commit: \`$GITHUB_SHA\`
+          - Ref: \`$GITHUB_REF\`
+          - Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          - Built at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          This DMG is unsigned and non-notarized. macOS Gatekeeper may warn or
+          block the first launch; users may need to approve it in Privacy &
+          Security or use Finder's Open action.
+
+          This is the rolling Electron release, not a normal stable release.
+          EOF
+
+          if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --repo "$repo" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes-file "$notes" \
+              --latest=false
+          fi
+
+          gh release upload "$tag" \
+            --repo "$repo" \
+            packages/electron/dist/pi-relay-macos.dmg \
+            packages/electron/dist/pi-relay-macos.dmg.sha256 \
+            --clobber
+          echo "uploaded=true" >> "$GITHUB_OUTPUT"
+
+          release_id="$(gh api \
+            "repos/$repo/releases/tags/$tag" \
+            --jq '.id')"
+          gh api --method PATCH \
+            "repos/$repo/releases/$release_id" \
+            -f "name=$title" \
+            -f "body=$(cat "$notes")" \
+            -f "make_latest=false"
+
+          # Keep the rolling tag aligned with the build while avoiding a git
+          # push, which could trigger another workflow run.
+          gh api --method PATCH \
+            "repos/$repo/git/refs/tags/$tag" \
+            -f "sha=$GITHUB_SHA" \
+            -F force=true
+
+      - name: Remove unexpected rolling release assets
+        if: always() && steps.publish.outputs.uploaded == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="electron-latest"
+          repo="$GITHUB_REPOSITORY"
+
+          gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name' |
+            while IFS= read -r asset; do
+              case "$asset" in
+                pi-relay-macos.dmg|pi-relay-macos.dmg.sha256) ;;
+                *) gh release delete-asset "$tag" "$asset" --repo "$repo" --yes ;;
+              esac
+            done
+
+      - name: Remove legacy rolling Actions artifacts
+        if: always() && steps.publish.outputs.uploaded == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -88,13 +169,3 @@ jobs:
                 });
               }
             }
-
-      - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: electron-macos-dmg
-          path: |
-            packages/electron/dist/*.dmg
-            packages/electron/dist/*.dmg.sha256
-          if-no-files-found: error
-          retention-days: 30
