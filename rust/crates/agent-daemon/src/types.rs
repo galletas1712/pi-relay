@@ -94,6 +94,9 @@ pub(crate) enum RpcMethod {
     DelegationSteerSubagent,
     DelegationList,
     DelegationReadHandoffFile,
+    ArtifactsSnapshot,
+    ArtifactsReadFile,
+    ArtifactsDiff,
     HarnessModelComplete,
     HarnessModelFail,
 }
@@ -148,6 +151,9 @@ impl RpcMethod {
             "delegation.steer_subagent" => Some(Self::DelegationSteerSubagent),
             "delegation.list" => Some(Self::DelegationList),
             "delegation.read_handoff_file" => Some(Self::DelegationReadHandoffFile),
+            "artifacts.snapshot" => Some(Self::ArtifactsSnapshot),
+            "artifacts.read_file" => Some(Self::ArtifactsReadFile),
+            "artifacts.diff" => Some(Self::ArtifactsDiff),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
             _ => None,
@@ -255,6 +261,18 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("delegation.read_handoff_file"),
             Some(RpcMethod::DelegationReadHandoffFile)
+        );
+        assert_eq!(
+            RpcMethod::parse("artifacts.snapshot"),
+            Some(RpcMethod::ArtifactsSnapshot)
+        );
+        assert_eq!(
+            RpcMethod::parse("artifacts.read_file"),
+            Some(RpcMethod::ArtifactsReadFile)
+        );
+        assert_eq!(
+            RpcMethod::parse("artifacts.diff"),
+            Some(RpcMethod::ArtifactsDiff)
         );
         for old in [
             "stage.start_full",

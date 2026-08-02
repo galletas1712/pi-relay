@@ -2451,21 +2451,13 @@ describe("App workspace route identity integration", () => {
 		);
 		const api = createRouteApi({ missingSessionIds: new Set(["missing-child"]) });
 		const mounted = renderRouteApp(api, browser);
-		const user = userEvent.setup();
 
 		await open(api);
-		expect(await screen.findByRole("heading", { name: /Execution workspace is not available/ })).toBeTruthy();
-		expect(screen.getByRole("alert").textContent).toContain("requested conversation was unavailable");
+		expect(await screen.findByRole("heading", { name: "Activity" })).toBeTruthy();
 		expect(browser.currentUrl).toBe("/w/host/run/root-1/execution/activity");
 		expect(browser.replaceCalls).toHaveLength(1);
 		expect(screen.queryByRole("textbox")).toBeNull();
-		expect(document.querySelector("[data-slot='execution-placeholder']")?.textContent).toContain(
-			"Conversation root-1",
-		);
-
-		await user.click(screen.getByRole("button", { name: "Open effective Conversation" }));
-		await waitFor(() => expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/root-1"));
-		expect(await screen.findByRole("textbox")).toBeTruthy();
+		expect(screen.getByRole("alert").textContent).toContain("requested conversation was unavailable");
 
 		await mounted.dispose();
 	});
@@ -2494,9 +2486,11 @@ describe("App workspace route identity integration", () => {
 				"/w/host/run/root-1/execution/overview?conversation=agent%3Achild-1",
 			);
 		});
-		expect(await screen.findByRole("heading", { name: /Execution workspace is not available/ })).toBeTruthy();
+		expect(await screen.findByText("No session workspace is configured.")).toBeTruthy();
 		expect(screen.queryByRole("textbox")).toBeNull();
-		await user.click(screen.getByRole("button", { name: "Open effective Conversation" }));
+		await act(async () => {
+			browser.navigate("/w/host/run/root-1/conversation/child-1");
+		});
 		const restored = await screen.findByRole<HTMLTextAreaElement>("textbox");
 		expect(restored.value).toBe("child draft survives");
 		const restoredScroller = document.querySelector<HTMLDivElement>(".message-scroll");

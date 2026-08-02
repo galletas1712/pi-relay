@@ -8,6 +8,16 @@ tools always run when requested, and there is no approval interface.
 The goal of the contract is to make every user-facing behavior testable by
 sending the same websocket frames a frontend would send.
 
+## Read-only workspace artifacts
+
+The `artifacts.snapshot`, `artifacts.read_file`, and `artifacts.diff` methods
+inspect a session's persisted workspace on its runtime. The daemon validates
+session ownership and workspace membership before forwarding typed runtime
+commands. Paths are workspace-relative only; host paths and `.pi-handoff` are
+never exposed. Responses are bounded and contain file trees, Git status/change
+summaries, and bounded text/diff previews. These methods are read-only: there
+are no stage, commit, push, branch-switch, or edit operations.
+
 ## Browser connection acceptance
 
 The daemon upgrades only requests containing exactly one `Origin` header whose

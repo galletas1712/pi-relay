@@ -3,6 +3,221 @@
 	margin: 7px 10px 0;
 }
 
+.artifacts-view {
+	display: flex;
+	min-width: 0;
+	height: 100%;
+	flex-direction: column;
+	overflow: hidden;
+	padding: clamp(18px, 3vw, 40px);
+}
+
+.execution-route-surface {
+	grid-column: 1;
+	grid-row: 2;
+	display: flex;
+	min-height: 0;
+	flex-direction: column;
+	overflow: hidden;
+}
+
+.execution-route-surface > .artifacts-view,
+.execution-route-surface > .execution-route-state {
+	min-height: 0;
+	flex: 1;
+}
+
+.artifacts-header {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+	border-bottom: 1px solid var(--border);
+	padding-bottom: 20px;
+}
+
+.artifacts-header h1 {
+	margin: 2px 0 0;
+	font-size: clamp(1.4rem, 3vw, 2rem);
+}
+
+.artifacts-summary,
+.artifacts-muted {
+	color: var(--muted-foreground);
+}
+
+.artifacts-mobile-status,
+.artifacts-mobile-back {
+	display: none;
+}
+
+.artifacts-nav {
+	display: flex;
+	gap: 4px;
+	padding: 12px 0;
+}
+
+.artifacts-nav button {
+	display: inline-flex;
+	align-items: center;
+	gap: 7px;
+	border: 0;
+	border-radius: 7px;
+	background: transparent;
+	padding: 8px 11px;
+	color: var(--muted-foreground);
+	cursor: pointer;
+}
+
+.artifacts-nav button.artifacts-nav-active,
+.artifacts-nav button:hover {
+	background: var(--accent);
+	color: var(--foreground);
+}
+
+.artifacts-body {
+	display: grid;
+	min-height: 0;
+	flex: 1;
+	grid-template-columns: minmax(180px, 34%) minmax(0, 1fr);
+	gap: 14px;
+}
+
+.artifacts-list,
+.artifacts-preview {
+	min-height: 0;
+	overflow: auto;
+	border: 1px solid var(--border);
+	border-radius: 10px;
+	background: color-mix(in oklch, var(--card) 72%, transparent);
+	padding: 10px;
+}
+
+.artifact-row {
+	display: flex;
+	width: 100%;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	padding: 8px 9px;
+	color: var(--foreground);
+	text-align: left;
+	cursor: pointer;
+}
+
+.artifact-row:hover,
+.artifact-row.selected {
+	background: var(--accent);
+}
+
+.artifact-row span {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.artifact-row small {
+	color: var(--muted-foreground);
+}
+
+.artifacts-code {
+	margin: 0;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	font-size: var(--text-sm);
+	line-height: 1.55;
+}
+
+@media (max-width: 720px) {
+	.artifacts-view {
+		padding: 12px;
+	}
+
+	.artifacts-header {
+		gap: 10px;
+		padding-bottom: 12px;
+	}
+
+	.artifacts-header button {
+		align-self: flex-start;
+	}
+
+	.artifacts-header h1 {
+		display: none;
+	}
+
+	.artifacts-mobile-status {
+		display: block;
+		margin: 2px 0 7px;
+		color: var(--muted-foreground);
+		font-size: var(--text-sm);
+	}
+
+	.artifacts-header select {
+		max-width: min(100%, 280px);
+		min-height: 36px;
+	}
+
+	.artifacts-nav {
+		overflow-x: auto;
+		padding: 7px 0;
+		scrollbar-width: none;
+	}
+
+	.artifacts-nav button {
+		flex: 0 0 auto;
+		min-height: 36px;
+	}
+
+	.artifacts-body {
+		display: flex;
+		flex: 1;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.artifacts-list {
+		flex: 1;
+		max-height: none;
+	}
+
+	.artifacts-preview {
+		display: none;
+	}
+
+	.artifacts-view[data-mobile-detail="true"] .artifacts-list {
+		display: none;
+	}
+
+	.artifacts-view[data-mobile-detail="true"] .artifacts-preview {
+		display: block;
+		flex: 1;
+	}
+
+	.artifacts-mobile-back {
+		display: inline-flex;
+		min-height: 36px;
+		margin-bottom: 12px;
+		border: 1px solid var(--border);
+		border-radius: 7px;
+		background: transparent;
+		padding: 7px 10px;
+		color: var(--foreground);
+		cursor: pointer;
+	}
+}
+
+@media (min-width: 900px) and (max-width: 1279px) {
+	.execution-route-surface {
+		grid-column: 1;
+		grid-row: 2;
+	}
+}
+
 .mcp-picker-toggle:disabled,
 .workspace-scope-toggle:disabled {
 	cursor: default;
@@ -3693,6 +3908,11 @@ pre {
 		grid-row: 1 / span 2;
 	}
 
+	.execution-route-surface {
+		grid-column: 2;
+		grid-row: 1 / span 2;
+	}
+
 	.chat-dock {
 		grid-column: 2;
 		grid-row: 3;
@@ -3710,6 +3930,7 @@ pre {
 	 * them. */
 	.log-pane,
 	.workspace-route-state,
+	.execution-route-surface,
 	.chat-dock,
 	.sidebar,
 	.inspector,

@@ -21,6 +21,57 @@ pub struct RuntimeHello {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactsSnapshot {
+    pub workspace_dir: String,
+    pub tree: Vec<ArtifactEntry>,
+    pub git: Option<GitSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactEntry {
+    pub path: String,
+    pub kind: ArtifactEntryKind,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitSnapshot {
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub baseline: Option<String>,
+    pub changes: Vec<GitChange>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitChange {
+    pub path: String,
+    pub status: String,
+    pub old_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactsFile {
+    pub path: String,
+    pub contents: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactsDiff {
+    pub path: Option<String>,
+    pub contents: String,
+    pub truncated: bool,
+}
+
 pub async fn read_frame<T: for<'de> Deserialize<'de>>(
     reader: &mut (impl AsyncRead + Unpin),
 ) -> std::io::Result<Option<T>> {
@@ -154,6 +205,23 @@ pub enum RuntimeCommand {
         workspace_id: String,
         rel_path: String,
     },
+    /// Inspect one persisted session workspace without changing it.
+    ArtifactsSnapshot {
+        workspace_id: String,
+        workspace: SessionWorkspace,
+    },
+    /// Read one bounded, workspace-relative file.
+    ArtifactsReadFile {
+        workspace_id: String,
+        workspace_dir: String,
+        rel_path: String,
+    },
+    /// Read one bounded working-tree diff, optionally for one relative path.
+    ArtifactsDiff {
+        workspace_id: String,
+        workspace: SessionWorkspace,
+        rel_path: Option<String>,
+    },
     /// Return runtime-owned instructions and skill packages for a session.
     /// `project_key` selects `$HOME/.agents/projects/<project_key>/skills`
     /// when the session belongs to a project; ephemeral sessions pass `None`.
@@ -228,6 +296,9 @@ impl RuntimeCommand {
             | Self::ExecuteTool { .. }
             | Self::WriteWorkspaceFile { .. }
             | Self::ReadWorkspaceFile { .. }
+            | Self::ArtifactsSnapshot { .. }
+            | Self::ArtifactsReadFile { .. }
+            | Self::ArtifactsDiff { .. }
             | Self::ReadRuntimeContext { .. }
             | Self::McpInventory { .. }
             | Self::McpSelect { .. }
@@ -249,6 +320,9 @@ pub enum RuntimeCommandResult {
     Materialized { workspaces: Vec<SessionWorkspace> },
     Tool { result: ToolResultMessage },
     FileContents { contents: Option<String> },
+    ArtifactsSnapshot { snapshot: ArtifactsSnapshot },
+    ArtifactsFile { file: ArtifactsFile },
+    ArtifactsDiff { diff: ArtifactsDiff },
     RuntimeContext { context: RuntimeContext },
     McpInventory { inventory: McpInventory },
     McpManifest { manifest: McpSessionManifest },

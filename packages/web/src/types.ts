@@ -55,6 +55,44 @@ export interface SessionWorkspace extends ProjectWorkspace {
 	local_branch?: string;
 }
 
+export interface ArtifactEntry {
+	path: string;
+	kind: "file" | "directory";
+	size: number;
+}
+
+export interface GitChange {
+	path: string;
+	status: string;
+	old_path?: string | null;
+}
+
+export interface GitSnapshot {
+	head?: string | null;
+	branch?: string | null;
+	baseline?: string | null;
+	changes: GitChange[];
+	truncated: boolean;
+}
+
+export interface ArtifactsSnapshot {
+	workspace_dir: string;
+	tree: ArtifactEntry[];
+	git: GitSnapshot | null;
+}
+
+export interface ArtifactsFile {
+	path: string;
+	contents: string;
+	truncated: boolean;
+}
+
+export interface ArtifactsDiff {
+	path: string | null;
+	contents: string;
+	truncated: boolean;
+}
+
 export interface SessionSummary {
 	session_id: string;
 	project_id: string | null;

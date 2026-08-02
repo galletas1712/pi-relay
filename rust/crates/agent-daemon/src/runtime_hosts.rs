@@ -604,6 +604,83 @@ impl RuntimeRegistry {
         }
     }
 
+    pub(crate) async fn artifacts_snapshot(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        workspace: agent_runtime_protocol::SessionWorkspace,
+    ) -> Result<agent_runtime_protocol::ArtifactsSnapshot> {
+        self.artifacts_result(
+            runtime_id,
+            RuntimeCommand::ArtifactsSnapshot {
+                workspace_id: workspace_id.to_string(),
+                workspace,
+            },
+            |result| match result {
+                RuntimeCommandResult::ArtifactsSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            },
+            "runtime returned the wrong artifacts snapshot result",
+        )
+        .await
+    }
+
+    pub(crate) async fn artifacts_file(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        workspace_dir: &str,
+        rel_path: &str,
+    ) -> Result<agent_runtime_protocol::ArtifactsFile> {
+        self.artifacts_result(
+            runtime_id,
+            RuntimeCommand::ArtifactsReadFile {
+                workspace_id: workspace_id.to_string(),
+                workspace_dir: workspace_dir.to_string(),
+                rel_path: rel_path.to_string(),
+            },
+            |result| match result {
+                RuntimeCommandResult::ArtifactsFile { file } => Some(file),
+                _ => None,
+            },
+            "runtime returned the wrong artifacts file result",
+        )
+        .await
+    }
+
+    pub(crate) async fn artifacts_diff(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        workspace: agent_runtime_protocol::SessionWorkspace,
+        rel_path: Option<String>,
+    ) -> Result<agent_runtime_protocol::ArtifactsDiff> {
+        self.artifacts_result(
+            runtime_id,
+            RuntimeCommand::ArtifactsDiff {
+                workspace_id: workspace_id.to_string(),
+                workspace,
+                rel_path,
+            },
+            |result| match result {
+                RuntimeCommandResult::ArtifactsDiff { diff } => Some(diff),
+                _ => None,
+            },
+            "runtime returned the wrong artifacts diff result",
+        )
+        .await
+    }
+
+    async fn artifacts_result<T>(
+        &self,
+        runtime_id: &str,
+        command: RuntimeCommand,
+        extract: impl FnOnce(RuntimeCommandResult) -> Option<T>,
+        wrong: &'static str,
+    ) -> Result<T> {
+        extract(self.execute(runtime_id, command, None).await?).ok_or_else(|| anyhow!(wrong))
+    }
+
     // --- MCP: the servers, tool calls, and OAuth run on the runtime host; these
     // forward each control-plane MCP RPC over the existing conduit. Errors carry
     // the runtime's stable slug in RuntimeHostError.code for the caller to map. ---
@@ -997,6 +1074,29 @@ pub(crate) mod test_support {
                     contents: std::fs::read_to_string(&path).ok(),
                 })
             }
+            RuntimeCommand::ArtifactsSnapshot { workspace, .. } => {
+                Ok(RuntimeCommandResult::ArtifactsSnapshot {
+                    snapshot: agent_runtime_protocol::ArtifactsSnapshot {
+                        workspace_dir: workspace.workspace_dir,
+                        tree: Vec::new(),
+                        git: None,
+                    },
+                })
+            }
+            RuntimeCommand::ArtifactsReadFile { .. } => Ok(RuntimeCommandResult::ArtifactsFile {
+                file: agent_runtime_protocol::ArtifactsFile {
+                    path: String::new(),
+                    contents: String::new(),
+                    truncated: false,
+                },
+            }),
+            RuntimeCommand::ArtifactsDiff { .. } => Ok(RuntimeCommandResult::ArtifactsDiff {
+                diff: agent_runtime_protocol::ArtifactsDiff {
+                    path: None,
+                    contents: String::new(),
+                    truncated: false,
+                },
+            }),
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,

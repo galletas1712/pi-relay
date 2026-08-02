@@ -13,6 +13,30 @@ type RpcCall = {
 };
 
 describe("AgentApi MCP wire format", () => {
+	it("serializes read-only artifact inspection requests", async () => {
+		const calls: RpcCall[] = [];
+		const api = createAgentApi(fakeClient(calls));
+
+		await api.getArtifactsSnapshot("session-1", "repo");
+		await api.readArtifactFile("session-1", "repo", "README.md");
+		await api.getArtifactDiff("session-1", "repo", "README.md");
+
+		expect(calls).toEqual([
+			{
+				method: "artifacts.snapshot",
+				params: { session_id: "session-1", workspace_dir: "repo" },
+			},
+			{
+				method: "artifacts.read_file",
+				params: { session_id: "session-1", workspace_dir: "repo", path: "README.md" },
+			},
+			{
+				method: "artifacts.diff",
+				params: { session_id: "session-1", workspace_dir: "repo", path: "README.md" },
+			},
+		]);
+	});
+
 	it("requests inventory and serializes sorted raw session selection", async () => {
 		const calls: RpcCall[] = [];
 		const client = fakeClient(calls);
