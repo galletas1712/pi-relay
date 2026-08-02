@@ -119,6 +119,13 @@ pre {
 	color: var(--foreground);
 }
 
+/* iOS standalone mode reports a stable viewport through 100vh. Keep the
+ * dynamic viewport unit for regular browser tabs, where it tracks browser UI. */
+#root.standalone-mode .app-shell {
+	height: 100vh;
+	padding-top: env(safe-area-inset-top, 0px);
+}
+
 .mobile-topbar {
 	position: relative;
 	z-index: 30;
@@ -3570,6 +3577,12 @@ pre {
 	box-shadow: none;
 	transform: none;
 	transition: transform 180ms ease, box-shadow 180ms ease;
+}
+
+#root.standalone-mode .sidebar,
+#root.standalone-mode .inspector {
+	top: env(safe-area-inset-top, 0px);
+	padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 /* At static-grid widths (>=900px) the inspector lives in a grid column;
