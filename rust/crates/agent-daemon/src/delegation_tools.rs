@@ -936,10 +936,13 @@ async fn cancel_subagent_without_reactivation(
     if subagent_type == Some(SubagentType::ReadOnly) {
         if let Err(error) = state
             .runtime_hosts
-            .destroy_session_workspaces(session_id)
+            .cleanup_read_only_session(session_id, false)
             .await
         {
-            eprintln!("failed to destroy read-only subagent workspace {session_id}: {error:#}");
+            return Err(RpcError::new(
+                "subagent_cleanup_pending",
+                format!("failed to retain read-only subagent cleanup: {error:#}"),
+            ));
         }
     }
     Ok(())

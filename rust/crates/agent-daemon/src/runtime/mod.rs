@@ -876,7 +876,7 @@ impl SessionDriver {
                 if let Err(error) = self
                     .state
                     .runtime_hosts
-                    .destroy_session_workspaces(&self.session_id)
+                    .cleanup_read_only_session(&self.session_id, false)
                     .await
                 {
                     eprintln!(

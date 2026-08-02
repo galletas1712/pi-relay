@@ -936,24 +936,47 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
     delete_order.reverse();
     delete_order.push(session_id.clone());
     for candidate_session_id in &delete_order {
-        state.active.lock().await.remove(candidate_session_id);
-        let deleted = state
+        // Read the exact config/type while the row still exists. Read-only
+        // children own a forked workspace; full children share the parent's
+        // workspace and must never be destroyed here.
+        let config = state.repo.load_session_config(candidate_session_id).await?;
+        let subagent_type = state
             .repo
-            .delete_session(candidate_session_id)
-            .await
-            .map_err(map_source_mutation_error)?;
+            .session_subagent_type(candidate_session_id)
+            .await?;
+        let deleted = if subagent_type == Some(agent_store::SubagentType::ReadOnly) {
+            state
+                .runtime_hosts
+                .cleanup_read_only_workspace(
+                    candidate_session_id,
+                    &state
+                        .repo
+                        .session_parent_id(candidate_session_id)
+                        .await?
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                "session_delete_failed",
+                                "read-only subagent has no parent",
+                            )
+                        })?,
+                    &config.runtime_id,
+                    &config.workspace_id,
+                    true,
+                )
+                .await
+                .map_err(|error| RpcError::new("session_delete_failed", format!("{error:#}")))?;
+            true
+        } else {
+            state
+                .repo
+                .delete_session(candidate_session_id)
+                .await
+                .map_err(map_source_mutation_error)?
+        };
         if !deleted && candidate_session_id == &session_id {
             return Err(RpcError::new("session_not_found", "session not found"));
         }
-        if let Err(error) = state
-            .runtime_hosts
-            .destroy_session_workspaces(candidate_session_id)
-            .await
-        {
-            eprintln!(
-                "failed to remove session workspace state for {candidate_session_id}: {error:#}"
-            );
-        }
+        state.active.lock().await.remove(candidate_session_id);
         state
             .provider_connections
             .remove_session(candidate_session_id)
@@ -1415,6 +1438,16 @@ pub(crate) fn install_runtime_online_queued_redrive(state: &AppState) {
     state.runtime_hosts.set_on_online(Arc::new(move |runtime_id| {
         let state = state_for_hook.clone();
         tokio::spawn(async move {
+            if let Err(error) = state
+                .runtime_hosts
+                .reconcile_context_fork_workspace_reservations(&runtime_id)
+                .await
+            {
+                eprintln!(
+                    "failed to reconcile context-fork workspace reservations after runtime {runtime_id} came online: {error:#}"
+                );
+                return;
+            }
             match state
                 .repo
                 .sessions_with_active_queued_inputs_for_runtime(Some(&runtime_id))

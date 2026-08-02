@@ -280,6 +280,7 @@ model: claude:claude-opus-4-8
 reasoning_effort: high
 skills:
   - swe
+context: forked
 ---
 ```
 
@@ -291,7 +292,12 @@ for OpenAI roles for the same reason as in daemon config. `skills` may name
 only global packages from `$HOME/.agents/skills`; project and workflow packages
 cannot be role preloads. A child uses an explicit spawn override, then its role
 provider, then the parent provider. An unavailable role provider retains the
-existing stable-provider fallback.
+existing stable-provider fallback. `context: forked` gives the child the
+parent's durable transcript at the current active leaf before its delegated
+task. The snapshot is taken while the parent is running; later parent turns
+remain private to the parent, and the child continues from its own durable
+leaf. Omitted `context` (or `context: fresh`) starts with only the delegated
+task.
 
 Roles stay hidden from ordinary `LoadSkill` discovery. `LoadSkill` returns a
 JSON object containing the selected `SKILL.md`'s absolute runtime-host `path`

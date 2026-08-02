@@ -9,9 +9,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    CreateForkRequest, DelegationKind, HistoryChanged, HistoryTarget, HistoryTargetNotTurnBoundary,
-    OutputBatch, PostgresAgentStore, SessionConfig, SourceMutationConflict,
-    SwitchActiveLeafRequest, TranscriptEntryBodyMode,
+    CreateContextForkRequest, CreateForkRequest, DelegationKind, HistoryChanged, HistoryTarget,
+    HistoryTargetNotTurnBoundary, InputPriority, OutputBatch, PostgresAgentStore, SessionConfig,
+    SourceMutationConflict, SwitchActiveLeafRequest, TranscriptEntryBodyMode,
 };
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(40_000);
@@ -20,6 +20,496 @@ struct TestDb {
     store: PostgresAgentStore,
     admin_url: String,
     name: String,
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn cleanup_pending_reservation_can_retain_existing_child_history() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "retained cleanup test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let parent_id = "retained-cleanup-parent";
+    let child_id = "retained-cleanup-child";
+    let config = create_session(store, project_id, parent_id, false).await;
+    let mut child_config = config.clone();
+    child_config.workspace_id = "retained-cleanup-workspace".to_string();
+    store
+        .reserve_context_fork_workspace(
+            child_id,
+            parent_id,
+            &config.runtime_id,
+            &child_config.workspace_id,
+            "retained-cleanup-owner",
+        )
+        .await
+        .expect("reservation creates");
+    store
+        .create_session(child_id, &child_config)
+        .await
+        .expect("child creates");
+    store
+        .mark_context_fork_workspace_cleanup_pending_with_policy(
+            child_id,
+            parent_id,
+            &config.runtime_id,
+            &child_config.workspace_id,
+            "retained-cleanup-owner",
+            false,
+        )
+        .await
+        .expect("cleanup state marks");
+    assert!(store
+        .complete_context_fork_workspace_cleanup(
+            child_id,
+            parent_id,
+            &config.runtime_id,
+            &child_config.workspace_id,
+            "retained-cleanup-owner",
+        )
+        .await
+        .expect("cleanup completes"));
+    assert!(store.session_exists(child_id).await.expect("child lookup"));
+    assert!(store
+        .context_fork_workspace_reservations(None, "other-owner")
+        .await
+        .expect("reservations reload")
+        .is_empty());
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn context_fork_copies_parent_and_atomically_queues_delegated_task() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "context fork test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let source_session_id = "context-fork-source";
+    let child_config = create_session(store, project_id, source_session_id, true).await;
+    store
+        .reserve_context_fork_workspace(
+            "context-fork-child",
+            source_session_id,
+            &child_config.runtime_id,
+            &child_config.workspace_id,
+            "context-fork-test",
+        )
+        .await
+        .expect("workspace reservation creates");
+    let source_before = store
+        .load_stored_session(source_session_id)
+        .await
+        .expect("source loads");
+    let task = UserMessage::text("# Delegated task\n\nInspect this context.");
+
+    let result = store
+        .create_context_fork(CreateContextForkRequest {
+            source_session_id,
+            child_session_id: "context-fork-child",
+            reservation_owner_id: Some("context-fork-test"),
+            config: &child_config,
+            parent_session_id: source_session_id,
+            subagent_type: crate::SubagentType::ReadOnly,
+            delegation_id: None,
+            task: &task,
+        })
+        .await
+        .expect("context fork creates");
+
+    let source_after = store
+        .load_stored_session(source_session_id)
+        .await
+        .expect("source reloads");
+    let child = store
+        .load_stored_session("context-fork-child")
+        .await
+        .expect("child loads");
+    assert_eq!(source_after, source_before);
+    assert_eq!(child.entries, source_before.entries);
+    assert_eq!(child.active_leaf_id, source_before.active_leaf_id);
+    let child_config_after = store
+        .load_session_config("context-fork-child")
+        .await
+        .expect("child config loads");
+    assert_eq!(child_config_after.project_id, child_config.project_id);
+    assert_eq!(child_config_after.runtime_id, child_config.runtime_id);
+    assert_eq!(child_config_after.workspace_id, child_config.workspace_id);
+    assert_eq!(child_config_after.workspaces, child_config.workspaces);
+    assert_eq!(child_config_after.system_prompt, child_config.system_prompt);
+    assert_eq!(
+        serde_json::to_value(&child_config_after.provider).expect("provider serializes"),
+        serde_json::to_value(&child_config.provider).expect("provider serializes")
+    );
+    assert_eq!(child_config_after.metadata, child_config.metadata);
+    assert_eq!(child_config_after.mcp_manifest, child_config.mcp_manifest);
+    assert_eq!(
+        result.source_leaf_id.as_deref(),
+        source_before.active_leaf_id.as_deref()
+    );
+    let queue = store
+        .queue_state("context-fork-child")
+        .await
+        .expect("child queue loads");
+    assert_eq!(queue.queued_inputs.len(), 1);
+    assert_eq!(queue.queued_inputs[0].priority, InputPriority::FollowUp);
+    assert_eq!(
+        queue.queued_inputs[0].content.as_text(),
+        Some(task.as_text().expect("task text"))
+    );
+    assert!(store
+        .context_fork_workspace_reservations(None, "another-owner")
+        .await
+        .expect("reservations load")
+        .is_empty());
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn cleanup_pending_reservation_is_fenced_and_removes_existing_child_atomically() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "cleanup reservation test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let parent_id = "cleanup-parent";
+    let child_id = "cleanup-child";
+    let config = create_session(store, project_id, parent_id, false).await;
+    let mut child_config = config.clone();
+    child_config.workspace_id = "cleanup-workspace".to_string();
+    store
+        .reserve_context_fork_workspace(
+            child_id,
+            parent_id,
+            &config.runtime_id,
+            &child_config.workspace_id,
+            "cleanup-owner",
+        )
+        .await
+        .expect("reservation creates");
+    store
+        .start_session_outputs_with_parent(
+            child_id,
+            &child_config,
+            &[],
+            None,
+            &[],
+            &[],
+            InputPriority::FollowUp,
+            &UserMessage::text("cleanup child task"),
+            None,
+            Some(parent_id),
+            Some(crate::SubagentType::ReadOnly),
+            None,
+        )
+        .await
+        .expect("read-only child commits");
+    store
+        .mark_context_fork_workspace_cleanup_pending(
+            child_id,
+            parent_id,
+            &config.runtime_id,
+            &child_config.workspace_id,
+            "cleanup-owner",
+        )
+        .await
+        .expect("cleanup state marks");
+    let reservations = store
+        .context_fork_workspace_reservations(None, "other-owner")
+        .await
+        .expect("reservations load");
+    assert_eq!(reservations[0].state, "cleanup_pending");
+    assert!(!store
+        .complete_context_fork_workspace_cleanup(
+            child_id,
+            parent_id,
+            &config.runtime_id,
+            &child_config.workspace_id,
+            "wrong-owner",
+        )
+        .await
+        .expect("wrong owner is fenced"));
+    assert!(store.session_exists(child_id).await.expect("child remains"));
+    assert_eq!(
+        store
+            .context_fork_workspace_reservations(None, "other-owner")
+            .await
+            .expect("reservation remains")
+            .len(),
+        1
+    );
+    assert!(store
+        .complete_context_fork_workspace_cleanup(
+            child_id,
+            parent_id,
+            &config.runtime_id,
+            &child_config.workspace_id,
+            "cleanup-owner",
+        )
+        .await
+        .expect("cleanup completes"));
+    assert!(!store.session_exists(child_id).await.expect("child lookup"));
+    assert!(store
+        .context_fork_workspace_reservations(None, "other-owner")
+        .await
+        .expect("reservations reload")
+        .is_empty());
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn materializing_reservation_with_existing_child_is_not_cleanup_pending() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "materializing reservation test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let parent_id = "materializing-parent";
+    let child_id = "materializing-child";
+    let config = create_session(store, project_id, parent_id, false).await;
+    store
+        .reserve_context_fork_workspace(
+            child_id,
+            parent_id,
+            &config.runtime_id,
+            &config.workspace_id,
+            "materializing-owner",
+        )
+        .await
+        .expect("reservation creates");
+    store
+        .create_session(child_id, &config)
+        .await
+        .expect("child creates");
+    let reservations = store
+        .context_fork_workspace_reservations(None, "other-owner")
+        .await
+        .expect("reservations load");
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].state, "materializing");
+    assert!(store.session_exists(child_id).await.expect("child lookup"));
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn stale_materializing_read_only_child_reservation_is_adopted_and_cleaned_up() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "stale materializing adoption test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let parent_id = "adoption-parent";
+    let child_id = "adoption-child";
+    let parent_config = create_session(store, project_id, parent_id, false).await;
+    let mut child_config = parent_config.clone();
+    child_config.workspace_id = "adoption-workspace".to_string();
+    store
+        .reserve_context_fork_workspace(
+            child_id,
+            parent_id,
+            &child_config.runtime_id,
+            &child_config.workspace_id,
+            "old-daemon-owner",
+        )
+        .await
+        .expect("reservation creates");
+    store
+        .start_session_outputs_with_parent(
+            child_id,
+            &child_config,
+            &[],
+            None,
+            &[],
+            &[],
+            InputPriority::FollowUp,
+            &UserMessage::text("fresh child task"),
+            None,
+            Some(parent_id),
+            Some(crate::SubagentType::ReadOnly),
+            None,
+        )
+        .await
+        .expect("fresh read-only child commits");
+    sqlx::query(
+        "update context_fork_workspace_reservations
+         set created_at=now() - interval '10 minutes'
+         where child_session_id=$1",
+    )
+    .bind(child_id)
+    .execute(&store.pool)
+    .await
+    .expect("reservation becomes stale");
+
+    let adopted = store
+        .adopt_stale_context_fork_workspace_reservations(
+            &parent_config.runtime_id,
+            "new-daemon-owner",
+            300,
+        )
+        .await
+        .expect("stale reservation adopts");
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0].owner_id, "new-daemon-owner");
+    assert_eq!(adopted[0].state, "materializing");
+    assert!(store.session_exists(child_id).await.expect("child remains"));
+    assert!(store
+        .adopt_stale_context_fork_workspace_reservations(
+            &parent_config.runtime_id,
+            "new-daemon-owner",
+            300,
+        )
+        .await
+        .expect("repeated adoption is idempotent")
+        .is_empty());
+
+    // The new daemon can now use the ordinary terminal cleanup fence. This
+    // models successful destruction of the exact workspace before completion.
+    store
+        .mark_context_fork_workspace_cleanup_pending(
+            child_id,
+            parent_id,
+            &parent_config.runtime_id,
+            &child_config.workspace_id,
+            "new-daemon-owner",
+        )
+        .await
+        .expect("adopted reservation enters cleanup");
+    assert!(store
+        .complete_context_fork_workspace_cleanup(
+            child_id,
+            parent_id,
+            &parent_config.runtime_id,
+            &child_config.workspace_id,
+            "new-daemon-owner",
+        )
+        .await
+        .expect("adopted reservation cleans up"));
+    assert!(!store.session_exists(child_id).await.expect("child removed"));
+    assert!(store
+        .context_fork_workspace_reservations(None, "another-owner")
+        .await
+        .expect("reservations reload")
+        .is_empty());
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn context_fork_transaction_rollback_keeps_workspace_reservation() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "context fork rollback test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let source_session_id = "context-fork-rollback-source";
+    let child_config = create_session(store, project_id, source_session_id, true).await;
+    let child_session_id = "context-fork-rollback-child";
+    store
+        .reserve_context_fork_workspace(
+            child_session_id,
+            source_session_id,
+            &child_config.runtime_id,
+            &child_config.workspace_id,
+            "context-fork-rollback-test",
+        )
+        .await
+        .expect("workspace reservation creates");
+    store
+        .create_session(child_session_id, &child_config)
+        .await
+        .expect("duplicate child setup creates");
+    let task = UserMessage::text("rollback");
+    assert!(store
+        .create_context_fork(CreateContextForkRequest {
+            source_session_id,
+            child_session_id,
+            reservation_owner_id: Some("context-fork-rollback-test"),
+            config: &child_config,
+            parent_session_id: source_session_id,
+            subagent_type: crate::SubagentType::ReadOnly,
+            delegation_id: None,
+            task: &task,
+        })
+        .await
+        .is_err());
+    let reservations = store
+        .context_fork_workspace_reservations(None, "other-owner")
+        .await
+        .expect("reservations load");
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].child_session_id, child_session_id);
+    db.cleanup().await;
 }
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]

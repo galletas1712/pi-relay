@@ -41,5 +41,6 @@ pub(crate) use session_titles::{
 pub(crate) use sidecar::{run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 pub(crate) use skills::{
     home_project_key, load_skill_result, resolve_skill_role, ResolvedPreloadedSkill,
+    RoleContextPolicy,
 };
 pub(crate) use web_tools::{is_web_tool_name, run_web_tool};
