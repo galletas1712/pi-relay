@@ -467,6 +467,7 @@ export function QueuedInputPane({
 				.map((input) => input.input_id),
 		[inputs],
 	);
+	const canReorder = followUpIds.length > 1;
 	const submitReorder = useCallback(
 		(nextOrder: string[]) => {
 			if (nextOrder.every((inputId, index) => inputId === followUpIds[index])) return;
@@ -527,7 +528,7 @@ export function QueuedInputPane({
 					const preview = contentBlocksToText(input.content);
 					return (
 						<div
-							className={`queue-row${draggedId === input.input_id ? " is-dragging" : ""}${dragOverId === input.input_id ? " is-drag-over" : ""}`}
+							className={`queue-row${canReorder ? " has-reorder-handle" : ""}${draggedId === input.input_id ? " is-dragging" : ""}${dragOverId === input.input_id ? " is-drag-over" : ""}`}
 							key={input.input_id}
 							onDragOver={(event) => {
 								if (!draggedId || !canMutate || draggedId === input.input_id) return;
@@ -540,7 +541,7 @@ export function QueuedInputPane({
 								handleDrop(input.input_id);
 							}}
 						>
-							{canMutate ? (
+							{canReorder && canMutate ? (
 								<button
 									className="queue-drag-handle"
 									type="button"
@@ -569,9 +570,9 @@ export function QueuedInputPane({
 								>
 									<GripVertical size={15} aria-hidden />
 								</button>
-							) : (
+							) : canReorder ? (
 								<span className="queue-drag-handle-slot" aria-hidden />
-							)}
+							) : null}
 							{isEditing ? (
 								<textarea
 									className="queue-edit"
