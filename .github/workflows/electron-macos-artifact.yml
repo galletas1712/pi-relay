@@ -11,8 +11,14 @@ name: Electron macOS artifact
       - "package.json"
       - "package-lock.json"
 
+concurrency:
+  group: electron-macos-artifact
+  cancel-in-progress: true
+
 permissions:
   contents: read
+  # Needed to remove the previous rolling artifact before uploading its replacement.
+  actions: write
 
 jobs:
   package:
@@ -58,10 +64,35 @@ jobs:
             echo "macOS Gatekeeper may warn or block the first launch; users may need to approve it in Privacy & Security or use Finder's Open action."
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Remove previous rolling artifact
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifactName = "electron-macos-dmg";
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: artifactName,
+                per_page: 100,
+              },
+            );
+
+            for (const artifact of artifacts) {
+              if (!artifact.expired && artifact.name === artifactName) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              }
+            }
+
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: electron-macos-dmg-${{ github.run_number }}-${{ github.sha }}
+          name: electron-macos-dmg
           path: |
             packages/electron/dist/*.dmg
             packages/electron/dist/*.dmg.sha256

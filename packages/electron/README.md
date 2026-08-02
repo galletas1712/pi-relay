@@ -71,8 +71,10 @@ this workflow. To build on demand from any selected ref:
 1. Open the repository's **Actions** tab.
 2. Select **Electron macOS artifact**.
 3. Select **Run workflow**, choose the ref, and select **Run workflow** again.
-4. Open the completed run and download the artifact whose name starts with
-   `electron-macos-dmg-`. It contains the DMG and its `.sha256` checksum file.
+4. Open the completed run and download the artifact named
+   `electron-macos-dmg`. It contains only the DMG and its `.sha256` checksum
+   file. Each successful build replaces the previous rolling artifact, so only
+   one current artifact is retained.
 
 The DMG is not signed or notarized. macOS Gatekeeper will likely warn that the
 developer cannot be verified and may quarantine or block the app on first
