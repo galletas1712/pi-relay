@@ -4,6 +4,7 @@ import {
 	COMPOSER_DRAFT_STORAGE_PREFIX,
 	composerDraftKey,
 	loadComposerDrafts,
+	reorderQueuedInputsBefore,
 	resolveSubmittedDraft,
 	saveComposerDrafts,
 	submissionIdsForDraft,
@@ -11,6 +12,18 @@ import {
 	type ComposerDraftStorage,
 	type PendingSubmittedDraft,
 } from "./composer.tsx";
+
+describe("queued input drop ordering", () => {
+	it.each([
+		["moves a row forward before the target", ["a", "b", "c"], "a", "c", ["b", "a", "c"]],
+		["moves a row backward before the target", ["a", "b", "c"], "c", "a", ["c", "a", "b"]],
+		["drops before the first row", ["a", "b", "c"], "b", "a", ["b", "a", "c"]],
+		["drops before the last row", ["a", "b", "c"], "b", "c", ["a", "b", "c"]],
+		["keeps a same-row drop unchanged", ["a", "b", "c"], "b", "b", ["a", "b", "c"]],
+	])("%s", (_description, inputIds, draggedId, targetId, expected) => {
+		expect(reorderQueuedInputsBefore(inputIds, draggedId, targetId)).toEqual(expected);
+	});
+});
 
 describe("composer draft storage", () => {
 	const pending: PendingSubmittedDraft = {

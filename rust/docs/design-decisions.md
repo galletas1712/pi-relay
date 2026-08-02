@@ -110,7 +110,9 @@ parent-scoped `delegation.steer_subagent`; slash commands remain commands in
 both cases. Queued follow-ups appear in a small pane above the composer. Each
 queued follow-up has a row-level steer control; pressing it promotes that row
 to the steer queue, ordered by promotion time. Each queued follow-up can also
-be edited, cancelled, and reordered from the queue pane; the web UI wires
+be edited, cancelled, and reordered from the queue pane. Reordering uses the
+drag handle (dropping on a row inserts before that row), or ArrowUp/ArrowDown
+while the handle is focused. The web UI wires
 `input.update_queued`, `input.cancel_queued`, and
 `input.reorder_queued_follow_ups`. Steers stay pinned on top and are not
 reorderable. Active turns are interrupted with a stop button beside the
