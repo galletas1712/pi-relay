@@ -272,7 +272,7 @@ export interface AppProps {
 	api: AgentApi;
 	routeHistory?: WorkspaceRouteHistory | null;
 	entityStorage?: Storage;
-	headerControls?: ReactNode;
+	serverControls?: ReactNode;
 }
 
 type RememberedRouteRestore = {
@@ -350,7 +350,7 @@ export function App({
 	api,
 	routeHistory: injectedRouteHistory,
 	entityStorage,
-	headerControls,
+	serverControls,
 }: AppProps) {
 	const routeHistory = useMemo(
 		() => injectedRouteHistory === undefined ? browserWorkspaceRouteHistory() : injectedRouteHistory,
@@ -4482,6 +4482,7 @@ export function App({
 			) : null}
 
 			<Sidebar
+				serverControls={serverControls}
 				projects={projects}
 				projectActiveSessionCounts={projectActiveSessionCounts}
 				projectsLoading={projectsQuery.isLoading}
@@ -4554,7 +4555,6 @@ export function App({
 
 			{conversationVisible ? (
 				<ChatPane
-						headerControls={headerControls}
 						session={selectedChatSession}
 						snapshot={loadedSnapshot}
 						entries={loadedEntries}

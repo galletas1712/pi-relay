@@ -1,4 +1,4 @@
-import { memo, type RefObject } from "react";
+import { memo, type ReactNode, type RefObject } from "react";
 import { SidebarToolbar } from "./sidebarToolbar.tsx";
 import type { SessionListItem } from "./sessionList.ts";
 import type { Project } from "./types.ts";
@@ -21,6 +21,7 @@ export type { InspectorProps } from "./inspector.tsx";
 const EMPTY_PROJECT_ACTIVE_SESSION_COUNTS = new Map<string, number>();
 
 export interface SidebarProps {
+	serverControls?: ReactNode;
 	projects: Project[];
 	projectActiveSessionCounts?: ReadonlyMap<string, number>;
 	projectsLoading?: boolean;
@@ -52,6 +53,7 @@ export interface SidebarProps {
 }
 
 export const Sidebar = memo(function Sidebar({
+	serverControls,
 	projects,
 	projectActiveSessionCounts = EMPTY_PROJECT_ACTIVE_SESSION_COUNTS,
 	projectsLoading = false,
@@ -83,6 +85,7 @@ export const Sidebar = memo(function Sidebar({
 }: SidebarProps) {
 	return (
 		<aside className="sidebar" data-slot="sidebar" inert={inert}>
+			{serverControls}
 			<ProjectList
 				projects={projects}
 				projectActiveSessionCounts={projectActiveSessionCounts}

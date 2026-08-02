@@ -146,8 +146,8 @@ export function ServerApp({
 					key={`${activeProfile.id}:${activeProfile.url}`}
 					profile={activeProfile}
 					entityStorage={store.storageFor(activeProfile.id)}
-					headerControls={
-						<ServerHeaderControls
+					serverControls={
+						<ServerSidebarControls
 							snapshot={snapshot}
 							manageButtonRef={manageButtonRef}
 							onSelect={selectProfile}
@@ -192,11 +192,11 @@ export function ServerApp({
 function ConnectedServer({
 	profile,
 	entityStorage,
-	headerControls,
+	serverControls,
 }: {
 	profile: ServerProfile;
 	entityStorage: Storage;
-	headerControls: ReactNode;
+	serverControls: ReactNode;
 }) {
 	const queryClient = useMemo(() => createQueryClient(), []);
 	const api = useMemo(
@@ -216,14 +216,14 @@ function ConnectedServer({
 					api={api}
 					routeHistory={routeHistory}
 					entityStorage={entityStorage}
-					headerControls={headerControls}
+					serverControls={serverControls}
 				/>
 			</TooltipProvider>
 		</QueryClientProvider>
 	);
 }
 
-function ServerHeaderControls({
+function ServerSidebarControls({
 	snapshot,
 	manageButtonRef,
 	onSelect,
@@ -235,9 +235,9 @@ function ServerHeaderControls({
 	onManage: () => void;
 }) {
 	return (
-		<div className="server-header-controls">
+		<div className="server-sidebar-controls">
 			<NativeSelect
-				className="header-select server-context-select"
+				className="server-context-select"
 				size="sm"
 				value={snapshot.activeProfileId ?? ""}
 				onChange={(event) => onSelect(event.target.value)}
