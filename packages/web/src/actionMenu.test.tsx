@@ -103,7 +103,7 @@ function DialogActionHarness() {
 				triggerLabel="Open dialog actions"
 				items={[{
 					id: "rename",
-					label: "Rename…",
+					label: "Rename",
 					focusDestination: "dialog",
 					onSelect: () => setOpen(true),
 				}]}

@@ -127,7 +127,7 @@ export function projectMenuItems(project: Project, onEditProject: (project: Proj
 	return [
 		{
 			id: "settings",
-			label: "Project settings…",
+			label: "Project settings",
 			icon: <SquarePen size={15} aria-hidden />,
 			focusDestination: "dialog",
 			onSelect: () => onEditProject(project),

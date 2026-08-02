@@ -622,7 +622,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(
 			screen.getByRole("button", { name: "Open session actions for Root one" }),
 		);
-		await user.click(await screen.findByRole("menuitem", { name: "Delete…" }));
+		await user.click(await screen.findByRole("menuitem", { name: "Delete" }));
 		await user.click(await screen.findByRole("button", { name: "Delete" }));
 		await waitFor(() =>
 			expect(api.unsubscribeEvents.mock.calls.filter(
@@ -637,7 +637,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(
 			screen.getByRole("button", { name: "Open session actions for Root one" }),
 		);
-		await user.click(await screen.findByRole("menuitem", { name: "Delete…" }));
+		await user.click(await screen.findByRole("menuitem", { name: "Delete" }));
 		await user.click(await screen.findByRole("button", { name: "Delete" }));
 		await waitFor(() =>
 			expect(api.unsubscribeEvents.mock.calls.filter(
@@ -798,7 +798,7 @@ describe("App workspace route identity integration", () => {
 		await user.click(
 			screen.getByRole("button", { name: "Open session actions for Root one" }),
 		);
-		await user.click(await screen.findByRole("menuitem", { name: "Delete…" }));
+		await user.click(await screen.findByRole("menuitem", { name: "Delete" }));
 		await user.click(await screen.findByRole("button", { name: "Delete" }));
 
 		await waitFor(() => expect(browser.currentUrl).toBe("/"));

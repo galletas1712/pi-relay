@@ -1,6 +1,5 @@
 import { Archive, ArchiveRestore, SquarePen, Trash2 } from "lucide-react";
 import { ActionMenu, type ActionMenuItem } from "./actionMenu.tsx";
-import { firstDisabledReason } from "./connectionRecovery.tsx";
 import {
 	isArchivedSession,
 	sessionStatusWithDelegations,
@@ -59,8 +58,6 @@ export function SessionRow({
 	);
 }
 
-const IDLE_SESSION_ACTION_REASON = "Available when the session and its subagents are idle.";
-
 export function sessionMenuItems({
 	archived,
 	canArchive,
@@ -79,35 +76,35 @@ export function sessionMenuItems({
 	mutationBlockedReason?: string | null;
 }): ActionMenuItem[] {
 	const ArchiveIcon = archived ? ArchiveRestore : Archive;
-	return [
+	const items: ActionMenuItem[] = [
 		{
 			id: "rename",
-			label: "Rename…",
+			label: "Rename",
 			icon: <SquarePen size={15} aria-hidden />,
 			focusDestination: "dialog",
 			onSelect: onRename,
 		},
-		{
+	];
+	if (canArchive) {
+		items.push({
 			id: archived ? "unarchive" : "archive",
 			label: archived ? "Unarchive" : "Archive",
 			icon: <ArchiveIcon size={15} aria-hidden />,
-			disabled: !canArchive || !!mutationBlockedReason,
-			disabledReason: firstDisabledReason(
-				mutationBlockedReason,
-				!canArchive && IDLE_SESSION_ACTION_REASON,
-			) ?? undefined,
+			disabled: !!mutationBlockedReason,
+			disabledReason: mutationBlockedReason ?? undefined,
 			onSelect: onArchiveToggle,
-		},
-		{
+		});
+	}
+	if (canDelete) {
+		items.push({
 			id: "delete",
-			label: "Delete…",
+			label: "Delete",
 			icon: <Trash2 size={15} aria-hidden />,
-			disabled: !canDelete,
-			disabledReason: !canDelete ? IDLE_SESSION_ACTION_REASON : undefined,
 			destructive: true,
 			separatorBefore: true,
 			focusDestination: "dialog",
 			onSelect: onDelete,
-		},
-	];
+		});
+	}
+	return items;
 }
