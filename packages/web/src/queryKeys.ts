@@ -13,4 +13,5 @@ export const queryKeys = {
 	delegations: (parentSessionId: string | null, limit?: number) => ["delegations", parentSessionId, limit ?? null] as const,
 	session: (sessionId: string, scope: EntryScope = "full_tree") => ["session", sessionId, scope] as const,
 	historyTree: (sessionId: string, lastEventId: number) => ["history-tree", sessionId, lastEventId] as const,
+	artifacts: (sessionId: string, workspaceDir: string) => ["artifacts", sessionId, workspaceDir] as const,
 };

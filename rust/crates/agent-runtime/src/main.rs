@@ -522,6 +522,43 @@ impl Runtime {
                     .await?;
                 Ok(RuntimeCommandResult::FileContents { contents })
             }
+            RuntimeCommand::ArtifactsSnapshot {
+                workspace_id,
+                workspace,
+            } => Ok(RuntimeCommandResult::ArtifactsSnapshot {
+                snapshot: workspaces::artifacts::snapshot(
+                    &self.workspaces,
+                    &workspace_id,
+                    &workspace,
+                )
+                .await?,
+            }),
+            RuntimeCommand::ArtifactsReadFile {
+                workspace_id,
+                workspace_dir,
+                rel_path,
+            } => Ok(RuntimeCommandResult::ArtifactsFile {
+                file: workspaces::artifacts::read_file(
+                    &self.workspaces,
+                    &workspace_id,
+                    &workspace_dir,
+                    &rel_path,
+                )
+                .await?,
+            }),
+            RuntimeCommand::ArtifactsDiff {
+                workspace_id,
+                workspace,
+                rel_path,
+            } => Ok(RuntimeCommandResult::ArtifactsDiff {
+                diff: workspaces::artifacts::diff(
+                    &self.workspaces,
+                    &workspace_id,
+                    &workspace,
+                    rel_path.as_deref(),
+                )
+                .await?,
+            }),
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,

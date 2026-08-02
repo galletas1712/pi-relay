@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod artifacts;
 mod auth;
 mod browser_websocket;
 mod codec;
@@ -619,6 +620,9 @@ async fn dispatch_request(
         RpcMethod::DelegationReadHandoffFile => {
             delegation_tools::rpc_read_handoff_file(state, params).await
         }
+        RpcMethod::ArtifactsSnapshot => artifacts::snapshot(state, params).await,
+        RpcMethod::ArtifactsReadFile => artifacts::read_file(state, params).await,
+        RpcMethod::ArtifactsDiff => artifacts::diff(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }

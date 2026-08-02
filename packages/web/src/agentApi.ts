@@ -36,6 +36,9 @@ import type {
 	ProjectWorkspace,
 	Runtime,
 	WorkspaceMaterializeProgress,
+	ArtifactsSnapshot,
+	ArtifactsFile,
+	ArtifactsDiff,
 } from "./types.ts";
 import type { EntryScope } from "./queryKeys.ts";
 
@@ -95,6 +98,9 @@ export interface AgentApi {
 	reorderQueuedFollowUps(sessionId: string, inputIds: string[], expectedQueueRevision?: number | null): Promise<ReorderQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
+	getArtifactsSnapshot(sessionId: string, workspaceDir: string): Promise<ArtifactsSnapshot>;
+	readArtifactFile(sessionId: string, workspaceDir: string, path: string): Promise<ArtifactsFile>;
+	getArtifactDiff(sessionId: string, workspaceDir: string, path?: string): Promise<ArtifactsDiff>;
 }
 
 export interface AddMcpToolsParams {
@@ -805,6 +811,29 @@ class AgentApiClient implements AgentApi {
 			leaf_id: leafId || undefined
 		});
 		return result.items;
+	}
+
+	getArtifactsSnapshot(sessionId: string, workspaceDir: string): Promise<ArtifactsSnapshot> {
+		return this.client.request<ArtifactsSnapshot>("artifacts.snapshot", {
+			session_id: sessionId,
+			workspace_dir: workspaceDir,
+		});
+	}
+
+	readArtifactFile(sessionId: string, workspaceDir: string, path: string): Promise<ArtifactsFile> {
+		return this.client.request<ArtifactsFile>("artifacts.read_file", {
+			session_id: sessionId,
+			workspace_dir: workspaceDir,
+			path,
+		});
+	}
+
+	getArtifactDiff(sessionId: string, workspaceDir: string, path?: string): Promise<ArtifactsDiff> {
+		return this.client.request<ArtifactsDiff>("artifacts.diff", {
+			session_id: sessionId,
+			workspace_dir: workspaceDir,
+			path,
+		});
 	}
 }
 

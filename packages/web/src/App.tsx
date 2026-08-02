@@ -15,6 +15,7 @@ import {
 import { ArrowUp, Bot, Menu, PanelRightOpen } from "lucide-react";
 import { type AgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
+import { ArtifactsView } from "./artifactsView.tsx";
 import { clearAcknowledgedTranscriptDestination } from "./transcript.tsx";
 import type {
 	OlderTurnsLoadRequest,
@@ -4629,8 +4630,7 @@ export function App({
 						}
 					/>
 			) : executionRoute ? (
-				<main className="workspace-route-state execution-route-state" data-slot="execution-placeholder">
-					<p className="workspace-route-eyebrow">Execution · {executionRoute.view}</p>
+				<div className="execution-route-surface">
 					{persistentRouteWarnings.length > 0 ? (
 						<div className="workspace-route-warning" role="alert">
 							{persistentRouteWarnings.map((warning) => (
@@ -4638,20 +4638,26 @@ export function App({
 							))}
 						</div>
 					) : null}
-					<h1>Execution workspace is not available in this step</h1>
-					<p>
-						This URL retains root <code>{executionRoute.rootSessionId}</code> and Conversation{" "}
-						<code>{routeConversationSessionId(executionRoute)}</code>. The visual Execution
-						overview, activity, and handoffs workspace comes next.
-					</p>
-					<button
-						type="button"
-						className="primary-button workspace-route-action"
-						onClick={() => applyNavigation(showConversation(executionRoute))}
-					>
-						Open effective Conversation
-					</button>
-				</main>
+					{executionRoute.view === "overview" ? (
+						loadedSnapshot?.session_id === selectedId ? (
+							<ArtifactsView api={api} session={loadedSnapshot} connection={connection} />
+						) : (
+							<main className="workspace-route-state execution-route-state" data-slot="execution-placeholder">
+								<p>Loading execution workspace…</p>
+							</main>
+						)
+					) : (
+						<main className="workspace-route-state execution-route-state" data-slot="execution-placeholder">
+							<p className="workspace-route-eyebrow">Execution</p>
+							<h1>{executionRoute.view === "activity" ? "Activity" : "Handoffs"}</h1>
+							<p>
+								{executionRoute.view === "activity"
+									? "Activity history is not available in this first release."
+									: "Handoff navigation remains available through the execution inspector."}
+							</p>
+						</main>
+					)}
+				</div>
 			) : unavailableState ? (
 				<main className="workspace-route-state unavailable-route-state" data-slot="route-unavailable">
 					<p className="workspace-route-eyebrow">Workspace unavailable</p>
