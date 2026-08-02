@@ -10,7 +10,10 @@
 		"build": "npm run build --workspace @pi-relay/web",
 		"build:web": "cd packages/web && npm run build",
 		"dev": "cd packages/web && npm run dev",
+		"dev:electron": "npm run dev --workspace @pi-relay/electron",
 		"dev:web": "cd packages/web && npm run dev",
+		"package:electron": "npm run package --workspace @pi-relay/electron",
+		"package:electron:dir": "npm run package:dir --workspace @pi-relay/electron",
 		"test": "npm run test --workspaces --if-present"
 	},
 	"devDependencies": {
