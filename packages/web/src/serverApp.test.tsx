@@ -43,11 +43,11 @@ vi.mock("./App.tsx", async () => {
 		App: ({
 			api,
 			entityStorage,
-			headerControls,
+			serverControls,
 		}: {
 			api: AgentApi;
 			entityStorage: Storage;
-			headerControls?: ReactNode;
+			serverControls?: ReactNode;
 		}) => {
 			const queryClient = useQueryClient();
 			if (!boundary.queryClients.includes(queryClient)) {
@@ -59,7 +59,10 @@ vi.mock("./App.tsx", async () => {
 			}, [api]);
 			return (
 				<>
-					<div className="log-controls">{headerControls}</div>
+					<aside className="sidebar">
+						{serverControls}
+						<section className="project-section">Projects</section>
+					</aside>
 					<div data-testid="entity-draft">{entityStorage.getItem("draft")}</div>
 				</>
 			);
@@ -83,12 +86,15 @@ afterEach(() => {
 });
 
 describe("ServerApp profile boundary", () => {
-	it("places compact server controls in the existing header without exposing its URL", () => {
+	it("places compact server controls above Projects without exposing its URL", () => {
 		const store = localStore();
 		const { container } = render(<ServerApp store={store} />);
-		const controls = container.querySelector<HTMLElement>(".log-controls");
+		const sidebar = container.querySelector<HTMLElement>(".sidebar");
+		const controls = container.querySelector<HTMLElement>(".server-sidebar-controls");
 
 		expect(container.querySelector(".server-bar")).toBeNull();
+		expect(container.querySelector(".log-controls")).toBeNull();
+		expect(sidebar).toBeTruthy();
 		expect(controls).toBeTruthy();
 		expect(within(controls!).getAllByRole("combobox", { name: "Active control server" }))
 			.toHaveLength(1);
@@ -96,6 +102,11 @@ describe("ServerApp profile boundary", () => {
 			.toBeTruthy();
 		expect(controls!.textContent).not.toContain("Manage");
 		expect(controls!.textContent).not.toContain("ws://127.0.0.1:8787/");
+		expect(
+			controls!.compareDocumentPosition(
+				container.querySelector(".project-section")!,
+			) & Node.DOCUMENT_POSITION_FOLLOWING,
+		).toBeTruthy();
 	});
 
 	it("replaces route, entity storage, query cache, and client when selecting another profile", async () => {

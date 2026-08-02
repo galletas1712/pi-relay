@@ -1,5 +1,4 @@
 import { ArrowUp, Bot, PanelRightOpen } from "lucide-react";
-import type { ReactNode } from "react";
 import {
 	NativeSelect,
 	NativeSelectOption,
@@ -8,7 +7,6 @@ import type { ReasoningEffort } from "./types.ts";
 import type { SessionStatus } from "./sessionList.ts";
 
 export function LogHeader({
-	headerControls,
 	archived,
 	status,
 	title,
@@ -25,7 +23,6 @@ export function LogHeader({
 	rightOpen,
 	onToggleRight
 }: {
-	headerControls?: ReactNode;
 	archived: boolean;
 	status: SessionStatus | null;
 	title: string | null;
@@ -72,7 +69,6 @@ export function LogHeader({
 				</span>
 			) : null}
 			<div className="log-controls">
-				{headerControls}
 				<NativeSelect
 					className="header-select header-model-select"
 					size="sm"

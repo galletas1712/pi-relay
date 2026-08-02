@@ -1027,11 +1027,6 @@ pre {
 	text-transform: capitalize;
 }
 
-.server-manage-button {
-	width: 28px;
-	height: 28px;
-}
-
 .message-list-shell {
 	position: relative;
 	flex: 1;
@@ -4317,11 +4312,7 @@ pre {
 		min-width: 0;
 		margin-left: 0;
 		display: grid;
-		grid-template-columns:
-			minmax(0, 1fr)
-			34px
-			minmax(0, 1fr)
-			minmax(0, 0.72fr);
+		grid-template-columns: minmax(0, 1fr) minmax(0, 0.72fr);
 	}
 
 	.header-select {
@@ -4333,11 +4324,6 @@ pre {
 	.header-select select {
 		width: 100%;
 		max-width: none;
-		height: 34px;
-	}
-
-	.server-manage-button {
-		width: 34px;
 		height: 34px;
 	}
 
@@ -4603,20 +4589,7 @@ pre {
 		min-height: 46px;
 	}
 
-	.log-controls {
-		grid-template-columns:
-			minmax(0, 1fr)
-			32px
-			minmax(0, 1fr)
-			minmax(0, 0.72fr);
-	}
-
 	.header-select select {
-		height: 32px;
-	}
-
-	.server-manage-button {
-		width: 32px;
 		height: 32px;
 	}
 

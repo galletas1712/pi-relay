@@ -245,6 +245,16 @@ describe("Sidebar session list loading states", () => {
 		);
 	}
 
+	it("renders server controls immediately above Projects", () => {
+		const html = renderSidebar({
+			serverControls: <div className="server-sidebar-controls">Server controls</div>,
+		});
+
+		expect(html).toMatch(
+			/<div class="server-sidebar-controls">Server controls<\/div><div class="project-section">/,
+		);
+	});
+
 	it("renders project and session navigation as semantic lists with sibling selection and menu buttons", () => {
 		const project: Project = {
 			project_id: "project-1",
