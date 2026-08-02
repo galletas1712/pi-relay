@@ -10,7 +10,7 @@
 
 ## 1. Executive direction
 
-Improve the existing pi-relay web client without replacing its identity or its strongest workflow. The transcript and live-work experience are the product's best foundation: keep its turn-based progressive disclosure, per-session draft and scroll safety, stale-response defenses, live tool visibility, warm Gruvbox palette, Geist/Space Grotesk typography, light/dark support, and reduced-motion behavior.
+Improve the existing π-relay web client without replacing its identity or its strongest workflow. The transcript and live-work experience are the product's best foundation: keep its turn-based progressive disclosure, per-session draft and scroll safety, stale-response defenses, live tool visibility, warm Gruvbox palette, Geist/Space Grotesk typography, light/dark support, and reduced-motion behavior.
 
 The primary structural change is to stop treating one global "selected session" as all of the following at once:
 

@@ -4,16 +4,17 @@ const html = await readFile(new URL("../dist/index.html", import.meta.url), "utf
 const headers = await readFile(new URL("../dist/_headers", import.meta.url), "utf8");
 const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/giu)];
 
-const policyHeaders = new Map();
+const routes = new Map();
 let route;
 for (const line of headers.split(/\r?\n/u)) {
 	if (!line.trim() || line.trimStart().startsWith("#")) continue;
 
 	if (!/^\s/u.test(line)) {
-		if (route !== undefined) {
-			throw new Error("shipped Cloudflare Pages _headers must contain only one route");
-		}
 		route = line.trim();
+		if (routes.has(route)) {
+			throw new Error(`shipped Cloudflare Pages _headers repeats ${route}`);
+		}
+		routes.set(route, new Map());
 		continue;
 	}
 
@@ -25,16 +26,18 @@ for (const line of headers.split(/\r?\n/u)) {
 		throw new Error("shipped Cloudflare Pages _headers contains a malformed header");
 	}
 	const name = line.slice(0, separator).trim().toLowerCase();
+	const policyHeaders = routes.get(route);
 	if (policyHeaders.has(name)) {
-		throw new Error(`shipped Cloudflare Pages _headers repeats ${name}`);
+		throw new Error(`shipped Cloudflare Pages _headers repeats ${name} for ${route}`);
 	}
 	policyHeaders.set(name, line.slice(separator + 1).trim());
 }
 
-if (route !== "/*") {
-	throw new Error("shipped Cloudflare Pages _headers must have one /* route");
+if (!routes.has("/*") || routes.size !== 2 || !routes.has("/service-worker.js")) {
+	throw new Error("shipped Cloudflare Pages _headers must have /* and /service-worker.js routes");
 }
 
+const policyHeaders = routes.get("/*");
 const cspDirectives = new Map();
 for (const directive of (policyHeaders.get("content-security-policy") ?? "").split(";")) {
 	const [name, ...values] = directive.trim().split(/\s+/u);
@@ -72,6 +75,9 @@ if (policyHeaders.get("referrer-policy") !== "no-referrer") {
 }
 if (policyHeaders.get("x-content-type-options") !== "nosniff") {
 	throw new Error("shipped Cloudflare Pages policy must disable content sniffing");
+}
+if (routes.get("/service-worker.js").get("cache-control") !== "no-cache") {
+	throw new Error("shipped Cloudflare Pages service worker must be revalidated promptly");
 }
 if (
 	scripts.length === 0 ||

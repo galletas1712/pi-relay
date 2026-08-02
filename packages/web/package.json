@@ -3,7 +3,7 @@
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
-	"description": "React websocket UI for pi-relay sessions.",
+	"description": "React websocket UI for π-relay sessions.",
 	"scripts": {
 		"dev": "vite",
 		"build": "tsc -b && vite build && node scripts/check-built-csp.mjs",

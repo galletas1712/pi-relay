@@ -1,6 +1,6 @@
-# Rust Agent Stack
+# π-relay Rust Agent Stack
 
-Personal-use Rust agent runtime and control plane. It provides durable
+Personal-use π-relay Rust agent runtime and control plane. It provides durable
 PostgreSQL-backed sessions, resume/switch/compaction, host-side workspace
 tools and MCP routes, bounded delegation, and the React web client.
 
@@ -368,7 +368,7 @@ callback_timeout_ms = 300000
 
 Omit `client_id` to let rmcp perform Dynamic Client Registration. `scopes` and
 the RFC 8707 `resource` authorization parameter are optional. A fixed
-`callback_port` may be configured; otherwise pi-relay binds an ephemeral port
+`callback_port` may be configured; otherwise π-relay binds an ephemeral port
 on `127.0.0.1`. `callback_timeout_ms` defaults to five minutes. Both callback
 settings are operational and do not change route identity. Streamable HTTP
 keeps its existing URL rule for OAuth: HTTPS is required remotely, while HTTP
@@ -390,7 +390,7 @@ observational:
 expired credentials with a refresh token remain OAuth-ready without consuming
 that token; refresh occurs only on route acquisition/reconnect. A transient
 refresh or atomic-save failure preserves the old durable record for a later
-attempt. The current access token is injected only into pi-relay's
+attempt. The current access token is injected only into π-relay's
 bounded/no-replay Streamable HTTP client, whose
 POST, common GET/SSE, and DELETE behavior and secret scrubbing remain shared
 with `bearer_env`. An MCP 401 closes the route without replaying the current
@@ -456,7 +456,7 @@ tailscale serve status
 ```
 
 The selected `CONTROL_WSS_PORT` must be unused by Serve or Funnel. The examples
-use `8443`, reserving that entire port for pi-relay and avoiding HTTPS path
+use `8443`, reserving that entire port for π-relay and avoiding HTTPS path
 mappings on `443`. After confirming it is free, publish loopback `pi-agentd`
 through Tailscale Serve's TLS-terminated TCP mode:
 
@@ -467,7 +467,7 @@ tailscale serve --bg --tls-terminated-tcp=8443 tcp://127.0.0.1:8787
 ```
 
 Remove the listener only when `tailscale serve status` confirms it is still
-pi-relay-owned, using the matching flags:
+π-relay-owned, using the matching flags:
 
 ```sh
 tailscale serve --bg --tls-terminated-tcp=8443 tcp://127.0.0.1:8787 off
@@ -524,7 +524,7 @@ Credentials are loaded at model-call time, not stored on the session:
 
 - `provider.kind = "openai"` uses the ChatGPT/Codex subscription transport
   (`CODEX_ACCESS_TOKEN` or `~/.codex/auth.json`, including `tokens.account_id`).
-  pi-relay does not support plain OpenAI API-key auth for OpenAI models.
+  π-relay does not support plain OpenAI API-key auth for OpenAI models.
 - `provider.kind = "claude"` uses `ANTHROPIC_API_KEY` or Claude
   Code's `primaryApiKey` from `~/.claude/config.json` / `~/.claude.json`.
 

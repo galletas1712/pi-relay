@@ -564,7 +564,7 @@ The picker remains a static seeded convenience: its existing hosted GPT-5.6 choi
 entries expose `low…max`. `max` is the highest public wire effort; catalog-only
 values such as `ultra` are not exposed. The private catalog reports `ultra` for
 Sol/Terra, but pinned Codex maps that selector to `max` on Responses requests
-and uses it to select proactive MultiAgent V2 behavior. pi-relay implements no
+and uses it to select proactive MultiAgent V2 behavior. π-relay implements no
 equivalent orchestration mode, and live literal-Ultra requests were rejected,
 so it neither exposes nor aliases the value. Some seeded OpenAI choices can be
 rejected when the active account's catalog does not advertise them. Changing

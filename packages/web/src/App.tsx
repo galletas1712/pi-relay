@@ -4381,7 +4381,7 @@ export function App({
 		? sessionTitle(selectedChatSession)
 		: selectedProject
 			? projectTitle(selectedProject)
-			: "pi relay";
+			: "π-relay";
 	const mobileActivity = selectedChatSession
 		? sessionStatusWithDelegations(loadedSnapshot?.activity ?? selectedChatSession.activity, hasRunningDelegations)
 		: null;

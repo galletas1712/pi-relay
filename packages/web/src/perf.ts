@@ -16,7 +16,7 @@ export function perfNow(): number {
 
 export function perfLog(label: string, data: Record<string, unknown>) {
 	if (!perfEnabled()) return;
-	console.debug(`[pi-relay perf] ${label}`, data);
+	console.debug(`[π-relay perf] ${label}`, data);
 }
 
 export function approximateJsonSize(value: unknown): number {
