@@ -1,0 +1,45 @@
+{
+	"name": "@pi-relay/electron",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Thin desktop shell for the π-relay web application.",
+	"main": "src/main.mjs",
+	"scripts": {
+		"dev": "electron .",
+		"start": "electron .",
+		"test": "vitest --run",
+		"validate": "node --check src/main.mjs && node --check src/policy.mjs && node --check src/refresh.mjs && npm test",
+		"package": "electron-builder --mac",
+		"package:dir": "electron-builder --dir --mac"
+	},
+	"author": {
+		"name": "Schwinn Saereesitthipitak",
+		"email": "17022745+galletas1712@users.noreply.github.com"
+	},
+	"devDependencies": {
+		"electron": "40.10.6",
+		"electron-builder": "^26.0.12"
+	},
+	"engines": {
+		"node": ">=22.12.0"
+	},
+	"build": {
+		"appId": "dev.pi-relay.desktop",
+		"productName": "π-relay",
+		"files": [
+			"src/**/*",
+			"package.json"
+		],
+		"icon": "../web/public/icons/icon-512.png",
+		"directories": {
+			"output": "dist"
+		},
+		"mac": {
+			"category": "public.app-category.productivity",
+			"target": [
+				"dmg",
+				"zip"
+			]
+		}
+	}
+}
