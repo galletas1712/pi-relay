@@ -37,21 +37,32 @@ describe("MCP picker layout", () => {
 		expect(css).toMatch(
 			/@media \(max-width: 640px\)[\s\S]*?\.workspace-scope-detail\s*\{[^}]*flex-wrap: wrap/,
 		);
-		expect(css).toContain(
-			`.workspace-scope-toggle,
-	.mcp-picker-toggle,
-	.workspace-scope-name,
-	.workspace-scope-branch,
-	.mcp-picker-tool,
-	.mcp-picker-server-name,
-	.mcp-picker-auth-action,
-	.new-session-setup-error button {
-		min-height: 44px;
-	}`,
+		expect(css).toMatch(
+			/\.mcp-picker-tool\s*\{[^}]*min-height: 44px/,
+		);
+		expect(css).toMatch(
+			/\.mcp-picker-server-check-target\s*\{[^}]*width: 44px;[^}]*height: 44px/,
+		);
+		expect(css).toMatch(
+			/@media \(max-width: 640px\)[\s\S]*?\.mcp-oauth-dialog \[data-slot="input-group"\]\s*\{[^}]*height: 44px/,
+		);
+		expect(css).toMatch(
+			/@media \(max-width: 640px\)[\s\S]*?\.mcp-oauth-dialog \[data-slot="input-group-button"\]\s*\{[^}]*width: 44px;[^}]*height: 44px/,
+		);
+		expect(css).toMatch(
+			/@media \(max-width: 640px\)[\s\S]*?\.mcp-oauth-open\s*\{[^}]*min-height: 44px/,
+		);
+		expect(css).toMatch(
+			/@media \(max-width: 640px\)[\s\S]*?\.mcp-oauth-dialog > \.dialog-header \.plain-close-button,[\s\S]*?width: 44px;[^}]*height: 44px/,
 		);
 		expect(css).toMatch(
 			/@media \(max-width: 640px\)[\s\S]*?\.new-session-setup-error\s*\{[^}]*flex-wrap: wrap/,
 		);
+		expect(css).toMatch(
+			/@media \(max-width: 640px\)[\s\S]*?\.mcp-oauth-expiration\s*\{[^}]*order: 3;[^}]*width: 100%/,
+		);
+		expect(css).not.toMatch(/^\s*size\s*:/m);
+		expect(css).not.toContain(".new-session-setup-error button");
 		expect(css).toContain(".workspace-scope-toggle:focus-visible");
 		expect(css).toContain(".mcp-picker-toggle:focus-visible");
 		expect(css).not.toContain("transition: all");

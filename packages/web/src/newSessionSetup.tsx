@@ -1,5 +1,9 @@
-import { FolderTree, Loader2, Plug } from "lucide-react";
+import { FolderTree, Loader2, Plug, RotateCcw, TriangleAlert } from "lucide-react";
 import { useState } from "react";
+import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
 import { McpToolPicker } from "./mcpToolPicker.tsx";
 import type { McpSelectionState } from "./mcpSelection.ts";
 import type { McpAuthServerStatus, McpInventory } from "./types.ts";
@@ -132,29 +136,46 @@ export function NewSessionSetup({
 											<h2>MCP tools</h2>
 										</div>
 										{mcpLoading ? (
-											<p className="new-session-setup-status" role="status">
-												Loading MCP tools…
-											</p>
+											<McpSetupSkeleton label="Loading MCP tools" />
 										) : null}
 									</>
 								)}
 								{showMcp && mcpLoading ? (
-									<p className="new-session-setup-status" role="status">
-										Refreshing MCP tools…
-									</p>
+									<div className="mcp-setup-progress" role="status" aria-label="Refreshing MCP tools">
+										<Spinner aria-hidden />
+										<span>Refreshing MCP tools…</span>
+									</div>
 								) : null}
 								{!mcpError && !mcpLoading && !mcpConfigurationReady ? (
-									<p className="new-session-setup-status" role="status">
-										{mcpAuthMutationBlockedReason ?? "Loading MCP tools…"}
-									</p>
+									mcpAuthMutationBlockedReason ? (
+										showMcp ? null : (
+											<Alert className="mcp-setup-alert" role="status">
+												<Plug aria-hidden />
+												<AlertDescription>{mcpAuthMutationBlockedReason}</AlertDescription>
+											</Alert>
+										)
+									) : (
+										<McpSetupSkeleton label="Loading MCP tools" compact />
+									)
 								) : null}
 								{mcpError ? (
-									<div className="new-session-setup-error" role="alert">
-										<span>MCP tools unavailable</span>
-										<button type="button" onClick={onRetryMcp} disabled={disabled || mcpLoading}>
+									<Alert className="mcp-setup-alert" variant="destructive">
+										<TriangleAlert aria-hidden />
+										<AlertTitle>MCP unavailable</AlertTitle>
+										<AlertDescription>{mcpError}</AlertDescription>
+										<AlertAction>
+											<Button
+												type="button"
+												variant="ghost"
+												size="sm"
+												onClick={onRetryMcp}
+												disabled={disabled || mcpLoading}
+											>
+												<RotateCcw data-icon="inline-start" aria-hidden />
 											Retry
-										</button>
-									</div>
+											</Button>
+										</AlertAction>
+									</Alert>
 								) : null}
 							</section>
 						) : null}
@@ -165,6 +186,19 @@ export function NewSessionSetup({
 					</div>
 				)}
 			</div>
+		</div>
+	);
+}
+
+function McpSetupSkeleton({ label, compact = false }: { label: string; compact?: boolean }) {
+	return (
+		<div className="mcp-setup-skeleton" role="status">
+			<span className="sr-only">{label}</span>
+			<div className="mcp-setup-skeleton-row">
+				<Spinner aria-hidden />
+				<Skeleton className="h-3 w-28" />
+			</div>
+			{compact ? null : <Skeleton className="h-12 w-full" />}
 		</div>
 	);
 }

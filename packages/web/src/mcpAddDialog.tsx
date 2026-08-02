@@ -1,4 +1,9 @@
 import type { RefObject } from "react";
+import { RotateCcw, TriangleAlert } from "lucide-react";
+import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
+import { Button, buttonVariants } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
 import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import {
 	AppDialog,
@@ -54,9 +59,7 @@ export function McpAddDialog({
 			<DialogHeader>
 				<DialogHeading>
 					<DialogTitle>Add MCP tools</DialogTitle>
-					<DialogDescription>
-						Existing tools stay selected. Adding tools rerenders this session’s system prompt.
-					</DialogDescription>
+					<DialogDescription>Extend this session’s capabilities.</DialogDescription>
 				</DialogHeading>
 				<DialogCloseButton label="close add MCP tools dialog" disabled={loading} />
 			</DialogHeader>
@@ -70,29 +73,57 @@ export function McpAddDialog({
 						disabled={loading}
 						inventoryReady={!loading && !error}
 						authStatusRequired={false}
+						defaultOpen
 					/>
 				) : loading ? (
-					<p role="status">Loading MCP tools…</p>
+					<McpPickerSkeleton label="Loading MCP tools" />
 				) : null}
 				{error ? (
-					<div className="new-session-setup-error" role="alert">
-						<span>MCP tools unavailable: {error}</span>
-						<button type="button" onClick={onRetry} disabled={loading}>Retry</button>
-					</div>
+					<Alert variant="destructive">
+						<TriangleAlert aria-hidden />
+						<AlertDescription>{error}</AlertDescription>
+						<AlertAction>
+							<Button
+								type="button"
+								variant="ghost"
+								size="sm"
+								onClick={onRetry}
+								disabled={loading}
+							>
+								<RotateCcw data-icon="inline-start" aria-hidden />
+								Retry
+							</Button>
+						</AlertAction>
+					</Alert>
 				) : null}
 			</DialogBody>
 			<DialogFooter>
 				<ConnectionBlockedReason reason={mutationBlockedReason} className="dialog-blocked-reason" />
-				<DialogClose className="secondary-button" disabled={loading}>Cancel</DialogClose>
-				<button
+				<DialogClose className={buttonVariants({ variant: "outline" })} disabled={loading}>
+					Cancel
+				</DialogClose>
+				<Button
 					type="button"
-					className="primary-button"
 					disabled={loading || !!error || !additions || !!mutationBlockedReason}
 					onClick={onSubmit}
 				>
-					{loading ? "Loading…" : "Add tools"}
-				</button>
+					{loading ? <Spinner data-icon="inline-start" /> : null}
+					Add tools
+				</Button>
 			</DialogFooter>
 		</AppDialog>
+	);
+}
+
+function McpPickerSkeleton({ label }: { label: string }) {
+	return (
+		<div className="mcp-picker-skeleton" role="status" aria-label={label}>
+			<div className="mcp-picker-skeleton-heading">
+				<Skeleton className="size-8" />
+				<Skeleton className="h-4 w-32" />
+			</div>
+			<Skeleton className="h-16 w-full" />
+			<Skeleton className="h-16 w-full" />
+		</div>
 	);
 }

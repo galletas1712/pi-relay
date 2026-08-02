@@ -373,7 +373,8 @@ describe("App workspace route identity integration", () => {
 				"root-1",
 			),
 		);
-		await user.click(screen.getByRole("button", { name: /^MCP tools/ }));
+		expect(screen.getByRole("button", { name: /^MCP tools/ }).getAttribute("aria-expanded"))
+			.toBe("true");
 		await user.click(screen.getByRole("checkbox", { name: "workspace" }));
 		api.getSession.mockRejectedValueOnce(new Error("snapshot refresh failed"));
 		await user.click(screen.getByRole("button", { name: "Add tools" }));

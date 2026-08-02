@@ -65,11 +65,11 @@ describe("McpToolPicker", () => {
 		);
 		await userEvent.click(screen.getByRole("button", { name: "expand workspace tools" }));
 
-		const existing = screen.getByRole<HTMLInputElement>("checkbox", { name: /read/i });
-		expect(existing.checked).toBe(true);
+		const existing = screen.getByRole<HTMLButtonElement>("checkbox", { name: /read/i });
+		expect(existing.getAttribute("aria-checked")).toBe("true");
 		expect(existing.disabled).toBe(true);
-		expect(screen.getByText("Already selected")).toBeTruthy();
-		const addition = screen.getByRole<HTMLInputElement>("checkbox", { name: /write/i });
+		expect(screen.getByText("Added")).toBeTruthy();
+		const addition = screen.getByRole<HTMLButtonElement>("checkbox", { name: /write/i });
 		expect(addition.disabled).toBe(false);
 		await userEvent.click(addition);
 		expect(onChange).toHaveBeenCalledWith(
@@ -77,6 +77,20 @@ describe("McpToolPicker", () => {
 				["workspace", new Set(["read", "write"])],
 			]),
 		);
+	});
+
+	it("keeps the disclosure free of nested controls and concise", () => {
+		const { container } = render(
+			<McpToolPicker
+				inventory={INVENTORY}
+				selection={new Map([["workspace", new Set(["read"])]])}
+				onChange={() => {}}
+			/>,
+		);
+		const toggle = screen.getByRole("button", { name: /MCP tools/ });
+		expect(toggle.querySelector("button, a, input, [tabindex]")).toBeNull();
+		expect(toggle.textContent).toBe("MCP tools1 tool selected12 tokens");
+		expect(container.querySelector(".mcp-picker-summary-flags")?.children).toHaveLength(2);
 	});
 
 	it("omits markup when there are no configured servers", () => {
@@ -100,8 +114,8 @@ describe("McpToolPicker", () => {
 		expect(markup).not.toContain("mcp-picker-list");
 		expect(markup).not.toContain('aria-checked="mixed"');
 		expect(markup).not.toContain("workspace");
-		expect(markup).toContain("<dt>Scope</dt><dd>All agents</dd>");
-		expect(markup).toContain("<dt>Risk</dt><dd>Remote side effects</dd>");
+		expect(markup).toContain("Shared with all agents. May cause remote side effects.");
+		expect(markup).not.toContain("<dl");
 		expect(markup).not.toContain("Every full and read-only subagent inherits these tools");
 		expect(markup).not.toContain("Choose optional remote capabilities");
 		expect(markup).not.toContain("setup-disclosure-description");
@@ -177,7 +191,7 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 		expect(markup).toContain("1 tool selected");
-		expect(markup).toContain("Remote side effects");
+		expect(markup).toContain("remote side effects");
 		expect(markup).not.toContain("mcp-picker-list");
 	});
 
@@ -200,7 +214,7 @@ describe("McpToolPicker", () => {
 		);
 		expect(markup).toContain("empty");
 		expect(markup).toContain("No tools selected");
-		expect(markup).toContain("No tools available");
+		expect(markup).toContain("No tools");
 		expect(markup).not.toContain("0 selected");
 		expect(markup).not.toContain("0/0");
 		expect(markup).not.toContain("·");
@@ -267,11 +281,11 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 
-		expect(screen.getByText("No tools available")).toBeTruthy();
-		expect(screen.getByText("1 tool selected")).toBeTruthy();
+		expect(screen.getByText("No tools")).toBeTruthy();
+		expect(screen.getByText("1 selected")).toBeTruthy();
 		expect(screen.queryByText("All 1 tool selected")).toBeNull();
-		expect(screen.getByText("All 2 tools selected")).toBeTruthy();
-		expect(screen.getAllByText("About 1 context token").length).toBeGreaterThan(0);
+		expect(screen.getByText("2 selected")).toBeTruthy();
+		expect(screen.getAllByText("1 token").length).toBeGreaterThan(0);
 		expect(screen.getByRole("status").textContent).toBe(
 			"MCP tool selection: 3 tools selected. About 6 context tokens.",
 		);
@@ -299,14 +313,37 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 
-		expect(screen.getAllByText("About 1 context token")).toHaveLength(2);
+		expect(screen.getAllByText("1 token")).toHaveLength(2);
 		expect(screen.getByRole("status").textContent).toBe(
 			"MCP tool selection: 1 tool selected. About 1 context token.",
 		);
 		await userEvent.click(screen.getByRole("button", { name: "expand tokens tools" }));
-		expect(screen.getAllByText("About 1 context token")).toHaveLength(3);
-		expect(screen.getByText("About 2 context tokens")).toBeTruthy();
-		expect(screen.queryByText(/1 context tokens/)).toBeNull();
+		expect(screen.getAllByText("1 token")).toHaveLength(3);
+		expect(screen.getByText("2 tokens")).toBeTruthy();
+		expect(screen.queryByText(/1 tokens/)).toBeNull();
+	});
+
+	it("uses a minus mark for a mixed server selection", () => {
+		render(
+			<McpToolPicker
+				inventory={INVENTORY}
+				selection={new Map([["workspace", new Set(["read"])]])}
+				onChange={() => {}}
+				authStatusRequired={false}
+				open
+			/>,
+		);
+		const checkbox = screen.getByRole("checkbox", { name: "workspace" });
+		expect(checkbox.getAttribute("aria-checked")).toBe("mixed");
+		expect(checkbox.getAttribute("data-state")).toBe("indeterminate");
+		const checkboxClass = checkbox.getAttribute("class") ?? "";
+		expect(checkboxClass).toContain("data-[state=indeterminate]:border-primary");
+		expect(checkboxClass).toContain("data-[state=indeterminate]:bg-primary");
+		expect(checkboxClass).toContain("data-[state=indeterminate]:text-primary-foreground");
+		expect(checkbox.querySelector('[data-checkbox-mark="mixed"]')).toBeTruthy();
+		expect(checkbox.querySelector('[data-checkbox-mark="checked"]')?.getAttribute("class") ?? "").toContain(
+			"indeterminate",
+		);
 	});
 
 	it("keeps a login-required OAuth server visible without inventory and starts login", async () => {
@@ -322,7 +359,7 @@ describe("McpToolPicker", () => {
 			/>,
 		);
 		expect(screen.getByText("oauth")).toBeTruthy();
-		expect(screen.getByText("login required")).toBeTruthy();
+		expect(screen.getByLabelText("OAuth login required")).toBeTruthy();
 		expect(screen.queryByRole("checkbox")).toBeNull();
 		await userEvent.click(screen.getByRole("button", { name: "Login" }));
 		expect(onLogin).toHaveBeenCalledWith("oauth");
@@ -353,18 +390,15 @@ describe("McpToolPicker", () => {
 				open
 			/>,
 		);
-		expect(screen.getByText("OAuth ready")).toBeTruthy();
-		expect(screen.getByText("login pending")).toBeTruthy();
-		expect(screen.getByText("login expired")).toBeTruthy();
-		expect(screen.getByText("OAuth unsupported")).toBeTruthy();
-		expect(screen.getByText("OAuth unknown")).toBeTruthy();
-		expect(screen.getByText("OAuth discovery failed")).toBeTruthy();
-		expect(screen.getByText("Authorization pending")).toBeTruthy();
-		expect(screen.getByText("After reload")).toBeTruthy();
-		expect(screen.getByText("Cancel and restart")).toBeTruthy();
+		expect(screen.getByLabelText("OAuth ready")).toBeTruthy();
+		expect(screen.getByLabelText("OAuth authorization pending")).toBeTruthy();
+		expect(screen.getByLabelText("OAuth login expired")).toBeTruthy();
+		expect(screen.getByLabelText("OAuth unsupported")).toBeTruthy();
+		expect(screen.getByLabelText("OAuth status unknown: OAuth discovery failed")).toBeTruthy();
+		expect(screen.getByText("Restart after reload")).toBeTruthy();
 	});
 
-	it("keeps pending authorization metadata native and announces it from a separate hidden status", () => {
+	it("keeps pending recovery compact and announces it from a separate hidden status", () => {
 		const { container } = render(
 			<McpToolPicker
 				inventory={{ revision: "", servers: [] }}
@@ -376,17 +410,10 @@ describe("McpToolPicker", () => {
 		);
 
 		const metadata = container.querySelector<HTMLElement>(".mcp-picker-pending");
-		expect(metadata?.tagName).toBe("DL");
+		expect(metadata?.tagName).toBe("DIV");
 		expect(metadata?.hasAttribute("role")).toBe(false);
-		expect(container.querySelector("dl[role]")).toBeNull();
-		expect([...metadata!.querySelectorAll("dt")].map((term) => term.textContent)).toEqual([
-			"Status",
-			"After reload",
-		]);
-		expect([...metadata!.querySelectorAll("dd")].map((description) => description.textContent)).toEqual([
-			"Authorization pending",
-			"Cancel and restart",
-		]);
+		expect(metadata?.textContent).toBe("Restart after reload");
+		expect(container.querySelector("dl")).toBeNull();
 
 		const liveStatus = [...container.querySelectorAll<HTMLElement>(".sr-only[role='status']")]
 			.find((status) =>
@@ -438,8 +465,29 @@ describe("McpToolPicker", () => {
 		);
 		expect(screen.getAllByRole("button", { name: "Logout" })).toHaveLength(2);
 		expect(screen.getAllByRole("button", { name: "Login" })).toHaveLength(2);
-		expect(screen.getAllByText("bearer")).toHaveLength(2);
-		expect(screen.getByText("no auth")).toBeTruthy();
+		expect(screen.getByLabelText("Bearer token")).toBeTruthy();
+		expect(screen.getByLabelText("No authentication")).toBeTruthy();
+	});
+
+	it("keeps combined recovery action labels stable with one neutral busy indicator", () => {
+		const { container } = render(
+			<McpToolPicker
+				inventory={{ revision: "", servers: [] }}
+				selection={new Map()}
+				onChange={() => {}}
+				authStatus={[oauthStatus("reauthentication_required", {
+					can_login: true,
+					can_logout: true,
+				})]}
+				authBusyServer="oauth"
+				open
+			/>,
+		);
+		expect(screen.getByRole<HTMLButtonElement>("button", { name: "Login" }).disabled).toBe(true);
+		expect(screen.getByRole<HTMLButtonElement>("button", { name: "Logout" }).disabled).toBe(true);
+		expect(screen.queryByRole("button", { name: /Starting|Logging out/ })).toBeNull();
+		expect(screen.getByText("Working")).toBeTruthy();
+		expect(container.querySelectorAll(".mcp-picker-auth-note [data-slot='spinner']")).toHaveLength(1);
 	});
 
 	it("confirms logout when the server has selected draft tools", async () => {
@@ -549,6 +597,7 @@ describe("McpToolPicker", () => {
 		);
 		const login = screen.getByRole<HTMLButtonElement>("button", { name: "Login" });
 		expect(login.disabled).toBe(true);
-		expect(login.title).toBe("Waiting for connection");
+		expect(login.title).toBe("");
+		expect(screen.getByText("Waiting for connection")).toBeTruthy();
 	});
 });
