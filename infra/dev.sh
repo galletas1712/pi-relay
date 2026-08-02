@@ -33,7 +33,7 @@ if [ ! -d "$PI_AGENTD_CONFIG_HOME" ]; then
   exit 1
 fi
 export PI_AGENTD_CONFIG_HOME
-PI_RELAY_ALLOWED_ORIGINS="${PI_RELAY_ALLOWED_ORIGINS-http://127.0.0.1:8788}"
+PI_RELAY_ALLOWED_ORIGINS="${PI_RELAY_ALLOWED_ORIGINS-https://pi-relay.pages.dev}"
 export PI_RELAY_ALLOWED_ORIGINS
 
 # Build pi-runtime before replacing either side of the control protocol. Its
