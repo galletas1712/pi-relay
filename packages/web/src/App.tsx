@@ -391,7 +391,6 @@ export function App({
 	const selectedRef = useRef<string | null>(initialSelection.conversationSessionId);
 	const [query, setQuery] = useState("");
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
-	const [newSessionProviderWasExplicit, setNewSessionProviderWasExplicit] = useState(false);
 	const [, setProviderConfigurationRevision] = useState(0);
 	const providerConfigurationControllerRef = useRef<ProviderConfigurationController | null>(null);
 	const providerConfigurationMountGenerationRef = useRef(0);
@@ -2974,7 +2973,6 @@ export function App({
 					setMcpSelection(providerChange.selection);
 				}
 				setNewSessionProvider(provider);
-				setNewSessionProviderWasExplicit(true);
 				setNewSessionSetupGeneration((generation) => generation + 1);
 				return;
 			}
@@ -2998,7 +2996,6 @@ export function App({
 			const sessionId = selectedRef.current;
 			if (!sessionId) {
 				setNewSessionProvider(withReasoningEffort(activeProvider, effort));
-				setNewSessionProviderWasExplicit(true);
 				setNewSessionSetupGeneration((generation) => generation + 1);
 				return;
 			}
@@ -3365,7 +3362,7 @@ export function App({
 				runtimeId: projectId
 					? undefined
 					: runtimes.find((runtime) => runtime.online)?.runtime_id,
-				provider: newSessionProviderWasExplicit ? newSessionProvider : undefined,
+				provider: newSessionProvider,
 				metadata: {
 					title,
 					created_by: "web",
@@ -3456,7 +3453,6 @@ export function App({
 			mcpAuthStatus,
 			mcpAuthStatusReady,
 			newSessionProvider,
-			newSessionProviderWasExplicit,
 			newSessionRuntimeId,
 			openRootConversation,
 			pushErrorNotice,

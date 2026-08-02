@@ -8,6 +8,7 @@ import type { AgentApi } from "./agentApi.ts";
 import { App } from "./App.tsx";
 import { RpcRequestError, RpcTransportError, type ConnectionStatus } from "./rpc.ts";
 import { queryKeys } from "./queryKeys.ts";
+import { DEFAULT_PROVIDER } from "./sessionDefaults.ts";
 import type {
 	DelegationListResult,
 	EventFrame,
@@ -1521,10 +1522,10 @@ describe("App workspace route identity integration", () => {
 					servers: [{ server: "workspace", tools: ["read", "write"] }],
 				});
 			} else if (setupEdit === "model") {
-				expect(first.provider).toBeUndefined();
+				expect(first.provider).toEqual(DEFAULT_PROVIDER);
 				expect(second.provider.model).toBe("gpt-5.6-terra");
 			} else if (setupEdit === "effort") {
-				expect(first.provider).toBeUndefined();
+				expect(first.provider).toEqual(DEFAULT_PROVIDER);
 				expect(second.provider.reasoning_effort).toBe("high");
 			}
 
@@ -1878,7 +1879,7 @@ describe("App workspace route identity integration", () => {
 		expect(startParams).toEqual({
 			sessionId: params.sessionId,
 			projectId: "project-1",
-			provider: undefined,
+			provider: DEFAULT_PROVIDER,
 			metadata: {
 				title: "start combined setup",
 				created_by: "web",

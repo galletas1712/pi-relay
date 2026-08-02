@@ -551,8 +551,8 @@ project workspaces are safe to clone.
 ## Model and reasoning controls
 
 The chat header exposes a model picker and a provider-specific reasoning-effort picker (`sessionDefaults.ts`). The
-picker displays canonical composite keys: `openai:gpt-5.6-sol` (default), `openai:gpt-5.6-terra`,
-`openai:gpt-5.6-luna`, `claude:claude-opus-5`, `claude:claude-opus-4-8`, and `claude:claude-fable-5`.
+picker displays canonical composite keys: `openai:gpt-5.6-luna` (default), `openai:gpt-5.6-sol`,
+`openai:gpt-5.6-terra`, `claude:claude-opus-5`, `claude:claude-opus-4-8`, and `claude:claude-fable-5`.
 Opus 5 is the first normal Claude choice and starts at its documented default `high` effort.
 Fable 5 is listed last as an explicit opt-in, and its option text and tooltip state that it is not ZDR.
 The model control is idle-only for an existing session (`activity !== "idle"` disables it); kind and model
