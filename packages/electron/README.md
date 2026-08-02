@@ -40,8 +40,8 @@ npm run package:electron
 
 The configured production targets are macOS DMG and ZIP. The ZIP is retained
 as the macOS distribution artifact needed for a future auto-update flow; this
-PR does not add an auto-updater or release workflow. To validate the packaged
-app layout without creating an installer:
+workflow does not publish the ZIP, add an auto-updater, or sign the app. To
+validate the packaged app layout without creating an installer:
 
 ```sh
 npm run package:electron:dir
@@ -54,11 +54,12 @@ refresh revalidates the document and ignores the HTTP cache without clearing
 localStorage or service-worker state, so reinstalling the Electron binary is
 not normally required for frontend updates.
 
-## GitHub Actions artifacts
+## GitHub Release distribution
 
-The [`Electron macOS artifact`](../../.github/workflows/electron-macos-artifact.yml)
-workflow builds a universal DMG on a GitHub-hosted macOS runner. It runs
-automatically after a push to `main` changes any of the following:
+The [`Electron macOS release`](../../.github/workflows/electron-macos-artifact.yml)
+workflow builds a universal DMG on a GitHub-hosted macOS runner and publishes
+it to the rolling [`electron-latest` GitHub Release](https://github.com/galletas1712/pi-relay/releases/tag/electron-latest).
+It runs automatically after a push to `main` changes any of the following:
 
 - `.github/workflows/electron-macos-artifact.yml`
 - `packages/electron/**`
@@ -66,19 +67,35 @@ automatically after a push to `main` changes any of the following:
 - `package.json` or `package-lock.json`
 
 Frontend-only changes outside the icon path and Rust-only changes do not start
-this workflow. To build on demand from any selected ref:
+this workflow.
+
+To download the latest build:
+
+1. Open the repository's **Releases** page.
+2. Open **π-relay macOS (latest)**.
+3. Download `pi-relay-macos.dmg` and, optionally, verify it with
+   `pi-relay-macos.dmg.sha256`.
+   From the directory containing both files, run
+   `shasum -a 256 -c pi-relay-macos.dmg.sha256`.
+
+This is a GitHub Release, not GitHub Packages. Each successful build replaces
+the two fixed-name assets in that release and moves its rolling tag to the
+build's commit. Unexpected old assets are removed only after both new assets
+are uploaded; the fixed-name assets are replaced with `--clobber` during that
+upload. The workflow does not create a new Actions artifact; it also cleans up
+legacy Actions artifacts named `electron-macos-dmg` after a successful release
+upload.
+
+To build on demand from any selected ref:
 
 1. Open the repository's **Actions** tab.
-2. Select **Electron macOS artifact**.
+2. Select **Electron macOS release**.
 3. Select **Run workflow**, choose the ref, and select **Run workflow** again.
-4. Open the completed run and download the artifact named
-   `electron-macos-dmg`. It contains only the DMG and its `.sha256` checksum
-   file. Each successful build replaces the previous rolling artifact, so only
-   one current artifact is retained.
+4. After the run succeeds, open **Releases** and download the fixed-name DMG
+   and checksum from **π-relay macOS (latest)**.
 
 The DMG is not signed or notarized. macOS Gatekeeper will likely warn that the
 developer cannot be verified and may quarantine or block the app on first
 launch. Use Finder's **Open** action or approve the app under **System
 Settings → Privacy & Security** if macOS offers that option. This workflow
-does not publish a GitHub Release, configure auto-updating, or provide Apple
-signing/notarization.
+does not configure auto-updating or provide Apple signing/notarization.
