@@ -43,8 +43,8 @@ export const CLAUDE_REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "hi
 
 export const DEFAULT_PROVIDER: ProviderConfig = {
 	kind: "openai",
-	model: "gpt-5.6-sol",
-	reasoning_effort: "xhigh"
+	model: "gpt-5.6-luna",
+	reasoning_effort: "high"
 };
 
 export function textContent(text: string): ContentBlock[] {

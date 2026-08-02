@@ -176,7 +176,7 @@ export interface StartSessionParams {
 	sessionId: string;
 	projectId?: string | null;
 	runtimeId?: string | null;
-	/** Omit for a new session to use the daemon's configured parent default. */
+	/** Omit to use the daemon's configured parent default. */
 	provider?: ProviderConfig;
 	metadata: Record<string, unknown>;
 	clientInputId: string;

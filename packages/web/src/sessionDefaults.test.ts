@@ -9,11 +9,11 @@ import {
 } from "./sessionDefaults.ts";
 
 describe("session defaults", () => {
-	it("uses gpt-5.6-sol as the default OpenAI/Codex model", () => {
+	it("uses gpt-5.6-luna with high reasoning as the default OpenAI/Codex provider", () => {
 		expect(DEFAULT_PROVIDER).toMatchObject({
 			kind: "openai",
-			model: "gpt-5.6-sol",
-			reasoning_effort: "xhigh",
+			model: "gpt-5.6-luna",
+			reasoning_effort: "high",
 		});
 	});
 
