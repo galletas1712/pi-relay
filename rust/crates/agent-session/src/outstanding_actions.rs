@@ -238,9 +238,7 @@ impl RecordedCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_vocab::{
-        AssistantMessage, ToolCall, ToolCallId, ToolResultMessage, ToolResultStatus,
-    };
+    use agent_vocab::{AssistantMessage, ToolCall, ToolCallId, ToolResultMessage};
 
     fn model_request(action: u64, turn: u64) -> AgentAction {
         AgentAction::RequestModel {
@@ -283,12 +281,7 @@ mod tests {
         actions.accept_completion(&AgentInput::ToolCompleted {
             action_id: ActionId(2),
             turn_id: TurnId(1),
-            result: ToolResultMessage {
-                tool_call_id: ToolCallId::from_u64(1),
-                tool_name: "bash".to_string(),
-                output: "ok".to_string(),
-                status: ToolResultStatus::Success,
-            },
+            result: ToolResultMessage::success(ToolCallId::from_u64(1), "bash", "ok"),
         });
         assert!(!actions.is_empty()); // model still pending
         actions.accept_completion(&AgentInput::ModelCompleted {
@@ -306,22 +299,12 @@ mod tests {
         assert!(!actions.accept_completion(&AgentInput::ToolCompleted {
             action_id: ActionId(2),
             turn_id: TurnId(1),
-            result: ToolResultMessage {
-                tool_call_id: ToolCallId::from_u64(99),
-                tool_name: "bash".to_string(),
-                output: "wrong call".to_string(),
-                status: ToolResultStatus::Success,
-            },
+            result: ToolResultMessage::success(ToolCallId::from_u64(99), "bash", "wrong call"),
         }));
         assert!(!actions.accept_completion(&AgentInput::ToolCompleted {
             action_id: ActionId(2),
             turn_id: TurnId(1),
-            result: ToolResultMessage {
-                tool_call_id: ToolCallId::from_u64(1),
-                tool_name: "other".to_string(),
-                output: "wrong tool".to_string(),
-                status: ToolResultStatus::Success,
-            },
+            result: ToolResultMessage::success(ToolCallId::from_u64(1), "other", "wrong tool"),
         }));
         assert!(!actions.is_empty());
     }

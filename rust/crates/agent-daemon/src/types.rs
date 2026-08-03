@@ -47,6 +47,8 @@ pub(crate) struct DispatchAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RpcMethod {
+    ImageUpload,
+    ImageGet,
     SessionStart,
     SessionList,
     SessionGet,
@@ -101,6 +103,8 @@ pub(crate) enum RpcMethod {
 impl RpcMethod {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
+            "image.upload" => Some(Self::ImageUpload),
+            "image.get" => Some(Self::ImageGet),
             "session.start" => Some(Self::SessionStart),
             "session.list" => Some(Self::SessionList),
             "session.get" => Some(Self::SessionGet),

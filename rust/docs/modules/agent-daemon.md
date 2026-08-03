@@ -164,6 +164,17 @@ does not own session durability.
 
 `provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (provider-native compaction and parent-only post-compaction delegation ledger append), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + runtime-context parsing + stable prompt sections), `skills.rs` (`LoadSkill` and role resolution), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization). The adjacent `delegation_context.rs` builds the bounded compaction ledger for top-level parent sessions.
 
+Image bytes cross daemon boundaries only transiently. Browser
+`image.upload` stores validated bytes and returns a durable
+`sha256:<lowercase hex>` ref; transcript and queue messages carry that ref
+only, and browser rendering resolves it through `image.get`. Tool execution
+returns transient inline image blocks, which `runtime/tool.rs` finalizes once
+before store ingestion artifactizes them. Immediately before model,
+compaction, or count dispatch, `provider_runtime/transcript.rs` batch-loads all
+referenced artifacts into a request-local `ResolvedImageMap`; provider adapters
+then encode the bytes for their wire protocol. Missing refs fail before a
+provider request.
+
 ## Key types
 
 - `AppState` (state.rs): cloneable handle shared by every connection and background task. Holds `Arc<PostgresAgentStore>`, `active: HashMap<session_id, Arc<Mutex<RuntimeSession>>>` (loaded live sessions), `session_driver_locks`, a `tasks` registry of running dispatch/compaction handles, a `broadcast::Sender<EventFrame>`, the `ToolRegistry`, the `ProviderConnectionRegistry`, the `WorkspaceManager`, and the `prompt_root` (nearest ancestor containing `PI.md`).

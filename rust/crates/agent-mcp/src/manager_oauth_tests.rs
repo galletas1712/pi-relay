@@ -479,7 +479,7 @@ async fn persisted_login_reconnects_and_restores_bounded_authenticated_route() {
             .await
             .expect("restored OAuth call succeeds"),
         McpCallOutput {
-            output: "hello".to_string(),
+            content: vec![agent_vocab::InlineContentBlock::text("hello")],
             is_error: false,
         }
     );
@@ -527,7 +527,7 @@ async fn persisted_login_reconnects_and_restores_bounded_authenticated_route() {
             .await
             .expect("frozen route resumes after compatible re-login"),
         McpCallOutput {
-            output: "restored".to_string(),
+            content: vec![agent_vocab::InlineContentBlock::text("restored")],
             is_error: false,
         }
     );
@@ -600,7 +600,7 @@ async fn oauth_tools_call_401_is_not_replayed_and_later_inventory_refreshes() {
             .await
             .expect("later call uses refreshed route"),
         McpCallOutput {
-            output: "later".to_string(),
+            content: vec![agent_vocab::InlineContentBlock::text("later")],
             is_error: false,
         }
     );

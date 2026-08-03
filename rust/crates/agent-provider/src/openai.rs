@@ -1,7 +1,7 @@
 use agent_tools::{tool_display, ProviderTool, ToolDisplayInput};
 use agent_vocab::{
-    AssistantItem, AssistantMessage, ContentBlock, ProviderKind, ProviderReplayItem,
-    ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem, UserMessage,
+    AssistantItem, AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort,
+    ReplayDisplay, ToolCall, ToolCallId, TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, ACCEPT, CONTENT_ENCODING, CONTENT_TYPE};
@@ -600,6 +600,7 @@ mod catalog_tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::default(),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -615,6 +616,7 @@ mod catalog_tests {
             model: model.to_string(),
             prompt: PromptSections::default(),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             reasoning_effort: effort,
@@ -2571,7 +2573,12 @@ fn responses_body_with_metadata(
     Ok(json!({
         "model": request.model,
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
-        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
+        "input": response_input_items(
+            request.prompt.dynamic_context.as_deref(),
+            &request.prompt,
+            &request.transcript,
+            &request.resolved_images,
+        )?,
         "tools": tools,
         "tool_choice": "auto",
         "parallel_tool_calls": metadata.supports_parallel_tool_calls,
@@ -2604,7 +2611,12 @@ fn compact_body_with_metadata(
     Ok(json!({
         "model": request.model,
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
-        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
+        "input": response_input_items(
+            request.prompt.dynamic_context.as_deref(),
+            &request.prompt,
+            &request.transcript,
+            &request.resolved_images,
+        )?,
         "tools": tools,
         "parallel_tool_calls": metadata.supports_parallel_tool_calls,
         "reasoning": {
@@ -2652,9 +2664,31 @@ fn openai_reasoning_effort(
     }
 }
 
-pub(crate) fn transcript_to_response_items(
+pub(crate) fn transcript_to_estimate_items(
     prompt: &crate::PromptSections,
     items: &[ModelTranscriptEntry],
+) -> ProviderResult<Vec<Value>> {
+    response_items_for_image_mode(prompt, items, ResponseImageMode::Estimate)
+}
+
+fn transcript_to_response_items_with_images(
+    prompt: &crate::PromptSections,
+    items: &[ModelTranscriptEntry],
+    images: &crate::ResolvedImageMap,
+) -> ProviderResult<Vec<Value>> {
+    response_items_for_image_mode(prompt, items, ResponseImageMode::Resolved(images))
+}
+
+#[derive(Clone, Copy)]
+enum ResponseImageMode<'a> {
+    Resolved(&'a crate::ResolvedImageMap),
+    Estimate,
+}
+
+fn response_items_for_image_mode(
+    prompt: &crate::PromptSections,
+    items: &[ModelTranscriptEntry],
+    images: ResponseImageMode<'_>,
 ) -> ProviderResult<Vec<Value>> {
     let mut responses = Vec::new();
     for entry in items {
@@ -2663,7 +2697,7 @@ pub(crate) fn transcript_to_response_items(
                 responses.push(json!({
                     "type": "message",
                     "role": "user",
-                    "content": responses_user_content(message),
+                    "content": responses_user_content(message, images)?,
                 }));
             }
             TranscriptItem::CompactionSummary(summary) => {
@@ -2702,7 +2736,7 @@ pub(crate) fn transcript_to_response_items(
                 }
             }
             TranscriptItem::ToolResult(result) => {
-                responses.push(response_tool_result_item(result));
+                responses.push(response_tool_result_item(result, images)?);
             }
             TranscriptItem::DaemonToolObservation(observation) => {
                 responses.push(json!({
@@ -2747,19 +2781,65 @@ fn response_tool_call_item(call: &ToolCall) -> Value {
     }
 }
 
-fn response_tool_result_item(result: &agent_vocab::ToolResultMessage) -> Value {
-    if result.tool_name == "Edit" {
+fn response_tool_result_item(
+    result: &agent_vocab::ToolResultMessage,
+    images: ResponseImageMode<'_>,
+) -> ProviderResult<Value> {
+    let output = responses_tool_output(&result.content, images)?;
+    Ok(if result.tool_name == "Edit" {
         json!({
             "type": "custom_tool_call_output",
             "call_id": result.tool_call_id.as_str(),
-            "output": result.output,
+            "output": output,
         })
     } else {
         json!({
             "type": "function_call_output",
             "call_id": result.tool_call_id.as_str(),
-            "output": result.output,
+            "output": output,
         })
+    })
+}
+
+fn responses_content_block(
+    block: &agent_vocab::ContentBlock,
+    images: ResponseImageMode<'_>,
+) -> ProviderResult<Value> {
+    match block {
+        agent_vocab::ContentBlock::Text { text } => {
+            Ok(json!({ "type": "input_text", "text": text }))
+        }
+        agent_vocab::ContentBlock::Image { artifact_id } => Ok(match images {
+            ResponseImageMode::Resolved(images) => {
+                let image = images.get(artifact_id).ok_or_else(|| {
+                    ProviderError::Provider(format!(
+                        "missing resolved image artifact {artifact_id}"
+                    ))
+                })?;
+                json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{};base64,{}", image.mime_type, image.data)
+                })
+            }
+            ResponseImageMode::Estimate => json!({
+                "type": "input_image",
+                "artifact_id": artifact_id,
+            }),
+        }),
+    }
+}
+
+fn responses_tool_output(
+    content: &[agent_vocab::ContentBlock],
+    images: ResponseImageMode<'_>,
+) -> ProviderResult<Value> {
+    match content {
+        [agent_vocab::ContentBlock::Text { text }] => Ok(Value::String(text.clone())),
+        _ => content
+            .iter()
+            .map(|block| responses_content_block(block, images))
+            .collect::<ProviderResult<Vec<_>>>()
+            .map(Value::Array),
     }
 }
 
@@ -2767,9 +2847,12 @@ fn response_input_items(
     dynamic_context: Option<&str>,
     prompt: &crate::PromptSections,
     transcript: &[ModelTranscriptEntry],
+    images: &crate::ResolvedImageMap,
 ) -> ProviderResult<Vec<Value>> {
     let mut items = Vec::new();
-    items.extend(transcript_to_response_items(prompt, transcript)?);
+    items.extend(transcript_to_response_items_with_images(
+        prompt, transcript, images,
+    )?);
     if let Some(dynamic_context) = dynamic_context.filter(|value| !value.trim().is_empty()) {
         items.push(json!({
             "type": "message",
@@ -2819,23 +2902,23 @@ fn validate_openai_compaction_replay(replay: &[Value]) -> ProviderResult<()> {
     Ok(())
 }
 
-fn responses_user_content(message: &UserMessage) -> Vec<Value> {
+fn responses_user_content(
+    message: &UserMessage,
+    images: ResponseImageMode<'_>,
+) -> ProviderResult<Vec<Value>> {
     message
         .content
         .iter()
-        .map(|block| match block {
-            ContentBlock::Text { text } => json!({ "type": "input_text", "text": text }),
-            ContentBlock::Image { image } => match &image.source {
-                agent_vocab::ImageSource::Url(url) => {
-                    json!({ "type": "input_image", "image_url": url })
-                }
-                agent_vocab::ImageSource::Base64(data) => {
-                    let url = format!("data:{};base64,{}", image.mime_type, data);
-                    json!({ "type": "input_image", "image_url": url })
-                }
-            },
-        })
+        .map(|block| responses_content_block(block, images))
         .collect()
+}
+
+#[cfg(test)]
+fn transcript_to_response_items(
+    prompt: &crate::PromptSections,
+    items: &[ModelTranscriptEntry],
+) -> ProviderResult<Vec<Value>> {
+    transcript_to_estimate_items(prompt, items)
 }
 
 async fn parse_responses_stream(
@@ -3443,7 +3526,7 @@ fn openai_usage(value: &Value) -> Option<ProviderUsage> {
 mod tests {
     use super::*;
     use crate::PromptSections;
-    use agent_vocab::{CompactionSummary, ToolCall, ToolResultMessage, TurnId};
+    use agent_vocab::{CompactionSummary, ContentBlock, ToolCall, ToolResultMessage, TurnId};
     use reqwest::header::HeaderValue;
 
     fn test_tool(
@@ -3641,6 +3724,7 @@ mod tests {
                     Some("cwd: /tmp/project".to_string()),
                 ),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 reasoning_effort: ReasoningEffort::High,
@@ -3677,6 +3761,7 @@ mod tests {
                 model: "gpt-5.5".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 reasoning_effort: ReasoningEffort::Medium,
@@ -3845,6 +3930,7 @@ mod tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::default(),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::OpenAiCoding,
             tools: Vec::new(),
             max_tokens: None,
@@ -4134,6 +4220,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::default(),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4161,6 +4248,7 @@ mod tests {
                     Some("cwd: /tmp/project".to_string()),
                 ),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::CustomDefinitions,
                 tools: vec![test_tool(
                     ProviderKind::OpenAi,
@@ -4216,6 +4304,7 @@ mod tests {
                         transcript: vec![
                             TranscriptItem::UserMessage(UserMessage::text("hello")).into()
                         ],
+                        resolved_images: Default::default(),
                         tool_profile: ProviderToolProfile::None,
                         tools: Vec::new(),
                         max_tokens: None,
@@ -4242,6 +4331,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::default(),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4275,6 +4365,7 @@ mod tests {
                     Some("cwd: /tmp/one".to_string()),
                 ),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4295,6 +4386,7 @@ mod tests {
                     Some("cwd: /tmp/two".to_string()),
                 ),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("changed")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4326,6 +4418,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4352,6 +4445,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4378,6 +4472,7 @@ mod tests {
                     Some("workspace: /tmp/pi".to_string()),
                 ),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4404,6 +4499,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable agent rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::CustomDefinitions,
                 tools: vec![
                     test_tool(
@@ -4441,6 +4537,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable agent rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::OpenAiCoding,
                 tools: first_party_tools(ProviderKind::OpenAi),
                 max_tokens: None,
@@ -4470,11 +4567,13 @@ mod tests {
         assert_eq!(body["tools"][7]["type"], "function");
         assert_eq!(body["tools"][7]["name"], "LoadSkill");
         assert_eq!(body["tools"][8]["type"], "function");
-        assert_eq!(body["tools"][8]["name"], "steer_subagent");
+        assert_eq!(body["tools"][8]["name"], "ReadImage");
         assert_eq!(body["tools"][9]["type"], "function");
-        assert_eq!(body["tools"][9]["name"], "web_fetch");
+        assert_eq!(body["tools"][9]["name"], "steer_subagent");
         assert_eq!(body["tools"][10]["type"], "function");
-        assert_eq!(body["tools"][10]["name"], "web_search");
+        assert_eq!(body["tools"][10]["name"], "web_fetch");
+        assert_eq!(body["tools"][11]["type"], "function");
+        assert_eq!(body["tools"][11]["name"], "web_search");
     }
 
     #[test]
@@ -6137,37 +6236,62 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
 
     #[test]
     fn responses_input_preserves_images_and_tool_results() {
-        let items = transcript_to_response_items(
+        let artifact_id = agent_vocab::ImageArtifactId::parse(format!("sha256:{}", "a".repeat(64)))
+            .expect("valid artifact id");
+        let transcript = [
+            TranscriptItem::UserMessage(UserMessage::from_parts(vec![
+                ContentBlock::text("look"),
+                ContentBlock::Image {
+                    artifact_id: artifact_id.clone(),
+                },
+            ]))
+            .into(),
+            TranscriptItem::ToolResult(ToolResultMessage::success(
+                ToolCallId::new("call_1"),
+                "read",
+                "contents",
+            ))
+            .into(),
+        ];
+        assert!(transcript_to_response_items_with_images(
             &crate::PromptSections::default(),
-            &[
-                TranscriptItem::UserMessage(UserMessage::from_parts(vec![
-                    ContentBlock::text("look"),
-                    ContentBlock::Image {
-                        image: agent_vocab::ImageContent {
-                            mime_type: "image/png".to_string(),
-                            source: agent_vocab::ImageSource::Base64("abc".to_string()),
-                        },
-                    },
-                ]))
-                .into(),
-                TranscriptItem::ToolResult(ToolResultMessage::success(
-                    ToolCallId::new("call_1"),
-                    "read",
-                    "contents",
-                ))
-                .into(),
-            ],
+            &transcript,
+            &Default::default(),
         )
-        .expect("responses input renders");
+        .is_err());
+        let items = transcript_to_estimate_items(&crate::PromptSections::default(), &transcript)
+            .expect("structural estimate renders");
 
-        assert_eq!(items[0]["type"], "message");
-        assert_eq!(items[0]["content"][0]["type"], "input_text");
-        assert_eq!(items[0]["content"][1]["type"], "input_image");
         assert_eq!(
-            items[0]["content"][1]["image_url"],
-            "data:image/png;base64,abc"
+            items[0]["content"][1],
+            json!({"type":"input_image","artifact_id":artifact_id})
         );
+        assert!(items[0]["content"][1].get("image_url").is_none());
         assert_eq!(items[1]["type"], "function_call_output");
         assert_eq!(items[1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn resolved_image_refs_render_as_openai_data_urls() {
+        let artifact_id = agent_vocab::ImageArtifactId::parse(format!("sha256:{}", "b".repeat(64)))
+            .expect("valid artifact id");
+        let images = crate::ResolvedImageMap::from([(
+            artifact_id.clone(),
+            crate::ResolvedImage {
+                mime_type: "image/webp".to_string(),
+                data: "encoded".to_string(),
+            },
+        )]);
+        let rendered = responses_user_content(
+            &UserMessage::from_parts(vec![ContentBlock::image(artifact_id.clone())]),
+            ResponseImageMode::Resolved(&images),
+        )
+        .expect("resolved image renders");
+        assert_eq!(rendered[0]["image_url"], "data:image/webp;base64,encoded");
+        assert!(responses_user_content(
+            &UserMessage::from_parts(vec![ContentBlock::image(artifact_id)]),
+            ResponseImageMode::Resolved(&Default::default()),
+        )
+        .is_err());
     }
 }

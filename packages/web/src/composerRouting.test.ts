@@ -4,7 +4,7 @@ import {
 	type ComposerRoutingDependencies,
 	type ComposerSubmission,
 } from "./composerRouting.ts";
-import type { SessionSnapshot } from "./types.ts";
+import type { ContentBlock, SessionSnapshot } from "./types.ts";
 
 function snapshot(sessionId: string, parentSessionId?: string | null): SessionSnapshot {
 	return {
@@ -26,10 +26,15 @@ function dependencies(
 	};
 }
 
+function textContent(text: string): ContentBlock[] {
+	return [{ type: "text", text }];
+}
+
 function submission(sessionId: string | null, text: string): ComposerSubmission {
 	return {
 		sessionId,
 		text,
+		content: textContent(text.trim()),
 		clientControlId: "web_control_1",
 		newSessionId: "session_1",
 	};
@@ -46,7 +51,7 @@ describe("routeComposerSubmission", () => {
 		expect(deps.steerSubagent).toHaveBeenCalledWith({
 			parentSessionId: "parent-session",
 			subagentSessionId: "child-session",
-			message: "check the retry path",
+			content: textContent("check the retry path"),
 			clientControlId: "web_control_1",
 		});
 		expect(deps.queueFollowUp).not.toHaveBeenCalled();
@@ -61,7 +66,7 @@ describe("routeComposerSubmission", () => {
 
 		expect(deps.queueFollowUp).toHaveBeenCalledWith(
 			"root-session",
-			"continue",
+			textContent("continue"),
 			root,
 			"web_control_1",
 		);
@@ -77,7 +82,7 @@ describe("routeComposerSubmission", () => {
 		).resolves.toBe(true);
 
 		expect(deps.startNewSession).toHaveBeenCalledWith(
-			"start here",
+			textContent("start here"),
 			"web_control_1",
 			"session_1",
 		);
@@ -94,13 +99,13 @@ describe("routeComposerSubmission", () => {
 
 		expect(deps.startNewSession).toHaveBeenNthCalledWith(
 			1,
-			"start here",
+			textContent("start here"),
 			"web_control_1",
 			"session_1",
 		);
 		expect(deps.startNewSession).toHaveBeenNthCalledWith(
 			2,
-			"start here",
+			textContent("start here"),
 			"web_control_1",
 			"session_1",
 		);
@@ -156,6 +161,32 @@ describe("routeComposerSubmission", () => {
 		expect(deps.queueFollowUp).not.toHaveBeenCalled();
 	});
 
+	it("rejects slash commands that include image attachments", async () => {
+		const deps = dependencies(snapshot("child", "parent"));
+		const image: ContentBlock = {
+			type: "image",
+			artifact_id: `sha256:${"a".repeat(64)}`,
+		};
+
+		await expect(
+			routeComposerSubmission(
+				{
+					sessionId: "child",
+					text: "/export",
+					content: [...textContent("/export"), image],
+					clientControlId: "web_control_1",
+					newSessionId: "session_1",
+				},
+				deps,
+			),
+		).resolves.toBe(false);
+
+		expect(deps.reportError).toHaveBeenCalledWith(
+			expect.objectContaining({ message: "slash commands cannot include image attachments" }),
+		);
+		expect(deps.executeSlash).not.toHaveBeenCalled();
+	});
+
 	it("keeps an accepted asynchronous steer attached to Composer's captured child", async () => {
 		let appSelection = "child";
 		const deps = dependencies(snapshot("child", "parent"));
@@ -170,7 +201,7 @@ describe("routeComposerSubmission", () => {
 		expect(deps.steerSubagent).toHaveBeenCalledWith({
 			parentSessionId: "parent",
 			subagentSessionId: "child",
-			message: "stay with this child",
+			content: textContent("stay with this child"),
 			clientControlId: "web_control_1",
 		});
 		expect(appSelection).toBe("other-session");
@@ -196,7 +227,7 @@ describe("routeComposerSubmission", () => {
 		expect(deps.steerSubagent).toHaveBeenCalledWith({
 			parentSessionId: "old-parent",
 			subagentSessionId: "old-child",
-			message: "stay old",
+			content: textContent("stay old"),
 			clientControlId: "web_control_1",
 		});
 	});

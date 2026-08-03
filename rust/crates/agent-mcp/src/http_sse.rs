@@ -14,9 +14,9 @@ use super::{
     BoundedHttpError, ClientNotifications, RequestRegistration, SecretScrubber, BODY_IDLE_TIMEOUT,
 };
 
-pub(super) const SSE_LINE_LIMIT: usize = 256 * 1024;
-pub(super) const SSE_EVENT_LIMIT: usize = 2 * 1024 * 1024;
-pub(super) const SSE_DATA_LIMIT: usize = 2 * 1024 * 1024;
+pub(super) const SSE_NON_DATA_LINE_LIMIT: usize = 256 * 1024;
+pub(super) const SSE_EVENT_LIMIT: usize = 16 * 1024 * 1024;
+pub(super) const SSE_DATA_LIMIT: usize = 16 * 1024 * 1024;
 pub(super) const SSE_FIELD_LIMIT: usize = 16 * 1024;
 pub(super) const SSE_EVENTS_PER_RESPONSE_LIMIT: usize = 1_024;
 const MAX_SERVER_RETRY: Duration = Duration::from_secs(5);
@@ -177,7 +177,12 @@ impl BoundedSseParser {
                 }
                 b'\n' => self.finish_line(pending)?,
                 byte => {
-                    if self.line.len() == SSE_LINE_LIMIT {
+                    let line_limit = if self.line.starts_with(b"data:") {
+                        SSE_DATA_LIMIT
+                    } else {
+                        SSE_NON_DATA_LINE_LIMIT
+                    };
+                    if self.line.len() == line_limit {
                         return Err(BoundedHttpError::BodyTooLarge);
                     }
                     self.line.push(*byte);

@@ -10,7 +10,7 @@ describe("buildTurnViews", () => {
 			entry("user", { type: "user_message", content: [{ type: "text", text: "inspect" }] }),
 			entry("assistant-tools", { type: "assistant_message", items: [text("I will inspect."), toolCall] }),
 			entry("tool-start", { type: "tool_call_started", turn_id: 1, tool_call: toolCall }),
-			entry("tool-result", { type: "tool_result", tool_call_id: "call_1", tool_name: "bash", output: "ok", status: "Success" }),
+			entry("tool-result", { type: "tool_result", tool_call_id: "call_1", tool_name: "bash", content: [{ type: "text", text: "ok" }], status: "Success" }),
 			entry("assistant-final", { type: "assistant_message", items: [text("Done.")] }),
 			entry("finish", { type: "turn_finished", turn_id: 1, outcome: "Graceful" })
 		];

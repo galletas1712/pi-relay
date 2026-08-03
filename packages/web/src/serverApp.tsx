@@ -7,9 +7,10 @@ import {
 	Settings,
 	Trash2,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { App } from "./App.tsx";
 import { createAgentApi } from "./agentApi.ts";
+import { ArtifactImageProvider } from "./artifactImage.tsx";
 import {
 	AppDialog,
 	DialogBody,
@@ -207,17 +208,23 @@ function ConnectedServer({
 		() => browserWorkspaceRouteHistory(profile.id),
 		[profile.id],
 	);
+	const loadImageArtifact = useCallback(
+		(artifactId: string) => api.getImageArtifact(artifactId),
+		[api],
+	);
 	useEffect(() => () => queryClient.clear(), [queryClient]);
 
 	return (
 		<QueryClientProvider client={queryClient}>
 			<TooltipProvider>
-				<App
-					api={api}
-					routeHistory={routeHistory}
-					entityStorage={entityStorage}
-					serverControls={serverControls}
-				/>
+				<ArtifactImageProvider load={loadImageArtifact}>
+					<App
+						api={api}
+						routeHistory={routeHistory}
+						entityStorage={entityStorage}
+						serverControls={serverControls}
+					/>
+				</ArtifactImageProvider>
 			</TooltipProvider>
 		</QueryClientProvider>
 	);

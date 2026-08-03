@@ -2,12 +2,13 @@
 
 use agent_tools::{ProviderTool, ToolRegistry};
 use agent_vocab::{
-    AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, TranscriptItem,
-    TurnId,
+    AssistantMessage, ImageArtifactId, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall,
+    TranscriptItem, TurnId,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub mod anthropic;
@@ -25,6 +26,14 @@ pub use token_estimator::{
 };
 pub use transcript::normalize_transcript_for_provider;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedImage {
+    pub mime_type: String,
+    pub data: String,
+}
+
+pub type ResolvedImageMap = BTreeMap<ImageArtifactId, ResolvedImage>;
+
 #[derive(Debug, Clone)]
 pub struct ModelRequest {
     pub model: String,
@@ -38,6 +47,7 @@ pub struct ModelRequest {
     /// sidecar-only suffix does not become the cache breakpoint.
     pub transcript_cache_prefix_len: Option<usize>,
     pub transcript: Vec<ModelTranscriptEntry>,
+    pub resolved_images: ResolvedImageMap,
     pub tool_profile: ProviderToolProfile,
     pub tools: Vec<ProviderTool>,
     pub max_tokens: Option<u32>,
@@ -91,6 +101,7 @@ pub struct ProviderCompactionRequest {
     pub model: String,
     pub prompt: PromptSections,
     pub transcript: Vec<ModelTranscriptEntry>,
+    pub resolved_images: ResolvedImageMap,
     pub tool_profile: ProviderToolProfile,
     pub tools: Vec<ProviderTool>,
     pub reasoning_effort: ReasoningEffort,
@@ -116,6 +127,7 @@ pub struct ProviderTokenCountRequest {
     pub model: String,
     pub prompt: PromptSections,
     pub transcript: Vec<ModelTranscriptEntry>,
+    pub resolved_images: ResolvedImageMap,
     pub tool_profile: ProviderToolProfile,
     pub tools: Vec<ProviderTool>,
     pub max_tokens: Option<u32>,

@@ -8,12 +8,13 @@ use agent_mcp_types::{
     McpSessionSelection, McpToolView,
 };
 use agent_tools::ProviderTool;
-use agent_vocab::{ProviderKind, ToolCall, ToolResultMessage};
+use agent_vocab::{InlineToolResultMessage, ProviderKind, ToolCall};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 pub const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
+pub const MAX_RUNTIME_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeHello {
@@ -29,6 +30,12 @@ pub async fn read_frame<T: for<'de> Deserialize<'de>>(
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error),
     };
+    if length > MAX_RUNTIME_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("runtime protocol frame exceeds {MAX_RUNTIME_FRAME_BYTES} bytes"),
+        ));
+    }
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes).await?;
     serde_json::from_slice(&bytes)
@@ -42,6 +49,12 @@ pub async fn write_frame<T: Serialize>(
 ) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if bytes.len() > MAX_RUNTIME_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("runtime protocol frame exceeds {MAX_RUNTIME_FRAME_BYTES} bytes"),
+        ));
+    }
     let length = u32::try_from(bytes.len()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -247,7 +260,7 @@ impl RuntimeCommand {
 pub enum RuntimeCommandResult {
     Ack,
     Materialized { workspaces: Vec<SessionWorkspace> },
-    Tool { result: ToolResultMessage },
+    Tool { result: InlineToolResultMessage },
     FileContents { contents: Option<String> },
     RuntimeContext { context: RuntimeContext },
     McpInventory { inventory: McpInventory },

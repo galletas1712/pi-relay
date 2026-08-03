@@ -22,7 +22,12 @@ import type {
 	TranscriptDestination,
 	TranscriptTurnPageIdentity,
 } from "./transcript.tsx";
-import { Composer, type ComposerHandle } from "./composer.tsx";
+import {
+	Composer,
+	ComposerDraftStore,
+	composerDraftKey,
+	type ComposerHandle,
+} from "./composer.tsx";
 import { routeComposerSubmission, type ComposerSubmission } from "./composerRouting.ts";
 import {
 	assertRemoteActionAllowed,
@@ -145,9 +150,9 @@ import {
 	providerModelKey,
 	providerReasoningEffort,
 	reasoningEffortsForProvider,
-	textContent,
 	withReasoningEffort,
 } from "./sessionDefaults.ts";
+import { replaceTextPreserveImages } from "./imageContent.ts";
 import {
 	IntermediateUiStateError,
 	isSelectedSessionFetchError,
@@ -211,6 +216,7 @@ import {
 	type WorkspaceRouteParseResult,
 } from "./workspaceRoute.ts";
 import type {
+	ContentBlock,
 	EventFrame,
 	McpInventory,
 	McpLoginResult,
@@ -401,7 +407,14 @@ export function App({
 	const [reconciledMcpInventoryIdentity, setReconciledMcpInventoryIdentity] =
 		useState<string | null>(null);
 	const [newSessionSetupGeneration, setNewSessionSetupGeneration] = useState(0);
-	const [sending, setSending] = useState(false);
+	const [sendingDrafts, setSendingDrafts] = useState<Set<string>>(
+		() => new Set(),
+	);
+	const sendingDraftsRef = useRef(new Set<string>());
+	const composerDraftStore = useMemo(
+		() => new ComposerDraftStore(entityStorage),
+		[entityStorage],
+	);
 	const mountLifetimeRef = useRef(new AbortController());
 	// Aborts the uncertain-start reconcile poll so it cannot outlive the view and
 	// keep writing workspace-preparation state after unmount.
@@ -410,8 +423,9 @@ export function App({
 		() => () => {
 			mountLifetimeRef.current.abort();
 			reconcileAbortRef.current?.abort();
+			composerDraftStore.dispose();
 		},
-		[],
+		[composerDraftStore],
 	);
 	const [workspacePreparation, setWorkspacePreparation] =
 		useState<{ projectId: string; status: string } | null>(null);
@@ -3273,7 +3287,7 @@ export function App({
 	const queueUserInput = useCallback(
 		async (
 			sessionId: string,
-			text: string,
+			content: ContentBlock[],
 			snapshot: SessionSnapshot,
 			clientInputId: string,
 		) => {
@@ -3304,7 +3318,6 @@ export function App({
 				}));
 				invalidateSessionList(projectId);
 			}
-			const content = textContent(text);
 			const result = await api.queueFollowUp({
 				sessionId,
 				clientInputId,
@@ -3337,10 +3350,10 @@ export function App({
 	);
 
 	const startNewSession = useCallback(
-		async (text: string, clientInputId: string, sessionId: string) => {
+		async (content: ContentBlock[], clientInputId: string, sessionId: string) => {
 			assertServerMutationAllowed();
 			const projectId = selectedProjectRef.current;
-			const title = nextSessionTitleRef.current || titleFromText(text);
+			const title = nextSessionTitleRef.current || titleFromContent(content);
 			nextSessionTitleRef.current = null;
 			const submittedWorkspaceScope = projectId
 				? workspaceScopeRef.current.map((entry) => ({ ...entry }))
@@ -3372,7 +3385,7 @@ export function App({
 				},
 				clientInputId,
 				priority: "follow_up" as const,
-				content: textContent(text),
+				content,
 				workspaces,
 				mcp: mcpSelectionPayloadForProvider(
 					newSessionProvider.kind,
@@ -3731,8 +3744,13 @@ export function App({
 			assertServerMutationAllowed();
 			const sessionId = requireSelected();
 			const projectId = selectedProjectRef.current;
-			const queueRevision = selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current.snapshot?.queue_revision : undefined;
-			const result = await api.updateQueuedInput(sessionId, inputId, textContent(text), queueRevision);
+			const snapshot =
+				selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current.snapshot : null;
+			const queueRevision = snapshot?.queue_revision;
+			const existing =
+				snapshot?.queued_inputs?.find((input) => input.input_id === inputId)?.content ?? [];
+			const content = replaceTextPreserveImages(existing, text);
+			const result = await api.updateQueuedInput(sessionId, inputId, content, queueRevision);
 			updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue));
 			invalidateSessionList(projectId);
 		},
@@ -3966,14 +3984,22 @@ export function App({
 
 	const submitComposer = useCallback(
 		async (submission: ComposerSubmission) => {
-			if (!submission.text.trim() || sending) return false;
+			const hasImages = submission.content.some((block) => block.type === "image");
+			const draftKey = composerDraftKey(submission.sessionId);
+			if (
+				(!submission.text.trim() && !hasImages) ||
+				sendingDraftsRef.current.has(draftKey)
+			) {
+				return false;
+			}
 			if (
 				connectionRemoteActionBlockedReason &&
 				composerTextNeedsConnection(submission.text)
 			) {
 				return false;
 			}
-			setSending(true);
+			sendingDraftsRef.current.add(draftKey);
+			setSendingDrafts(new Set(sendingDraftsRef.current));
 			try {
 				return await routeComposerSubmission(submission, {
 					getLoadedSnapshot: (sessionId) => {
@@ -3991,12 +4017,14 @@ export function App({
 					},
 				});
 			} finally {
-				setSending(false);
+				sendingDraftsRef.current.delete(draftKey);
+				setSendingDrafts(new Set(sendingDraftsRef.current));
 			}
 		},
-		[api, assertServerMutationAllowed, connectionRemoteActionBlockedReason, executeSlash, getSelectedCache, pushErrorNotice, queueUserInput, sending, startNewSession],
+		[api, assertServerMutationAllowed, connectionRemoteActionBlockedReason, executeSlash, getSelectedCache, pushErrorNotice, queueUserInput, startNewSession],
 	);
 
+	const selectedDraftSending = sendingDrafts.has(composerDraftKey(selectedId));
 	const canStop = !!selectedId && loadedSnapshot?.activity === "running";
 	const queuedInputs = (loadedSnapshot?.queued_inputs ?? []).filter(
 		(input) => input.content_type !== "daemon_tool_observation" && input.editable !== false,
@@ -4612,7 +4640,7 @@ export function App({
 									onMcpLogin={(server) => void loginMcp(server)}
 									onMcpLogout={cancelOrLogoutMcp}
 									mcpAuthBusyServer={mcpAuthBusyServer}
-									disabled={sending}
+									disabled={selectedDraftSending}
 									workspacePreparationStatus={workspacePreparationStatus}
 									mcpAuthMutationBlockedReason={connectionRemoteActionBlockedReason}
 								/>
@@ -4703,13 +4731,15 @@ export function App({
 							loadedSnapshot?.session_id === selectedId && !!loadedSnapshot.parent_session_id
 						}
 						composerHandleRef={composerHandleRef}
-						sending={sending}
+						sending={selectedDraftSending}
 						canStop={canStop}
 						stopping={stopping}
 						queuedInputs={queuedInputs}
 						mutationBlockedReason={connectionRemoteActionBlockedReason}
 						newSessionSetupGeneration={newSessionSetupGeneration}
 						storage={entityStorage}
+						draftStore={composerDraftStore}
+						uploadImage={(input) => api.uploadImage(input)}
 						onSubmit={submitComposer}
 						onStop={handleStop}
 						onPromoteQueued={handlePromoteQueued}
@@ -4874,8 +4904,13 @@ export function App({
 	);
 }
 
-function titleFromText(text: string): string {
-	return truncate(firstLine(text).trim() || "New session", 64);
+function titleFromContent(content: ContentBlock[]): string {
+	const text = content
+		.filter((block): block is Extract<ContentBlock, { type: "text" }> => block.type === "text")
+		.map((block) => block.text)
+		.join("\n");
+	const fallback = content.some((block) => block.type === "image") ? "Image" : "New session";
+	return truncate(firstLine(text).trim() || fallback, 64);
 }
 
 function errorMessageOrNull(error: unknown): string | null {

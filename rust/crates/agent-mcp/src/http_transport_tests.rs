@@ -3,7 +3,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use agent_tools::{ProviderTool, ToolRegistry};
-use agent_vocab::ProviderKind;
+use agent_vocab::{InlineContentBlock, ProviderKind};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use pretty_assertions::assert_eq;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +21,7 @@ enum FakeMode {
     StatelessJson,
     StatefulSseStaleCall,
     StatefulSseSecrets,
+    StatefulSseImage,
     StatefulTimeoutCall,
     StatefulListChanged,
     OversizedInitialize,
@@ -33,6 +36,46 @@ enum FakeMode {
     ReconnectExhaustion,
     InitialCommonGetUnavailable,
     InitialCommonGetUnsupported,
+}
+
+#[tokio::test]
+async fn stateful_sse_call_normalizes_a_large_ordered_image_result() {
+    let server = FakeHttpServer::spawn(FakeMode::StatefulSseImage, None).await;
+    let manager = McpManager::start(remote_config(&server.url, None, 2_000))
+        .await
+        .expect("stateful image manager starts");
+    let inventory = manager
+        .inventory(ProviderKind::OpenAi, &first_party())
+        .await
+        .expect("image inventory loads");
+    let snapshot = select_all(&manager, &inventory).await;
+    let tool = snapshot
+        .manifest()
+        .tools
+        .iter()
+        .find(|tool| tool.raw_name == "echo")
+        .expect("echo tool selected");
+
+    let output = manager
+        .call(
+            &snapshot,
+            &tool.exposed_name,
+            json!({"value": "large-image"}),
+        )
+        .await
+        .expect("large SSE image call succeeds");
+    assert!(!output.is_error);
+    assert_eq!(output.content.len(), 3);
+    assert_eq!(output.content[0], InlineContentBlock::text("before"));
+    let InlineContentBlock::Image { mime_type, data } = &output.content[1] else {
+        panic!("middle block is not an image");
+    };
+    assert_eq!(mime_type, "image/png");
+    let decoded = STANDARD.decode(data).expect("image base64 decodes");
+    assert!(decoded.len() > SSE_NON_DATA_LINE_LIMIT);
+    assert!(decoded.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(output.content[2], InlineContentBlock::text("after"));
+    manager.shutdown().await;
 }
 
 #[test]
@@ -459,7 +502,7 @@ async fn stateless_json_remote_discovers_calls_authenticates_and_ignores_instruc
             .await
             .expect("remote call succeeds"),
         McpCallOutput {
-            output: "hello <redacted>".to_string(),
+            content: vec![agent_vocab::InlineContentBlock::text("hello <redacted>")],
             is_error: false,
         }
     );
@@ -635,7 +678,7 @@ async fn inbound_secret_is_scrubbed_from_json_sse_errors_catalog_and_output() {
             .call(&snapshot, &tool, json!({"value": "reflected"}))
             .await
             .expect("reflected result succeeds");
-        assert!(!output.output.contains(&bearer));
+        assert!(!agent_vocab::inline_content_display_text(&output.content).contains(&bearer));
         if matches!(mode, FakeMode::StatelessJson) {
             let error = manager
                 .call(&snapshot, &tool, json!({"value": "echo-secret"}))
@@ -913,9 +956,28 @@ fn sse_parser_enforces_line_event_data_event_count_and_termination_limits() {
     let mut pending = VecDeque::new();
     let mut line = parser();
     assert!(matches!(
-        line.push(&vec![b'x'; SSE_LINE_LIMIT + 1], &mut pending),
+        line.push(&vec![b'x'; SSE_NON_DATA_LINE_LIMIT + 1], &mut pending),
         Err(BoundedHttpError::BodyTooLarge)
     ));
+    let mut comment = parser();
+    assert!(matches!(
+        comment.push(
+            format!(":{}", "x".repeat(SSE_NON_DATA_LINE_LIMIT)).as_bytes(),
+            &mut pending
+        ),
+        Err(BoundedHttpError::BodyTooLarge)
+    ));
+    let mut large_data = parser();
+    large_data
+        .push(
+            format!(
+                "data: {{\"payload\":\"{}\"}}\n\n",
+                "x".repeat(SSE_NON_DATA_LINE_LIMIT)
+            )
+            .as_bytes(),
+            &mut pending,
+        )
+        .expect("data line may exceed the non-data physical line limit");
 
     let mut event = parser();
     let event_bytes = format!(
@@ -1276,7 +1338,7 @@ async fn handle_request(
             "200 OK",
             Some("text/event-stream"),
             None,
-            &format!("data: {}", "x".repeat(SSE_LINE_LIMIT + 1)),
+            &format!("field: {}", "x".repeat(SSE_NON_DATA_LINE_LIMIT + 1)),
         )
         .await;
         return;
@@ -1357,6 +1419,17 @@ async fn handle_request(
                 }
             ]
         }),
+        "tools/call" if matches!(mode, FakeMode::StatefulSseImage) => {
+            let mut bytes = vec![0_u8; SSE_NON_DATA_LINE_LIMIT + 1];
+            bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+            json!({
+                "content": [
+                    {"type":"text","text":"before"},
+                    {"type":"image","mimeType":"image/png","data":STANDARD.encode(bytes)},
+                    {"type":"text","text":"after"}
+                ]
+            })
+        }
         "tools/call" => json!({
             "content": [{
                 "type": "text",
@@ -1378,6 +1451,7 @@ async fn handle_request(
         mode,
         FakeMode::StatefulSseStaleCall
             | FakeMode::StatefulSseSecrets
+            | FakeMode::StatefulSseImage
             | FakeMode::StatefulTimeoutCall
             | FakeMode::StatefulListChanged
             | FakeMode::ReconnectExhaustion
@@ -1387,7 +1461,7 @@ async fn handle_request(
     let session = stateful.then_some("test-session");
     if matches!(
         mode,
-        FakeMode::StatefulSseStaleCall | FakeMode::StatefulSseSecrets
+        FakeMode::StatefulSseStaleCall | FakeMode::StatefulSseSecrets | FakeMode::StatefulSseImage
     ) {
         write_response(
             &mut stream,

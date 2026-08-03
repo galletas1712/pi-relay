@@ -16,8 +16,8 @@ use agent_runtime_protocol::{
     RuntimeCommandError, RuntimeCommandResult, RuntimeHello, RuntimeToControl, SelectedWorkspace,
     HEARTBEAT_INTERVAL_SECS,
 };
-use agent_tools::{ToolContext, ToolRegistry};
-use agent_vocab::{ToolCall, ToolResultMessage};
+use agent_tools::ToolRegistry;
+use agent_vocab::{InlineToolResultMessage, ToolCall};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -39,25 +39,190 @@ const MCP_CONFIG_FILE: &str = "mcp.toml";
 /// Carries a pre-shaped RuntimeCommandError through anyhow so the connection
 /// loop can put the stable slug on the wire instead of a generic runtime_error.
 #[derive(Debug, Clone)]
-struct McpWireError(RuntimeCommandError);
+struct RuntimeWireError(RuntimeCommandError);
 
-impl std::fmt::Display for McpWireError {
+impl std::fmt::Display for RuntimeWireError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}: {}", self.0.code, self.0.message)
     }
 }
 
-impl std::error::Error for McpWireError {}
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use agent_vocab::{
+        decode_base64_bounded, InlineContentBlock, ProviderKind, ToolCall, ToolCallId,
+    };
+    use std::fs;
+
+    fn test_runtime(root: &std::path::Path) -> Runtime {
+        Runtime {
+            workspaces: WorkspaceManager::new(
+                root.to_path_buf(),
+                root.join("config"),
+                root.join("home"),
+            )
+            .expect("pin disposable workspace root"),
+            tools: Arc::new(ToolRegistry::with_builtin_tools()),
+            running: Default::default(),
+            mcp: McpManager::disabled(),
+        }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "pi-runtime-capability-{label}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create disposable runtime root");
+        root
+    }
+
+    fn read_image_command(workspace_id: &str, path: &str) -> RuntimeCommand {
+        RuntimeCommand::ExecuteTool {
+            workspace_id: workspace_id.to_string(),
+            provider: ProviderKind::OpenAi,
+            tool_call: ToolCall {
+                id: ToolCallId::new("call_read_image"),
+                tool_name: "ReadImage".to_string(),
+                args_json: json!({ "path": path }).to_string(),
+            },
+        }
+    }
+
+    fn tiny_png(marker: u8) -> Vec<u8> {
+        let mut bytes = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        bytes.push(marker);
+        bytes
+    }
+
+    #[test]
+    fn missing_workspace_capability_maps_to_a_typed_runtime_error() {
+        let root = temp_root("missing");
+        let runtime = test_runtime(&root);
+
+        let error = runtime
+            .workspaces
+            .tool_context("missing-session")
+            .map_err(workspace_capability_wire_error)
+            .expect_err("missing session cwd must fail capability acquisition");
+        let wire = into_runtime_command_error(error);
+
+        assert_eq!(wire.code, "workspace_capability_unavailable");
+        assert!(wire.message.contains("session workspace is unavailable"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn execute_tool_reads_from_the_verified_managed_cwd() {
+        let root = temp_root("normal");
+        let runtime = test_runtime(&root);
+        let cwd = root.join("sessions/session-normal/cwd");
+        fs::create_dir_all(&cwd).expect("create managed cwd");
+        let expected = tiny_png(1);
+        fs::write(cwd.join("pixel.png"), &expected).expect("write managed image");
+
+        let result = runtime
+            .execute(read_image_command("session-normal", "pixel.png"), None)
+            .await
+            .expect("execute ReadImage");
+        let RuntimeCommandResult::Tool { result } = result else {
+            panic!("expected tool result");
+        };
+        let InlineContentBlock::Image { data, .. } = &result.content[1] else {
+            panic!("expected image content");
+        };
+        assert_eq!(
+            decode_base64_bounded(data).expect("decode returned image"),
+            expected
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_tool_rejects_replaced_cwd_outside_the_pinned_root() {
+        let root = temp_root("outside");
+        let runtime = test_runtime(&root);
+        let session = root.join("sessions/session-outside");
+        let cwd = session.join("cwd");
+        fs::create_dir_all(&cwd).expect("create managed cwd");
+        fs::rename(&cwd, session.join("displaced-cwd")).expect("displace managed cwd");
+        let outside = temp_root("external");
+        let external = tiny_png(2);
+        fs::write(outside.join("external.png"), &external).expect("write external image");
+        std::os::unix::fs::symlink(&outside, &cwd).expect("replace cwd with external symlink");
+
+        let error = runtime
+            .execute(read_image_command("session-outside", "external.png"), None)
+            .await
+            .expect_err("replaced cwd must fail capability acquisition");
+        let wire = into_runtime_command_error(error);
+        assert_eq!(wire.code, "workspace_capability_unavailable");
+        assert!(!wire
+            .message
+            .contains(&agent_vocab::encode_base64(&external)));
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_tool_rejects_replaced_cwd_inside_the_pinned_root() {
+        let root = temp_root("inside");
+        let runtime = test_runtime(&root);
+        let victim = root.join("sessions/session-victim");
+        let cwd = victim.join("cwd");
+        fs::create_dir_all(&cwd).expect("create victim cwd");
+        fs::rename(&cwd, victim.join("displaced-cwd")).expect("displace victim cwd");
+        let other = root.join("sessions/session-other/cwd");
+        fs::create_dir_all(&other).expect("create other managed cwd");
+        let other_bytes = tiny_png(3);
+        fs::write(other.join("other.png"), &other_bytes).expect("write other image");
+        std::os::unix::fs::symlink("../session-other/cwd", &cwd)
+            .expect("replace cwd with in-root symlink");
+
+        let error = runtime
+            .execute(read_image_command("session-victim", "other.png"), None)
+            .await
+            .expect_err("in-root cwd substitution must fail capability acquisition");
+        let wire = into_runtime_command_error(error);
+        assert_eq!(wire.code, "workspace_capability_unavailable");
+        assert!(!wire
+            .message
+            .contains(&agent_vocab::encode_base64(&other_bytes)));
+
+        fs::remove_dir_all(root).ok();
+    }
+}
+
+impl std::error::Error for RuntimeWireError {}
+
+fn workspace_capability_wire_error(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(RuntimeWireError(RuntimeCommandError::new(
+        "workspace_capability_unavailable",
+        format!("session workspace is unavailable: {error:#}"),
+    )))
+}
 
 fn into_runtime_command_error(error: anyhow::Error) -> RuntimeCommandError {
-    if let Some(wire) = error.downcast_ref::<McpWireError>() {
+    if let Some(wire) = error.downcast_ref::<RuntimeWireError>() {
         return wire.0.clone();
     }
     RuntimeCommandError::new("runtime_error", format!("{error:#}"))
 }
 
 fn mcp_manager_wire_error(error: McpManagerError) -> anyhow::Error {
-    anyhow::Error::new(McpWireError(match error {
+    anyhow::Error::new(RuntimeWireError(match error {
         McpManagerError::InventoryChanged { current_revision } => RuntimeCommandError::with_data(
             "mcp_inventory_changed",
             "MCP inventory changed; refresh and review the selection",
@@ -82,14 +247,14 @@ fn mcp_manager_wire_error(error: McpManagerError) -> anyhow::Error {
 }
 
 fn mcp_catalog_wire_error(error: anyhow::Error) -> anyhow::Error {
-    anyhow::Error::new(McpWireError(RuntimeCommandError::new(
+    anyhow::Error::new(RuntimeWireError(RuntimeCommandError::new(
         "mcp_selection_invalid",
         format!("invalid MCP catalog: {error:#}"),
     )))
 }
 
 fn mcp_credential_store_wire_error(_error: OAuthCredentialStoreError) -> anyhow::Error {
-    anyhow::Error::new(McpWireError(RuntimeCommandError::new(
+    anyhow::Error::new(RuntimeWireError(RuntimeCommandError::new(
         "mcp_oauth_credential_store_failed",
         "MCP OAuth credential storage is unavailable",
     )))
@@ -144,7 +309,7 @@ fn mcp_oauth_wire_error(error: McpOAuthLoginError) -> anyhow::Error {
             "The MCP OAuth login could not be completed",
         ),
     };
-    anyhow::Error::new(McpWireError(RuntimeCommandError::new(code, message)))
+    anyhow::Error::new(RuntimeWireError(RuntimeCommandError::new(code, message)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +336,17 @@ struct Runtime {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = load_config()?;
+    let workspaces = WorkspaceManager::new(
+        config.workspace_root.clone(),
+        config.config_root.clone(),
+        config.home_dir.clone(),
+    )?;
+    workspaces.validate_root().await.with_context(|| {
+        format!(
+            "workspace_root {} must support btrfs subvolumes",
+            config.workspace_root.display()
+        )
+    })?;
     // MCP servers run on the runtime host next to tool execution. The OAuth
     // credential store lives alongside the managed workspaces under the
     // configured workspace_root.
@@ -189,21 +365,11 @@ async fn main() -> Result<()> {
         }
     };
     let runtime = Runtime {
-        workspaces: WorkspaceManager::new(
-            config.workspace_root.clone(),
-            config.config_root.clone(),
-            config.home_dir.clone(),
-        ),
+        workspaces,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         running: Default::default(),
         mcp,
     };
-    runtime.workspaces.validate_root().await.with_context(|| {
-        format!(
-            "workspace_root {} must support btrfs subvolumes",
-            config.workspace_root.display()
-        )
-    })?;
     loop {
         match connect(&config, runtime.clone()).await {
             Ok(()) => eprintln!("control connection closed"),
@@ -494,7 +660,10 @@ impl Runtime {
                     .workspaces
                     .acquire_cwd_mutation_guard(&workspace_id)
                     .await;
-                let context = ToolContext::new(self.workspaces.resolve(&workspace_id));
+                let context = self
+                    .workspaces
+                    .tool_context(&workspace_id)
+                    .map_err(workspace_capability_wire_error)?;
                 let result = self.tools.execute(provider, &tool_call, &context).await?;
                 Ok(RuntimeCommandResult::Tool { result })
             }
@@ -559,9 +728,10 @@ impl Runtime {
             RuntimeCommand::ExecuteMcpTool {
                 manifest,
                 tool_call,
-            } => Ok(RuntimeCommandResult::Tool {
-                result: self.execute_mcp_tool(manifest, tool_call).await,
-            }),
+            } => {
+                let result = self.execute_mcp_tool(manifest, tool_call).await;
+                Ok(RuntimeCommandResult::Tool { result })
+            }
             RuntimeCommand::McpToolViews { manifest } => Ok(RuntimeCommandResult::McpToolViews {
                 views: self
                     .mcp
@@ -606,18 +776,18 @@ impl Runtime {
         }
     }
 
-    /// Run one MCP tool call and shape it into a ToolResultMessage, mirroring the
+    /// Run one MCP tool call and shape it into a transient inline result, mirroring the
     /// former in-process control-plane path (success unless the server reports an
     /// error or dispatch fails).
     async fn execute_mcp_tool(
         &self,
         manifest: McpSessionManifest,
         tool_call: ToolCall,
-    ) -> ToolResultMessage {
+    ) -> InlineToolResultMessage {
         let snapshot = match McpSessionSnapshot::new(manifest) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                return ToolResultMessage::error(
+                return InlineToolResultMessage::error(
                     tool_call.id,
                     tool_call.tool_name,
                     format!("invalid MCP manifest: {error:#}"),
@@ -627,9 +797,11 @@ impl Runtime {
         let arguments = serde_json::from_str(&tool_call.args_json).unwrap_or(Value::Null);
         let ToolCall { id, tool_name, .. } = tool_call;
         match self.mcp.call(&snapshot, &tool_name, arguments).await {
-            Ok(output) if output.is_error => ToolResultMessage::error(id, tool_name, output.output),
-            Ok(output) => ToolResultMessage::success(id, tool_name, output.output),
-            Err(error) => ToolResultMessage::error(id, tool_name, error.to_string()),
+            Ok(output) if output.is_error => {
+                InlineToolResultMessage::error_content(id, tool_name, output.content)
+            }
+            Ok(output) => InlineToolResultMessage::success_content(id, tool_name, output.content),
+            Err(error) => InlineToolResultMessage::error(id, tool_name, error.to_string()),
         }
     }
 }

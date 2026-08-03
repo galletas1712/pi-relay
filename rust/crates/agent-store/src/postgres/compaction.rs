@@ -971,7 +971,7 @@ mod tests {
     use super::*;
     use agent_vocab::{
         ActionId, AssistantItem, AssistantMessage, CompactionSummary, ToolCall, ToolCallId,
-        ToolResultMessage, ToolResultStatus, TurnOutcome, UserMessage,
+        ToolResultMessage, TurnOutcome, UserMessage,
     };
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
@@ -983,12 +983,7 @@ mod tests {
     }
 
     fn successful_tool_result(tool_call: &ToolCall, output: &str) -> ToolResultMessage {
-        ToolResultMessage {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.tool_name.clone(),
-            output: output.to_string(),
-            status: ToolResultStatus::Success,
-        }
+        ToolResultMessage::success(tool_call.id.clone(), tool_call.tool_name.clone(), output)
     }
 
     fn stored_entry(id: &str, timestamp_ms: u64, item: TranscriptItem) -> StoredTranscriptEntry {
@@ -1103,7 +1098,7 @@ mod tests {
             .any(|item| matches!(
                 item,
                 TranscriptItem::ToolResult(result)
-                    if result.output.contains("caused overflow")
+                    if result.display_text().contains("caused overflow")
             )));
     }
 }

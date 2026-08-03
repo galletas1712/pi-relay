@@ -1,13 +1,12 @@
 use std::time::Duration;
 
-use agent_vocab::{ToolCall, ToolDefinition, ToolResultMessage};
+use agent_vocab::{InlineToolResultMessage, ToolCall, ToolDefinition};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::context::ToolContext;
 use crate::error::ToolResult;
-use crate::output::limit_tool_output_with_max_tokens;
 use crate::registry::AgentTool;
 
 /// Single shell tool, registered as `Bash` for both providers.
@@ -25,8 +24,8 @@ struct BashArgs {
     command: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
-    #[serde(default)]
-    max_output_tokens: Option<usize>,
+    #[serde(default, rename = "max_output_tokens")]
+    _max_output_tokens: Option<usize>,
 }
 
 #[async_trait]
@@ -61,7 +60,11 @@ impl AgentTool for BashTool {
         )
     }
 
-    async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolContext,
+    ) -> ToolResult<InlineToolResultMessage> {
         let args: BashArgs = serde_json::from_str(&call.args_json)?;
         run_bash(call, ctx, args).await
     }
@@ -71,21 +74,21 @@ async fn run_bash(
     call: &ToolCall,
     ctx: &ToolContext,
     args: BashArgs,
-) -> ToolResult<ToolResultMessage> {
+) -> ToolResult<InlineToolResultMessage> {
     let timeout = args
         .timeout_ms
         .map(Duration::from_millis)
-        .unwrap_or(ctx.timeout);
+        .unwrap_or_else(|| ctx.timeout());
     let mut command = tokio::process::Command::new("bash");
     command.arg("-lc").arg(args.command);
-    command.current_dir(&ctx.cwd);
+    command.current_dir(ctx.cwd());
     // Keep timeouts as ordinary tool results so the transcript records a
     // recoverable failure at the tool-call boundary instead of a generic crash.
     command.kill_on_drop(true);
     let output = match tokio::time::timeout(timeout, command.output()).await {
         Ok(output) => output?,
         Err(_) => {
-            return Ok(ToolResultMessage::error(
+            return Ok(InlineToolResultMessage::error(
                 call.id.clone(),
                 &call.tool_name,
                 format!("command timed out after {} ms", timeout.as_millis()),
@@ -98,11 +101,10 @@ async fn run_bash(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = limit_tool_output_with_max_tokens(text, args.max_output_tokens);
     let result = if output.status.success() {
-        ToolResultMessage::success(call.id.clone(), &call.tool_name, text)
+        InlineToolResultMessage::success(call.id.clone(), &call.tool_name, text)
     } else {
-        ToolResultMessage::error(call.id.clone(), &call.tool_name, text)
+        InlineToolResultMessage::error(call.id.clone(), &call.tool_name, text)
     };
     Ok(result)
 }
@@ -113,7 +115,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use agent_vocab::{ToolCallId, ToolResultMessage, ToolResultStatus};
+    use agent_vocab::{InlineToolResultMessage, ToolCallId, ToolResultStatus};
+    use cap_std::{ambient_authority, fs::Dir};
     use serde_json::json;
 
     use super::*;
@@ -135,6 +138,13 @@ mod tests {
         }
     }
 
+    fn context(root: &PathBuf) -> ToolContext {
+        ToolContext::new(
+            root,
+            Dir::open_ambient_dir(root, ambient_authority()).expect("open disposable workspace"),
+        )
+    }
+
     #[test]
     fn definition_advertises_string_command_only() {
         let definition = BashTool.definition();
@@ -151,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn text_commands_run_with_bash_semantics() {
         let root = workspace();
-        let ctx = ToolContext::new(&root);
+        let ctx = context(&root);
 
         let result = BashTool
             .execute(
@@ -163,7 +173,7 @@ mod tests {
 
         assert_eq!(
             result,
-            ToolResultMessage::success(
+            InlineToolResultMessage::success(
                 ToolCallId("call_bash".to_string()),
                 "Bash",
                 "exit: exit status: 0\nstdout:\nbash\n\nstderr:\n",
@@ -175,7 +185,7 @@ mod tests {
     #[tokio::test]
     async fn text_commands_do_not_enable_strict_mode() {
         let root = workspace();
-        let ctx = ToolContext::new(&root);
+        let ctx = context(&root);
 
         let result = BashTool
             .execute(
@@ -187,7 +197,7 @@ mod tests {
 
         assert_eq!(
             result,
-            ToolResultMessage::success(
+            InlineToolResultMessage::success(
                 ToolCallId("call_bash".to_string()),
                 "Bash",
                 "exit: exit status: 0\nstdout:\nbefore\nafter\n\nstderr:\n",
@@ -199,7 +209,7 @@ mod tests {
     #[tokio::test]
     async fn timeouts_return_tool_error_results() {
         let root = workspace();
-        let ctx = ToolContext::new(&root);
+        let ctx = context(&root);
         let call = ToolCall {
             id: ToolCallId("call_bash".to_string()),
             tool_name: "Bash".to_string(),
@@ -214,7 +224,7 @@ mod tests {
         assert_eq!(result.status, ToolResultStatus::Error);
         assert_eq!(result.tool_call_id, ToolCallId("call_bash".to_string()));
         assert_eq!(result.tool_name, "Bash");
-        assert!(result.output.contains("command timed out after"));
+        assert!(result.display_text().contains("command timed out after"));
         fs::remove_dir_all(root).ok();
     }
 }

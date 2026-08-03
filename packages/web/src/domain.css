@@ -1240,6 +1240,51 @@ pre {
 	padding: 9px 12px;
 }
 
+.content-block-text + .content-block-image-wrap,
+.content-block-image-wrap + .content-block-text,
+.content-block-image-wrap + .content-block-image-wrap {
+	margin-top: 8px;
+}
+
+.content-block-image-wrap {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 4px;
+}
+
+.content-block-image {
+	display: block;
+	max-width: min(100%, 360px);
+	max-height: 280px;
+	border-radius: 8px;
+	object-fit: contain;
+	background: var(--muted);
+}
+
+.content-block-image-download,
+.content-block-image-loading,
+.content-block-image-error {
+	font-size: var(--text-xs);
+}
+
+.content-block-image-error {
+	color: var(--destructive);
+}
+
+.tool-output-blocks {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	min-width: 0;
+}
+
+.tool-output-blocks > pre {
+	margin: 0;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
 .assistant-block {
 	position: relative;
 	display: flex;
@@ -3340,15 +3385,46 @@ pre {
 .composer-wrap {
 	position: relative;
 	display: grid;
-	grid-template-columns: minmax(0, 1fr) 36px 36px;
+	grid-template-columns: minmax(0, 1fr) 36px 36px 36px;
 	gap: 8px;
 	max-width: 920px;
 	margin: 0 auto;
 }
 
+.composer-attachments,
+.composer-attachment-error {
+	grid-column: 1 / -1;
+}
+
+.composer-attachments {
+	min-width: 0;
+}
+
+.composer-attach-button {
+	height: 36px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--background);
+	color: var(--foreground);
+}
+
+.composer-attach-button {
+	width: 36px;
+	height: 44px;
+	align-self: end;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.composer-attachment-error {
+	color: var(--destructive);
+	font-size: var(--text-sm);
+}
+
 .composer-blocked-reason {
 	grid-column: 1 / -1;
-	grid-row: 2;
+	grid-row: auto;
 	justify-self: end;
 }
 
@@ -4442,7 +4518,8 @@ pre {
 	.primary-button,
 	.secondary-button,
 	.send-button,
-	.stop-button {
+	.stop-button,
+	.composer-attach-button {
 		min-width: 36px;
 		min-height: 36px;
 	}
@@ -4555,7 +4632,7 @@ pre {
 	}
 
 	.composer-wrap {
-		grid-template-columns: minmax(0, 1fr) 42px 42px;
+		grid-template-columns: minmax(0, 1fr) 42px 42px 42px;
 		gap: 6px;
 		max-width: none;
 	}
@@ -4567,7 +4644,8 @@ pre {
 	}
 
 	.send-button,
-	.stop-button {
+	.stop-button,
+	.composer-attach-button {
 		width: 42px;
 		height: 46px;
 	}
@@ -4780,11 +4858,12 @@ pre {
 	}
 
 	.composer-wrap {
-		grid-template-columns: minmax(0, 1fr) 40px 40px;
+		grid-template-columns: minmax(0, 1fr) 40px 40px 40px;
 	}
 
 	.send-button,
-	.stop-button {
+	.stop-button,
+	.composer-attach-button {
 		width: 40px;
 	}
 

@@ -333,7 +333,8 @@ mod tests {
 
         assert_eq!(result.status, ToolResultStatus::Success);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&result.output).expect("JSON result"),
+            serde_json::from_str::<serde_json::Value>(result.as_text().expect("text result"))
+                .expect("JSON result"),
             serde_json::json!({
                 "path": skill.path,
                 "content": skill.contents,
@@ -356,7 +357,10 @@ mod tests {
             args_json: serde_json::json!({"name":"workflow-review"}).to_string(),
         };
 
-        let output = load_skill_result(std::slice::from_ref(&workflow), &call).output;
+        let output = load_skill_result(std::slice::from_ref(&workflow), &call)
+            .as_text()
+            .expect("text result")
+            .to_string();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&output).expect("JSON result"),
             serde_json::json!({

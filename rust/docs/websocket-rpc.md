@@ -1394,22 +1394,74 @@ Consequently, the web Stop button on a selected root interrupts only that root,
 and Stop on a selected delegation child interrupts only that child. Use
 `delegation.cancel`/`cancel_delegation` to cancel a whole delegation.
 
-Content blocks use `agent-vocab`:
+Content blocks use the ref-only `agent-vocab` durable shape:
 
 ```json
 [
   { "type": "text", "text": "What is in this image?" },
-  {
-    "type": "image",
-    "image": {
-      "mime_type": "image/png",
-      "source": { "kind": "url", "value": "https://example.com/image.png" }
-    }
-  }
+  { "type": "image", "artifact_id": "sha256:<64 lowercase hex>" }
 ]
 ```
 
-Image sources support `url` and `base64`.
+Clients obtain the reference with `image.upload`; URL and inline-base64 blocks
+are not accepted by session/input RPCs. User-originated content is checked for
+reference existence, four-image count, and 10 MiB decoded aggregate before
+queue/transcript persistence. Owned durable user/tool `ContentBlock` JSON never
+contains base64. Historical URL blocks exist only as input to the one-time
+cutover, which replaces each URL in place with exact ordered text. Opaque
+provider-owned `provider_replay` remains untouched during migration and may
+contain historical provider payloads, including provider-native base64.
+
+## Image artifact RPC
+
+### `image.upload`
+
+Base64 is transient at this upload boundary:
+
+```json
+{
+  "method": "image.upload",
+  "params": {"mime_type":"image/png","data":"iVBORw0KGgo..."}
+}
+```
+
+Response:
+
+```json
+{
+  "artifact_id": "sha256:<64 lowercase hex>",
+  "mime_type": "image/png",
+  "byte_length": 12345
+}
+```
+
+PNG, JPEG, GIF, and WebP are supported. The daemon validates declared MIME
+against the decoded signature, rejects empty/invalid base64, and caps one image
+at 5 MiB decoded (`invalid_image`).
+
+### `image.get`
+
+```json
+{
+  "method": "image.get",
+  "params": {"artifact_id":"sha256:<64 lowercase hex>"}
+}
+```
+
+Response:
+
+```json
+{
+  "artifact_id": "sha256:<64 lowercase hex>",
+  "mime_type": "image/png",
+  "byte_length": 12345,
+  "data": "iVBORw0KGgo..."
+}
+```
+
+The daemon rechecks stored length, MIME signature, and SHA-256 before returning
+transient base64. Bad ids use `invalid_image_reference`; missing or corrupt
+artifacts use `image_unavailable`.
 
 ## History RPC
 
@@ -1732,11 +1784,16 @@ optional but recommended for retries.
 {
   "parent_session_id": "parent-session",
   "subagent_id": "session_...",
-  "message": "Please also check the retry path.",
+  "content": [
+    { "type": "text", "text": "Please also check the retry path." }
+  ],
   "interrupt": false,
   "client_control_id": "web_control_..."
 }
 ```
+
+`content` is required structured durable content. The scalar model-tool
+`message` field is not part of this websocket RPC.
 
 Result:
 
@@ -2200,12 +2257,13 @@ not content storage: daemon wakeup observation `input.queued` events do not
 inline prose summaries, full result JSON, final messages, or task prompts.
 
 `transcript.appended` carries the appended entry body when available, plus its
-compact `tree_node`, `active_leaf_id`, and revision counters:
+compact `tree_node`, `active_leaf_id`, and revision counters. The full item
+lives only under `entry` (not a duplicate top-level `item`):
 
 ```json
 {
   "entry_id": "entry_10",
-  "entry": { "id": "entry_10", "sequence": 10, "parent_id": "entry_9" },
+  "entry": { "id": "entry_10", "sequence": 10, "parent_id": "entry_9", "item": { "type": "assistant_message" } },
   "tree_node": { "id": "entry_10", "sequence": 10, "item_type": "assistant_message" },
   "active_leaf_id": "entry_10",
   "session_revision": 14,
@@ -2283,11 +2341,11 @@ Verify:
 
 ### 3. Image Input Persistence
 
-Send text plus an image block using both `url` and `base64` forms in separate
-turns. Complete the model through the harness.
-
-Verify the exact `mime_type` and source survive `history.context` and the
-stored transcript.
+Call `image.upload` with a small PNG, send text plus its returned `artifact_id`,
+and queue another mixed text/ref follow-up. Complete the model through the
+harness, restart the daemon, and verify `history.context`, transcript, queue,
+and events preserve block order and contain the ref but never upload base64.
+Call `image.get` and verify the returned MIME, length, and bytes.
 
 ### 4. Queueing, Steering, And Idempotency
 
@@ -2468,23 +2526,18 @@ With `~/.codex/auth.json` or `CODEX_ACCESS_TOKEN` available:
 Verify a real `model.completed`, assistant transcript entry, prompt-cache-key
 request path, and `session.idle`.
 
-For image support, send a public image URL, for example:
+For image support, upload bytes first, then include the returned reference:
 
 ```json
 {
   "type": "image",
-  "image": {
-    "mime_type": "image/png",
-    "source": {
-      "kind": "url",
-      "value": "https://raw.githubusercontent.com/github/explore/main/topics/rust/rust.png"
-    }
-  }
+  "artifact_id": "sha256:<64 lowercase hex>"
 }
 ```
 
-Verify the real response references the image and `history.context` still
-contains the original image block.
+Verify the real response references the image, `history.context` contains the
+same artifact ref, owned durable user/tool content contains no base64, and provider encoding
+occurs only after daemon batch resolution.
 
 ### 13. Real Anthropic Provider
 

@@ -255,14 +255,44 @@ The app subscribes to events for every visible session via `events.subscribe`, r
 
 ## Composer, queue, and slash commands
 
-The composer (`composer.tsx`) routes ordinary text according to the selected
+The composer (`composer.tsx`) routes ordinary submissions according to the selected
 transcript:
 
 - no selection calls `session.start`;
 - a selected top-level/root session calls `input.follow_up`;
 - a selected subagent calls the parent-scoped
   `delegation.steer_subagent`, using the loaded snapshot's
-  `parent_session_id`, its `session_id`, and the submitted text.
+  `parent_session_id`, its `session_id`, and the submitted `content` blocks.
+
+Submissions are `ContentBlock[]`: optional normalized text plus zero or more
+durable image references:
+
+```json
+{"type":"image","artifact_id":"sha256:<64 lowercase hex>"}
+```
+
+Picker, paste, and drop use one validator for MIME, signature, per-file size,
+count, and aggregate size. The browser first calls `image.upload` with transient
+base64 and receives the artifact reference used by `session.start`,
+`input.follow_up`, or `delegation.steer_subagent`. There is no client-facing URL
+image source. Image-only messages are allowed; slash commands reject attached
+images.
+
+Raw files, preview object URLs, and upload base64 stay in page memory keyed by
+target session and are never written to localStorage (text drafts still are).
+The composer optimistically captures and clears a ready submission while its RPC
+is pending, so the next draft stays editable. Failure restores the exact raw
+text and attachment identity only when that session still has no newer draft.
+Every preview URL is revoked on removal, capture success/discard, upload
+replacement/failure discard, or owning store disposal. A transient Composer
+view unmount does not revoke URLs held by the App-owned store, so pending
+uploads and previews survive remount.
+
+Transcript images call `image.get` through one bounded LRU that deduplicates
+in-flight reads and evicts failures. The returned base64 exists only long enough
+to build the browser data URL and download link; failed reads expose a named
+retry action. Text/Markdown export emits an artifact-reference placeholder and
+never embeds image bytes.
 
 The placeholder identifies the selected mode ("Follow up" or "Steer this
 subagent"). Cmd/Ctrl+Enter sends; Enter inserts a newline. There is no local
@@ -280,8 +310,8 @@ transcript. At submit time `Composer` captures an immutable session id, a
 restoration, and RPC dispatch use those captured values rather than rereading
 the current selection. App trusts only a loaded snapshot whose `session_id`
 exactly matches the submitted id. If that snapshot is no longer available,
-submission fails through the normal notice path and restores the text under the
-captured session's draft key. It never redirects text to a newer selection.
+submission fails through the normal notice path and restores the text and
+attachments under the captured session's draft key. It never redirects content to a newer selection.
 
 The daemon's canonical creation model makes this routing unambiguous:
 top-level `session.start` stores no `parent_session_id`, while the delegation
@@ -309,12 +339,13 @@ selection.
 
 Textbox steering is an additional producer for the existing delegation
 mailbox, not a replacement for parent/model control. The model-facing
-`steer_subagent` tool and web `delegation.steer_subagent` RPC both call the same
-daemon `steer_subagent_core`, which writes through
-`enqueue_scoped_subagent_steer`. Every accepted instruction is one durable
-`queued_inputs` row on the child with `priority = steer`; there is no
-browser-specific or producer-specific queue. Concurrent parent/model and user
-steers serialize on the same delegation/child database locks. Both may be
+`steer_subagent` tool accepts a text `message`; the web
+`delegation.steer_subagent` RPC accepts structured `content` blocks. Both
+adapters normalize to the same daemon user-message steering operation, which
+writes through `enqueue_scoped_subagent_steer`. Every accepted instruction is
+one durable `queued_inputs` row on the child with `priority = steer`; there is
+no browser-specific or producer-specific queue. Concurrent parent/model and
+user steers serialize on the same delegation/child database locks. Both may be
 accepted with distinct `input_id`s, and the mailbox processes them in canonical
 steer order (promotion/creation time and ID tie-break), ahead of follow-ups;
 neither producer receives extra priority.
@@ -341,8 +372,8 @@ Steer and interrupt have three deliberately separate forms:
 - **Steer** does not abort an in-flight model or tool (including a long polling
   loop). It waits durably and is injected at the next continuation point; tool
   completion explicitly checks the steer mailbox before the next model step.
-  Omitting `interrupt` (or passing `false`) preserves the original
-  `steer_subagent(subagent_id, message)` behavior.
+  Omitting `interrupt` (or passing `false`) preserves noninterrupting semantics
+  for both adapters.
 - **Interrupt and steer** passes `interrupt: true`. The committed row starts in
   `pending_interrupt` and blocks generic consumption of every row in that
   child's mailbox. Under the exact-child `SessionDriver`, reconciliation

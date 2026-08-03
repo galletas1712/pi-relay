@@ -34,9 +34,10 @@ import { branchEntriesFor } from "./historyTargets.ts";
 import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { MermaidBlock } from "./mermaidBlock.tsx";
 import { contentBlocksToText, firstLine } from "./text.ts";
+import { ArtifactImage } from "./artifactImage.tsx";
 import { assistantMessageText, buildTurnViews } from "./turnView.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
-import type { AssistantItem, NoticeTone, PendingAction, TranscriptEntry, TranscriptItem, TurnCard } from "./types.ts";
+import type { AssistantItem, ContentBlock, NoticeTone, PendingAction, TranscriptEntry, TranscriptItem, TurnCard } from "./types.ts";
 
 type ToolResultItem = Extract<TranscriptItem, { type: "tool_result" }>;
 type AssistantMessageEntry = TranscriptEntry & { item: Extract<TranscriptItem, { type: "assistant_message" }> };
@@ -1508,10 +1509,30 @@ const UserBubble = memo(function UserBubble({
 	return (
 		<div className="message-row user-row">
 			<EntryId entryId={entryId} />
-			<div className="user-bubble">{contentBlocksToText(item.content)}</div>
+			<div className="user-bubble">
+				<ContentBlocksView blocks={item.content} />
+			</div>
 		</div>
 	);
 });
+
+function ContentBlocksView({ blocks }: { blocks: ContentBlock[] }) {
+	if (!blocks.length) return null;
+	return (
+		<>
+			{blocks.map((block, index) => {
+				if (block.type === "text") {
+					return (
+						<span key={index} className="content-block-text">
+							{block.text}
+						</span>
+					);
+				}
+				return <ArtifactImage key={index} artifactId={block.artifact_id} />;
+			})}
+		</>
+	);
+}
 
 export type AssistantRenderPart =
 	| { type: "text"; key: string; item: Extract<AssistantItem, { type: "text" }> }
@@ -2157,7 +2178,7 @@ export function editToolPreview(
 	result?: ToolResultItem
 ): EditToolPreview | null {
 	if (isApplyPatchEdit(toolName, input)) {
-		const patch = stringValue(input?.input) ?? result?.output ?? null;
+		const patch = stringValue(input?.input) ?? (result ? contentBlocksToText(result.content) : null);
 		return patch ? applyPatchPreview(patch) : null;
 	}
 
@@ -2172,7 +2193,7 @@ export function editToolPreview(
 			additions: 0,
 			deletions: 0,
 			kind: "file",
-			content: result?.output ?? "",
+			content: result ? contentBlocksToText(result.content) : "",
 			hideSuccessOutput: true
 		};
 	}
@@ -2291,8 +2312,24 @@ function diffMarker(kind: EditDiffRow["kind"]): string {
 }
 
 export function ToolOutput({ result }: { result: ToolResultItem }) {
-	const output = result.output || "(empty)";
-	return <pre className={result.status === "Success" ? "" : "tool-output-error"}>{output}</pre>;
+	if (!result.content.length) {
+		return <pre className={result.status === "Success" ? "" : "tool-output-error"}>(empty)</pre>;
+	}
+	const onlyText = result.content.every((block) => block.type === "text");
+	if (onlyText) {
+		const output = contentBlocksToText(result.content) || "(empty)";
+		return <pre className={result.status === "Success" ? "" : "tool-output-error"}>{output}</pre>;
+	}
+	return (
+		<div className={result.status === "Success" ? "tool-output-blocks" : "tool-output-blocks tool-output-error"}>
+			{result.content.map((block, index) => {
+				if (block.type === "text") {
+					return <pre key={index}>{block.text || (result.content.length === 1 ? "(empty)" : "")}</pre>;
+				}
+				return <ArtifactImage key={index} artifactId={block.artifact_id} />;
+			})}
+		</div>
+	);
 }
 
 function SystemMessage({

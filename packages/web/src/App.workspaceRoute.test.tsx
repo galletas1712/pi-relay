@@ -1018,6 +1018,46 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
+	it("allows session B to submit while session A remains unresolved", async () => {
+		const sessionA = deferred<{ queued: true }>();
+		const api = createRouteApi();
+		api.queueFollowUp.mockImplementation((params: { sessionId: string }) =>
+			params.sessionId === "root-1"
+				? sessionA.promise
+				: Promise.resolve({ queued: true }));
+		const browser = new FakeWorkspaceBrowser(
+			"/w/host/run/root-1/conversation/root-1",
+		);
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.type(await screen.findByRole("textbox"), "pending in A");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await waitFor(() => expect(api.queueFollowUp).toHaveBeenCalledTimes(1));
+
+		await act(async () =>
+			browser.navigate("/w/host/run/legacy-root/conversation/legacy-root"),
+		);
+		await waitFor(() =>
+			expect(document.querySelector(".log-session")?.textContent).toBe(
+				"Legacy root",
+			),
+		);
+		await user.type(await screen.findByRole("textbox"), "accepted in B");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		await waitFor(() => expect(api.queueFollowUp).toHaveBeenCalledTimes(2));
+		expect(api.queueFollowUp.mock.calls[1]?.[0]).toEqual(
+			expect.objectContaining({
+				sessionId: "legacy-root",
+				content: [{ type: "text", text: "accepted in B" }],
+			}),
+		);
+		await act(async () => sessionA.resolve({ queued: true }));
+		await mounted.dispose();
+	});
+
 	it("does not prepare workspaces or call session.start for a no-session slash command", async () => {
 		const api = createRouteApi();
 		const mounted = renderRouteApp(api, new FakeWorkspaceBrowser("/"));
@@ -2535,7 +2575,7 @@ describe("App workspace route identity integration", () => {
 		expect((api.steerSubagent as ApiSpy).mock.calls[0][0]).toMatchObject({
 			parentSessionId: "root-1",
 			subagentSessionId: "child-1",
-			message: "captured child message",
+			content: [{ type: "text", text: "captured child message" }],
 		});
 		steer.resolve({ accepted: true });
 

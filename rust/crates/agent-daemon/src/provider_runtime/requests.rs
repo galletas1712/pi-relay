@@ -12,7 +12,7 @@ use crate::state::AppState;
 use super::auth_retry::complete_with_auth_retry;
 use super::prompt::{assemble_agent_prompt, effective_prompt_profile, provider_tools_for_session};
 use super::provider::provider_for_config;
-use super::transcript::provider_transcript;
+use super::transcript::{provider_transcript, resolve_transcript_images};
 
 pub(crate) fn model_prompt_cache_key(config: &SessionConfig, session_id: &str) -> String {
     config
@@ -191,11 +191,14 @@ pub(crate) async fn build_model_request(
         effective_prompt_profile(state, config, session_id).await?,
     );
     tools.extend(snapshot.provider_tools(config.provider.kind));
+    let transcript = provider_transcript(model_context);
+    let resolved_images = resolve_transcript_images(&state.repo, &transcript).await?;
     Ok(ModelRequest {
         model: config.provider.model.clone(),
         transcript_cache_prefix_len: None,
         prompt,
-        transcript: provider_transcript(model_context),
+        transcript,
+        resolved_images,
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools,
         // Provider adapters apply authoritative discovered/static output

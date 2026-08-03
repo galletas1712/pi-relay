@@ -420,7 +420,6 @@ pub(super) async fn insert_transcript_item_events_tx(
             EventType::TranscriptAppended,
             json!({
                 "entry_id": entry_id,
-                "item": item,
                 "entry": entry_payload,
                 "tree_node": tree_node,
                 "active_leaf_id": state.active_leaf_id,

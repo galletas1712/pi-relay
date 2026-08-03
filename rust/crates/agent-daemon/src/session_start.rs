@@ -34,7 +34,7 @@ pub(crate) async fn session_start(
         .unwrap_or_else(|| format!("session_{}", Uuid::new_v4()));
     let project_id = params.project_id;
     let priority = params.priority.unwrap_or(InputPriority::FollowUp);
-    let content = parse_user_message(params.content)?;
+    let content = parse_user_message(&state.repo, params.content).await?;
 
     let driver = SessionDriver::acquire(state, &session_id).await;
     if state.repo.session_exists(&session_id).await? {

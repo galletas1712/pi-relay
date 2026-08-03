@@ -418,12 +418,11 @@ fn stored_session_repairs_compacted_open_tool_turn_to_boundary() {
             turn_id: TurnId(58),
             tool_call: first.clone(),
         },
-        TranscriptItem::ToolResult(ToolResultMessage {
-            tool_call_id: first.id.clone(),
-            tool_name: first.tool_name.clone(),
-            output: "ok".to_string(),
-            status: ToolResultStatus::Success,
-        }),
+        TranscriptItem::ToolResult(ToolResultMessage::success(
+            first.id.clone(),
+            first.tool_name.clone(),
+            "ok",
+        )),
     ]));
 
     let session = AgentSession::from_transcript_store(store)
@@ -499,12 +498,11 @@ fn unmatched_tool_completion_before_tool_request_is_ignored() {
         .enqueue_input(AgentInput::ToolCompleted {
             action_id: ActionId(2),
             turn_id: TurnId(1),
-            result: ToolResultMessage {
-                tool_call_id: tool_call.id,
-                tool_name: tool_call.tool_name.clone(),
-                output: "too early".to_string(),
-                status: ToolResultStatus::Success,
-            },
+            result: ToolResultMessage::success(
+                tool_call.id,
+                tool_call.tool_name.clone(),
+                "too early",
+            ),
         })
         .expect("early tool completion is well formed but not yet matchable");
     session.drive();
@@ -652,7 +650,9 @@ fn tool_crash_result_records_failure_and_continues_turn() {
             result: ToolResultMessage {
                 tool_call_id: tool_call.id,
                 tool_name: tool_call.tool_name,
-                output: "tool runner crashed".to_string(),
+                content: vec![agent_vocab::ContentBlock::text(
+                    "tool runner crashed".to_string(),
+                )],
                 status: ToolResultStatus::Crashed,
             },
         })
@@ -1048,12 +1048,7 @@ fn history_operation_interrupts_active_tool_work_before_applying() {
         .enqueue_input(AgentInput::ToolCompleted {
             action_id: ActionId(2),
             turn_id: TurnId(1),
-            result: ToolResultMessage {
-                tool_call_id: tool_call.id,
-                tool_name: tool_call.tool_name,
-                output: "late".to_string(),
-                status: ToolResultStatus::Success,
-            },
+            result: ToolResultMessage::success(tool_call.id, tool_call.tool_name, "late"),
         })
         .expect("late tool completion is valid but stale");
     session.drive();
@@ -1090,12 +1085,11 @@ fn mismatched_tool_completion_does_not_clear_live_tool_work() {
         .enqueue_input(AgentInput::ToolCompleted {
             action_id: ActionId(2),
             turn_id: TurnId(1),
-            result: ToolResultMessage {
-                tool_call_id: ToolCallId::from_u64(99),
-                tool_name: tool_call.tool_name,
-                output: "misrouted".to_string(),
-                status: ToolResultStatus::Success,
-            },
+            result: ToolResultMessage::success(
+                ToolCallId::from_u64(99),
+                tool_call.tool_name,
+                "misrouted",
+            ),
         })
         .expect("well-formed but mismatched tool completion is valid");
     session.drive();

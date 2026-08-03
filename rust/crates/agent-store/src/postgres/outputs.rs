@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use agent_session::{SessionAction, SessionEvent};
 use anyhow::{anyhow, Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
@@ -15,6 +15,7 @@ use super::action_records::{
     action_event_matches_row, action_payload, ActionKey, POST_COMPACTION_DISPATCH_KEY,
 };
 use super::events::{insert_event_tx, insert_session_event_tx};
+use super::image_artifacts::{require_content_refs_tx, require_tool_result_refs_tx};
 use super::queue::{bump_revisions_tx, queue_event_payload, queue_state_tx};
 use super::rows::row_text;
 use super::sql::{action_is_unfinished, lock_session_tx, QUEUED_INPUT_DISPATCH_ORDER};
@@ -176,6 +177,7 @@ pub(super) async fn persist_outputs_tx(
 
     let mut accepted_input_event = None;
     if let Some(input) = accepted_input {
+        require_content_refs_tx(tx, &input.content.content).await?;
         let mut input_id = None;
         if let Some(client_input_id) = input.client_input_id.as_deref() {
             let id = format!("input_{}", Uuid::new_v4());
@@ -577,6 +579,14 @@ async fn complete_action_tx(
             update.status = explicit_status;
             update.result = explicit_result;
         }
+        if row_kind == ActionKind::Tool {
+            if let Some((result, canonical)) =
+                classify_tool_action_result(update.status, &update.result)?
+            {
+                require_tool_result_refs_tx(tx, &result).await?;
+                update.result = canonical;
+            }
+        }
     }
 
     let update_query = format!(
@@ -627,6 +637,68 @@ async fn complete_action_tx(
         ));
     }
     Ok(())
+}
+
+fn classify_tool_action_result(
+    status: ActionStatus,
+    value: &Value,
+) -> Result<Option<(agent_vocab::ToolResultMessage, Value)>> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("tool action result must be an object"))?;
+    let exact_keys = |expected: &[&str]| {
+        object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+    };
+    let reason = exact_keys(&["reason"]) && object.get("reason").and_then(Value::as_str).is_some();
+    let control = exact_keys(&["reason", "control_input_id"])
+        && object.get("reason").and_then(Value::as_str).is_some()
+        && object
+            .get("control_input_id")
+            .and_then(Value::as_str)
+            .is_some();
+    let error = exact_keys(&["error"]) && object.get("error").and_then(Value::as_str).is_some();
+    if reason || control || error {
+        let valid = match status {
+            ActionStatus::Interrupted => reason || control,
+            ActionStatus::Error => error,
+            _ => false,
+        };
+        return valid.then_some(None).ok_or_else(|| {
+            anyhow!("tool action bookkeeping does not match final status {status}")
+        });
+    }
+    if !matches!(status, ActionStatus::Completed | ActionStatus::Error) {
+        return Err(anyhow!(
+            "canonical tool action result does not match final status {status}"
+        ));
+    }
+    if !exact_keys(&["tool_call_id", "tool_name", "content", "status"]) {
+        return Err(anyhow!(
+            "tool action result is neither canonical content nor sanctioned bookkeeping"
+        ));
+    }
+    let result: agent_vocab::ToolResultMessage =
+        serde_json::from_value(value.clone()).context("invalid canonical tool action result")?;
+    let result_status_matches = match status {
+        ActionStatus::Completed => {
+            matches!(result.status, agent_vocab::ToolResultStatus::Success)
+        }
+        ActionStatus::Error => !matches!(result.status, agent_vocab::ToolResultStatus::Success),
+        _ => false,
+    };
+    if !result_status_matches {
+        return Err(anyhow!(
+            "canonical tool result status does not match final action status {status}"
+        ));
+    }
+    let canonical =
+        serde_json::to_value(&result).context("serialize canonical tool action result")?;
+    if canonical != *value {
+        return Err(anyhow!(
+            "canonical tool action result contains unknown or noncanonical fields"
+        ));
+    }
+    Ok(Some((result, canonical)))
 }
 
 #[cfg(test)]

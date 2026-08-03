@@ -13,6 +13,7 @@ import {
 	stableWorkingElapsedMs,
 	ToolOutput,
 } from "./transcript.tsx";
+import { ArtifactImage, ArtifactImageProvider } from "./artifactImage.tsx";
 import type { AssistantItem, PendingAction, TranscriptEntry, TurnCard } from "./types.ts";
 import { buildTurnViews } from "./turnView.ts";
 
@@ -71,6 +72,24 @@ describe("assistantRenderParts", () => {
 				{ kind: "add", text: "beta" }
 			]
 		});
+	});
+
+	it("renders artifact images through the shared loader with accessible fallback markup", () => {
+		const artifactId = `sha256:${"a".repeat(64)}`;
+		const html = renderToStaticMarkup(
+			<ArtifactImageProvider load={async () => ({
+				artifact_id: artifactId,
+				mime_type: "image/png",
+				byte_length: 8,
+				data: "iVBORw0KGgo=",
+			})}>
+				<ArtifactImage artifactId={artifactId} />
+			</ArtifactImageProvider>,
+		);
+
+		expect(html).toContain("Loading image");
+		expect(html).not.toContain("data:image");
+		expect(html).not.toContain("https://");
 	});
 });
 
@@ -683,7 +702,7 @@ describe("MessageList markdown code rendering", () => {
 describe("ToolOutput", () => {
 	it("does not truncate long output text in markup", () => {
 		const output = Array.from({ length: 60 }, (_, index) => `line ${index + 1}`).join("\n");
-		const html = renderToStaticMarkup(<ToolOutput result={{ type: "tool_result", tool_call_id: "call_1", tool_name: "Bash", status: "Success", output }} />);
+		const html = renderToStaticMarkup(<ToolOutput result={{ type: "tool_result", tool_call_id: "call_1", tool_name: "Bash", status: "Success", content: [{ type: "text", text: output }] }} />);
 
 		expect(html).toContain("line 60");
 		expect(html).not.toContain("\\n...");
@@ -1427,7 +1446,13 @@ function toolResultEntry(
 		id,
 		parent_id: parentId,
 		timestamp_ms: 0,
-		item: { type: "tool_result", tool_call_id: toolCallId, tool_name: toolName, output, status },
+		item: {
+			type: "tool_result",
+			tool_call_id: toolCallId,
+			tool_name: toolName,
+			content: [{ type: "text", text: output }],
+			status,
+		},
 	};
 }
 

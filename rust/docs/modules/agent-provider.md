@@ -2,7 +2,7 @@
 
 > Part of the [Rust Agent Stack](../architecture.md) | [Provider API support](../provider-api-support.md) | [Design decisions](../design-decisions.md)
 
-`agent-provider` is the model-IO boundary. It defines the `ModelProvider` trait and two adapters: `OpenAiProvider` (the private ChatGPT/Codex Responses-compatible backend, not public OpenAI API-key transport) and `AnthropicProvider` (Messages API). Each adapter turns a provider-neutral `ModelRequest` — stable prompt prefix, dynamic context, transcript items, tool definitions — into the exact wire envelope the upstream backend expects, streams the SSE response, and returns a single normalized `ModelResponse` plus the opaque per-turn replay state needed to continue the conversation later. The crate forbids `unsafe`.
+`agent-provider` is the model-IO boundary. It defines the `ModelProvider` trait and two adapters: `OpenAiProvider` (the private ChatGPT/Codex Responses-compatible backend, not public OpenAI API-key transport) and `AnthropicProvider` (Messages API). Each adapter turns a provider-neutral `ModelRequest` — stable prompt prefix, dynamic context, transcript items, resolved image map, tool definitions — into the exact wire envelope the upstream backend expects, streams the SSE response, and returns a single normalized `ModelResponse` plus the opaque per-turn replay state needed to continue the conversation later. The crate forbids `unsafe`.
 
 See [design decisions](../design-decisions.md) for *why* the provider scope is small (two providers, ChatGPT/Codex subscription transport only, no plain OpenAI API key).
 
@@ -12,6 +12,11 @@ See [design decisions](../design-decisions.md) for *why* the provider scope is s
   `compact`, plus optional provider-neutral `model_metadata` and
   `count_tokens`.
 - Render `ModelRequest` into provider-native request bodies and headers.
+- Resolve no storage itself: the daemon batch-loads all artifact ids from the
+  complete context immediately before request construction and supplies a
+  request-local `ResolvedImageMap`. This crate has no `agent-store` dependency.
+- Render resolved images as OpenAI data URLs or Anthropic base64 source blocks,
+  preserving user/tool-result block order. Missing map entries fail locally.
 - Stream and parse provider SSE into one `AssistantMessage` (`Text` / `ToolCall` items only).
 - Capture per-item `ProviderReplayItem` sidecars so encrypted reasoning / thinking blocks replay verbatim on the next request.
 - Map provider-native tool names to canonical pi-relay names only in semantic
@@ -361,11 +366,11 @@ accumulated tool-input JSON instead of substituting arguments. It accumulates va
 defensively rejects all compaction content/deltas/stops before producing a
 `ModelResponse`.
 
-Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire → pi-relay names; `openai_wire_tool_name` / `anthropic_wire_tool_name` map back. `transcript.rs::normalize_transcript_for_provider` canonicalizes historical tool-call names to the entry's recorded provider and bounds historical tool-result output via `agent-tools::limit_tool_output`.
+Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire → pi-relay names; `openai_wire_tool_name` / `anthropic_wire_tool_name` map back. `transcript.rs::normalize_transcript_for_provider` canonicalizes historical tool-call names to the entry's recorded provider. Tool-result text is finalized once at the daemon execution boundary; provider normalization does not retruncate durable content.
 
 ### Token estimation
 
-`token_estimator.rs` serializes each prompt section and transcript entry to its provider wire JSON and approximates tokens as `ceil(bytes / 4)`. Entries with replay sidecars are estimated from the exact serialized raw replay JSON. Replay rendering/serialization errors propagate instead of being masked as zero tokens. Base64 image data URLs are discounted to a fixed `~7373`-byte resized-image estimate (Codex-style) so large inline images don't inflate the count.
+`token_estimator.rs` serializes each prompt section and transcript entry to provider-shaped structural JSON and approximates tokens as `ceil(bytes / 4)`. Entries with replay sidecars are estimated from the exact serialized raw replay JSON. Replay rendering/serialization errors propagate instead of being masked as zero tokens. Durable image refs become structural image markers plus a fixed `~7373`-byte resized-image estimate (Codex-style); estimation never fabricates a provider data URL or requires artifact bytes. Real request rendering remains a separate, fail-closed path that requires the daemon-supplied `ResolvedImageMap`.
 
 ## Notes
 
@@ -384,6 +389,6 @@ Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire �
   provider, and retries exactly once inside that provider call. The provider
   surfaces the status through either `ProviderError::ModelCatalog` or the
   ordinary HTTP error path.
-- Registered builtin tools (from [agent-tools](./agent-tools.md)): `edit` (custom `apply_patch` for OpenAI, native `text_editor_20250728` named `str_replace_based_edit_tool` for Anthropic), `bash` (uniform JSON `Bash`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). There are no `read`/`write` tools.
+- Registered builtin tools (from [agent-tools](./agent-tools.md)): `edit` (custom `apply_patch` for OpenAI, native `text_editor_20250728` named `str_replace_based_edit_tool` for Anthropic), `bash` (uniform JSON `Bash`), `ReadImage`, `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). There are no general `read`/`write` tools.
 - Sending OpenAI-profile tools to Anthropic (or vice versa) is a hard `ProviderError::Provider`; the profile must match the provider.
 - Wire details (RPC methods, how the daemon calls these adapters) live in [websocket-rpc](../websocket-rpc.md); the React client that drives sessions is documented in the [web UI](../../../packages/web/docs/web-ui.md) doc.

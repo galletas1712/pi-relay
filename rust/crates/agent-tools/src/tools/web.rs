@@ -1,4 +1,4 @@
-use agent_vocab::{ToolCall, ToolDefinition, ToolResultMessage};
+use agent_vocab::{InlineToolResultMessage, ToolCall, ToolDefinition};
 use async_trait::async_trait;
 use reqwest::Url;
 use serde::Deserialize;
@@ -6,7 +6,6 @@ use serde_json::json;
 
 use crate::context::ToolContext;
 use crate::error::{ToolError, ToolResult};
-use crate::output::limit_tool_output_with_max_tokens;
 use crate::registry::AgentTool;
 
 #[derive(Debug, Clone, Copy)]
@@ -121,7 +120,11 @@ impl AgentTool for WebSearchTool {
         )
     }
 
-    async fn execute(&self, call: &ToolCall, _ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        _ctx: &ToolContext,
+    ) -> ToolResult<InlineToolResultMessage> {
         let args: WebSearchArgs = serde_json::from_str(&call.args_json)?;
         if args.query.trim().is_empty() {
             return Err(ToolError::InvalidInput(
@@ -146,10 +149,10 @@ impl AgentTool for WebSearchTool {
         if let Some(domains) = nonempty_domains(args.blocked_domains.as_deref()) {
             output.push_str(&format!("\nBlocked domains: {}", domains.join(", ")));
         }
-        Ok(ToolResultMessage::error(
+        Ok(InlineToolResultMessage::error(
             call.id.clone(),
             &call.tool_name,
-            limit_tool_output_with_max_tokens(output, args.max_output_tokens),
+            output,
         ))
     }
 }
@@ -183,7 +186,11 @@ impl AgentTool for WebFetchTool {
         )
     }
 
-    async fn execute(&self, call: &ToolCall, _ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        _ctx: &ToolContext,
+    ) -> ToolResult<InlineToolResultMessage> {
         let args: WebFetchArgs = serde_json::from_str(&call.args_json)?;
         let url = validate_http_url(&args.url)?;
         Ok(fetch_url(call, _ctx, args, url).await)
@@ -195,16 +202,16 @@ async fn fetch_url(
     ctx: &ToolContext,
     args: WebFetchArgs,
     url: Url,
-) -> ToolResultMessage {
+) -> InlineToolResultMessage {
     let client = match reqwest::Client::builder()
         .user_agent(WEB_FETCH_USER_AGENT)
-        .timeout(ctx.timeout)
+        .timeout(ctx.timeout())
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
     {
         Ok(client) => client,
         Err(error) => {
-            return ToolResultMessage::error(
+            return InlineToolResultMessage::error(
                 call.id.clone(),
                 &call.tool_name,
                 format!("web_fetch failed to initialize HTTP client: {error}"),
@@ -215,7 +222,7 @@ async fn fetch_url(
     let response = match client.get(url.clone()).send().await {
         Ok(response) => response,
         Err(error) => {
-            return ToolResultMessage::error(
+            return InlineToolResultMessage::error(
                 call.id.clone(),
                 &call.tool_name,
                 format!("web_fetch request failed for {url}: {error}"),
@@ -234,7 +241,7 @@ async fn fetch_url(
     let bytes = match read_bounded_response_body(response).await {
         Ok(bytes) => bytes,
         Err(error) => {
-            return ToolResultMessage::error(
+            return InlineToolResultMessage::error(
                 call.id.clone(),
                 &call.tool_name,
                 format!("web_fetch failed to read response body for {final_url}: {error}"),
@@ -266,11 +273,10 @@ async fn fetch_url(
     output.push_str("\nContent:\n");
     output.push_str(content.trim());
 
-    let output = limit_tool_output_with_max_tokens(output, args.max_output_tokens);
     if status.is_success() {
-        ToolResultMessage::success(call.id.clone(), &call.tool_name, output)
+        InlineToolResultMessage::success(call.id.clone(), &call.tool_name, output)
     } else {
-        ToolResultMessage::error(call.id.clone(), &call.tool_name, output)
+        InlineToolResultMessage::error(call.id.clone(), &call.tool_name, output)
     }
 }
 

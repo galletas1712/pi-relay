@@ -1,14 +1,13 @@
 use std::fs;
 use std::path::Path;
 
-use agent_vocab::{ToolCall, ToolDefinition, ToolResultMessage};
+use agent_vocab::{InlineToolResultMessage, ToolCall, ToolDefinition};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::context::{workspace_path, ToolContext};
 use crate::error::ToolResult;
-use crate::output::limit_tool_output;
 use crate::registry::AgentTool;
 
 #[derive(Debug, Clone, Copy)]
@@ -52,15 +51,19 @@ impl AgentTool for ApplyPatchTool {
         )
     }
 
-    async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolContext,
+    ) -> ToolResult<InlineToolResultMessage> {
         let args: ApplyPatchArgs = serde_json::from_str(&call.args_json)?;
         let result = match apply_patch(&args.input, ctx) {
-            Ok(changes) => ToolResultMessage::success(
+            Ok(changes) => InlineToolResultMessage::success(
                 call.id.clone(),
                 &call.tool_name,
-                limit_tool_output(success_message(&changes)),
+                success_message(&changes),
             ),
-            Err(error) => ToolResultMessage::error(call.id.clone(), &call.tool_name, error),
+            Err(error) => InlineToolResultMessage::error(call.id.clone(), &call.tool_name, error),
         };
         Ok(result)
     }
@@ -317,6 +320,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use agent_vocab::{ToolCallId, ToolResultStatus};
+    use cap_std::{ambient_authority, fs::Dir};
 
     use super::*;
 
@@ -338,10 +342,17 @@ mod tests {
         }
     }
 
+    fn context(root: &Path) -> ToolContext {
+        ToolContext::new(
+            root,
+            Dir::open_ambient_dir(root, ambient_authority()).expect("open disposable workspace"),
+        )
+    }
+
     #[test]
     fn adds_file_relative_to_workspace() {
         let root = workspace();
-        let ctx = ToolContext::new(&root);
+        let ctx = context(&root);
         let patch =
             "*** Begin Patch\n*** Add File: nested/hello.txt\n+hello\n+world\n*** End Patch\n";
 
@@ -359,7 +370,7 @@ mod tests {
     fn updates_file_with_exact_hunk() {
         let root = workspace();
         fs::write(root.join("app.txt"), "alpha\nbeta\ngamma\n").expect("write file");
-        let ctx = ToolContext::new(&root);
+        let ctx = context(&root);
         let patch = "*** Begin Patch\n*** Update File: app.txt\n@@\n alpha\n-beta\n+bravo\n gamma\n*** End Patch\n";
 
         apply_patch(patch, &ctx).expect("apply patch");
@@ -375,7 +386,7 @@ mod tests {
     fn deletes_file() {
         let root = workspace();
         fs::write(root.join("old.txt"), "bye\n").expect("write file");
-        let ctx = ToolContext::new(&root);
+        let ctx = context(&root);
         let patch = "*** Begin Patch\n*** Delete File: old.txt\n*** End Patch\n";
 
         apply_patch(patch, &ctx).expect("apply patch");
@@ -388,7 +399,7 @@ mod tests {
     fn moves_and_updates_file() {
         let root = workspace();
         fs::write(root.join("old.txt"), "name = old\n").expect("write file");
-        let ctx = ToolContext::new(&root);
+        let ctx = context(&root);
         let patch = "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n-name = old\n+name = new\n*** End Patch\n";
 
         let changes = apply_patch(patch, &ctx).expect("apply patch");
@@ -406,7 +417,7 @@ mod tests {
     fn reports_unmatched_update() {
         let root = workspace();
         fs::write(root.join("app.txt"), "alpha\n").expect("write file");
-        let ctx = ToolContext::new(&root);
+        let ctx = context(&root);
         let patch = "*** Begin Patch\n*** Update File: app.txt\n@@\n-beta\n+bravo\n*** End Patch\n";
 
         let error = apply_patch(patch, &ctx).expect_err("patch should fail");
@@ -422,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn execute_returns_tool_error_instead_of_spawning_external_binary() {
         let root = workspace();
-        let ctx = ToolContext::new(&root);
+        let ctx = context(&root);
         let result = ApplyPatchTool
             .execute(
                 &call("*** Begin Patch\n*** Delete File: missing.txt\n*** End Patch\n"),
@@ -432,7 +443,7 @@ mod tests {
             .expect("tool execution returns a tool result");
 
         assert_eq!(result.status, ToolResultStatus::Error);
-        assert!(result.output.contains("missing.txt"));
+        assert!(result.display_text().contains("missing.txt"));
         fs::remove_dir_all(root).ok();
     }
 }

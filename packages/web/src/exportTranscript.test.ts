@@ -1,17 +1,41 @@
 import { describe, expect, it } from "vitest";
-import { buildExportBlocks, defaultSelectedAssistantIds, formatExportMarkdown } from "./exportTranscript.ts";
-import type { AssistantItem, TranscriptEntry, TranscriptItem } from "./types.ts";
+import {
+	buildExportBlocks,
+	defaultSelectedAssistantIds,
+	formatExportMarkdown,
+} from "./exportTranscript.ts";
+import type {
+	AssistantItem,
+	TranscriptEntry,
+	TranscriptItem,
+} from "./types.ts";
 
 describe("export transcript", () => {
 	it("exports every user input from the containing turn once for a selected final answer", () => {
 		const entries = [
 			entry("start", { type: "turn_started", turn_id: 1 }),
 			entry("user-1", user("first request")),
-			entry("assistant-progress", { type: "assistant_message", items: [text("I will inspect."), toolCall()] }),
-			entry("tool-result", { type: "tool_result", tool_call_id: "call_1", tool_name: "bash", output: "ok", status: "Success" }),
+			entry("assistant-progress", {
+				type: "assistant_message",
+				items: [text("I will inspect."), toolCall()],
+			}),
+			entry("tool-result", {
+				type: "tool_result",
+				tool_call_id: "call_1",
+				tool_name: "bash",
+				content: [{ type: "text", text: "ok" }],
+				status: "Success",
+			}),
 			entry("user-2", user("also check tests")),
-			entry("assistant-final", { type: "assistant_message", items: [text("Final answer.")] }),
-			entry("finish", { type: "turn_finished", turn_id: 1, outcome: "Graceful" })
+			entry("assistant-final", {
+				type: "assistant_message",
+				items: [text("Final answer.")],
+			}),
+			entry("finish", {
+				type: "turn_finished",
+				turn_id: 1,
+				outcome: "Graceful",
+			}),
 		];
 
 		const blocks = buildExportBlocks(entries);
@@ -28,10 +52,26 @@ describe("export transcript", () => {
 		const entries = [
 			entry("start", { type: "turn_started", turn_id: 2 }),
 			entry("user", user("run command")),
-			entry("assistant-progress", { type: "assistant_message", items: [text("Running command."), toolCall()] }),
-			entry("tool-result", { type: "tool_result", tool_call_id: "call_1", tool_name: "bash", output: "ok", status: "Success" }),
-			entry("assistant-final", { type: "assistant_message", items: [text("Done.")] }),
-			entry("finish", { type: "turn_finished", turn_id: 2, outcome: "Graceful" })
+			entry("assistant-progress", {
+				type: "assistant_message",
+				items: [text("Running command."), toolCall()],
+			}),
+			entry("tool-result", {
+				type: "tool_result",
+				tool_call_id: "call_1",
+				tool_name: "bash",
+				content: [{ type: "text", text: "ok" }],
+				status: "Success",
+			}),
+			entry("assistant-final", {
+				type: "assistant_message",
+				items: [text("Done.")],
+			}),
+			entry("finish", {
+				type: "turn_finished",
+				turn_id: 2,
+				outcome: "Graceful",
+			}),
 		];
 
 		const selected = defaultSelectedAssistantIds(buildExportBlocks(entries));
@@ -49,19 +89,59 @@ describe("export transcript", () => {
 				replayed_after_compaction: true,
 			}),
 			entry("genuine", user("same request")),
-			entry("assistant-final", { type: "assistant_message", items: [text("Done.")] }),
-			entry("finish", { type: "turn_finished", turn_id: 3, outcome: "Graceful" }),
+			entry("assistant-final", {
+				type: "assistant_message",
+				items: [text("Done.")],
+			}),
+			entry("finish", {
+				type: "turn_finished",
+				turn_id: 3,
+				outcome: "Graceful",
+			}),
 		];
 
 		const blocks = buildExportBlocks(entries);
 
-		expect(blocks.filter((block) => block.type === "user").map((block) => block.entryId)).toEqual([
-			"original",
-			"genuine",
-		]);
+		expect(
+			blocks
+				.filter((block) => block.type === "user")
+				.map((block) => block.entryId),
+		).toEqual(["original", "genuine"]);
 		expect(blocks.find((block) => block.type === "assistant")).toMatchObject({
 			priorUserEntryIds: ["original", "genuine"],
 		});
+	});
+
+	it("exports artifact references as placeholders without embedding image bytes", () => {
+		const artifactId = `sha256:${"a".repeat(64)}`;
+		const entries = [
+			entry("start", { type: "turn_started", turn_id: 4 }),
+			entry("user-image", {
+				type: "user_message",
+				content: [
+					{ type: "text", text: "inspect" },
+					{ type: "image", artifact_id: artifactId },
+				],
+			}),
+			entry("assistant-final", {
+				type: "assistant_message",
+				items: [text("Done.")],
+			}),
+			entry("finish", {
+				type: "turn_finished",
+				turn_id: 4,
+				outcome: "Graceful",
+			}),
+		];
+
+		const markdown = formatExportMarkdown(
+			buildExportBlocks(entries),
+			new Set(["assistant-final"]),
+		);
+
+		expect(markdown).toContain(`[image ${artifactId}]`);
+		expect(markdown).not.toContain("data:image");
+		expect(markdown).not.toContain("base64");
 	});
 });
 
@@ -74,7 +154,12 @@ function text(value: string): AssistantItem {
 }
 
 function toolCall(): AssistantItem {
-	return { type: "tool_call", id: "call_1", tool_name: "bash", args_json: "{\"command\":\"ls\"}" };
+	return {
+		type: "tool_call",
+		id: "call_1",
+		tool_name: "bash",
+		args_json: '{"command":"ls"}',
+	};
 }
 
 function entry(id: string, item: TranscriptItem): TranscriptEntry {
@@ -82,6 +167,6 @@ function entry(id: string, item: TranscriptItem): TranscriptEntry {
 		id,
 		parent_id: null,
 		timestamp_ms: 1,
-		item
+		item,
 	};
 }

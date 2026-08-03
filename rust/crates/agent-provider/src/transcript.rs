@@ -1,4 +1,3 @@
-use agent_tools::limit_tool_output;
 use agent_vocab::{ProviderReplayItem, TranscriptItem};
 
 use crate::{canonical_tool_call_for_provider, ModelTranscriptEntry};
@@ -10,22 +9,12 @@ pub fn normalize_transcript_for_provider(
         .into_iter()
         .map(|entry| ModelTranscriptEntry {
             item: normalize_transcript_item_for_provider(
-                limit_transcript_tool_output(entry.item),
+                entry.item,
                 entry.provider_replay.as_slice(),
             ),
             provider_replay: entry.provider_replay,
         })
         .collect()
-}
-
-fn limit_transcript_tool_output(item: TranscriptItem) -> TranscriptItem {
-    match item {
-        TranscriptItem::ToolResult(mut result) => {
-            result.output = limit_tool_output(result.output);
-            TranscriptItem::ToolResult(result)
-        }
-        item => item,
-    }
 }
 
 fn normalize_transcript_item_for_provider(
@@ -58,7 +47,7 @@ mod tests {
     use agent_vocab::{ToolCallId, ToolResultMessage, TranscriptItem};
 
     #[test]
-    fn provider_transcript_bounds_historical_tool_results() {
+    fn provider_transcript_does_not_retruncate_durable_tool_results() {
         let transcript = vec![ModelTranscriptEntry::from(TranscriptItem::ToolResult(
             ToolResultMessage::success(ToolCallId::from_u64(1), "bash", "x".repeat(50_000)),
         ))];
@@ -68,7 +57,6 @@ mod tests {
             panic!("expected tool result");
         };
 
-        assert!(result.output.len() < 50_000);
-        assert!(result.output.contains("[tool output truncated:"));
+        assert_eq!(result.display_text(), "x".repeat(50_000));
     }
 }

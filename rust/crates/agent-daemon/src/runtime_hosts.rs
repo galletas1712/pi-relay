@@ -13,7 +13,7 @@ use agent_runtime_protocol::{
 };
 use agent_store::PostgresAgentStore;
 use agent_tools::ProviderTool;
-use agent_vocab::{ProviderKind, ToolCall, ToolResultMessage};
+use agent_vocab::{InlineToolResultMessage, ProviderKind, ToolCall};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -665,7 +665,7 @@ impl RuntimeRegistry {
         runtime_id: &str,
         manifest: McpSessionManifest,
         tool_call: ToolCall,
-    ) -> Result<ToolResultMessage> {
+    ) -> Result<InlineToolResultMessage> {
         self.mcp_result(
             runtime_id,
             RuntimeCommand::ExecuteMcpTool {
@@ -966,7 +966,16 @@ pub(crate) mod test_support {
                 provider,
                 tool_call,
             } => {
-                let context = ToolContext::new(fake_workspace_dir(dirs, &workspace_id).await);
+                let cwd = fake_workspace_dir(dirs, &workspace_id).await;
+                let workspace_dir =
+                    cap_std::fs::Dir::open_ambient_dir(&cwd, cap_std::ambient_authority())
+                        .map_err(|error| {
+                            RuntimeCommandError::new(
+                                "workspace_capability_unavailable",
+                                format!("fake session workspace is unavailable: {error}"),
+                            )
+                        })?;
+                let context = ToolContext::new(cwd, workspace_dir);
                 match tools.execute(provider, &tool_call, &context).await {
                     Ok(result) => Ok(RuntimeCommandResult::Tool { result }),
                     Err(error) => Err(RuntimeCommandError::new("tool_error", format!("{error:#}"))),

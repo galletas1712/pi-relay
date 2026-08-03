@@ -28,14 +28,15 @@ snapshot isolation only; remote tools may still mutate external systems.
 - Leave other first-party and MCP arguments unchanged for their own
   deserializers or server contracts.
 - Canonicalize provider wire names back to internal names for execution.
-- Carry the per-call `ToolContext` (session cwd + timeout).
+- Carry the per-call `ToolContext` (immutable session cwd identity, injected
+  directory capability, and timeout).
 - Bound tool output with a character-budget approximation before it re-enters
   model context.
 
 ## Key types
 
 - `AgentTool` — async trait: `definition() -> ToolDefinition` and
-  `execute(&ToolCall, &ToolContext) -> ToolResult<ToolResultMessage>`.
+  `execute(&ToolCall, &ToolContext) -> ToolResult<InlineToolResultMessage>`.
 - `ToolRegistry` — holds, per `(ProviderKind, name)`: the provider declarations,
   the wire-name aliases, and the boxed executors. Built once and shared as
   `Arc<ToolRegistry>` in daemon state.
@@ -51,7 +52,12 @@ snapshot isolation only; remote tools may still mutate external systems.
   `ProviderTool`s and per-provider executors. `ToolExtension` /
   `FirstPartyToolExtension` register descriptors; an extension registers once,
   keyed by its `id`.
-- `ToolContext` — `{ cwd: PathBuf, timeout: Duration }`, default timeout 30s.
+- `ToolContext` — immutable display/path identity plus an already-open
+  `cap_std::fs::Dir` for the exact session workspace and a 30s default timeout.
+  It never ambient-opens its cwd path. The runtime `WorkspaceManager` pins the
+  configured workspace root at initialization and constructs tool contexts by
+  opening `sessions/<id>/cwd` descriptor-relatively without following managed
+  symlinks/reparse points.
 - `ToolError` / `ToolResult` — unknown tool, invalid args, IO, timeout, edit
   target not found, invalid input.
 - `tool_display` — replay-display labels (pretty name + a one-line input
@@ -76,6 +82,7 @@ semantics justify it.
 |--------------|-------------------------------------------|-------------------------------------------------|--------------------|----------------------------------|
 | `Edit`       | `apply_patch` (custom Lark grammar)       | `str_replace_based_edit_tool` (`text_editor_20250728`) | `edit`      | `ApplyPatchTool` / `TextEditorTool` |
 | `Bash`       | `Bash` (JSON function)                    | `Bash` (JSON client tool)                       | `shell`            | `BashTool`                       |
+| `ReadImage`  | `ReadImage` (JSON function)               | `ReadImage` (JSON client tool)                  | `read_image`       | `ReadImageTool`                  |
 | `WebSearch`  | `web_search` (JSON function)              | `web_search` (JSON client tool)                 | `web_search`       | `WebSearchTool`                  |
 | `WebFetch`   | `web_fetch` (JSON function)               | `web_fetch` (JSON client tool)                  | `web_fetch`        | `WebFetchTool`                   |
 | `LoadSkill`  | `LoadSkill` (JSON function)               | `LoadSkill` (JSON client tool)                  | `skill_loader`     | runtime-handled (no registry executor) |
@@ -89,7 +96,8 @@ semantics justify it.
 `FirstPartyToolExtension` decorates the canonical `Bash` JSON definition once
 in `register_bash`; all other first-party declarations retain their native
 schemas. Other registry extensions, including MCP, are not decorated. There
-are no `read`/`write` tools.
+are no general `read`/`write` tools; `ReadImage` is the vision-only file reader
+for workspace PNG/JPEG/GIF/WebP paths.
 
 ### edit — provider-shaped
 
@@ -199,15 +207,16 @@ web/inspector surface, not provider-visible tool names.
 
 ```
 model emits tool call (provider wire name, e.g. "apply_patch")
-  -> daemon: ToolContext::new(session outer_cwd)   [timeout 30s]
   -> LoadSkill?  -> runtime skill loader (no registry executor)
   -> web tool?   -> runtime web dispatch (WebSearch/WebFetch)
   -> delegation? -> runtime delegation dispatch (no registry executor)
-  -> else        -> registry.execute(provider, call, ctx)
+  -> else        -> runtime WorkspaceManager opens exact session cwd from pinned root
+                  -> ToolContext::new(display cwd, verified Dir)  [timeout 30s]
+                  -> registry.execute(provider, call, ctx)
                       canonical_tool_name_for_provider() maps wire name
                       -> canonical name  (apply_patch -> Edit)
                       -> per-(provider, canonical) executor.execute()
-  -> ToolResultMessage (success | error) fed back into the session
+  -> InlineToolResultMessage (success | error), then durable ingestion
 ```
 
 Provider tool declarations are produced from the same registry:
@@ -230,14 +239,17 @@ call dispatches to the `Edit` executor for that provider.
 - **Posture buckets and the rationale** (uniform custom function vs.
   provider-native vs. local wrapper) are recorded in design decisions
   [Provider Tool Surfaces Diverge Only When Semantics Justify It](../design-decisions.md#provider-tool-surfaces-diverge-only-when-semantics-justify-it).
-- **Output bounding.** `limit_tool_output` caps results at
-  `DEFAULT_MAX_TOOL_OUTPUT_TOKENS` (10k) via a 4-chars-per-token approximation
-  (the crate carries no tokenizer). Over-budget output keeps a 3/5 head and 2/5
-  tail with a `[tool output truncated: N characters omitted]` marker on a char
-  boundary. `Bash`, `WebSearch`, and `WebFetch` honor a per-call
-  `max_output_tokens` override. For the web tools, this is a local
-  post-response truncation cap; it is not forwarded to the provider as a
-  generation parameter.
+- **Output bounding.** The daemon execution boundary calls
+  `finalize_tool_result_content` exactly once for the default 10k-token budget.
+  It uses a 4-chars-per-token approximation (the crate carries no tokenizer),
+  keeps a 3/5 head and 2/5 tail with the original
+  `[tool output truncated: N characters omitted]` marker, preserves every image
+  and mixed-block order, and is byte-for-byte idempotent. Store ingestion only
+  artifactizes and admits the finalized content; provider rendering does not
+  truncate it again. `Bash`, `WebSearch`, and `WebFetch` still honor an explicit
+  per-call `max_output_tokens` as part of that invocation's contract. For the
+  web tools, this is a local post-response cap; it is not forwarded to the
+  provider as a generation parameter.
 - **`ProviderKind` is `{ OpenAi, Claude }`.** OpenAI always routes through the
   ChatGPT/Codex subscription transport; "codex" is an auth transport, not a
   provider kind.

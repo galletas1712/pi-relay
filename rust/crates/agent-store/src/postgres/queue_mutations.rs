@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::events::insert_event_tx;
+use super::image_artifacts::require_content_refs_tx;
 use super::queue_projection::{
     append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
     queued_follow_up_ids_from_state, queued_follow_up_ids_tx, queued_input_content_from_value,
@@ -109,6 +110,7 @@ impl PostgresAgentStore {
             }
         }
         ensure_expected_active_leaf_tx(&mut tx, session_id, expected_active_leaf_id).await?;
+        require_content_refs_tx(&mut tx, &content.content).await?;
         let route = match priority {
             InputPriority::Steer => steering_route_tx(&mut tx, session_id).await?,
             InputPriority::FollowUp => session_default_route_tx(&mut tx, session_id).await?,
@@ -456,6 +458,7 @@ impl PostgresAgentStore {
         }
 
         let previous_content = row.get::<Value, _>("content");
+        require_content_refs_tx(&mut tx, &content.content).await?;
         let content_value =
             serde_json::to_value(QueuedInputContent::user_message(content.clone()))?;
         if previous_content == content_value || previous_content == serde_json::to_value(content)? {

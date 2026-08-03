@@ -286,6 +286,29 @@ describe("AgentApi delegation launch identity", () => {
 	});
 });
 
+describe("AgentApi image artifact RPCs", () => {
+	it("uploads and reads image artifacts through transport RPCs", async () => {
+		const calls: RpcCall[] = [];
+		const api = createAgentApi(fakeClient(calls));
+		const artifactId = `sha256:${"a".repeat(64)}`;
+
+		await api.uploadImage({ mimeType: "image/png", data: "iVBORw0KGgo=" });
+		await api.getImageArtifact(artifactId);
+		expect(calls).toEqual([
+			{
+				method: "image.upload",
+				params: { mime_type: "image/png", data: "iVBORw0KGgo=" },
+				options: { timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
+			},
+			{
+				method: "image.get",
+				params: { artifact_id: artifactId },
+				options: { timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
+			},
+		]);
+	});
+});
+
 function fakeClient(calls: RpcCall[]): RpcClient {
 	return {
 		connect: async () => {},
@@ -310,6 +333,21 @@ function fakeClient(calls: RpcCall[]): RpcClient {
 				} as T;
 			}
 			if (method === "mcp.logout") return { result: "removed" } as T;
+			if (method === "image.upload") {
+				return {
+					artifact_id: `sha256:${"a".repeat(64)}`,
+					mime_type: "image/png",
+					byte_length: 8,
+				} as T;
+			}
+			if (method === "image.get") {
+				return {
+					artifact_id: params?.artifact_id,
+					mime_type: "image/png",
+					byte_length: 8,
+					data: "iVBORw0KGgo=",
+				} as T;
+			}
 			return { session_id: "session-1", activity: "running" } as T;
 		},
 	};

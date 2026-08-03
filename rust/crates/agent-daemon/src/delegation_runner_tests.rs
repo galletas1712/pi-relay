@@ -3921,7 +3921,8 @@ async fn interrupt_only_replay_never_interrupts_newer_generation_or_queues_text(
         agent_vocab::ToolResultStatus::Success
     );
     let first: serde_json::Value =
-        serde_json::from_str(&first_tool_result.output).expect("interrupt result JSON");
+        serde_json::from_str(first_tool_result.as_text().expect("text result"))
+            .expect("interrupt result JSON");
     assert_eq!(first["accepted"], true);
     assert_eq!(first["phase"], "ready");
     assert_eq!(first["interrupted"], true);
@@ -4010,7 +4011,8 @@ async fn interrupt_only_replay_never_interrupts_newer_generation_or_queues_text(
         agent_vocab::ToolResultStatus::Success
     );
     let replay: serde_json::Value =
-        serde_json::from_str(&replay_tool_result.output).expect("replay result JSON");
+        serde_json::from_str(replay_tool_result.as_text().expect("text result"))
+            .expect("replay result JSON");
     assert_eq!(replay["input_id"], input_id);
     assert_eq!(replay["replayed"], true);
     assert_eq!(replay["phase"], "ready");
@@ -4045,7 +4047,7 @@ async fn interrupt_only_replay_never_interrupts_newer_generation_or_queues_text(
         agent_vocab::ToolResultStatus::Success
     );
     let terminal_replay: serde_json::Value =
-        serde_json::from_str(&terminal_replay_tool_result.output)
+        serde_json::from_str(terminal_replay_tool_result.as_text().expect("text result"))
             .expect("terminal replay result JSON");
     assert_eq!(terminal_replay["input_id"], input_id);
     assert_eq!(terminal_replay["replayed"], true);
@@ -4630,7 +4632,12 @@ async fn combined_control_interrupts_complete_parallel_tool_generation_once() {
                     row_id: attempts[0].row_id.clone(),
                     attempt_id: attempts[0].attempt_id.clone(),
                     status: ActionStatus::Completed,
-                    result: json!({ "completed": true }),
+                    result: serde_json::to_value(ToolResultMessage::success(
+                        first_call.id.clone(),
+                        first_call.tool_name.clone(),
+                        "completed before reconciliation",
+                    ))
+                    .expect("tool result serializes"),
                     post_compaction_dispatch_lease: None,
                 })),
         )
@@ -6457,7 +6464,8 @@ async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
     .await;
     assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Success);
     let output: serde_json::Value =
-        serde_json::from_str(&tool_result.output).expect("tool output JSON");
+        serde_json::from_str(tool_result.as_text().expect("text result"))
+            .expect("tool output JSON");
     assert_eq!(output["subagent_id"], "impl_busy");
     assert_eq!(output["queued"], true);
     assert!(output["input_id"].as_str().is_some());
@@ -6652,18 +6660,38 @@ async fn websocket_delegation_steer_subagent_uses_parent_scope() {
 
     let error = crate::delegation_tools::rpc_steer_subagent(
         &env.state,
-        json!({ "subagent_id": "readonly_busy", "message": "missing parent" }),
+        json!({
+            "subagent_id": "readonly_busy",
+            "content": [{"type": "text", "text": "missing parent"}],
+        }),
     )
     .await
     .expect_err("parent scope is required");
     assert_eq!(error.code, "invalid_params");
+
+    let error = crate::delegation_tools::rpc_steer_subagent(
+        &env.state,
+        json!({
+            "parent_session_id": "parent",
+            "subagent_id": "readonly_busy",
+            "message": "legacy scalar websocket input",
+        }),
+    )
+    .await
+    .expect_err("legacy scalar message is rejected");
+    assert_eq!(error.code, "invalid_params");
+    assert!(
+        error.message.contains("unknown field `message`"),
+        "unexpected error: {}",
+        error.message
+    );
 
     let result = crate::delegation_tools::rpc_steer_subagent(
         &env.state,
         json!({
             "parent_session_id": "parent",
             "subagent_id": "readonly_busy",
-            "message": "Please inspect one more file."
+            "content": [{"type": "text", "text": "Please inspect one more file."}],
         }),
     )
     .await
@@ -6715,14 +6743,18 @@ async fn model_and_websocket_steers_share_one_durable_subagent_mailbox() {
             json!({
                 "parent_session_id": "parent",
                 "subagent_id": "impl_busy",
-                "message": "instruction from the user transcript"
+                "content": [{
+                    "type": "text",
+                    "text": "instruction from the user transcript",
+                }],
             }),
         ),
     );
 
     assert_eq!(model_result.status, agent_vocab::ToolResultStatus::Success);
     let model_output: serde_json::Value =
-        serde_json::from_str(&model_result.output).expect("model steer output JSON");
+        serde_json::from_str(model_result.as_text().expect("text result"))
+            .expect("model steer output JSON");
     let web_output = web_result.expect("websocket steer succeeds");
     assert_eq!(model_output["queued"], true);
     assert!(model_output["input_id"].as_str().is_some());
@@ -6794,7 +6826,7 @@ async fn model_facing_delegation_tools_reject_subagent_sessions() {
     .await;
     assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Error);
     assert!(tool_result
-        .output
+        .display_text()
         .contains("delegations_not_allowed_for_subagent"));
 
     env.cleanup().await;
@@ -6851,7 +6883,8 @@ async fn model_facing_steer_subagent_queues_steer_for_running_read_only_subagent
     .await;
     assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Success);
     let output: serde_json::Value =
-        serde_json::from_str(&tool_result.output).expect("tool output JSON");
+        serde_json::from_str(tool_result.as_text().expect("text result"))
+            .expect("tool output JSON");
     assert_eq!(output["subagent_id"], "readonly_running");
     assert_eq!(output["queued"], true);
     assert!(output["input_id"].as_str().is_some());
@@ -7692,7 +7725,9 @@ async fn steer_subagent_rejects_terminal_or_cancelled_delegations() {
     )
     .await;
     assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Error);
-    assert!(tool_result.output.contains("delegation_not_running"));
+    assert!(tool_result
+        .display_text()
+        .contains("delegation_not_running"));
 
     let cancelled = create_delegation(&env, "parent", DelegationKind::Full, None, None, 1)
         .await
@@ -7711,7 +7746,9 @@ async fn steer_subagent_rejects_terminal_or_cancelled_delegations() {
     )
     .await;
     assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Error);
-    assert!(tool_result.output.contains("delegation_not_running"));
+    assert!(tool_result
+        .display_text()
+        .contains("delegation_not_running"));
 
     env.cleanup().await;
 }

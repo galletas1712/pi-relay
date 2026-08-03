@@ -348,6 +348,7 @@ fn compaction_body_with_metadata(
         model: request.model,
         prompt: request.prompt,
         transcript: request.transcript,
+        resolved_images: request.resolved_images,
         // Native compaction is a text-only sampling request. Supplying no
         // tools avoids Anthropic's documented null compaction-block failure.
         tool_profile: ProviderToolProfile::None,
@@ -1186,6 +1187,7 @@ fn prepare_messages_request(
         model: request.model,
         prompt: request.prompt,
         transcript: request.transcript,
+        resolved_images: request.resolved_images,
         tool_profile,
         tools: crate::effective_provider_tools(tool_profile, request.tools),
         max_tokens: Some(max_tokens),
@@ -1228,6 +1230,7 @@ fn prepare_count_tokens_request(
         model: request.model,
         prompt: request.prompt,
         transcript: request.transcript,
+        resolved_images: request.resolved_images,
         tool_profile,
         tools: crate::effective_provider_tools(tool_profile, request.tools),
         // Anthropic's /messages/count_tokens endpoint accepts the same prompt,
@@ -1247,6 +1250,7 @@ struct AnthropicRequestBodyInput {
     model: String,
     prompt: crate::PromptSections,
     transcript: Vec<ModelTranscriptEntry>,
+    resolved_images: crate::ResolvedImageMap,
     tool_profile: ProviderToolProfile,
     tools: Vec<ProviderTool>,
     max_tokens: Option<u32>,
@@ -1335,12 +1339,14 @@ fn transcript_to_messages_for_request(
     input: &AnthropicRequestBodyInput,
 ) -> ProviderResult<RenderedAnthropicMessages> {
     if !input.cache_transcript {
-        let mut rendered = render_transcript_messages(&input.prompt, &input.transcript)?;
+        let mut rendered =
+            render_transcript_messages(&input.prompt, &input.transcript, &input.resolved_images)?;
         append_dynamic_context_message(&input.prompt, &mut rendered.messages);
         return Ok(rendered);
     }
     let Some(prefix_len) = input.transcript_cache_prefix_len else {
-        let mut rendered = render_transcript_messages(&input.prompt, &input.transcript)?;
+        let mut rendered =
+            render_transcript_messages(&input.prompt, &input.transcript, &input.resolved_images)?;
         add_transcript_cache_breakpoints(&mut rendered.messages);
         append_dynamic_context_message(&input.prompt, &mut rendered.messages);
         return Ok(rendered);
@@ -1348,9 +1354,9 @@ fn transcript_to_messages_for_request(
 
     let prefix_len = prefix_len.min(input.transcript.len());
     let (prefix, suffix) = input.transcript.split_at(prefix_len);
-    let mut rendered = render_transcript_messages(&input.prompt, prefix)?;
+    let mut rendered = render_transcript_messages(&input.prompt, prefix, &input.resolved_images)?;
     add_transcript_cache_breakpoints(&mut rendered.messages);
-    let suffix = render_transcript_messages(&input.prompt, suffix)?;
+    let suffix = render_transcript_messages(&input.prompt, suffix, &input.resolved_images)?;
     rendered.messages.extend(suffix.messages);
     rendered.replays_compaction |= suffix.replays_compaction;
     append_dynamic_context_message(&input.prompt, &mut rendered.messages);
@@ -1657,14 +1663,16 @@ fn is_cacheable_transcript_block(block: &Value) -> bool {
 fn render_transcript_messages(
     prompt: &crate::PromptSections,
     items: &[ModelTranscriptEntry],
+    images: &crate::ResolvedImageMap,
 ) -> ProviderResult<RenderedAnthropicMessages> {
     let mut messages = Vec::new();
     let mut replays_compaction = false;
     for entry in items {
         match entry.item() {
             TranscriptItem::UserMessage(message) => {
-                messages
-                    .push(json!({ "role": "user", "content": anthropic_user_content(message) }));
+                messages.push(
+                    json!({ "role": "user", "content": anthropic_user_content(message, images)? }),
+                );
             }
             TranscriptItem::CompactionSummary(summary) => {
                 let (replay, has_compaction) = emitted_anthropic_replay(entry, true)?;
@@ -1705,7 +1713,11 @@ fn render_transcript_messages(
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": result.tool_call_id.as_str(),
-                        "content": result.output,
+                        "content": result
+                            .content
+                            .iter()
+                            .map(|block| anthropic_content_block(block, images))
+                            .collect::<ProviderResult<Vec<_>>>()?,
                         "is_error": matches!(result.status, agent_vocab::ToolResultStatus::Error | agent_vocab::ToolResultStatus::Interrupted | agent_vocab::ToolResultStatus::Crashed),
                     }]
                 }));
@@ -1732,7 +1744,7 @@ fn transcript_to_messages(
     prompt: &crate::PromptSections,
     items: &[ModelTranscriptEntry],
 ) -> ProviderResult<Vec<Value>> {
-    Ok(render_transcript_messages(prompt, items)?.messages)
+    Ok(render_transcript_messages(prompt, items, &Default::default())?.messages)
 }
 
 fn emitted_anthropic_replay(
@@ -1790,29 +1802,38 @@ fn anthropic_block_type<'a>(block: &'a Value, context: &str) -> ProviderResult<&
         .ok_or_else(|| ProviderError::Provider(format!("{context} missing nonempty string type")))
 }
 
-fn anthropic_user_content(message: &UserMessage) -> Value {
-    Value::Array(
-        message
-            .content
-            .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
-                ContentBlock::Image { image } => match &image.source {
-                    agent_vocab::ImageSource::Base64(data) => json!({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": image.mime_type,
-                            "data": data,
-                        }
-                    }),
-                    agent_vocab::ImageSource::Url(url) => {
-                        json!({ "type": "text", "text": format!("[image url: {url}]") })
-                    }
-                },
-            })
-            .collect(),
-    )
+fn anthropic_content_block(
+    block: &ContentBlock,
+    images: &crate::ResolvedImageMap,
+) -> ProviderResult<Value> {
+    match block {
+        ContentBlock::Text { text } => Ok(json!({ "type": "text", "text": text })),
+        ContentBlock::Image { artifact_id } => {
+            let image = images.get(artifact_id).ok_or_else(|| {
+                ProviderError::Provider(format!("missing resolved image artifact {artifact_id}"))
+            })?;
+            Ok(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image.mime_type,
+                    "data": image.data,
+                }
+            }))
+        }
+    }
+}
+
+fn anthropic_user_content(
+    message: &UserMessage,
+    images: &crate::ResolvedImageMap,
+) -> ProviderResult<Value> {
+    message
+        .content
+        .iter()
+        .map(|block| anthropic_content_block(block, images))
+        .collect::<ProviderResult<Vec<_>>>()
+        .map(Value::Array)
 }
 
 async fn parse_anthropic_stream(response: reqwest::Response) -> ProviderResult<ModelResponse> {
@@ -2999,6 +3020,7 @@ mod tests {
             model: "claude-opus-4-8".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript,
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::AnthropicCoding,
             tools: first_party_tools(ProviderKind::Claude),
             reasoning_effort: ReasoningEffort::High,
@@ -3017,6 +3039,7 @@ mod tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript,
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: Some(1024),
@@ -3225,7 +3248,10 @@ mod tests {
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": "toolu_1",
-                        "content": "contents",
+                        "content": [{
+                            "type": "text",
+                            "text": "contents",
+                        }],
                         "is_error": false,
                         "cache_control": { "type": "ephemeral" },
                     }],
@@ -3530,6 +3556,7 @@ mod tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![test_tool(
                 ProviderKind::Claude,
@@ -3592,6 +3619,7 @@ mod tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![test_tool(
                 ProviderKind::Claude,
@@ -3627,6 +3655,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -3651,6 +3680,7 @@ mod tests {
                 model: "claude-opus-4-8".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -3675,6 +3705,7 @@ mod tests {
                         transcript: vec![
                             TranscriptItem::UserMessage(UserMessage::text("hello")).into()
                         ],
+                        resolved_images: Default::default(),
                         tool_profile: ProviderToolProfile::None,
                         tools: Vec::new(),
                         max_tokens: None,
@@ -3704,6 +3735,7 @@ mod tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens,
@@ -4060,6 +4092,7 @@ mod tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -4159,6 +4192,7 @@ mod tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -4708,6 +4742,7 @@ mod tests {
             model: "claude-opus-4-7".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![test_tool(
                 ProviderKind::Claude,
@@ -4747,6 +4782,7 @@ mod tests {
             model: "claude-sonnet-4-5".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: Some(80),
@@ -4772,6 +4808,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: transcript.clone(),
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4788,6 +4825,7 @@ mod tests {
                 model: "claude-opus-4-8".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: transcript.clone(),
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4833,6 +4871,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry.clone()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: Some(1024),
@@ -4874,6 +4913,7 @@ mod tests {
                 model: "claude-opus-4-8".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4961,6 +5001,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry.clone()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -4993,6 +5034,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry.clone()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -5014,6 +5056,7 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -5055,6 +5098,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry.clone()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -5068,6 +5112,7 @@ mod tests {
                 model: "claude-opus-4-8".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -5106,6 +5151,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -5144,6 +5190,7 @@ mod tests {
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -5173,6 +5220,7 @@ mod tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![entry],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -5282,7 +5330,12 @@ mod tests {
                 provider_replay: vec![replay],
             };
             assert!(
-                render_transcript_messages(&PromptSections::default(), &[entry]).is_err(),
+                render_transcript_messages(
+                    &PromptSections::default(),
+                    &[entry],
+                    &Default::default(),
+                )
+                .is_err(),
                 "corrupt or malformed exact compaction replay must fail locally"
             );
         }
@@ -5295,6 +5348,7 @@ mod tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![
                 test_tool(
@@ -5326,11 +5380,45 @@ mod tests {
     }
 
     #[test]
+    fn resolved_image_refs_render_as_anthropic_base64_blocks() {
+        let artifact_id = agent_vocab::ImageArtifactId::parse(format!("sha256:{}", "a".repeat(64)))
+            .expect("valid artifact id");
+        let images = crate::ResolvedImageMap::from([(
+            artifact_id.clone(),
+            crate::ResolvedImage {
+                mime_type: "image/png".to_string(),
+                data: "encoded".to_string(),
+            },
+        )]);
+        let content = anthropic_user_content(
+            &UserMessage::from_parts(vec![
+                ContentBlock::text("before"),
+                ContentBlock::image(artifact_id.clone()),
+                ContentBlock::text("after"),
+            ]),
+            &images,
+        )
+        .expect("resolved image renders");
+
+        assert_eq!(content[0]["text"], "before");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "encoded");
+        assert_eq!(content[2]["text"], "after");
+        assert!(anthropic_user_content(
+            &UserMessage::from_parts(vec![ContentBlock::image(artifact_id)]),
+            &Default::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn count_tokens_body_counts_the_same_local_tool_surface() {
         let body = count_tokens_body(ProviderTokenCountRequest {
             model: "claude-opus-4-7".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hi")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::AnthropicCoding,
             tools: first_party_tools(ProviderKind::Claude),
             max_tokens: None,
@@ -5355,6 +5443,7 @@ mod tests {
                 "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
+                "ReadImage",
                 "steer_subagent",
                 "str_replace_based_edit_tool",
                 "web_fetch",
@@ -5377,6 +5466,7 @@ mod tests {
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::AnthropicCoding,
             tools: first_party_tools(ProviderKind::Claude),
             max_tokens: None,
@@ -5401,17 +5491,19 @@ mod tests {
         assert!(body["tools"][5].get("type").is_none());
         assert_eq!(body["tools"][6]["name"], "LoadSkill");
         assert!(body["tools"][6].get("type").is_none());
-        assert_eq!(body["tools"][7]["name"], "steer_subagent");
+        assert_eq!(body["tools"][7]["name"], "ReadImage");
         assert!(body["tools"][7].get("type").is_none());
-        assert_eq!(body["tools"][8]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][8]["name"], "str_replace_based_edit_tool");
-        assert_eq!(body["tools"][9]["name"], "web_fetch");
-        assert!(body["tools"][9].get("type").is_none());
-        assert_eq!(body["tools"][10]["name"], "web_search");
+        assert_eq!(body["tools"][8]["name"], "steer_subagent");
+        assert!(body["tools"][8].get("type").is_none());
+        assert_eq!(body["tools"][9]["type"], "text_editor_20250728");
+        assert_eq!(body["tools"][9]["name"], "str_replace_based_edit_tool");
+        assert_eq!(body["tools"][10]["name"], "web_fetch");
         assert!(body["tools"][10].get("type").is_none());
+        assert_eq!(body["tools"][11]["name"], "web_search");
+        assert!(body["tools"][11].get("type").is_none());
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
-        for index in 0..11 {
+        for index in 0..12 {
             assert!(
                 body["tools"][index].get("cache_control").is_none(),
                 "tool {index} should not carry cache_control"
@@ -5432,6 +5524,7 @@ mod tests {
                 })
                 .into(),
             ],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -5465,6 +5558,7 @@ mod tests {
                 TranscriptItem::UserMessage(UserMessage::text("normal user turn")).into(),
                 TranscriptItem::UserMessage(UserMessage::text("sidecar title prompt")).into(),
             ],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -5496,6 +5590,7 @@ mod tests {
                 Some("volatile context".to_string()),
             ),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -5875,6 +5970,7 @@ data: {"type":"message_stop"}
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry.clone()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: Some(1024),
@@ -5888,6 +5984,7 @@ data: {"type":"message_stop"}
                 model: "claude-opus-4-8".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -7561,6 +7658,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -7597,6 +7695,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript,
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -7641,6 +7740,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript,
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
@@ -7695,6 +7795,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("a stable system prompt long enough to fingerprint"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text(first_user)).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
@@ -7727,6 +7828,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable(stable),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("anything")).into()],
+                resolved_images: Default::default(),
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,

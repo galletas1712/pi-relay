@@ -3,8 +3,7 @@ use agent_provider::{
 };
 use agent_store::SessionConfig;
 use agent_tools::{
-    limit_tool_output_with_max_tokens, nonempty_domains, ProviderTool, ToolContext, ToolExecution,
-    WebFetchArgs, WebSearchArgs,
+    nonempty_domains, ProviderTool, ToolContext, ToolExecution, WebFetchArgs, WebSearchArgs,
 };
 use agent_vocab::{
     AssistantItem, ProviderKind, ProviderReplayItem, ToolCall, ToolResultMessage, TranscriptItem,
@@ -79,16 +78,7 @@ async fn run_web_search(
         ProviderKind::OpenAi => openai_web_search_tool(),
     };
     let prompt = web_search_sidecar_prompt(&args);
-    run_provider_web_sidecar(
-        state,
-        config,
-        session_id,
-        call,
-        tool,
-        prompt,
-        args.max_output_tokens,
-    )
-    .await
+    run_provider_web_sidecar(state, config, session_id, call, tool, prompt).await
 }
 
 async fn run_web_fetch(
@@ -120,17 +110,7 @@ async fn run_web_fetch(
         ProviderKind::Claude => {
             let tool = anthropic_web_fetch_tool();
             let prompt = web_fetch_sidecar_prompt(&args);
-            match run_provider_web_sidecar(
-                state,
-                config,
-                session_id,
-                call,
-                tool,
-                prompt,
-                args.max_output_tokens,
-            )
-            .await
-            {
+            match run_provider_web_sidecar(state, config, session_id, call, tool, prompt).await {
                 result if matches!(result.status, agent_vocab::ToolResultStatus::Success) => result,
                 provider_error => {
                     // If Claude's server-side fetch cannot run, fall back to
@@ -141,10 +121,13 @@ async fn run_web_fetch(
                         .execute(config.provider.kind, call, ctx)
                         .await
                         .unwrap_or_else(|_| {
-                            ToolResultMessage::crashed(call.id.clone(), call.tool_name.clone())
+                            agent_vocab::InlineToolResultMessage::crashed(
+                                call.id.clone(),
+                                call.tool_name.clone(),
+                            )
                         });
                     if matches!(fallback.status, agent_vocab::ToolResultStatus::Success) {
-                        fallback
+                        fallback.into_durable_text()
                     } else {
                         provider_error
                     }
@@ -156,8 +139,12 @@ async fn run_web_fetch(
             .execute(config.provider.kind, call, ctx)
             .await
             .unwrap_or_else(|_| {
-                ToolResultMessage::crashed(call.id.clone(), call.tool_name.clone())
-            }),
+                agent_vocab::InlineToolResultMessage::crashed(
+                    call.id.clone(),
+                    call.tool_name.clone(),
+                )
+            })
+            .into_durable_text(),
     }
 }
 
@@ -168,12 +155,11 @@ async fn run_provider_web_sidecar(
     call: &ToolCall,
     tool: ProviderTool,
     user_prompt: String,
-    max_output_tokens: Option<usize>,
 ) -> ToolResultMessage {
     let request = build_web_sidecar_request(config, session_id, call, tool, user_prompt);
 
     match run_model_sidecar(state, config, request).await {
-        Ok(response) => sidecar_response_to_tool_result(call, response, max_output_tokens),
+        Ok(response) => sidecar_response_to_tool_result(call, response),
         Err(error) => ToolResultMessage::error(
             call.id.clone(),
             &call.tool_name,
@@ -202,6 +188,7 @@ fn build_web_sidecar_request(
             transcript: vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
                 UserMessage::text(user_prompt),
             ))],
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![tool],
             max_tokens: config.provider.max_tokens,
@@ -213,11 +200,7 @@ fn build_web_sidecar_request(
     }
 }
 
-fn sidecar_response_to_tool_result(
-    call: &ToolCall,
-    response: ModelResponse,
-    max_output_tokens: Option<usize>,
-) -> ToolResultMessage {
+fn sidecar_response_to_tool_result(call: &ToolCall, response: ModelResponse) -> ToolResultMessage {
     let mut output = response.assistant.text().trim().to_string();
     if response.assistant.tool_calls().next().is_some() {
         output = run_embedded_web_tool_calls(&response, &output);
@@ -228,11 +211,7 @@ fn sidecar_response_to_tool_result(
     if output.is_empty() {
         output = "web tool backend returned no text output".to_string();
     }
-    ToolResultMessage::success(
-        call.id.clone(),
-        &call.tool_name,
-        limit_tool_output_with_max_tokens(output, max_output_tokens),
-    )
+    ToolResultMessage::success(call.id.clone(), &call.tool_name, output)
 }
 
 fn run_embedded_web_tool_calls(response: &ModelResponse, initial_text: &str) -> String {
@@ -516,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn web_max_output_tokens_truncates_the_local_tool_result() {
+    fn web_sidecar_returns_raw_output_for_daemon_finalization() {
         let call = ToolCall {
             args_json: json!({
                 "query": "rust",
@@ -525,8 +504,6 @@ mod tests {
             .to_string(),
             ..test_web_search_call()
         };
-        let args: WebSearchArgs =
-            serde_json::from_str(&call.args_json).expect("web arguments deserialize");
         let response = ModelResponse {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::Text("abcdefghi".to_string())],
@@ -538,12 +515,8 @@ mod tests {
         };
 
         assert_eq!(
-            sidecar_response_to_tool_result(&call, response, args.max_output_tokens),
-            ToolResultMessage::success(
-                ToolCallId::new("call_web"),
-                "WebSearch",
-                "ab\n\n[tool output truncated: 5 characters omitted]\n\nhi",
-            )
+            sidecar_response_to_tool_result(&call, response),
+            ToolResultMessage::success(ToolCallId::new("call_web"), "WebSearch", "abcdefghi",)
         );
     }
 

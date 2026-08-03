@@ -2,13 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
 	COMPOSER_DRAFTS_STORAGE_KEY,
 	COMPOSER_DRAFT_STORAGE_PREFIX,
+	ComposerDraftStore,
 	composerDraftKey,
 	loadComposerDrafts,
 	reorderQueuedInputsBefore,
-	resolveSubmittedDraft,
 	saveComposerDrafts,
 	submissionIdsForDraft,
-	submittedDraftStillCurrent,
 	type ComposerDraftStorage,
 	type PendingSubmittedDraft,
 } from "./composer.tsx";
@@ -28,7 +27,9 @@ describe("queued input drop ordering", () => {
 describe("composer draft storage", () => {
 	const pending: PendingSubmittedDraft = {
 		value: "run tests",
-		version: 3,
+		attachments: [],
+		images: [],
+		revision: 3,
 		newSessionSetupGeneration: 7,
 		clientControlId: "web_control_stable",
 		newSessionId: "session_stable",
@@ -51,14 +52,23 @@ describe("composer draft storage", () => {
 		saveComposerDrafts(new Map([["session_a", "draft a"]]), storage);
 		saveComposerDrafts(new Map([["session_b", "draft b"]]), storage);
 
-		expect(storage.getItem(`${COMPOSER_DRAFT_STORAGE_PREFIX}session_a`)).toBe("draft a");
-		expect(storage.getItem(`${COMPOSER_DRAFT_STORAGE_PREFIX}session_b`)).toBe("draft b");
+		expect(storage.getItem(`${COMPOSER_DRAFT_STORAGE_PREFIX}session_a`)).toBe(
+			"draft a",
+		);
+		expect(storage.getItem(`${COMPOSER_DRAFT_STORAGE_PREFIX}session_b`)).toBe(
+			"draft b",
+		);
 	});
 
 	it("replaces both IDs after a deliberate new-session setup edit", () => {
 		let next = 0;
 		expect(
-			submissionIdsForDraft(pending, "run tests", 8, (prefix) => `${prefix}_${++next}`),
+			submissionIdsForDraft(
+				pending,
+				"run tests",
+				8,
+				(prefix) => `${prefix}_${++next}`,
+			),
 		).toEqual({
 			clientControlId: "web_control_1",
 			newSessionId: "session_2",
@@ -82,54 +92,86 @@ describe("composer draft storage", () => {
 	});
 
 	it("reuses both durable IDs when unchanged text is retried after an uncertain response", () => {
-		expect(submissionIdsForDraft(pending, "run tests", 7, () => "new-id")).toEqual({
+		expect(
+			submissionIdsForDraft(pending, "run tests", 7, () => "new-id"),
+		).toEqual({
 			clientControlId: "web_control_stable",
 			newSessionId: "session_stable",
+		});
+	});
+
+	it("keeps retry identity small and changes it when artifact refs change", () => {
+		const first = {
+			type: "image" as const,
+			artifact_id: `sha256:${"a".repeat(64)}`,
+		};
+		const second = {
+			type: "image" as const,
+			artifact_id: `sha256:${"b".repeat(64)}`,
+		};
+		const imagePending = { ...pending, attachments: [first] };
+
+		expect(
+			submissionIdsForDraft(imagePending, "run tests", 7, () => "new-id", [
+				first,
+			]),
+		).toEqual({
+			clientControlId: "web_control_stable",
+			newSessionId: "session_stable",
+		});
+		expect(
+			submissionIdsForDraft(
+				imagePending,
+				"run tests",
+				7,
+				(prefix) => `${prefix}_new`,
+				[second],
+			),
+		).toEqual({
+			clientControlId: "web_control_new",
+			newSessionId: "session_new",
 		});
 	});
 
 	it("replaces both IDs after a deliberate edit", () => {
 		let next = 0;
 		expect(
-			submissionIdsForDraft(pending, "run all tests", 7, (prefix) => `${prefix}_${++next}`),
+			submissionIdsForDraft(
+				pending,
+				"run all tests",
+				7,
+				(prefix) => `${prefix}_${++next}`,
+			),
 		).toEqual({
 			clientControlId: "web_control_1",
 			newSessionId: "session_2",
 		});
 	});
-});
 
-describe("submitted composer draft guards", () => {
-	const pending: PendingSubmittedDraft = {
-		value: "run tests",
-		version: 3,
-		newSessionSetupGeneration: 7,
-		clientControlId: "web_control_stable",
-		newSessionId: "session_stable",
-	};
+	it("refuses to replace an unresolved submission before newer user intent", () => {
+		const store = new ComposerDraftStore(memoryStorage());
+		store.setDraft("session-a", "run tests");
+		const first = store.beginSubmission(
+			"session-a",
+			"run tests",
+			[],
+			0,
+			(prefix) => `${prefix}_stable`,
+		);
 
-	it("accepts a pending submitted draft only while the stored draft version still matches", () => {
-		expect(submittedDraftStillCurrent(pending, 3, "run tests", 3)).toBe(true);
-		expect(resolveSubmittedDraft(pending, 3, "run tests", 3)).toBe("apply");
-	});
-
-	it("rejects stale successes or failures after a newer non-empty draft replaced the submitted text", () => {
-		expect(submittedDraftStillCurrent(pending, 4, "run tests", 3)).toBe(false);
-		expect(resolveSubmittedDraft(pending, 4, "run tests", 3)).toBe("ignore");
-	});
-
-	it("rejects stale successes or failures after a newer empty draft cleared the submitted text", () => {
-		expect(submittedDraftStillCurrent(pending, 4, "run tests", 3)).toBe(false);
-		expect(resolveSubmittedDraft(pending, 4, "run tests", 3)).toBe("ignore");
-	});
-
-	it("rejects same-version pending markers for different submitted text", () => {
-		expect(submittedDraftStillCurrent(pending, 3, "ship it", 3)).toBe(false);
-	});
-
-	it("allows unversioned imperative restore only when the pending marker is still current", () => {
-		expect(submittedDraftStillCurrent(pending, 3, "run tests")).toBe(true);
-		expect(submittedDraftStillCurrent(pending, 4, "run tests")).toBe(false);
+		expect(first).not.toBeNull();
+		expect(
+			store.beginSubmission(
+				"session-a",
+				"run tests",
+				[],
+				0,
+				() => "replacement",
+			),
+		).toBeNull();
+		store.settleSubmission("session-a", first!, true);
+		expect(store.draft("session-a")).toBe("");
+		store.dispose();
 	});
 });
 

@@ -100,7 +100,7 @@ pub struct McpToolView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpCallOutput {
-    pub output: String,
+    pub content: Vec<agent_vocab::InlineContentBlock>,
     pub is_error: bool,
 }
 

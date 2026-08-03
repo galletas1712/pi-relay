@@ -241,13 +241,7 @@ export interface ActiveBranchSyncResponse {
 
 export type ContentBlock =
 	| { type: "text"; text: string }
-	| {
-			type: "image";
-			image: {
-				mime_type: string;
-				source: { kind: "url" | "base64"; value: string };
-			};
-	  };
+	| { type: "image"; artifact_id: string };
 
 export type AssistantItem =
 	| { type: "text"; text: string }
@@ -278,7 +272,7 @@ export type TranscriptItem =
 	| { type: "user_message"; content: ContentBlock[]; replayed_after_compaction?: boolean }
 	| { type: "assistant_message"; items: AssistantItem[] }
 	| { type: "tool_call_started"; turn_id: number; tool_call: ToolCall }
-	| { type: "tool_result"; tool_call_id: string; tool_name: string; output: string; status: ToolResultStatus }
+	| { type: "tool_result"; tool_call_id: string; tool_name: string; content: ContentBlock[]; status: ToolResultStatus }
 	| { type: "turn_finished"; turn_id: number; outcome: TurnOutcome }
 	| ({ type: "daemon_tool_observation" } & DaemonToolObservation)
 	| {

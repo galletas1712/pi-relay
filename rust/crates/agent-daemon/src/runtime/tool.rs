@@ -2,8 +2,12 @@ use agent_core::AgentInput;
 use agent_runtime_protocol::{RuntimeCommand, RuntimeCommandResult};
 use agent_session::SessionAction;
 use agent_store::{ActionStatus, ActionUpdate};
-use agent_tools::{bash_call_for_execution, limit_tool_output, ToolContext};
-use agent_vocab::{ToolResultMessage, ToolResultStatus};
+use agent_tools::{
+    bash_call_for_execution, finalize_tool_result_content_with_max_tokens,
+    requested_tool_output_limit, ToolContext,
+};
+use agent_vocab::{InlineToolResultMessage, ToolResultMessage, ToolResultStatus};
+use cap_std::{ambient_authority, fs::Dir};
 use serde_json::json;
 
 use crate::delegation_tools::is_delegation_tool_name;
@@ -33,6 +37,7 @@ pub(super) async fn run_tool_turn(
         .tool(&tool_call.tool_name)
         .is_some();
     let execution_call = bash_call_for_execution(&tool_call);
+    let max_output_tokens = requested_tool_output_limit(&execution_call);
     state
         .runtime_hosts
         .ensure_session(
@@ -42,7 +47,11 @@ pub(super) async fn run_tool_turn(
         )
         .await?;
 
-    let tool_context = ToolContext::new(std::path::PathBuf::from("/"));
+    let tool_context = ToolContext::new(
+        std::path::PathBuf::from("/"),
+        Dir::open_ambient_dir("/", ambient_authority())
+            .map_err(|error| RpcError::new("tool_context_unavailable", error.to_string()))?,
+    );
     let mut result = if is_mcp_tool {
         // MCP servers run on the session's runtime; ship the manifest + call and
         // let the runtime resolve/execute it into a ToolResultMessage.
@@ -56,7 +65,7 @@ pub(super) async fn run_tool_turn(
             .await
         {
             Ok(result) => result,
-            Err(error) => ToolResultMessage::error(
+            Err(error) => InlineToolResultMessage::error(
                 tool_call.id.clone(),
                 tool_call.tool_name.clone(),
                 format!("MCP tool execution failed: {error:#}"),
@@ -82,8 +91,10 @@ pub(super) async fn run_tool_turn(
                 )
                 .await
             {
-                Ok(runtime_context) => load_skill_result(&runtime_context.skills, &execution_call),
-                Err(error) => ToolResultMessage::error(
+                Ok(runtime_context) => {
+                    load_skill_result(&runtime_context.skills, &execution_call).into_inline_text()
+                }
+                Err(error) => InlineToolResultMessage::error(
                     tool_call.id.clone(),
                     tool_call.tool_name.clone(),
                     format!("failed to read runtime skills: {error:#}"),
@@ -93,7 +104,8 @@ pub(super) async fn run_tool_turn(
                 tool_call.id.clone(),
                 tool_call.tool_name.clone(),
                 format!("failed to resolve project skills: {error:#}"),
-            ),
+            )
+            .into_inline_text(),
         }
     } else if is_web_tool_name(&tool_call.tool_name) {
         run_web_tool(
@@ -104,6 +116,7 @@ pub(super) async fn run_tool_turn(
             &tool_context,
         )
         .await
+        .into_inline_text()
     } else if is_delegation_tool_name(&tool_call.tool_name) {
         crate::delegation_tools::run_delegation_tool_with_launch_key(
             &state,
@@ -112,6 +125,7 @@ pub(super) async fn run_tool_turn(
             &execution_call,
         )
         .await
+        .into_inline_text()
     } else {
         match state
             .runtime_hosts
@@ -127,12 +141,12 @@ pub(super) async fn run_tool_turn(
             .await
         {
             Ok(RuntimeCommandResult::Tool { result }) => result,
-            Ok(_) => ToolResultMessage::error(
+            Ok(_) => InlineToolResultMessage::error(
                 tool_call.id.clone(),
                 tool_call.tool_name.clone(),
                 "runtime returned the wrong tool result",
             ),
-            Err(error) => ToolResultMessage::error(
+            Err(error) => InlineToolResultMessage::error(
                 tool_call.id.clone(),
                 tool_call.tool_name.clone(),
                 format!("runtime tool execution failed: {error:#}"),
@@ -141,12 +155,7 @@ pub(super) async fn run_tool_turn(
     };
     // Completion persistence acquires the SessionDriver. Release the cwd guard
     // first so cancellation and source mutation never depend on both locks.
-    finalize_tool_result(&mut result);
-    let status = if matches!(result.status, ToolResultStatus::Success) {
-        ActionStatus::Completed
-    } else {
-        ActionStatus::Error
-    };
+    finalize_tool_result(&mut result, max_output_tokens);
     let driver = SessionDriver::acquire(&state, &session_id).await;
     if !state
         .repo
@@ -155,6 +164,16 @@ pub(super) async fn run_tool_turn(
     {
         return Ok(());
     }
+    let result = state
+        .repo
+        .ingest_tool_result(result)
+        .await
+        .map_err(anyhow::Error::new)?;
+    let status = if matches!(result.status, ToolResultStatus::Success) {
+        ActionStatus::Completed
+    } else {
+        ActionStatus::Error
+    };
     let active = driver
         .active_session()
         .await
@@ -219,24 +238,34 @@ pub(super) async fn run_tool_turn(
     Ok(())
 }
 
-fn escape_nul_in_tool_result(result: &mut ToolResultMessage) {
+fn finalize_tool_result(result: &mut InlineToolResultMessage, max_output_tokens: Option<usize>) {
     // Rust strings and JSON permit U+0000, but PostgreSQL JSONB does not.
-    if result.output.contains('\0') {
-        result.output = result.output.replace('\0', "\\x00");
-    }
-}
-
-fn finalize_tool_result(result: &mut ToolResultMessage) {
-    escape_nul_in_tool_result(result);
-    result.output = limit_tool_output(std::mem::take(&mut result.output));
+    // Shared finalize also truncates text and applies the image policy.
+    finalize_tool_result_content_with_max_tokens(result, max_output_tokens);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use agent_provider::{normalize_transcript_for_provider, ModelTranscriptEntry};
+    use agent_store::PostgresAgentStore;
     use agent_tools::{ToolContext, ToolRegistry};
-    use agent_vocab::{ProviderKind, ToolCall, ToolCallId};
+    use agent_vocab::{
+        ContentBlock, InlineContentBlock, ProviderKind, ToolCall, ToolCallId, TranscriptItem,
+    };
 
     use super::*;
+
+    fn test_tool_context() -> ToolContext {
+        let cwd = std::env::temp_dir();
+        ToolContext::new(
+            &cwd,
+            Dir::open_ambient_dir(&cwd, ambient_authority()).expect("open test temp directory"),
+        )
+    }
+
+    static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(70_000);
 
     #[tokio::test]
     async fn escapes_nul_emitted_by_bash() {
@@ -246,18 +275,15 @@ mod tests {
             args_json: serde_json::json!({ "command": "printf 'before\\0after'" }).to_string(),
         };
         let mut result = ToolRegistry::with_builtin_tools()
-            .execute(
-                ProviderKind::OpenAi,
-                &call,
-                &ToolContext::new(std::env::temp_dir()),
-            )
+            .execute(ProviderKind::OpenAi, &call, &test_tool_context())
             .await
             .expect("bash execution succeeds");
 
-        finalize_tool_result(&mut result);
+        finalize_tool_result(&mut result, None);
 
-        assert!(result.output.contains(r"before\x00after"));
-        assert!(!result.output.contains('\0'));
+        let text = result.display_text();
+        assert!(text.contains(r"before\x00after"));
+        assert!(!text.contains('\0'));
         assert!(!serde_json::to_string(&result)
             .expect("serialize tool result")
             .contains(r"\u0000"));
@@ -265,16 +291,207 @@ mod tests {
 
     #[test]
     fn nul_expansion_is_bounded_by_the_final_tool_output_limit() {
-        let mut result = ToolResultMessage::success(
+        let mut result = InlineToolResultMessage::success(
             ToolCallId::new("call"),
             "mcp__fixture__nul",
             "\0".repeat(40_000),
         );
 
-        finalize_tool_result(&mut result);
+        finalize_tool_result(&mut result, None);
 
-        assert!(!result.output.contains('\0'));
-        assert!(result.output.chars().count() <= 40_100);
-        assert!(result.output.contains("[tool output truncated:"));
+        let text = result.display_text();
+        assert!(!text.contains('\0'));
+        assert!(text.chars().count() <= 40_100);
+        assert!(text.contains("[tool output truncated:"));
+    }
+
+    #[tokio::test]
+    async fn oversized_bash_keeps_original_head_tail_and_count_across_refinalization() {
+        let call = oversized_bash_call();
+        let mut result = ToolRegistry::with_builtin_tools()
+            .execute(ProviderKind::OpenAi, &call, &test_tool_context())
+            .await
+            .expect("bash execution succeeds");
+        let original = result.display_text();
+        let total = original.chars().count();
+        let expected_head = original.chars().take(24_000).collect::<String>();
+        let expected_tail = original
+            .chars()
+            .skip(total.saturating_sub(16_000))
+            .collect::<String>();
+
+        finalize_tool_result(&mut result, requested_tool_output_limit(&call));
+        let once = serde_json::to_vec(&result).expect("serialize finalized result");
+        finalize_tool_result(&mut result, requested_tool_output_limit(&call));
+
+        assert_eq!(
+            serde_json::to_vec(&result).expect("serialize refinalized result"),
+            once
+        );
+        let finalized = result.display_text();
+        assert!(finalized.starts_with(&expected_head));
+        assert!(finalized.ends_with(&expected_tail));
+        assert!(finalized.contains(&format!(
+            "[tool output truncated: {} characters omitted]",
+            total - 40_000
+        )));
+    }
+
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+    #[tokio::test]
+    async fn oversized_local_and_mcp_results_stay_stable_through_store_and_provider() {
+        let Ok(admin_url) = std::env::var("PI_RELAY_TEST_DATABASE_URL") else {
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let name = format!(
+            "pi_relay_tool_chain_test_{}_{}",
+            std::process::id(),
+            TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let admin = sqlx::PgPool::connect(&admin_url)
+            .await
+            .expect("connect test administrator database");
+        sqlx::query(&format!(r#"create database "{name}""#))
+            .execute(&admin)
+            .await
+            .expect("create isolated tool-chain test database");
+        admin.close().await;
+        let store = PostgresAgentStore::connect(&database_url_with_name(&admin_url, &name))
+            .await
+            .expect("connect isolated tool-chain database");
+        store.migrate().await.expect("install real schema");
+
+        let bash_call = oversized_bash_call();
+        let mut bash = ToolRegistry::with_builtin_tools()
+            .execute(ProviderKind::OpenAi, &bash_call, &test_tool_context())
+            .await
+            .expect("bash execution succeeds");
+        let original_bash = bash.display_text();
+        let original_bash_chars = original_bash.chars().count();
+        let expected_bash_head = original_bash.chars().take(24_000).collect::<String>();
+        let expected_bash_tail = original_bash
+            .chars()
+            .skip(original_bash_chars.saturating_sub(16_000))
+            .collect::<String>();
+        finalize_tool_result(&mut bash, requested_tool_output_limit(&bash_call));
+        let bash_text = bash.display_text();
+        assert!(bash_text.starts_with(&expected_bash_head));
+        assert!(bash_text.ends_with(&expected_bash_tail));
+        assert!(bash_text.contains(&format!(
+            "[tool output truncated: {} characters omitted]",
+            original_bash_chars - 40_000
+        )));
+        let durable_bash = store
+            .ingest_tool_result(bash)
+            .await
+            .expect("ingest finalized Bash result");
+        let durable_bash_bytes =
+            serde_json::to_vec(&durable_bash).expect("serialize durable Bash result");
+        let provider_bash = normalize_transcript_for_provider(vec![ModelTranscriptEntry::from(
+            TranscriptItem::ToolResult(durable_bash),
+        )]);
+        let TranscriptItem::ToolResult(provider_bash) = &provider_bash[0].item else {
+            panic!("provider transcript must retain the Bash result");
+        };
+        assert_eq!(
+            serde_json::to_vec(provider_bash).expect("serialize provider Bash result"),
+            durable_bash_bytes
+        );
+
+        let png = agent_vocab::encode_base64(&tiny_png());
+        let mut result = InlineToolResultMessage::success_content(
+            ToolCallId::new("call_mcp_mixed"),
+            "mcp__fixture__mixed",
+            vec![
+                InlineContentBlock::text("h".repeat(24_000)),
+                InlineContentBlock::image("image/png", png.clone()),
+                InlineContentBlock::text("x".repeat(5_000)),
+                InlineContentBlock::image("image/png", png),
+                InlineContentBlock::text("t".repeat(16_000)),
+            ],
+        );
+        finalize_tool_result(&mut result, None);
+        let once = serde_json::to_vec(&result).expect("serialize finalized MCP result");
+        finalize_tool_result(&mut result, None);
+        assert_eq!(
+            serde_json::to_vec(&result).expect("serialize refinalized MCP result"),
+            once
+        );
+
+        let durable = store
+            .ingest_tool_result(result)
+            .await
+            .expect("artifactize finalized MCP result");
+        assert!(matches!(
+            durable.content.as_slice(),
+            [
+                ContentBlock::Text { text: head },
+                ContentBlock::Image { .. },
+                ContentBlock::Text { text: note },
+                ContentBlock::Image { .. },
+                ContentBlock::Text { text: tail },
+            ] if head == &"h".repeat(24_000)
+                && note == "[tool output truncated: 5000 characters omitted]"
+                && tail == &"t".repeat(16_000)
+        ));
+        let durable_bytes = serde_json::to_vec(&durable).expect("serialize durable MCP result");
+
+        let provider = normalize_transcript_for_provider(vec![ModelTranscriptEntry::from(
+            TranscriptItem::ToolResult(durable),
+        )]);
+        let TranscriptItem::ToolResult(provider_result) = &provider[0].item else {
+            panic!("provider transcript must retain the tool result");
+        };
+        assert_eq!(
+            serde_json::to_vec(provider_result).expect("serialize provider MCP result"),
+            durable_bytes
+        );
+
+        store.close().await;
+        let admin = sqlx::PgPool::connect(&admin_url)
+            .await
+            .expect("reconnect test administrator database");
+        sqlx::query(&format!(r#"drop database "{name}""#))
+            .execute(&admin)
+            .await
+            .expect("drop only isolated tool-chain test database");
+        admin.close().await;
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    fn oversized_bash_call() -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new("call_oversized_bash"),
+            tool_name: "Bash".to_string(),
+            args_json: serde_json::json!({
+                "command": concat!(
+                    "printf '%*s' 24000 '' | tr ' ' h; ",
+                    "printf '%*s' 5000 '' | tr ' ' x; ",
+                    "printf '%*s' 16000 '' | tr ' ' t"
+                )
+            })
+            .to_string(),
+        }
+    }
+
+    fn database_url_with_name(base: &str, name: &str) -> String {
+        let (prefix, query) = base
+            .split_once('?')
+            .map(|(prefix, query)| (prefix, format!("?{query}")))
+            .unwrap_or((base, String::new()));
+        let Some((root, _)) = prefix.rsplit_once('/') else {
+            return format!("{base}_{name}");
+        };
+        format!("{root}/{name}{query}")
     }
 }

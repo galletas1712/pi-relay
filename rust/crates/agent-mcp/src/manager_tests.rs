@@ -978,7 +978,10 @@ async fn stdio_client_initializes_pages_calls_refreshes_and_cleans_up() {
             .await
             .expect("call succeeds"),
         McpCallOutput {
-            output: "hello\n[structured content]\n{\"a\":2,\"z\":1}".to_string(),
+            content: vec![
+                agent_vocab::InlineContentBlock::text("hello"),
+                agent_vocab::InlineContentBlock::text("[structured content]\n{\"a\":2,\"z\":1}",),
+            ],
             is_error: false,
         }
     );
@@ -1000,7 +1003,7 @@ async fn stdio_client_initializes_pages_calls_refreshes_and_cleans_up() {
             .await
             .expect("MCP isError is a normal result"),
         McpCallOutput {
-            output: "expected failure".to_string(),
+            content: vec![agent_vocab::InlineContentBlock::text("expected failure")],
             is_error: true,
         }
     );

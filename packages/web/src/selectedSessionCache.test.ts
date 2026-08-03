@@ -1564,11 +1564,7 @@ function toolResultEntry(id: string, parentId: string | null, sequence: number):
 		timestamp_ms: 1_700_000_000_000 + sequence,
 		sequence,
 		item: {
-			type: "tool_result",
-			tool_call_id: "tool_0",
-			tool_name: "tool_0",
-			output: "ok",
-			status: "Success",
+			type: "tool_result", tool_call_id: "tool_0", tool_name: "tool_0", content: [{ type: "text", text: "ok" }], status: "Success",
 		},
 	};
 }

@@ -23,9 +23,9 @@ tools and MCP routes, bounded delegation, and the React web client.
 | `agent-vocab` | Shared serializable ids, message blocks, images, assistant items, tool calls/results, transcript items, provider config. | [docs/modules/agent-vocab.md](docs/modules/agent-vocab.md) |
 | `agent-core` | Pure deterministic FSM for one agent turn loop. No I/O. | [docs/modules/agent-core.md](docs/modules/agent-core.md) |
 | `agent-session` | Durable transcript forest, model-context materialization, resume, switch, compaction. | [docs/modules/agent-session.md](docs/modules/agent-session.md) |
-| `agent-store` | Postgres-only session/transcript/queue/action/event persistence and recovery. | [docs/modules/agent-store.md](docs/modules/agent-store.md) |
+| `agent-store` | Postgres-only session/transcript/queue/action/event persistence and recovery; owns image artifact bytes, content-addressed references, and reference admission. | [docs/modules/agent-store.md](docs/modules/agent-store.md) |
 | `agent-provider` | `ModelProvider` plus OpenAI/Codex and Anthropic adapters. | [docs/modules/agent-provider.md](docs/modules/agent-provider.md) |
-| `agent-tools` | `AgentTool`, `ToolRegistry`, and builtins: `apply_patch` / `str_replace_based_edit_tool`, `Bash`, `web_search`, `web_fetch`, `LoadSkill`, and delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). | [docs/modules/agent-tools.md](docs/modules/agent-tools.md) |
+| `agent-tools` | `AgentTool`, `ToolRegistry`, and builtins: `apply_patch` / `str_replace_based_edit_tool`, `Bash`, `ReadImage`, `web_search`, `web_fetch`, `LoadSkill`, and delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). | [docs/modules/agent-tools.md](docs/modules/agent-tools.md) |
 | `agent-mcp` | Session-scoped stdio and generic Streamable HTTP MCP clients, inventory/selection, deterministic persisted manifests, and result normalization. | [docs/plans/mcp-client.md](docs/plans/mcp-client.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch. | [docs/modules/agent-daemon.md](docs/modules/agent-daemon.md) |
 | `agent-runtime` | `pi-runtime` host worker for managed workspaces, local tools, runtime skills, and MCP. | — |
@@ -174,6 +174,15 @@ The service boundary is explicit:
   control plane.
 
 ### Database initialization and migrations
+
+> **Existing sessions require a one-time image cutover before this revision is
+> deployed or started.** Back up and verify the database, stop the daemon,
+> runtime, and every other writer, then follow
+> [`migrations/image-content-cutover.md`](migrations/image-content-cutover.md).
+> Do not start this revision against existing sessions until that runbook
+> reaches its fixed-point check. See the
+> [migration index](migrations/README.md) for all one-time deployment
+> migrations.
 
 `PostgresAgentStore::migrate()` runs the embedded, idempotent current schema at
 every daemon startup. On a fresh database this creates the complete schema.

@@ -1,10 +1,11 @@
 import { parseSlash, type ParsedSlash } from "./slash.ts";
 import { IntermediateUiStateError } from "./selectedSessionFetchState.ts";
-import type { SessionSnapshot } from "./types.ts";
+import type { ContentBlock, SessionSnapshot } from "./types.ts";
 
 export interface ComposerSubmission {
 	sessionId: string | null;
 	text: string;
+	content: ContentBlock[];
 	clientControlId: string;
 	newSessionId: string;
 }
@@ -14,17 +15,17 @@ export interface ComposerRoutingDependencies {
 	executeSlash(parsed: ParsedSlash, sessionId: string | null, snapshot: SessionSnapshot | null): Promise<void>;
 	queueFollowUp(
 		sessionId: string,
-		message: string,
+		content: ContentBlock[],
 		snapshot: SessionSnapshot,
 		clientInputId: string,
 	): Promise<void>;
 	steerSubagent(params: {
 		parentSessionId: string;
 		subagentSessionId: string;
-		message: string;
+		content: ContentBlock[];
 		clientControlId: string;
 	}): Promise<unknown>;
-	startNewSession(message: string, clientInputId: string, sessionId: string): Promise<unknown>;
+	startNewSession(content: ContentBlock[], clientInputId: string, sessionId: string): Promise<unknown>;
 	reportError(error: unknown): void;
 }
 
@@ -41,21 +42,25 @@ export async function routeComposerSubmission(
 	dependencies: ComposerRoutingDependencies,
 ): Promise<boolean> {
 	const message = submission.text.trim();
-	if (!message) return false;
+	const hasImages = submission.content.some((block) => block.type === "image");
+	if (!message && !hasImages) return false;
 
 	try {
 		const snapshot = submission.sessionId
 			? dependencies.getLoadedSnapshot(submission.sessionId)
 			: null;
-		const slash = parseSlash(message);
+		const slash = message ? parseSlash(message) : null;
 		if (slash) {
+			if (hasImages) {
+				throw new Error("slash commands cannot include image attachments");
+			}
 			await dependencies.executeSlash(slash, submission.sessionId, snapshot);
 			return true;
 		}
 
 		if (!submission.sessionId) {
 			await dependencies.startNewSession(
-				message,
+				submission.content,
 				submission.clientControlId,
 				submission.newSessionId,
 			);
@@ -69,13 +74,13 @@ export async function routeComposerSubmission(
 			await dependencies.steerSubagent({
 				parentSessionId: snapshot.parent_session_id,
 				subagentSessionId: submission.sessionId,
-				message,
+				content: submission.content,
 				clientControlId: submission.clientControlId,
 			});
 		} else {
 			await dependencies.queueFollowUp(
 				submission.sessionId,
-				message,
+				submission.content,
 				snapshot,
 				submission.clientControlId,
 			);

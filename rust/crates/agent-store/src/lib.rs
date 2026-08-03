@@ -14,8 +14,8 @@ use agent_vocab::{
 };
 pub use postgres::{
     CreateDelegationRequest, Delegation, DelegationLaunchGuard, DelegationProgress,
-    DelegationSubagent, DelegationSubagentOverview, PostgresAgentStore,
-    MAX_RESERVED_READONLY_SLOTS,
+    DelegationSubagent, DelegationSubagentOverview, ImageArtifact, ImageArtifactError,
+    ImageArtifactMetadata, PostgresAgentStore, MAX_RESERVED_READONLY_SLOTS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

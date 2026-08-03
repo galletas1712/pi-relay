@@ -1,13 +1,12 @@
 use std::path::Path;
 
-use agent_vocab::{ToolCall, ToolDefinition, ToolResultMessage};
+use agent_vocab::{InlineToolResultMessage, ToolCall, ToolDefinition};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::context::{workspace_path, ToolContext};
 use crate::error::{ToolError, ToolResult};
-use crate::output::limit_tool_output;
 use crate::registry::AgentTool;
 
 #[derive(Debug, Clone, Copy)]
@@ -55,7 +54,11 @@ impl AgentTool for TextEditorTool {
         )
     }
 
-    async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolContext,
+    ) -> ToolResult<InlineToolResultMessage> {
         let args: TextEditorArgs = serde_json::from_str(&call.args_json)?;
         let path = workspace_path(ctx, &args.path);
         let output = match args.command.as_str() {
@@ -110,10 +113,10 @@ impl AgentTool for TextEditorTool {
                 )))
             }
         };
-        Ok(ToolResultMessage::success(
+        Ok(InlineToolResultMessage::success(
             call.id.clone(),
             &call.tool_name,
-            limit_tool_output(output),
+            output,
         ))
     }
 }
