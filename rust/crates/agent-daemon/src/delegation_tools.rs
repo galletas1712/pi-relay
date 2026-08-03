@@ -935,29 +935,26 @@ async fn cancel_subagent_without_reactivation(
         let _dispatches = driver
             .apply_agent_input(active, AgentInput::Interrupt, None)
             .await?;
-    } else {
-        let events = state
-            .repo
-            .cancel_unfinished_session_work(session_id, "delegation cancelled")
-            .await?;
-        if !events.is_empty() {
-            publish_events(state, events);
-        }
+    }
+    let cleanup_mode = (subagent_type == Some(SubagentType::ReadOnly))
+        .then_some(agent_store::WorkspaceCleanupMode::RetainSession);
+    let (events, cleanup_requested) = state
+        .repo
+        .cancel_unfinished_session_work_with_cleanup(
+            session_id,
+            "delegation cancelled",
+            cleanup_mode,
+        )
+        .await?;
+    if !events.is_empty() {
+        publish_events(state, events);
     }
     state.active.lock().await.remove(session_id);
-    if subagent_type == Some(SubagentType::ReadOnly) {
-        if let Err(error) = crate::workspace_lifecycle::request_session_cleanup(
-            state,
-            session_id,
-            agent_store::WorkspaceCleanupMode::RetainSession,
-        )
-        .await
-        {
-            return Err(RpcError::new(
-                "subagent_cleanup_pending",
-                format!("failed to retain read-only subagent cleanup: {error:#}"),
-            ));
-        }
+    if cleanup_mode.is_some() && !cleanup_requested {
+        return Err(RpcError::new(
+            "subagent_cleanup_pending",
+            "read-only subagent has no durable workspace cleanup target",
+        ));
     }
     Ok(())
 }

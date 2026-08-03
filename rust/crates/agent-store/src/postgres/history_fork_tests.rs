@@ -399,10 +399,31 @@ async fn deleting_workspace_cleanup_requests_are_idempotent_and_monotonic() {
         .await
         .expect("terminal projection requests retention"));
 
-    assert!(store
-        .request_session_workspace_cleanup(session_id, crate::WorkspaceCleanupMode::RetainSession,)
+    let (events, cleanup_requested) = store
+        .cancel_unfinished_session_work_with_cleanup(
+            session_id,
+            "delegation cancelled",
+            Some(crate::WorkspaceCleanupMode::RetainSession),
+        )
         .await
-        .expect("repeated retention bypasses ordinary mutation eligibility"));
+        .expect("cancellation settles work after terminal cleanup starts");
+    assert!(cleanup_requested);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, crate::EventType::SessionWorkCancelled);
+    assert!(!store
+        .has_unfinished_actions(session_id)
+        .await
+        .expect("cancellation settles the active child action"));
+    let (replayed_events, replayed_cleanup) = store
+        .cancel_unfinished_session_work_with_cleanup(
+            session_id,
+            "delegation cancelled",
+            Some(crate::WorkspaceCleanupMode::RetainSession),
+        )
+        .await
+        .expect("cancellation lifecycle replay succeeds");
+    assert!(replayed_events.is_empty());
+    assert!(replayed_cleanup);
     let retained = store
         .workspace_resource_for_session(session_id)
         .await

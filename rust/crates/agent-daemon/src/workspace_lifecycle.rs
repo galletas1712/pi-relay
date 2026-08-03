@@ -189,19 +189,6 @@ pub(crate) async fn abandon_prepared(state: &AppState, workspace: &PreparedWorks
     }
 }
 
-/// Persist logical deletion first. The periodic worker owns physical cleanup,
-/// so offline runtimes never block cancellation, startup, or an RPC response.
-pub(crate) async fn request_session_cleanup(
-    state: &AppState,
-    session_id: &str,
-    mode: WorkspaceCleanupMode,
-) -> Result<bool> {
-    state
-        .repo
-        .request_session_workspace_cleanup(session_id, mode)
-        .await
-}
-
 pub(crate) async fn reconcile(state: &AppState, runtime_id: Option<&str>) -> Result<()> {
     state.repo.reconcile_workspace_resources().await?;
     for resource in state.repo.claim_due_workspace_deletions(runtime_id).await? {

@@ -9,7 +9,7 @@ use crate::{
     ActionKind, ActionStatus, ClaimedPostCompactionDispatch, CorruptPostCompactionDispatch,
     EventFrame, EventType, PendingDispatchAction, PostCompactionDispatchClaimError,
     PostCompactionDispatchFence, PostCompactionDispatchIntent, PostCompactionDispatchLease,
-    ResumableModelAction, StoredAction,
+    ResumableModelAction, StoredAction, WorkspaceCleanupMode,
 };
 
 use super::action_records::{
@@ -1013,6 +1013,22 @@ impl PostgresAgentStore {
         session_id: &str,
         reason: &str,
     ) -> Result<Vec<EventFrame>> {
+        let (events, _) = self
+            .cancel_unfinished_session_work_with_cleanup(session_id, reason, None)
+            .await?;
+        Ok(events)
+    }
+
+    /// Settle accepted work and optionally fence its private workspace as one
+    /// lifecycle transition. Unlike ordinary mutation admission, cancellation
+    /// owns the inverse transition and remains valid after terminal projection
+    /// has already initiated cleanup.
+    pub async fn cancel_unfinished_session_work_with_cleanup(
+        &self,
+        session_id: &str,
+        reason: &str,
+        cleanup_mode: Option<WorkspaceCleanupMode>,
+    ) -> Result<(Vec<EventFrame>, bool)> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let unfinished_actions = action_is_unfinished(None);
@@ -1034,9 +1050,50 @@ impl PostgresAgentStore {
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        let cleanup_requested = if let Some(cleanup_mode) = cleanup_mode {
+            let updated = sqlx::query(
+                r#"
+                update workspace_resources r
+                set state='deleting',
+                    cleanup_mode=case
+                        when r.cleanup_mode='delete_session' or $2='delete_session'
+                            then 'delete_session'
+                        else 'retain_session'
+                    end,
+                    retry_at=now(), last_error=null, updated_at=now()
+                from sessions s
+                where r.owner_session_id=$1 and s.id=$1
+                  and s.runtime_id=r.runtime_id and s.workspace_id=r.workspace_id
+                  and r.state in ('provisioning','ready','deleting')
+                "#,
+            )
+            .bind(session_id)
+            .bind(cleanup_mode.as_str())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            updated == 1
+                || sqlx::query_scalar(
+                    r#"
+                    select exists(
+                        select 1
+                        from workspace_resources r
+                        join sessions s on s.id=r.owner_session_id
+                        where r.owner_session_id=$1
+                          and s.runtime_id=r.runtime_id and s.workspace_id=r.workspace_id
+                          and r.state='deleted'
+                    )
+                    "#,
+                )
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?
+        } else {
+            false
+        };
         if updated == 0 {
             tx.commit().await?;
-            return Ok(Vec::new());
+            return Ok((Vec::new(), cleanup_requested));
         }
         bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_with_activity_tx(
@@ -1047,7 +1104,7 @@ impl PostgresAgentStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(vec![event])
+        Ok((vec![event], cleanup_requested))
     }
 }
 

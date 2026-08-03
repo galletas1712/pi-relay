@@ -935,8 +935,12 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
     ];
     let child_tool_call = ToolCall {
         id: ToolCallId::new("offline-child-tool"),
-        tool_name: "bash".to_string(),
-        args_json: r#"{"command":"sleep 1"}"#.to_string(),
+        tool_name: "Bash".to_string(),
+        args_json: json!({
+            "command": "printf runtime-online-redrive",
+            "call_description": "Emit deterministic runtime-online recovery evidence."
+        })
+        .to_string(),
     };
     let child_action = SessionAction::RequestTool {
         action_id: ActionId(1),
@@ -1002,6 +1006,13 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
             .expect("runtime child recovery query"),
         vec![child_id.to_string()]
     );
+    let committed_child_actions = state
+        .repo
+        .pending_actions_for_dispatch(child_id)
+        .await
+        .expect("load committed child action");
+    assert_eq!(committed_child_actions.len(), 1);
+    let committed_child_action_row_id = committed_child_actions[0].row_id.clone();
 
     connect_test_runtime(&runtime_hosts, TEST_RUNTIME_ID).await;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1021,21 +1032,45 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
     .expect("runtime Hello redrives and consumes the stuck queued input");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if state
-                .tasks
-                .lock()
-                .expect("task map")
-                .values()
-                .any(|task| task.session_id == child_id)
-            {
+            let events = state
+                .repo
+                .events_after(child_id, None)
+                .await
+                .expect("load child lifecycle events");
+            let started = events.iter().any(|event| {
+                event.event == EventType::ToolStarted
+                    && event.data["action_row_id"] == committed_child_action_row_id
+            });
+            let completed = events.iter().any(|event| {
+                event.event == EventType::ToolCompleted
+                    && event.data["action_row_id"] == committed_child_action_row_id
+            });
+            if started && completed {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("runtime Hello registers the committed child action");
-
+    .expect("runtime Hello starts and completes the committed child action");
+    let child_events = state
+        .repo
+        .events_after(child_id, None)
+        .await
+        .expect("load completed child lifecycle");
+    for event_type in [EventType::ToolStarted, EventType::ToolCompleted] {
+        assert_eq!(
+            child_events
+                .iter()
+                .filter(|event| {
+                    event.event == event_type
+                        && event.data["action_row_id"] == committed_child_action_row_id
+                })
+                .count(),
+            1,
+            "runtime-online recovery advances the exact committed tool once"
+        );
+    }
     for handle in take_tasks(&state) {
         handle.abort();
     }
@@ -4041,8 +4076,8 @@ async fn interrupt_only_replay_never_interrupts_newer_generation_or_queues_text(
         "interrupt_parent",
         &delegation.id,
         "interrupt_child",
-        "reviewer",
-        SubagentType::ReadOnly,
+        "implementer",
+        SubagentType::Full,
     )
     .await;
     create_busy_subagent(
