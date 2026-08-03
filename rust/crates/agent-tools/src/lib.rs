@@ -14,7 +14,11 @@ pub use call_description::{
 pub use context::ToolContext;
 pub use display::{tool_display, ToolDisplayInput};
 pub use error::{ToolError, ToolResult};
-pub use output::{limit_tool_output, limit_tool_output_with_max_tokens};
+pub use output::{
+    finalize_tool_result_content, finalize_tool_result_content_with_max_tokens,
+    limit_inline_tool_content, limit_tool_output, limit_tool_output_with_max_tokens,
+    requested_tool_output_limit,
+};
 pub use registry::{
     AgentTool, FirstPartyToolExtension, ProviderTool, ToolDescriptor, ToolExecution, ToolExtension,
     ToolRegistry,

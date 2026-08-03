@@ -32,10 +32,10 @@ use http_sse::{bounded_sse_stream, SseDispatch};
 #[cfg(test)]
 use http_sse::{
     BoundedSseParser, SSE_DATA_LIMIT, SSE_EVENTS_PER_RESPONSE_LIMIT, SSE_EVENT_LIMIT,
-    SSE_FIELD_LIMIT, SSE_LINE_LIMIT,
+    SSE_FIELD_LIMIT, SSE_NON_DATA_LINE_LIMIT,
 };
 
-const JSON_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const JSON_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const ERROR_BODY_LIMIT: usize = 64 * 1024;
 const SESSION_ID_LIMIT: usize = 4 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

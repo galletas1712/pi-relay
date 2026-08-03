@@ -4,8 +4,7 @@ export function contentBlocksToText(blocks: ContentBlock[]): string {
 	return blocks
 		.map((block) => {
 			if (block.type === "text") return block.text;
-			const source = block.image.source.kind === "url" ? block.image.source.value : "base64";
-			return `[image ${block.image.mime_type} ${source}]`;
+			return `[image ${block.artifact_id}]`;
 		})
 		.join("\n");
 }

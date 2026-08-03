@@ -522,8 +522,8 @@ impl McpManager {
                     unreachable!("handled in admission loop")
                 }
             };
-            let (output, is_error) = normalize_call_result(result);
-            Ok(McpCallOutput { output, is_error })
+            let (content, is_error) = normalize_call_result(result);
+            Ok(McpCallOutput { content, is_error })
         };
         tokio::time::timeout_at(deadline, operation)
             .await

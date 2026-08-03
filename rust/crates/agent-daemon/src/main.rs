@@ -239,6 +239,39 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn image_upload(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let mime_type = required_string(&params, "mime_type")?;
+    let data = required_string(&params, "data")?;
+    let metadata = state
+        .repo
+        .put_inline_image(&mime_type, &data)
+        .await
+        .map_err(|error| RpcError::new("invalid_image", error.to_string()))?;
+    Ok(json!({
+        "artifact_id": metadata.artifact_id,
+        "mime_type": metadata.mime_type,
+        "byte_length": metadata.byte_length,
+    }))
+}
+
+async fn image_get(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let artifact_id = required_string(&params, "artifact_id")?;
+    let artifact_id = agent_vocab::ImageArtifactId::parse(artifact_id)
+        .map_err(|error| RpcError::new("invalid_image_reference", error))?;
+    let artifact = state
+        .repo
+        .image_artifact(&artifact_id)
+        .await
+        .map_err(|error| RpcError::new("image_unavailable", error.to_string()))?;
+    let data = artifact.base64();
+    Ok(json!({
+        "artifact_id": artifact.metadata.artifact_id,
+        "mime_type": artifact.metadata.mime_type,
+        "byte_length": artifact.metadata.byte_length,
+        "data": data,
+    }))
+}
+
 fn spawn_pending_subagent_control_sweeper(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -562,6 +595,8 @@ async fn dispatch_request(
         ));
     };
     match method {
+        RpcMethod::ImageUpload => image_upload(state, params).await,
+        RpcMethod::ImageGet => image_get(state, params).await,
         RpcMethod::SessionStart => session_start::session_start(state, params, on_progress).await,
         RpcMethod::SessionList => session_list(state, params).await,
         RpcMethod::SessionGet => session_get(state, params).await,
@@ -1335,7 +1370,7 @@ pub(crate) async fn input_user(
         .get("content")
         .cloned()
         .ok_or_else(|| RpcError::new("invalid_params", "content is required"))?;
-    let content = parse_user_message(content_value)?;
+    let content = parse_user_message(&state.repo, content_value).await?;
     enqueue_session_input(
         state,
         SessionInputRequest {
@@ -1619,7 +1654,7 @@ async fn input_update_queued(
         .get("content")
         .cloned()
         .ok_or_else(|| RpcError::new("invalid_params", "content is required"))?;
-    let content = parse_user_message(content_value)?;
+    let content = parse_user_message(&state.repo, content_value).await?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.recover_if_needed().await?;
     let result = state

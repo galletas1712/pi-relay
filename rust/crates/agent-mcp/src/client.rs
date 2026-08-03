@@ -29,7 +29,7 @@ use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::config::{McpServerConfig, McpStdioTransportConfig, McpTransportConfig};
 
-const MAX_INBOUND_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const MAX_INBOUND_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LIST_PAGES: usize = 64;
 const MAX_LIST_TOOLS: usize = 512;
 const MAX_LIST_BYTES: usize = 2 * 1024 * 1024;

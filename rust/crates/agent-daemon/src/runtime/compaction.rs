@@ -776,12 +776,11 @@ mod tests {
                     turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
-                TranscriptItem::ToolResult(ToolResultMessage {
-                    tool_call_id: tool_call.id.clone(),
-                    tool_name: tool_call.tool_name.clone(),
-                    output: "very large generated output".to_string(),
-                    status: ToolResultStatus::Success,
-                }),
+                TranscriptItem::ToolResult(ToolResultMessage::success(
+                    tool_call.id.clone(),
+                    tool_call.tool_name.clone(),
+                    "very large generated output",
+                )),
                 TranscriptItem::DaemonToolObservation(DaemonToolObservation::new(
                     ToolCallId::from_u64(8),
                     "delegate",

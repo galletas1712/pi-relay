@@ -232,11 +232,7 @@ function exportEntries(): TranscriptEntry[] {
 			}],
 		}),
 		entry("tool-result", {
-			type: "tool_result",
-			tool_call_id: "call-1",
-			tool_name: "bash",
-			output: "ok",
-			status: "Success",
+			type: "tool_result", tool_call_id: "call-1", tool_name: "bash", content: [{ type: "text", text: "ok" }], status: "Success",
 		}),
 		entry("assistant-final", { type: "assistant_message", items: [text("Final answer.")] }),
 		entry("finish", { type: "turn_finished", turn_id: 1, outcome: "Graceful" }),

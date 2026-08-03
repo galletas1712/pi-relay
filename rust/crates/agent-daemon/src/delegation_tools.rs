@@ -330,12 +330,30 @@ pub(crate) async fn steer_subagent_core(
     parent_session_id: &str,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
-    let params: SteerSubagentParams = from_params(params)?;
-    let subagent_id = trim_required(&params.subagent_id, "subagent_id")?;
+    let params: ModelSteerSubagentParams = from_params(params)?;
     let message = trim_required(&params.message, "message")?;
-    let interrupt = params.interrupt.unwrap_or(false);
-    let client_control_id = params
-        .client_control_id
+    steer_subagent_user_message(
+        state,
+        parent_session_id,
+        params.subagent_id,
+        UserMessage::text(message),
+        params.interrupt,
+        params.client_control_id,
+    )
+    .await
+}
+
+async fn steer_subagent_user_message(
+    state: &AppState,
+    parent_session_id: &str,
+    subagent_id: String,
+    user_message: UserMessage,
+    interrupt: Option<bool>,
+    client_control_id: Option<String>,
+) -> std::result::Result<Value, RpcError> {
+    let subagent_id = trim_required(&subagent_id, "subagent_id")?;
+    let interrupt = interrupt.unwrap_or(false);
+    let client_control_id = client_control_id
         .as_deref()
         .map(|id| trim_required(id, "client_control_id"))
         .transpose()?
@@ -352,7 +370,7 @@ pub(crate) async fn steer_subagent_core(
             &client_input_id,
             parent_session_id,
             &scope.id,
-            &UserMessage::text(&message),
+            &user_message,
             interrupt,
         )
         .await
@@ -396,7 +414,7 @@ pub(crate) async fn steer_subagent_core(
             parent_session_id,
             &scope.id,
             &subagent_id,
-            &UserMessage::text(message),
+            &user_message,
             &client_input_id,
             interrupt,
         )
@@ -791,13 +809,19 @@ struct DelegationIdParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SteerSubagentParams {
-    /// Present for websocket `delegation.steer_subagent`, absent for the
-    /// model-facing `steer_subagent` tool.
-    #[serde(rename = "parent_session_id")]
-    _parent_session_id: Option<String>,
+struct ModelSteerSubagentParams {
     subagent_id: String,
     message: String,
+    interrupt: Option<bool>,
+    client_control_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcSteerSubagentParams {
+    parent_session_id: String,
+    subagent_id: String,
+    content: Vec<agent_vocab::ContentBlock>,
     interrupt: Option<bool>,
     client_control_id: Option<String>,
 }
@@ -1630,8 +1654,24 @@ pub(crate) async fn rpc_steer_subagent(
     state: &AppState,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
-    let parent_session_id = parent_session_id_from_params(&params)?;
-    steer_subagent_core(state, &parent_session_id, params).await
+    let params: RpcSteerSubagentParams = from_params(params)?;
+    let parent_session_id = trim_required(&params.parent_session_id, "parent_session_id")?;
+    agent_vocab::validate_durable_content(&params.content)
+        .map_err(|error| RpcError::new("invalid_params", error.to_string()))?;
+    let user_message = state
+        .repo
+        .admit_user_message(UserMessage::from_parts(params.content))
+        .await
+        .map_err(|error| RpcError::new("invalid_image_reference", error.to_string()))?;
+    steer_subagent_user_message(
+        state,
+        &parent_session_id,
+        params.subagent_id,
+        user_message,
+        params.interrupt,
+        params.client_control_id,
+    )
+    .await
 }
 
 const DEFAULT_DELEGATION_LIST_LIMIT: i64 = 3;
@@ -1925,6 +1965,34 @@ mod tests {
                 .expect("launch id"),
             "launch-1"
         );
+    }
+
+    #[test]
+    fn websocket_steer_requires_structured_content() {
+        let structured = from_params::<RpcSteerSubagentParams>(json!({
+            "parent_session_id": "parent",
+            "subagent_id": "child",
+            "content": [{"type": "text", "text": "check the retry"}],
+        }))
+        .expect("structured websocket steer");
+        assert_eq!(structured.content.len(), 1);
+
+        let error = from_params::<RpcSteerSubagentParams>(json!({
+            "parent_session_id": "parent",
+            "subagent_id": "child",
+            "message": "check the retry",
+        }))
+        .expect_err("legacy message is unknown");
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("unknown field `message`"));
+
+        let error = from_params::<RpcSteerSubagentParams>(json!({
+            "parent_session_id": "parent",
+            "subagent_id": "child",
+        }))
+        .expect_err("content is required");
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("missing field `content`"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use agent_session::{StoredSession, TranscriptStore, TranscriptStoreError};
+use agent_store::PostgresAgentStore;
 use agent_vocab::{AssistantMessage, ContentBlock, UserMessage};
 use serde::Deserialize;
 use serde_json::Value;
@@ -6,10 +7,17 @@ use uuid::Uuid;
 
 use crate::types::RpcError;
 
-pub(crate) fn parse_user_message(value: Value) -> std::result::Result<UserMessage, RpcError> {
+pub(crate) async fn parse_user_message(
+    repo: &PostgresAgentStore,
+    value: Value,
+) -> std::result::Result<UserMessage, RpcError> {
     let content: Vec<ContentBlock> = serde_json::from_value(value)
         .map_err(|error| RpcError::new("invalid_params", error.to_string()))?;
-    Ok(UserMessage::from_parts(content))
+    agent_vocab::validate_durable_content(&content)
+        .map_err(|error| RpcError::new("invalid_params", error.to_string()))?;
+    repo.admit_user_message(UserMessage::from_parts(content))
+        .await
+        .map_err(|error| RpcError::new("invalid_image_reference", error.to_string()))
 }
 
 pub(crate) fn required_uuid(params: &Value, key: &str) -> std::result::Result<Uuid, RpcError> {

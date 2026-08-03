@@ -58,10 +58,15 @@ function requireDirective(name, expected) {
 	}
 }
 
+requireDirective("default-src", ["'self'"]);
 requireDirective("script-src", ["'self'"]);
+requireDirective("style-src", ["'self'", "'unsafe-inline'"]);
+requireDirective("font-src", ["'self'"]);
+requireDirective("img-src", ["'self'", "data:", "blob:"]);
 requireDirective("object-src", ["'none'"]);
 requireDirective("base-uri", ["'none'"]);
 requireDirective("frame-ancestors", ["'none'"]);
+requireDirective("form-action", ["'self'"]);
 requireDirective("connect-src", [
 	"'self'",
 	"wss:",

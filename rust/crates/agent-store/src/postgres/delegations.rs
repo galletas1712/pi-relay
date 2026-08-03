@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::events::insert_event_tx;
+use super::image_artifacts::require_content_refs_tx;
 use super::queue::{
     append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
 };
@@ -1128,6 +1129,9 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok(None);
         }
+        if let Some(content) = content {
+            require_content_refs_tx(&mut tx, &content.content).await?;
+        }
 
         let id = format!("input_{}", Uuid::new_v4());
         let inserted = sqlx::query(
@@ -1924,6 +1928,9 @@ async fn enqueue_steer_content_tx(
     client_input_id: &str,
 ) -> Result<bool> {
     lock_session_tx(tx, parent_session_id).await?;
+    if let QueuedInputContent::UserMessage(message) = &content {
+        require_content_refs_tx(tx, &message.content).await?;
+    }
     let route = steering_route_tx(tx, parent_session_id).await?;
     let id = format!("input_{}", Uuid::new_v4());
     let inserted = sqlx::query(

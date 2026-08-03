@@ -5,6 +5,7 @@ mod delegations;
 mod events;
 mod history_fork;
 mod history_target;
+mod image_artifacts;
 mod mcp;
 mod outputs;
 mod projects;
@@ -26,6 +27,7 @@ pub use delegations::{
     CreateDelegationRequest, Delegation, DelegationLaunchGuard, DelegationProgress,
     DelegationSubagent, DelegationSubagentOverview, MAX_RESERVED_READONLY_SLOTS,
 };
+pub use image_artifacts::{ImageArtifact, ImageArtifactError, ImageArtifactMetadata};
 
 use anyhow::{anyhow, Result};
 use sqlx::postgres::{PgPoolOptions, PgRow};

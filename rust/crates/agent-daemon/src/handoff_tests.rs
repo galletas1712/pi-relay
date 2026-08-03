@@ -1,7 +1,7 @@
 use agent_store::{HistoryTree, TranscriptEntryRecord};
 use agent_vocab::{
-    AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage, ToolResultStatus,
-    TranscriptItem, TurnId, TurnOutcome, UserMessage,
+    AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage, TranscriptItem,
+    TurnId, TurnOutcome, UserMessage,
 };
 
 use super::*;
@@ -88,12 +88,11 @@ fn render_includes_failed_tool_results_and_compaction() {
     let history = history(vec![
         entry(
             "tr",
-            TranscriptItem::ToolResult(ToolResultMessage {
-                tool_call_id: ToolCallId("c".to_string()),
-                tool_name: "Bash".to_string(),
-                output: "boom".to_string(),
-                status: ToolResultStatus::Error,
-            }),
+            TranscriptItem::ToolResult(ToolResultMessage::error(
+                ToolCallId("c".to_string()),
+                "Bash",
+                "boom",
+            )),
         ),
         entry(
             "tr2",

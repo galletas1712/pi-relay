@@ -121,6 +121,8 @@ dependencies = [
  "agent-tools",
  "agent-vocab",
  "anyhow",
+ "cap-fs-ext",
+ "cap-std",
  "futures-util",
  "serde",
  "serde_json",
@@ -163,11 +165,15 @@ dependencies = [
  "agent-tools",
  "agent-vocab",
  "anyhow",
+ "base64",
  "pretty_assertions",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
+ "thiserror 2.0.18",
  "tokio",
+ "url",
  "uuid",
 ]
 
@@ -177,7 +183,10 @@ version = "0.1.0"
 dependencies = [
  "agent-vocab",
  "async-trait",
+ "cap-fs-ext",
+ "cap-std",
  "reqwest 0.12.28",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -188,8 +197,10 @@ dependencies = [
 name = "agent-vocab"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use agent_vocab::{ProviderKind, ToolCall, ToolDefinition, ToolResultMessage};
+use agent_vocab::{InlineToolResultMessage, ProviderKind, ToolCall, ToolDefinition};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -8,14 +8,19 @@ use serde_json::{json, Value};
 use crate::context::ToolContext;
 use crate::error::{ToolError, ToolResult};
 use crate::tools::{
-    ApplyPatchTool, BashTool, TextEditorTool, WebFetchTool, WebSearchTool, APPLY_PATCH_LARK_GRAMMAR,
+    ApplyPatchTool, BashTool, ReadImageTool, TextEditorTool, WebFetchTool, WebSearchTool,
+    APPLY_PATCH_LARK_GRAMMAR,
 };
 use crate::CALL_DESCRIPTION_KEY;
 
 #[async_trait]
 pub trait AgentTool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
-    async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage>;
+    async fn execute(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolContext,
+    ) -> ToolResult<InlineToolResultMessage>;
 }
 
 /// The local-call payload shape pi-relay needs to round-trip calls/results.
@@ -250,7 +255,7 @@ impl ToolRegistry {
         provider: ProviderKind,
         call: &ToolCall,
         ctx: &ToolContext,
-    ) -> ToolResult<ToolResultMessage> {
+    ) -> ToolResult<InlineToolResultMessage> {
         let canonical_name = self.canonical_tool_name_for_provider(provider, &call.tool_name);
         let tool = self
             .tools
@@ -534,6 +539,7 @@ impl ToolExtension for FirstPartyToolExtension {
         );
         register_edit(registry);
         register_bash(registry);
+        register_uniform(registry, "ReadImage", "read_image", ReadImageTool);
         register_uniform(registry, "WebSearch", "web_search", WebSearchTool);
         register_uniform(registry, "WebFetch", "web_fetch", WebFetchTool);
     }
@@ -658,6 +664,7 @@ fn openai_apply_patch_tool() -> ProviderTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cap_std::{ambient_authority, fs::Dir};
 
     #[test]
     fn provider_definitions_expose_coding_tools_without_grep() {
@@ -684,7 +691,10 @@ mod tests {
             tool_name: "Grep".to_string(),
             args_json: json!({ "pattern": "needle" }).to_string(),
         };
-        let ctx = ToolContext::new(".");
+        let ctx = ToolContext::new(
+            ".",
+            Dir::open_ambient_dir(".", ambient_authority()).expect("open test cwd"),
+        );
 
         for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
             let error = registry
@@ -723,6 +733,7 @@ mod tests {
                 "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
+                "ReadImage",
                 "steer_subagent",
                 "WebFetch",
                 "WebSearch"
@@ -738,6 +749,7 @@ mod tests {
                 "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
+                "ReadImage",
                 "steer_subagent",
                 "Edit",
                 "WebFetch",
@@ -771,6 +783,7 @@ mod tests {
                 "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
+                "ReadImage",
                 "steer_subagent",
                 "web_fetch",
                 "web_search"
@@ -786,6 +799,7 @@ mod tests {
                 "inspect_delegation",
                 "interrupt_subagent",
                 "LoadSkill",
+                "ReadImage",
                 "steer_subagent",
                 "str_replace_based_edit_tool",
                 "web_fetch",

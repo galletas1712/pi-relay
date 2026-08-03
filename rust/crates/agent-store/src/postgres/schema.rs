@@ -11,6 +11,8 @@ use sqlx::PgPool;
 ///   source metadata; project sessions get their own private workspace
 ///   directories addressed by their runtime-scoped `workspace_id`.
 /// - `daemon_config`: reserved daemon key-value config.
+/// - `image_artifacts`: immutable, globally deduplicated image bytes addressed
+///   by the SHA-256 digest of their decoded content.
 /// - `transcript_entries`: append-only transcript forest. `parent_id` points
 ///   within the same session, while `sequence` preserves insertion order.
 /// - `queued_inputs`: user inputs waiting to be consumed by a session turn.
@@ -30,6 +32,34 @@ create table if not exists projects (
     workspaces jsonb not null default '[]'::jsonb,
     metadata jsonb not null default '{}'::jsonb
 );
+
+create table if not exists image_artifacts (
+    id text primary key
+        constraint image_artifacts_id_format
+        check (id ~ '^sha256:[0-9a-f]{64}$'),
+    mime_type text not null
+        constraint image_artifacts_mime_type
+        check (mime_type in ('image/png', 'image/jpeg', 'image/gif', 'image/webp')),
+    data bytea not null,
+    byte_length integer generated always as (octet_length(data)) stored,
+    created_at timestamptz not null default now(),
+    constraint image_artifacts_size
+        check (byte_length between 1 and 5242880)
+);
+
+create or replace function reject_image_artifact_mutation()
+returns trigger
+language plpgsql
+as $$
+begin
+    raise exception 'image artifacts are immutable';
+end
+$$;
+
+drop trigger if exists image_artifacts_immutable on image_artifacts;
+create trigger image_artifacts_immutable
+before update or delete on image_artifacts
+for each row execute function reject_image_artifact_mutation();
 
 create table if not exists runtimes (
     id text primary key,

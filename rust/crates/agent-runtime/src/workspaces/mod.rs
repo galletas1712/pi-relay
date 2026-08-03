@@ -16,7 +16,10 @@ use agent_runtime_protocol::{
     SessionWorkspace, SkillKind, SkillOrigin, WorkspaceKind, WorkspaceMaterializePhase,
     WorkspaceMaterializeProgress,
 };
+use agent_tools::ToolContext;
 use anyhow::{bail, Context, Result};
+use cap_fs_ext::DirExt;
+use cap_std::{ambient_authority, fs::Dir};
 use futures_util::future::try_join_all;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
@@ -47,6 +50,7 @@ type KeyedLocks<K> = Arc<Mutex<HashMap<K, Arc<Mutex<()>>>>>;
 #[derive(Clone)]
 pub struct WorkspaceManager {
     state_root: PathBuf,
+    state_dir: Arc<Dir>,
     runtime_config_root: PathBuf,
     home_dir: PathBuf,
     /// Serializes project-level base-tree mutations (stale slot cleanup, wipe).
@@ -57,19 +61,45 @@ pub struct WorkspaceManager {
 }
 
 impl WorkspaceManager {
-    pub fn new(state_root: PathBuf, runtime_config_root: PathBuf, home_dir: PathBuf) -> Self {
-        Self {
+    pub fn new(
+        state_root: PathBuf,
+        runtime_config_root: PathBuf,
+        home_dir: PathBuf,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(&state_root)
+            .with_context(|| format!("create workspace root {}", state_root.display()))?;
+        let state_dir = Dir::open_ambient_dir(&state_root, ambient_authority())
+            .with_context(|| format!("open workspace root {}", state_root.display()))?;
+        Ok(Self {
             state_root,
+            state_dir: Arc::new(state_dir),
             runtime_config_root,
             home_dir,
             project_bases_locks: Arc::new(Mutex::new(HashMap::new())),
             workspace_base_slot_locks: Arc::new(Mutex::new(HashMap::new())),
             cwd_mutation_guards: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
     pub fn resolve(&self, workspace_id: &str) -> PathBuf {
         self.session_root(workspace_id).join("cwd")
+    }
+
+    /// Build a tool context from the exact managed cwd entry without following
+    /// symlinks or reparse points in any runtime-owned path component.
+    pub fn tool_context(&self, workspace_id: &str) -> Result<ToolContext> {
+        let sessions = self
+            .state_dir
+            .open_dir_nofollow("sessions")
+            .context("open managed sessions directory")?;
+        let session_component = path_component(workspace_id);
+        let session = sessions
+            .open_dir_nofollow(&session_component)
+            .with_context(|| format!("open managed session directory {session_component}"))?;
+        let cwd = session
+            .open_dir_nofollow("cwd")
+            .with_context(|| format!("open managed session cwd for {workspace_id}"))?;
+        Ok(ToolContext::new(self.resolve(workspace_id), cwd))
     }
 
     /// Resolve a cwd-relative path, rejecting anything that is absolute or
@@ -921,7 +951,8 @@ mod tests {
     #[tokio::test]
     async fn a_live_workspace_base_keeps_its_slot_locked() {
         let root = temp_dir("slot-lock");
-        let manager = WorkspaceManager::new(root.clone(), root.clone(), root.clone());
+        let manager = WorkspaceManager::new(root.clone(), root.clone(), root.clone())
+            .expect("open disposable workspace root");
         let project = Uuid::new_v4();
 
         let base = WorkspaceBase {
@@ -1095,7 +1126,8 @@ mod tests {
             "---\nname: kubernetes\ndescription: personal\n---\npersonal",
         );
 
-        let manager = WorkspaceManager::new(state, config, home);
+        let manager =
+            WorkspaceManager::new(state, config, home).expect("open disposable workspace root");
         // Selecting only "other" still surfaces project-level skills and
         // concatenates personal+repo AGENTS under that workspace.
         let context = manager
@@ -1160,7 +1192,8 @@ mod tests {
             Uuid::new_v4()
         ));
         let manager =
-            WorkspaceManager::new(state.clone(), state.join("config"), state.join("home"));
+            WorkspaceManager::new(state.clone(), state.join("config"), state.join("home"))
+                .expect("open disposable workspace root");
         manager.validate_root().await.expect("btrfs state root");
         std::fs::create_dir_all(state.join("sessions/parent")).expect("parent session root");
         create_session_subvolume(&manager.resolve("parent"))

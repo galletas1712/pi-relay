@@ -95,6 +95,23 @@ export interface AgentApi {
 	reorderQueuedFollowUps(sessionId: string, inputIds: string[], expectedQueueRevision?: number | null): Promise<ReorderQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
+	uploadImage(input: ImageUploadInput): Promise<ImageArtifactMetadata>;
+	getImageArtifact(artifactId: string): Promise<ImageArtifact>;
+}
+
+export interface ImageUploadInput {
+	mimeType: string;
+	data: string;
+}
+
+export interface ImageArtifactMetadata {
+	artifact_id: string;
+	mime_type: string;
+	byte_length: number;
+}
+
+export interface ImageArtifact extends ImageArtifactMetadata {
+	data: string;
 }
 
 export interface AddMcpToolsParams {
@@ -242,7 +259,7 @@ export interface ReadHandoffFileParams {
 export interface SteerSubagentParams {
 	parentSessionId: string;
 	subagentSessionId: string;
-	message: string;
+	content: ContentBlock[];
 	clientControlId?: string;
 	interrupt?: boolean;
 }
@@ -487,6 +504,22 @@ class AgentApiClient implements AgentApi {
 		return this.client.isOpen();
 	}
 
+	uploadImage(input: ImageUploadInput): Promise<ImageArtifactMetadata> {
+		return this.client.request<ImageArtifactMetadata>(
+			"image.upload",
+			{ mime_type: input.mimeType, data: input.data },
+			{ timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
+		);
+	}
+
+	getImageArtifact(artifactId: string): Promise<ImageArtifact> {
+		return this.client.request<ImageArtifact>(
+			"image.get",
+			{ artifact_id: artifactId },
+			{ timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
+		);
+	}
+
 	onEvent(handler: EventHandler): () => void {
 		return this.client.onEvent(handler);
 	}
@@ -579,7 +612,7 @@ class AgentApiClient implements AgentApi {
 		return this.client.request<SteerSubagentResult>("delegation.steer_subagent", {
 			parent_session_id: params.parentSessionId,
 			subagent_id: params.subagentSessionId,
-			message: params.message,
+			content: params.content,
 			client_control_id: params.clientControlId,
 			interrupt: params.interrupt,
 		});

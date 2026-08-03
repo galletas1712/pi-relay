@@ -357,8 +357,7 @@ fn empty_transition() -> (Vec<TranscriptItem>, Vec<AgentAction>) {
 mod tests {
     use super::*;
     use agent_vocab::{
-        AssistantItem, AssistantMessage, ToolCallId, ToolResultMessage, ToolResultStatus,
-        UserMessage,
+        AssistantItem, AssistantMessage, ToolCallId, ToolResultMessage, UserMessage,
     };
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
@@ -370,12 +369,7 @@ mod tests {
     }
 
     fn tool_result(id: u64, name: &str) -> ToolResultMessage {
-        ToolResultMessage {
-            tool_call_id: ToolCallId::from_u64(id),
-            tool_name: name.to_string(),
-            output: "ok".to_string(),
-            status: ToolResultStatus::Success,
-        }
+        ToolResultMessage::success(ToolCallId::from_u64(id), name, "ok")
     }
 
     fn running_tool(action_id: u64, call: ToolCall) -> RunningTool {

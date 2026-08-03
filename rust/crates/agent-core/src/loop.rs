@@ -176,19 +176,14 @@ mod tests {
     }
 
     fn successful_tool_result(tool_call_id: ToolCallId, tool_name: &str) -> ToolResultMessage {
-        ToolResultMessage {
-            tool_call_id,
-            tool_name: tool_name.to_string(),
-            output: "ok".to_string(),
-            status: ToolResultStatus::Success,
-        }
+        ToolResultMessage::success(tool_call_id, tool_name, "ok")
     }
 
     fn crashed_tool_result(tool_call_id: ToolCallId, tool_name: &str) -> ToolResultMessage {
         ToolResultMessage {
             tool_call_id,
             tool_name: tool_name.to_string(),
-            output: "crashed".to_string(),
+            content: vec![agent_vocab::ContentBlock::text("crashed")],
             status: ToolResultStatus::Crashed,
         }
     }

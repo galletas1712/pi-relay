@@ -91,7 +91,7 @@ agent-vocab      shared ids, message blocks, tool calls/results,
 | `agent-session` | Durable transcript forest, model-context materialization, resume, switch, compaction, and the provider-replay lane. | [modules/agent-session.md](modules/agent-session.md) |
 | `agent-store` | Postgres-only session/transcript/queue/action/event persistence plus recovery and revision/queue projections. | [modules/agent-store.md](modules/agent-store.md) |
 | `agent-provider` | `ModelProvider` plus OpenAI/Codex (Responses) and Anthropic (Messages) adapters, prompt-cache shaping, and provider compaction. | [modules/agent-provider.md](modules/agent-provider.md) |
-| `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`web_search`/`web_fetch`/`LoadSkill`/delegation tools. | [modules/agent-tools.md](modules/agent-tools.md) |
+| `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`ReadImage`/`web_search`/`web_fetch`/`LoadSkill`/delegation tools. | [modules/agent-tools.md](modules/agent-tools.md) |
 | `agent-mcp` | Operator-configured stdio/Streamable HTTP MCP clients and Codex-parity rmcp-backed OAuth. Runs on the runtime host next to tool execution; OAuth credentials live under that host's `workspace_root`. | [plans/mcp-client.md](plans/mcp-client.md) |
 | `agent-mcp-types` | Pure catalog / manager / OAuth DTOs used on the wire between control and runtime without pulling in the `rmcp` engine. | — |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. Proxies MCP RPCs to the session's runtime. | [modules/agent-daemon.md](modules/agent-daemon.md) |
@@ -130,6 +130,29 @@ provider requests have no idempotency key. Long provider, tool, and compaction
 I/O runs outside the per-session row lock and reconverges through action
 attempt/dispatch-owner fences. The mechanics live in
 [agent-store](modules/agent-store.md) and [agent-daemon](modules/agent-daemon.md).
+
+### Image data flow
+
+```mermaid
+flowchart LR
+    File[Browser file] -->|image.upload: transient base64| Store[(image_artifacts bytes)]
+    Store -->|artifact id| Ref[Durable ContentBlock ref]
+    Ref --> Durable[(transcript / action / queue / event JSON)]
+    Ref -->|image.get| Browser[Browser bounded cache + data URL]
+    Ref -->|batch resolve + integrity check| Daemon[Daemon provider boundary]
+    Daemon -->|transient base64/data URL| Provider[OpenAI / Anthropic wire]
+```
+
+Owned durable user/tool `ContentBlock` JSON contains only strict
+content-addressed refs; PostgreSQL stores raw immutable bytes separately.
+Opaque provider-owned `provider_replay` is not interpreted or rewritten and can
+retain historical provider payloads, including provider-native base64. The
+browser has no URL-image vocabulary.
+Runtime/MCP inline base64 is transient until store artifact ingestion. The
+daemon finalizes tool output once; store ingestion artifactizes/admits without
+retruncating, and providers render resolved durable content without
+retruncating. Historical URLs are handled only by the stopped-writer one-time
+cutover and become exact ordered text.
 
 ## Feature Audit
 
@@ -233,8 +256,10 @@ current work.
 
 The implementation is checked with full-workspace format/compile/unit tests,
 plus the manual websocket exercises in [websocket-rpc.md](websocket-rpc.md)
-against a real Postgres database (real Codex text and image-URL turns, daemon
-death/restart recovery with snapshot reload, and reconnect event replay).
+against a real Postgres database (real Codex text turns, daemon death/restart
+recovery with snapshot reload, and reconnect event replay). Artifact-ref image
+turns have fixture and integration coverage; a live provider artifact-ref image
+turn has not been recorded.
 Anthropic real-provider websocket tests require a raw `ANTHROPIC_API_KEY`.
 
 ## Where To Read Next

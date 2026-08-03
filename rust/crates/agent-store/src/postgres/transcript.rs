@@ -18,6 +18,7 @@ use crate::{
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
 use super::history_target::{branch_entry_ids_tx, validate_history_target_tx};
+use super::image_artifacts::require_transcript_item_refs_tx;
 use super::queue::bump_revisions_tx;
 use super::rows::{row_to_stored_entry, row_to_transcript_entry};
 use super::sql::{lock_session_tx, stale_unfinished_actions_for_session};
@@ -1476,7 +1477,9 @@ fn display_hint(item: &TranscriptItem) -> Option<String> {
         TranscriptItem::ToolCallStarted { tool_call, .. } => {
             format!("tool call: {}", tool_call.tool_name)
         }
-        TranscriptItem::ToolResult(result) => format!("{}: {}", result.tool_name, result.output),
+        TranscriptItem::ToolResult(result) => {
+            format!("{}: {}", result.tool_name, result.display_text())
+        }
         TranscriptItem::TurnFinished { turn_id, outcome } => {
             format!("{outcome:?} turn boundary for turn {}", turn_id.0)
         }
@@ -1495,14 +1498,7 @@ fn display_hint(item: &TranscriptItem) -> Option<String> {
 }
 
 fn content_blocks_text(blocks: &[agent_vocab::ContentBlock]) -> String {
-    blocks
-        .iter()
-        .map(|block| match block {
-            agent_vocab::ContentBlock::Text { text } => text.clone(),
-            agent_vocab::ContentBlock::Image { .. } => "[image]".to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    agent_vocab::content_display_text(blocks)
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -1540,6 +1536,7 @@ pub(super) async fn insert_stored_entry_tx(
     session_id: &str,
     entry: &StoredTranscriptEntry,
 ) -> Result<Option<TranscriptEntryRecord>> {
+    require_transcript_item_refs_tx(tx, &entry.item).await?;
     let turn_id = entry.item.turn_id().map(|turn_id| turn_id.0 as i64);
     let row = sqlx::query(
         r#"

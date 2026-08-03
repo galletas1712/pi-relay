@@ -9,11 +9,15 @@ agent-session = { workspace = true }
 agent-vocab = { workspace = true }
 agent-runtime-protocol = { workspace = true }
 anyhow = { workspace = true }
+base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 agent-mcp = { workspace = true }

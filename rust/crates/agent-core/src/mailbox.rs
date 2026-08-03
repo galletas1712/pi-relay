@@ -213,17 +213,10 @@ mod tests {
     use super::*;
     use crate::event::AgentEvent;
     use agent_vocab::UserMessage;
-    use agent_vocab::{
-        ActionId, AssistantMessage, ToolCallId, ToolResultMessage, ToolResultStatus,
-    };
+    use agent_vocab::{ActionId, AssistantMessage, ToolCallId, ToolResultMessage};
 
     fn tool_result(id: u64, name: &str) -> ToolResultMessage {
-        ToolResultMessage {
-            tool_call_id: ToolCallId::from_u64(id),
-            tool_name: name.to_string(),
-            output: "ok".to_string(),
-            status: ToolResultStatus::Success,
-        }
+        ToolResultMessage::success(ToolCallId::from_u64(id), name, "ok")
     }
 
     #[test]

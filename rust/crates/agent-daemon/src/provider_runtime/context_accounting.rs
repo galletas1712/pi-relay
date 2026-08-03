@@ -12,7 +12,7 @@ use super::auth_retry::count_tokens_with_auth_retry;
 use super::mcp::provider_toolset_fingerprint;
 use super::prompt::{assemble_agent_prompt, effective_prompt_profile, provider_tools_for_session};
 use super::provider::provider_for_config;
-use super::transcript::provider_transcript;
+use super::transcript::{provider_transcript, resolve_transcript_images};
 
 pub(crate) async fn model_input_tokens_for_gate(
     state: &AppState,
@@ -59,10 +59,13 @@ async fn count_claude_model_input_tokens_remotely(
     // wrappers now that they are normal client JSON tools.
     let prompt = assemble_agent_prompt(state, config, session_id).await?;
     let tools = request_tools(state, config, session_id, snapshot).await?;
+    let transcript = provider_transcript(model_context);
+    let resolved_images = resolve_transcript_images(&state.repo, &transcript).await?;
     let request = ProviderTokenCountRequest {
         model: config.provider.model.clone(),
         prompt,
-        transcript: provider_transcript(model_context),
+        transcript,
+        resolved_images,
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools,
         max_tokens: config.provider.max_tokens,

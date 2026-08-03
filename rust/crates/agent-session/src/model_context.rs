@@ -309,12 +309,7 @@ mod tests {
     }
 
     fn tool_result(id: impl Into<ToolCallId>, name: &str) -> ToolResultMessage {
-        ToolResultMessage {
-            tool_call_id: id.into(),
-            tool_name: name.to_string(),
-            output: "ok".to_string(),
-            status: ToolResultStatus::Success,
-        }
+        ToolResultMessage::success(id.into(), name, "ok")
     }
 
     #[test]

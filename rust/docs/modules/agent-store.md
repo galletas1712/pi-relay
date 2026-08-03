@@ -4,8 +4,8 @@
 
 `agent-store` is the only durable backend. `PostgresAgentStore` wraps an SQLx
 `PgPool` and owns normalized Postgres persistence for sessions, transcript
-entries, the queued-inputs ledger, actions, events, projects, and daemon
-config. SQL is written by hand — Postgres is the clearest language for the
+entries, image artifacts, the queued-inputs ledger, actions, events, projects,
+and daemon config. SQL is written by hand — Postgres is the clearest language for the
 JSONB-heavy ledger and the recursive transcript/recovery queries. There is no
 repository trait; the daemon calls the concrete store directly. Why this crate
 is authoritative and trait-free lives in [design decisions](../design-decisions.md)
@@ -37,6 +37,10 @@ refuses to release reservations while active child mailbox rows remain.
 
 - Persist and query sessions, projects, transcript forest, queued inputs,
   actions, and the observable event stream.
+- Own image validation, content-addressed insertion, deduplication, collision
+  detection, reference admission, tool-result artifactization, batch provider
+  loads, and one-artifact browser reads behind the `PostgresAgentStore`
+  interface.
 - Serialize one session's short state transitions with a per-session row lock,
   without locking unrelated sessions or holding locks across provider/tool I/O.
 - Track per-session revision counters and emit canonical queue projections so
@@ -52,7 +56,19 @@ refuses to release reservations while active child mailbox rows remain.
 Tables (created idempotently by `migrate`; see `postgres/schema.rs`):
 
 ```
+
+- `image_artifacts.id` is SHA-256 of the raw decoded bytes. Rows are global,
+  immutable, ownerless, and constrained to 1..5 MiB with authoritative
+  PNG/JPEG/GIF/WebP MIME. There is no v1 garbage collector.
+- Durable user/tool content holds only artifact refs. Store write seams verify
+  every ref and enforce four images / 10 MiB aggregate metadata admission.
+  Missing, corrupt, or colliding rows are typed hard errors.
+- Transient tool images are stored in order before `ToolCompleted`, action
+  result, or transcript persistence. Invalid image blocks become useful text
+  notes in the same position. The daemon finalizes tool text once; store
+  ingestion artifactizes and admits content without retruncating it.
 projects(id, name, workspaces jsonb, metadata jsonb, ...)
+image_artifacts(id, mime_type, data bytea, byte_length generated, created_at)
 sessions(id, project_id?, outer_cwd, workspaces jsonb, active_leaf_id?,
          system_prompt, provider_config jsonb, metadata jsonb,
          mcp_manifest_fingerprint?, session_revision, queue_revision,

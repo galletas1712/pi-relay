@@ -18,7 +18,7 @@ use crate::state::AppState;
 use super::auth_retry::compact_with_auth_retry;
 use super::prompt::render_pi_compaction_prompt;
 use super::provider::provider_for_config;
-use super::transcript::provider_transcript;
+use super::transcript::{provider_transcript, resolve_transcript_images};
 
 fn generic_native_compaction_summary(provider: ProviderKind) -> String {
     match provider {
@@ -312,6 +312,7 @@ pub(crate) async fn native_compaction_request(
     transcript: Vec<ModelTranscriptEntry>,
     snapshot: &McpSessionSnapshot,
 ) -> Result<ProviderCompactionRequest> {
+    let resolved_images = resolve_transcript_images(&state.repo, &transcript).await?;
     let compaction_instructions = if config.provider.kind == ProviderKind::Claude {
         Some(format!(
             "{}\n\nDo not call any tools while writing this summary. Respond with summary text only.",
@@ -331,6 +332,7 @@ pub(crate) async fn native_compaction_request(
         // appended to the stored compaction result after the provider returns.
         prompt: PromptSections::stable(config.system_prompt.clone()),
         transcript,
+        resolved_images,
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools,
         reasoning_effort: config.provider.reasoning_effort,
@@ -432,6 +434,7 @@ mod tests {
             model: "claude-opus-4-8".to_string(),
             prompt: PromptSections::stable("test prompt"),
             transcript,
+            resolved_images: Default::default(),
             tool_profile: ProviderToolProfile::AnthropicCoding,
             tools: Vec::new(),
             reasoning_effort: agent_vocab::ReasoningEffort::High,

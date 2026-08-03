@@ -19,9 +19,7 @@
 use std::path::{Component, Path};
 
 use agent_store::{Delegation, DelegationStatus, HistoryTree};
-use agent_vocab::{
-    AssistantMessage, ContentBlock, ToolResultStatus, TranscriptItem, TurnOutcome, UserMessage,
-};
+use agent_vocab::{AssistantMessage, ToolResultStatus, TranscriptItem, TurnOutcome, UserMessage};
 
 use crate::state::AppState;
 use crate::types::RpcError;
@@ -98,15 +96,7 @@ pub(crate) fn active_branch_is_terminal(history: &HistoryTree) -> bool {
 }
 
 fn user_message_text(message: &UserMessage) -> String {
-    message
-        .content
-        .iter()
-        .map(|block| match block {
-            ContentBlock::Text { text } => text.as_str(),
-            ContentBlock::Image { .. } => "[image]",
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    message.display_text()
 }
 
 fn fenced(language: &str, body: &str) -> String {
@@ -165,7 +155,7 @@ pub(crate) fn render_transcript_markdown(history: &HistoryTree) -> String {
                     "### Tool result: {} [{}]\n\n{}\n\n",
                     result.tool_name,
                     tool_status_label(&result.status),
-                    fenced("", &result.output)
+                    fenced("", &result.display_text())
                 ));
             }
             TranscriptItem::CompactionSummary(summary) => {

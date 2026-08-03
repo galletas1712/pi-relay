@@ -7,8 +7,10 @@ use crate::{ModelTranscriptEntry, PromptSections, ProviderResult};
 // The local token estimator only ever runs for OpenAI: Claude sessions count
 // tokens against the authoritative remote `count_tokens` endpoint (see
 // `context_accounting.rs`). So the estimate reuses the OpenAI adapter's actual
-// wire rendering (`openai::transcript_to_response_items`) and approximates
-// tokens as ceil(model-visible bytes / 4), with a discount for base64 images.
+// structural request rendering (`openai::transcript_to_estimate_items`) and
+// approximates tokens as ceil(model-visible bytes / 4). Durable image refs add
+// a fixed resized-image cost without fabricated wire data; opaque replay data
+// URLs receive the same bounded adjustment.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenEstimate {
@@ -84,7 +86,7 @@ pub fn estimate_transcript_tokens(
     prompt: &PromptSections,
     transcript: &[ModelTranscriptEntry],
 ) -> ProviderResult<TokenEstimate> {
-    crate::openai::transcript_to_response_items(prompt, transcript)?
+    crate::openai::transcript_to_estimate_items(prompt, transcript)?
         .iter()
         .map(serialized_estimate)
         .try_fold(
@@ -112,6 +114,11 @@ fn model_visible_bytes_for_serialized_json(serialized: &str) -> usize {
     let image_adjustment = estimate_image_data_url_adjustment(serialized);
     raw.saturating_sub(image_adjustment.payload_bytes)
         .saturating_add(image_adjustment.replacement_bytes)
+        .saturating_add(structural_image_ref_count(serialized) * RESIZED_IMAGE_BYTES_ESTIMATE)
+}
+
+fn structural_image_ref_count(serialized: &str) -> usize {
+    serialized.matches(r#""artifact_id":"sha256:"#).count()
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -174,8 +181,8 @@ pub fn approx_tokens_from_byte_count(bytes: usize) -> usize {
 mod token_estimator_tests {
     use super::*;
     use agent_vocab::{
-        AssistantItem, AssistantMessage, ContentBlock, ImageContent, ImageSource, ToolCall,
-        ToolCallId, ToolResultMessage, ToolResultStatus, TranscriptItem, UserMessage,
+        AssistantItem, AssistantMessage, ContentBlock, ImageArtifactId, ToolCall, ToolCallId,
+        ToolResultMessage, TranscriptItem, UserMessage,
     };
     use serde_json::json;
 
@@ -194,12 +201,11 @@ mod token_estimator_tests {
                 ],
             })
             .into(),
-            TranscriptItem::ToolResult(ToolResultMessage {
-                tool_call_id: ToolCallId::from_u64(1),
-                tool_name: "Bash".to_string(),
-                output: "ok".to_string(),
-                status: ToolResultStatus::Success,
-            })
+            TranscriptItem::ToolResult(ToolResultMessage::success(
+                ToolCallId::from_u64(1),
+                "Bash",
+                "ok",
+            ))
             .into(),
         ];
 
@@ -213,20 +219,17 @@ mod token_estimator_tests {
     }
 
     #[test]
-    fn image_payload_estimator_discounts_base64_bytes_like_codex() {
+    fn image_ref_estimator_uses_a_fixed_structural_cost() {
+        let artifact_id = || {
+            ImageArtifactId::parse(format!("sha256:{}", "a".repeat(64))).expect("valid artifact id")
+        };
         let small_text =
             ModelTranscriptEntry::from(TranscriptItem::UserMessage(UserMessage::from_parts(vec![
-                ContentBlock::image(ImageContent {
-                    mime_type: "image/png".to_string(),
-                    source: ImageSource::Base64("a".repeat(16)),
-                }),
+                ContentBlock::image(artifact_id()),
             ])));
         let large_text =
             ModelTranscriptEntry::from(TranscriptItem::UserMessage(UserMessage::from_parts(vec![
-                ContentBlock::image(ImageContent {
-                    mime_type: "image/png".to_string(),
-                    source: ImageSource::Base64("a".repeat(16_000)),
-                }),
+                ContentBlock::image(artifact_id()),
             ])));
 
         let small = estimate_transcript_tokens(

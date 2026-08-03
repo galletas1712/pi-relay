@@ -2,7 +2,7 @@
 
 > Part of the [Rust Agent Stack](../architecture.md) | [Design decisions](../design-decisions.md)
 
-`agent-vocab` owns the serializable data shapes the rest of the stack shares: message blocks, tool calls and results, transcript items, id newtypes, and provider config. It sits at the bottom of the crate graph so [agent-provider](./agent-provider.md), [agent-tools](./agent-tools.md), [agent-store](./agent-store.md), [agent-session](./agent-session.md), and [agent-daemon](./agent-daemon.md) can all talk about messages without depending on the [agent-core](./agent-core.md) FSM. It defines data only — no behavior, no I/O, no async.
+`agent-vocab` owns the serializable data shapes the rest of the stack shares: message blocks, tool calls and results, transcript items, id newtypes, and provider config. It sits at the bottom of the crate graph so [agent-provider](./agent-provider.md), [agent-tools](./agent-tools.md), [agent-store](./agent-store.md), [agent-session](./agent-session.md), and [agent-daemon](./agent-daemon.md) can all talk about messages without depending on the [agent-core](./agent-core.md) FSM. It has no I/O or async behavior; its only active policy is bounded validation and normalization of shared image values.
 
 ## Responsibilities
 
@@ -10,6 +10,8 @@
 - Define the id newtypes used to key turns, actions, and tool calls.
 - Define provider selection and tuning config (`ProviderKind`, `ReasoningEffort`, `ProviderConfig`).
 - Define `ProviderReplayItem`, the opaque per-provider raw payload carried for replay/rehydration.
+- Validate shared inline image declarations, signatures, base64 bounds, and
+  durable content shape limits.
 - Provide serde representations stable enough to persist in Postgres and to send across the [websocket-rpc](../websocket-rpc.md) boundary.
 
 ## Key types
@@ -25,26 +27,39 @@
 ### Messages (`message.rs`)
 
 ```
-UserMessage { content: Vec<ContentBlock> }
-ContentBlock = Text { text } | Image { image: ImageContent }   (tag = "type")
-ImageContent { mime_type, source: ImageSource }
-ImageSource  = Base64(String) | Url(String)                    (tag = "kind", content = "value")
+UserMessage { content: Vec<ContentBlock>, replayed_after_compaction? }
+ContentBlock = Text { text } | Image { artifact_id }           (tag = "type")
+ImageArtifactId = "sha256:" + 64 lowercase hex
+
+InlineContentBlock = Text { text } | Image { mime_type, data } (tag = "type")
+InlineToolResultMessage { tool_call_id, tool_name,
+                          content: Vec<InlineContentBlock>, status }
 
 AssistantMessage { items: Vec<AssistantItem> }
 AssistantItem = Text(String) | ToolCall(ToolCall)
 
 ToolDefinition   { name, description, input_schema: Value }
 ToolCall         { id: ToolCallId, tool_name, args_json: String }
-ToolResultMessage{ tool_call_id, tool_name, output, status: ToolResultStatus }
+ToolResultMessage{ tool_call_id, tool_name, content: Vec<ContentBlock>, status }
 ToolResultStatus = Success | Error | Interrupted | Crashed
 ```
 
-- `UserMessage` carries an ordered block list. `text(..)` builds a single-text message; `as_text()` returns the text only when the message is exactly one `Text` block.
-- `ContentBlock` is internally tagged on `type` (`text` / `image`). Images are first-class input so providers can issue vision-capable requests.
+- `UserMessage` carries an ordered block list. `text(..)` builds a single-text message; `as_text()` returns the text only when the message is exactly one `Text` block; `display_text()` joins text and short `[image …]` placeholders (never base64).
+- Durable `ContentBlock` is internally tagged on `type` (`text` / `image`) and
+  can contain only a small artifact reference. It cannot represent inline bytes,
+  a URL, a MIME declaration, a filename, or upload state.
+- `InlineContentBlock` and `InlineToolResultMessage` are separate transient
+  runtime/MCP types. Their images carry base64 plus declared MIME exactly once
+  across the bounded runtime envelope; `agent-store` validates and artifactizes
+  them before any transcript, action, queue, or event serialization.
+- Shared validation (`image.rs`) bounds base64 before decode, normalizes the
+  PNG/JPEG/GIF/WebP declaration, sniffs decoded bytes, and requires a match.
+  Durable reference existence, count, aggregate-byte admission, deduplication,
+  and integrity verification belong to `agent-store`.
 - `AssistantItem` has only `Text` and `ToolCall`. There is no thinking variant — thinking blocks are discarded at the provider parse layer (`agent-provider`'s `anthropic.rs`), so they never reach vocab or storage. `AssistantMessage` exposes `tool_calls()` and `text()` helpers over its items.
 - `AssistantItem` has a hand-written serde impl: `Text` serializes as `{ "type": "text", "text": .. }` and `ToolCall` as `{ "type": "tool_call", "id": .., "tool_name": .., "args_json": .. }`. Unknown keys are ignored on deserialize; a missing `args_json` defaults to `"{}"`.
 - `ToolCall.args_json` is the raw JSON string of arguments; `args_value()` parses it to `serde_json::Value`. `ToolDefinition.input_schema` is a JSON-schema `Value`.
-- `ToolResultMessage` has constructors `success`, `error`, `interrupted` (output `"interrupted"`), and `crashed` (output `"crashed before tool result was recorded"`).
+- `ToolResultMessage` is multimodal. `success`/`error` wrap a single text block; `success_content`/`error_content` accept arbitrary blocks. `as_text()` is exact single-text access; `display_text()` is for previews only.
 
 ### Transcript items (`transcript_item.rs`)
 
@@ -84,9 +99,14 @@ provider <-> agent-vocab <-> store / session / daemon
    +-- parses raw model output, drops thinking, emits AssistantItem::{Text,ToolCall}
 ```
 
-Every crate above vocab speaks these shapes instead of provider SDK types. Providers translate their wire formats to and from vocab (dropping thinking content on the way in); tools produce `ToolResultMessage`; the store persists `TranscriptItem` nodes, including typed `DaemonToolObservation` items for daemon-authored observations; the daemon serializes the same shapes over [websocket-rpc](../websocket-rpc.md).
+Every crate above vocab speaks these shapes instead of provider SDK types.
+Providers translate durable refs plus a daemon-resolved image map into their
+wire formats (dropping thinking content on the way in); tools produce
+`InlineToolResultMessage`; the store converts it to durable
+`ToolResultMessage` and persists `TranscriptItem` nodes. The daemon serializes
+only durable ref-bearing shapes over ordinary websocket methods.
 
-The registered builtin tools (defined in [agent-tools](./agent-tools.md), not here) are `edit`, `bash`, `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). There are no `read`/`write` tools. `agent-vocab` only defines the `ToolDefinition`/`ToolCall`/`ToolResultMessage` shapes those tools are expressed in.
+The registered builtin tools (defined in [agent-tools](./agent-tools.md), not here) are `edit`, `bash`, `ReadImage`, `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`, `interrupt_subagent`). There are no general `read`/`write` tools. `agent-vocab` only defines the `ToolDefinition`/`ToolCall`/`ToolResultMessage` shapes those tools are expressed in.
 
 ## Notes
 

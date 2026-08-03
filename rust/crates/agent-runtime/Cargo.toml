@@ -15,6 +15,8 @@ agent-runtime-protocol = { workspace = true }
 agent-tools = { workspace = true }
 agent-vocab = { workspace = true }
 anyhow = { workspace = true }
+cap-fs-ext = { workspace = true }
+cap-std = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
