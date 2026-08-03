@@ -39,6 +39,7 @@ function initialState(): SelectedSessionFetchState {
 		sessionId: null,
 		selectionVersion: 0,
 		loading: false,
+		fetching: false,
 		retrying: false,
 		hadUsableCache: false,
 		error: null,
@@ -294,5 +295,26 @@ describe("selected session request ownership", () => {
 		expect(notices).toBe(0);
 		expect(shouldReportActionError(new IntermediateUiStateError("conversation is loading"))).toBe(false);
 		expect(shouldReportActionError(new Error("mutation failed"))).toBe(true);
+	});
+
+	it("marks background refresh as fetching without loading when the cache is usable", async () => {
+		const sessionId = "session-a";
+		const coordinator = new SelectedSessionFetchCoordinator(initialState());
+		coordinator.select(sessionId, true);
+		const response = deferred<string>();
+		const refresh = coordinator.run(sessionId, true, () => response.promise);
+		expect(coordinator.getSnapshot()).toMatchObject({
+			loading: false,
+			fetching: true,
+			hadUsableCache: true,
+		});
+		response.resolve("ok");
+		await expect(refresh).resolves.toBe("ok");
+		expect(coordinator.getSnapshot()).toMatchObject({
+			loading: false,
+			fetching: false,
+			hadUsableCache: true,
+			error: null,
+		});
 	});
 });

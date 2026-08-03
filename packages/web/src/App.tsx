@@ -335,32 +335,6 @@ function applyReplayedAndBufferedEvents(
 	}
 }
 
-function LoadingConversation() {
-	const [dotCount, setDotCount] = useState(1);
-
-	useEffect(() => {
-		const interval = window.setInterval(() => {
-			setDotCount((current) => current % 3 + 1);
-		}, 250);
-		return () => window.clearInterval(interval);
-	}, []);
-
-	return (
-		<main
-			className="workspace-route-state conversation-loading-state"
-			data-slot="route-loading"
-			role="status"
-		>
-			<h1>
-				Loading conversation
-				<span className="conversation-loading-dots" aria-hidden>
-					{".".repeat(dotCount)}
-				</span>
-			</h1>
-		</main>
-	);
-}
-
 export function App({
 	api,
 	routeHistory: injectedRouteHistory,
@@ -487,6 +461,7 @@ export function App({
 			sessionId: initialSelection.conversationSessionId,
 			selectionVersion: 0,
 			loading: !!initialSelection.conversationSessionId,
+			fetching: false,
 			retrying: false,
 			hadUsableCache: false,
 			error: null,
@@ -933,6 +908,12 @@ export function App({
 	const selectedErrorHasUsableCache =
 		selectedFetchState.sessionId === selectedId && selectedFetchState.hadUsableCache;
 	const transcriptLoading = !!selectedId && selectedLoading;
+	const transcriptRefreshing =
+		!!selectedId &&
+		selectedFetchState.sessionId === selectedId &&
+		selectedFetchState.fetching &&
+		!selectedFetchState.loading &&
+		!selectedFetchState.retrying;
 	const loadedEntries = useMemo(
 		() => (selectedCache.sessionId === selectedId ? selectedEntries(selectedCache) : []),
 		[selectedCache.activeBranchEntryIds, selectedCache.entriesById, selectedCache.sessionId, selectedId],
@@ -4551,8 +4532,16 @@ export function App({
 		workspaceRouteResult.kind === "route" && routeRemoteReadsEnabled
 			? workspaceRouteResult.route
 			: null;
+	const routePending =
+		routeValidation.kind === "pending" &&
+		(workspaceRouteResult.kind === "route" || legacyMigrationPendingRef.current);
+	const pendingConversation =
+		routePending &&
+		workspaceRouteResult.kind === "route" &&
+		workspaceRouteResult.route.destination === "conversation";
 	const conversationVisible =
-		(validatedRoute?.destination === "conversation") ||
+		validatedRoute?.destination === "conversation" ||
+		pendingConversation ||
 		(workspaceRouteResult.kind === "none" && routeValidation.kind === "idle");
 	const executionRoute =
 		validatedRoute?.destination === "execution" ? validatedRoute : null;
@@ -4562,9 +4551,6 @@ export function App({
 			: workspaceRouteResult.kind === "unavailable"
 				? workspaceRouteResult
 				: null;
-	const routePending =
-		routeValidation.kind === "pending" &&
-		(workspaceRouteResult.kind === "route" || legacyMigrationPendingRef.current);
 	const retryRouteValidation = useCallback(() => {
 		setRouteValidationRetry((current) => current + 1);
 	}, []);
@@ -4784,6 +4770,7 @@ export function App({
 						entries={loadedEntries}
 						turnCards={turnCardViews}
 						transcriptLoading={transcriptLoading}
+						transcriptRefreshing={transcriptRefreshing}
 						transcriptError={selectedError}
 						transcriptErrorHasUsableCache={selectedErrorHasUsableCache}
 						transcriptRetrying={selectedRetrying}
@@ -4923,7 +4910,7 @@ export function App({
 						) : null}
 					</div>
 				</main>
-			) : routePending ? <LoadingConversation /> : null}
+			) : null}
 
 			{selectedFilePath && selectedId ? (
 				<>

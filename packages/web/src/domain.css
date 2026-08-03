@@ -798,17 +798,6 @@ pre {
 	color: var(--foreground);
 }
 
-.conversation-loading-state {
-	align-items: center;
-	text-align: center;
-}
-
-.conversation-loading-dots {
-	display: inline-block;
-	min-width: 3ch;
-	text-align: left;
-}
-
 .workspace-route-state > p {
 	max-width: 64ch;
 	margin: 0;
@@ -1000,6 +989,17 @@ pre {
 .transcript-load-error {
 	width: min(calc(100% - 48px), 852px);
 	margin: 0 auto var(--space-4);
+}
+
+.transcript-refresh-status {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-2);
+	width: min(calc(100% - 48px), 852px);
+	margin: 0 auto var(--space-3);
+	padding: 0;
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
 }
 
 .turn-jump-controls {

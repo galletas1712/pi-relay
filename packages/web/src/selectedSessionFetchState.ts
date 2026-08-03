@@ -2,6 +2,7 @@ export interface SelectedSessionFetchState {
 	sessionId: string | null;
 	selectionVersion: number;
 	loading: boolean;
+	fetching: boolean;
 	retrying: boolean;
 	hadUsableCache: boolean;
 	error: string | null;
@@ -48,6 +49,7 @@ export function beginSelectedSessionFetch(
 		sessionId,
 		selectionVersion,
 		loading: !usableCache,
+		fetching: true,
 		retrying,
 		hadUsableCache: usableCache,
 		error: retrying ? current.error : null,
@@ -65,6 +67,7 @@ export function settleSelectedSessionFetch(
 		sessionId,
 		selectionVersion,
 		loading: false,
+		fetching: false,
 		retrying: false,
 		hadUsableCache: error === null ? true : current.hadUsableCache,
 		error,
@@ -94,6 +97,7 @@ export class SelectedSessionFetchCoordinator {
 			sessionId,
 			selectionVersion,
 			loading: !!sessionId && !hasUsableCache,
+			fetching: false,
 			retrying: false,
 			hadUsableCache: hasUsableCache,
 			error: null,
@@ -109,6 +113,7 @@ export class SelectedSessionFetchCoordinator {
 			...this.state,
 			selectionVersion,
 			loading: !!this.state.sessionId && !hadUsableCache,
+			fetching: false,
 			retrying: false,
 			hadUsableCache,
 		};
