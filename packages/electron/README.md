@@ -48,11 +48,12 @@ npm run package:electron:dir
 ```
 
 Packaging only wraps the remote URL; it does not bundle `packages/web/dist`.
-A frontend deployment is picked up on the next desktop launch, or when an
-existing window returns to the foreground after five minutes hidden. That
-refresh revalidates the document and ignores the HTTP cache without clearing
-localStorage or service-worker state, so reinstalling the Electron binary is
-not normally required for frontend updates.
+A frontend deployment is picked up on the next desktop launch. While the app
+stays open, the web UI soft-reconciles session data when the window returns to
+the foreground (same path as the browser/PWA). After display sleep or a failed
+load, the shell invalidates the compositor or retries a normal `loadURL` so a
+blank window is not left as the terminal state. Reinstalling the Electron
+binary is not normally required for frontend updates.
 
 ## GitHub Release distribution
 

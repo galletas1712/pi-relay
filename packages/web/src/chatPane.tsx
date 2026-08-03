@@ -18,6 +18,7 @@ export interface ChatPaneProps {
 	entries: TranscriptEntry[];
 	turnCards?: TurnCardView[] | null;
 	transcriptLoading: boolean;
+	transcriptRefreshing?: boolean;
 	transcriptError: string | null;
 	transcriptErrorHasUsableCache: boolean;
 	transcriptRetrying: boolean;
@@ -60,6 +61,7 @@ export const ChatPane = memo(function ChatPane({
 	entries,
 	turnCards,
 	transcriptLoading,
+	transcriptRefreshing = false,
 	transcriptError,
 	transcriptErrorHasUsableCache,
 	transcriptRetrying,
@@ -128,6 +130,7 @@ export const ChatPane = memo(function ChatPane({
 				sessionId={selectedId}
 				entriesSessionId={snapshot?.session_id ?? null}
 				loadingSession={transcriptLoading}
+				refreshingSession={transcriptRefreshing}
 				sessionError={transcriptError}
 				sessionErrorHasUsableCache={transcriptErrorHasUsableCache}
 				retryingSession={transcriptRetrying}

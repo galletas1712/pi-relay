@@ -593,6 +593,26 @@ describe("MessageList session loading guard", () => {
 		expect(html).not.toContain("Loading conversation");
 	});
 
+	it("shows a quiet refresh status over cached transcript content", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[userEntry("entry_1", "cached transcript text")]}
+				activeLeafId="entry_1"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				refreshingSession
+			/>,
+		);
+
+		expect(html).toContain("cached transcript text");
+		expect(html).toContain("Refreshing…");
+		expect(html).not.toContain("Loading conversation…");
+		expect(html).not.toContain("Session refresh failed");
+	});
+
 	it("keeps matching cached content visible with a refresh warning and Retry", () => {
 		const html = renderToStaticMarkup(
 			<MessageList

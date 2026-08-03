@@ -8,7 +8,7 @@
 		"dev": "electron .",
 		"start": "electron .",
 		"test": "vitest --run",
-		"validate": "node --check src/main.mjs && node --check src/policy.mjs && node --check src/refresh.mjs && npm test",
+		"validate": "node --check src/main.mjs && node --check src/policy.mjs && npm test",
 		"package": "electron-builder --mac",
 		"package:dir": "electron-builder --dir --mac"
 	},

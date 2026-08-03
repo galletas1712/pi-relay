@@ -262,6 +262,7 @@ export const MessageList = memo(function MessageList({
 	sessionId,
 	entriesSessionId,
 	loadingSession = false,
+	refreshingSession = false,
 	sessionError = null,
 	sessionErrorHasUsableCache = false,
 	retryingSession = false,
@@ -293,6 +294,7 @@ export const MessageList = memo(function MessageList({
 	sessionId?: string | null;
 	entriesSessionId?: string | null;
 	loadingSession?: boolean;
+	refreshingSession?: boolean;
 	sessionError?: string | null;
 	sessionErrorHasUsableCache?: boolean;
 	retryingSession?: boolean;
@@ -892,6 +894,11 @@ export const MessageList = memo(function MessageList({
 									<ConnectionBlockedReason reason={remoteReadBlockedReason} />
 								</>
 							) : null}
+						</div>
+					) : refreshingSession ? (
+						<div className="transcript-refresh-status" role="status" aria-live="polite">
+							<Loader2 className="spin" size={14} aria-hidden />
+							<span>Refreshing…</span>
 						</div>
 					) : null}
 					{!hasOlderTurns && transcriptStartContent != null ? (
