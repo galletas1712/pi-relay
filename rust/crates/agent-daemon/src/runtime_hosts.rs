@@ -580,6 +580,46 @@ impl RuntimeRegistry {
         }
     }
 
+    pub(crate) async fn browse_list_dir(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        path: &str,
+        after_name: Option<&str>,
+        limit: u32,
+    ) -> Result<RuntimeCommandResult> {
+        self.execute(
+            runtime_id,
+            RuntimeCommand::BrowseListDir {
+                workspace_id: workspace_id.to_string(),
+                path: path.to_string(),
+                after_name: after_name.map(str::to_string),
+                limit,
+            },
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn browse_read_file(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        path: &str,
+        max_bytes: u32,
+    ) -> Result<RuntimeCommandResult> {
+        self.execute(
+            runtime_id,
+            RuntimeCommand::BrowseReadFile {
+                workspace_id: workspace_id.to_string(),
+                path: path.to_string(),
+                max_bytes,
+            },
+            None,
+        )
+        .await
+    }
+
     pub(crate) async fn read_runtime_context(
         &self,
         runtime_id: &str,
@@ -997,6 +1037,17 @@ pub(crate) mod test_support {
                     contents: std::fs::read_to_string(&path).ok(),
                 })
             }
+            RuntimeCommand::BrowseListDir {
+                workspace_id,
+                path,
+                after_name,
+                limit,
+            } => fake_browse_list_dir(dirs, &workspace_id, &path, after_name.as_deref(), limit).await,
+            RuntimeCommand::BrowseReadFile {
+                workspace_id,
+                path,
+                max_bytes,
+            } => fake_browse_read_file(dirs, &workspace_id, &path, max_bytes).await,
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,
@@ -1094,6 +1145,119 @@ pub(crate) mod test_support {
                 path
             })
             .clone()
+    }
+
+    async fn fake_browse_list_dir(
+        dirs: &Arc<TokioMutex<HashMap<String, std::path::PathBuf>>>,
+        workspace_id: &str,
+        path: &str,
+        after_name: Option<&str>,
+        limit: u32,
+    ) -> std::result::Result<RuntimeCommandResult, RuntimeCommandError> {
+        use std::os::unix::fs::MetadataExt;
+        let cwd = fake_workspace_dir(dirs, workspace_id).await;
+        let target = if path.is_empty() {
+            cwd.clone()
+        } else {
+            cwd.join(path)
+        };
+        let read = std::fs::read_dir(&target).map_err(|error| {
+            RuntimeCommandError::new("browse_error", format!("list_dir failed: {error}"))
+        })?;
+        let mut entries = Vec::new();
+        for entry in read {
+            let entry = entry.map_err(|error| {
+                RuntimeCommandError::new("browse_error", format!("list_dir entry failed: {error}"))
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let meta = entry.metadata().map_err(|error| {
+                RuntimeCommandError::new("browse_error", format!("stat failed: {error}"))
+            })?;
+            let kind = if meta.file_type().is_dir() {
+                "directory"
+            } else if meta.file_type().is_file() {
+                "file"
+            } else {
+                "other"
+            }
+            .to_string();
+            let size = if kind == "file" {
+                Some(meta.len())
+            } else {
+                None
+            };
+            let mtime_ms = meta.mtime().checked_mul(1000).map(|v| v as u64);
+            entries.push(agent_runtime_protocol::WorkspaceDirEntry {
+                name,
+                kind,
+                size,
+                mtime_ms,
+            });
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let limit = if limit == 0 { 200 } else { limit.min(500) } as usize;
+        let start = match after_name {
+            Some(after) => entries
+                .iter()
+                .position(|entry| entry.name == after)
+                .map(|idx| idx + 1)
+                .unwrap_or(0),
+            None => 0,
+        };
+        let end = (start + limit).min(entries.len());
+        let page = entries[start..end].to_vec();
+        let next_after_name = if end < entries.len() {
+            page.last().map(|entry| entry.name.clone())
+        } else {
+            None
+        };
+        Ok(RuntimeCommandResult::DirListing {
+            path: path.to_string(),
+            entries: page,
+            next_after_name,
+        })
+    }
+
+    async fn fake_browse_read_file(
+        dirs: &Arc<TokioMutex<HashMap<String, std::path::PathBuf>>>,
+        workspace_id: &str,
+        path: &str,
+        max_bytes: u32,
+    ) -> std::result::Result<RuntimeCommandResult, RuntimeCommandError> {
+        use base64::Engine as _;
+        use std::os::unix::fs::MetadataExt;
+        let cwd = fake_workspace_dir(dirs, workspace_id).await;
+        let target = cwd.join(path);
+        let meta = std::fs::metadata(&target).map_err(|error| {
+            RuntimeCommandError::new("browse_error", format!("stat failed: {error}"))
+        })?;
+        if !meta.is_file() {
+            return Err(RuntimeCommandError::new(
+                "browse_error",
+                "path is not a regular file",
+            ));
+        }
+        let max_bytes = if max_bytes == 0 {
+            256 * 1024
+        } else {
+            max_bytes.min(1024 * 1024)
+        } as usize;
+        let mut file = std::fs::File::open(&target).map_err(|error| {
+            RuntimeCommandError::new("browse_error", format!("open failed: {error}"))
+        })?;
+        let mut buf = vec![0_u8; max_bytes.min(meta.len() as usize)];
+        let read = std::io::Read::read(&mut file, &mut buf).map_err(|error| {
+            RuntimeCommandError::new("browse_error", format!("read failed: {error}"))
+        })?;
+        buf.truncate(read);
+        Ok(RuntimeCommandResult::FilePrefix {
+            path: path.to_string(),
+            content_base64: base64::engine::general_purpose::STANDARD.encode(&buf),
+            byte_len: read as u64,
+            total_size: meta.len(),
+            eof: (read as u64) >= meta.len(),
+            mtime_ms: meta.mtime().checked_mul(1000).map(|v| v as u64),
+        })
     }
 
     fn session_workspace_from(workspace: ProjectWorkspace) -> SessionWorkspace {

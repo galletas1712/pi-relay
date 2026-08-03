@@ -1,15 +1,18 @@
 import { X } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import type { AgentApi } from "./agentApi.ts";
+import { FilesTab } from "./filesTab.tsx";
 import { RunBoard } from "./runBoard.tsx";
 import { COMMANDS } from "./slash.ts";
 import type { Delegation, SessionSnapshot, SessionWorkspace, ToolListing } from "./types.ts";
 
 const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
 
-type InspectorTab = "run-board" | "debug";
+export type InspectorTab = "run-board" | "files" | "debug";
 
 const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
 	{ id: "run-board", label: "Agents" },
+	{ id: "files", label: "Files" },
 	{ id: "debug", label: "Inspector" },
 ];
 
@@ -19,6 +22,7 @@ function pendingActionLabel(action: SessionSnapshot["pending_actions"][number]):
 }
 
 export interface InspectorProps {
+	api?: AgentApi | null;
 	snapshot: SessionSnapshot | null;
 	runBoardParentSessionId?: string | null;
 	delegations: Delegation[];
@@ -37,11 +41,15 @@ export interface InspectorProps {
 	mutationBlockedReason?: string | null;
 	remoteReadBlockedReason?: string | null;
 	tools: ToolListing[];
+	selectedFilePath?: string | null;
+	preferredTab?: InspectorTab | null;
+	onSelectFile?: (path: string) => void;
 	onSelectSession?: (sessionId: string) => void;
 	onClose?: () => void;
 }
 
 export function Inspector({
+	api = null,
 	snapshot,
 	runBoardParentSessionId = snapshot?.session_id ?? null,
 	delegations,
@@ -60,10 +68,18 @@ export function Inspector({
 	mutationBlockedReason,
 	remoteReadBlockedReason,
 	tools,
+	selectedFilePath = null,
+	preferredTab = null,
+	onSelectFile,
 	onSelectSession,
 	onClose
 }: InspectorProps) {
-	const [activeTab, setActiveTab] = useState<InspectorTab>("run-board");
+	const [activeTab, setActiveTab] = useState<InspectorTab>(preferredTab ?? "run-board");
+
+	useEffect(() => {
+		if (preferredTab) setActiveTab(preferredTab);
+	}, [preferredTab]);
+
 	return (
 		<div className="inspector-inner">
 			<div className="inspector-tabs" role="tablist" aria-label="inspector tabs">
@@ -111,6 +127,26 @@ export function Inspector({
 						mutationBlockedReason={mutationBlockedReason}
 						remoteReadBlockedReason={remoteReadBlockedReason}
 					/>
+				</div>
+			) : activeTab === "files" ? (
+				<div
+					className="inspector-tab-panel"
+					role="tabpanel"
+					id="inspector-panel-files"
+					aria-labelledby="inspector-tab-files"
+				>
+					{api ? (
+						<FilesTab
+							api={api}
+							sessionId={selectedSessionId}
+							selectedPath={selectedFilePath}
+							remoteReadBlockedReason={remoteReadBlockedReason}
+							activity={snapshot?.activity ?? null}
+							onSelectFile={(path) => onSelectFile?.(path)}
+						/>
+					) : (
+						<p className="muted">Files browser unavailable.</p>
+					)}
 				</div>
 			) : (
 				<div

@@ -1,4 +1,5 @@
 mod config;
+pub mod fs;
 mod git;
 mod instantiate;
 mod local;
@@ -113,6 +114,38 @@ impl WorkspaceManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Shallow paged directory listing for the session files browser.
+    pub async fn browse_list_dir(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        after_name: Option<&str>,
+        limit: u32,
+    ) -> Result<fs::DirListing> {
+        let cwd = self.resolve(workspace_id);
+        let path = path.to_string();
+        let after = after_name.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            fs::list_dir(&cwd, &path, after.as_deref(), limit)
+        })
+        .await
+        .context("browse list_dir task failed")?
+    }
+
+    /// Bounded prefix read for the session files browser.
+    pub async fn browse_read_file(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        max_bytes: u32,
+    ) -> Result<fs::FilePrefix> {
+        let cwd = self.resolve(workspace_id);
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || fs::read_file_prefix(&cwd, &path, max_bytes))
+            .await
+            .context("browse read_file task failed")?
     }
 
     /// Return all runtime-owned instructions and skill packages visible to a

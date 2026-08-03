@@ -1924,6 +1924,70 @@ Result:
 }
 ```
 
+### `workspace.list_dir`
+
+Shallow, paged listing of one directory under the selected session's cwd. The
+browser sends a session ID and a cwd-relative path only; the daemon resolves
+runtime/workspace authority and the runtime performs confined filesystem access.
+`path` of `""` is the cwd root. Symlinks, special files, and nested mounts are
+returned as `kind: "other"` and cannot be opened. Sort is by name; `after_name`
+is exclusive.
+
+```json
+{
+  "session_id": "session_...",
+  "path": "src",
+  "after_name": "main.rs",
+  "limit": 200
+}
+```
+
+```json
+{
+  "path": "src",
+  "entries": [
+    {
+      "name": "lib.rs",
+      "kind": "file",
+      "size": 4812,
+      "mtime_ms": 1785737400000
+    }
+  ],
+  "next_after_name": "lib.rs"
+}
+```
+
+`limit` defaults to 200 and is capped at 500. Directories with more than 10,000
+immediate children are rejected. Non-UTF-8 child names fail the listing.
+
+### `workspace.read_file`
+
+Bounded prefix read of a regular file under the selected session cwd. Content is
+always base64. `max_bytes` defaults to 256 KiB and is capped at 1 MiB. There is
+no offset protocol.
+
+```json
+{
+  "session_id": "session_...",
+  "path": "README.md",
+  "max_bytes": 262144
+}
+```
+
+```json
+{
+  "path": "README.md",
+  "content_base64": "IyBQcm9qZWN0Cg==",
+  "byte_len": 10,
+  "total_size": 10,
+  "eof": true,
+  "mtime_ms": 1785737400000
+}
+```
+
+`total_size` is required. `byte_len` is the decoded prefix length; `eof` reports
+whether that prefix reached the observed file size.
+
 ## Subagent events
 
 When a delegation subagent is spawned or re-driven, the daemon may emit

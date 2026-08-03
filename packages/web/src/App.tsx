@@ -57,18 +57,28 @@ import {
 } from "./sessionInventory.ts";
 import {
 	clampSidebarWidth,
+	clampFilePaneWidth,
 	DEFAULT_SIDEBAR_WIDTH,
+	DEFAULT_FILE_PANE_WIDTH,
 	defaultPanelState,
+	FILE_SPLIT_MIN_CENTER_PX,
 	MAX_SIDEBAR_WIDTH,
+	MAX_FILE_PANE_WIDTH,
 	MEDIUM_PANEL_QUERY,
 	MIN_SIDEBAR_WIDTH,
+	MIN_FILE_PANE_WIDTH,
 	panelModeForViewport,
 	saveSidebarWidth,
+	saveFilePaneWidth,
 	SIDEBAR_KEYBOARD_STEP,
 	WIDE_PANEL_QUERY,
 	loadSidebarWidth,
+	loadFilePaneWidth,
 	type PanelMode,
 } from "./panelLayout.ts";
+import { FilePane } from "./filePane.tsx";
+import { readFileQuery, replaceFileQuery } from "./filePath.ts";
+import type { InspectorTab } from "./inspector.tsx";
 import {
 	PanelGestureController,
 	type PanelGestureAction,
@@ -423,6 +433,13 @@ export function App({
 	const [panelMode, setPanelMode] = useState<PanelMode>(() => panelModeForViewport());
 	const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
 	const [sidebarResizing, setSidebarResizing] = useState(false);
+	const [filePaneWidth, setFilePaneWidth] = useState(loadFilePaneWidth);
+	const [filePaneResizing, setFilePaneResizing] = useState(false);
+	const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() => readFileQuery());
+	const [inspectorPreferredTab, setInspectorPreferredTab] = useState<InspectorTab | null>(
+		() => (readFileQuery() ? "files" : null),
+	);
+	const [fileSplitMode, setFileSplitMode] = useState(false);
 	const [showArchived, setShowArchived] = useState(false);
 	const [showAllDelegations, setShowAllDelegations] = useState(false);
 	const [backgroundWarmRevision, setBackgroundWarmRevision] = useState(0);
@@ -484,11 +501,19 @@ export function App({
 	const mobileSidebarToggleRef = useRef<HTMLButtonElement | null>(null);
 	const sidebarNewSessionButtonRef = useRef<HTMLButtonElement | null>(null);
 	const sidebarWidthRef = useRef(sidebarWidth);
+	const filePaneWidthRef = useRef(filePaneWidth);
+	sidebarWidthRef.current = sidebarWidth;
+	filePaneWidthRef.current = filePaneWidth;
 	const panelGestureRef = useRef<PanelGestureController | null>(null);
 	if (!panelGestureRef.current) panelGestureRef.current = new PanelGestureController();
 	const panelOpenStateRef = useRef({ sidebarOpen, rightOpen });
 	panelOpenStateRef.current = { sidebarOpen, rightOpen };
 	const sidebarResizeRef = useRef<{
+		pointerId: number;
+		startX: number;
+		startWidth: number;
+	} | null>(null);
+	const filePaneResizeRef = useRef<{
 		pointerId: number;
 		startX: number;
 		startWidth: number;
@@ -4295,6 +4320,129 @@ export function App({
 	const resetSidebarWidth = useCallback(() => {
 		applySidebarWidth(DEFAULT_SIDEBAR_WIDTH, true);
 	}, [applySidebarWidth]);
+
+	const applyFilePaneWidth = useCallback((width: number, persist = false) => {
+		const nextWidth = clampFilePaneWidth(width);
+		filePaneWidthRef.current = nextWidth;
+		appShellRef.current?.style.setProperty("--file-pane-width", `${nextWidth}px`);
+		if (persist) {
+			setFilePaneWidth(nextWidth);
+			saveFilePaneWidth(nextWidth);
+		}
+	}, []);
+	const handleFilePaneResizePointerDown = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			if (event.button !== 0) return;
+			event.preventDefault();
+			filePaneResizeRef.current = {
+				pointerId: event.pointerId,
+				startX: event.clientX,
+				startWidth: filePaneWidthRef.current,
+			};
+			event.currentTarget.setPointerCapture(event.pointerId);
+			setFilePaneResizing(true);
+		},
+		[],
+	);
+	const handleFilePaneResizePointerMove = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			const resize = filePaneResizeRef.current;
+			if (!resize || resize.pointerId !== event.pointerId) return;
+			// Dragging the separator right shrinks the file pane.
+			applyFilePaneWidth(resize.startWidth - (event.clientX - resize.startX));
+		},
+		[applyFilePaneWidth],
+	);
+	const handleFilePaneResizePointerEnd = useCallback(
+		(event: ReactPointerEvent<HTMLDivElement>) => {
+			const resize = filePaneResizeRef.current;
+			if (!resize || resize.pointerId !== event.pointerId) return;
+			filePaneResizeRef.current = null;
+			setFilePaneResizing(false);
+			applyFilePaneWidth(filePaneWidthRef.current, true);
+			if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+				event.currentTarget.releasePointerCapture(event.pointerId);
+			}
+		},
+		[applyFilePaneWidth],
+	);
+	const handleFilePaneResizeKeyDown = useCallback(
+		(event: ReactKeyboardEvent<HTMLDivElement>) => {
+			let nextWidth: number;
+			switch (event.key) {
+				case "ArrowLeft":
+					nextWidth = filePaneWidthRef.current + SIDEBAR_KEYBOARD_STEP;
+					break;
+				case "ArrowRight":
+					nextWidth = filePaneWidthRef.current - SIDEBAR_KEYBOARD_STEP;
+					break;
+				case "Home":
+					nextWidth = MAX_FILE_PANE_WIDTH;
+					break;
+				case "End":
+					nextWidth = MIN_FILE_PANE_WIDTH;
+					break;
+				default:
+					return;
+			}
+			event.preventDefault();
+			applyFilePaneWidth(nextWidth, true);
+		},
+		[applyFilePaneWidth],
+	);
+	const resetFilePaneWidth = useCallback(() => {
+		applyFilePaneWidth(DEFAULT_FILE_PANE_WIDTH, true);
+	}, [applyFilePaneWidth]);
+
+	const selectFilePath = useCallback((path: string | null) => {
+		setSelectedFilePath(path);
+		replaceFileQuery(path);
+		if (path) {
+			setInspectorPreferredTab("files");
+			setRightOpen(true);
+		}
+	}, []);
+
+	useEffect(() => {
+		const onPopState = () => {
+			setSelectedFilePath(readFileQuery());
+		};
+		window.addEventListener("popstate", onPopState);
+		return () => window.removeEventListener("popstate", onPopState);
+	}, []);
+
+	const previousSelectedIdForFileRef = useRef(selectedId);
+	useEffect(() => {
+		if (previousSelectedIdForFileRef.current === selectedId) return;
+		previousSelectedIdForFileRef.current = selectedId;
+		setSelectedFilePath((current) => {
+			if (current == null) return current;
+			replaceFileQuery(null);
+			return null;
+		});
+		setInspectorPreferredTab(null);
+	}, [selectedId]);
+
+	useEffect(() => {
+		const measure = () => {
+			const shell = appShellRef.current;
+			if (!shell || !selectedFilePath) {
+				setFileSplitMode(false);
+				return;
+			}
+			const sidebarCol = panelModeRef.current === "wide" ? sidebarWidthRef.current : 0;
+			const inspectorCol = rightOpen ? 350 : 0;
+			const fileCol = filePaneWidthRef.current;
+			const available = shell.clientWidth - sidebarCol - inspectorCol;
+			const canSplit =
+				available >= FILE_SPLIT_MIN_CENTER_PX && available - fileCol >= MIN_FILE_PANE_WIDTH;
+			setFileSplitMode(canSplit);
+		};
+		measure();
+		window.addEventListener("resize", measure);
+		return () => window.removeEventListener("resize", measure);
+	}, [selectedFilePath, rightOpen, panelMode, sidebarWidth, filePaneWidth]);
+
 	const handleResumeTurn = useCallback(
 		(entryId: string) => {
 			void resumeTerminalTurn(entryId).catch(reportActionError);
@@ -4402,8 +4550,24 @@ export function App({
 		}),
 		[],
 	);
-	const appClassName = `app-shell ${sidebarOpen ? "sidebar-open" : ""} ${rightOpen ? "inspector-open" : ""} ${sidebarResizing ? "sidebar-resizing" : ""}`;
-	const appStyle = { "--sidebar-width": `${sidebarWidth}px` } as CSSProperties;
+	const fileOpen = Boolean(selectedFilePath);
+	const fileReplacementMode = fileOpen && !fileSplitMode;
+	const appClassName = [
+		"app-shell",
+		sidebarOpen ? "sidebar-open" : "",
+		rightOpen ? "inspector-open" : "",
+		sidebarResizing ? "sidebar-resizing" : "",
+		filePaneResizing ? "file-pane-resizing" : "",
+		fileOpen ? "file-open" : "",
+		fileSplitMode ? "file-split" : "",
+		fileReplacementMode ? "file-replacement" : "",
+	]
+		.filter(Boolean)
+		.join(" ");
+	const appStyle = {
+		"--sidebar-width": `${sidebarWidth}px`,
+		"--file-pane-width": `${filePaneWidth}px`,
+	} as CSSProperties;
 
 	return (
 		<div
@@ -4542,7 +4706,7 @@ export function App({
 				/>
 			) : null}
 
-			{conversationVisible ? (
+			{conversationVisible && !fileReplacementMode ? (
 				<ChatPane
 						session={selectedChatSession}
 						snapshot={loadedSnapshot}
@@ -4690,6 +4854,42 @@ export function App({
 				</main>
 			) : routePending ? <LoadingConversation /> : null}
 
+			{selectedFilePath && selectedId ? (
+				<>
+					{fileSplitMode ? (
+						<div
+							className="file-pane-resize-handle"
+							role="separator"
+							aria-label="Resize file pane"
+							aria-orientation="vertical"
+							aria-valuemin={MIN_FILE_PANE_WIDTH}
+							aria-valuemax={MAX_FILE_PANE_WIDTH}
+							aria-valuenow={filePaneWidth}
+							aria-valuetext={`${filePaneWidth} pixels`}
+							tabIndex={0}
+							title="Drag to resize file pane. Double-click to reset."
+							onDoubleClick={resetFilePaneWidth}
+							onKeyDown={handleFilePaneResizeKeyDown}
+							onPointerDown={handleFilePaneResizePointerDown}
+							onPointerMove={handleFilePaneResizePointerMove}
+							onPointerUp={handleFilePaneResizePointerEnd}
+							onPointerCancel={handleFilePaneResizePointerEnd}
+							onLostPointerCapture={handleFilePaneResizePointerEnd}
+						/>
+					) : null}
+					<FilePane
+						api={api}
+						sessionId={selectedId}
+						path={selectedFilePath}
+						replacementMode={fileReplacementMode}
+						remoteReadBlockedReason={connectionRemoteActionBlockedReason}
+						onClose={() => selectFilePath(null)}
+						onNavigate={selectFilePath}
+					/>
+				</>
+			) : null}
+
+			{!fileReplacementMode ? (
 			<footer className="chat-dock" data-slot="chat-box">
 				<ConnectionRecoveryBanner
 					disconnected={disconnected}
@@ -4719,6 +4919,7 @@ export function App({
 					/>
 				) : null}
 			</footer>
+			) : null}
 
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
 				{executionRoute || unavailableState ? (
@@ -4731,6 +4932,7 @@ export function App({
 					</div>
 				) : (
 				<Inspector
+					api={api}
 					snapshot={loadedSnapshot}
 					runBoardParentSessionId={delegationParentSessionId}
 					delegations={delegations}
@@ -4752,6 +4954,9 @@ export function App({
 					mutationBlockedReason={connectionRemoteActionBlockedReason}
 					remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 					tools={tools}
+					selectedFilePath={selectedFilePath}
+					preferredTab={inspectorPreferredTab}
+					onSelectFile={selectFilePath}
 					onSelectSession={(sessionId) => {
 						openConversation(sessionId);
 						if (inspectorIsOverlay) setRightOpen(false);

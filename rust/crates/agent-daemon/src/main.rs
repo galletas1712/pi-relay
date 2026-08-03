@@ -21,6 +21,7 @@ mod session_start;
 mod state;
 mod subagents;
 mod types;
+mod workspace_browse;
 mod workspace_selection;
 
 use crate::browser_websocket::{accept, handshake_semaphore, BrowserWebSocket};
@@ -621,6 +622,8 @@ async fn dispatch_request(
         }
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
+        RpcMethod::WorkspaceListDir => workspace_browse::list_dir(state, params).await,
+        RpcMethod::WorkspaceReadFile => workspace_browse::read_file(state, params).await,
     }
 }
 

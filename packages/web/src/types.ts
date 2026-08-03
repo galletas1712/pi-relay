@@ -228,6 +228,30 @@ export interface ReadHandoffFileResult {
 	content: string;
 }
 
+export type WorkspaceDirEntryKind = "file" | "directory" | "other";
+
+export interface WorkspaceDirEntry {
+	name: string;
+	kind: WorkspaceDirEntryKind;
+	size?: number | null;
+	mtime_ms?: number | null;
+}
+
+export interface WorkspaceDirListing {
+	path: string;
+	entries: WorkspaceDirEntry[];
+	next_after_name?: string | null;
+}
+
+export interface WorkspaceFilePrefix {
+	path: string;
+	content_base64: string;
+	byte_len: number;
+	total_size: number;
+	eof: boolean;
+	mtime_ms?: number | null;
+}
+
 export type SessionOverview = Omit<SessionSnapshot, "entries">;
 
 export interface ActiveBranchSyncResponse {

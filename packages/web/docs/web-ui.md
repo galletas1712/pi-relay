@@ -27,12 +27,19 @@ Cancellation and progress remain delegation-ID scoped.
 | active server + selector + Manage                              |
 +----------------+----------------------------------+--------------+
 | Sidebar        | Chat pane                        | Inspector    |
-| projects +     | header (model/effort/title)      | global cfg   |
-| session list   | transcript (turn cards)          | session head |
-|                | ----------------------------------| pending      |
-|                | composer + queue pane + slash    | actions/tools|
+| projects +     | header (model/effort/title)      | Agents /     |
+| session list   | transcript (turn cards)          | Files tree / |
+|                | ----------------------------------| debug        |
+|                | composer + queue pane + slash    |              |
 +----------------+----------------------------------+--------------+
 ```
+
+When a file is open, wide layouts place a read-only `FilePane` beside chat
+(`chat | resize | file | inspector`). Narrower center allocations replace the
+chat surface with the file preview and a **Back to chat** control. The Files
+inspector tab owns the lazy cwd tree only; file contents always render in the
+center `FilePane`. Selection is URL-addressable via `?file=<relative-path>`
+(replaceState).
 
 Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar to an overlay,
 `compact` overlays both side panels. The mobile top bar exposes drawer toggles and a connection pill.
@@ -53,6 +60,9 @@ Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar
   separate normalized per-session cache.
 - Render the active branch as collapsible turn cards, fetching full entry detail lazily.
 - Compose and submit input, manage the queued-follow-up pane, and expose slash commands.
+- Browse the selected session cwd from the Files inspector tab and preview
+  Markdown/code/images in the center file pane via `workspace.list_dir` /
+  `workspace.read_file`.
 
 ## Data layer
 

@@ -522,6 +522,49 @@ impl Runtime {
                     .await?;
                 Ok(RuntimeCommandResult::FileContents { contents })
             }
+            RuntimeCommand::BrowseListDir {
+                workspace_id,
+                path,
+                after_name,
+                limit,
+            } => {
+                let listing = self
+                    .workspaces
+                    .browse_list_dir(&workspace_id, &path, after_name.as_deref(), limit)
+                    .await?;
+                Ok(RuntimeCommandResult::DirListing {
+                    path: listing.path,
+                    entries: listing
+                        .entries
+                        .into_iter()
+                        .map(|entry| agent_runtime_protocol::WorkspaceDirEntry {
+                            name: entry.name,
+                            kind: entry.kind.as_str().to_string(),
+                            size: entry.size,
+                            mtime_ms: entry.mtime_ms,
+                        })
+                        .collect(),
+                    next_after_name: listing.next_after_name,
+                })
+            }
+            RuntimeCommand::BrowseReadFile {
+                workspace_id,
+                path,
+                max_bytes,
+            } => {
+                let prefix = self
+                    .workspaces
+                    .browse_read_file(&workspace_id, &path, max_bytes)
+                    .await?;
+                Ok(RuntimeCommandResult::FilePrefix {
+                    path: prefix.path,
+                    content_base64: prefix.content_base64,
+                    byte_len: prefix.byte_len,
+                    total_size: prefix.total_size,
+                    eof: prefix.eof,
+                    mtime_ms: prefix.mtime_ms,
+                })
+            }
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,

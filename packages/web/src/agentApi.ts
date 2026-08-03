@@ -36,6 +36,8 @@ import type {
 	ProjectWorkspace,
 	Runtime,
 	WorkspaceMaterializeProgress,
+	WorkspaceDirListing,
+	WorkspaceFilePrefix,
 } from "./types.ts";
 import type { EntryScope } from "./queryKeys.ts";
 
@@ -95,6 +97,21 @@ export interface AgentApi {
 	reorderQueuedFollowUps(sessionId: string, inputIds: string[], expectedQueueRevision?: number | null): Promise<ReorderQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
+	listWorkspaceDir(params: ListWorkspaceDirParams): Promise<WorkspaceDirListing>;
+	readWorkspaceFile(params: ReadWorkspaceFileParams): Promise<WorkspaceFilePrefix>;
+}
+
+export interface ListWorkspaceDirParams {
+	sessionId: string;
+	path?: string;
+	afterName?: string | null;
+	limit?: number;
+}
+
+export interface ReadWorkspaceFileParams {
+	sessionId: string;
+	path: string;
+	maxBytes?: number;
 }
 
 export interface AddMcpToolsParams {
@@ -805,6 +822,23 @@ class AgentApiClient implements AgentApi {
 			leaf_id: leafId || undefined
 		});
 		return result.items;
+	}
+
+	listWorkspaceDir(params: ListWorkspaceDirParams): Promise<WorkspaceDirListing> {
+		return this.client.request<WorkspaceDirListing>("workspace.list_dir", {
+			session_id: params.sessionId,
+			path: params.path ?? "",
+			after_name: params.afterName ?? undefined,
+			limit: params.limit,
+		});
+	}
+
+	readWorkspaceFile(params: ReadWorkspaceFileParams): Promise<WorkspaceFilePrefix> {
+		return this.client.request<WorkspaceFilePrefix>("workspace.read_file", {
+			session_id: params.sessionId,
+			path: params.path,
+			max_bytes: params.maxBytes,
+		});
 	}
 }
 
