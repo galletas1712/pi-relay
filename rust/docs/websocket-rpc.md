@@ -1087,15 +1087,18 @@ cold loads and history UI.
 ### `session.delete`
 
 Idle-only. Params: `session_id` (and optional `expected_active_leaf_id`).
-Acquires the session driver, requires idle (no unfinished action, no queued
-input), and re-checks that state under the store transaction that deletes the
-row. If a follow-up was accepted concurrently, deletion fails with
-`session_busy` rather than cascade-deleting accepted input. Otherwise the RPC
-evicts any live session, removes the row, and cascades to its transcript
-entries, queued inputs, actions, and events; session workspace directories are
-cleaned up. Returns `{ "session_id", "deleted": true,
+Acquires the complete hidden subagent tree, requires every identity idle, then
+marks each private workspace owner `deleting` under the same session-row lock
+used by input, replay, configuration, history, recovery, and delegation
+admission. A mutation that wins before the delete makes deletion fail with
+`session_busy`; after the delete commits, all later mutation is rejected with
+`session_deleting`. The RPC immediately hides and evicts the fenced tree even
+when its runtime is offline. A periodic worker retries exact runtime destruction
+and removes child identities before their parent, finally cascading transcript,
+queue, action, and event rows. Returns `{ "session_id", "deleted": true,
 "deleted_child_session_ids": [...] }`; the child IDs cover the recursively
-deleted hidden subagent tree. A missing session is `session_not_found`.
+fenced hidden subagent tree. Physical workspace and identity removal are
+asynchronous. A missing session is `session_not_found`.
 
 ## System Prompt RPC
 
@@ -1174,11 +1177,12 @@ the same store transaction that queues the row and rejects stale sends with
 `history_changed`. The row will materialize only after background driving
 consumes it from the then-active branch; queued rows can later be
 edited/cancelled/reordered before consumption. Idle-only source mutations such
-as `history.switch` and `session.delete` re-check for queued input in their own
-store transactions, so they fail with `session_busy` instead of redirecting or
-deleting already accepted input. The web UI uses this fence for restored
-composer drafts so a historical edit cannot silently send into a newer idle
-context.
+as `history.switch` re-check for queued input in their own store transactions,
+so they fail with `session_busy` instead of redirecting accepted input.
+`session.delete` additionally changes the private owner to `deleting` in that
+transaction, permanently fencing later input while asynchronous cleanup runs.
+The web UI uses the leaf fence for restored composer drafts so a historical edit
+cannot silently send into a newer idle context.
 `client_input_id` is optional but strongly recommended for frontend sends;
 without it, retry idempotency is intentionally not provided.
 
@@ -1693,8 +1697,12 @@ packages; the delegation `workflow` value is an unvalidated observability label.
 
 Interrupts all running subagents in a delegation and marks the delegation
 cancelled. Terminal delegations are left unchanged and return
-`{ "cancelled": false }`. A successful cancellation returns a cwd-relative `handoff_dir` and compact
-per-subagent transcript file references relative to it.
+`{ "cancelled": false }`. Cancellation success is durable and does not depend
+on runtime availability. When the parent runtime is online, the result includes
+a cwd-relative `handoff_dir` and compact per-subagent transcript file
+references relative to it. If optional artifact publication is unavailable,
+`handoff_dir` is `null` and `subagents` is empty; the durable child transcripts
+remain available after runtime recovery.
 
 ```json
 {
@@ -1940,10 +1948,9 @@ the UI renders it as a daemon/system observation card. Use
 later/running; use the per-subagent `task_prompt.md`, `final_message.md`, and
 `transcript.md` files for extra detail.
 
-`subagent.idle` remains an event type for non-delegation subagent compatibility
-(for example, defensive dispatch-failure compensation). When emitted, idle
-notifications are de-duplicated per completed terminal child state, not for the
-child session lifetime.
+`subagent.idle` remains an event type for non-delegation subagents. When
+emitted, idle notifications are de-duplicated per completed terminal child
+state, not for the child session lifetime.
 
 ## MCP inventory and tools
 

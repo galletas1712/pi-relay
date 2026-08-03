@@ -421,6 +421,10 @@ impl Runtime {
                 selected_workspaces,
             } => {
                 let project_id = Uuid::parse_str(&project_id)?;
+                let _target_guard = self
+                    .workspaces
+                    .acquire_cwd_mutation_guard(&workspace_id)
+                    .await;
                 let (_, workspaces) = self
                     .workspaces
                     .materialize_session(
@@ -440,6 +444,10 @@ impl Runtime {
                 workspace_id,
                 workspaces,
             } => {
+                let _guard = self
+                    .workspaces
+                    .acquire_cwd_mutation_guard(&workspace_id)
+                    .await;
                 self.workspaces
                     .ensure_session(&workspace_id, &workspaces)
                     .await?;
@@ -454,6 +462,10 @@ impl Runtime {
                     .workspaces
                     .acquire_cwd_mutation_guard(&source_workspace_id)
                     .await;
+                let _target_guard = self
+                    .workspaces
+                    .acquire_cwd_mutation_guard(&target_workspace_id)
+                    .await;
                 let (_, workspaces) = self
                     .workspaces
                     .fork_session_from_parent(
@@ -465,6 +477,10 @@ impl Runtime {
                 Ok(RuntimeCommandResult::Materialized { workspaces })
             }
             RuntimeCommand::DestroySession { workspace_id } => {
+                let _guard = self
+                    .workspaces
+                    .acquire_cwd_mutation_guard(&workspace_id)
+                    .await;
                 self.workspaces
                     .destroy_session_workspaces(&workspace_id)
                     .await?;

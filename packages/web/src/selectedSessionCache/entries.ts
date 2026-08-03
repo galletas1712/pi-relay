@@ -15,18 +15,9 @@ export function mergeEntryBodies(current: Map<string, TranscriptEntry>, entries:
 
 function reusableEntry(existing: TranscriptEntry | undefined, incoming: TranscriptEntry): TranscriptEntry {
 	if (!existing) return incoming;
-	// Transcript rows are append-only and immutable. Reusing existing entry
-	// objects when the durable identity matches keeps React transcript rows and
-	// scroll bookkeeping stable across canonical `session.get` refreshes.
-	if (
-		existing.id === incoming.id &&
-		existing.parent_id === incoming.parent_id &&
-		existing.timestamp_ms === incoming.timestamp_ms &&
-		existing.sequence === incoming.sequence
-	) {
-		return existing;
-	}
-	return incoming;
+	// Transcript rows are append-only and immutable. Once a newer live source
+	// has supplied an id, a stale hydration response must never replace it.
+	return existing;
 }
 
 export function entryIds(entries: TranscriptEntry[]): string[] {

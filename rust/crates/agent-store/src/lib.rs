@@ -72,6 +72,27 @@ text_enum! {
         Failed => "failed",
     }
 
+    /// Durable state of a private runtime workspace.
+    pub enum WorkspaceResourceState {
+        Provisioning => "provisioning",
+        Ready => "ready",
+        Deleting => "deleting",
+        Deleted => "deleted",
+    }
+
+    /// Why a session owns a private runtime workspace.
+    pub enum WorkspaceOwnerKind {
+        Root => "root",
+        HistoryFork => "history_fork",
+        ReadOnly => "read_only",
+    }
+
+    /// What durable identity remains after a private workspace is destroyed.
+    pub enum WorkspaceCleanupMode {
+        RetainSession => "retain_session",
+        DeleteSession => "delete_session",
+    }
+
     pub enum ActiveBranchSyncStatus {
         Unchanged => "unchanged",
         Extended => "extended",
@@ -114,6 +135,60 @@ text_enum! {
         TurnFinished => "turn.finished",
         AssistantMessage => "assistant.message",
     }
+}
+
+/// A private workspace prepared before its owning session is committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedWorkspace {
+    pub owner_session_id: String,
+    pub runtime_id: String,
+    pub workspace_id: String,
+    pub generation: String,
+    pub owner_kind: WorkspaceOwnerKind,
+    pub workspaces: Vec<SessionWorkspace>,
+}
+
+impl PreparedWorkspace {
+    pub fn attachment(&self) -> WorkspaceAttachment<'_> {
+        WorkspaceAttachment {
+            workspace_id: &self.workspace_id,
+            generation: &self.generation,
+            owner_kind: self.owner_kind,
+        }
+    }
+}
+
+/// Exact generation fence consumed by a session-creation transaction.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceAttachment<'a> {
+    pub workspace_id: &'a str,
+    pub generation: &'a str,
+    pub owner_kind: WorkspaceOwnerKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceResource {
+    pub owner_session_id: String,
+    pub runtime_id: String,
+    pub workspace_id: String,
+    pub generation: String,
+    pub owner_kind: WorkspaceOwnerKind,
+    pub state: WorkspaceResourceState,
+    pub cleanup_mode: Option<WorkspaceCleanupMode>,
+    pub workspaces: Option<Vec<SessionWorkspace>>,
+}
+
+/// Atomically copy the parent's completed conversational history and enqueue
+/// the first child task.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateContextForkRequest<'a> {
+    pub child_session_id: &'a str,
+    pub config: &'a SessionConfig,
+    pub parent_session_id: &'a str,
+    pub subagent_type: SubagentType,
+    pub delegation_id: Option<&'a str>,
+    pub task: &'a UserMessage,
+    pub workspace: Option<WorkspaceAttachment<'a>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -472,6 +547,17 @@ impl fmt::Display for SessionNotFound {
 }
 
 impl std::error::Error for SessionNotFound {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionDeleting;
+
+impl fmt::Display for SessionDeleting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "session deletion is already pending")
+    }
+}
+
+impl std::error::Error for SessionDeleting {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootSessionRequired;
@@ -912,6 +998,7 @@ pub struct CreateForkRequest<'a> {
     pub child_session_id: &'a str,
     pub config: &'a SessionConfig,
     pub target: HistoryTarget<'a>,
+    pub workspace: WorkspaceAttachment<'a>,
 }
 
 #[derive(Debug, Clone)]

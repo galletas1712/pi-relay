@@ -19,9 +19,9 @@ use agent_session::{
 use agent_store::{
     ActionKind, ActionStatus, ActionUpdate, CompactionCompletion, CompactionScope,
     CompactionTrigger, Delegation, DelegationKind, DelegationStatus, EventType, InputPriority,
-    McpSessionManifestBinding, OutputBatch, PostgresAgentStore, QueuedInputContent,
-    QueuedInputStatus, SessionConfig, SubagentControlPhase, SubagentType, TranscriptEntryBodyMode,
-    TranscriptEntryScope,
+    McpSessionManifestBinding, OutputBatch, PostgresAgentStore, PreparedWorkspace,
+    QueuedInputContent, QueuedInputStatus, SessionConfig, SubagentControlPhase, SubagentType,
+    TranscriptEntryBodyMode, TranscriptEntryScope, WorkspaceOwnerKind,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{
@@ -86,6 +86,7 @@ async fn ordinary_tool_dispatch_claims_starts_and_completes_exactly_once() {
             parent_session_id: None,
             subagent_type: None,
             delegation_id: None,
+            workspace: None,
             dispatch_mode: PreparedSessionDispatchMode::Auto,
         },
     )
@@ -608,6 +609,44 @@ fn subagent_test_metadata(role: &str, subagent_type: SubagentType) -> serde_json
     })
 }
 
+async fn prepare_subagent_test_workspace(
+    env: &TestEnv,
+    session_id: &str,
+    config: &mut SessionConfig,
+    subagent_type: SubagentType,
+) -> Option<PreparedWorkspace> {
+    if subagent_type == SubagentType::Full {
+        return None;
+    }
+    config.workspace_id = format!("test-read-only-workspace-{session_id}");
+    let generation = format!("test-read-only-generation-{}", Uuid::new_v4());
+    env.state
+        .repo
+        .begin_workspace_provisioning(
+            session_id,
+            &config.runtime_id,
+            &config.workspace_id,
+            &generation,
+            WorkspaceOwnerKind::ReadOnly,
+            300,
+        )
+        .await
+        .expect("read-only test workspace provisioning begins");
+    Some(
+        env.state
+            .repo
+            .finish_workspace_provisioning(
+                session_id,
+                &config.runtime_id,
+                &config.workspace_id,
+                &generation,
+                &config.workspaces,
+            )
+            .await
+            .expect("read-only test workspace provisioning finishes"),
+    )
+}
+
 /// A parent session that opts into the harness, so any model dispatch the
 /// barrier's wakeup observation triggers stops at `pending` instead of calling
 /// a provider.
@@ -858,6 +897,126 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
         "failed offline drive must leave the durable queued input"
     );
 
+    let parent_id = "offline_runtime_parent";
+    state
+        .repo
+        .create_session(parent_id, &config)
+        .await
+        .expect("create delegation parent");
+    let delegation = state
+        .repo
+        .create_delegation_idempotent(agent_store::CreateDelegationRequest {
+            parent_session_id: parent_id,
+            launch_key: "runtime-online-pending-child",
+            launch_shape: r#"{"kind":"full","role":"implementer","prompt":"resume"}"#,
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("create running delegation");
+    let child_id = "offline_runtime_committed_child";
+    let entries = vec![
+        TranscriptStorageNode {
+            id: "offline-child-turn".to_string(),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "offline-child-user".to_string(),
+            parent_id: Some("offline-child-turn".to_string()),
+            timestamp_ms: 2,
+            item: TranscriptItem::UserMessage(UserMessage::text("resume")),
+            provider_replay: Vec::new(),
+        },
+    ];
+    let child_tool_call = ToolCall {
+        id: ToolCallId::new("offline-child-tool"),
+        tool_name: "Bash".to_string(),
+        args_json: json!({
+            "command": "printf runtime-online-redrive",
+            "call_description": "Emit deterministic runtime-online recovery evidence."
+        })
+        .to_string(),
+    };
+    let child_action = SessionAction::RequestTool {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        tool_call: child_tool_call.clone(),
+    };
+    let mut entries = entries;
+    entries.extend([
+        TranscriptStorageNode {
+            id: "offline-child-assistant".to_string(),
+            parent_id: Some("offline-child-user".to_string()),
+            timestamp_ms: 3,
+            item: TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(child_tool_call.clone())],
+            }),
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "offline-child-tool-started".to_string(),
+            parent_id: Some("offline-child-assistant".to_string()),
+            timestamp_ms: 4,
+            item: TranscriptItem::ToolCallStarted {
+                turn_id: TurnId(1),
+                tool_call: child_tool_call,
+            },
+            provider_replay: Vec::new(),
+        },
+    ]);
+    let mut child_config = config.clone();
+    child_config.metadata = json!({
+        "created_by": "test",
+        "harness": true,
+        "delegation_spawn_index": 0,
+    });
+    state
+        .repo
+        .start_session_outputs_with_parent(
+            child_id,
+            &child_config,
+            &entries,
+            Some("offline-child-tool-started"),
+            &[],
+            &[child_action],
+            InputPriority::FollowUp,
+            &UserMessage::text("resume"),
+            None,
+            Some(parent_id),
+            Some(SubagentType::Full),
+            Some(&delegation.id),
+        )
+        .await
+        .expect("commit child action while runtime is offline");
+    assert!(!state
+        .repo
+        .has_queued_inputs(child_id)
+        .await
+        .expect("child queue check"));
+    assert_eq!(
+        state
+            .repo
+            .recoverable_delegation_children_for_runtime(TEST_RUNTIME_ID)
+            .await
+            .expect("runtime child recovery query"),
+        vec![child_id.to_string()]
+    );
+    let committed_child_actions = state
+        .repo
+        .pending_actions_for_dispatch(child_id)
+        .await
+        .expect("load committed child action");
+    assert_eq!(committed_child_actions.len(), 1);
+    let committed_child_action_row_id = committed_child_actions[0].row_id.clone();
+    let durable_state = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect durable-state assertion pool");
+
     connect_test_runtime(&runtime_hosts, TEST_RUNTIME_ID).await;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -874,7 +1033,41 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
     })
     .await
     .expect("runtime Hello redrives and consumes the stuck queued input");
-
+    let completed_child_action = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row =
+                sqlx::query("select status, result from actions where session_id=$1 and id=$2")
+                    .bind(child_id)
+                    .bind(&committed_child_action_row_id)
+                    .fetch_one(&durable_state)
+                    .await
+                    .expect("load exact committed child action");
+            let status = row.get::<String, _>("status");
+            if !matches!(status.as_str(), "pending" | "running") {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("runtime Hello terminalizes the exact committed child action");
+    assert_eq!(
+        completed_child_action.get::<String, _>("status"),
+        "completed"
+    );
+    assert_eq!(
+        completed_child_action.get::<serde_json::Value, _>("result"),
+        serde_json::to_value(ToolResultMessage::success(
+            ToolCallId::new("offline-child-tool"),
+            "Bash",
+            "exit: exit status: 0\nstdout:\nruntime-online-redrive\nstderr:\n",
+        ))
+        .expect("serialize expected canonical Bash result")
+    );
+    durable_state.close().await;
+    for handle in take_tasks(&state) {
+        handle.abort();
+    }
     drop(state_dir);
     drop(cwd);
     state.repo.close().await;
@@ -1492,6 +1685,7 @@ async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recrea
             parent_session_id: None,
             subagent_type: None,
             delegation_id: None,
+            workspace: None,
             dispatch_mode: PreparedSessionDispatchMode::Deferred,
         },
     )
@@ -3369,6 +3563,7 @@ async fn unexpected_ordinary_turn_stops_discard_partial_content_and_replay() {
                 parent_session_id: None,
                 subagent_type: None,
                 delegation_id: None,
+                workspace: None,
                 dispatch_mode: PreparedSessionDispatchMode::Deferred,
             },
         )
@@ -3875,8 +4070,8 @@ async fn interrupt_only_replay_never_interrupts_newer_generation_or_queues_text(
         "interrupt_parent",
         &delegation.id,
         "interrupt_child",
-        "reviewer",
-        SubagentType::ReadOnly,
+        "implementer",
+        SubagentType::Full,
     )
     .await;
     create_busy_subagent(
@@ -4823,11 +5018,14 @@ async fn create_terminal_subagent(
             provider_replay: Vec::new(),
         },
     ];
+    let mut config = session_config(env, project_id, subagent_test_metadata(role, subagent_type));
+    let workspace =
+        prepare_subagent_test_workspace(env, session_id, &mut config, subagent_type).await;
     env.state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             session_id,
-            &session_config(env, project_id, subagent_test_metadata(role, subagent_type)),
+            &config,
             &entries,
             Some(&leaf),
             &[],
@@ -4838,6 +5036,7 @@ async fn create_terminal_subagent(
             Some(parent_id),
             Some(subagent_type),
             Some(delegation_id),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
         .await
         .expect("create terminal subagent");
@@ -4902,15 +5101,18 @@ async fn create_running_subagent(
             provider_replay: Vec::new(),
         },
     ];
+    let mut config = session_config(
+        env,
+        project_id,
+        subagent_test_metadata(role, SubagentType::ReadOnly),
+    );
+    let workspace =
+        prepare_subagent_test_workspace(env, session_id, &mut config, SubagentType::ReadOnly).await;
     env.state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             session_id,
-            &session_config(
-                env,
-                project_id,
-                subagent_test_metadata(role, SubagentType::ReadOnly),
-            ),
+            &config,
             &entries,
             Some(&mid_turn),
             &[],
@@ -4926,6 +5128,7 @@ async fn create_running_subagent(
             Some(parent_id),
             Some(SubagentType::ReadOnly),
             Some(delegation_id),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
         .await
         .expect("create running subagent");
@@ -4957,11 +5160,14 @@ async fn create_empty_subagent(
     role: &str,
     subagent_type: SubagentType,
 ) {
+    let mut config = session_config(env, project_id, subagent_test_metadata(role, subagent_type));
+    let workspace =
+        prepare_subagent_test_workspace(env, session_id, &mut config, subagent_type).await;
     env.state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             session_id,
-            &session_config(env, project_id, subagent_test_metadata(role, subagent_type)),
+            &config,
             &[],
             None,
             &[],
@@ -4972,6 +5178,7 @@ async fn create_empty_subagent(
             Some(parent_id),
             Some(subagent_type),
             Some(delegation_id),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
         .await
         .expect("create empty delegation subagent");
@@ -5020,6 +5227,232 @@ fn assert_delegation_tools_hidden(names: &[String]) {
     assert!(!names.contains(&"cancel_delegation".to_string()));
     assert!(!names.contains(&"steer_subagent".to_string()));
     assert!(!names.contains(&"interrupt_subagent".to_string()));
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn delegate_tool_launches_forked_role_from_completed_parent_boundary() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    std::fs::write(
+        env.cwd.path().join("PI.md"),
+        "Test prompt for {{ session.cwd }}.\n",
+    )
+    .expect("write test PI template");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "forked role production launch",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "forked-role-parent").await;
+    let delegation_call = ToolCall {
+        id: ToolCallId::new("call_forked_role"),
+        tool_name: "delegate_writing_task".to_string(),
+        args_json: json!({
+            "role": "forked-reviewer",
+            "prompt": "Inspect the completed parent context."
+        })
+        .to_string(),
+    };
+    env.state
+        .repo
+        .persist_outputs(
+            "forked-role-parent",
+            OutputBatch::new(
+                &[
+                    TranscriptStorageNode {
+                        id: "forked-parent-start".to_string(),
+                        parent_id: None,
+                        timestamp_ms: 1,
+                        item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-parent-user".to_string(),
+                        parent_id: Some("forked-parent-start".to_string()),
+                        timestamp_ms: 2,
+                        item: TranscriptItem::UserMessage(UserMessage::text(
+                            "This completed context must be inherited.",
+                        )),
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-parent-assistant".to_string(),
+                        parent_id: Some("forked-parent-user".to_string()),
+                        timestamp_ms: 3,
+                        item: TranscriptItem::AssistantMessage(AssistantMessage {
+                            items: vec![AssistantItem::Text("Completed answer.".to_string())],
+                        }),
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-parent-finish".to_string(),
+                        parent_id: Some("forked-parent-assistant".to_string()),
+                        timestamp_ms: 4,
+                        item: TranscriptItem::TurnFinished {
+                            turn_id: TurnId(1),
+                            outcome: TurnOutcome::Graceful,
+                        },
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-delegation-start".to_string(),
+                        parent_id: Some("forked-parent-finish".to_string()),
+                        timestamp_ms: 5,
+                        item: TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-delegation-user".to_string(),
+                        parent_id: Some("forked-delegation-start".to_string()),
+                        timestamp_ms: 6,
+                        item: TranscriptItem::UserMessage(UserMessage::text(
+                            "Delegate using the forked role.",
+                        )),
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "forked-delegation-call".to_string(),
+                        parent_id: Some("forked-delegation-user".to_string()),
+                        timestamp_ms: 7,
+                        item: TranscriptItem::AssistantMessage(AssistantMessage {
+                            items: vec![AssistantItem::ToolCall(delegation_call.clone())],
+                        }),
+                        provider_replay: Vec::new(),
+                    },
+                ],
+                Some("forked-delegation-call"),
+                &[],
+                &[SessionAction::RequestTool {
+                    action_id: ActionId(2),
+                    turn_id: TurnId(2),
+                    tool_call: delegation_call.clone(),
+                }],
+            ),
+        )
+        .await
+        .expect("parent completed and open delegation turns persist");
+    let parent_driver = SessionDriver::acquire(&env.state, "forked-role-parent").await;
+    parent_driver
+        .ensure_active_loaded_preserving_open_turn()
+        .await
+        .expect("parent open tool turn loads");
+    drop(parent_driver);
+
+    let tool_result = run_delegation_tool(&env.state, "forked-role-parent", &delegation_call).await;
+    assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Success);
+    let output: serde_json::Value =
+        serde_json::from_str(&tool_result.output).expect("delegation result JSON");
+    let child_id = output["subagent_session_id"]
+        .as_str()
+        .expect("committed child id");
+    let stored = env
+        .state
+        .repo
+        .load_stored_session(child_id)
+        .await
+        .expect("forked child durable history loads");
+    assert_eq!(
+        stored
+            .entries
+            .iter()
+            .take(4)
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "forked-parent-start",
+            "forked-parent-user",
+            "forked-parent-assistant",
+            "forked-parent-finish",
+        ]
+    );
+    assert!(stored
+        .entries
+        .iter()
+        .all(|entry| !entry.id.starts_with("forked-delegation-")));
+
+    let durable_context = AgentSession::from_stored_session(stored)
+        .expect("forked child rehydrates")
+        .model_context();
+    assert!(durable_context
+        .transcript_items()
+        .iter()
+        .any(|item| matches!(
+            item,
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            }
+        )));
+    assert!(durable_context
+        .transcript_items()
+        .iter()
+        .all(|item| !matches!(
+            item,
+            TranscriptItem::AssistantMessage(message)
+                if message.tool_calls().any(|call| call.id == delegation_call.id)
+        )));
+
+    let pending = env
+        .state
+        .repo
+        .pending_actions_for_dispatch(child_id)
+        .await
+        .expect("child initial model action loads");
+    let model_context = pending
+        .into_iter()
+        .find_map(|pending| match pending.action {
+            SessionAction::RequestModel { model_context, .. } => Some(model_context),
+            _ => None,
+        })
+        .expect("forked child has a pending first model action");
+    assert!(model_context
+        .transcript_items()
+        .iter()
+        .all(|item| !matches!(
+            item,
+            TranscriptItem::AssistantMessage(message)
+                if message.tool_calls().any(|call| call.id == delegation_call.id)
+        )));
+    let config = env
+        .state
+        .repo
+        .load_session_config(child_id)
+        .await
+        .expect("forked child config loads");
+    let provider_request = build_model_request(
+        &env.state,
+        &config,
+        child_id,
+        None,
+        model_context,
+        &mcp_snapshot_for_session(&config).expect("empty MCP snapshot"),
+    )
+    .await
+    .expect("first provider request builds without provider contact");
+    assert!(provider_request.transcript.iter().all(|entry| !matches!(
+        &entry.item,
+        TranscriptItem::AssistantMessage(message)
+            if message.tool_calls().any(|call| call.id == delegation_call.id)
+    )));
+    assert!(provider_request.transcript.iter().any(|entry| matches!(
+        entry.item,
+        TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Graceful,
+        }
+    )));
+
+    env.cleanup().await;
 }
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
@@ -5258,15 +5691,18 @@ async fn create_busy_subagent(
         model_context: ModelContext::new(),
         context_leaf_id: Some(active_leaf.clone()),
     }];
+    let mut config = session_config(env, project_id, {
+        let mut metadata = subagent_test_metadata(role, subagent_type);
+        metadata["harness"] = json!(true);
+        metadata
+    });
+    let workspace =
+        prepare_subagent_test_workspace(env, session_id, &mut config, subagent_type).await;
     env.state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             session_id,
-            &session_config(env, project_id, {
-                let mut metadata = subagent_test_metadata(role, subagent_type);
-                metadata["harness"] = json!(true);
-                metadata
-            }),
+            &config,
             &entries,
             Some(&active_leaf),
             &[],
@@ -5277,6 +5713,7 @@ async fn create_busy_subagent(
             Some(parent_id),
             Some(subagent_type),
             Some(delegation_id),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
         .await
         .expect("create busy subagent");
@@ -7591,15 +8028,18 @@ async fn steer_subagent_rejects_idle_terminal_subagent_without_reactivating_it()
             provider_replay: Vec::new(),
         },
     ];
+    let mut config = session_config(
+        &env,
+        project_id,
+        json!({ "created_by": "test", "role_name": "reviewer" }),
+    );
+    let workspace =
+        prepare_subagent_test_workspace(&env, "ro_idle", &mut config, SubagentType::ReadOnly).await;
     env.state
         .repo
-        .start_session_outputs_with_parent(
+        .start_session_outputs_with_parent_and_workspace(
             "ro_idle",
-            &session_config(
-                &env,
-                project_id,
-                json!({ "created_by": "test", "role_name": "reviewer" }),
-            ),
+            &config,
             &entries,
             Some(active_leaf),
             &[],
@@ -7610,6 +8050,7 @@ async fn steer_subagent_rejects_idle_terminal_subagent_without_reactivating_it()
             Some("parent"),
             Some(SubagentType::ReadOnly),
             Some(&delegation.id),
+            workspace.as_ref().map(PreparedWorkspace::attachment),
         )
         .await
         .expect("create idle nonterminal subagent");
@@ -9186,9 +9627,8 @@ async fn spawn_failure_leaves_no_running_delegation() {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
-    // A parent with NO project makes spawn_subagent fail with project_required,
-    // exercising the compensation path: the half-started delegation is failed so the
-    // Writer admission releases rather than stranding the parent.
+    // A parent with NO project makes spawn_subagent fail before child commit.
+    // The launch intent becomes failed so writer admission is released.
     env.state
         .repo
         .start_session_outputs(
@@ -9233,6 +9673,118 @@ async fn spawn_failure_leaves_no_running_delegation() {
         .expect("list delegations");
     assert_eq!(delegations.len(), 1);
     assert_eq!(delegations[0].status, DelegationStatus::Failed);
+
+    env.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn failed_delegation_never_replays_committed_children_as_a_successful_launch() {
+    let Some(env) = test_env().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    std::fs::write(
+        env.cwd.path().join("PI.md"),
+        "Test prompt for {{ session.cwd }}.\n",
+    )
+    .expect("write test PI template");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "runtime-test",
+            "failed committed launch replay",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let launch_shape = json!({
+        "kind": "full",
+        "role": "implementer",
+        "prompt": "committed child",
+        "workflow": null,
+        "label": null
+    })
+    .to_string();
+    let delegation = env
+        .state
+        .repo
+        .create_delegation_idempotent(agent_store::CreateDelegationRequest {
+            parent_session_id: "parent",
+            launch_key: "failed-committed-launch",
+            launch_shape: &launch_shape,
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("persist launch");
+    crate::delegation_tools::materialize_delegation_launch(&env.state, &delegation)
+        .await
+        .expect("child commits");
+    assert_eq!(
+        env.state
+            .repo
+            .delegation_spawned_indices(&delegation.id)
+            .await
+            .expect("committed index loads")
+            .len(),
+        1
+    );
+    assert!(
+        env.state
+            .repo
+            .begin_delegation_teardown(
+                "parent",
+                &delegation.id,
+                &delegation.attempt_id,
+                DelegationStatus::Failed,
+                "test launch failure",
+            )
+            .await
+            .expect("failure teardown begins")
+            .0
+    );
+    env.state
+        .repo
+        .record_delegation_launch_error(
+            &delegation.id,
+            &delegation.attempt_id,
+            "initial_dispatch_failed",
+            "committed launch must be redriven",
+        )
+        .await
+        .expect("launch error persists");
+    assert!(env
+        .state
+        .repo
+        .finish_delegation_teardown(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Failed,
+        )
+        .await
+        .expect("failure teardown finishes"));
+
+    let error = crate::delegation_tools::materialize_delegation_launch(&env.state, &delegation)
+        .await
+        .expect_err("failed delegation cannot return committed children as success");
+    assert_eq!(error.code, "initial_dispatch_failed");
+    assert_eq!(error.message, "committed launch must be redriven");
+    assert_eq!(
+        env.state
+            .repo
+            .delegation_spawned_indices(&delegation.id)
+            .await
+            .expect("failed launch retains durable child index")
+            .len(),
+        1
+    );
 
     env.cleanup().await;
 }

@@ -10,8 +10,8 @@ use super::queue::{
     append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
 };
 use super::sql::{
-    action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity,
-    steering_route_tx,
+    action_is_unfinished, lock_session_for_mutation_tx, lock_session_tx, queued_input_is_active,
+    session_activity, steering_route_tx,
 };
 use super::PostgresAgentStore;
 use crate::{
@@ -255,7 +255,7 @@ impl PostgresAgentStore {
         let id = format!("delegation_{}", Uuid::new_v4());
         let attempt_id = Uuid::new_v4().to_string();
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, parent_session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, parent_session_id).await?;
         if let Some(row) = sqlx::query(
             r#"
             select id, parent_session_id, workflow, label, kind, status, attempt_id,
@@ -546,6 +546,27 @@ impl PostgresAgentStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_delegation).collect()
+    }
+
+    pub async fn recoverable_delegation_children_for_runtime(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Vec<String>> {
+        let unfinished = action_is_unfinished(Some("a"));
+        let query = format!(
+            r#"
+            select distinct s.id
+            from sessions s
+            join delegations d on d.id=s.delegation_id and d.status='running'
+            where s.runtime_id=$1
+              and exists(select 1 from actions a where a.session_id=s.id and {unfinished})
+            order by s.id
+            "#
+        );
+        Ok(sqlx::query_scalar(&query)
+            .bind(runtime_id)
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     pub async fn list_cancelling_delegations(&self) -> Result<Vec<Delegation>> {
@@ -1923,7 +1944,7 @@ async fn enqueue_steer_content_tx(
     content: QueuedInputContent,
     client_input_id: &str,
 ) -> Result<bool> {
-    lock_session_tx(tx, parent_session_id).await?;
+    lock_session_for_mutation_tx(tx, parent_session_id).await?;
     let route = steering_route_tx(tx, parent_session_id).await?;
     let id = format!("input_{}", Uuid::new_v4());
     let inserted = sqlx::query(

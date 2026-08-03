@@ -19,6 +19,12 @@ leased actions and session state when the control connection returns. When a
 runtime Hello registers a live connection, the daemon also redrives sessions on
 that runtime that still hold active queued/consuming inputs, so a transient
 `runtime unavailable` failure cannot leave durable queue rows stuck forever.
+Hello also wakes private-workspace reconciliation, but it is not the only
+trigger: a periodic daemon worker retries due provisioning/deletion work. The
+daemon persists the exact runtime/workspace/generation identity before a
+materialize or fork command and keeps session identity until an idempotent
+`DestroySession` succeeds. Runtime downtime therefore does not block daemon
+startup or logical delegation cancellation.
 
 ## Workspace and security boundary
 

@@ -1,6 +1,37 @@
-# One-time single-delegation-wakeup upgrade
+# One-time database upgrades
 
 These files are deployment artifacts, not automatic startup migrations.
+
+## Private workspace ownership
+
+`2026-03-20-private-workspace-ownership.sql` is the one-time bridge from
+main-era session rows to the current private-workspace lifecycle.
+
+Safe rollout:
+
+1. Stop `pi-agentd` and any process that can create or delete sessions.
+2. Take and verify a PostgreSQL backup.
+3. Run the script's preflight audits. Repair every parentless read-only row,
+   invalid root/full/read-only shape, duplicate private workspace identity, and
+   full child that does not exactly share its parent.
+4. Run:
+
+   ```sh
+   psql -v ON_ERROR_STOP=1 "$DATABASE_URL" \
+     -f rust/migrations/2026-03-20-private-workspace-ownership.sql
+   ```
+
+   The script is additive/backfill-only and rerunnable while the daemon remains
+   stopped before cutover. Any conflicting ownership mapping aborts the
+   transaction rather than overwriting identity.
+5. Save the post-check output, then deploy/start the new daemon.
+
+The migration never lists runtime directories and never marks an unknown
+workspace safe to delete. Do not start the new daemon until every root,
+independent history fork, and read-only session has exactly one mapping and
+every full subagent has none.
+
+## Single delegation wakeup
 
 The new code never enqueues, republishes, or cancels a partial (per-child)
 parent wakeup. A parent whose queue still holds a `queued`/`consuming` partial

@@ -47,6 +47,35 @@ tokio::task_local! {
     static IN_FLIGHT_BARRIERS: RefCell<HashSet<String>>;
 }
 
+pub(crate) async fn recover_delegation_children_for_runtime(state: &AppState, runtime_id: &str) {
+    let children = match state
+        .repo
+        .recoverable_delegation_children_for_runtime(runtime_id)
+        .await
+    {
+        Ok(children) => children,
+        Err(error) => {
+            eprintln!("runtime child recovery could not list {runtime_id}: {error:#}");
+            return;
+        }
+    };
+    for session_id in children {
+        let driver = SessionDriver::acquire(state, &session_id).await;
+        let recovered = async {
+            driver.ensure_active_loaded_preserving_open_turn().await?;
+            driver.dispatch_ready_actions().await?;
+            Ok::<(), RpcError>(())
+        }
+        .await;
+        if let Err(error) = recovered {
+            eprintln!(
+                "runtime child recovery failed runtime={runtime_id} session={session_id}: {}: {}",
+                error.code, error.message
+            );
+        }
+    }
+}
+
 /// Recover durable delegation launch work immediately after the global
 /// abandoned-action stale mark. A process can die after a child session and
 /// initial action commit but before registering its runner; every persisted

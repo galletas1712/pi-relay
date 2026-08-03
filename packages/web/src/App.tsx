@@ -113,6 +113,7 @@ import {
 	patchSessionListProvider,
 } from "./sessionQueryCache.ts";
 import {
+	applyActionLifecycleEvent,
 	applyEntryBodies,
 	applyEventHighWater,
 	applyQueueProjection,
@@ -122,6 +123,7 @@ import {
 	applyTranscriptTurns,
 	applyTurnDetail,
 	activeBranchEntriesForExport,
+	captureTurnDetailRequest,
 	emptySelectedSessionCache,
 	hasUsableSelectedSessionCache,
 	mergeSessionActivityEvent,
@@ -136,6 +138,7 @@ import {
 	type SelectedSessionCache,
 } from "./selectedSessionCache.ts";
 import { SessionListRequestCoordinator } from "./sessionListRequestCoordinator.ts";
+import { TurnDetailRequestCoordinator } from "./turnDetailRequestCoordinator.ts";
 import { useSelectedSessionStore } from "./selectedSessionStore.ts";
 import {
 	DEFAULT_PROVIDER,
@@ -521,6 +524,7 @@ export function App({
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
 	const sidebarSelectTimer = useRef<number | null>(null);
 	const autoLoadedTurnDetailRef = useRef<string | null>(null);
+	const turnDetailRequestsRef = useRef(new TurnDetailRequestCoordinator());
 	const nextTranscriptDestinationIdRef = useRef(0);
 	const lastForegroundReconcileAt = useRef(Date.now());
 	const lastAwakeAt = useRef(Date.now());
@@ -2460,6 +2464,8 @@ export function App({
 				assertServerReadAllowed();
 				if (options.mode === "manual") setLoadingTurnId(cardId);
 				else setAutoLoadingTurnId(cardId);
+				const request = turnDetailRequestsRef.current.begin(sessionId, card.id);
+				const fence = captureTurnDetailRequest(cache, card.id);
 				const result = await api.getTranscriptTurnDetail(sessionId, {
 					cardId: card.id,
 					leafId: card.active_leaf_id,
@@ -2471,7 +2477,12 @@ export function App({
 				let applied = false;
 				const applyStartedAt = perfNow();
 				updateSelectedCache((current) => {
-					const detail = applyTurnDetail(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.card_id, result.entries);
+					const detail = applyTurnDetail(
+						current.sessionId === sessionId ? current : selectedCacheRef.current,
+						result,
+						fence,
+						turnDetailRequestsRef.current.isCurrent(request),
+					);
 					applied = detail.applied;
 					return detail.cache;
 				});
@@ -2536,6 +2547,7 @@ export function App({
 
 	useEffect(() => {
 		autoLoadedTurnDetailRef.current = null;
+		turnDetailRequestsRef.current.clear();
 	}, [selectedId]);
 
 	const reconcileAfterForeground = useCallback(
@@ -2667,6 +2679,11 @@ export function App({
 			backgroundWarmUpdatedAt.current.delete(event.session_id);
 			let shouldSyncSelected = refreshPlan.syncSelected && event.session_id === selectedRef.current;
 			if (event.session_id === selectedRef.current) {
+				const actionProjection = applyActionLifecycleEvent(selectedCacheRef.current, event);
+				if (actionProjection.applied) {
+					replaceSelectedCache(actionProjection.cache);
+					if (!refreshPlan.syncSelected) shouldSyncSelected = false;
+				}
 				const queue = queueProjectionFromEvent(event);
 				if (queue) {
 					replaceSelectedCache(

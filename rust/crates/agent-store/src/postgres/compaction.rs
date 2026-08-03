@@ -25,7 +25,7 @@ use super::rows::row_to_stored_entry;
 use super::sessions::{
     next_auto_compaction_failure_metadata, next_compaction_success_metadata, session_metadata_tx,
 };
-use super::sql::{action_is_unfinished, lock_session_tx};
+use super::sql::{action_is_unfinished, lock_session_for_mutation_tx, lock_session_tx};
 use super::transcript::{
     branch_entries_to_leaf, insert_stored_entry_tx, model_context_from_entries,
 };
@@ -50,7 +50,7 @@ impl PostgresAgentStore {
         auto_limit_tokens: Option<usize>,
     ) -> Result<CreateCompactionResult> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let lease_owner = post_compaction_dispatch_lease.map(|lease| lease.owner_id.as_str());
         let lease_generation =
             post_compaction_dispatch_lease.map(|lease| lease.generation.to_string());
@@ -232,6 +232,7 @@ impl PostgresAgentStore {
                     "kind": ActionKind::Compaction,
                     "action_id": 0,
                     "action_row_id": action_row_id,
+                    "status": ActionStatus::Running,
                     "payload": compaction_payload,
                 }),
             )
@@ -283,7 +284,7 @@ impl PostgresAgentStore {
         trigger: CompactionTrigger,
     ) -> Result<CreateCompactionResult> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let active_leaf_id: Option<String> =
             sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
                 .bind(session_id)
@@ -364,6 +365,7 @@ impl PostgresAgentStore {
                     "kind": ActionKind::Compaction,
                     "action_id": 0,
                     "action_row_id": action_row_id,
+                    "status": ActionStatus::Running,
                     "payload": payload,
                 }),
             )
@@ -693,6 +695,8 @@ impl PostgresAgentStore {
                 EventType::CompactionCompleted,
                 json!({
                     "action_row_id": job.action_row_id,
+                    "kind": ActionKind::Compaction,
+                    "status": ActionStatus::Completed,
                     "scope": job.scope.kind(),
                     "new_root_id": new_root_id,
                     "active_leaf_id": installed_active_leaf_id,
@@ -802,6 +806,8 @@ impl PostgresAgentStore {
                         EventType::ModelError,
                         json!({
                             "action_row_id": blocked_model_action_row_id,
+                            "kind": ActionKind::Model,
+                            "status": ActionStatus::Error,
                             "error": model_error,
                         }),
                     )
@@ -859,6 +865,7 @@ impl PostgresAgentStore {
         bump_revisions_tx(tx, &job.source_session_id, false, false).await?;
         let mut payload = json!({
             "action_row_id": job.action_row_id,
+            "kind": ActionKind::Compaction,
             "error": error,
             "status": status,
             "scope": job.scope.kind(),

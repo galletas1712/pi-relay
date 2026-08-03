@@ -16,7 +16,7 @@ use agent_core::AgentInput;
 use agent_session::{AgentSession, SessionAction, SessionInput};
 use agent_store::{
     AcceptedInput, ActionUpdate, EventFrame, EventType, OutputBatch, QueuedInput, SessionActivity,
-    SessionConfig, SubagentType, POST_COMPACTION_DISPATCH_LEASE_DURATION,
+    SessionConfig, POST_COMPACTION_DISPATCH_LEASE_DURATION,
 };
 use agent_vocab::ProviderReplayItem;
 use anyhow::Context;
@@ -207,6 +207,11 @@ impl SessionDriver {
     async fn load_interrupted_control_runtime(
         &self,
     ) -> std::result::Result<Arc<Mutex<RuntimeSession>>, RpcError> {
+        self.state
+            .repo
+            .ensure_session_mutation_eligible(&self.session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         let config = self
             .state
             .repo
@@ -303,6 +308,11 @@ impl SessionDriver {
         {
             return Ok(());
         }
+        self.state
+            .repo
+            .ensure_session_mutation_eligible(&self.session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         let config = self
             .state
             .repo
@@ -613,6 +623,11 @@ impl SessionDriver {
     }
 
     pub(crate) async fn recover_if_needed(&self) -> std::result::Result<(), RpcError> {
+        self.state
+            .repo
+            .ensure_session_mutation_eligible(&self.session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         self.reconcile_pending_subagent_controls().await?;
         if self
             .state
@@ -690,6 +705,11 @@ impl SessionDriver {
     }
 
     pub(crate) async fn ensure_active_loaded(&self) -> std::result::Result<(), RpcError> {
+        self.state
+            .repo
+            .ensure_session_mutation_eligible(&self.session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         if self
             .state
             .active
@@ -865,34 +885,6 @@ impl SessionDriver {
         }
     }
 
-    async fn destroy_read_only_subagent_workspaces(&self) {
-        match self
-            .state
-            .repo
-            .session_subagent_type(&self.session_id)
-            .await
-        {
-            Ok(Some(SubagentType::ReadOnly)) => {
-                if let Err(error) = self
-                    .state
-                    .runtime_hosts
-                    .destroy_session_workspaces(&self.session_id)
-                    .await
-                {
-                    eprintln!(
-                        "failed to destroy read-only subagent workspace {}: {error:#}",
-                        self.session_id
-                    );
-                }
-            }
-            Ok(_) => {}
-            Err(error) => eprintln!(
-                "failed to load subagent type for workspace teardown {}: {error:#}",
-                self.session_id
-            ),
-        }
-    }
-
     async fn reconcile_abandoned_boundary_session(&self) -> std::result::Result<(), RpcError> {
         let activity = self.state.repo.activity(&self.session_id).await?;
         if activity == SessionActivity::Running
@@ -928,10 +920,11 @@ impl SessionDriver {
         // ONE typed delegation wakeup observation,
         // NOT a per-child idle. Fire the once-gate WITHOUT writing a
         // parent-visible SubagentIdle row (so events_after / the product UI never
-        // surface per-child idle), then — on that single firing — destroy the RO
-        // snapshot and run the barrier. The barrier is single-flighted by the DB
-        // delegation-row CAS, so concurrent terminal children wake the parent exactly
-        // once. Return None: the per-child idle is suppressed for the parent.
+        // surface per-child idle). That transaction also persists RO snapshot
+        // cleanup intent; physical cleanup is independently idempotent. The
+        // barrier is single-flighted by the DB delegation-row CAS, so concurrent
+        // terminal children wake the parent exactly once. Return None: the
+        // per-child idle is suppressed for the parent.
         let delegation_id = match self
             .state
             .repo
@@ -948,13 +941,13 @@ impl SessionDriver {
                 return None;
             }
         };
-        let first_fire = match self
+        match self
             .state
             .repo
-            .claim_subagent_idle_once(&self.session_id, &notification_key)
+            .claim_subagent_terminal_once(&self.session_id, &notification_key)
             .await
         {
-            Ok(first_fire) => first_fire,
+            Ok(_) => {}
             Err(error) => {
                 eprintln!(
                     "failed to claim delegation-member idle once-gate child={}: {error:#}",
@@ -963,9 +956,6 @@ impl SessionDriver {
                 return None;
             }
         };
-        if first_fire {
-            self.destroy_read_only_subagent_workspaces().await;
-        }
         self.try_delegation_barrier(&delegation_id).await;
         None
     }
@@ -1276,6 +1266,11 @@ impl SessionDriver {
         if pending.is_empty() {
             return Ok(Vec::new());
         }
+        self.state
+            .repo
+            .ensure_session_mutation_eligible(&self.session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         let config = self
             .state
             .repo

@@ -394,6 +394,7 @@ impl RuntimeRegistry {
     /// Materialize a project session's workspaces on `runtime_id`, returning the
     /// generated workspace id and the runtime's resolved workspace list. Shared
     /// by `session_start` and history-fork tests.
+    #[cfg(test)]
     pub(crate) async fn materialize_session(
         &self,
         runtime_id: &str,
@@ -403,12 +404,34 @@ impl RuntimeRegistry {
         on_progress: Option<mpsc::Sender<WorkspaceMaterializeProgress>>,
     ) -> Result<(String, Vec<agent_store::SessionWorkspace>)> {
         let workspace_id = format!("workspace_{}", Uuid::new_v4());
+        let workspaces = self
+            .materialize_session_at(
+                runtime_id,
+                project_id,
+                project_workspaces,
+                selected,
+                &workspace_id,
+                on_progress,
+            )
+            .await?;
+        Ok((workspace_id, workspaces))
+    }
+
+    pub(crate) async fn materialize_session_at(
+        &self,
+        runtime_id: &str,
+        project_id: Uuid,
+        project_workspaces: &[agent_store::ProjectWorkspace],
+        selected: &[crate::workspace_selection::SelectedWorkspace],
+        workspace_id: &str,
+        on_progress: Option<mpsc::Sender<WorkspaceMaterializeProgress>>,
+    ) -> Result<Vec<agent_store::SessionWorkspace>> {
         let result = self
             .execute(
                 runtime_id,
                 RuntimeCommand::MaterializeSession {
                     project_id: project_id.to_string(),
-                    workspace_id: workspace_id.clone(),
+                    workspace_id: workspace_id.to_string(),
                     project_workspaces: project_workspaces.to_vec(),
                     selected_workspaces: selected
                         .iter()
@@ -424,7 +447,7 @@ impl RuntimeRegistry {
         let RuntimeCommandResult::Materialized { workspaces } = result else {
             return Err(anyhow!("runtime returned the wrong materialization result"));
         };
-        Ok((workspace_id, workspaces))
+        Ok(workspaces)
     }
 
     pub(crate) async fn ensure_for_runtime(
@@ -456,17 +479,16 @@ impl RuntimeRegistry {
             .await
     }
 
-    pub(crate) async fn fork_session_from_parent(
+    pub(crate) async fn fork_workspace(
         &self,
-        parent_session_id: &str,
+        runtime_id: &str,
         source_workspace_id: &str,
         workspaces: &[agent_store::SessionWorkspace],
         target_workspace_id: &str,
-    ) -> Result<(String, Vec<agent_store::SessionWorkspace>)> {
-        let runtime_id = self.repo.session_runtime_id(parent_session_id).await?;
+    ) -> Result<Vec<agent_store::SessionWorkspace>> {
         let result = self
             .execute(
-                &runtime_id,
+                runtime_id,
                 RuntimeCommand::ForkSession {
                     source_workspace_id: source_workspace_id.to_string(),
                     target_workspace_id: target_workspace_id.to_string(),
@@ -478,16 +500,10 @@ impl RuntimeRegistry {
         let RuntimeCommandResult::Materialized { workspaces } = result else {
             return Err(anyhow!("runtime returned wrong fork result"));
         };
-        Ok((target_workspace_id.to_string(), workspaces))
+        Ok(workspaces)
     }
 
-    pub(crate) async fn destroy_session_workspaces(&self, session_id: &str) -> Result<()> {
-        let config = self.repo.load_session_config(session_id).await?;
-        self.destroy_workspace_for_runtime(&config.runtime_id, &config.workspace_id)
-            .await
-    }
-
-    pub(crate) async fn destroy_workspace_for_runtime(
+    pub(crate) async fn destroy_workspace(
         &self,
         runtime_id: &str,
         workspace_id: &str,
@@ -1005,16 +1021,20 @@ pub(crate) mod test_support {
                 // The fake runtime serves only workspace skills; home skills are
                 // exercised by pure parse tests to keep results host-independent.
                 let base = fake_workspace_dir(dirs, &workspace_id).await;
-                let mut skills = ["implementer", "reviewer"]
+                let mut skills = [
+                    ("implementer", ""),
+                    ("reviewer", ""),
+                    ("forked-reviewer", "context: forked\n"),
+                ]
                     .into_iter()
-                    .map(|name| agent_runtime_protocol::RawSkillFile {
+                    .map(|(name, role_config)| agent_runtime_protocol::RawSkillFile {
                         kind: agent_runtime_protocol::SkillKind::SubagentRole,
                         origin: agent_runtime_protocol::SkillOrigin::RuntimeRole,
                         workspace: None,
                         package_name: name.to_string(),
                         path: format!("/runtime/roles/{name}/SKILL.md"),
                         contents: format!(
-                            "---\nname: {name}\ndescription: test {name} role\n---\n\nTest role."
+                            "---\nname: {name}\ndescription: test {name} role\n{role_config}---\n\nTest role."
                         ),
                     })
                     .collect::<Vec<_>>();

@@ -1,22 +1,28 @@
 use std::path::PathBuf;
 
-use agent_store::{EventFrame, EventType, InputPriority, SessionConfig, SubagentType};
+use agent_store::{
+    CreateContextForkRequest, EventFrame, EventType, InputPriority, PreparedWorkspace,
+    SessionActivity, SessionConfig, SubagentType, WorkspaceOwnerKind,
+};
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::config::stable_default_provider;
-use crate::provider_runtime::{model_available_for_config, render_pi_prompt, resolve_skill_role};
+use crate::provider_runtime::{
+    model_available_for_config, render_pi_prompt, resolve_skill_role, RoleContextPolicy,
+};
 use crate::runtime::{publish_events, SessionDriver};
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart, StartedSession,
 };
 use crate::state::AppState;
 use crate::types::RpcError;
+use crate::workspace_lifecycle;
 
-/// A subagent spawned as part of a delegation: fresh context (no
-/// parent-transcript fork, no source refs), tagged with its delegation id and
-/// type.
+/// A subagent spawned as part of a delegation. The role's optional
+/// `context: forked` policy copies the parent's durable transcript at its
+/// latest completed turn; omitted context remains fresh.
 pub(crate) struct DelegationSubagentSpawn {
     pub(crate) parent_session_id: String,
     pub(crate) role: String,
@@ -106,28 +112,30 @@ pub(crate) async fn spawn_subagent(
     let role = resolve_skill_role(&runtime_context.skills, &request.role)
         .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
     let resolved_role_name = role.name.clone();
-
     // A full subagent is the durable workspace's single writer for its
     // delegation: it runs against the parent's dirs in place (no fork). A
     // read-only subagent forks the parent into its own disposable snapshot.
-    let (workspace_id, workspaces) = match request.subagent_type {
-        SubagentType::Full => (
-            parent_config.workspace_id.clone(),
-            parent_config.workspaces.clone(),
+    let prepared_workspace = match request.subagent_type {
+        SubagentType::Full => None,
+        SubagentType::ReadOnly => Some(
+            workspace_lifecycle::prepare_snapshot(
+                state,
+                &child_session_id,
+                WorkspaceOwnerKind::ReadOnly,
+                &parent_config,
+            )
+            .await?,
         ),
-        SubagentType::ReadOnly => {
-            let child_workspace_id = format!("workspace_{}", Uuid::new_v4());
-            state
-                .runtime_hosts
-                .fork_session_from_parent(
-                    &request.parent_session_id,
-                    &parent_config.workspace_id,
-                    &parent_config.workspaces,
-                    &child_workspace_id,
-                )
-                .await?
-        }
     };
+    let (workspace_id, workspaces) = prepared_workspace
+        .as_ref()
+        .map(|prepared| (prepared.workspace_id.clone(), prepared.workspaces.clone()))
+        .unwrap_or_else(|| {
+            (
+                parent_config.workspace_id.clone(),
+                parent_config.workspaces.clone(),
+            )
+        });
     let child_metadata = subagent_metadata(
         match (request.metadata, request.spawn_index) {
             (Value::Object(mut metadata), Some(index)) => {
@@ -179,7 +187,7 @@ pub(crate) async fn spawn_subagent(
             child_config.provider = stable_default_provider();
         }
     }
-    child_config.system_prompt = child_system_prompt(
+    child_config.system_prompt = match child_system_prompt(
         state,
         &child_config,
         ChildPromptRole {
@@ -192,38 +200,76 @@ pub(crate) async fn spawn_subagent(
             subagent_type: request.subagent_type,
         },
     )
-    .await?;
-    let task = request.task;
-    let initial_task = child_initial_task_message(&request.parent_session_id, &task);
-    let subagent_type = request.subagent_type;
-    let started = match start_prepared_session(
-        state,
-        PreparedSessionStart {
-            session_id: child_session_id.clone(),
-            config: child_config,
-            priority: InputPriority::FollowUp,
-            content: UserMessage::text(initial_task),
-            client_input_id: None,
-            parent_session_id: Some(request.parent_session_id.clone()),
-            subagent_type: Some(subagent_type),
-            delegation_id: request.delegation_id.clone(),
-            dispatch_mode: PreparedSessionDispatchMode::Deferred,
-        },
-    )
     .await
     {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            if let Some(prepared) = &prepared_workspace {
+                workspace_lifecycle::abandon_prepared(state, prepared).await;
+            }
+            return Err(error);
+        }
+    };
+    let task = request.task;
+    let initial_task = child_initial_task_message(&request.parent_session_id, &task);
+    let initial_task_message = UserMessage::text(initial_task);
+    let subagent_type = request.subagent_type;
+    let forked_context = role.context == RoleContextPolicy::Forked;
+    let started_result = match role.context {
+        RoleContextPolicy::Fresh => {
+            start_prepared_session(
+                state,
+                PreparedSessionStart {
+                    session_id: child_session_id.clone(),
+                    config: child_config,
+                    priority: InputPriority::FollowUp,
+                    content: initial_task_message.clone(),
+                    client_input_id: None,
+                    parent_session_id: Some(request.parent_session_id.clone()),
+                    subagent_type: Some(subagent_type),
+                    delegation_id: request.delegation_id.clone(),
+                    workspace: prepared_workspace.clone(),
+                    dispatch_mode: PreparedSessionDispatchMode::Deferred,
+                },
+            )
+            .await
+        }
+        RoleContextPolicy::Forked => {
+            let result = state
+                .repo
+                .create_context_fork(CreateContextForkRequest {
+                    child_session_id: &child_session_id,
+                    config: &child_config,
+                    parent_session_id: &request.parent_session_id,
+                    subagent_type,
+                    delegation_id: request.delegation_id.as_deref(),
+                    task: &initial_task_message,
+                    workspace: prepared_workspace
+                        .as_ref()
+                        .map(PreparedWorkspace::attachment),
+                })
+                .await
+                .map_err(RpcError::from);
+            match result {
+                Ok(result) => {
+                    publish_events(state, result.events);
+                    Ok(StartedSession {
+                        session_id: child_session_id.clone(),
+                        project_id: child_config.project_id,
+                        activity: SessionActivity::Queued,
+                        replayed: false,
+                        dispatches: Vec::new(),
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+    };
+    let started = match started_result {
         Ok(started) => started,
         Err(error) => {
-            if subagent_type == SubagentType::ReadOnly {
-                if let Err(cleanup_error) = state
-                    .runtime_hosts
-                    .destroy_workspace_for_runtime(&parent_config.runtime_id, &workspace_id)
-                    .await
-                {
-                    eprintln!(
-                        "failed to clean up unpersisted child workspace {workspace_id}: {cleanup_error:#}"
-                    );
-                }
+            if let Some(prepared) = &prepared_workspace {
+                workspace_lifecycle::abandon_prepared(state, prepared).await;
             }
             return Err(error);
         }
@@ -233,14 +279,10 @@ pub(crate) async fn spawn_subagent(
         .fail_subagent_after_start_before_dispatch
         .swap(false, std::sync::atomic::Ordering::SeqCst)
     {
-        return Err(RpcError::new(
-            "injected_post_start_failure",
-            "injected failure after child/action commit and before dispatch",
-        ));
+        return Ok(SpawnedSubagent { started });
     }
-    require_known_subagent(state, &request.parent_session_id, &child_session_id).await?;
 
-    let parent_events = match subagent_parent_spawn_events(
+    match subagent_parent_spawn_events(
         state,
         &request.parent_session_id,
         &started.session_id,
@@ -248,22 +290,24 @@ pub(crate) async fn spawn_subagent(
     )
     .await
     {
-        Ok(parent_events) => parent_events,
-        Err(error) => {
-            cleanup_failed_spawn(
-                state,
-                &started.session_id,
-                subagent_type,
-                "parent lifecycle event failure",
-            )
-            .await;
-            return Err(error);
-        }
-    };
-    publish_events(state, parent_events);
+        Ok(parent_events) => publish_events(state, parent_events),
+        Err(error) => eprintln!(
+            "failed to publish committed subagent launch parent={} child={}: {}: {}",
+            request.parent_session_id, started.session_id, error.code, error.message
+        ),
+    }
 
     let child_driver = SessionDriver::acquire(state, &started.session_id).await;
-    if let Err(error) = child_driver.dispatch(started.dispatches.clone()).await {
+    let dispatch_result = if forked_context {
+        async {
+            child_driver.ensure_active_loaded().await?;
+            child_driver.drive_until_blocked().await.map(|_| ())
+        }
+        .await
+    } else {
+        child_driver.dispatch(started.dispatches.clone()).await
+    };
+    if let Err(error) = dispatch_result {
         publish_subagent_parent_dispatch_failed_event(
             state,
             &request.parent_session_id,
@@ -272,14 +316,6 @@ pub(crate) async fn spawn_subagent(
             &error,
         )
         .await;
-        cleanup_failed_spawn(
-            state,
-            &started.session_id,
-            subagent_type,
-            "initial dispatch failure",
-        )
-        .await;
-        return Err(error);
     }
 
     Ok(SpawnedSubagent { started })
@@ -370,11 +406,9 @@ async fn publish_subagent_parent_dispatch_failed_event(
     role: &str,
     error: &RpcError,
 ) {
-    // A delegation member's failure is owned by the delegation:
-    // delegation_tools spawn-failure compensation fails the delegation and the
-    // tool returns Err synchronously.
-    // Suppress the per-child idle so the parent never sees a per-child
-    // notification for a delegation member (matching the live idle gate).
+    // A committed delegation member remains launched and durable redrive owns
+    // its initial action. Suppress the per-child idle so the parent observes
+    // only the delegation lifecycle (matching the live idle gate).
     match state.repo.session_delegation_id(child_session_id).await {
         Ok(Some(_)) => return,
         Ok(None) => {}
@@ -423,61 +457,6 @@ pub(crate) async fn publish_subagent_parent_dispatch_failed_event_for_test(
     .await;
 }
 
-pub(crate) async fn require_known_subagent(
-    state: &AppState,
-    parent_session_id: &str,
-    child_session_id: &str,
-) -> std::result::Result<(), RpcError> {
-    let actual_parent_session_id = state
-        .repo
-        .session_parent_id(child_session_id)
-        .await?
-        .ok_or_else(|| RpcError::new("subagent_not_found", "subagent is not in scope"))?;
-    if actual_parent_session_id != parent_session_id {
-        return Err(RpcError::new(
-            "subagent_not_found",
-            "subagent is not in scope",
-        ));
-    }
-    Ok(())
-}
-
-async fn cleanup_failed_spawn(
-    state: &AppState,
-    child_session_id: &str,
-    subagent_type: SubagentType,
-    reason: &str,
-) {
-    state.active.lock().await.remove(child_session_id);
-    // A full subagent shares the parent's session root/cwd in place; its
-    // session dir was never created, so tearing it down would delete the
-    // parent's durable workspace. Only a forked read-only child owns a private
-    // dir that is safe to reclaim.
-    match subagent_type {
-        SubagentType::Full => {}
-        SubagentType::ReadOnly => {
-            if let Err(workspace_error) = state
-                .runtime_hosts
-                .destroy_session_workspaces(child_session_id)
-                .await
-            {
-                eprintln!(
-                    "failed to clean up child workspace {child_session_id} after {reason}: {workspace_error:#}"
-                );
-            }
-        }
-    }
-    if let Err(delete_error) = state.repo.delete_session(child_session_id).await {
-        eprintln!(
-            "failed to clean up child session {child_session_id} after {reason}: {delete_error:#}"
-        );
-    }
-    state
-        .provider_connections
-        .remove_session(child_session_id)
-        .await;
-}
-
 fn subagent_metadata(
     metadata: Value,
     role_name: &str,
@@ -522,8 +501,9 @@ fn subagent_metadata(
 fn child_initial_task_message(parent_session_id: &str, task: &str) -> String {
     format!(
         "# Delegated task\n\nParent session: `{parent_session_id}`\n\n{task}\n\n# Parent active context\n\n\
-A subagent runs with fresh context: no parent transcript snapshot is included. \
-Use the delegated task, role instructions, workspace/project context, and any files/tools you inspect."
+The selected role controls context: `context: forked` includes the parent's \
+durable transcript, while the default is fresh context. Use the delegated task, \
+role instructions, workspace/project context, and any files/tools you inspect."
     )
 }
 
@@ -629,13 +609,13 @@ mod tests {
     }
 
     #[test]
-    fn child_initial_task_message_marks_fresh_context() {
+    fn child_initial_task_message_describes_role_controlled_context() {
         let message = child_initial_task_message("parent", "Inspect the repo.");
 
         assert!(message.contains("# Delegated task"));
         assert!(message.contains("Parent session: `parent`"));
         assert!(message.contains("Inspect the repo."));
-        assert!(message.contains("A subagent runs with fresh context"));
+        assert!(message.contains("The selected role controls context"));
     }
 
     #[test]

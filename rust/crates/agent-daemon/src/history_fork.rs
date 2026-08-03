@@ -1,4 +1,4 @@
-use agent_store::CreateForkRequest;
+use agent_store::{CreateForkRequest, WorkspaceOwnerKind};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -9,6 +9,7 @@ use crate::runtime::{
 };
 use crate::state::AppState;
 use crate::types::RpcError;
+use crate::workspace_lifecycle;
 
 pub(crate) async fn fork(state: &AppState, params: Value) -> Result<Value, RpcError> {
     let target = parse_history_target(&params, &[])?;
@@ -29,18 +30,17 @@ pub(crate) async fn fork(state: &AppState, params: Value) -> Result<Value, RpcEr
         }
     };
 
-    let child_workspace_id = format!("workspace_{}", Uuid::new_v4());
-    let (workspace_id, workspaces) = state
-        .runtime_hosts
-        .fork_session_from_parent(
-            &target.session_id,
-            &config.workspace_id,
-            &config.workspaces,
-            &child_workspace_id,
-        )
-        .await?;
-    config.workspace_id = workspace_id;
-    config.workspaces = workspaces;
+    let prepared_workspace = workspace_lifecycle::prepare_snapshot(
+        state,
+        &child_session_id,
+        WorkspaceOwnerKind::HistoryFork,
+        &config,
+    )
+    .await?;
+    config
+        .workspace_id
+        .clone_from(&prepared_workspace.workspace_id);
+    config.workspaces.clone_from(&prepared_workspace.workspaces);
     config.metadata = fork_metadata(
         config.metadata,
         &target.session_id,
@@ -56,6 +56,7 @@ pub(crate) async fn fork(state: &AppState, params: Value) -> Result<Value, RpcEr
                     child_session_id: &child_session_id,
                     config: &config,
                     target: target.as_store_target(),
+                    workspace: prepared_workspace.attachment(),
                 })
                 .await
                 .map_err(map_source_mutation_error)
@@ -65,21 +66,7 @@ pub(crate) async fn fork(state: &AppState, params: Value) -> Result<Value, RpcEr
     let result = match result {
         Ok(result) => result,
         Err(error) => {
-            if let Err(cleanup_error) = state
-                .runtime_hosts
-                .execute(
-                    &config.runtime_id,
-                    agent_runtime_protocol::RuntimeCommand::DestroySession {
-                        workspace_id: child_workspace_id,
-                    },
-                    None,
-                )
-                .await
-            {
-                eprintln!(
-                    "failed to clean up child workspace {child_session_id} after history.fork: {cleanup_error:#}"
-                );
-            }
+            workspace_lifecycle::abandon_prepared(state, &prepared_workspace).await;
             return Err(error);
         }
     };

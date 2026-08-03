@@ -54,6 +54,7 @@ const LIST_ONLY_EVENTS = new Set([
 	"tool.requested",
 	"tool.started",
 	"tool.completed",
+	"compaction.requested",
 	"turn.finished",
 ]);
 
@@ -70,7 +71,6 @@ const SELECTED_AND_LIST_EVENTS = new Set([
 	"history.compacted",
 	"model.error",
 	"tool.error",
-	"compaction.requested",
 	"compaction.completed",
 	"compaction.error",
 ]);

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use agent_session::{SessionAction, SessionActionKind, SessionEvent};
 use agent_vocab::TranscriptItem;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::{Executor, Postgres, Row, Transaction};
 
@@ -63,7 +63,7 @@ impl PostgresAgentStore {
 
     /// Parent-visible
     /// `subagent.idle`. Delegation members do not call this on terminal completion;
-    /// they use `claim_subagent_idle_once` below to fire cleanup/barrier work
+    /// they use `claim_subagent_terminal_once` below to fire cleanup/barrier work
     /// without surfacing a per-child idle event to the parent.
     pub async fn insert_subagent_idle_event_once(
         &self,
@@ -73,10 +73,11 @@ impl PostgresAgentStore {
         payload: Value,
     ) -> Result<Option<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("select metadata from sessions where id=$1 for update")
-            .bind(child_session_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let row =
+            sqlx::query("select metadata, subagent_type from sessions where id=$1 for update")
+                .bind(child_session_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some(row) = row else {
             tx.commit().await?;
             return Ok(None);
@@ -109,23 +110,64 @@ impl PostgresAgentStore {
     /// Claim the once-only terminal-idle gate for a child WITHOUT writing a
     /// parent-visible `SubagentIdle` row. Returns `true` exactly once per
     /// `notification_key` (the same dedup `insert_subagent_idle_event_once`
-    /// uses), so a delegation member's barrier + RO-snapshot destroy still fire
-    /// exactly once while no per-child idle ever surfaces to the parent.
-    pub async fn claim_subagent_idle_once(
+    /// uses). For read-only children the durable cleanup intent commits in the
+    /// same transaction; physical cleanup remains independently idempotent.
+    pub async fn claim_subagent_terminal_once(
         &self,
         child_session_id: &str,
         notification_key: &str,
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("select metadata from sessions where id=$1 for update")
-            .bind(child_session_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let row =
+            sqlx::query("select metadata, subagent_type from sessions where id=$1 for update")
+                .bind(child_session_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some(row) = row else {
             tx.commit().await?;
             return Ok(false);
         };
         let mut metadata: Value = row.get("metadata");
+        let subagent_type: Option<String> = row.get("subagent_type");
+        if subagent_type.as_deref() == Some("read_only") {
+            let resource_exists: bool = sqlx::query_scalar(
+                r#"
+                select exists(
+                    select 1 from workspace_resources r
+                    join sessions s on s.id=r.owner_session_id
+                    where r.owner_session_id=$1
+                      and s.runtime_id=r.runtime_id and s.workspace_id=r.workspace_id
+                )
+                "#,
+            )
+            .bind(child_session_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !resource_exists {
+                return Err(anyhow!(
+                    "read-only terminal session has no durable workspace ownership"
+                ));
+            }
+        }
+        sqlx::query(
+            r#"
+            update workspace_resources r
+            set state='deleting',
+                cleanup_mode=case
+                    when r.cleanup_mode='delete_session' then 'delete_session'
+                    else 'retain_session'
+                end,
+                retry_at=now(), last_error=null, updated_at=now()
+            from sessions s
+            where r.owner_session_id=$1 and s.id=$1
+              and s.subagent_type='read_only'
+              and s.runtime_id=r.runtime_id and s.workspace_id=r.workspace_id
+              and r.state in ('provisioning','ready','deleting')
+            "#,
+        )
+        .bind(child_session_id)
+        .execute(&mut *tx)
+        .await?;
         if metadata
             .get("subagent_parent_idle_notification_key")
             .and_then(Value::as_str)
@@ -320,14 +362,24 @@ pub(super) async fn insert_session_event_tx(
         ]),
         SessionEvent::ActionRequested { action } => {
             let (kind, action_id, _, payload) = action_payload(action)?;
-            let row_id = action_rows.get(&ActionKey::new(kind, action_id)).cloned();
-            let mut frames = vec![insert_event_with_activity_tx(
-                tx,
-                session_id,
-                EventType::ActionRequested,
-                json!({ "kind": kind, "action_id": action_id, "action_row_id": row_id, "payload": payload }),
-            )
-            .await?];
+            let row_id = action_rows
+                .get(&ActionKey::new(kind, action_id))
+                .ok_or_else(|| anyhow!("requested action is missing its durable row identity"))?;
+            let mut frames = vec![
+                insert_event_with_activity_tx(
+                    tx,
+                    session_id,
+                    EventType::ActionRequested,
+                    json!({
+                        "kind": kind,
+                        "action_id": action_id,
+                        "action_row_id": row_id,
+                        "status": "pending",
+                        "payload": payload
+                    }),
+                )
+                .await?,
+            ];
             let event_name = match action {
                 SessionAction::RequestModel { .. } => Some(EventType::ModelRequested),
                 SessionAction::RequestTool { .. } => Some(EventType::ToolRequested),
@@ -347,31 +399,64 @@ pub(super) async fn insert_session_event_tx(
             Ok(frames)
         }
         SessionEvent::ActionCompleted { kind, id } => {
-            let event_name = match kind {
-                SessionActionKind::Model => EventType::ModelCompleted,
-                SessionActionKind::Tool => EventType::ToolCompleted,
+            let kind = match kind {
+                SessionActionKind::Model => crate::ActionKind::Model,
+                SessionActionKind::Tool => crate::ActionKind::Tool,
             };
+            let event_name = match kind {
+                crate::ActionKind::Model => EventType::ModelCompleted,
+                crate::ActionKind::Tool => EventType::ToolCompleted,
+                crate::ActionKind::Compaction => unreachable!("session events have no compaction"),
+            };
+            let action_id = id
+                .parse::<i64>()
+                .map_err(|_| anyhow!("completed action has an invalid action id: {id}"))?;
+            let action_row_id = action_rows
+                .get(&ActionKey::new(kind, action_id))
+                .ok_or_else(|| anyhow!("completed action is missing its durable row identity"))?;
             Ok(vec![
                 insert_event_with_activity_tx(
                     tx,
                     session_id,
                     event_name,
-                    json!({ "action_id": id }),
+                    json!({
+                        "kind": kind,
+                        "action_id": id,
+                        "action_row_id": action_row_id,
+                        "status": "completed"
+                    }),
                 )
                 .await?,
             ])
         }
         SessionEvent::ActionFailed { kind, id, error } => {
-            let event_name = match kind {
-                SessionActionKind::Model => EventType::ModelError,
-                SessionActionKind::Tool => EventType::ToolError,
+            let kind = match kind {
+                SessionActionKind::Model => crate::ActionKind::Model,
+                SessionActionKind::Tool => crate::ActionKind::Tool,
             };
+            let event_name = match kind {
+                crate::ActionKind::Model => EventType::ModelError,
+                crate::ActionKind::Tool => EventType::ToolError,
+                crate::ActionKind::Compaction => unreachable!("session events have no compaction"),
+            };
+            let action_id = id
+                .parse::<i64>()
+                .map_err(|_| anyhow!("failed action has an invalid action id: {id}"))?;
+            let action_row_id = action_rows
+                .get(&ActionKey::new(kind, action_id))
+                .ok_or_else(|| anyhow!("failed action is missing its durable row identity"))?;
             Ok(vec![
                 insert_event_with_activity_tx(
                     tx,
                     session_id,
                     event_name,
-                    json!({ "action_id": id, "error": error }),
+                    json!({
+                        "kind": kind,
+                        "action_id": id,
+                        "action_row_id": action_row_id,
+                        "status": "error",
+                        "error": error
+                    }),
                 )
                 .await?,
             ])

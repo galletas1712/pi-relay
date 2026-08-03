@@ -1,5 +1,11 @@
 import { displayParentIdForEntry } from "../displayParent.ts";
-import type { TranscriptEntry, TranscriptItem, TranscriptTurnsResult, TurnCard } from "../types.ts";
+import type {
+	TranscriptEntry,
+	TranscriptItem,
+	TranscriptTurnDetailResult,
+	TranscriptTurnsResult,
+	TurnCard,
+} from "../types.ts";
 import { mergeEntryBodies, selectedEntriesFromIds, sameStringArray, uniqueStringArray } from "./entries.ts";
 import type { SelectedSessionCache } from "./types.ts";
 
@@ -161,16 +167,55 @@ export interface ApplyTurnDetailResult {
 	applied: boolean;
 }
 
-export function applyTurnDetail(cache: SelectedSessionCache, sessionId: string, turnId: string, entries: TranscriptEntry[]): ApplyTurnDetailResult {
-	if (cache.sessionId !== sessionId) return { cache, applied: false };
-	const card = cache.turnCardsById.get(turnId);
-	const lastEntryId = entries.at(-1)?.id ?? null;
-	if (!card || !lastEntryId) return { cache, applied: false };
-	const acceptsPartialOpenTurn = card.status === "open";
-	if (lastEntryId !== card.active_leaf_id && !acceptsPartialOpenTurn) return { cache, applied: false };
-	const entriesById = mergeEntryBodies(cache.entriesById, entries);
+export interface TurnDetailRequestFence {
+	sessionId: string;
+	cardId: string;
+	transcriptRevision: number | null;
+	activeLeafId: string | null;
+}
+
+export function captureTurnDetailRequest(
+	cache: SelectedSessionCache,
+	cardId: string,
+): TurnDetailRequestFence {
+	return {
+		sessionId: cache.sessionId ?? "",
+		cardId,
+		transcriptRevision: cache.snapshot?.transcript_revision ?? cache.turnTranscriptRevision,
+		activeLeafId: cache.snapshot?.active_leaf_id ?? cache.turnActiveLeafId,
+	};
+}
+
+export function applyTurnDetail(
+	cache: SelectedSessionCache,
+	result: TranscriptTurnDetailResult,
+	fence: TurnDetailRequestFence,
+	requestIsCurrent: boolean,
+): ApplyTurnDetailResult {
+	if (
+		cache.sessionId !== fence.sessionId ||
+		result.session_id !== fence.sessionId ||
+		result.card_id !== fence.cardId
+	) return { cache, applied: false };
+	const entriesById = mergeEntryBodies(cache.entriesById, result.entries);
+	const historyOnly = !requestIsCurrent;
+	const card = cache.turnCardsById.get(result.card_id);
+	const lastEntryId = result.entries.at(-1)?.id ?? null;
+	if (!card || !lastEntryId || historyOnly) {
+		return {
+			cache: entriesById === cache.entriesById ? cache : { ...cache, entriesById },
+			applied: false,
+		};
+	}
+	const ids = activeTurnAncestry(card, entriesById);
+	if (!ids) {
+		return {
+			cache: entriesById === cache.entriesById ? cache : { ...cache, entriesById },
+			applied: false,
+		};
+	}
 	const turnDetailsById = new Map(cache.turnDetailsById);
-	turnDetailsById.set(turnId, extendTurnDetailEntryIds(entries.map((entry) => entry.id), card, entriesById));
+	turnDetailsById.set(result.card_id, ids);
 	return {
 		cache: {
 			...cache,
@@ -181,28 +226,24 @@ export function applyTurnDetail(cache: SelectedSessionCache, sessionId: string, 
 	};
 }
 
-function extendTurnDetailEntryIds(entryIds: string[], card: TurnCard, entriesById: Map<string, TranscriptEntry>): string[] {
-	const ids = [...entryIds];
-	const seenIds = new Set(ids);
-	let currentLeafId = ids.at(-1) ?? null;
-	while (currentLeafId && currentLeafId !== card.active_leaf_id) {
-		const child = findOnlyDisplayChild(currentLeafId, entriesById);
-		if (!child || seenIds.has(child.id)) break;
-		ids.push(child.id);
-		seenIds.add(child.id);
-		currentLeafId = child.id;
+function activeTurnAncestry(
+	card: TurnCard,
+	entriesById: Map<string, TranscriptEntry>,
+): string[] | null {
+	const startId = card.start_entry_id ?? card.id;
+	const reversed: string[] = [];
+	const seen = new Set<string>();
+	let entryId: string | null = card.active_leaf_id;
+	while (entryId) {
+		if (seen.has(entryId)) return null;
+		seen.add(entryId);
+		const entry = entriesById.get(entryId);
+		if (!entry) return null;
+		reversed.push(entryId);
+		if (entryId === startId) return reversed.reverse();
+		entryId = displayParentIdForEntry(entry);
 	}
-	return ids;
-}
-
-function findOnlyDisplayChild(parentId: string, entriesById: Map<string, TranscriptEntry>): TranscriptEntry | null {
-	let child: TranscriptEntry | null = null;
-	for (const entry of entriesById.values()) {
-		if (displayParentIdForEntry(entry) !== parentId) continue;
-		if (child) return null;
-		child = entry;
-	}
-	return child;
+	return null;
 }
 
 export function turnCardsInOrder(cache: SelectedSessionCache): TurnCard[] {
@@ -215,6 +256,8 @@ export function turnCardsInOrder(cache: SelectedSessionCache): TurnCard[] {
 export function turnDetailEntries(cache: SelectedSessionCache, turnId: string): TranscriptEntry[] | null {
 	const ids = cache.turnDetailsById.get(turnId);
 	if (!ids) return null;
+	const card = cache.turnCardsById.get(turnId);
+	if (!card || !turnDetailCoversCard(ids, card)) return null;
 	const entries = ids.flatMap((id) => {
 		const entry = cache.entriesById.get(id);
 		return entry ? [entry] : [];

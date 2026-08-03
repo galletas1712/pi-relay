@@ -7,7 +7,7 @@ use crate::{
     AcceptedInput, AddSessionMcpResult, EventFrame, EventType, InputPriority,
     McpSessionManifestBinding, OutputBatch, PersistedAction, RootSessionRequired, SessionActivity,
     SessionConfig, SessionConfigChanged, SessionNotFound, SessionSummary, SessionWorkspace,
-    SubagentType, VersionedSessionConfig,
+    SubagentType, VersionedSessionConfig, WorkspaceAttachment,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 
@@ -17,9 +17,11 @@ use super::outputs::persist_outputs_tx;
 use super::queue::bump_revisions_tx;
 use super::sql::{
     action_is_unfinished, ensure_no_active_work_tx, ensure_no_running_delegation_tx,
-    freeze_legacy_routes_tx, lock_session_tx, queued_input_is_active, session_activity,
+    freeze_legacy_routes_tx, lock_session_for_mutation_tx, lock_session_tx, queued_input_is_active,
+    session_activity,
 };
 use super::transcript::session_state_for_event_tx;
+use super::workspace_resources::attach_workspace_resource_tx;
 use super::PostgresAgentStore;
 
 fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -104,6 +106,13 @@ enum TitleUpdateKind {
 }
 
 impl PostgresAgentStore {
+    pub async fn ensure_session_mutation_eligible(&self, session_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn create_session(
         &self,
         session_id: &str,
@@ -162,7 +171,7 @@ impl PostgresAgentStore {
         system_prompt: &str,
     ) -> Result<AddSessionMcpResult> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let current: (i64, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
             "select session_revision, mcp_manifest_fingerprint, parent_session_id, subagent_type from sessions where id=$1",
         )
@@ -224,7 +233,7 @@ impl PostgresAgentStore {
         metadata: &Value,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let result = sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
             .bind(session_id)
             .bind(metadata)
@@ -247,7 +256,7 @@ impl PostgresAgentStore {
 
     pub async fn reset_auto_compaction_failures(&self, session_id: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let mut metadata = session_metadata_tx(&mut tx, session_id).await?;
         let state = ensure_compaction_auto_state_object(&mut metadata);
         state.insert("consecutive_failures".to_string(), json!(0));
@@ -322,6 +331,44 @@ impl PostgresAgentStore {
         subagent_type: Option<SubagentType>,
         delegation_id: Option<&str>,
     ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
+        self.start_session_outputs_with_parent_and_workspace(
+            session_id,
+            config,
+            entries,
+            active_leaf_id,
+            session_events,
+            actions,
+            priority,
+            content,
+            client_input_id,
+            parent_session_id,
+            subagent_type,
+            delegation_id,
+            None,
+        )
+        .await
+    }
+
+    // Complete creation operation used by runtime-backed sessions. A private
+    // workspace generation is attached in the same transaction as identity,
+    // transcript outputs, and the accepted first input.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_session_outputs_with_parent_and_workspace(
+        &self,
+        session_id: &str,
+        config: &SessionConfig,
+        entries: &[TranscriptStorageNode],
+        active_leaf_id: Option<&str>,
+        session_events: &[SessionEvent],
+        actions: &[SessionAction],
+        priority: InputPriority,
+        content: &UserMessage,
+        client_input_id: Option<&str>,
+        parent_session_id: Option<&str>,
+        subagent_type: Option<SubagentType>,
+        delegation_id: Option<&str>,
+        workspace: Option<WorkspaceAttachment<'_>>,
+    ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
         if parent_session_id == Some(session_id) {
             return Err(anyhow!(
                 "child session id must differ from parent session id"
@@ -329,8 +376,9 @@ impl PostgresAgentStore {
         }
         let mut tx = self.pool.begin().await?;
         if let Some(parent_session_id) = parent_session_id {
+            lock_session_for_mutation_tx(&mut tx, parent_session_id).await?;
             let parent_fingerprint: Option<Option<String>> = sqlx::query_scalar(
-                "select mcp_manifest_fingerprint from sessions where id=$1::text for key share",
+                "select mcp_manifest_fingerprint from sessions where id=$1::text",
             )
             .bind(parent_session_id)
             .fetch_optional(&mut *tx)
@@ -386,8 +434,20 @@ impl PostgresAgentStore {
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_none() {
+            lock_session_for_mutation_tx(&mut tx, session_id).await?;
             tx.commit().await?;
             return Ok((Vec::new(), Vec::new()));
+        }
+        if let Some(workspace) = workspace {
+            attach_workspace_resource_tx(
+                &mut tx,
+                session_id,
+                &config.runtime_id,
+                &config.workspace_id,
+                &config.workspaces,
+                workspace,
+            )
+            .await?;
         }
 
         let mut frames = vec![
@@ -437,7 +497,7 @@ impl PostgresAgentStore {
         update_kind: TitleUpdateKind,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let query = match update_kind {
             TitleUpdateKind::Automatic => {
                 r#"
@@ -515,7 +575,7 @@ impl PostgresAgentStore {
         config: &SessionConfig,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         freeze_legacy_routes_tx(&mut tx, session_id).await?;
         let row = sqlx::query(
             "update sessions set provider_config=$2, metadata=$3, updated_at=now() where id=$1 returning metadata",
@@ -574,6 +634,11 @@ impl PostgresAgentStore {
                     exists(select 1 from delegations d where d.parent_session_id = s.id and d.status in ('running','cancelling')) as has_running_delegations
                 from sessions s
                 where s.metadata->>'hidden' is distinct from 'true'
+                    and not exists (
+                        select 1 from workspace_resources r
+                        where r.owner_session_id=s.id and r.state='deleting'
+                          and r.cleanup_mode='delete_session'
+                    )
                     and (
                         ($2::uuid is null and s.project_id is null)
                         or ($2::uuid is not null and s.project_id=$2)

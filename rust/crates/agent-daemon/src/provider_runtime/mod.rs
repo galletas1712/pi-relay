@@ -30,6 +30,7 @@ pub(crate) use mcp::{
 };
 pub(crate) use prompt::{
     current_pi_template, effective_prompt_profile, provider_tools_for_session, render_pi_prompt,
+    RoleContextPolicy,
 };
 pub(crate) use provider::{model_available_for_config, model_metadata_for_config};
 pub(crate) use requests::{build_model_request, run_model};

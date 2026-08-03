@@ -59,6 +59,41 @@ create table if not exists sessions (
     transcript_revision bigint not null default 0
 );
 
+-- Private runtime workspaces have one durable lifecycle owner. The intended
+-- session identity exists before the remote effect, so this table deliberately
+-- does not use a session foreign key.
+create table if not exists workspace_resources (
+    workspace_id text primary key,
+    owner_session_id text not null unique,
+    runtime_id text not null,
+    generation text not null,
+    owner_kind text not null
+        constraint workspace_resources_owner_kind_check
+        check (owner_kind in ('root','history_fork','read_only')),
+    state text not null
+        constraint workspace_resources_state_check
+        check (state in ('provisioning','ready','deleting','deleted')),
+    cleanup_mode text null
+        constraint workspace_resources_cleanup_mode_check
+        check (cleanup_mode is null or cleanup_mode in ('retain_session','delete_session')),
+    workspaces jsonb null,
+    lease_expires_at timestamptz not null,
+    retry_at timestamptz not null default now(),
+    last_error text null,
+    attached_at timestamptz null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    constraint workspace_resources_state_shape_check check (
+        (state='provisioning' and cleanup_mode is null and attached_at is null)
+        or (state='ready' and cleanup_mode is null)
+        or (state='deleting' and cleanup_mode is not null)
+        or (state='deleted' and cleanup_mode='retain_session' and attached_at is not null)
+    )
+);
+
+create index if not exists workspace_resources_due_idx
+    on workspace_resources(state, retry_at, lease_expires_at);
+
 create index if not exists sessions_project_created_idx
     on sessions(project_id, created_at desc, id desc);
 
@@ -215,7 +250,8 @@ alter table sessions add column if not exists delegation_id text null references
 
 create unique index if not exists sessions_delegation_spawn_index_uq
     on sessions(delegation_id, (metadata->>'delegation_spawn_index'))
-    where delegation_id is not null and metadata ? 'delegation_spawn_index';
+    where delegation_id is not null
+      and metadata ? 'delegation_spawn_index';
 
 alter table queued_inputs add column if not exists provider_config jsonb null;
 alter table actions add column if not exists provider_config jsonb null;

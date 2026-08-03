@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -9,7 +9,7 @@ use crate::{
     ActionKind, ActionStatus, ClaimedPostCompactionDispatch, CorruptPostCompactionDispatch,
     EventFrame, EventType, PendingDispatchAction, PostCompactionDispatchClaimError,
     PostCompactionDispatchFence, PostCompactionDispatchIntent, PostCompactionDispatchLease,
-    ResumableModelAction, StoredAction,
+    ResumableModelAction, StoredAction, WorkspaceCleanupMode,
 };
 
 use super::action_records::{
@@ -21,7 +21,7 @@ use super::events::insert_event_with_activity_tx;
 use super::queue::bump_revisions_tx;
 use super::rows::row_text;
 use super::sql::{
-    action_is_unfinished, lock_session_tx, stale_unfinished_actions,
+    action_is_unfinished, lock_session_for_mutation_tx, lock_session_tx, stale_unfinished_actions,
     stale_unfinished_actions_for_session,
 };
 use super::PostgresAgentStore;
@@ -214,7 +214,7 @@ impl PostgresAgentStore {
                 }
             }
         }
-        lock_session_tx(&mut tx, &intent.session_id)
+        lock_session_for_mutation_tx(&mut tx, &intent.session_id)
             .await
             .map_err(transient_post_compaction_claim)?;
         let binding_is_current: bool = sqlx::query_scalar(
@@ -648,25 +648,36 @@ impl PostgresAgentStore {
         event_type: EventType,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
-        let query = "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and status='pending'";
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
+        let query = r#"
+            update actions
+            set status='running', updated_at=now()
+            where session_id=$1 and id=$2::text and attempt_id=$3::text
+              and status='pending'
+            returning kind, action_id, payload
+        "#;
         let updated = sqlx::query(query)
             .bind(session_id)
             .bind(action_row_id)
             .bind(attempt_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        if updated != 1 {
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(updated) = updated else {
             tx.commit().await?;
             return Ok(Vec::new());
-        }
+        };
         bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_with_activity_tx(
             &mut tx,
             session_id,
             event_type,
-            json!({ "action_row_id": action_row_id }),
+            json!({
+                "action_row_id": action_row_id,
+                "action_id": updated.get::<i64, _>("action_id"),
+                "kind": updated.get::<String, _>("kind"),
+                "status": "running",
+                "payload": updated.get::<Value, _>("payload"),
+            }),
         )
         .await?;
         tx.commit().await?;
@@ -732,6 +743,8 @@ impl PostgresAgentStore {
             EventType::ModelError,
             serde_json::json!({
                 "action_row_id": intent.row_id,
+                "kind": ActionKind::Model,
+                "status": ActionStatus::Error,
                 "error": error,
             }),
         )
@@ -740,13 +753,14 @@ impl PostgresAgentStore {
         Ok(vec![event])
     }
 
-    pub async fn mark_action_stale(
+    pub async fn mark_action_stale_and_event(
         &self,
         session_id: &str,
         action_row_id: &str,
         attempt_id: &str,
         post_compaction_dispatch_lease: Option<&PostCompactionDispatchLease>,
-    ) -> Result<bool> {
+        error: &str,
+    ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let unfinished_actions = action_is_unfinished(None);
@@ -759,6 +773,7 @@ impl PostgresAgentStore {
             r#"
             update actions
             set status='stale',
+                result=jsonb_build_object('error', $7::text),
                 payload=payload - '{POST_COMPACTION_DISPATCH_KEY}',
                 updated_at=now()
             where session_id=$1
@@ -780,6 +795,7 @@ impl PostgresAgentStore {
                             > (extract(epoch from clock_timestamp()) * 1000)::bigint
                     )
                 )
+            returning kind, action_id, payload
             "#,
         );
         let updated = sqlx::query(&query)
@@ -789,14 +805,36 @@ impl PostgresAgentStore {
             .bind(lease_owner)
             .bind(lease_generation)
             .bind(lease_context)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        if updated > 0 {
-            bump_revisions_tx(&mut tx, session_id, false, false).await?;
-        }
+            .bind(error)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(updated) = updated else {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        };
+        let kind = row_text::<ActionKind>(&updated, "kind")?;
+        let event_type = match kind {
+            ActionKind::Model => EventType::ModelError,
+            ActionKind::Tool => EventType::ToolError,
+            ActionKind::Compaction => EventType::CompactionError,
+        };
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
+        let event = insert_event_with_activity_tx(
+            &mut tx,
+            session_id,
+            event_type,
+            json!({
+                "action_row_id": action_row_id,
+                "action_id": updated.get::<i64, _>("action_id"),
+                "kind": kind,
+                "status": ActionStatus::Stale,
+                "payload": updated.get::<Value, _>("payload"),
+                "error": error,
+            }),
+        )
+        .await?;
         tx.commit().await?;
-        Ok(updated > 0)
+        Ok(vec![event])
     }
 
     pub async fn pending_actions_for_dispatch(
@@ -872,7 +910,7 @@ impl PostgresAgentStore {
         attempt_id: &str,
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let updated = sqlx::query(
             "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and kind='model' and status='pending' and not (payload ? $4::text)",
         )
@@ -960,6 +998,8 @@ impl PostgresAgentStore {
             EventType::ModelError,
             serde_json::json!({
                 "action_row_id": action_row_id,
+                "kind": ActionKind::Model,
+                "status": ActionStatus::Error,
                 "error": error,
             }),
         )
@@ -973,6 +1013,22 @@ impl PostgresAgentStore {
         session_id: &str,
         reason: &str,
     ) -> Result<Vec<EventFrame>> {
+        let (events, _) = self
+            .cancel_unfinished_session_work_with_cleanup(session_id, reason, None)
+            .await?;
+        Ok(events)
+    }
+
+    /// Settle accepted work and optionally fence its private workspace as one
+    /// lifecycle transition. Unlike ordinary mutation admission, cancellation
+    /// owns the inverse transition and remains valid after terminal projection
+    /// has already initiated cleanup.
+    pub async fn cancel_unfinished_session_work_with_cleanup(
+        &self,
+        session_id: &str,
+        reason: &str,
+        cleanup_mode: Option<WorkspaceCleanupMode>,
+    ) -> Result<(Vec<EventFrame>, bool)> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let unfinished_actions = action_is_unfinished(None);
@@ -994,9 +1050,50 @@ impl PostgresAgentStore {
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        let cleanup_requested = if let Some(cleanup_mode) = cleanup_mode {
+            let updated = sqlx::query(
+                r#"
+                update workspace_resources r
+                set state='deleting',
+                    cleanup_mode=case
+                        when r.cleanup_mode='delete_session' or $2='delete_session'
+                            then 'delete_session'
+                        else 'retain_session'
+                    end,
+                    retry_at=now(), last_error=null, updated_at=now()
+                from sessions s
+                where r.owner_session_id=$1 and s.id=$1
+                  and s.runtime_id=r.runtime_id and s.workspace_id=r.workspace_id
+                  and r.state in ('provisioning','ready','deleting')
+                "#,
+            )
+            .bind(session_id)
+            .bind(cleanup_mode.as_str())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            updated == 1
+                || sqlx::query_scalar(
+                    r#"
+                    select exists(
+                        select 1
+                        from workspace_resources r
+                        join sessions s on s.id=r.owner_session_id
+                        where r.owner_session_id=$1
+                          and s.runtime_id=r.runtime_id and s.workspace_id=r.workspace_id
+                          and r.state='deleted'
+                    )
+                    "#,
+                )
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?
+        } else {
+            false
+        };
         if updated == 0 {
             tx.commit().await?;
-            return Ok(Vec::new());
+            return Ok((Vec::new(), cleanup_requested));
         }
         bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_with_activity_tx(
@@ -1007,7 +1104,7 @@ impl PostgresAgentStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(vec![event])
+        Ok((vec![event], cleanup_requested))
     }
 }
 
@@ -1213,6 +1310,88 @@ mod tests {
             .filter(|event| event.event == EventType::ToolStarted)
             .count();
         assert_eq!(started_count, 1);
+        db.cleanup().await;
+    }
+
+    #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+    #[tokio::test]
+    async fn dispatch_fallback_events_project_exact_model_and_tool_actions() {
+        let Some(db) = test_store().await else {
+            eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "dispatch-fallback-contract";
+        create_session(store, session_id).await;
+        let tool_call = ToolCall {
+            id: ToolCallId::new("call_dispatch_fallback"),
+            tool_name: "Bash".to_string(),
+            args_json: r#"{"command":"false"}"#.to_string(),
+        };
+        let (_, persisted) = store
+            .persist_outputs(
+                session_id,
+                crate::OutputBatch::new(
+                    &[],
+                    None,
+                    &[],
+                    &[
+                        SessionAction::RequestModel {
+                            action_id: ActionId(41),
+                            turn_id: TurnId(7),
+                            model_context: ModelContext::default(),
+                            context_leaf_id: Some("context-leaf".to_string()),
+                        },
+                        SessionAction::RequestTool {
+                            action_id: ActionId(42),
+                            turn_id: TurnId(7),
+                            tool_call: tool_call.clone(),
+                        },
+                    ],
+                ),
+            )
+            .await
+            .expect("model and tool actions persist");
+
+        for (index, kind, action_id, event_type, payload) in [
+            (
+                0,
+                ActionKind::Model,
+                41,
+                EventType::ModelError,
+                json!({ "context_leaf_id": "context-leaf" }),
+            ),
+            (
+                1,
+                ActionKind::Tool,
+                42,
+                EventType::ToolError,
+                serde_json::to_value(&tool_call).expect("tool call serializes"),
+            ),
+        ] {
+            let action = &persisted[index];
+            let events = store
+                .mark_action_stale_and_event(
+                    session_id,
+                    &action.row_id,
+                    &action.attempt_id,
+                    None,
+                    "dispatch registration failed",
+                )
+                .await
+                .expect("dispatch fallback commits");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event, event_type);
+            assert_eq!(events[0].data["action_row_id"], action.row_id);
+            assert_eq!(events[0].data["action_id"], action_id);
+            assert_eq!(events[0].data["kind"], serde_json::to_value(kind).unwrap());
+            assert_eq!(events[0].data["status"], json!("stale"));
+            assert_eq!(events[0].data["payload"], payload);
+            assert_eq!(
+                events[0].data["error"],
+                json!("dispatch registration failed")
+            );
+        }
         db.cleanup().await;
     }
 

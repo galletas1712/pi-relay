@@ -1,17 +1,19 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_session::TranscriptStorageNode;
+use agent_session::{AgentSession, ModelContext, SessionAction, TranscriptStorageNode};
 use agent_vocab::{
-    AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
-    ProviderReplayItem, ReasoningEffort, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+    ActionId, AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
+    ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, TurnId, TurnOutcome,
+    UserMessage,
 };
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    CreateForkRequest, DelegationKind, HistoryChanged, HistoryTarget, HistoryTargetNotTurnBoundary,
-    OutputBatch, PostgresAgentStore, SessionConfig, SourceMutationConflict,
-    SwitchActiveLeafRequest, TranscriptEntryBodyMode,
+    CreateContextForkRequest, CreateForkRequest, DelegationKind, HistoryChanged, HistoryTarget,
+    HistoryTargetNotTurnBoundary, OutputBatch, PostgresAgentStore, PreparedWorkspace,
+    SessionConfig, SourceMutationConflict, SwitchActiveLeafRequest, TranscriptEntryBodyMode,
+    WorkspaceOwnerKind,
 };
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(40_000);
@@ -20,6 +22,868 @@ struct TestDb {
     store: PostgresAgentStore,
     admin_url: String,
     name: String,
+}
+
+async fn prepare_test_workspace(
+    store: &PostgresAgentStore,
+    owner_session_id: &str,
+    config: &SessionConfig,
+    owner_kind: WorkspaceOwnerKind,
+) -> PreparedWorkspace {
+    let generation = format!("test-generation-{}", Uuid::new_v4());
+    store
+        .begin_workspace_provisioning(
+            owner_session_id,
+            &config.runtime_id,
+            &config.workspace_id,
+            &generation,
+            owner_kind,
+            300,
+        )
+        .await
+        .expect("workspace provisioning begins");
+    store
+        .finish_workspace_provisioning(
+            owner_session_id,
+            &config.runtime_id,
+            &config.workspace_id,
+            &generation,
+            &config.workspaces,
+        )
+        .await
+        .expect("workspace provisioning finishes")
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn context_fork_excludes_in_progress_parent_delegation_tool_call() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "completed context boundary test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let parent_id = "context-open-delegation-parent";
+    let config = create_session(store, project_id, parent_id, true).await;
+    let delegation_call = ToolCall {
+        id: ToolCallId::new("call_delegate_in_progress"),
+        tool_name: "delegate_readonly_tasks".to_string(),
+        args_json: r#"{"tasks":[{"role":"reviewer","prompt":"inspect"}]}"#.to_string(),
+    };
+    store
+        .persist_outputs(
+            parent_id,
+            OutputBatch::new(
+                &[
+                    entry(
+                        "open-start",
+                        Some("finish"),
+                        TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+                    ),
+                    entry(
+                        "open-user",
+                        Some("open-start"),
+                        TranscriptItem::UserMessage(UserMessage::text("delegate this")),
+                    ),
+                    entry(
+                        "open-assistant",
+                        Some("open-user"),
+                        TranscriptItem::AssistantMessage(AssistantMessage {
+                            items: vec![AssistantItem::ToolCall(delegation_call)],
+                        }),
+                    ),
+                ],
+                Some("open-assistant"),
+                &[],
+                &[],
+            ),
+        )
+        .await
+        .expect("open delegation turn persists");
+
+    let task = UserMessage::text("inspect the completed conversation");
+    let result = store
+        .create_context_fork(CreateContextForkRequest {
+            child_session_id: "context-open-delegation-child",
+            config: &config,
+            parent_session_id: parent_id,
+            subagent_type: crate::SubagentType::Full,
+            delegation_id: None,
+            task: &task,
+            workspace: None,
+        })
+        .await
+        .expect("context fork commits");
+
+    assert_eq!(result.active_leaf_id.as_deref(), Some("finish"));
+    let stored = store
+        .load_stored_session("context-open-delegation-child")
+        .await
+        .expect("child loads");
+    assert_eq!(stored.active_leaf_id.as_deref(), Some("finish"));
+    assert!(stored
+        .entries
+        .iter()
+        .all(|entry| !entry.id.starts_with("open-")));
+    let child = AgentSession::from_stored_session(stored).expect("child history rehydrates");
+    assert!(child
+        .model_context()
+        .transcript_items()
+        .iter()
+        .all(|item| !matches!(
+            item,
+            TranscriptItem::AssistantMessage(message)
+                if message
+                    .tool_calls()
+                    .any(|call| call.tool_name.starts_with("delegate_"))
+        )));
+    let queue = store
+        .queue_state("context-open-delegation-child")
+        .await
+        .expect("delegated task queued");
+    assert_eq!(queue.queued_inputs.len(), 1);
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn private_workspace_cleanup_routes_root_full_and_read_only_sessions() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "workspace routing test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+
+    let mut root_config = session_config(project_id);
+    root_config.workspace_id = "workspace-root-private".to_string();
+    let root_workspace = prepare_test_workspace(
+        store,
+        "workspace-root-session",
+        &root_config,
+        WorkspaceOwnerKind::Root,
+    )
+    .await;
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            "workspace-root-session",
+            &root_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("root"),
+            None,
+            None,
+            None,
+            None,
+            Some(root_workspace.attachment()),
+        )
+        .await
+        .expect("root session attaches");
+
+    let mut full_config = root_config.clone();
+    full_config.metadata = json!({ "delegation_spawn_index": 0 });
+    store
+        .start_session_outputs_with_parent(
+            "workspace-full-child",
+            &full_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("full"),
+            None,
+            Some("workspace-root-session"),
+            Some(crate::SubagentType::Full),
+            None,
+        )
+        .await
+        .expect("full child creates");
+    assert!(!store
+        .request_session_workspace_cleanup(
+            "workspace-full-child",
+            crate::WorkspaceCleanupMode::DeleteSession,
+        )
+        .await
+        .expect("full cleanup routes"));
+    assert!(store
+        .delete_session("workspace-full-child")
+        .await
+        .expect("full identity deletes"));
+    assert!(store
+        .session_exists("workspace-root-session")
+        .await
+        .expect("root remains"));
+
+    let mut read_only_config = root_config.clone();
+    read_only_config.workspace_id = "workspace-read-only-private".to_string();
+    let read_only_workspace = prepare_test_workspace(
+        store,
+        "workspace-read-only-child",
+        &read_only_config,
+        WorkspaceOwnerKind::ReadOnly,
+    )
+    .await;
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            "workspace-read-only-child",
+            &read_only_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("readonly"),
+            None,
+            Some("workspace-root-session"),
+            Some(crate::SubagentType::ReadOnly),
+            None,
+            Some(read_only_workspace.attachment()),
+        )
+        .await
+        .expect("read-only child attaches");
+    assert!(store
+        .claim_subagent_terminal_once("workspace-read-only-child", "terminal-leaf")
+        .await
+        .expect("terminal marker and cleanup intent commit together"));
+    assert!(!store
+        .claim_subagent_terminal_once("workspace-read-only-child", "terminal-leaf")
+        .await
+        .expect("restart repeats terminal transition"));
+    assert_eq!(
+        store
+            .workspace_resource_for_session("workspace-read-only-child")
+            .await
+            .expect("terminal resource loads")
+            .expect("terminal resource exists")
+            .state,
+        crate::WorkspaceResourceState::Deleting,
+        "cleanup remains independently discoverable after the once marker commits"
+    );
+    let read_only_claim = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("read-only cleanup claims")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == "workspace-read-only-child")
+        .expect("read-only resource claimed");
+    assert!(store
+        .complete_workspace_cleanup(&read_only_claim)
+        .await
+        .expect("read-only cleanup completes"));
+    assert!(store
+        .session_exists("workspace-read-only-child")
+        .await
+        .expect("read-only transcript retained"));
+    assert_eq!(
+        store
+            .workspace_resource_for_session("workspace-read-only-child")
+            .await
+            .expect("read-only tombstone loads")
+            .expect("read-only tombstone exists")
+            .state,
+        crate::WorkspaceResourceState::Deleted
+    );
+    assert!(store
+        .request_session_workspace_cleanup(
+            "workspace-read-only-child",
+            crate::WorkspaceCleanupMode::DeleteSession,
+        )
+        .await
+        .expect("retained read-only identity deletes"));
+    assert!(!store
+        .session_exists("workspace-read-only-child")
+        .await
+        .expect("read-only identity gone"));
+
+    assert!(store
+        .request_session_workspace_cleanup(
+            "workspace-root-session",
+            crate::WorkspaceCleanupMode::DeleteSession,
+        )
+        .await
+        .expect("root cleanup intent persists"));
+    let root_claim = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("root cleanup claims")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == "workspace-root-session")
+        .expect("root resource claimed");
+    assert!(store
+        .complete_workspace_cleanup(&root_claim)
+        .await
+        .expect("root cleanup completes"));
+    assert!(!store
+        .session_exists("workspace-root-session")
+        .await
+        .expect("root identity gone"));
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn deleting_workspace_cleanup_requests_are_idempotent_and_monotonic() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "workspace cleanup merge test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    create_session(store, project_id, "cleanup-merge-parent", false).await;
+
+    let session_id = "cleanup-merge-read-only";
+    let mut config = session_config(project_id);
+    config.workspace_id = "workspace-cleanup-merge-read-only".to_string();
+    let workspace =
+        prepare_test_workspace(store, session_id, &config, WorkspaceOwnerKind::ReadOnly).await;
+    let action = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::new(),
+        context_leaf_id: None,
+    };
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            session_id,
+            &config,
+            &[],
+            None,
+            &[],
+            &[action],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("read-only task"),
+            None,
+            Some("cleanup-merge-parent"),
+            Some(crate::SubagentType::ReadOnly),
+            None,
+            Some(workspace.attachment()),
+        )
+        .await
+        .expect("read-only child attaches with unfinished work");
+    assert!(store
+        .claim_subagent_terminal_once(session_id, "cleanup-merge-terminal")
+        .await
+        .expect("terminal projection requests retention"));
+
+    let (events, cleanup_requested) = store
+        .cancel_unfinished_session_work_with_cleanup(
+            session_id,
+            "delegation cancelled",
+            Some(crate::WorkspaceCleanupMode::RetainSession),
+        )
+        .await
+        .expect("cancellation settles work after terminal cleanup starts");
+    assert!(cleanup_requested);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, crate::EventType::SessionWorkCancelled);
+    assert!(!store
+        .has_unfinished_actions(session_id)
+        .await
+        .expect("cancellation settles the active child action"));
+    let (replayed_events, replayed_cleanup) = store
+        .cancel_unfinished_session_work_with_cleanup(
+            session_id,
+            "delegation cancelled",
+            Some(crate::WorkspaceCleanupMode::RetainSession),
+        )
+        .await
+        .expect("cancellation lifecycle replay succeeds");
+    assert!(replayed_events.is_empty());
+    assert!(replayed_cleanup);
+    let retained = store
+        .workspace_resource_for_session(session_id)
+        .await
+        .expect("retained resource loads")
+        .expect("retained resource exists");
+    assert_eq!(retained.generation, workspace.generation);
+    assert_eq!(
+        retained.cleanup_mode,
+        Some(crate::WorkspaceCleanupMode::RetainSession)
+    );
+
+    assert!(store
+        .request_session_workspace_cleanup(session_id, crate::WorkspaceCleanupMode::DeleteSession,)
+        .await
+        .expect("delete request escalates existing cleanup"));
+    let escalated = store
+        .workspace_resource_for_session(session_id)
+        .await
+        .expect("escalated resource loads")
+        .expect("escalated resource exists");
+    assert_eq!(escalated.generation, workspace.generation);
+    assert_eq!(
+        escalated.cleanup_mode,
+        Some(crate::WorkspaceCleanupMode::DeleteSession)
+    );
+
+    assert!(store
+        .request_session_workspace_cleanup(session_id, crate::WorkspaceCleanupMode::RetainSession,)
+        .await
+        .expect("weaker repeat remains accepted"));
+    assert_eq!(
+        store
+            .workspace_resource_for_session(session_id)
+            .await
+            .expect("monotonic resource loads")
+            .expect("monotonic resource exists")
+            .cleanup_mode,
+        Some(crate::WorkspaceCleanupMode::DeleteSession)
+    );
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn deleting_offline_session_rejects_later_input_before_reconnect_cleanup() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "offline deletion admission test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let session_id = "offline-deleting-session";
+    let client_input_id = "input-after-delete";
+    let mut config = session_config(project_id);
+    config.workspace_id = "workspace-offline-deleting".to_string();
+    let workspace =
+        prepare_test_workspace(store, session_id, &config, WorkspaceOwnerKind::Root).await;
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            session_id,
+            &config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("initial input"),
+            None,
+            None,
+            None,
+            None,
+            Some(workspace.attachment()),
+        )
+        .await
+        .expect("session attaches while runtime is online");
+
+    assert!(store
+        .request_session_workspace_cleanup(session_id, crate::WorkspaceCleanupMode::DeleteSession)
+        .await
+        .expect("logical deletion persists while runtime is offline"));
+    let error = match store
+        .enqueue_user_input(
+            session_id,
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("must not be accepted"),
+            Some(client_input_id),
+            None,
+        )
+        .await
+    {
+        Ok(_) => panic!("deleting owner accepted later input"),
+        Err(error) => error,
+    };
+    assert!(error.downcast_ref::<crate::SessionDeleting>().is_some());
+    assert!(store
+        .find_client_input(session_id, client_input_id)
+        .await
+        .expect("client input lookup succeeds")
+        .is_none());
+
+    let reconnect_claim = store
+        .claim_due_workspace_deletions(Some(&config.runtime_id))
+        .await
+        .expect("runtime reconnect claims pending cleanup")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == session_id)
+        .expect("offline cleanup remains pending for reconnect");
+    assert!(store
+        .complete_workspace_cleanup(&reconnect_claim)
+        .await
+        .expect("reconnect cleanup completes"));
+    assert!(!store
+        .session_exists(session_id)
+        .await
+        .expect("deleted identity stays gone"));
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn root_cleanup_waits_for_full_and_offline_read_only_descendants() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "workspace descendant cleanup test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+
+    let root_id = "cleanup-tree-root";
+    let full_id = "cleanup-tree-full";
+    let read_only_id = "cleanup-tree-read-only";
+    let mut root_config = session_config(project_id);
+    root_config.workspace_id = "workspace-cleanup-tree-root".to_string();
+    let root_workspace =
+        prepare_test_workspace(store, root_id, &root_config, WorkspaceOwnerKind::Root).await;
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            root_id,
+            &root_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("root"),
+            None,
+            None,
+            None,
+            None,
+            Some(root_workspace.attachment()),
+        )
+        .await
+        .expect("root session attaches");
+
+    let full_delegation = store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: root_id,
+            launch_key: "cleanup-tree-full-launch",
+            launch_shape: r#"{"kind":"full","role":"implementer","prompt":"work"}"#,
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("full delegation creates");
+    let mut full_config = root_config.clone();
+    full_config.metadata = json!({ "delegation_spawn_index": 0 });
+    store
+        .start_session_outputs_with_parent(
+            full_id,
+            &full_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("full task"),
+            None,
+            Some(root_id),
+            Some(crate::SubagentType::Full),
+            Some(&full_delegation.id),
+        )
+        .await
+        .expect("full child creates");
+
+    let read_only_delegation = store
+        .create_delegation_idempotent(crate::CreateDelegationRequest {
+            parent_session_id: root_id,
+            launch_key: "cleanup-tree-read-only-launch",
+            launch_shape:
+                r#"{"kind":"readonly_fanout","tasks":[{"role":"reviewer","prompt":"inspect"}]}"#,
+            kind: DelegationKind::ReadonlyFanout,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("read-only delegation creates");
+    let mut read_only_config = root_config.clone();
+    read_only_config.workspace_id = "workspace-cleanup-tree-read-only".to_string();
+    read_only_config.metadata = json!({ "delegation_spawn_index": 0 });
+    let read_only_workspace = prepare_test_workspace(
+        store,
+        read_only_id,
+        &read_only_config,
+        WorkspaceOwnerKind::ReadOnly,
+    )
+    .await;
+    store
+        .start_session_outputs_with_parent_and_workspace(
+            read_only_id,
+            &read_only_config,
+            &[],
+            None,
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("read-only task"),
+            None,
+            Some(root_id),
+            Some(crate::SubagentType::ReadOnly),
+            Some(&read_only_delegation.id),
+            Some(read_only_workspace.attachment()),
+        )
+        .await
+        .expect("read-only child attaches");
+
+    let children = store
+        .request_session_tree_cleanup(root_id)
+        .await
+        .expect("whole tree deletion intent commits");
+    assert_eq!(children.len(), 2);
+    let rejected = match store
+        .enqueue_user_input(
+            root_id,
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("too late"),
+            Some("tree-delete-fenced-input"),
+            None,
+        )
+        .await
+    {
+        Ok(_) => panic!("root accepted input after tree deletion commit"),
+        Err(error) => error,
+    };
+    assert!(rejected.downcast_ref::<crate::SessionDeleting>().is_some());
+
+    let child_claim = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("eligible child cleanup claims")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == read_only_id)
+        .expect("read-only child claims before root");
+    store
+        .record_workspace_cleanup_failure(&child_claim, "runtime offline")
+        .await
+        .expect("offline child remains pending");
+    let root_resource = store
+        .workspace_resource_for_session(root_id)
+        .await
+        .expect("root resource loads")
+        .expect("root resource exists");
+    assert!(!store
+        .complete_workspace_cleanup(&root_resource)
+        .await
+        .expect("root finalization is durably blocked by descendants"));
+    assert!(store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("blocked root does not claim")
+        .is_empty());
+
+    store
+        .reconcile_workspace_resources()
+        .await
+        .expect("restart reconciliation prunes fenced full leaves");
+    assert!(!store
+        .session_exists(full_id)
+        .await
+        .expect("full child lookup"));
+    assert!(
+        store
+            .request_session_workspace_cleanup(
+                read_only_id,
+                crate::WorkspaceCleanupMode::DeleteSession,
+            )
+            .await
+            .expect("reconnect makes offline child immediately retryable")
+    );
+    let retried_child = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("retried child cleanup claims")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == read_only_id)
+        .expect("read-only child reclaims");
+    assert!(store
+        .complete_workspace_cleanup(&retried_child)
+        .await
+        .expect("read-only child cleanup completes"));
+
+    let root_claim = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("root becomes eligible after descendants disappear")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == root_id)
+        .expect("root cleanup claims last");
+    assert!(store
+        .complete_workspace_cleanup(&root_claim)
+        .await
+        .expect("root cleanup completes"));
+    assert!(!store
+        .session_exists(root_id)
+        .await
+        .expect("root identity is gone"));
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn workspace_reconciliation_adopts_exact_owner_and_retries_offline_cleanup() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "workspace recovery test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let mut config = session_config(project_id);
+    config.workspace_id = "workspace-recovery-private".to_string();
+    let prepared = prepare_test_workspace(
+        store,
+        "workspace-recovery-session",
+        &config,
+        WorkspaceOwnerKind::Root,
+    )
+    .await;
+    // Simulate a restart between session commit and attachment. Reconciliation
+    // adopts the exact identity immediately, without waiting for the lease or a
+    // second runtime Hello.
+    store
+        .create_session("workspace-recovery-session", &config)
+        .await
+        .expect("session commits without attachment");
+    store
+        .reconcile_workspace_resources()
+        .await
+        .expect("exact owner adopts");
+    let adopted = store
+        .workspace_resource_for_session("workspace-recovery-session")
+        .await
+        .expect("resource loads")
+        .expect("resource exists");
+    assert_eq!(adopted.state, crate::WorkspaceResourceState::Ready);
+
+    assert!(store
+        .request_workspace_cleanup_exact(
+            &prepared.owner_session_id,
+            &prepared.runtime_id,
+            &prepared.workspace_id,
+            &prepared.generation,
+            crate::WorkspaceCleanupMode::DeleteSession,
+        )
+        .await
+        .expect("cleanup persists"));
+    let claim = store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("cleanup claims")
+        .into_iter()
+        .find(|resource| resource.owner_session_id == "workspace-recovery-session")
+        .expect("resource claimed");
+    store
+        .record_workspace_cleanup_failure(&claim, "runtime unavailable")
+        .await
+        .expect("offline failure records");
+    let pending = store
+        .workspace_resource_for_session("workspace-recovery-session")
+        .await
+        .expect("pending resource loads")
+        .expect("pending resource exists");
+    assert_eq!(pending.state, crate::WorkspaceResourceState::Deleting);
+    assert!(store
+        .session_exists("workspace-recovery-session")
+        .await
+        .expect("identity retained while offline"));
+    assert!(store
+        .claim_due_workspace_deletions(None)
+        .await
+        .expect("immediate duplicate claim fenced")
+        .is_empty());
+
+    store
+        .begin_workspace_provisioning(
+            "workspace-abandoned-session",
+            &config.runtime_id,
+            "workspace-abandoned-private",
+            "workspace-abandoned-generation",
+            WorkspaceOwnerKind::Root,
+            1,
+        )
+        .await
+        .expect("abandoned provisioning intent persists");
+    store
+        .reconcile_workspace_resources()
+        .await
+        .expect("quick restart reconciliation runs before lease expiry");
+    assert_eq!(
+        store
+            .workspace_resource_for_session("workspace-abandoned-session")
+            .await
+            .expect("pre-expiry resource loads")
+            .expect("pre-expiry resource exists")
+            .state,
+        crate::WorkspaceResourceState::Provisioning
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    store
+        .reconcile_workspace_resources()
+        .await
+        .expect("periodic reconciliation expires lease without another Hello");
+    let abandoned = store
+        .workspace_resource_for_session("workspace-abandoned-session")
+        .await
+        .expect("abandoned resource loads")
+        .expect("abandoned resource exists");
+    assert_eq!(abandoned.state, crate::WorkspaceResourceState::Deleting);
+    db.cleanup().await;
 }
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
@@ -107,6 +971,13 @@ async fn create_fork_copies_full_forest_and_replay_without_mutating_source() {
         "first-finish".to_string(),
         "compaction".to_string(),
     ];
+    let workspace = prepare_test_workspace(
+        store,
+        "fork-child",
+        &child_config,
+        WorkspaceOwnerKind::HistoryFork,
+    )
+    .await;
 
     let result = store
         .create_fork(CreateForkRequest {
@@ -120,6 +991,7 @@ async fn create_fork_copies_full_forest_and_replay_without_mutating_source() {
                 expected_transcript_revision: Some(revision),
                 expected_active_branch_entry_ids: Some(&target_branch_ids),
             },
+            workspace: workspace.attachment(),
         })
         .await
         .expect("fork creates");
@@ -339,12 +1211,22 @@ async fn fork(
     config: &SessionConfig,
     target: HistoryTarget<'_>,
 ) -> anyhow::Result<()> {
+    let mut child_config = config.clone();
+    child_config.workspace_id = format!("test-history-fork-workspace-{child_session_id}");
+    let workspace = prepare_test_workspace(
+        store,
+        child_session_id,
+        &child_config,
+        WorkspaceOwnerKind::HistoryFork,
+    )
+    .await;
     store
         .create_fork(CreateForkRequest {
             source_session_id,
             child_session_id,
-            config,
+            config: &child_config,
             target,
+            workspace: workspace.attachment(),
         })
         .await
         .map(|_| ())

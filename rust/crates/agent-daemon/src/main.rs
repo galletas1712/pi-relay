@@ -21,6 +21,7 @@ mod session_start;
 mod state;
 mod subagents;
 mod types;
+mod workspace_lifecycle;
 mod workspace_selection;
 
 use crate::browser_websocket::{accept, handshake_semaphore, BrowserWebSocket};
@@ -106,20 +107,19 @@ async fn main() -> Result<()> {
     // Install before accepting runtime connections so a Hello that races boot
     // still redrives durable queued work that the one-shot boot sweep missed.
     install_runtime_online_queued_redrive(&state);
+    workspace_lifecycle::spawn_reconciler(&state);
+    delegation_tools::spawn_cancelling_delegation_reconciler(&state);
     tokio::spawn(runtime_hosts.listen(config.runtime_bind.clone()));
 
-    // Teardown owns every child of a cancelling delegation. Finish it before
-    // controls, action recovery, post-compaction recovery, or any other child
-    // driver can run. Fail startup closed if even one teardown cannot finish.
-    delegation_tools::reconcile_cancelling_delegations_on_boot(&state)
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "boot cancelling-delegation reconciliation failed: {}: {}",
-                error.code,
-                error.message
-            )
-        })?;
+    // Logical teardown is durable. Startup must remain available while a
+    // runtime is offline; periodic recovery will retry unfinished cancellation
+    // and the workspace worker independently finishes physical cleanup.
+    if let Err(error) = delegation_tools::reconcile_cancelling_delegations_on_boot(&state).await {
+        eprintln!(
+            "boot cancelling-delegation reconciliation remains pending: {}: {}",
+            error.code, error.message
+        );
+    }
 
     // Combined controls capture an exact unfinished child action generation.
     // Reconcile them before post-compaction recovery so a committed interrupt
@@ -910,7 +910,8 @@ async fn session_rename(state: &AppState, params: Value) -> std::result::Result<
     let events = state
         .repo
         .rename_session_manually(&session_id, &title)
-        .await?;
+        .await
+        .map_err(map_source_mutation_error)?;
     let config = state.repo.load_session_config(&session_id).await?;
     replace_active_session_config(state, &session_id, config.clone()).await;
     publish_events(state, events);
@@ -929,31 +930,14 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
         return Err(RpcError::new("session_not_found", "session not found"));
     }
 
-    let (child_session_ids, _drivers) =
-        lock_hidden_subagent_delete_tree(state, &session_id).await?;
+    let (_, _drivers) = lock_hidden_subagent_delete_tree(state, &session_id).await?;
 
-    let mut delete_order = child_session_ids.clone();
-    delete_order.reverse();
-    delete_order.push(session_id.clone());
-    for candidate_session_id in &delete_order {
-        state.active.lock().await.remove(candidate_session_id);
-        let deleted = state
-            .repo
-            .delete_session(candidate_session_id)
+    let child_session_ids =
+        crate::workspace_lifecycle::request_session_tree_cleanup(state, &session_id)
             .await
             .map_err(map_source_mutation_error)?;
-        if !deleted && candidate_session_id == &session_id {
-            return Err(RpcError::new("session_not_found", "session not found"));
-        }
-        if let Err(error) = state
-            .runtime_hosts
-            .destroy_session_workspaces(candidate_session_id)
-            .await
-        {
-            eprintln!(
-                "failed to remove session workspace state for {candidate_session_id}: {error:#}"
-            );
-        }
+    for candidate_session_id in child_session_ids.iter().chain(std::iter::once(&session_id)) {
+        state.active.lock().await.remove(candidate_session_id);
         state
             .provider_connections
             .remove_session(candidate_session_id)
@@ -1037,7 +1021,11 @@ async fn session_configure(
         metadata,
         mcp_manifest: current.mcp_manifest.clone(),
     };
-    let events = state.repo.configure_session(&session_id, &config).await?;
+    let events = state
+        .repo
+        .configure_session(&session_id, &config)
+        .await
+        .map_err(map_source_mutation_error)?;
     // Refresh non-provider session state while the active runtime retains the
     // immutable route captured for its open turn.
     replace_active_session_config(state, &session_id, config.clone()).await;
@@ -1219,6 +1207,11 @@ async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<V
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::new("session_required", "system.prompt requires session_id"))?;
+    state
+        .repo
+        .ensure_session_mutation_eligible(session_id)
+        .await
+        .map_err(map_source_mutation_error)?;
     let config = state.repo.load_session_config(session_id).await?;
     state
         .runtime_hosts
@@ -1415,6 +1408,17 @@ pub(crate) fn install_runtime_online_queued_redrive(state: &AppState) {
     state.runtime_hosts.set_on_online(Arc::new(move |runtime_id| {
         let state = state_for_hook.clone();
         tokio::spawn(async move {
+            if let Err(error) = crate::workspace_lifecycle::reconcile(&state, Some(&runtime_id)).await
+            {
+                eprintln!(
+                    "failed to reconcile private workspaces after runtime {runtime_id} came online: {error:#}"
+                );
+            }
+            crate::delegation_runner::recover_delegation_children_for_runtime(
+                &state,
+                &runtime_id,
+            )
+            .await;
             match state
                 .repo
                 .sessions_with_active_queued_inputs_for_runtime(Some(&runtime_id))

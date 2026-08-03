@@ -19,8 +19,9 @@ use super::queue_projection::{
 };
 use super::rows::row_text;
 use super::sql::{
-    lock_session_tx, queued_input_is_active, queued_input_is_editable, session_default_route_tx,
-    steering_route_tx, unfinished_generation_route_tx, QUEUED_INPUT_DISPATCH_ORDER,
+    lock_session_for_mutation_tx, queued_input_is_active, queued_input_is_editable,
+    session_default_route_tx, steering_route_tx, unfinished_generation_route_tx,
+    QUEUED_INPUT_DISPATCH_ORDER,
 };
 use super::PostgresAgentStore;
 
@@ -37,11 +38,11 @@ async fn lock_user_input_scope_tx(
             .fetch_optional(&mut **tx)
             .await?;
     let Some((parent_session_id, delegation_id)) = scope else {
-        lock_session_tx(tx, session_id).await?;
+        lock_session_for_mutation_tx(tx, session_id).await?;
         return Ok(());
     };
     let Some(delegation_id) = delegation_id else {
-        lock_session_tx(tx, session_id).await?;
+        lock_session_for_mutation_tx(tx, session_id).await?;
         return Ok(());
     };
     let parent_session_id =
@@ -50,13 +51,13 @@ async fn lock_user_input_scope_tx(
     // Match teardown's global parent -> delegation -> child lock order. The
     // child binding is immutable, but re-read it under the child lock so this
     // trust-boundary check never relies on the optimistic scope read alone.
-    lock_session_tx(tx, &parent_session_id).await?;
+    lock_session_for_mutation_tx(tx, &parent_session_id).await?;
     let status: String =
         sqlx::query_scalar("select status from delegations where id=$1 for update")
             .bind(&delegation_id)
             .fetch_one(&mut **tx)
             .await?;
-    lock_session_tx(tx, session_id).await?;
+    lock_session_for_mutation_tx(tx, session_id).await?;
     let bound_delegation: Option<String> =
         sqlx::query_scalar("select delegation_id from sessions where id=$1")
             .bind(session_id)
@@ -319,7 +320,7 @@ impl PostgresAgentStore {
         input_id: &str,
     ) -> Result<PromoteQueuedInputResult> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let generation_route = unfinished_generation_route_tx(&mut tx, session_id).await?;
         let editable_queue = queued_input_is_editable(None);
         let query = format!(
@@ -410,7 +411,7 @@ impl PostgresAgentStore {
         expected_queue_revision: Option<i64>,
     ) -> Result<UpdateQueuedInputResult> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         if revision_mismatch_tx(&mut tx, session_id, expected_queue_revision).await? {
             let queue = queue_state_tx(&mut tx, session_id).await?;
             tx.commit().await?;
@@ -524,7 +525,7 @@ impl PostgresAgentStore {
         expected_queue_revision: Option<i64>,
     ) -> Result<CancelQueuedInputResult> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         if revision_mismatch_tx(&mut tx, session_id, expected_queue_revision).await? {
             let queue = queue_state_tx(&mut tx, session_id).await?;
             tx.commit().await?;
@@ -620,7 +621,7 @@ impl PostgresAgentStore {
         expected_queue_revision: Option<i64>,
     ) -> Result<ReorderQueuedFollowUpsResult> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         if revision_mismatch_tx(&mut tx, session_id, expected_queue_revision).await? {
             let queue = queue_state_tx(&mut tx, session_id).await?;
             let current = queued_follow_up_ids_from_state(&queue);
@@ -754,7 +755,7 @@ impl PostgresAgentStore {
 
     pub async fn reset_abandoned_consuming_inputs(&self, session_id: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let updated = sqlx::query(
             r#"
                 update queued_inputs
@@ -786,7 +787,7 @@ impl PostgresAgentStore {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
-        lock_session_tx(&mut tx, session_id).await?;
+        lock_session_for_mutation_tx(&mut tx, session_id).await?;
         let updated = sqlx::query(
             r#"
                 update queued_inputs

@@ -914,6 +914,30 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[tokio::test]
+    async fn cwd_mutation_guard_serializes_only_the_same_workspace() {
+        let root = temp_dir("cwd-mutation-guard");
+        let manager = WorkspaceManager::new(root.clone(), root.clone(), root);
+        let held = manager.acquire_cwd_mutation_guard("workspace-a").await;
+
+        let mut same_workspace = Box::pin(manager.acquire_cwd_mutation_guard("workspace-a"));
+        assert!(
+            futures_util::poll!(same_workspace.as_mut()).is_pending(),
+            "create and destroy for one workspace must not overlap"
+        );
+        let mut other_workspace = Box::pin(manager.acquire_cwd_mutation_guard("workspace-b"));
+        assert!(
+            futures_util::poll!(other_workspace.as_mut()).is_ready(),
+            "unrelated workspace mutations remain independent"
+        );
+
+        drop(held);
+        assert!(
+            futures_util::poll!(same_workspace.as_mut()).is_ready(),
+            "the next same-workspace mutation proceeds after the guard drops"
+        );
+    }
+
     /// The session copy reads the base tree after `refresh_workspace_base`
     /// returns, so `WorkspaceBase` carries the slot guard. Polling directly
     /// keeps this deterministic: a contended acquire must be `Pending` while the

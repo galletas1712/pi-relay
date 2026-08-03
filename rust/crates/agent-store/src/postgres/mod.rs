@@ -21,6 +21,7 @@ mod sql;
 mod token_usage;
 mod transcript;
 mod turn_cards;
+mod workspace_resources;
 
 pub use delegations::{
     CreateDelegationRequest, Delegation, DelegationLaunchGuard, DelegationProgress,
