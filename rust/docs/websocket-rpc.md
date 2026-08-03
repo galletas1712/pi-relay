@@ -1957,20 +1957,23 @@ is exclusive.
 }
 ```
 
-`limit` defaults to 200 and is capped at 500. Directories with more than 10,000
-immediate children are rejected. Non-UTF-8 child names fail the listing.
+`limit` defaults to 200 and is capped at 500. Clients page with `after_name` /
+`next_after_name`. Non-UTF-8 child names fail the listing.
 
 ### `workspace.read_file`
 
-Bounded prefix read of a regular file under the selected session cwd. Content is
-always base64. `max_bytes` defaults to 256 KiB and is capped at 1 MiB. There is
-no offset protocol.
+Bounded range read of a regular file under the selected session cwd. Content is
+always base64. `offset` defaults to `0`. `max_bytes` is the **chunk length**
+(default 1 MiB, capped at 4 MiB so each response fits under the 8 MiB websocket
+frame). There is no whole-file size reject: clients download by looping
+`offset += byte_len` until `eof` is true, then cache locally.
 
 ```json
 {
   "session_id": "session_...",
   "path": "README.md",
-  "max_bytes": 262144
+  "offset": 0,
+  "max_bytes": 1048576
 }
 ```
 
@@ -1985,8 +1988,8 @@ no offset protocol.
 }
 ```
 
-`total_size` is required. `byte_len` is the decoded prefix length; `eof` reports
-whether that prefix reached the observed file size.
+`total_size` is required. `byte_len` is the decoded chunk length; `eof` reports
+whether `offset + byte_len` reached the observed file size.
 
 ### `workspace.watch`
 

@@ -3973,6 +3973,11 @@ pre {
 	font-size: var(--text-sm);
 }
 
+.files-tree-load-more {
+	color: var(--muted);
+	font-style: italic;
+}
+
 .file-pane {
 	display: flex;
 	min-width: 0;

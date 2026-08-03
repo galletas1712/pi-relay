@@ -112,6 +112,7 @@ export interface ListWorkspaceDirParams {
 export interface ReadWorkspaceFileParams {
 	sessionId: string;
 	path: string;
+	offset?: number;
 	maxBytes?: number;
 }
 
@@ -844,6 +845,7 @@ class AgentApiClient implements AgentApi {
 		return this.client.request<WorkspaceFilePrefix>("workspace.read_file", {
 			session_id: params.sessionId,
 			path: params.path,
+			offset: params.offset ?? 0,
 			max_bytes: params.maxBytes,
 		});
 	}

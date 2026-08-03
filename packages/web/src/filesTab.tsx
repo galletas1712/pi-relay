@@ -8,7 +8,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { ChevronRight, File, Folder, FolderOpen, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AgentApi } from "./agentApi.ts";
-import { fetchWorkspaceDir, workspaceDirQueryKey } from "./fileBrowser.ts";
+import {
+	fetchWorkspaceDir,
+	mergeWorkspaceDirPage,
+	workspaceDirQueryKey,
+} from "./fileBrowser.ts";
 import { joinBrowsePath } from "./filePath.ts";
 import type { WorkspaceDirEntry, WorkspaceDirListing } from "./types.ts";
 
@@ -62,6 +66,8 @@ export function FilesTab({
 	sessionIdRef.current = sessionId;
 	const prevActivity = useRef(activity);
 	const [expandedItems, setExpandedItems] = useState<string[]>([]);
+	const [loadingMore, setLoadingMore] = useState<string | null>(null);
+	const [listingEpoch, setListingEpoch] = useState(0);
 
 	const loadChildren = useCallback(
 		async (itemId: string): Promise<{ id: string; data: TreeItemData }[]> => {
@@ -70,7 +76,10 @@ export function FilesTab({
 			const path = pathFromItemId(itemId);
 			const listing = await queryClient.fetchQuery({
 				queryKey: workspaceDirQueryKey(sid, path, null),
-				queryFn: () => fetchWorkspaceDir(api, sid, path),
+				queryFn: async () => {
+					const page = await fetchWorkspaceDir(api, sid, path);
+					return mergeWorkspaceDirPage(undefined, page);
+				},
 				staleTime: 5_000,
 			});
 			return listing.entries.map((entry) => {
@@ -155,9 +164,51 @@ export function FilesTab({
 		tree.rebuildTree();
 	}, [treeEpoch, tree]);
 
+	useEffect(() => {
+		if (listingEpoch === 0) return;
+		tree.rebuildTree();
+	}, [listingEpoch, tree]);
+
+	const loadMore = useCallback(
+		async (dirPath: string) => {
+			if (!sessionId || remoteReadBlockedReason) return;
+			const key = workspaceDirQueryKey(sessionId, dirPath, null);
+			const current = queryClient.getQueryData<WorkspaceDirListing>(key);
+			const afterName = current?.next_after_name;
+			if (!afterName) return;
+			setLoadingMore(dirPath);
+			try {
+				const page = await fetchWorkspaceDir(api, sessionId, dirPath, afterName);
+				queryClient.setQueryData<WorkspaceDirListing>(key, (previous) =>
+					mergeWorkspaceDirPage(previous, page),
+				);
+				setListingEpoch((epoch) => epoch + 1);
+			} finally {
+				setLoadingMore(null);
+			}
+		},
+		[api, queryClient, remoteReadBlockedReason, sessionId],
+	);
+
 	const items = tree.getItems();
 	const canBrowse = Boolean(sessionId) && !remoteReadBlockedReason;
 	const selectedSet = useMemo(() => new Set(selectedPath ? [selectedPath] : []), [selectedPath]);
+
+	const nextAfterByDir = useMemo(() => {
+		const map = new Map<string, string>();
+		if (!sessionId) return map;
+		const dirs = new Set<string>([""]);
+		for (const itemId of expandedItems) {
+			if (itemId !== ROOT_ID) dirs.add(pathFromItemId(itemId));
+		}
+		for (const dir of dirs) {
+			const listing = queryClient.getQueryData<WorkspaceDirListing>(
+				workspaceDirQueryKey(sessionId, dir, null),
+			);
+			if (listing?.next_after_name) map.set(dir, listing.next_after_name);
+		}
+		return map;
+	}, [expandedItems, listingEpoch, queryClient, sessionId, treeEpoch]);
 
 	return (
 		<div className="files-tab">
@@ -184,7 +235,7 @@ export function FilesTab({
 				<p className="muted files-tab-empty">{remoteReadBlockedReason}</p>
 			) : (
 				<div {...tree.getContainerProps("Files")} className="files-tree">
-					{items.map((item) => {
+					{items.map((item, index) => {
 						const data = item.getItemData();
 						if (!data || data.kind === "root") return null;
 						const meta = item.getItemMeta();
@@ -193,43 +244,62 @@ export function FilesTab({
 						const isFolder = data.kind === "directory";
 						const disabled = data.kind === "other";
 						const itemProps = item.getProps();
+						const parentPath = pathFromItemId(meta.parentId ?? ROOT_ID);
+						const nextSibling = items[index + 1];
+						const nextParent = nextSibling
+							? pathFromItemId(nextSibling.getItemMeta().parentId ?? ROOT_ID)
+							: null;
+						const showLoadMore =
+							nextAfterByDir.has(parentPath) && nextParent !== parentPath;
 						return (
-							<button
-								key={item.getId()}
-								{...itemProps}
-								type="button"
-								className={`files-tree-item${selected ? " selected" : ""}${disabled ? " disabled" : ""}`}
-								style={{ paddingLeft: `${10 + meta.level * 12}px` }}
-								disabled={disabled}
-								onClick={(event) => {
-									itemProps.onClick?.(event);
-									if (isFolder) {
-										if (expanded) item.collapse();
-										else void item.expand();
-										return;
-									}
-									if (data.kind === "file") onSelectFile(data.path);
-								}}
-							>
-								<span className="files-tree-twist" aria-hidden>
-									{isFolder ? (
-										<ChevronRight
-											size={12}
-											className={expanded ? "files-tree-twist-open" : undefined}
-										/>
-									) : (
-										<span className="files-tree-twist-spacer" />
-									)}
-								</span>
-								<span className="files-tree-icon" aria-hidden>
-									{isFolder ? (
-										expanded ? <FolderOpen size={14} /> : <Folder size={14} />
-									) : (
-										<File size={14} />
-									)}
-								</span>
-								<span className="files-tree-name">{data.name}</span>
-							</button>
+							<div key={item.getId()}>
+								<button
+									{...itemProps}
+									type="button"
+									className={`files-tree-item${selected ? " selected" : ""}${disabled ? " disabled" : ""}`}
+									style={{ paddingLeft: `${10 + meta.level * 12}px` }}
+									disabled={disabled}
+									onClick={(event) => {
+										itemProps.onClick?.(event);
+										if (isFolder) {
+											if (expanded) item.collapse();
+											else void item.expand();
+											return;
+										}
+										if (data.kind === "file") onSelectFile(data.path);
+									}}
+								>
+									<span className="files-tree-twist" aria-hidden>
+										{isFolder ? (
+											<ChevronRight
+												size={12}
+												className={expanded ? "files-tree-twist-open" : undefined}
+											/>
+										) : (
+											<span className="files-tree-twist-spacer" />
+										)}
+									</span>
+									<span className="files-tree-icon" aria-hidden>
+										{isFolder ? (
+											expanded ? <FolderOpen size={14} /> : <Folder size={14} />
+										) : (
+											<File size={14} />
+										)}
+									</span>
+									<span className="files-tree-name">{data.name}</span>
+								</button>
+								{showLoadMore ? (
+									<button
+										type="button"
+										className="files-tree-item files-tree-load-more"
+										style={{ paddingLeft: `${10 + meta.level * 12}px` }}
+										disabled={loadingMore === parentPath}
+										onClick={() => void loadMore(parentPath)}
+									>
+										{loadingMore === parentPath ? "Loading…" : "Load more"}
+									</button>
+								) : null}
+							</div>
 						);
 					})}
 				</div>

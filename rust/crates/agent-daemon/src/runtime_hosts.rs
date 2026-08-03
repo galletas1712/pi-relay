@@ -626,6 +626,7 @@ impl RuntimeRegistry {
         runtime_id: &str,
         workspace_id: &str,
         path: &str,
+        offset: u64,
         max_bytes: u32,
     ) -> Result<RuntimeCommandResult> {
         self.execute(
@@ -633,6 +634,7 @@ impl RuntimeRegistry {
             RuntimeCommand::BrowseReadFile {
                 workspace_id: workspace_id.to_string(),
                 path: path.to_string(),
+                offset,
                 max_bytes,
             },
             None,
@@ -1086,8 +1088,9 @@ pub(crate) mod test_support {
             RuntimeCommand::BrowseReadFile {
                 workspace_id,
                 path,
+                offset,
                 max_bytes,
-            } => fake_browse_read_file(dirs, &workspace_id, &path, max_bytes).await,
+            } => fake_browse_read_file(dirs, &workspace_id, &path, offset, max_bytes).await,
             RuntimeCommand::BrowseWatch { .. } => Ok(RuntimeCommandResult::Ack),
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
@@ -1263,9 +1266,11 @@ pub(crate) mod test_support {
         dirs: &Arc<TokioMutex<HashMap<String, std::path::PathBuf>>>,
         workspace_id: &str,
         path: &str,
+        offset: u64,
         max_bytes: u32,
     ) -> std::result::Result<RuntimeCommandResult, RuntimeCommandError> {
         use base64::Engine as _;
+        use std::io::{Read, Seek, SeekFrom};
         use std::os::unix::fs::MetadataExt;
         let cwd = fake_workspace_dir(dirs, workspace_id).await;
         let target = cwd.join(path);
@@ -1279,15 +1284,27 @@ pub(crate) mod test_support {
             ));
         }
         let max_bytes = if max_bytes == 0 {
-            256 * 1024
+            1024 * 1024
         } else {
-            max_bytes.min(1024 * 1024)
-        } as usize;
+            max_bytes.min(4 * 1024 * 1024)
+        } as u64;
+        if offset > meta.len() {
+            return Err(RuntimeCommandError::new(
+                "browse_error",
+                "offset is past end of file",
+            ));
+        }
+        let to_read = max_bytes.min(meta.len() - offset) as usize;
         let mut file = std::fs::File::open(&target).map_err(|error| {
             RuntimeCommandError::new("browse_error", format!("open failed: {error}"))
         })?;
-        let mut buf = vec![0_u8; max_bytes.min(meta.len() as usize)];
-        let read = std::io::Read::read(&mut file, &mut buf).map_err(|error| {
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset)).map_err(|error| {
+                RuntimeCommandError::new("browse_error", format!("seek failed: {error}"))
+            })?;
+        }
+        let mut buf = vec![0_u8; to_read];
+        let read = file.read(&mut buf).map_err(|error| {
             RuntimeCommandError::new("browse_error", format!("read failed: {error}"))
         })?;
         buf.truncate(read);
@@ -1296,7 +1313,7 @@ pub(crate) mod test_support {
             content_base64: base64::engine::general_purpose::STANDARD.encode(&buf),
             byte_len: read as u64,
             total_size: meta.len(),
-            eof: (read as u64) >= meta.len(),
+            eof: offset + (read as u64) >= meta.len(),
             mtime_ms: meta.mtime().checked_mul(1000).map(|v| v as u64),
         })
     }

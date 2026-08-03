@@ -62,10 +62,12 @@ Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar
 - Compose and submit input, manage the queued-follow-up pane, and expose slash commands.
 - Browse the selected session cwd from the Files inspector tab and preview
   Markdown/code/images in the center file pane via `workspace.list_dir` /
-  `workspace.read_file`. The UI registers `workspace.watch` interest for
-  currently expanded tree directories (name/presence) and the open file
-  (contents), then invalidates those queries on ephemeral `workspace.fs_changed`
-  events.
+  `workspace.read_file`. Directory listings accumulate pages with a Load more
+  control. Opening a file downloads it in websocket-sized chunks into an
+  in-memory cache (pinned while open; 8 GiB / 16-entry LRU for unpinned
+  history). The UI registers `workspace.watch` interest for currently expanded
+  tree directories (name/presence) and the open file (contents), then invalidates
+  those queries on ephemeral `workspace.fs_changed` events.
 
 ## Data layer
 

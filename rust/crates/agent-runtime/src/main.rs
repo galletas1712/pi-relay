@@ -592,11 +592,12 @@ impl Runtime {
             RuntimeCommand::BrowseReadFile {
                 workspace_id,
                 path,
+                offset,
                 max_bytes,
             } => {
                 let prefix = self
                     .workspaces
-                    .browse_read_file(&workspace_id, &path, max_bytes)
+                    .browse_read_file(&workspace_id, &path, offset, max_bytes)
                     .await?;
                 Ok(RuntimeCommandResult::FilePrefix {
                     path: prefix.path,

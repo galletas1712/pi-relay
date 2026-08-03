@@ -104,7 +104,11 @@ import {
 } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
-import { workspaceFileQueryKey } from "./fileBrowser.ts";
+import {
+	invalidateCachedWorkspaceFile,
+	workspaceFileQueryKey,
+} from "./fileBrowser.ts";
+import { workspaceFileCache } from "./workspaceFileCache.ts";
 import { isDelegationRunning } from "./delegationBoard.ts";
 import { DelegationListRetryController } from "./delegationListRetryController.ts";
 import {
@@ -2692,6 +2696,7 @@ export function App({
 					});
 				}
 				for (const path of files) {
+					invalidateCachedWorkspaceFile(event.session_id, path);
 					void queryClient.invalidateQueries({
 						queryKey: workspaceFileQueryKey(event.session_id, path),
 					});
@@ -4440,6 +4445,7 @@ export function App({
 	const previousSelectedIdForFileRef = useRef(selectedId);
 	useEffect(() => {
 		if (previousSelectedIdForFileRef.current === selectedId) return;
+		const previousSessionId = previousSelectedIdForFileRef.current;
 		previousSelectedIdForFileRef.current = selectedId;
 		setSelectedFilePath((current) => {
 			if (current == null) return current;
@@ -4448,6 +4454,9 @@ export function App({
 		});
 		setInspectorPreferredTab(null);
 		setFilesVisibleDirectories([]);
+		if (previousSessionId) {
+			workspaceFileCache.clearSession(previousSessionId);
+		}
 	}, [selectedId]);
 
 	useEffect(() => {

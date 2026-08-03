@@ -17,9 +17,8 @@ use cap_std::{
 
 pub const DEFAULT_LIST_LIMIT: u32 = 200;
 pub const MAX_LIST_LIMIT: u32 = 500;
-pub const MAX_DIR_CHILDREN: usize = 10_000;
-pub const DEFAULT_READ_BYTES: u32 = 256 * 1024;
-pub const MAX_READ_BYTES: u32 = 1024 * 1024;
+pub const DEFAULT_CHUNK_BYTES: u32 = 1024 * 1024;
+pub const MAX_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirEntryKind {
@@ -158,9 +157,6 @@ pub fn list_dir(cwd: &Path, path: &str, after_name: Option<&str>, limit: u32) ->
             size,
             mtime_ms: mtime_ms(&meta),
         });
-        if entries.len() > MAX_DIR_CHILDREN {
-            bail!("directory has more than {MAX_DIR_CHILDREN} entries");
-        }
     }
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -189,12 +185,17 @@ pub fn list_dir(cwd: &Path, path: &str, after_name: Option<&str>, limit: u32) ->
     })
 }
 
-pub fn read_file_prefix(cwd: &Path, path: &str, max_bytes: u32) -> Result<FilePrefix> {
+pub fn read_file_range(
+    cwd: &Path,
+    path: &str,
+    offset: u64,
+    max_bytes: u32,
+) -> Result<FilePrefix> {
     let normalized = validate_browse_path(path)?;
     if normalized.is_empty() {
         bail!("path must name a regular file");
     }
-    let max_bytes = clamp_read_bytes(max_bytes);
+    let max_bytes = clamp_chunk_bytes(max_bytes);
     let root = open_cwd(cwd)?;
     let root_dev = root.dir_metadata()?.dev();
 
@@ -226,7 +227,15 @@ pub fn read_file_prefix(cwd: &Path, path: &str, max_bytes: u32) -> Result<FilePr
     }
 
     let total_size = opened.len();
-    let to_read = (max_bytes as u64).min(total_size) as usize;
+    if offset > total_size {
+        bail!("offset is past end of file");
+    }
+    let remaining = total_size - offset;
+    let to_read = (max_bytes as u64).min(remaining) as usize;
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("seek file {normalized}"))?;
+    }
     let mut buf = vec![0_u8; to_read];
     let mut read_total = 0usize;
     while read_total < to_read {
@@ -238,15 +247,13 @@ pub fn read_file_prefix(cwd: &Path, path: &str, max_bytes: u32) -> Result<FilePr
         }
     }
     buf.truncate(read_total);
-    // Leave the cursor defined for callers that inspect the handle later.
-    let _ = file.seek(SeekFrom::Start(read_total as u64));
 
     Ok(FilePrefix {
         path: normalized,
         content_base64: BASE64.encode(&buf),
         byte_len: read_total as u64,
         total_size,
-        eof: (read_total as u64) >= total_size,
+        eof: offset + (read_total as u64) >= total_size,
         mtime_ms: mtime_ms(&opened),
     })
 }
@@ -314,11 +321,11 @@ fn clamp_list_limit(limit: u32) -> u32 {
     }
 }
 
-fn clamp_read_bytes(max_bytes: u32) -> u32 {
+fn clamp_chunk_bytes(max_bytes: u32) -> u32 {
     if max_bytes == 0 {
-        DEFAULT_READ_BYTES
+        DEFAULT_CHUNK_BYTES
     } else {
-        max_bytes.min(MAX_READ_BYTES)
+        max_bytes.min(MAX_CHUNK_BYTES)
     }
 }
 
@@ -363,12 +370,12 @@ mod tests {
         assert!(names.contains(&"src"));
         assert!(names.contains(&".pi-handoff"));
 
-        let file = read_file_prefix(dir.path(), "README.md", 1024).unwrap();
+        let file = read_file_range(dir.path(), "README.md", 0, 1024).unwrap();
         assert_eq!(file.byte_len, 5);
         assert!(file.eof);
         assert_eq!(BASE64.decode(&file.content_base64).unwrap(), b"# hi\n");
 
-        let handoff = read_file_prefix(dir.path(), ".pi-handoff/note.md", 1024).unwrap();
+        let handoff = read_file_range(dir.path(), ".pi-handoff/note.md", 0, 1024).unwrap();
         assert_eq!(BASE64.decode(&handoff.content_base64).unwrap(), b"handoff\n");
     }
 
@@ -384,7 +391,7 @@ mod tests {
         let link = listing.entries.iter().find(|e| e.name == "link.txt").unwrap();
         assert_eq!(link.kind, DirEntryKind::Other);
 
-        assert!(read_file_prefix(dir.path(), "link.txt", 1024).is_err());
+        assert!(read_file_range(dir.path(), "link.txt", 0, 1024).is_err());
         assert!(list_dir(dir.path(), "subdir/up", None, 200).is_err());
     }
 
@@ -417,13 +424,17 @@ mod tests {
     }
 
     #[test]
-    fn truncates_large_files() {
+    fn reads_file_ranges() {
         let dir = tempdir().unwrap();
         let body = vec![b'x'; 100];
         std::fs::write(dir.path().join("big.bin"), &body).unwrap();
-        let prefix = read_file_prefix(dir.path(), "big.bin", 16).unwrap();
+        let prefix = read_file_range(dir.path(), "big.bin", 0, 16).unwrap();
         assert_eq!(prefix.byte_len, 16);
         assert_eq!(prefix.total_size, 100);
         assert!(!prefix.eof);
+        let mid = read_file_range(dir.path(), "big.bin", 90, 16).unwrap();
+        assert_eq!(mid.byte_len, 10);
+        assert!(mid.eof);
+        assert_eq!(BASE64.decode(&mid.content_base64).unwrap(), vec![b'x'; 10]);
     }
 }

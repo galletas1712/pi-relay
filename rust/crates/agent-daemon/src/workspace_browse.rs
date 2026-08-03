@@ -33,6 +33,8 @@ struct ReadFileParams {
     session_id: String,
     path: String,
     #[serde(default)]
+    offset: u64,
+    #[serde(default)]
     max_bytes: Option<u32>,
 }
 
@@ -98,6 +100,7 @@ pub(crate) async fn read_file(state: &AppState, params: Value) -> Result<Value, 
             &config.runtime_id,
             &config.workspace_id,
             &params.path,
+            params.offset,
             max_bytes,
         )
         .await

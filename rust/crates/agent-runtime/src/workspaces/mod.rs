@@ -147,11 +147,12 @@ impl WorkspaceManager {
         &self,
         workspace_id: &str,
         path: &str,
+        offset: u64,
         max_bytes: u32,
     ) -> Result<fs::FilePrefix> {
         let cwd = self.resolve(workspace_id);
         let path = path.to_string();
-        tokio::task::spawn_blocking(move || fs::read_file_prefix(&cwd, &path, max_bytes))
+        tokio::task::spawn_blocking(move || fs::read_file_range(&cwd, &path, offset, max_bytes))
             .await
             .context("browse read_file task failed")?
     }

@@ -1,10 +1,10 @@
-import { memo, useMemo } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
-import { bytesToUtf8Prefix, decodeBase64 } from "./fileBrowser.ts";
-import type { WorkspaceFilePrefix } from "./types.ts";
+import { bytesToUtf8Prefix } from "./fileBrowser.ts";
+import type { CachedWorkspaceFile } from "./workspaceFileCache.ts";
 import { browsePathBasename, joinBrowsePath, parentBrowsePath, validateBrowsePath } from "./filePath.ts";
 
 const MARKDOWN_EXTENSIONS = new Set(["md", "markdown"]);
@@ -47,7 +47,6 @@ const CODE_EXTENSIONS: Record<string, string> = {
 const TEXT_RENDER_CAP = 256 * 1024;
 const HIGHLIGHT_CAP = 64 * 1024;
 const MARKDOWN_PARSE_CAP = 128 * 1024;
-const IMAGE_MAX = 1024 * 1024;
 
 function extensionOf(path: string): string {
 	const base = browsePathBasename(path);
@@ -155,22 +154,30 @@ export const FileView = memo(function FileView({
 	file,
 	onNavigate,
 }: {
-	file: WorkspaceFilePrefix;
+	file: CachedWorkspaceFile;
 	onNavigate?: (path: string) => void;
 }) {
-	const bytes = useMemo(() => decodeBase64(file.content_base64), [file.content_base64]);
+	const bytes = file.bytes;
 	const ext = extensionOf(file.path);
+	const mime = IMAGE_EXTENSIONS.has(ext) ? sniffRasterMime(bytes) : null;
+	const [imageUrl, setImageUrl] = useState<string | null>(null);
 
-	if (IMAGE_EXTENSIONS.has(ext) && file.eof && file.total_size <= IMAGE_MAX) {
-		const mime = sniffRasterMime(bytes);
-		if (mime) {
-			const dataUrl = `data:${mime};base64,${file.content_base64}`;
-			return (
-				<div className="file-image-view">
-					<img src={dataUrl} alt={browsePathBasename(file.path)} />
-				</div>
-			);
+	useEffect(() => {
+		if (!mime) {
+			setImageUrl(null);
+			return;
 		}
+		const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: mime }));
+		setImageUrl(url);
+		return () => URL.revokeObjectURL(url);
+	}, [bytes, mime]);
+
+	if (mime && imageUrl) {
+		return (
+			<div className="file-image-view">
+				<img src={imageUrl} alt={browsePathBasename(file.path)} />
+			</div>
+		);
 	}
 
 	if (MARKDOWN_EXTENSIONS.has(ext)) {
@@ -185,6 +192,7 @@ export const FileView = memo(function FileView({
 		const language = CODE_EXTENSIONS[ext];
 		const highlightSource =
 			decoded.text.length > HIGHLIGHT_CAP ? decoded.text.slice(0, HIGHLIGHT_CAP) : decoded.text;
+		const truncatedDisplay = bytes.byteLength > TEXT_RENDER_CAP || highlightSource.length < decoded.text.length;
 		if (language) {
 			return (
 				<div className="file-code-view">
@@ -196,10 +204,10 @@ export const FileView = memo(function FileView({
 							</ReactMarkdown>
 						</div>
 					</pre>
-					{!file.eof || decoded.text.length > HIGHLIGHT_CAP ? (
+					{truncatedDisplay ? (
 						<p className="muted file-truncated-note">
-							Showing first {Math.min(file.byte_len, HIGHLIGHT_CAP).toLocaleString()} of{" "}
-							{file.total_size.toLocaleString()} bytes.
+							Showing first {Math.min(bytes.byteLength, HIGHLIGHT_CAP).toLocaleString()} of{" "}
+							{file.totalSize.toLocaleString()} bytes.
 						</p>
 					) : null}
 				</div>
@@ -208,9 +216,9 @@ export const FileView = memo(function FileView({
 		return (
 			<div className="file-text-view">
 				<pre className="file-text-pre">{decoded.text.slice(0, TEXT_RENDER_CAP)}</pre>
-				{!file.eof ? (
+				{bytes.byteLength > TEXT_RENDER_CAP ? (
 					<p className="muted file-truncated-note">
-						Showing first {file.byte_len.toLocaleString()} of {file.total_size.toLocaleString()} bytes.
+						Showing first {TEXT_RENDER_CAP.toLocaleString()} of {file.totalSize.toLocaleString()} bytes.
 					</p>
 				) : null}
 			</div>
@@ -221,8 +229,8 @@ export const FileView = memo(function FileView({
 		<div className="file-unavailable">
 			<p className="muted">Preview unavailable.</p>
 			<p className="muted">
-				{file.total_size.toLocaleString()} bytes
-				{file.mtime_ms ? ` · mtime ${new Date(file.mtime_ms).toLocaleString()}` : ""}
+				{file.totalSize.toLocaleString()} bytes
+				{file.mtimeMs ? ` · mtime ${new Date(file.mtimeMs).toLocaleString()}` : ""}
 			</p>
 		</div>
 	);

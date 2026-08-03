@@ -167,10 +167,11 @@ pub enum RuntimeCommand {
         after_name: Option<String>,
         limit: u32,
     },
-    /// Bounded prefix read of a regular file under the session cwd.
+    /// Bounded range read of a regular file under the session cwd.
     BrowseReadFile {
         workspace_id: String,
         path: String,
+        offset: u64,
         max_bytes: u32,
     },
     /// Replace the watched interest set for this workspace cwd. Empty

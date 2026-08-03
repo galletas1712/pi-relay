@@ -1,9 +1,15 @@
 import { ArrowLeft, RefreshCw, X } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { fetchWorkspaceFile, workspaceFileQueryKey } from "./fileBrowser.ts";
+import { useEffect } from "react";
+import {
+	invalidateCachedWorkspaceFile,
+	loadCachedWorkspaceFile,
+	workspaceFileQueryKey,
+} from "./fileBrowser.ts";
 import { FileView } from "./fileView.tsx";
 import type { AgentApi } from "./agentApi.ts";
 import { browsePathBasename } from "./filePath.ts";
+import { workspaceFileCache } from "./workspaceFileCache.ts";
 
 export interface FilePaneProps {
 	api: AgentApi;
@@ -27,10 +33,18 @@ export function FilePane({
 	const queryClient = useQueryClient();
 	const query = useQuery({
 		queryKey: workspaceFileQueryKey(sessionId, path),
-		queryFn: () => fetchWorkspaceFile(api, sessionId, path),
+		queryFn: () => loadCachedWorkspaceFile(api, sessionId, path),
 		enabled: !remoteReadBlockedReason,
-		staleTime: 5_000,
+		staleTime: Infinity,
+		gcTime: 0,
 	});
+
+	useEffect(() => {
+		workspaceFileCache.pin(sessionId, path);
+		return () => {
+			workspaceFileCache.unpin(sessionId, path);
+		};
+	}, [sessionId, path]);
 
 	return (
 		<section className="file-pane" data-slot="file-pane" aria-label="File preview">
@@ -53,6 +67,7 @@ export function FilePane({
 						title="Refresh file"
 						disabled={Boolean(remoteReadBlockedReason) || query.isFetching}
 						onClick={() => {
+							invalidateCachedWorkspaceFile(sessionId, path);
 							void queryClient.invalidateQueries({ queryKey: workspaceFileQueryKey(sessionId, path) });
 						}}
 					>
@@ -75,9 +90,10 @@ export function FilePane({
 				) : query.data ? (
 					<>
 						<div className="file-pane-meta muted">
-							{query.data.byte_len.toLocaleString()}
-							{query.data.eof ? "" : "+"} / {query.data.total_size.toLocaleString()} bytes
-							{query.data.mtime_ms ? ` · ${new Date(query.data.mtime_ms).toLocaleString()}` : ""}
+							{query.data.bytes.byteLength.toLocaleString()} / {query.data.totalSize.toLocaleString()}{" "}
+							bytes
+							{query.data.mtimeMs ? ` · ${new Date(query.data.mtimeMs).toLocaleString()}` : ""}
+							{query.isFetching ? " · refreshing…" : ""}
 						</div>
 						<FileView file={query.data} onNavigate={onNavigate} />
 					</>
