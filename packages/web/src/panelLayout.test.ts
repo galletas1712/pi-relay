@@ -2,9 +2,13 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	canSplitFilePane,
+	CHAT_COLUMN_MAX_WIDTH,
 	clampSidebarWidth,
 	DEFAULT_SIDEBAR_WIDTH,
 	defaultPanelState,
+	FILE_SPLIT_MIN_CENTER_PX,
+	MAX_FILE_PANE_WIDTH,
 	MAX_SIDEBAR_WIDTH,
 	MEDIUM_PANEL_QUERY,
 	MIN_SIDEBAR_WIDTH,
@@ -67,5 +71,13 @@ describe("panel layout policies", () => {
 		expect(panelModeForViewport()).toBe("medium");
 		matches.set(WIDE_PANEL_QUERY, true);
 		expect(panelModeForViewport()).toBe("wide");
+	});
+
+	it("splits only when the center can fit two chat-max columns", () => {
+		expect(FILE_SPLIT_MIN_CENTER_PX).toBe(CHAT_COLUMN_MAX_WIDTH * 2);
+		expect(MAX_FILE_PANE_WIDTH).toBe(CHAT_COLUMN_MAX_WIDTH);
+		expect(canSplitFilePane(FILE_SPLIT_MIN_CENTER_PX - 1)).toBe(false);
+		expect(canSplitFilePane(FILE_SPLIT_MIN_CENTER_PX)).toBe(true);
+		expect(canSplitFilePane(2400)).toBe(true);
 	});
 });
