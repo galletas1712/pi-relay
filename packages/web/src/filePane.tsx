@@ -1,11 +1,7 @@
-import { ArrowLeft, RefreshCw, X } from "lucide-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { ArrowLeft, X } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { useEffect } from "react";
-import {
-	invalidateCachedWorkspaceFile,
-	loadCachedWorkspaceFile,
-	workspaceFileQueryKey,
-} from "./fileBrowser.ts";
+import { loadCachedWorkspaceFile, workspaceFileQueryKey } from "./fileBrowser.ts";
 import { FileView } from "./fileView.tsx";
 import type { AgentApi } from "./agentApi.ts";
 import { browsePathBasename } from "./filePath.ts";
@@ -30,7 +26,6 @@ export function FilePane({
 	onClose,
 	onNavigate,
 }: FilePaneProps) {
-	const queryClient = useQueryClient();
 	const query = useQuery({
 		queryKey: workspaceFileQueryKey(sessionId, path),
 		queryFn: () => loadCachedWorkspaceFile(api, sessionId, path),
@@ -60,19 +55,6 @@ export function FilePane({
 					<span className="muted file-pane-path">{path}</span>
 				</div>
 				<div className="file-pane-actions">
-					<button
-						className="icon-button"
-						type="button"
-						aria-label="Refresh file"
-						title="Refresh file"
-						disabled={Boolean(remoteReadBlockedReason) || query.isFetching}
-						onClick={() => {
-							invalidateCachedWorkspaceFile(sessionId, path);
-							void queryClient.invalidateQueries({ queryKey: workspaceFileQueryKey(sessionId, path) });
-						}}
-					>
-						<RefreshCw size={14} />
-					</button>
 					{!replacementMode ? (
 						<button className="icon-button" type="button" aria-label="Close file" title="Close file" onClick={onClose}>
 							<X size={14} />
@@ -83,7 +65,7 @@ export function FilePane({
 			<div className="file-pane-body">
 				{remoteReadBlockedReason ? (
 					<p className="muted">{remoteReadBlockedReason}</p>
-				) : query.isLoading ? (
+				) : query.isLoading || (query.isFetching && !query.data) ? (
 					<p className="muted">Loading file…</p>
 				) : query.error ? (
 					<p className="error-text">{query.error instanceof Error ? query.error.message : "Failed to load file"}</p>
@@ -93,7 +75,7 @@ export function FilePane({
 							{query.data.bytes.byteLength.toLocaleString()} / {query.data.totalSize.toLocaleString()}{" "}
 							bytes
 							{query.data.mtimeMs ? ` · ${new Date(query.data.mtimeMs).toLocaleString()}` : ""}
-							{query.isFetching ? " · refreshing…" : ""}
+							{query.isFetching ? " · updating…" : ""}
 						</div>
 						<FileView file={query.data} onNavigate={onNavigate} />
 					</>

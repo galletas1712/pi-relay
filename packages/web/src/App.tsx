@@ -2690,20 +2690,24 @@ export function App({
 				const files = Array.isArray(event.data.files)
 					? event.data.files.filter((value): value is string => typeof value === "string")
 					: [];
-				for (const path of directories) {
-					void queryClient.invalidateQueries({
-						queryKey: ["workspace-dir", event.session_id, path],
-					});
-				}
-				for (const path of files) {
-					invalidateCachedWorkspaceFile(event.session_id, path);
-					void queryClient.invalidateQueries({
-						queryKey: workspaceFileQueryKey(event.session_id, path),
-					});
-				}
-				if (directories.length > 0 && event.session_id === selectedRef.current) {
-					setFilesTreeEpoch((epoch) => epoch + 1);
-				}
+				void (async () => {
+					await Promise.all(
+						directories.map((path) =>
+							queryClient.resetQueries({
+								queryKey: ["workspace-dir", event.session_id, path],
+							}),
+						),
+					);
+					for (const path of files) {
+						invalidateCachedWorkspaceFile(event.session_id, path);
+						await queryClient.resetQueries({
+							queryKey: workspaceFileQueryKey(event.session_id, path),
+						});
+					}
+					if (directories.length > 0 && event.session_id === selectedRef.current) {
+						setFilesTreeEpoch((epoch) => epoch + 1);
+					}
+				})();
 				return;
 			}
 			const currentSessions = queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(selectedProjectRef.current));

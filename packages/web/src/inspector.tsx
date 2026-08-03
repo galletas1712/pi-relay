@@ -141,6 +141,7 @@ export function Inspector({
 				>
 					{api ? (
 						<FilesTab
+							key={selectedSessionId ?? "none"}
 							api={api}
 							sessionId={selectedSessionId}
 							selectedPath={selectedFilePath}
