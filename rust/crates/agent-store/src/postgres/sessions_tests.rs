@@ -80,7 +80,8 @@ async fn drop_test_database(admin_url: &str, name: &str) -> Result<()> {
     let admin = sqlx::PgPool::connect(admin_url)
         .await
         .context("connect to test database admin for cleanup")?;
-    sqlx::query(&format!(r#"drop database if exists "{name}""#))
+    // FORCE terminates leftover pool connections so parallel tests cannot block DROP.
+    sqlx::query(&format!(r#"drop database if exists "{name}" with (force)"#))
         .execute(&admin)
         .await
         .with_context(|| format!("drop isolated test database {name}"))?;
