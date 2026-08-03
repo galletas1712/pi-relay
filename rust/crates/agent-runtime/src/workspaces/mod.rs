@@ -135,11 +135,9 @@ impl WorkspaceManager {
         let cwd = self.resolve(workspace_id);
         let path = path.to_string();
         let after = after_name.map(str::to_string);
-        tokio::task::spawn_blocking(move || {
-            fs::list_dir(&cwd, &path, after.as_deref(), limit)
-        })
-        .await
-        .context("browse list_dir task failed")?
+        tokio::task::spawn_blocking(move || fs::list_dir(&cwd, &path, after.as_deref(), limit))
+            .await
+            .context("browse list_dir task failed")?
     }
 
     /// Bounded prefix read for the session files browser.

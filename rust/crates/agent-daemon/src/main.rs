@@ -110,16 +110,18 @@ async fn main() -> Result<()> {
     install_runtime_online_queued_redrive(&state);
     {
         let state_for_hook = state.clone();
-        state.runtime_hosts.set_on_browse_fs_changed(std::sync::Arc::new(
-            move |workspace_id, directories, files| {
-                workspace_browse::publish_browse_fs_changed(
-                    &state_for_hook,
-                    workspace_id,
-                    directories,
-                    files,
-                );
-            },
-        ));
+        state
+            .runtime_hosts
+            .set_on_browse_fs_changed(std::sync::Arc::new(
+                move |workspace_id, directories, files| {
+                    workspace_browse::publish_browse_fs_changed(
+                        &state_for_hook,
+                        workspace_id,
+                        directories,
+                        files,
+                    );
+                },
+            ));
     }
     tokio::spawn(runtime_hosts.listen(config.runtime_bind.clone()));
 

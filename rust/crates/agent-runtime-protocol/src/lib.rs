@@ -277,9 +277,15 @@ impl RuntimeCommand {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeCommandResult {
     Ack,
-    Materialized { workspaces: Vec<SessionWorkspace> },
-    Tool { result: ToolResultMessage },
-    FileContents { contents: Option<String> },
+    Materialized {
+        workspaces: Vec<SessionWorkspace>,
+    },
+    Tool {
+        result: ToolResultMessage,
+    },
+    FileContents {
+        contents: Option<String>,
+    },
     DirListing {
         path: String,
         entries: Vec<WorkspaceDirEntry>,
@@ -295,13 +301,27 @@ pub enum RuntimeCommandResult {
         #[serde(skip_serializing_if = "Option::is_none")]
         mtime_ms: Option<u64>,
     },
-    RuntimeContext { context: RuntimeContext },
-    McpInventory { inventory: McpInventory },
-    McpManifest { manifest: McpSessionManifest },
-    McpToolViews { views: Vec<McpToolView> },
-    McpAuthStatuses { servers: Vec<McpAuthServerStatus> },
-    McpLoginStart { start: McpOAuthLoginStart },
-    McpLogout { result: McpLogoutResult },
+    RuntimeContext {
+        context: RuntimeContext,
+    },
+    McpInventory {
+        inventory: McpInventory,
+    },
+    McpManifest {
+        manifest: McpSessionManifest,
+    },
+    McpToolViews {
+        views: Vec<McpToolView>,
+    },
+    McpAuthStatuses {
+        servers: Vec<McpAuthServerStatus>,
+    },
+    McpLoginStart {
+        start: McpOAuthLoginStart,
+    },
+    McpLogout {
+        result: McpLogoutResult,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

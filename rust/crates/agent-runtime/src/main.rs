@@ -203,12 +203,16 @@ async fn main() -> Result<()> {
     };
     // Keep the coalesce task alive for the process; it forwards into each
     // control connection via an ArcSwap-style slot updated in `connect`.
-    let browse_forward: Arc<Mutex<Option<mpsc::Sender<(String, workspaces::watch::BrowseFsDelta)>>>> =
-        Arc::new(Mutex::new(None));
+    let browse_forward: Arc<
+        Mutex<Option<mpsc::Sender<(String, workspaces::watch::BrowseFsDelta)>>>,
+    > = Arc::new(Mutex::new(None));
     {
         let browse_forward = browse_forward.clone();
         let (coalesce_tx, mut coalesce_rx) = mpsc::channel(32);
-        tokio::spawn(workspaces::watch::coalesce_watch_events(browse_raw_rx, coalesce_tx));
+        tokio::spawn(workspaces::watch::coalesce_watch_events(
+            browse_raw_rx,
+            coalesce_tx,
+        ));
         tokio::spawn(async move {
             while let Some(delta) = coalesce_rx.recv().await {
                 let forward = browse_forward.lock().await.clone();

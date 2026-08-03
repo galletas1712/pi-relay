@@ -203,11 +203,7 @@ fn watch_targets(cwd: &Path, interest: &BrowseInterest) -> BTreeSet<PathBuf> {
 
 fn sync_watches(entry: &mut WorkspaceWatch) -> Result<()> {
     let desired = watch_targets(&entry.cwd, &entry.interest);
-    let to_remove: Vec<_> = entry
-        .watched_abs
-        .difference(&desired)
-        .cloned()
-        .collect();
+    let to_remove: Vec<_> = entry.watched_abs.difference(&desired).cloned().collect();
     for path in to_remove {
         let _ = entry.watcher.unwatch(&path);
         entry.watched_abs.remove(&path);

@@ -136,10 +136,7 @@ pub(crate) async fn read_file(state: &AppState, params: Value) -> Result<Value, 
 pub(crate) async fn watch(state: &AppState, params: Value) -> Result<Value, RpcError> {
     let params: WatchParams = from_params(params)?;
     let config = state.repo.load_session_config(&params.session_id).await?;
-    let directories = params
-        .directories
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let directories = params.directories.into_iter().collect::<BTreeSet<_>>();
     let files = params.files.into_iter().collect::<BTreeSet<_>>();
     {
         let mut watches = state.browse_watches.lock().await;
@@ -156,8 +153,7 @@ pub(crate) async fn watch(state: &AppState, params: Value) -> Result<Value, RpcE
             );
         }
     }
-    let (union_dirs, union_files) =
-        union_interest_for_workspace(state, &config.workspace_id).await;
+    let (union_dirs, union_files) = union_interest_for_workspace(state, &config.workspace_id).await;
     state
         .runtime_hosts
         .browse_watch(
@@ -229,7 +225,10 @@ async fn union_interest_for_workspace(
         directories.extend(interest.directories.iter().cloned());
         files.extend(interest.files.iter().cloned());
     }
-    (directories.into_iter().collect(), files.into_iter().collect())
+    (
+        directories.into_iter().collect(),
+        files.into_iter().collect(),
+    )
 }
 
 fn map_browse_error(error: anyhow::Error) -> RpcError {

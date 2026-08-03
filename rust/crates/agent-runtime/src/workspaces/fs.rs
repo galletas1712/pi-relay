@@ -76,10 +76,7 @@ pub fn validate_browse_path(path: &str) -> Result<String> {
     if path.starts_with('/') || path.starts_with('\\') {
         bail!("path must be relative");
     }
-    if path
-        .chars()
-        .any(|ch| ch.is_control() || ch == '\\')
-    {
+    if path.chars().any(|ch| ch.is_control() || ch == '\\') {
         bail!("path contains illegal characters");
     }
 
@@ -98,7 +95,10 @@ pub fn validate_browse_path(path: &str) -> Result<String> {
                 }
                 parts.push(name.to_string());
             }
-            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
                 bail!("path must be relative and normal");
             }
         }
@@ -114,7 +114,12 @@ pub fn validate_browse_path(path: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-pub fn list_dir(cwd: &Path, path: &str, after_name: Option<&str>, limit: u32) -> Result<DirListing> {
+pub fn list_dir(
+    cwd: &Path,
+    path: &str,
+    after_name: Option<&str>,
+    limit: u32,
+) -> Result<DirListing> {
     let normalized = validate_browse_path(path)?;
     let limit = clamp_list_limit(limit);
     let root = open_cwd(cwd)?;
@@ -185,12 +190,7 @@ pub fn list_dir(cwd: &Path, path: &str, after_name: Option<&str>, limit: u32) ->
     })
 }
 
-pub fn read_file_range(
-    cwd: &Path,
-    path: &str,
-    offset: u64,
-    max_bytes: u32,
-) -> Result<FilePrefix> {
+pub fn read_file_range(cwd: &Path, path: &str, offset: u64, max_bytes: u32) -> Result<FilePrefix> {
     let normalized = validate_browse_path(path)?;
     if normalized.is_empty() {
         bail!("path must name a regular file");
@@ -376,7 +376,10 @@ mod tests {
         assert_eq!(BASE64.decode(&file.content_base64).unwrap(), b"# hi\n");
 
         let handoff = read_file_range(dir.path(), ".pi-handoff/note.md", 0, 1024).unwrap();
-        assert_eq!(BASE64.decode(&handoff.content_base64).unwrap(), b"handoff\n");
+        assert_eq!(
+            BASE64.decode(&handoff.content_base64).unwrap(),
+            b"handoff\n"
+        );
     }
 
     #[test]
@@ -388,7 +391,11 @@ mod tests {
         symlink("..", dir.path().join("subdir/up")).unwrap();
 
         let listing = list_dir(dir.path(), "", None, 200).unwrap();
-        let link = listing.entries.iter().find(|e| e.name == "link.txt").unwrap();
+        let link = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "link.txt")
+            .unwrap();
         assert_eq!(link.kind, DirEntryKind::Other);
 
         assert!(read_file_range(dir.path(), "link.txt", 0, 1024).is_err());

@@ -1084,7 +1084,9 @@ pub(crate) mod test_support {
                 path,
                 after_name,
                 limit,
-            } => fake_browse_list_dir(dirs, &workspace_id, &path, after_name.as_deref(), limit).await,
+            } => {
+                fake_browse_list_dir(dirs, &workspace_id, &path, after_name.as_deref(), limit).await
+            }
             RuntimeCommand::BrowseReadFile {
                 workspace_id,
                 path,
