@@ -1013,6 +1013,9 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
         .expect("load committed child action");
     assert_eq!(committed_child_actions.len(), 1);
     let committed_child_action_row_id = committed_child_actions[0].row_id.clone();
+    let durable_state = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect durable-state assertion pool");
 
     connect_test_runtime(&runtime_hosts, TEST_RUNTIME_ID).await;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1030,47 +1033,38 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
     })
     .await
     .expect("runtime Hello redrives and consumes the stuck queued input");
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let completed_child_action = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let events = state
-                .repo
-                .events_after(child_id, None)
-                .await
-                .expect("load child lifecycle events");
-            let started = events.iter().any(|event| {
-                event.event == EventType::ToolStarted
-                    && event.data["action_row_id"] == committed_child_action_row_id
-            });
-            let completed = events.iter().any(|event| {
-                event.event == EventType::ToolCompleted
-                    && event.data["action_row_id"] == committed_child_action_row_id
-            });
-            if started && completed {
-                break;
+            let row =
+                sqlx::query("select status, result from actions where session_id=$1 and id=$2")
+                    .bind(child_id)
+                    .bind(&committed_child_action_row_id)
+                    .fetch_one(&durable_state)
+                    .await
+                    .expect("load exact committed child action");
+            let status = row.get::<String, _>("status");
+            if !matches!(status.as_str(), "pending" | "running") {
+                break row;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("runtime Hello starts and completes the committed child action");
-    let child_events = state
-        .repo
-        .events_after(child_id, None)
-        .await
-        .expect("load completed child lifecycle");
-    for event_type in [EventType::ToolStarted, EventType::ToolCompleted] {
-        assert_eq!(
-            child_events
-                .iter()
-                .filter(|event| {
-                    event.event == event_type
-                        && event.data["action_row_id"] == committed_child_action_row_id
-                })
-                .count(),
-            1,
-            "runtime-online recovery advances the exact committed tool once"
-        );
-    }
+    .expect("runtime Hello terminalizes the exact committed child action");
+    assert_eq!(
+        completed_child_action.get::<String, _>("status"),
+        "completed"
+    );
+    assert_eq!(
+        completed_child_action.get::<serde_json::Value, _>("result"),
+        serde_json::to_value(ToolResultMessage::success(
+            ToolCallId::new("offline-child-tool"),
+            "Bash",
+            "exit: exit status: 0\nstdout:\nruntime-online-redrive\nstderr:\n",
+        ))
+        .expect("serialize expected canonical Bash result")
+    );
+    durable_state.close().await;
     for handle in take_tasks(&state) {
         handle.abort();
     }
