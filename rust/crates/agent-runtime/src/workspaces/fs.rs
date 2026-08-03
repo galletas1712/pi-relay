@@ -269,7 +269,7 @@ fn open_browse_dir(root: &Dir, path: &str, root_dev: u64) -> Result<Dir> {
         if meta.dev() != root_dev {
             bail!("session cwd crossed a mount boundary");
         }
-        return Ok(root.try_clone().context("clone session cwd directory")?);
+        return root.try_clone().context("clone session cwd directory");
     }
 
     // Walk one component at a time so each step can reject symlinks and mounts.

@@ -203,9 +203,7 @@ async fn main() -> Result<()> {
     };
     // Keep the coalesce task alive for the process; it forwards into each
     // control connection via an ArcSwap-style slot updated in `connect`.
-    let browse_forward: Arc<
-        Mutex<Option<mpsc::Sender<(String, workspaces::watch::BrowseFsDelta)>>>,
-    > = Arc::new(Mutex::new(None));
+    let browse_forward: BrowseForwardSlot = Arc::new(Mutex::new(None));
     {
         let browse_forward = browse_forward.clone();
         let (coalesce_tx, mut coalesce_rx) = mpsc::channel(32);
@@ -307,10 +305,13 @@ fn config_root_from_env(
         .join(RUNTIME_CONFIG_DIR))
 }
 
+type BrowseForwardSlot =
+    Arc<Mutex<Option<mpsc::Sender<(String, workspaces::watch::BrowseFsDelta)>>>>;
+
 async fn connect(
     config: &Config,
     runtime: Runtime,
-    browse_forward: Arc<Mutex<Option<mpsc::Sender<(String, workspaces::watch::BrowseFsDelta)>>>>,
+    browse_forward: BrowseForwardSlot,
 ) -> Result<()> {
     let stream = TcpStream::connect(&config.control_addr).await?;
     let (mut reader, mut writer) = stream.into_split();
