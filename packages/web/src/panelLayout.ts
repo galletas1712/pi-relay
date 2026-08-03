@@ -11,8 +11,20 @@ export const SIDEBAR_KEYBOARD_STEP = 16;
 export const FILE_PANE_WIDTH_STORAGE_KEY = "piRelayFilePaneWidth:v1";
 export const DEFAULT_FILE_PANE_WIDTH = 440;
 export const MIN_FILE_PANE_WIDTH = 360;
-export const MAX_FILE_PANE_WIDTH = 720;
-export const FILE_SPLIT_MIN_CENTER_PX = 960;
+/** Matches the transcript/composer centered column (`width: min(100%, 900px)`). */
+export const CHAT_COLUMN_MAX_WIDTH = 900;
+/** File pane can grow as wide as the chat column when split. */
+export const MAX_FILE_PANE_WIDTH = CHAT_COLUMN_MAX_WIDTH;
+/**
+ * Split only when the center strip can host a full-width chat column and an
+ * equally wide file column at once (sidebar/inspector excluded).
+ */
+export const FILE_SPLIT_MIN_CENTER_PX = CHAT_COLUMN_MAX_WIDTH * 2;
+
+/** Whether the app-shell center (chat + file) is wide enough to split. */
+export function canSplitFilePane(centerWidthPx: number): boolean {
+	return centerWidthPx >= FILE_SPLIT_MIN_CENTER_PX;
+}
 
 export function clampSidebarWidth(width: number): number {
 	return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(width)));

@@ -61,7 +61,7 @@ import {
 	DEFAULT_SIDEBAR_WIDTH,
 	DEFAULT_FILE_PANE_WIDTH,
 	defaultPanelState,
-	FILE_SPLIT_MIN_CENTER_PX,
+	canSplitFilePane,
 	MAX_SIDEBAR_WIDTH,
 	MAX_FILE_PANE_WIDTH,
 	MEDIUM_PANEL_QUERY,
@@ -420,7 +420,8 @@ export function App({
 	const [inspectorPreferredTab, setInspectorPreferredTab] = useState<InspectorTab | null>(
 		() => (readFileQuery() ? "files" : null),
 	);
-	const [fileSplitMode, setFileSplitMode] = useState(false);
+	const [fileSplitCapable, setFileSplitCapable] = useState(false);
+	const [filesOnlyPreference, setFilesOnlyPreference] = useState(false);
 	const [showArchived, setShowArchived] = useState(false);
 	const [showAllDelegations, setShowAllDelegations] = useState(false);
 	const [backgroundWarmRevision, setBackgroundWarmRevision] = useState(0);
@@ -4411,6 +4412,7 @@ export function App({
 	}, [applyFilePaneWidth]);
 
 	const selectFilePath = useCallback((path: string | null) => {
+		setFilesOnlyPreference(false);
 		setSelectedFilePath(path);
 		replaceFileQuery(path);
 		if (path) {
@@ -4421,6 +4423,7 @@ export function App({
 
 	useEffect(() => {
 		const onPopState = () => {
+			setFilesOnlyPreference(false);
 			setSelectedFilePath(readFileQuery());
 		};
 		window.addEventListener("popstate", onPopState);
@@ -4439,6 +4442,7 @@ export function App({
 		});
 		setInspectorPreferredTab(null);
 		setFilesVisibleDirectories([]);
+		setFilesOnlyPreference(false);
 		if (previousSessionId) {
 			workspaceFileCache.clearSession(previousSessionId);
 		}
@@ -4483,21 +4487,18 @@ export function App({
 		const measure = () => {
 			const shell = appShellRef.current;
 			if (!shell || !selectedFilePath) {
-				setFileSplitMode(false);
+				setFileSplitCapable(false);
 				return;
 			}
 			const sidebarCol = panelModeRef.current === "wide" ? sidebarWidthRef.current : 0;
 			const inspectorCol = rightOpen ? 350 : 0;
-			const fileCol = filePaneWidthRef.current;
 			const available = shell.clientWidth - sidebarCol - inspectorCol;
-			const canSplit =
-				available >= FILE_SPLIT_MIN_CENTER_PX && available - fileCol >= MIN_FILE_PANE_WIDTH;
-			setFileSplitMode(canSplit);
+			setFileSplitCapable(canSplitFilePane(available));
 		};
 		measure();
 		window.addEventListener("resize", measure);
 		return () => window.removeEventListener("resize", measure);
-	}, [selectedFilePath, rightOpen, panelMode, sidebarWidth, filePaneWidth]);
+	}, [selectedFilePath, rightOpen, panelMode, sidebarWidth]);
 
 	const handleResumeTurn = useCallback(
 		(entryId: string) => {
@@ -4612,6 +4613,7 @@ export function App({
 		[],
 	);
 	const fileOpen = Boolean(selectedFilePath);
+	const fileSplitMode = fileOpen && fileSplitCapable && !filesOnlyPreference;
 	const fileReplacementMode = fileOpen && !fileSplitMode;
 	const appClassName = [
 		"app-shell",
@@ -4946,6 +4948,7 @@ export function App({
 						replacementMode={fileReplacementMode}
 						remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 						onClose={() => selectFilePath(null)}
+						onHideChat={fileSplitMode ? () => setFilesOnlyPreference(true) : undefined}
 						onNavigate={selectFilePath}
 					/>
 				</>
