@@ -5,7 +5,7 @@ import {
 } from "@headless-tree/core";
 import { useTree } from "@headless-tree/react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ChevronRight, File, Folder, FolderOpen, RefreshCw } from "lucide-react";
+import { ChevronRight, File, Folder, FolderOpen } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AgentApi } from "./agentApi.ts";
 import {
@@ -29,6 +29,10 @@ function pathFromItemId(itemId: string): string {
 	return itemId === ROOT_ID ? "" : itemId;
 }
 
+function itemIdForDirPath(path: string): string {
+	return path === "" ? ROOT_ID : path;
+}
+
 /** Directories whose listings are currently visible (cwd root + expanded folders). */
 export function visibleBrowseDirectories(expandedItemIds: readonly string[]): string[] {
 	const dirs = new Set<string>([""]);
@@ -45,7 +49,7 @@ export interface FilesTabProps {
 	selectedPath: string | null;
 	remoteReadBlockedReason?: string | null;
 	activity?: string | null;
-	/** Bumped when interest-scoped dir listings should rebuild. */
+	/** Bumped when interest-scoped dir listings should reload from disk. */
 	treeEpoch?: number;
 	onSelectFile: (path: string) => void;
 	onVisibleDirectoriesChange?: (directories: string[]) => void;
@@ -66,6 +70,8 @@ export function FilesTab({
 	sessionIdRef.current = sessionId;
 	const prevActivity = useRef(activity);
 	const [expandedItems, setExpandedItems] = useState<string[]>([]);
+	const expandedItemsRef = useRef(expandedItems);
+	expandedItemsRef.current = expandedItems;
 	const [loadingMore, setLoadingMore] = useState<string | null>(null);
 	const [listingEpoch, setListingEpoch] = useState(0);
 
@@ -80,7 +86,7 @@ export function FilesTab({
 					const page = await fetchWorkspaceDir(api, sid, path);
 					return mergeWorkspaceDirPage(undefined, page);
 				},
-				staleTime: 5_000,
+				staleTime: 0,
 			});
 			return listing.entries.map((entry) => {
 				const childPath = joinBrowsePath(path, entry.name);
@@ -136,6 +142,17 @@ export function FilesTab({
 		features: [asyncDataLoaderFeature, selectionFeature, hotkeysCoreFeature],
 	});
 
+	const reloadVisibleDirectories = useCallback(() => {
+		const itemIds = [ROOT_ID, ...expandedItemsRef.current];
+		for (const itemId of itemIds) {
+			try {
+				void tree.getItemInstance(itemId).invalidateChildrenIds(true);
+			} catch {
+				// Item may not be mounted yet.
+			}
+		}
+	}, [tree]);
+
 	useEffect(() => {
 		onVisibleDirectoriesChange?.(visibleBrowseDirectories(expandedItems));
 	}, [expandedItems, onVisibleDirectoriesChange]);
@@ -147,27 +164,23 @@ export function FilesTab({
 	useEffect(() => {
 		if (!sessionId) return;
 		if (prevActivity.current === "running" && activity === "idle") {
-			void queryClient.invalidateQueries({ queryKey: ["workspace-dir", sessionId] });
+			void queryClient.resetQueries({ queryKey: ["workspace-dir", sessionId] }).then(() => {
+				reloadVisibleDirectories();
+			});
 			void queryClient.invalidateQueries({ queryKey: ["workspace-file", sessionId] });
-			tree.rebuildTree();
 		}
 		prevActivity.current = activity;
-	}, [activity, queryClient, sessionId, tree]);
-
-	useEffect(() => {
-		setExpandedItems([]);
-		tree.rebuildTree();
-	}, [sessionId, tree]);
+	}, [activity, queryClient, reloadVisibleDirectories, sessionId]);
 
 	useEffect(() => {
 		if (treeEpoch === 0) return;
-		tree.rebuildTree();
-	}, [treeEpoch, tree]);
+		reloadVisibleDirectories();
+	}, [treeEpoch, reloadVisibleDirectories]);
 
 	useEffect(() => {
 		if (listingEpoch === 0) return;
-		tree.rebuildTree();
-	}, [listingEpoch, tree]);
+		reloadVisibleDirectories();
+	}, [listingEpoch, reloadVisibleDirectories]);
 
 	const loadMore = useCallback(
 		async (dirPath: string) => {
@@ -182,16 +195,19 @@ export function FilesTab({
 				queryClient.setQueryData<WorkspaceDirListing>(key, (previous) =>
 					mergeWorkspaceDirPage(previous, page),
 				);
-				setListingEpoch((epoch) => epoch + 1);
+				try {
+					void tree.getItemInstance(itemIdForDirPath(dirPath)).invalidateChildrenIds(true);
+				} catch {
+					setListingEpoch((epoch) => epoch + 1);
+				}
 			} finally {
 				setLoadingMore(null);
 			}
 		},
-		[api, queryClient, remoteReadBlockedReason, sessionId],
+		[api, queryClient, remoteReadBlockedReason, sessionId, tree],
 	);
 
 	const items = tree.getItems();
-	const canBrowse = Boolean(sessionId) && !remoteReadBlockedReason;
 	const selectedSet = useMemo(() => new Set(selectedPath ? [selectedPath] : []), [selectedPath]);
 
 	const nextAfterByDir = useMemo(() => {
@@ -214,20 +230,6 @@ export function FilesTab({
 		<div className="files-tab">
 			<div className="files-tab-toolbar">
 				<span className="files-tab-label">Session cwd</span>
-				<button
-					className="icon-button"
-					type="button"
-					aria-label="Refresh files"
-					title="Refresh files"
-					disabled={!canBrowse}
-					onClick={() => {
-						if (!sessionId) return;
-						void queryClient.invalidateQueries({ queryKey: ["workspace-dir", sessionId] });
-						tree.rebuildTree();
-					}}
-				>
-					<RefreshCw size={14} />
-				</button>
 			</div>
 			{!sessionId ? (
 				<p className="muted files-tab-empty">Select a session to browse its files.</p>

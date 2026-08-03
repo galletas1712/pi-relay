@@ -239,7 +239,7 @@ async fn only_a_batch_with_no_durable_obligations_skips_the_transaction() {
     let admin = sqlx::PgPool::connect(&admin_url)
         .await
         .expect("connect test database admin for cleanup");
-    sqlx::query(&format!(r#"drop database if exists "{name}""#))
+    sqlx::query(&format!(r#"drop database if exists "{name}" with (force)"#))
         .execute(&admin)
         .await
         .expect("drop isolated test database");
