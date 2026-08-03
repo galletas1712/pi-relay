@@ -96,6 +96,9 @@ pub(crate) enum RpcMethod {
     DelegationReadHandoffFile,
     HarnessModelComplete,
     HarnessModelFail,
+    WorkspaceListDir,
+    WorkspaceReadFile,
+    WorkspaceWatch,
 }
 
 impl RpcMethod {
@@ -150,6 +153,9 @@ impl RpcMethod {
             "delegation.read_handoff_file" => Some(Self::DelegationReadHandoffFile),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
+            "workspace.list_dir" => Some(Self::WorkspaceListDir),
+            "workspace.read_file" => Some(Self::WorkspaceReadFile),
+            "workspace.watch" => Some(Self::WorkspaceWatch),
             _ => None,
         }
     }
@@ -255,6 +261,18 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("delegation.read_handoff_file"),
             Some(RpcMethod::DelegationReadHandoffFile)
+        );
+        assert_eq!(
+            RpcMethod::parse("workspace.list_dir"),
+            Some(RpcMethod::WorkspaceListDir)
+        );
+        assert_eq!(
+            RpcMethod::parse("workspace.read_file"),
+            Some(RpcMethod::WorkspaceReadFile)
+        );
+        assert_eq!(
+            RpcMethod::parse("workspace.watch"),
+            Some(RpcMethod::WorkspaceWatch)
         );
         for old in [
             "stage.start_full",

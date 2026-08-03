@@ -20,6 +20,7 @@ agent-vocab = { workspace = true }
 agent-runtime-protocol = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 cap-fs-ext = { workspace = true }
 cap-std = { workspace = true }
 futures-util = { workspace = true }

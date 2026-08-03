@@ -62,6 +62,7 @@ const KNOWN_SESSION_EVENTS = new Set([
 	"transcript.appended",
 	"turn.started",
 	"assistant.message",
+	"workspace.fs_changed",
 ]);
 
 export function refreshPlanForEvent(event: Pick<EventFrame, "event">): SessionEventRefreshPlan {

@@ -36,6 +36,8 @@ import type {
 	ProjectWorkspace,
 	Runtime,
 	WorkspaceMaterializeProgress,
+	WorkspaceDirListing,
+	WorkspaceFilePrefix,
 } from "./types.ts";
 import type { EntryScope } from "./queryKeys.ts";
 
@@ -95,6 +97,29 @@ export interface AgentApi {
 	reorderQueuedFollowUps(sessionId: string, inputIds: string[], expectedQueueRevision?: number | null): Promise<ReorderQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
+	listWorkspaceDir(params: ListWorkspaceDirParams): Promise<WorkspaceDirListing>;
+	readWorkspaceFile(params: ReadWorkspaceFileParams): Promise<WorkspaceFilePrefix>;
+	watchWorkspace(params: WatchWorkspaceParams): Promise<{ ok: boolean }>;
+}
+
+export interface ListWorkspaceDirParams {
+	sessionId: string;
+	path?: string;
+	afterName?: string | null;
+	limit?: number;
+}
+
+export interface ReadWorkspaceFileParams {
+	sessionId: string;
+	path: string;
+	offset?: number;
+	maxBytes?: number;
+}
+
+export interface WatchWorkspaceParams {
+	sessionId: string;
+	directories: string[];
+	files: string[];
 }
 
 export interface AddMcpToolsParams {
@@ -805,6 +830,32 @@ class AgentApiClient implements AgentApi {
 			leaf_id: leafId || undefined
 		});
 		return result.items;
+	}
+
+	listWorkspaceDir(params: ListWorkspaceDirParams): Promise<WorkspaceDirListing> {
+		return this.client.request<WorkspaceDirListing>("workspace.list_dir", {
+			session_id: params.sessionId,
+			path: params.path ?? "",
+			after_name: params.afterName ?? undefined,
+			limit: params.limit,
+		});
+	}
+
+	readWorkspaceFile(params: ReadWorkspaceFileParams): Promise<WorkspaceFilePrefix> {
+		return this.client.request<WorkspaceFilePrefix>("workspace.read_file", {
+			session_id: params.sessionId,
+			path: params.path,
+			offset: params.offset ?? 0,
+			max_bytes: params.maxBytes,
+		});
+	}
+
+	watchWorkspace(params: WatchWorkspaceParams): Promise<{ ok: boolean }> {
+		return this.client.request<{ ok: boolean }>("workspace.watch", {
+			session_id: params.sessionId,
+			directories: params.directories,
+			files: params.files,
+		});
 	}
 }
 

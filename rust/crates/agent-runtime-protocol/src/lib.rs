@@ -64,6 +64,12 @@ pub enum RuntimeToControl {
         command_id: String,
         progress: WorkspaceMaterializeProgress,
     },
+    /// Interest-filtered filesystem changes under a watched session cwd.
+    BrowseFsChanged {
+        workspace_id: String,
+        directories: Vec<String>,
+        files: Vec<String>,
+    },
     Result {
         command_id: String,
         result: Result<RuntimeCommandResult, RuntimeCommandError>,
@@ -154,6 +160,28 @@ pub enum RuntimeCommand {
         workspace_id: String,
         rel_path: String,
     },
+    /// Shallow, paged listing of one directory under the session cwd.
+    BrowseListDir {
+        workspace_id: String,
+        path: String,
+        after_name: Option<String>,
+        limit: u32,
+    },
+    /// Bounded range read of a regular file under the session cwd.
+    BrowseReadFile {
+        workspace_id: String,
+        path: String,
+        offset: u64,
+        max_bytes: u32,
+    },
+    /// Replace the watched interest set for this workspace cwd. Empty
+    /// directories and files clear interest for the caller; the runtime keeps a
+    /// watcher only while some interest remains.
+    BrowseWatch {
+        workspace_id: String,
+        directories: Vec<String>,
+        files: Vec<String>,
+    },
     /// Return runtime-owned instructions and skill packages for a session.
     /// `project_key` selects `$HOME/.agents/projects/<project_key>/skills`
     /// when the session belongs to a project; ephemeral sessions pass `None`.
@@ -228,6 +256,9 @@ impl RuntimeCommand {
             | Self::ExecuteTool { .. }
             | Self::WriteWorkspaceFile { .. }
             | Self::ReadWorkspaceFile { .. }
+            | Self::BrowseListDir { .. }
+            | Self::BrowseReadFile { .. }
+            | Self::BrowseWatch { .. }
             | Self::ReadRuntimeContext { .. }
             | Self::McpInventory { .. }
             | Self::McpSelect { .. }
@@ -246,16 +277,61 @@ impl RuntimeCommand {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeCommandResult {
     Ack,
-    Materialized { workspaces: Vec<SessionWorkspace> },
-    Tool { result: ToolResultMessage },
-    FileContents { contents: Option<String> },
-    RuntimeContext { context: RuntimeContext },
-    McpInventory { inventory: McpInventory },
-    McpManifest { manifest: McpSessionManifest },
-    McpToolViews { views: Vec<McpToolView> },
-    McpAuthStatuses { servers: Vec<McpAuthServerStatus> },
-    McpLoginStart { start: McpOAuthLoginStart },
-    McpLogout { result: McpLogoutResult },
+    Materialized {
+        workspaces: Vec<SessionWorkspace>,
+    },
+    Tool {
+        result: ToolResultMessage,
+    },
+    FileContents {
+        contents: Option<String>,
+    },
+    DirListing {
+        path: String,
+        entries: Vec<WorkspaceDirEntry>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after_name: Option<String>,
+    },
+    FilePrefix {
+        path: String,
+        content_base64: String,
+        byte_len: u64,
+        total_size: u64,
+        eof: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mtime_ms: Option<u64>,
+    },
+    RuntimeContext {
+        context: RuntimeContext,
+    },
+    McpInventory {
+        inventory: McpInventory,
+    },
+    McpManifest {
+        manifest: McpSessionManifest,
+    },
+    McpToolViews {
+        views: Vec<McpToolView>,
+    },
+    McpAuthStatuses {
+        servers: Vec<McpAuthServerStatus>,
+    },
+    McpLoginStart {
+        start: McpOAuthLoginStart,
+    },
+    McpLogout {
+        result: McpLogoutResult,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceDirEntry {
+    pub name: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtime_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

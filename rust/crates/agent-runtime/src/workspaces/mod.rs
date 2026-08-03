@@ -1,9 +1,11 @@
 mod config;
+pub mod fs;
 mod git;
 mod instantiate;
 mod local;
 mod sanitize;
 mod selection;
+pub mod watch;
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -54,6 +56,7 @@ pub struct WorkspaceManager {
     /// Serializes refresh of a single managed workspace base slot.
     workspace_base_slot_locks: KeyedLocks<(Uuid, String)>,
     cwd_mutation_guards: KeyedLocks<PathBuf>,
+    browse_watch: Option<std::sync::Arc<watch::BrowseWatchHub>>,
 }
 
 impl WorkspaceManager {
@@ -65,7 +68,13 @@ impl WorkspaceManager {
             project_bases_locks: Arc::new(Mutex::new(HashMap::new())),
             workspace_base_slot_locks: Arc::new(Mutex::new(HashMap::new())),
             cwd_mutation_guards: Arc::new(Mutex::new(HashMap::new())),
+            browse_watch: None,
         }
+    }
+
+    pub fn with_browse_watch(mut self, hub: std::sync::Arc<watch::BrowseWatchHub>) -> Self {
+        self.browse_watch = Some(hub);
+        self
     }
 
     pub fn resolve(&self, workspace_id: &str) -> PathBuf {
@@ -113,6 +122,53 @@ impl WorkspaceManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Shallow paged directory listing for the session files browser.
+    pub async fn browse_list_dir(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        after_name: Option<&str>,
+        limit: u32,
+    ) -> Result<fs::DirListing> {
+        let cwd = self.resolve(workspace_id);
+        let path = path.to_string();
+        let after = after_name.map(str::to_string);
+        tokio::task::spawn_blocking(move || fs::list_dir(&cwd, &path, after.as_deref(), limit))
+            .await
+            .context("browse list_dir task failed")?
+    }
+
+    /// Bounded prefix read for the session files browser.
+    pub async fn browse_read_file(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<fs::FilePrefix> {
+        let cwd = self.resolve(workspace_id);
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || fs::read_file_range(&cwd, &path, offset, max_bytes))
+            .await
+            .context("browse read_file task failed")?
+    }
+
+    pub fn browse_watch_hub(&self) -> Option<&std::sync::Arc<watch::BrowseWatchHub>> {
+        self.browse_watch.as_ref()
+    }
+
+    pub fn set_browse_watch(
+        &self,
+        workspace_id: &str,
+        directories: Vec<String>,
+        files: Vec<String>,
+    ) -> Result<()> {
+        let Some(hub) = &self.browse_watch else {
+            bail!("browse watch hub is not configured");
+        };
+        hub.set_interest(workspace_id, self.resolve(workspace_id), directories, files)
     }
 
     /// Return all runtime-owned instructions and skill packages visible to a
@@ -508,6 +564,9 @@ impl WorkspaceManager {
     /// teardown primitive; callers that only want directory removal still route
     /// through it so subvolume metadata is never leaked.
     pub async fn destroy_session_workspaces(&self, workspace_id: &str) -> Result<()> {
+        if let Some(hub) = &self.browse_watch {
+            hub.stop_workspace(workspace_id);
+        }
         let root = self.session_root(workspace_id);
         destroy_session_subvolume(&root.join("cwd")).await?;
         // Idempotent: a re-issued teardown (or the materialize cleanup path

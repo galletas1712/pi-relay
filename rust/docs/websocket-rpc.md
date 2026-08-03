@@ -1924,6 +1924,115 @@ Result:
 }
 ```
 
+### `workspace.list_dir`
+
+Shallow, paged listing of one directory under the selected session's cwd. The
+browser sends a session ID and a cwd-relative path only; the daemon resolves
+runtime/workspace authority and the runtime performs confined filesystem access.
+`path` of `""` is the cwd root. Symlinks, special files, and nested mounts are
+returned as `kind: "other"` and cannot be opened. Sort is by name; `after_name`
+is exclusive.
+
+```json
+{
+  "session_id": "session_...",
+  "path": "src",
+  "after_name": "main.rs",
+  "limit": 200
+}
+```
+
+```json
+{
+  "path": "src",
+  "entries": [
+    {
+      "name": "lib.rs",
+      "kind": "file",
+      "size": 4812,
+      "mtime_ms": 1785737400000
+    }
+  ],
+  "next_after_name": "lib.rs"
+}
+```
+
+`limit` defaults to 200 and is capped at 500. Clients page with `after_name` /
+`next_after_name`. Non-UTF-8 child names fail the listing.
+
+### `workspace.read_file`
+
+Bounded range read of a regular file under the selected session cwd. Content is
+always base64. `offset` defaults to `0`. `max_bytes` is the **chunk length**
+(default 1 MiB, capped at 4 MiB so each response fits under the 8 MiB websocket
+frame). There is no whole-file size reject: clients download by looping
+`offset += byte_len` until `eof` is true, then cache locally.
+
+```json
+{
+  "session_id": "session_...",
+  "path": "README.md",
+  "offset": 0,
+  "max_bytes": 1048576
+}
+```
+
+```json
+{
+  "path": "README.md",
+  "content_base64": "IyBQcm9qZWN0Cg==",
+  "byte_len": 10,
+  "total_size": 10,
+  "eof": true,
+  "mtime_ms": 1785737400000
+}
+```
+
+`total_size` is required. `byte_len` is the decoded chunk length; `eof` reports
+whether `offset + byte_len` reached the observed file size.
+
+### `workspace.watch`
+
+Replace the browser's filesystem-watch interest for a session. The daemon stores
+interest per session and forwards the **union** across sessions that share a
+workspace to the runtime. The runtime watches only those directories (non-recursive)
+and the parents of interested files.
+
+- `directories`: cwd-relative paths whose **name/presence listings** should stay
+  fresh. `""` is the session cwd root. The web UI sends the currently visible
+  expanded tree paths only.
+- `files`: cwd-relative paths whose **contents** should stay fresh. The web UI
+  sends the currently open file only (if any).
+- Empty `directories` and `files` clear this session's interest.
+
+```json
+{
+  "session_id": "session_...",
+  "directories": ["", "src"],
+  "files": ["src/main.rs"]
+}
+```
+
+```json
+{ "ok": true }
+```
+
+Matching changes are published as ephemeral `workspace.fs_changed` events
+(`event_id: 0`). Clients must invalidate listings/contents for the listed paths
+and must **not** advance their session high-water mark.
+
+```json
+{
+  "event_id": 0,
+  "event": "workspace.fs_changed",
+  "session_id": "session_...",
+  "data": {
+    "directories": ["src"],
+    "files": ["src/main.rs"]
+  }
+}
+```
+
 ## Subagent events
 
 When a delegation subagent is spawned or re-driven, the daemon may emit

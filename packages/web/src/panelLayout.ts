@@ -8,6 +8,12 @@ export const MIN_SIDEBAR_WIDTH = 240;
 export const MAX_SIDEBAR_WIDTH = 480;
 export const SIDEBAR_KEYBOARD_STEP = 16;
 
+export const FILE_PANE_WIDTH_STORAGE_KEY = "piRelayFilePaneWidth:v1";
+export const DEFAULT_FILE_PANE_WIDTH = 440;
+export const MIN_FILE_PANE_WIDTH = 360;
+export const MAX_FILE_PANE_WIDTH = 720;
+export const FILE_SPLIT_MIN_CENTER_PX = 960;
+
 export function clampSidebarWidth(width: number): number {
 	return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(width)));
 }
@@ -27,6 +33,30 @@ export function loadSidebarWidth(): number {
 export function saveSidebarWidth(width: number): void {
 	try {
 		window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(clampSidebarWidth(width)));
+	} catch {
+		// localStorage persistence is best-effort.
+	}
+}
+
+export function clampFilePaneWidth(width: number): number {
+	return Math.min(MAX_FILE_PANE_WIDTH, Math.max(MIN_FILE_PANE_WIDTH, Math.round(width)));
+}
+
+export function loadFilePaneWidth(): number {
+	if (typeof window === "undefined") return DEFAULT_FILE_PANE_WIDTH;
+	try {
+		const stored = Number(window.localStorage.getItem(FILE_PANE_WIDTH_STORAGE_KEY));
+		return Number.isFinite(stored) && stored > 0
+			? clampFilePaneWidth(stored)
+			: DEFAULT_FILE_PANE_WIDTH;
+	} catch {
+		return DEFAULT_FILE_PANE_WIDTH;
+	}
+}
+
+export function saveFilePaneWidth(width: number): void {
+	try {
+		window.localStorage.setItem(FILE_PANE_WIDTH_STORAGE_KEY, String(clampFilePaneWidth(width)));
 	} catch {
 		// localStorage persistence is best-effort.
 	}
