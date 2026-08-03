@@ -62,7 +62,10 @@ Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar
 - Compose and submit input, manage the queued-follow-up pane, and expose slash commands.
 - Browse the selected session cwd from the Files inspector tab and preview
   Markdown/code/images in the center file pane via `workspace.list_dir` /
-  `workspace.read_file`.
+  `workspace.read_file`. The UI registers `workspace.watch` interest for
+  currently expanded tree directories (name/presence) and the open file
+  (contents), then invalidates those queries on ephemeral `workspace.fs_changed`
+  events.
 
 ## Data layer
 

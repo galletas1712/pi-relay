@@ -101,6 +101,13 @@ describe("refreshPlanForEvent", () => {
 		}
 	});
 
+	it("does not refresh session state for workspace browse sync events", () => {
+		expect(refreshPlanForEvent({ event: "workspace.fs_changed" })).toEqual({
+			syncSelected: false,
+			refreshList: false,
+		});
+	});
+
 	it("syncs the selected session for unknown events without refreshing the list", () => {
 		expect(refreshPlanForEvent({ event: "unknown.event" })).toEqual({
 			syncSelected: true,

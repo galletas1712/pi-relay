@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
     sync::{atomic::AtomicBool, Arc, Mutex as StdMutex},
 };
@@ -33,6 +33,13 @@ pub(crate) struct RunningTask {
     pub(crate) handle: JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BrowseWatchInterest {
+    pub(crate) workspace_id: String,
+    pub(crate) directories: BTreeSet<String>,
+    pub(crate) files: BTreeSet<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) repo: Arc<PostgresAgentStore>,
@@ -50,6 +57,7 @@ pub(crate) struct AppState {
     pub(crate) provider_connections: ProviderConnectionRegistry,
     pub(crate) session_titles: SessionTitleScheduler,
     pub(crate) runtime_hosts: RuntimeRegistry,
+    pub(crate) browse_watches: Arc<Mutex<HashMap<String, BrowseWatchInterest>>>,
     pub(crate) prompt_root: PathBuf,
     pub(crate) daemon_config: DaemonConfig,
     #[cfg(test)]

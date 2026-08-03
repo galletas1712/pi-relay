@@ -104,6 +104,7 @@ import {
 } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
+import { workspaceFileQueryKey } from "./fileBrowser.ts";
 import { isDelegationRunning } from "./delegationBoard.ts";
 import { DelegationListRetryController } from "./delegationListRetryController.ts";
 import {
@@ -436,6 +437,8 @@ export function App({
 	const [filePaneWidth, setFilePaneWidth] = useState(loadFilePaneWidth);
 	const [filePaneResizing, setFilePaneResizing] = useState(false);
 	const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() => readFileQuery());
+	const [filesVisibleDirectories, setFilesVisibleDirectories] = useState<string[]>([]);
+	const [filesTreeEpoch, setFilesTreeEpoch] = useState(0);
 	const [inspectorPreferredTab, setInspectorPreferredTab] = useState<InspectorTab | null>(
 		() => (readFileQuery() ? "files" : null),
 	);
@@ -2675,6 +2678,29 @@ export function App({
 	const handleSessionEvent = useCallback(
 		(event: EventFrame) => {
 			if (deletedEventSessionTombstones.current.has(event.session_id)) return;
+			// Ephemeral browse invalidation: never advances high-water.
+			if (event.event === "workspace.fs_changed") {
+				const directories = Array.isArray(event.data.directories)
+					? event.data.directories.filter((value): value is string => typeof value === "string")
+					: [];
+				const files = Array.isArray(event.data.files)
+					? event.data.files.filter((value): value is string => typeof value === "string")
+					: [];
+				for (const path of directories) {
+					void queryClient.invalidateQueries({
+						queryKey: ["workspace-dir", event.session_id, path],
+					});
+				}
+				for (const path of files) {
+					void queryClient.invalidateQueries({
+						queryKey: workspaceFileQueryKey(event.session_id, path),
+					});
+				}
+				if (directories.length > 0 && event.session_id === selectedRef.current) {
+					setFilesTreeEpoch((epoch) => epoch + 1);
+				}
+				return;
+			}
 			const currentSessions = queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(selectedProjectRef.current));
 			const eventSession = currentSessions?.find((session) => session.session_id === event.session_id);
 			const eventProjectId =
@@ -4421,7 +4447,43 @@ export function App({
 			return null;
 		});
 		setInspectorPreferredTab(null);
+		setFilesVisibleDirectories([]);
 	}, [selectedId]);
+
+	useEffect(() => {
+		if (!selectedId) return;
+		if (connectionRemoteActionBlockedReason) {
+			void api.watchWorkspace({ sessionId: selectedId, directories: [], files: [] }).catch(() => undefined);
+			return;
+		}
+		const directories = filesVisibleDirectories;
+		const files = selectedFilePath ? [selectedFilePath] : [];
+		let cancelled = false;
+		const timer = window.setTimeout(() => {
+			if (cancelled) return;
+			void api
+				.watchWorkspace({ sessionId: selectedId, directories, files })
+				.catch(() => undefined);
+		}, 100);
+		return () => {
+			cancelled = true;
+			window.clearTimeout(timer);
+		};
+	}, [
+		api,
+		connectionRemoteActionBlockedReason,
+		filesVisibleDirectories,
+		selectedFilePath,
+		selectedId,
+	]);
+
+	useEffect(() => {
+		const sessionId = selectedId;
+		return () => {
+			if (!sessionId) return;
+			void api.watchWorkspace({ sessionId, directories: [], files: [] }).catch(() => undefined);
+		};
+	}, [api, selectedId]);
 
 	useEffect(() => {
 		const measure = () => {
@@ -4956,7 +5018,9 @@ export function App({
 					tools={tools}
 					selectedFilePath={selectedFilePath}
 					preferredTab={inspectorPreferredTab}
+					filesTreeEpoch={filesTreeEpoch}
 					onSelectFile={selectFilePath}
+					onVisibleDirectoriesChange={setFilesVisibleDirectories}
 					onSelectSession={(sessionId) => {
 						openConversation(sessionId);
 						if (inspectorIsOverlay) setRightOpen(false);

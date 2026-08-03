@@ -54,9 +54,9 @@ impl From<RuntimeCommandError> for RuntimeHostError {
 /// or fail the work of a newer connection for the same runtime_id.
 static CONNECTION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-/// Fired after a runtime Hello is registered in the live connection map.
-/// The hook must be cheap/non-blocking (spawn any follow-up work itself).
 pub(crate) type RuntimeOnlineHook = Arc<dyn Fn(String) + Send + Sync + 'static>;
+pub(crate) type BrowseFsChangedHook =
+    Arc<dyn Fn(String, Vec<String>, Vec<String>) + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub(crate) struct RuntimeRegistry {
@@ -64,6 +64,7 @@ pub(crate) struct RuntimeRegistry {
     connections: Arc<Mutex<HashMap<String, RuntimeConnection>>>,
     waiters: Arc<Mutex<HashMap<String, Waiter>>>,
     on_online: Arc<StdMutex<Option<RuntimeOnlineHook>>>,
+    on_browse_fs_changed: Arc<StdMutex<Option<BrowseFsChangedHook>>>,
 }
 
 #[derive(Clone)]
@@ -117,11 +118,19 @@ impl RuntimeRegistry {
             connections: Default::default(),
             waiters: Default::default(),
             on_online: Arc::new(StdMutex::new(None)),
+            on_browse_fs_changed: Arc::new(StdMutex::new(None)),
         }
     }
 
     pub(crate) fn set_on_online(&self, hook: RuntimeOnlineHook) {
         *self.on_online.lock().expect("runtime online hook lock") = Some(hook);
+    }
+
+    pub(crate) fn set_on_browse_fs_changed(&self, hook: BrowseFsChangedHook) {
+        *self
+            .on_browse_fs_changed
+            .lock()
+            .expect("browse fs changed hook lock") = Some(hook);
     }
 
     pub(crate) async fn listen(self, bind: String) -> Result<()> {
@@ -256,6 +265,17 @@ impl RuntimeRegistry {
                                 // loop's heartbeats and Result frames behind a
                                 // slow websocket client.
                                 let _ = progress_tx.try_send(progress);
+                            }
+                        }
+                        RuntimeToControl::BrowseFsChanged {
+                            workspace_id,
+                            directories,
+                            files,
+                        } => {
+                            if let Some(hook) =
+                                self.on_browse_fs_changed.lock().expect("browse hook").clone()
+                            {
+                                hook(workspace_id, directories, files);
                             }
                         }
                         RuntimeToControl::Result { command_id, result } => {
@@ -618,6 +638,26 @@ impl RuntimeRegistry {
             None,
         )
         .await
+    }
+
+    pub(crate) async fn browse_watch(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        directories: Vec<String>,
+        files: Vec<String>,
+    ) -> Result<()> {
+        self.execute(
+            runtime_id,
+            RuntimeCommand::BrowseWatch {
+                workspace_id: workspace_id.to_string(),
+                directories,
+                files,
+            },
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     pub(crate) async fn read_runtime_context(
@@ -1048,6 +1088,7 @@ pub(crate) mod test_support {
                 path,
                 max_bytes,
             } => fake_browse_read_file(dirs, &workspace_id, &path, max_bytes).await,
+            RuntimeCommand::BrowseWatch { .. } => Ok(RuntimeCommandResult::Ack),
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,

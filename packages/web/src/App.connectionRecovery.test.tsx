@@ -978,6 +978,11 @@ function createControllableApi(): ControllableApi {
 		startReadonlyDelegationFanout: mutation(),
 		cancelDelegation: mutation(),
 		steerSubagent: mutation(),
+		listWorkspaceDir: vi.fn(async () => ({ path: "", entries: [] })),
+		readWorkspaceFile: vi.fn(async () => {
+			throw new Error("unexpected readWorkspaceFile");
+		}),
+		watchWorkspace: vi.fn(async () => ({ ok: true })),
 		emitStatus(next: ConnectionStatus) {
 			status = next;
 			for (const listener of statusListeners) listener(next);

@@ -6,7 +6,7 @@ import {
 import { useTree } from "@headless-tree/react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ChevronRight, File, Folder, FolderOpen, RefreshCw } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AgentApi } from "./agentApi.ts";
 import { fetchWorkspaceDir, workspaceDirQueryKey } from "./fileBrowser.ts";
 import { joinBrowsePath } from "./filePath.ts";
@@ -25,13 +25,26 @@ function pathFromItemId(itemId: string): string {
 	return itemId === ROOT_ID ? "" : itemId;
 }
 
+/** Directories whose listings are currently visible (cwd root + expanded folders). */
+export function visibleBrowseDirectories(expandedItemIds: readonly string[]): string[] {
+	const dirs = new Set<string>([""]);
+	for (const itemId of expandedItemIds) {
+		if (itemId === ROOT_ID) continue;
+		dirs.add(pathFromItemId(itemId));
+	}
+	return [...dirs].sort();
+}
+
 export interface FilesTabProps {
 	api: AgentApi;
 	sessionId: string | null;
 	selectedPath: string | null;
 	remoteReadBlockedReason?: string | null;
 	activity?: string | null;
+	/** Bumped when interest-scoped dir listings should rebuild. */
+	treeEpoch?: number;
 	onSelectFile: (path: string) => void;
+	onVisibleDirectoriesChange?: (directories: string[]) => void;
 }
 
 export function FilesTab({
@@ -40,12 +53,15 @@ export function FilesTab({
 	selectedPath,
 	remoteReadBlockedReason,
 	activity,
+	treeEpoch = 0,
 	onSelectFile,
+	onVisibleDirectoriesChange,
 }: FilesTabProps) {
 	const queryClient = useQueryClient();
 	const sessionIdRef = useRef(sessionId);
 	sessionIdRef.current = sessionId;
 	const prevActivity = useRef(activity);
+	const [expandedItems, setExpandedItems] = useState<string[]>([]);
 
 	const loadChildren = useCallback(
 		async (itemId: string): Promise<{ id: string; data: TreeItemData }[]> => {
@@ -75,6 +91,8 @@ export function FilesTab({
 
 	const tree = useTree<TreeItemData>({
 		rootItemId: ROOT_ID,
+		state: { expandedItems },
+		setExpandedItems,
 		getItemName: (item) => item.getItemData()?.name ?? "",
 		isItemFolder: (item) => {
 			const data = item.getItemData();
@@ -110,6 +128,14 @@ export function FilesTab({
 	});
 
 	useEffect(() => {
+		onVisibleDirectoriesChange?.(visibleBrowseDirectories(expandedItems));
+	}, [expandedItems, onVisibleDirectoriesChange]);
+
+	useEffect(() => {
+		return () => onVisibleDirectoriesChange?.([]);
+	}, [onVisibleDirectoriesChange]);
+
+	useEffect(() => {
 		if (!sessionId) return;
 		if (prevActivity.current === "running" && activity === "idle") {
 			void queryClient.invalidateQueries({ queryKey: ["workspace-dir", sessionId] });
@@ -120,8 +146,14 @@ export function FilesTab({
 	}, [activity, queryClient, sessionId, tree]);
 
 	useEffect(() => {
+		setExpandedItems([]);
 		tree.rebuildTree();
 	}, [sessionId, tree]);
+
+	useEffect(() => {
+		if (treeEpoch === 0) return;
+		tree.rebuildTree();
+	}, [treeEpoch, tree]);
 
 	const items = tree.getItems();
 	const canBrowse = Boolean(sessionId) && !remoteReadBlockedReason;

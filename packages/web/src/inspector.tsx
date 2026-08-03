@@ -43,7 +43,9 @@ export interface InspectorProps {
 	tools: ToolListing[];
 	selectedFilePath?: string | null;
 	preferredTab?: InspectorTab | null;
+	filesTreeEpoch?: number;
 	onSelectFile?: (path: string) => void;
+	onVisibleDirectoriesChange?: (directories: string[]) => void;
 	onSelectSession?: (sessionId: string) => void;
 	onClose?: () => void;
 }
@@ -70,7 +72,9 @@ export function Inspector({
 	tools,
 	selectedFilePath = null,
 	preferredTab = null,
+	filesTreeEpoch = 0,
 	onSelectFile,
+	onVisibleDirectoriesChange,
 	onSelectSession,
 	onClose
 }: InspectorProps) {
@@ -142,7 +146,9 @@ export function Inspector({
 							selectedPath={selectedFilePath}
 							remoteReadBlockedReason={remoteReadBlockedReason}
 							activity={snapshot?.activity ?? null}
+							treeEpoch={filesTreeEpoch}
 							onSelectFile={(path) => onSelectFile?.(path)}
+							onVisibleDirectoriesChange={onVisibleDirectoriesChange}
 						/>
 					) : (
 						<p className="muted">Files browser unavailable.</p>

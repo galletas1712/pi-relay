@@ -3062,6 +3062,11 @@ function createRouteApi(
 		getSystemPrompt: mutation(),
 		syncActiveBranch: mutation(),
 		readHandoffFile: mutation(),
+		listWorkspaceDir: vi.fn(async () => ({ path: "", entries: [] })),
+		readWorkspaceFile: vi.fn(async () => {
+			throw new Error("unexpected readWorkspaceFile");
+		}),
+		watchWorkspace: vi.fn(async () => ({ ok: true })),
 		emitStatus(status: ConnectionStatus) {
 			open = status === "open";
 			for (const listener of statusListeners) listener(status);

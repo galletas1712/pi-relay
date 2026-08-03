@@ -98,6 +98,7 @@ pub(crate) enum RpcMethod {
     HarnessModelFail,
     WorkspaceListDir,
     WorkspaceReadFile,
+    WorkspaceWatch,
 }
 
 impl RpcMethod {
@@ -154,6 +155,7 @@ impl RpcMethod {
             "harness.model.fail" => Some(Self::HarnessModelFail),
             "workspace.list_dir" => Some(Self::WorkspaceListDir),
             "workspace.read_file" => Some(Self::WorkspaceReadFile),
+            "workspace.watch" => Some(Self::WorkspaceWatch),
             _ => None,
         }
     }
@@ -267,6 +269,10 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("workspace.read_file"),
             Some(RpcMethod::WorkspaceReadFile)
+        );
+        assert_eq!(
+            RpcMethod::parse("workspace.watch"),
+            Some(RpcMethod::WorkspaceWatch)
         );
         for old in [
             "stage.start_full",

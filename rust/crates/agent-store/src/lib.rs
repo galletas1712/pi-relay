@@ -113,6 +113,7 @@ text_enum! {
         TurnStarted => "turn.started",
         TurnFinished => "turn.finished",
         AssistantMessage => "assistant.message",
+        WorkspaceFsChanged => "workspace.fs_changed",
     }
 }
 

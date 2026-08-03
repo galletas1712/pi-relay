@@ -1988,6 +1988,48 @@ no offset protocol.
 `total_size` is required. `byte_len` is the decoded prefix length; `eof` reports
 whether that prefix reached the observed file size.
 
+### `workspace.watch`
+
+Replace the browser's filesystem-watch interest for a session. The daemon stores
+interest per session and forwards the **union** across sessions that share a
+workspace to the runtime. The runtime watches only those directories (non-recursive)
+and the parents of interested files.
+
+- `directories`: cwd-relative paths whose **name/presence listings** should stay
+  fresh. `""` is the session cwd root. The web UI sends the currently visible
+  expanded tree paths only.
+- `files`: cwd-relative paths whose **contents** should stay fresh. The web UI
+  sends the currently open file only (if any).
+- Empty `directories` and `files` clear this session's interest.
+
+```json
+{
+  "session_id": "session_...",
+  "directories": ["", "src"],
+  "files": ["src/main.rs"]
+}
+```
+
+```json
+{ "ok": true }
+```
+
+Matching changes are published as ephemeral `workspace.fs_changed` events
+(`event_id: 0`). Clients must invalidate listings/contents for the listed paths
+and must **not** advance their session high-water mark.
+
+```json
+{
+  "event_id": 0,
+  "event": "workspace.fs_changed",
+  "session_id": "session_...",
+  "data": {
+    "directories": ["src"],
+    "files": ["src/main.rs"]
+  }
+}
+```
+
 ## Subagent events
 
 When a delegation subagent is spawned or re-driven, the daemon may emit

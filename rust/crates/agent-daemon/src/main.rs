@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
         runtime_hosts: runtime_hosts.clone(),
+        browse_watches: Arc::new(Mutex::new(HashMap::new())),
         prompt_root,
         daemon_config: config.daemon_config,
         #[cfg(test)]
@@ -107,6 +108,19 @@ async fn main() -> Result<()> {
     // Install before accepting runtime connections so a Hello that races boot
     // still redrives durable queued work that the one-shot boot sweep missed.
     install_runtime_online_queued_redrive(&state);
+    {
+        let state_for_hook = state.clone();
+        state.runtime_hosts.set_on_browse_fs_changed(std::sync::Arc::new(
+            move |workspace_id, directories, files| {
+                workspace_browse::publish_browse_fs_changed(
+                    &state_for_hook,
+                    workspace_id,
+                    directories,
+                    files,
+                );
+            },
+        ));
+    }
     tokio::spawn(runtime_hosts.listen(config.runtime_bind.clone()));
 
     // Teardown owns every child of a cancelling delegation. Finish it before
@@ -624,6 +638,7 @@ async fn dispatch_request(
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
         RpcMethod::WorkspaceListDir => workspace_browse::list_dir(state, params).await,
         RpcMethod::WorkspaceReadFile => workspace_browse::read_file(state, params).await,
+        RpcMethod::WorkspaceWatch => workspace_browse::watch(state, params).await,
     }
 }
 

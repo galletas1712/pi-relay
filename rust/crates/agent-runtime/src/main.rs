@@ -188,16 +188,36 @@ async fn main() -> Result<()> {
             return Err(error).with_context(|| format!("read MCP config {}", mcp_path.display()))
         }
     };
+    let (browse_raw_tx, browse_raw_rx) = mpsc::unbounded_channel();
+    let browse_hub = Arc::new(workspaces::watch::BrowseWatchHub::new(browse_raw_tx));
     let runtime = Runtime {
         workspaces: WorkspaceManager::new(
             config.workspace_root.clone(),
             config.config_root.clone(),
             config.home_dir.clone(),
-        ),
+        )
+        .with_browse_watch(browse_hub),
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         running: Default::default(),
         mcp,
     };
+    // Keep the coalesce task alive for the process; it forwards into each
+    // control connection via an ArcSwap-style slot updated in `connect`.
+    let browse_forward: Arc<Mutex<Option<mpsc::Sender<(String, workspaces::watch::BrowseFsDelta)>>>> =
+        Arc::new(Mutex::new(None));
+    {
+        let browse_forward = browse_forward.clone();
+        let (coalesce_tx, mut coalesce_rx) = mpsc::channel(32);
+        tokio::spawn(workspaces::watch::coalesce_watch_events(browse_raw_rx, coalesce_tx));
+        tokio::spawn(async move {
+            while let Some(delta) = coalesce_rx.recv().await {
+                let forward = browse_forward.lock().await.clone();
+                if let Some(forward) = forward {
+                    let _ = forward.send(delta).await;
+                }
+            }
+        });
+    }
     runtime.workspaces.validate_root().await.with_context(|| {
         format!(
             "workspace_root {} must support btrfs subvolumes",
@@ -205,7 +225,7 @@ async fn main() -> Result<()> {
         )
     })?;
     loop {
-        match connect(&config, runtime.clone()).await {
+        match connect(&config, runtime.clone(), browse_forward.clone()).await {
             Ok(()) => eprintln!("control connection closed"),
             Err(error) => eprintln!("control connection failed: {error:#}"),
         }
@@ -283,7 +303,11 @@ fn config_root_from_env(
         .join(RUNTIME_CONFIG_DIR))
 }
 
-async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
+async fn connect(
+    config: &Config,
+    runtime: Runtime,
+    browse_forward: Arc<Mutex<Option<mpsc::Sender<(String, workspaces::watch::BrowseFsDelta)>>>>,
+) -> Result<()> {
     let stream = TcpStream::connect(&config.control_addr).await?;
     let (mut reader, mut writer) = stream.into_split();
     write_frame(
@@ -316,6 +340,8 @@ async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
         }
     });
     let (results_tx, mut results_rx) = mpsc::channel(32);
+    let (browse_tx, mut browse_rx) = mpsc::channel(32);
+    *browse_forward.lock().await = Some(browse_tx);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
     let connected = async {
         loop {
@@ -324,6 +350,18 @@ async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
             result = results_rx.recv() => {
                 let Some(result) = result else { break };
                 write_frame(&mut writer, &result).await?;
+            }
+            browse = browse_rx.recv() => {
+                let Some((workspace_id, delta)) = browse else { break };
+                write_frame(
+                    &mut writer,
+                    &RuntimeToControl::BrowseFsChanged {
+                        workspace_id,
+                        directories: delta.directories,
+                        files: delta.files,
+                    },
+                )
+                .await?;
             }
             frame = incoming_rx.recv() => {
                 let Some(frame) = frame else { break };
@@ -399,6 +437,7 @@ async fn connect(config: &Config, runtime: Runtime) -> Result<()> {
         Ok(())
     }
     .await;
+    *browse_forward.lock().await = None;
     reader_task.abort();
     connected
 }
@@ -465,6 +504,9 @@ impl Runtime {
                 Ok(RuntimeCommandResult::Materialized { workspaces })
             }
             RuntimeCommand::DestroySession { workspace_id } => {
+                if let Some(hub) = self.workspaces.browse_watch_hub() {
+                    hub.stop_workspace(&workspace_id);
+                }
                 self.workspaces
                     .destroy_session_workspaces(&workspace_id)
                     .await?;
@@ -564,6 +606,15 @@ impl Runtime {
                     eof: prefix.eof,
                     mtime_ms: prefix.mtime_ms,
                 })
+            }
+            RuntimeCommand::BrowseWatch {
+                workspace_id,
+                directories,
+                files,
+            } => {
+                self.workspaces
+                    .set_browse_watch(&workspace_id, directories, files)?;
+                Ok(RuntimeCommandResult::Ack)
             }
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,

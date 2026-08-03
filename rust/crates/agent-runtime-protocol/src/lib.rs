@@ -64,6 +64,12 @@ pub enum RuntimeToControl {
         command_id: String,
         progress: WorkspaceMaterializeProgress,
     },
+    /// Interest-filtered filesystem changes under a watched session cwd.
+    BrowseFsChanged {
+        workspace_id: String,
+        directories: Vec<String>,
+        files: Vec<String>,
+    },
     Result {
         command_id: String,
         result: Result<RuntimeCommandResult, RuntimeCommandError>,
@@ -167,6 +173,14 @@ pub enum RuntimeCommand {
         path: String,
         max_bytes: u32,
     },
+    /// Replace the watched interest set for this workspace cwd. Empty
+    /// directories and files clear interest for the caller; the runtime keeps a
+    /// watcher only while some interest remains.
+    BrowseWatch {
+        workspace_id: String,
+        directories: Vec<String>,
+        files: Vec<String>,
+    },
     /// Return runtime-owned instructions and skill packages for a session.
     /// `project_key` selects `$HOME/.agents/projects/<project_key>/skills`
     /// when the session belongs to a project; ephemeral sessions pass `None`.
@@ -243,6 +257,7 @@ impl RuntimeCommand {
             | Self::ReadWorkspaceFile { .. }
             | Self::BrowseListDir { .. }
             | Self::BrowseReadFile { .. }
+            | Self::BrowseWatch { .. }
             | Self::ReadRuntimeContext { .. }
             | Self::McpInventory { .. }
             | Self::McpSelect { .. }

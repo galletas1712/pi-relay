@@ -5,6 +5,7 @@ mod instantiate;
 mod local;
 mod sanitize;
 mod selection;
+pub mod watch;
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -55,6 +56,7 @@ pub struct WorkspaceManager {
     /// Serializes refresh of a single managed workspace base slot.
     workspace_base_slot_locks: KeyedLocks<(Uuid, String)>,
     cwd_mutation_guards: KeyedLocks<PathBuf>,
+    browse_watch: Option<std::sync::Arc<watch::BrowseWatchHub>>,
 }
 
 impl WorkspaceManager {
@@ -66,7 +68,13 @@ impl WorkspaceManager {
             project_bases_locks: Arc::new(Mutex::new(HashMap::new())),
             workspace_base_slot_locks: Arc::new(Mutex::new(HashMap::new())),
             cwd_mutation_guards: Arc::new(Mutex::new(HashMap::new())),
+            browse_watch: None,
         }
+    }
+
+    pub fn with_browse_watch(mut self, hub: std::sync::Arc<watch::BrowseWatchHub>) -> Self {
+        self.browse_watch = Some(hub);
+        self
     }
 
     pub fn resolve(&self, workspace_id: &str) -> PathBuf {
@@ -146,6 +154,22 @@ impl WorkspaceManager {
         tokio::task::spawn_blocking(move || fs::read_file_prefix(&cwd, &path, max_bytes))
             .await
             .context("browse read_file task failed")?
+    }
+
+    pub fn browse_watch_hub(&self) -> Option<&std::sync::Arc<watch::BrowseWatchHub>> {
+        self.browse_watch.as_ref()
+    }
+
+    pub fn set_browse_watch(
+        &self,
+        workspace_id: &str,
+        directories: Vec<String>,
+        files: Vec<String>,
+    ) -> Result<()> {
+        let Some(hub) = &self.browse_watch else {
+            bail!("browse watch hub is not configured");
+        };
+        hub.set_interest(workspace_id, self.resolve(workspace_id), directories, files)
     }
 
     /// Return all runtime-owned instructions and skill packages visible to a
@@ -541,6 +565,9 @@ impl WorkspaceManager {
     /// teardown primitive; callers that only want directory removal still route
     /// through it so subvolume metadata is never leaked.
     pub async fn destroy_session_workspaces(&self, workspace_id: &str) -> Result<()> {
+        if let Some(hub) = &self.browse_watch {
+            hub.stop_workspace(workspace_id);
+        }
         let root = self.session_root(workspace_id);
         destroy_session_subvolume(&root.join("cwd")).await?;
         // Idempotent: a re-issued teardown (or the materialize cleanup path

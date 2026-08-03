@@ -99,6 +99,7 @@ export interface AgentApi {
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
 	listWorkspaceDir(params: ListWorkspaceDirParams): Promise<WorkspaceDirListing>;
 	readWorkspaceFile(params: ReadWorkspaceFileParams): Promise<WorkspaceFilePrefix>;
+	watchWorkspace(params: WatchWorkspaceParams): Promise<{ ok: boolean }>;
 }
 
 export interface ListWorkspaceDirParams {
@@ -112,6 +113,12 @@ export interface ReadWorkspaceFileParams {
 	sessionId: string;
 	path: string;
 	maxBytes?: number;
+}
+
+export interface WatchWorkspaceParams {
+	sessionId: string;
+	directories: string[];
+	files: string[];
 }
 
 export interface AddMcpToolsParams {
@@ -838,6 +845,14 @@ class AgentApiClient implements AgentApi {
 			session_id: params.sessionId,
 			path: params.path,
 			max_bytes: params.maxBytes,
+		});
+	}
+
+	watchWorkspace(params: WatchWorkspaceParams): Promise<{ ok: boolean }> {
+		return this.client.request<{ ok: boolean }>("workspace.watch", {
+			session_id: params.sessionId,
+			directories: params.directories,
+			files: params.files,
 		});
 	}
 }
