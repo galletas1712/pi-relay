@@ -1211,10 +1211,12 @@ async fn fork(
     config: &SessionConfig,
     target: HistoryTarget<'_>,
 ) -> anyhow::Result<()> {
+    let mut child_config = config.clone();
+    child_config.workspace_id = format!("test-history-fork-workspace-{child_session_id}");
     let workspace = prepare_test_workspace(
         store,
         child_session_id,
-        config,
+        &child_config,
         WorkspaceOwnerKind::HistoryFork,
     )
     .await;
@@ -1222,7 +1224,7 @@ async fn fork(
         .create_fork(CreateForkRequest {
             source_session_id,
             child_session_id,
-            config,
+            config: &child_config,
             target,
             workspace: workspace.attachment(),
         })
