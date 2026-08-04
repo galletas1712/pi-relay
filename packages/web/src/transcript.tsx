@@ -284,6 +284,7 @@ export const MessageList = memo(function MessageList({
 	destination = null,
 	turnPageIdentity = null,
 	onAcknowledgeDestination,
+	parked = false,
 }: {
 	entries: TranscriptEntry[];
 	pendingActions?: PendingAction[];
@@ -316,10 +317,14 @@ export const MessageList = memo(function MessageList({
 	destination?: TranscriptDestination | null;
 	turnPageIdentity?: TranscriptTurnPageIdentity | null;
 	onAcknowledgeDestination?: (destinationId: number) => void;
+	/** When true, freeze sticky scroll so Agents↔Files parking cannot pin-to-bottom. */
+	parked?: boolean;
 }) {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const contentRef = useRef<HTMLDivElement | null>(null);
 	const shouldStickToBottomRef = useRef(true);
+	const parkedRef = useRef(parked);
+	parkedRef.current = parked;
 	const lastScrollMetricsRef = useRef<ScrollMetrics | null>(null);
 	const activeScrollIdentityRef = useRef<ActiveTranscriptScrollIdentity>({
 		sessionKey: null,
@@ -495,6 +500,7 @@ export const MessageList = memo(function MessageList({
 	}, [collectTranscriptNavigationStops, scrollToTranscriptNavigationTarget]);
 
 	const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
+		if (parkedRef.current) return;
 		if (pendingLatestSessionKeyRef.current === activeScrollIdentityRef.current.sessionKey) return;
 		const pointerIntent = pointerScrollbarIntentRef.current;
 		if (
@@ -670,6 +676,7 @@ export const MessageList = memo(function MessageList({
 		const content = contentRef.current;
 		if (!scroller || !content) return;
 		const observer = new ResizeObserver(() => {
+			if (parkedRef.current) return;
 			if (pendingLatestSessionKeyRef.current === activeScrollIdentityRef.current.sessionKey) return;
 			if (
 				destination &&

@@ -1,5 +1,6 @@
-import { memo, type ReactNode } from "react";
+import { memo, useCallback, useRef, type ReactNode } from "react";
 import { LogHeader } from "./panels.tsx";
+import { useParkedScrollPreservation } from "./parkedScroll.ts";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { isArchivedSession, sessionStatusWithDelegations, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
 import { MessageList } from "./transcript.tsx";
@@ -102,10 +103,17 @@ export const ChatPane = memo(function ChatPane({
 	emptySessionContent,
 	parked = false,
 }: ChatPaneProps) {
+	const rootRef = useRef<HTMLElement>(null);
+	const getTranscriptScroller = useCallback(
+		() => rootRef.current?.querySelector<HTMLElement>(".message-scroll") ?? null,
+		[],
+	);
+	useParkedScrollPreservation(getTranscriptScroller, parked);
 	const loadedLeafId = activeLeafIdFromEntries(entries);
 	const visibleActiveLeafId = loadedLeafId ?? snapshot?.active_leaf_id ?? null;
 	return (
 		<main
+			ref={rootRef}
 			className="log-pane"
 			data-slot="agent-log"
 			aria-hidden={parked || undefined}
@@ -162,6 +170,7 @@ export const ChatPane = memo(function ChatPane({
 				destination={transcriptDestination}
 				turnPageIdentity={transcriptTurnPageIdentity}
 				onAcknowledgeDestination={onAcknowledgeTranscriptDestination}
+				parked={parked}
 			/>
 		</main>
 	);
