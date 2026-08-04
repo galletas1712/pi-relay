@@ -230,9 +230,6 @@ export function FilesTab({
 
 	return (
 		<div className="files-tab">
-			<div className="files-tab-toolbar">
-				<span className="files-tab-label">Session cwd</span>
-			</div>
 			{!sessionId ? (
 				<p className="muted files-tab-empty">Select a session to browse its files.</p>
 			) : remoteReadBlockedReason ? (
