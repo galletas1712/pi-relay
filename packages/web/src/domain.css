@@ -1521,6 +1521,15 @@ pre {
 	height: auto;
 }
 
+/* Mermaid only wraps on whitespace. Force a break when a single token is
+   wider than wrappingWidth so labels are not clipped mid-word. */
+.assistant-markdown .mermaid-diagram-svg .nodeLabel,
+.assistant-markdown .mermaid-diagram-svg .edgeLabel,
+.mermaid-dialog-svg .nodeLabel,
+.mermaid-dialog-svg .edgeLabel {
+	overflow-wrap: anywhere;
+}
+
 .assistant-markdown .mermaid-source {
 	position: relative;
 }

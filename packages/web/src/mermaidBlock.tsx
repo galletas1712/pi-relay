@@ -23,12 +23,7 @@ function loadMermaid(theme: "default" | "dark"): Promise<MermaidApi> {
 	if (!mermaidPromise) {
 		const importedPromise = import("mermaid").then((mod) => {
 			const api = (mod.default ?? mod) as unknown as MermaidApi;
-			api.initialize({
-				startOnLoad: false,
-				securityLevel: "strict",
-				theme,
-				fontFamily: "var(--font-sans), system-ui, sans-serif"
-			});
+			api.initialize(mermaidConfig(theme));
 			currentTheme = theme;
 			return api;
 		});
@@ -47,16 +42,26 @@ function loadMermaid(theme: "default" | "dark"): Promise<MermaidApi> {
 	}
 	return mermaidPromise.then((api) => {
 		if (currentTheme !== theme) {
-			api.initialize({
-				startOnLoad: false,
-				securityLevel: "strict",
-				theme,
-				fontFamily: "var(--font-sans), system-ui, sans-serif"
-			});
+			api.initialize(mermaidConfig(theme));
 			currentTheme = theme;
 		}
 		return api;
 	});
+}
+
+// Cap label width so Mermaid wraps onto new lines (default is 200px and
+// overflow-clips). Mid-token overflow is handled in CSS via overflow-wrap.
+function mermaidConfig(theme: "default" | "dark"): Record<string, unknown> {
+	return {
+		startOnLoad: false,
+		securityLevel: "strict",
+		theme,
+		fontFamily: "var(--font-sans), system-ui, sans-serif",
+		markdownAutoWrap: true,
+		flowchart: {
+			wrappingWidth: 400,
+		},
+	};
 }
 
 function enqueueMermaidOperation<T>(operation: () => Promise<T>): Promise<T> {
