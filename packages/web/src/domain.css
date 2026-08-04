@@ -3981,15 +3981,6 @@ pre {
 	background: color-mix(in oklch, var(--card) 84%, var(--background));
 }
 
-.file-pane-back {
-	display: inline-flex;
-	align-items: center;
-	gap: 6px;
-	height: 30px;
-	padding: 0 10px;
-	font-size: var(--text-sm);
-}
-
 .file-pane-title {
 	display: flex;
 	min-width: 0;

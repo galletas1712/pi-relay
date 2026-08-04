@@ -46,6 +46,7 @@ export interface InspectorProps {
 	filesTreeEpoch?: number;
 	onSelectFile?: (path: string) => void;
 	onVisibleDirectoriesChange?: (directories: string[]) => void;
+	onActiveTabChange?: (tab: InspectorTab) => void;
 	onSelectSession?: (sessionId: string) => void;
 	onClose?: () => void;
 }
@@ -75,6 +76,7 @@ export function Inspector({
 	filesTreeEpoch = 0,
 	onSelectFile,
 	onVisibleDirectoriesChange,
+	onActiveTabChange,
 	onSelectSession,
 	onClose
 }: InspectorProps) {
@@ -96,7 +98,10 @@ export function Inspector({
 						id={`inspector-tab-${tab.id}`}
 						aria-selected={activeTab === tab.id}
 						aria-controls={`inspector-panel-${tab.id}`}
-						onClick={() => setActiveTab(tab.id)}
+						onClick={() => {
+							setActiveTab(tab.id);
+							onActiveTabChange?.(tab.id);
+						}}
 					>
 						{tab.label}
 					</button>

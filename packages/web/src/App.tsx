@@ -423,6 +423,10 @@ export function App({
 	);
 	const [fileSplitCapable, setFileSplitCapable] = useState(false);
 	const [filesOnlyPreference, setFilesOnlyPreference] = useState(false);
+	/** Narrow layouts: Agents/Files pick which center surface is primary. */
+	const [centerMode, setCenterMode] = useState<"chat" | "files">(() =>
+		readFileQuery() ? "files" : "chat",
+	);
 	const [showArchived, setShowArchived] = useState(false);
 	const [showAllDelegations, setShowAllDelegations] = useState(false);
 	const [backgroundWarmRevision, setBackgroundWarmRevision] = useState(0);
@@ -4427,15 +4431,30 @@ export function App({
 		setSelectedFilePath(path);
 		replaceFileQuery(path);
 		if (path) {
+			setCenterMode("files");
 			setInspectorPreferredTab("files");
 			setRightOpen(true);
+		} else {
+			setCenterMode("chat");
+		}
+	}, []);
+
+	const handleInspectorTabChange = useCallback((tab: InspectorTab) => {
+		setInspectorPreferredTab(tab);
+		if (tab === "run-board") {
+			setCenterMode("chat");
+			setFilesOnlyPreference(false);
+		} else if (tab === "files") {
+			setCenterMode("files");
 		}
 	}, []);
 
 	useEffect(() => {
 		const onPopState = () => {
 			setFilesOnlyPreference(false);
-			setSelectedFilePath(readFileQuery());
+			const path = readFileQuery();
+			setSelectedFilePath(path);
+			setCenterMode(path ? "files" : "chat");
 		};
 		window.addEventListener("popstate", onPopState);
 		return () => window.removeEventListener("popstate", onPopState);
@@ -4454,6 +4473,7 @@ export function App({
 		setInspectorPreferredTab(null);
 		setFilesVisibleDirectories([]);
 		setFilesOnlyPreference(false);
+		setCenterMode("chat");
 		if (previousSessionId) {
 			workspaceFileCache.clearSession(previousSessionId);
 		}
@@ -4644,14 +4664,16 @@ export function App({
 	);
 	const fileOpen = Boolean(selectedFilePath);
 	const fileSplitMode = fileOpen && fileSplitCapable && !filesOnlyPreference;
-	const fileReplacementMode = fileOpen && !fileSplitMode;
+	const showFilePane =
+		fileOpen && (fileSplitCapable || centerMode === "files" || filesOnlyPreference);
+	const fileReplacementMode = showFilePane && !fileSplitMode;
 	const appClassName = [
 		"app-shell",
 		sidebarOpen ? "sidebar-open" : "",
 		rightOpen ? "inspector-open" : "",
 		sidebarResizing ? "sidebar-resizing" : "",
 		filePaneResizing ? "file-pane-resizing" : "",
-		fileOpen ? "file-open" : "",
+		showFilePane ? "file-open" : "",
 		fileSplitMode ? "file-split" : "",
 		fileReplacementMode ? "file-replacement" : "",
 	]
@@ -4826,7 +4848,15 @@ export function App({
 						onReasoningEffortChange={handleReasoningEffortChange}
 						onSelectSession={openConversation}
 						onToggleRight={handleToggleRight}
-						onHideChat={fileSplitMode ? () => setFilesOnlyPreference(true) : undefined}
+						onHideChat={
+							fileSplitMode
+								? () => {
+										setFilesOnlyPreference(true);
+										setCenterMode("files");
+										setInspectorPreferredTab("files");
+									}
+								: undefined
+						}
 						onNewSession={handleSidebarNew}
 						onResumeTurn={handleResumeTurn}
 						onExpandTurn={expandTurn}
@@ -4949,7 +4979,7 @@ export function App({
 				</main>
 			) : null}
 
-			{selectedFilePath && selectedId ? (
+			{showFilePane && selectedFilePath && selectedId ? (
 				<>
 					{fileSplitMode ? (
 						<div
@@ -4976,9 +5006,13 @@ export function App({
 						api={api}
 						sessionId={selectedId}
 						path={selectedFilePath}
-						replacementMode={fileReplacementMode}
 						remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 						onClose={() => selectFilePath(null)}
+						onShowChat={
+							fileReplacementMode && fileSplitCapable
+								? () => setFilesOnlyPreference(false)
+								: undefined
+						}
 						onNavigate={selectFilePath}
 					/>
 				</>
@@ -5054,6 +5088,7 @@ export function App({
 					filesTreeEpoch={filesTreeEpoch}
 					onSelectFile={selectFilePath}
 					onVisibleDirectoriesChange={setFilesVisibleDirectories}
+					onActiveTabChange={handleInspectorTabChange}
 					onSelectSession={(sessionId) => {
 						openConversation(sessionId);
 						if (inspectorIsOverlay) setRightOpen(false);
