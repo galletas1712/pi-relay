@@ -3628,7 +3628,7 @@ pre {
 	padding-right: env(safe-area-inset-right, 0px);
 	border-left: 1px solid var(--border);
 	background: var(--card);
-	overflow: auto;
+	overflow: hidden;
 	box-shadow: none;
 	transform: none;
 	transition: transform 180ms ease, box-shadow 180ms ease;
@@ -3809,11 +3809,14 @@ pre {
 .inspector-inner {
 	display: flex;
 	min-height: 0;
+	flex: 1;
 	flex-direction: column;
+	height: 100%;
 }
 
 .inspector-footer {
 	flex: 0 0 auto;
+	margin-top: auto;
 	border-top: 1px solid var(--border);
 	padding: 8px 10px;
 }
