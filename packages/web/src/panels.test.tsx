@@ -115,14 +115,16 @@ function renderRunBoardList({
 describe("Inspector run board delegation list", () => {
 	it("collapses terminal history but always shows every running or cancelling delegation", () => {
 		const delegations = [
-			delegation({ delegation_id: "terminal-1", label: "terminal task 1", status: "done" }),
+			...Array.from({ length: 12 }, (_, index) =>
+				delegation({
+					delegation_id: `terminal-${index + 1}`,
+					label: `terminal task ${index + 1}`,
+					status: index % 2 === 0 ? "done" : "failed",
+				}),
+			),
 			delegation({ delegation_id: "active-1", label: "active task 1", status: "running" }),
-			delegation({ delegation_id: "terminal-2", label: "terminal task 2", status: "failed" }),
 			delegation({ delegation_id: "cancelling", label: "cancelling task", status: "cancelling" }),
-			delegation({ delegation_id: "terminal-3", label: "terminal task 3", status: "cancelled" }),
 			delegation({ delegation_id: "active-2", label: "active task 2", status: "running" }),
-			delegation({ delegation_id: "terminal-4", label: "terminal task 4", status: "done" }),
-			delegation({ delegation_id: "terminal-5", label: "terminal task 5", status: "done_with_failures" }),
 		];
 
 		const collapsed = renderRunBoardList({ delegations });
@@ -130,18 +132,18 @@ describe("Inspector run board delegation list", () => {
 		expect(collapsed).toContain("active task 2");
 		expect(collapsed).toContain("cancelling task");
 		expect(collapsed).toContain("terminal task 1");
-		expect(collapsed).toContain("terminal task 3");
-		expect(collapsed).not.toContain("terminal task 4");
-		expect(collapsed).not.toContain("terminal task 5");
+		expect(collapsed).toContain("terminal task 10");
+		expect(collapsed).not.toContain("terminal task 11");
+		expect(collapsed).not.toContain("terminal task 12");
 		expect(collapsed).toContain("See more (2)");
 
 		const expanded = renderRunBoardList({ delegations, showAllDelegations: true });
-		expect(expanded).toContain("terminal task 4");
-		expect(expanded).toContain("terminal task 5");
+		expect(expanded).toContain("terminal task 11");
+		expect(expanded).toContain("terminal task 12");
 	});
 
 	it("applies the default limit only to terminal history", () => {
-		const delegations = Array.from({ length: 5 }, (_, index) =>
+		const delegations = Array.from({ length: 12 }, (_, index) =>
 			delegation({
 				delegation_id: `terminal-${index + 1}`,
 				label: `terminal task ${index + 1}`,
@@ -151,12 +153,12 @@ describe("Inspector run board delegation list", () => {
 
 		const collapsed = renderRunBoardList({ delegations });
 		expect(collapsed).toContain("terminal task 1");
-		expect(collapsed).toContain("terminal task 3");
-		expect(collapsed).not.toContain("terminal task 4");
+		expect(collapsed).toContain("terminal task 10");
+		expect(collapsed).not.toContain("terminal task 11");
 		expect(collapsed).toContain("See more (2)");
 
 		const expanded = renderRunBoardList({ delegations, showAllDelegations: true });
-		expect(expanded).toContain("terminal task 5");
+		expect(expanded).toContain("terminal task 12");
 		expect(expanded).toContain("Show fewer");
 	});
 
