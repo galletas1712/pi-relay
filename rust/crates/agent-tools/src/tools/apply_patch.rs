@@ -110,9 +110,7 @@ fn patch_lock_paths(ops: &[PatchOp], ctx: &ToolContext) -> Vec<std::path::PathBu
             PatchOp::Add { path, .. } | PatchOp::Delete { path } => {
                 paths.push(workspace_path(ctx, path));
             }
-            PatchOp::Update {
-                path, move_to, ..
-            } => {
+            PatchOp::Update { path, move_to, .. } => {
                 paths.push(workspace_path(ctx, path));
                 if let Some(target) = move_to {
                     paths.push(workspace_path(ctx, target));

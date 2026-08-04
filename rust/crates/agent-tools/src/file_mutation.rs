@@ -115,10 +115,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "pi-file-mutation-{}-{nanos}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("pi-file-mutation-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&path).expect("temp dir");
         path
     }

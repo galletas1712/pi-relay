@@ -16,7 +16,7 @@ use agent_runtime_protocol::{
     RuntimeCommandError, RuntimeCommandResult, RuntimeHello, RuntimeToControl, SelectedWorkspace,
     HEARTBEAT_INTERVAL_SECS,
 };
-use agent_tools::{ToolContext, ToolRegistry, FileMutationLocks};
+use agent_tools::{FileMutationLocks, ToolContext, ToolRegistry};
 use agent_vocab::{ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
