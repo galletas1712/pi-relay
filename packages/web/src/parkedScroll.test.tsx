@@ -44,6 +44,13 @@ describe("useParkedScrollPreservation", () => {
 			},
 		});
 
+		scrollTop = 900;
+		await act(async () => {
+			view.rerender(<Harness parked={false} />);
+		});
+		// Initial mount / never-parked must not clobber sticky-to-bottom.
+		expect(scrollTop).toBe(900);
+
 		scrollTop = 420;
 		await act(async () => {
 			view.rerender(<Harness parked={true} />);
