@@ -3812,6 +3812,26 @@ pre {
 	flex-direction: column;
 }
 
+.inspector-footer {
+	flex: 0 0 auto;
+	border-top: 1px solid var(--border);
+	padding: 8px 10px;
+}
+
+.inspector-show-details {
+	width: 100%;
+	justify-content: center;
+}
+
+.inspector-details-dialog {
+	width: min(560px, calc(100vw - 24px));
+	max-height: min(80vh, 720px);
+}
+
+.inspector-details-dialog .dialog-body {
+	overflow: auto;
+}
+
 .inspector-tabs {
 	display: flex;
 	height: var(--top-header-height);
@@ -4454,7 +4474,8 @@ pre {
 }
 
 .run-board-subagent-button[aria-current="page"] {
-	background: color-mix(in oklch, var(--primary) 10%, var(--card));
+	background: color-mix(in oklch, var(--primary) 14%, var(--card));
+	box-shadow: inset 2px 0 0 var(--primary);
 }
 
 .run-board-subagent-main {

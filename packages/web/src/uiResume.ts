@@ -7,6 +7,10 @@ export interface UiResumeState {
 	selectedProjectId: string | null;
 	selectedSessionIdByProject: Record<string, string>;
 	selectedSubagentIdByParentSession: Record<string, string>;
+	/** Per root session: last Agents vs Files center surface. */
+	centerModeByRootSession: Record<string, "chat" | "files">;
+	/** Per conversation session: last opened file path (cwd-relative). */
+	lastFileBySession: Record<string, string>;
 	activeRootSessionId: string | null | undefined;
 	updatedAt: number;
 }
@@ -20,6 +24,8 @@ const EMPTY_STATE: UiResumeState = {
 	selectedProjectId: null,
 	selectedSessionIdByProject: {},
 	selectedSubagentIdByParentSession: {},
+	centerModeByRootSession: {},
+	lastFileBySession: {},
 	activeRootSessionId: undefined,
 	updatedAt: 0,
 };
@@ -100,6 +106,46 @@ export function rememberSelectedSubagent(
 	writeUiResumeState(state, storage);
 }
 
+export function centerModeForRootSession(
+	rootSessionId: string,
+	storage = browserStorage(),
+	state = readUiResumeState(storage),
+): "chat" | "files" {
+	return state.centerModeByRootSession[rootSessionId] === "files" ? "files" : "chat";
+}
+
+export function rememberCenterModeForRootSession(
+	rootSessionId: string,
+	mode: "chat" | "files",
+	storage = browserStorage(),
+): void {
+	const state = readUiResumeState(storage);
+	if (mode === "chat") delete state.centerModeByRootSession[rootSessionId];
+	else state.centerModeByRootSession[rootSessionId] = "files";
+	writeUiResumeState(state, storage);
+}
+
+export function lastFileForSession(
+	sessionId: string,
+	storage = browserStorage(),
+	state = readUiResumeState(storage),
+): string | null {
+	return Object.hasOwn(state.lastFileBySession, sessionId)
+		? state.lastFileBySession[sessionId] ?? null
+		: null;
+}
+
+export function rememberLastFileForSession(
+	sessionId: string,
+	path: string | null,
+	storage = browserStorage(),
+): void {
+	const state = readUiResumeState(storage);
+	if (path) state.lastFileBySession[sessionId] = path;
+	else delete state.lastFileBySession[sessionId];
+	writeUiResumeState(state, storage);
+}
+
 export function forgetDeletedSessions(
 	sessionIds: Iterable<string>,
 	storage = browserStorage(),
@@ -116,6 +162,12 @@ export function forgetDeletedSessions(
 		if (deleted.has(parentSessionId) || deleted.has(subagentSessionId)) {
 			delete state.selectedSubagentIdByParentSession[parentSessionId];
 		}
+	}
+	for (const sessionId of Object.keys(state.centerModeByRootSession)) {
+		if (deleted.has(sessionId)) delete state.centerModeByRootSession[sessionId];
+	}
+	for (const sessionId of Object.keys(state.lastFileBySession)) {
+		if (deleted.has(sessionId)) delete state.lastFileBySession[sessionId];
 	}
 	if (state.activeRootSessionId && deleted.has(state.activeRootSessionId)) {
 		state.activeRootSessionId = null;
@@ -145,6 +197,8 @@ function writeUiResumeState(state: UiResumeState, storage: UiResumeStorage | nul
 			selectedProjectId: state.selectedProjectId,
 			selectedSessionIdByProject: { ...state.selectedSessionIdByProject },
 			selectedSubagentIdByParentSession: { ...state.selectedSubagentIdByParentSession },
+			centerModeByRootSession: { ...state.centerModeByRootSession },
+			lastFileBySession: { ...state.lastFileBySession },
 			activeRootSessionId,
 			updatedAt: Date.now(),
 		};
@@ -171,6 +225,10 @@ function normalizeState(value: unknown): UiResumeState {
 	copyNormalizedIdMap(value.selectedSessionIdByProject, selectedSessionIdByProject);
 	const selectedSubagentIdByParentSession = emptyIdMap();
 	copyNormalizedIdMap(value.selectedSubagentIdByParentSession, selectedSubagentIdByParentSession);
+	const centerModeByRootSession = emptyCenterModeMap();
+	copyNormalizedCenterModeMap(value.centerModeByRootSession, centerModeByRootSession);
+	const lastFileBySession = emptyIdMap();
+	copyNormalizedIdMap(value.lastFileBySession, lastFileBySession);
 
 	const legacySelectedSessionId = normalizeId(value.selectedSessionId);
 	if (
@@ -190,6 +248,8 @@ function normalizeState(value: unknown): UiResumeState {
 		selectedProjectId,
 		selectedSessionIdByProject,
 		selectedSubagentIdByParentSession,
+		centerModeByRootSession,
+		lastFileBySession,
 		activeRootSessionId,
 		updatedAt: typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt) ? value.updatedAt : 0,
 	};
@@ -203,6 +263,17 @@ function copyNormalizedIdMap(value: unknown, target: Record<string, string>): vo
 	}
 }
 
+function copyNormalizedCenterModeMap(
+	value: unknown,
+	target: Record<string, "chat" | "files">,
+): void {
+	if (!isRecord(value)) return;
+	for (const [sessionId, mode] of Object.entries(value)) {
+		if (!sessionId) continue;
+		if (mode === "files" || mode === "chat") target[sessionId] = mode;
+	}
+}
+
 function normalizeId(value: unknown): string | null {
 	return typeof value === "string" && value.trim() ? value : null;
 }
@@ -211,11 +282,17 @@ function emptyIdMap(): Record<string, string> {
 	return Object.create(null) as Record<string, string>;
 }
 
+function emptyCenterModeMap(): Record<string, "chat" | "files"> {
+	return Object.create(null) as Record<string, "chat" | "files">;
+}
+
 function cloneEmptyState(): UiResumeState {
 	return {
 		selectedProjectId: EMPTY_STATE.selectedProjectId,
 		selectedSessionIdByProject: emptyIdMap(),
 		selectedSubagentIdByParentSession: emptyIdMap(),
+		centerModeByRootSession: emptyCenterModeMap(),
+		lastFileBySession: emptyIdMap(),
 		activeRootSessionId: EMPTY_STATE.activeRootSessionId,
 		updatedAt: EMPTY_STATE.updatedAt,
 	};

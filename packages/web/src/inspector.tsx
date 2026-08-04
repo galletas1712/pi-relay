@@ -1,6 +1,14 @@
 import { X } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { AgentApi } from "./agentApi.ts";
+import {
+	AppDialog,
+	DialogBody,
+	DialogCloseButton,
+	DialogHeader,
+	DialogHeading,
+	DialogTitle,
+} from "./dialog.tsx";
 import { FilesTab } from "./filesTab.tsx";
 import { RunBoard } from "./runBoard.tsx";
 import { COMMANDS } from "./slash.ts";
@@ -8,12 +16,11 @@ import type { Delegation, SessionSnapshot, SessionWorkspace, ToolListing } from 
 
 const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
 
-export type InspectorTab = "run-board" | "files" | "debug";
+export type InspectorTab = "run-board" | "files";
 
 const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
 	{ id: "run-board", label: "Agents" },
 	{ id: "files", label: "Files" },
-	{ id: "debug", label: "Inspector" },
 ];
 
 function pendingActionLabel(action: SessionSnapshot["pending_actions"][number]): string {
@@ -78,9 +85,10 @@ export function Inspector({
 	onVisibleDirectoriesChange,
 	onActiveTabChange,
 	onSelectSession,
-	onClose
+	onClose,
 }: InspectorProps) {
 	const [activeTab, setActiveTab] = useState<InspectorTab>(preferredTab ?? "run-board");
+	const [inspectorDialogOpen, setInspectorDialogOpen] = useState(false);
 
 	useEffect(() => {
 		if (preferredTab) setActiveTab(preferredTab);
@@ -137,7 +145,7 @@ export function Inspector({
 						remoteReadBlockedReason={remoteReadBlockedReason}
 					/>
 				</div>
-			) : activeTab === "files" ? (
+			) : (
 				<div
 					className="inspector-tab-panel"
 					role="tabpanel"
@@ -160,112 +168,150 @@ export function Inspector({
 						<p className="muted">Files browser unavailable.</p>
 					)}
 				</div>
-			) : (
-				<div
-					className="inspector-tab-panel"
-					role="tabpanel"
-					id="inspector-panel-debug"
-					aria-labelledby="inspector-tab-debug"
+			)}
+			<div className="inspector-footer">
+				<button
+					className="secondary-button inspector-show-details"
+					type="button"
+					onClick={() => setInspectorDialogOpen(true)}
 				>
-					<section className="inspect-section">
-						<h2>Workspace</h2>
-						{snapshot ? (
-							<>
-								<div className="kv">
-									<span>session cwd</span>
-									<code title={snapshot.workspace_id}>{snapshot.workspace_id}</code>
-								</div>
-								<div className="kv">
-									<span>runtime</span>
-									<strong>{snapshot.runtime_id}</strong>
-								</div>
-								{snapshot.workspaces.length ? (
-									<div className="inspect-workspace-list">
-										{snapshot.workspaces.map((workspace) => (
-											<WorkspaceContextRow key={workspace.workspace_dir} workspace={workspace} />
-										))}
-									</div>
-								) : (
-									<p className="muted">No materialized workspaces on this session.</p>
-								)}
-							</>
-						) : (
-							<p className="muted">No session loaded.</p>
-						)}
-					</section>
-					<section className="inspect-section">
-						<h2>Session</h2>
-						{snapshot ? (
-							<>
-								<div className="kv">
-									<span>activity</span>
-									<strong>{snapshot.activity}</strong>
-								</div>
-								<div className="kv">
-									<span>archived</span>
-									<strong>{snapshot.metadata.archived === true ? "yes" : "no"}</strong>
-								</div>
-								<div className="kv">
-									<span>parent</span>
-									{snapshot.parent_session_id ? (
-										<button
-											className="link-button"
-											type="button"
-											onClick={() => onSelectSession?.(snapshot.parent_session_id!)}
-											title={`open parent ${snapshot.parent_session_id}`}
-										>
-											{snapshot.parent_session_id.slice(0, 13)}
-										</button>
-									) : (
-										<strong>none</strong>
-									)}
-								</div>
-								<div className="kv">
-									<span>leaf</span>
-									<strong>{snapshot.active_leaf_id?.slice(0, 12) ?? "root"}</strong>
-								</div>
-								<div className="kv">
-									<span>metadata</span>
-									<strong>{Object.keys(snapshot.metadata).length}</strong>
-								</div>
-							</>
-						) : null}
-					</section>
-					<section className="inspect-section">
-						<h2>Pending</h2>
-						{snapshot?.pending_actions.length ? (
-							<div className="pending-list">
-								{snapshot.pending_actions.map((action) => (
-									<div className="pending-row" key={action.action_row_id}>
-										<span>{pendingActionLabel(action)}</span>
-										<code>{action.action_row_id.slice(0, 12)}</code>
-									</div>
+					Show inspector
+				</button>
+			</div>
+			{inspectorDialogOpen ? (
+				<AppDialog
+					className="inspector-details-dialog"
+					onDismiss={() => setInspectorDialogOpen(false)}
+				>
+					<DialogHeader>
+						<DialogHeading>
+							<DialogTitle>Inspector</DialogTitle>
+						</DialogHeading>
+						<DialogCloseButton label="close inspector" />
+					</DialogHeader>
+					<DialogBody>
+						<InspectorDetails
+							snapshot={snapshot}
+							tools={tools}
+							onSelectSession={onSelectSession}
+						/>
+					</DialogBody>
+				</AppDialog>
+			) : null}
+		</div>
+	);
+}
+
+function InspectorDetails({
+	snapshot,
+	tools,
+	onSelectSession,
+}: {
+	snapshot: SessionSnapshot | null;
+	tools: ToolListing[];
+	onSelectSession?: (sessionId: string) => void;
+}) {
+	return (
+		<>
+			<section className="inspect-section">
+				<h2>Workspace</h2>
+				{snapshot ? (
+					<>
+						<div className="kv">
+							<span>session cwd</span>
+							<code title={snapshot.workspace_id}>{snapshot.workspace_id}</code>
+						</div>
+						<div className="kv">
+							<span>runtime</span>
+							<strong>{snapshot.runtime_id}</strong>
+						</div>
+						{snapshot.workspaces.length ? (
+							<div className="inspect-workspace-list">
+								{snapshot.workspaces.map((workspace) => (
+									<WorkspaceContextRow key={workspace.workspace_dir} workspace={workspace} />
 								))}
 							</div>
 						) : (
-							<p className="muted">No active work.</p>
+							<p className="muted">No materialized workspaces on this session.</p>
 						)}
-					</section>
-					<section className="inspect-section">
-						<h2>Tools</h2>
-						<div className="tool-list">
-							{tools.map((tool) => (
-								<span key={`${tool.kind}:${tool.name}`} title={tool.description || tool.name}>{tool.name}</span>
-							))}
+					</>
+				) : (
+					<p className="muted">No session loaded.</p>
+				)}
+			</section>
+			<section className="inspect-section">
+				<h2>Session</h2>
+				{snapshot ? (
+					<>
+						<div className="kv">
+							<span>activity</span>
+							<strong>{snapshot.activity}</strong>
 						</div>
-					</section>
-					<section className="inspect-section commands">
-						<h2>Slash</h2>
-						{COMMANDS.map((command) => (
-							<div className="command-row" key={command.name}>
-								<code>/{command.name}</code>
-								<span>{command.argumentHint ?? ""}</span>
+						<div className="kv">
+							<span>archived</span>
+							<strong>{snapshot.metadata.archived === true ? "yes" : "no"}</strong>
+						</div>
+						<div className="kv">
+							<span>parent</span>
+							{snapshot.parent_session_id ? (
+								<button
+									className="link-button"
+									type="button"
+									onClick={() => onSelectSession?.(snapshot.parent_session_id!)}
+									title={`open parent ${snapshot.parent_session_id}`}
+								>
+									{snapshot.parent_session_id.slice(0, 13)}
+								</button>
+							) : (
+								<strong>none</strong>
+							)}
+						</div>
+						<div className="kv">
+							<span>leaf</span>
+							<strong>{snapshot.active_leaf_id?.slice(0, 12) ?? "root"}</strong>
+						</div>
+						<div className="kv">
+							<span>metadata</span>
+							<strong>{Object.keys(snapshot.metadata).length}</strong>
+						</div>
+					</>
+				) : null}
+			</section>
+			<section className="inspect-section">
+				<h2>Pending</h2>
+				{snapshot?.pending_actions.length ? (
+					<div className="pending-list">
+						{snapshot.pending_actions.map((action) => (
+							<div className="pending-row" key={action.action_row_id}>
+								<span>{pendingActionLabel(action)}</span>
+								<code>{action.action_row_id.slice(0, 12)}</code>
 							</div>
 						))}
-					</section>
+					</div>
+				) : (
+					<p className="muted">No active work.</p>
+				)}
+			</section>
+			<section className="inspect-section">
+				<h2>Tools</h2>
+				<div className="tool-list">
+					{tools.map((tool) => (
+						<span key={`${tool.kind}:${tool.name}`} title={tool.description || tool.name}>
+							{tool.name}
+						</span>
+					))}
 				</div>
-			)}
-		</div>
+			</section>
+			<section className="inspect-section commands">
+				<h2>Slash</h2>
+				{COMMANDS.map((command) => (
+					<div className="command-row" key={command.name}>
+						<code>/{command.name}</code>
+						<span>{command.argumentHint ?? ""}</span>
+					</div>
+				))}
+			</section>
+		</>
 	);
 }
 

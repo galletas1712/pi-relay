@@ -38,10 +38,14 @@ When a file is open, wide layouts place a read-only `FilePane` beside chat
 (`chat | resize | file | inspector`). Hide chat (chat header) keeps the file
 full-width with a show-chat control that restores the split without closing the
 file. On narrower center allocations, Agents / Files in the right rail select
-the primary center surface (chat vs last opened file); Inspector does not change
-that selection. The Files tab owns the lazy cwd tree; file contents always
-render in the center `FilePane`. Selection is URL-addressable via
-`?file=<relative-path>` (replaceState).
+the primary center surface (chat vs last opened file). Per root session, the
+last Agents/Files choice (and last file path per conversation) is remembered so
+switching sessions restores that surface; the last focused (sub)agent chat is
+also restored, with the Agents list highlighting the focused row. Inspector
+details open from a **Show inspector** control at the bottom of the rail (dialog),
+not as a third tab. Selection is URL-addressable via `?file=<relative-path>`
+(replaceState). Keyboard: `Cmd/Ctrl+[` / `]` move between root sessions;
+`Cmd/Ctrl+{` / `}` switch Agents / Files.
 
 Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar to an overlay,
 `compact` overlays both side panels. The mobile top bar exposes drawer toggles and a connection pill.
@@ -70,8 +74,11 @@ Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar
   hits its live minimum (content already shrinks below `900px`). In split, hide
   chat from the chat header or close the file from the file pane; files-only
   restores split via show-chat on the file header. When too narrow to split,
-  Agents / Files select whether the center shows chat or the last file
-  (Inspector is independent). Directory listings accumulate pages with a Load
+  Agents / Files select whether the center shows chat or the last file.
+  Inspector details are a bottom-rail dialog, not a tab. Per-session resume
+  restores Agents vs Files, the last file path, and the last focused
+  (sub)agent. `Cmd/Ctrl+[` / `]` cycle root sessions; `Cmd/Ctrl+{` / `}` switch
+  Agents / Files. Directory listings accumulate pages with a Load
   more control. Opening a file downloads it in websocket-sized chunks into an
   in-memory cache (pinned while open; 8 GiB / 16-entry LRU for unpinned
   history). The UI registers `workspace.watch` interest for currently expanded
