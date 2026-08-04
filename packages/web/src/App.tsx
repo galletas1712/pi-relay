@@ -4545,18 +4545,9 @@ export function App({
 	useEffect(() => {
 		const onKeyDown = (event: KeyboardEvent) => {
 			if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
-			const target = event.target;
-			if (
-				target instanceof HTMLElement &&
-				(target.isContentEditable ||
-					target.tagName === "INPUT" ||
-					target.tagName === "TEXTAREA" ||
-					target.tagName === "SELECT")
-			) {
-				return;
-			}
 
 			// Cmd/Ctrl+{ and Cmd/Ctrl+} — Agents / Files (Shift+[ / ] on US keyboards).
+			// Allowed even when the composer/input is focused.
 			if (event.shiftKey && (event.key === "{" || event.key === "[")) {
 				event.preventDefault();
 				handleInspectorTabChange("run-board");
@@ -4573,6 +4564,7 @@ export function App({
 			// Cmd/Ctrl+[ and Cmd/Ctrl+] — previous / next root session in the list.
 			if (event.shiftKey) return;
 			if (event.key !== "[" && event.key !== "]") return;
+			event.preventDefault();
 			if (filteredSessions.length === 0) return;
 			const currentRootId =
 				workspaceRouteResult.kind === "route"
@@ -4790,18 +4782,21 @@ export function App({
 	);
 	const fileOpen = Boolean(selectedFilePath);
 	const fileSplitMode = fileOpen && fileSplitCapable && !filesOnlyPreference;
-	const showFilePane =
-		fileOpen && (fileSplitCapable || centerMode === "files" || filesOnlyPreference);
-	const fileReplacementMode = showFilePane && !fileSplitMode;
+	const fileReplacementMode =
+		fileOpen &&
+		!fileSplitMode &&
+		(fileSplitCapable ? filesOnlyPreference : centerMode === "files");
+	const fileParked = fileOpen && !fileSplitMode && !fileReplacementMode;
 	const appClassName = [
 		"app-shell",
 		sidebarOpen ? "sidebar-open" : "",
 		rightOpen ? "inspector-open" : "",
 		sidebarResizing ? "sidebar-resizing" : "",
 		filePaneResizing ? "file-pane-resizing" : "",
-		showFilePane ? "file-open" : "",
+		fileOpen ? "file-open" : "",
 		fileSplitMode ? "file-split" : "",
 		fileReplacementMode ? "file-replacement" : "",
+		fileParked ? "file-parked" : "",
 	]
 		.filter(Boolean)
 		.join(" ");
@@ -4947,7 +4942,7 @@ export function App({
 				/>
 			) : null}
 
-			{conversationVisible && !fileReplacementMode ? (
+			{conversationVisible ? (
 				<ChatPane
 						session={selectedChatSession}
 						snapshot={loadedSnapshot}
@@ -4969,6 +4964,7 @@ export function App({
 						reasoningEffort={providerReasoningEffort(activeProvider)}
 						rightOpen={rightOpen}
 						selectedId={selectedId}
+						parked={fileReplacementMode}
 						resumingTurnId={resumingTurnId}
 						onModelChange={handleModelChange}
 						onReasoningEffortChange={handleReasoningEffortChange}
@@ -5105,7 +5101,7 @@ export function App({
 				</main>
 			) : null}
 
-			{showFilePane && selectedFilePath && selectedId ? (
+			{selectedFilePath && selectedId ? (
 				<>
 					{fileSplitMode ? (
 						<div
@@ -5133,6 +5129,7 @@ export function App({
 						sessionId={selectedId}
 						path={selectedFilePath}
 						remoteReadBlockedReason={connectionRemoteActionBlockedReason}
+						parked={fileParked}
 						onClose={() => selectFilePath(null)}
 						onShowChat={
 							fileReplacementMode && fileSplitCapable
@@ -5144,8 +5141,12 @@ export function App({
 				</>
 			) : null}
 
-			{!fileReplacementMode ? (
-			<footer className="chat-dock" data-slot="chat-box">
+			<footer
+				className="chat-dock"
+				data-slot="chat-box"
+				aria-hidden={fileReplacementMode || undefined}
+				inert={fileReplacementMode}
+			>
 				<ConnectionRecoveryBanner
 					disconnected={disconnected}
 					retrying={retryingConnection}
@@ -5174,7 +5175,6 @@ export function App({
 					/>
 				) : null}
 			</footer>
-			) : null}
 
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
 				{executionRoute || unavailableState ? (
