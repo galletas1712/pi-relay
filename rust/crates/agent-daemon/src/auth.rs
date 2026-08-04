@@ -16,6 +16,7 @@ pub(crate) struct Credentials {
     pub(crate) codex_account_id: Option<String>,
     pub(crate) codex_installation_id: Option<String>,
     pub(crate) anthropic_api_key: Option<String>,
+    pub(crate) anthropic_oauth_token: Option<String>,
 }
 
 impl Credentials {
@@ -30,7 +31,31 @@ impl Credentials {
             anthropic_api_key: env::var("ANTHROPIC_API_KEY")
                 .ok()
                 .or_else(read_claude_code_config_api_key),
+            anthropic_oauth_token: env::var("CLAUDE_CODE_OAUTH_TOKEN")
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+                .or_else(read_claude_code_oauth_access_token),
         }
+    }
+
+    pub(crate) fn anthropic_auth(&self) -> Option<agent_provider::anthropic::AnthropicAuth> {
+        // Prefer Claude.ai OAuth (Agent SDK / Claude Code subscription path).
+        // The Claude Code console API key workspace rate-limits Fable to 0 TPM.
+        if let Some(token) = self
+            .anthropic_oauth_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            return Some(agent_provider::anthropic::AnthropicAuth::Bearer(
+                token.to_string(),
+            ));
+        }
+        self.anthropic_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(|key| agent_provider::anthropic::AnthropicAuth::ApiKey(key.to_string()))
     }
 }
 
@@ -82,6 +107,23 @@ fn read_claude_code_config_api_key_from_home(home: &Path) -> Option<String> {
     }
 
     None
+}
+
+fn read_claude_code_oauth_access_token() -> Option<String> {
+    let home = env::var("HOME").ok().filter(|value| !value.is_empty())?;
+    read_claude_code_oauth_access_token_from_home(Path::new(&home))
+}
+
+fn read_claude_code_oauth_access_token_from_home(home: &Path) -> Option<String> {
+    let path = home.join(".claude/.credentials.json");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&contents).ok()?;
+    value
+        .pointer("/claudeAiOauth/accessToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| token.starts_with("sk-ant-"))
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Default)]
@@ -327,5 +369,40 @@ mod tests {
 
         assert_eq!(key, None);
         std::fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn reads_claude_code_oauth_access_token() {
+        let home = temp_home();
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("create claude dir");
+        std::fs::write(
+            claude_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-test-token","refreshToken":"sk-ant-oat-refresh"}}"#,
+        )
+        .expect("write credentials");
+
+        let token = read_claude_code_oauth_access_token_from_home(&home);
+
+        assert_eq!(token.as_deref(), Some("sk-ant-oat-test-token"));
+        std::fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn anthropic_auth_prefers_oauth_over_api_key() {
+        let credentials = Credentials {
+            codex_access_token: None,
+            codex_account_id: None,
+            codex_installation_id: None,
+            anthropic_api_key: Some("sk-ant-api-key".to_string()),
+            anthropic_oauth_token: Some("sk-ant-oat-token".to_string()),
+        };
+
+        match credentials.anthropic_auth() {
+            Some(agent_provider::anthropic::AnthropicAuth::Bearer(token)) => {
+                assert_eq!(token, "sk-ant-oat-token");
+            }
+            other => panic!("expected Bearer auth, got {other:?}"),
+        }
     }
 }

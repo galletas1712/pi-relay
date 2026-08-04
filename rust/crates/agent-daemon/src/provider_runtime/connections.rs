@@ -157,12 +157,15 @@ impl OpenAiCodexConnection {
 
 impl AnthropicConnection {
     fn provider_handle(&self, credentials: &Credentials) -> Result<ProviderHandle> {
+        let auth = credentials.anthropic_auth().ok_or_else(|| {
+            anyhow!(
+                "Anthropic credentials not found: set CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY, or sign in with Claude Code (~/.claude/.credentials.json) / configure primaryApiKey"
+            )
+        })?;
         Ok(ProviderHandle {
-            provider: Box::new(AnthropicProvider::new_with_client_and_cache(
+            provider: Box::new(AnthropicProvider::new_with_auth_and_cache(
                 self.client.clone(),
-                credentials.anthropic_api_key.clone().ok_or_else(|| {
-                    anyhow!("ANTHROPIC_API_KEY not found in env or Claude Code config")
-                })?,
+                auth,
                 self.model_cache.clone(),
             )),
             uses_codex_auth: false,
