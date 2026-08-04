@@ -197,6 +197,15 @@ describe("LogHeader", () => {
 		expect(html).not.toContain("Model, locked");
 		expect(html).not.toContain("Model is locked after the first transcript entry");
 	});
+
+	it("places hide-chat next to model and effort when provided", () => {
+		const html = renderLogHeader({ onHideChat: () => {} });
+		expect(html).toContain(`aria-label="Hide chat"`);
+		const effortIdx = html.indexOf(`aria-label="Reasoning effort"`);
+		const hideIdx = html.indexOf(`aria-label="Hide chat"`);
+		expect(effortIdx).toBeGreaterThan(-1);
+		expect(hideIdx).toBeGreaterThan(effortIdx);
+	});
 });
 
 describe("Inspector tabs", () => {

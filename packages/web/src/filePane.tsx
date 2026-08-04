@@ -1,4 +1,4 @@
-import { ArrowLeft, PanelLeftClose, X } from "lucide-react";
+import { ArrowLeft, X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { loadCachedWorkspaceFile, workspaceFileQueryKey } from "./fileBrowser.ts";
@@ -14,8 +14,6 @@ export interface FilePaneProps {
 	replacementMode: boolean;
 	remoteReadBlockedReason?: string | null;
 	onClose: () => void;
-	/** When split, hide chat and keep only the file pane. */
-	onHideChat?: () => void;
 	onNavigate: (path: string) => void;
 }
 
@@ -26,7 +24,6 @@ export function FilePane({
 	replacementMode,
 	remoteReadBlockedReason,
 	onClose,
-	onHideChat,
 	onNavigate,
 }: FilePaneProps) {
 	const query = useQuery({
@@ -58,17 +55,6 @@ export function FilePane({
 					<span className="muted file-pane-path">{path}</span>
 				</div>
 				<div className="file-pane-actions">
-					{!replacementMode && onHideChat ? (
-						<button
-							className="icon-button"
-							type="button"
-							aria-label="Hide chat"
-							title="Hide chat"
-							onClick={onHideChat}
-						>
-							<PanelLeftClose size={14} />
-						</button>
-					) : null}
 					{!replacementMode ? (
 						<button className="icon-button" type="button" aria-label="Close file" title="Close file" onClick={onClose}>
 							<X size={14} />

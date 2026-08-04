@@ -38,6 +38,7 @@ export interface ChatPaneProps {
 	onReasoningEffortChange: (value: ReasoningEffort) => void;
 	onSelectSession?: (sessionId: string) => void;
 	onToggleRight: () => void;
+	onHideChat?: () => void;
 	onNewSession: () => void;
 	onResumeTurn: (entryId: string) => void;
 	onExpandTurn?: (turnId: string) => void;
@@ -81,6 +82,7 @@ export const ChatPane = memo(function ChatPane({
 	onReasoningEffortChange,
 	onSelectSession,
 	onToggleRight,
+	onHideChat,
 	onNewSession,
 	onResumeTurn,
 	onExpandTurn,
@@ -118,6 +120,7 @@ export const ChatPane = memo(function ChatPane({
 				onReasoningEffortChange={onReasoningEffortChange}
 				onSelectSession={onSelectSession}
 				onToggleRight={onToggleRight}
+				onHideChat={onHideChat}
 			/>
 			<MessageList
 				entries={entries}
@@ -176,6 +179,7 @@ interface ChatHeaderProps {
 	onReasoningEffortChange: (value: ReasoningEffort) => void;
 	onSelectSession?: (sessionId: string) => void;
 	onToggleRight: () => void;
+	onHideChat?: () => void;
 }
 
 const ChatHeader = memo(function ChatHeader({
@@ -193,7 +197,8 @@ const ChatHeader = memo(function ChatHeader({
 	onModelChange,
 	onReasoningEffortChange,
 	onSelectSession,
-	onToggleRight
+	onToggleRight,
+	onHideChat,
 }: ChatHeaderProps) {
 	const archived = session ? isArchivedSession(session) : false;
 	const modelDisabled = modelControlsDisabled || !!mutationBlockedReason;
@@ -220,6 +225,7 @@ const ChatHeader = memo(function ChatHeader({
 			onReasoningEffortChange={onReasoningEffortChange}
 			onSelectSession={onSelectSession}
 			onToggleRight={onToggleRight}
+			onHideChat={onHideChat}
 		/>
 	);
 });

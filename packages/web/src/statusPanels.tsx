@@ -1,4 +1,4 @@
-import { ArrowUp, Bot, PanelRightOpen } from "lucide-react";
+import { ArrowUp, Bot, PanelLeftClose, PanelRightOpen } from "lucide-react";
 import {
 	NativeSelect,
 	NativeSelectOption,
@@ -21,7 +21,8 @@ export function LogHeader({
 	onReasoningEffortChange,
 	onSelectSession,
 	rightOpen,
-	onToggleRight
+	onToggleRight,
+	onHideChat,
 }: {
 	archived: boolean;
 	status: SessionStatus | null;
@@ -38,6 +39,7 @@ export function LogHeader({
 	onSelectSession?: (sessionId: string) => void;
 	rightOpen: boolean;
 	onToggleRight: () => void;
+	onHideChat?: () => void;
 }) {
 	const statusLabel = archived ? "archived session" : status ? `${status} session` : null;
 	return (
@@ -103,6 +105,17 @@ export function LogHeader({
 						</NativeSelectOption>
 					))}
 				</NativeSelect>
+				{onHideChat ? (
+					<button
+						className="icon-button tiny"
+						type="button"
+						onClick={onHideChat}
+						title="Hide chat"
+						aria-label="Hide chat"
+					>
+						<PanelLeftClose size={14} />
+					</button>
+				) : null}
 			</div>
 			{rightOpen ? null : (
 				<button

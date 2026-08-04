@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import { bytesToUtf8Prefix } from "./fileBrowser.ts";
 import type { CachedWorkspaceFile } from "./workspaceFileCache.ts";
 import { browsePathBasename, joinBrowsePath, parentBrowsePath, validateBrowsePath } from "./filePath.ts";
+import { markdownComponents } from "./transcript.tsx";
 
 const MARKDOWN_EXTENSIONS = new Set(["md", "markdown"]);
 const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
@@ -91,6 +92,7 @@ function sniffRasterMime(bytes: Uint8Array): string | null {
 
 function fileMarkdownComponents(onNavigate: ((path: string) => void) | undefined, currentPath: string): Components {
 	return {
+		...markdownComponents,
 		a: ({ href, children, ...props }) => {
 			if (href && !/^[a-z][a-z0-9+.-]*:/i.test(href) && !href.startsWith("//") && !href.startsWith("#")) {
 				const resolved = validateBrowsePath(joinBrowsePath(parentBrowsePath(currentPath), href.replace(/^\.\//, "")));

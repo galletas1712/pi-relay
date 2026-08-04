@@ -2018,8 +2018,10 @@ and the parents of interested files.
 ```
 
 Matching changes are published as ephemeral `workspace.fs_changed` events
-(`event_id: 0`). Clients must invalidate listings/contents for the listed paths
-and must **not** advance their session high-water mark.
+(`event_id: 0`). The daemon forwards these to subscribed sockets without the
+persisted-event high-water filter (and without advancing that mark). Clients
+must invalidate listings/contents for the listed paths and must **not** advance
+their session high-water mark.
 
 ```json
 {
