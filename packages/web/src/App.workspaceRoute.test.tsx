@@ -576,7 +576,7 @@ describe("App workspace route identity integration", () => {
 			const user = userEvent.setup();
 
 			await open(api);
-			await waitFor(() => expect(api.listDelegations).toHaveBeenCalledWith(sessionId, 3));
+			await waitFor(() => expect(api.listDelegations).toHaveBeenCalledWith(sessionId, 10));
 			await user.type(await screen.findByRole("textbox"), `/${command}`);
 			await user.click(screen.getByRole("button", { name: "send message" }));
 
@@ -2065,7 +2065,7 @@ describe("App workspace route identity integration", () => {
 			expect(api.getTranscriptTurns).toHaveBeenCalledWith("project-child-1", { limit: 50 });
 			expect(api.listTools).toHaveBeenCalled();
 			expect(api.subscribeEvents).toHaveBeenCalled();
-			expect(api.listDelegations).toHaveBeenCalledWith("project-root-1", 3);
+			expect(api.listDelegations).toHaveBeenCalledWith("project-root-1", 10);
 		});
 		expect(api.getMcpInventory).not.toHaveBeenCalled();
 
@@ -2146,7 +2146,7 @@ describe("App workspace route identity integration", () => {
 			expect(parentLink.getAttribute("title")).toBe("Open parent conversation");
 		}
 		expect(api.getTranscriptTurns).toHaveBeenCalledWith("child-1", { limit: 50 });
-		expect(api.listDelegations).toHaveBeenCalledWith("root-1", 3);
+		expect(api.listDelegations).toHaveBeenCalledWith("root-1", 10);
 		expect(api.listDelegations.mock.calls.every(([parent]) => parent === "root-1")).toBe(true);
 		expect(browser.currentUrl).toBe("/w/host/run/root-1/conversation/child-1");
 		expect(loadUiSelection()).toEqual({ projectId: null, sessionId: "root-1" });
