@@ -3,9 +3,13 @@ import {
 	forgetDeletedSessions,
 	loadUiSelection,
 	rememberActiveUiSelection,
+	rememberCenterModeForRootSession,
+	rememberLastFileForSession,
 	rememberSelectedSession,
 	rememberSelectedSubagent,
 	rememberUiSelection,
+	centerModeForRootSession,
+	lastFileForSession,
 	selectedSessionForProject,
 	selectedSubagentForSession,
 	type UiResumeStorage,
@@ -86,6 +90,24 @@ describe("ui resume storage", () => {
 
 		expect(selectedSubagentForSession("parent_a", storage)).toBe("subagent_a");
 		expect(selectedSubagentForSession("parent_b", storage)).toBeNull();
+	});
+
+	it("remembers Agents vs Files center mode per root and last file per conversation", () => {
+		const storage = memoryStorage();
+
+		rememberCenterModeForRootSession("root_a", "files", storage);
+		rememberCenterModeForRootSession("root_b", "chat", storage);
+		rememberLastFileForSession("root_a", "README.md", storage);
+		rememberLastFileForSession("child_a", "src/main.rs", storage);
+
+		expect(centerModeForRootSession("root_a", storage)).toBe("files");
+		expect(centerModeForRootSession("root_b", storage)).toBe("chat");
+		expect(centerModeForRootSession("missing", storage)).toBe("chat");
+		expect(lastFileForSession("root_a", storage)).toBe("README.md");
+		expect(lastFileForSession("child_a", storage)).toBe("src/main.rs");
+
+		rememberLastFileForSession("root_a", null, storage);
+		expect(lastFileForSession("root_a", storage)).toBeNull();
 	});
 
 	it("does not read inherited object properties as remembered subagents", () => {

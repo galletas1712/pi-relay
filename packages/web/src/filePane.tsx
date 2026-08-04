@@ -1,4 +1,4 @@
-import { ArrowLeft, X } from "lucide-react";
+import { PanelLeftOpen, X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { loadCachedWorkspaceFile, workspaceFileQueryKey } from "./fileBrowser.ts";
@@ -11,9 +11,10 @@ export interface FilePaneProps {
 	api: AgentApi;
 	sessionId: string;
 	path: string;
-	replacementMode: boolean;
 	remoteReadBlockedReason?: string | null;
 	onClose: () => void;
+	/** Restore chat beside the file (wide files-only → split). */
+	onShowChat?: () => void;
 	onNavigate: (path: string) => void;
 }
 
@@ -21,9 +22,9 @@ export function FilePane({
 	api,
 	sessionId,
 	path,
-	replacementMode,
 	remoteReadBlockedReason,
 	onClose,
+	onShowChat,
 	onNavigate,
 }: FilePaneProps) {
 	const query = useQuery({
@@ -44,10 +45,15 @@ export function FilePane({
 	return (
 		<section className="file-pane" data-slot="file-pane" aria-label="File preview">
 			<header className="file-pane-header">
-				{replacementMode ? (
-					<button className="secondary-button file-pane-back" type="button" onClick={onClose}>
-						<ArrowLeft size={14} aria-hidden />
-						Back to chat
+				{onShowChat ? (
+					<button
+						className="icon-button"
+						type="button"
+						aria-label="Show chat"
+						title="Show chat"
+						onClick={onShowChat}
+					>
+						<PanelLeftOpen size={14} />
 					</button>
 				) : null}
 				<div className="file-pane-title" title={path}>
@@ -55,11 +61,9 @@ export function FilePane({
 					<span className="muted file-pane-path">{path}</span>
 				</div>
 				<div className="file-pane-actions">
-					{!replacementMode ? (
-						<button className="icon-button" type="button" aria-label="Close file" title="Close file" onClick={onClose}>
-							<X size={14} />
-						</button>
-					) : null}
+					<button className="icon-button" type="button" aria-label="Close file" title="Close file" onClick={onClose}>
+						<X size={14} />
+					</button>
 				</div>
 			</header>
 			<div className="file-pane-body">

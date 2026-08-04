@@ -183,9 +183,13 @@ import {
 	forgetDeletedSessions,
 	loadUiSelection,
 	rememberActiveUiSelection,
+	rememberCenterModeForRootSession,
+	rememberLastFileForSession,
 	rememberSelectedSession,
 	rememberSelectedSubagent,
 	rememberUiSelection,
+	centerModeForRootSession,
+	lastFileForSession,
 	selectedSessionForProject,
 	selectedSubagentForSession,
 } from "./uiResume.ts";
@@ -423,6 +427,10 @@ export function App({
 	);
 	const [fileSplitCapable, setFileSplitCapable] = useState(false);
 	const [filesOnlyPreference, setFilesOnlyPreference] = useState(false);
+	/** Narrow layouts: Agents/Files pick which center surface is primary. */
+	const [centerMode, setCenterMode] = useState<"chat" | "files">(() =>
+		readFileQuery() ? "files" : "chat",
+	);
 	const [showArchived, setShowArchived] = useState(false);
 	const [showAllDelegations, setShowAllDelegations] = useState(false);
 	const [backgroundWarmRevision, setBackgroundWarmRevision] = useState(0);
@@ -4427,37 +4435,175 @@ export function App({
 		setSelectedFilePath(path);
 		replaceFileQuery(path);
 		if (path) {
+			setCenterMode("files");
 			setInspectorPreferredTab("files");
 			setRightOpen(true);
+		} else {
+			setCenterMode("chat");
+			setInspectorPreferredTab("run-board");
 		}
 	}, []);
+
+	const handleInspectorTabChange = useCallback((tab: InspectorTab) => {
+		setInspectorPreferredTab(tab);
+		if (tab === "run-board") {
+			setCenterMode("chat");
+			setFilesOnlyPreference(false);
+			return;
+		}
+		setCenterMode("files");
+		setSelectedFilePath((current) => {
+			if (current || !selectedId) return current;
+			const path = lastFileForSession(selectedId, entityStorage);
+			if (path) replaceFileQuery(path);
+			return path;
+		});
+	}, [entityStorage, selectedId]);
 
 	useEffect(() => {
 		const onPopState = () => {
 			setFilesOnlyPreference(false);
-			setSelectedFilePath(readFileQuery());
+			const path = readFileQuery();
+			setSelectedFilePath(path);
+			setCenterMode(path ? "files" : "chat");
+			setInspectorPreferredTab(path ? "files" : "run-board");
 		};
 		window.addEventListener("popstate", onPopState);
 		return () => window.removeEventListener("popstate", onPopState);
 	}, []);
 
 	const previousSelectedIdForFileRef = useRef(selectedId);
+	const previousRootSessionIdRef = useRef<string | null>(
+		workspaceRouteResult.kind === "route" ? workspaceRouteResult.route.rootSessionId : selectedId,
+	);
+	const centerModeRef = useRef(centerMode);
+	centerModeRef.current = centerMode;
 	useEffect(() => {
-		if (previousSelectedIdForFileRef.current === selectedId) return;
+		const rootSessionId =
+			workspaceRouteResult.kind === "route"
+				? workspaceRouteResult.route.rootSessionId
+				: selectedId;
 		const previousSessionId = previousSelectedIdForFileRef.current;
+		const previousRootSessionId = previousRootSessionIdRef.current;
+		const sessionChanged = previousSessionId !== selectedId;
+		const rootChanged = previousRootSessionId !== rootSessionId;
 		previousSelectedIdForFileRef.current = selectedId;
-		setSelectedFilePath((current) => {
-			if (current == null) return current;
-			replaceFileQuery(null);
-			return null;
-		});
-		setInspectorPreferredTab(null);
+		previousRootSessionIdRef.current = rootSessionId;
+		if (!sessionChanged && !rootChanged) return;
+
 		setFilesVisibleDirectories([]);
 		setFilesOnlyPreference(false);
-		if (previousSessionId) {
+		if (previousSessionId && sessionChanged) {
 			workspaceFileCache.clearSession(previousSessionId);
 		}
-	}, [selectedId]);
+
+		if (!selectedId || !rootSessionId) {
+			setSelectedFilePath(null);
+			replaceFileQuery(null);
+			setCenterMode("chat");
+			setInspectorPreferredTab(null);
+			return;
+		}
+
+		const nextMode = rootChanged
+			? centerModeForRootSession(rootSessionId, entityStorage)
+			: centerModeRef.current;
+		if (rootChanged) {
+			setCenterMode(nextMode);
+			setInspectorPreferredTab(nextMode === "files" ? "files" : "run-board");
+		}
+		if (nextMode === "files") {
+			const path = lastFileForSession(selectedId, entityStorage);
+			setSelectedFilePath(path);
+			replaceFileQuery(path);
+		} else {
+			setSelectedFilePath(null);
+			replaceFileQuery(null);
+		}
+	}, [entityStorage, selectedId, workspaceRouteResult]);
+
+	const rootSessionIdForView =
+		workspaceRouteResult.kind === "route"
+			? workspaceRouteResult.route.rootSessionId
+			: selectedId;
+
+	useEffect(() => {
+		if (!rootSessionIdForView) return;
+		rememberCenterModeForRootSession(rootSessionIdForView, centerMode, entityStorage);
+	}, [centerMode, entityStorage, rootSessionIdForView]);
+
+	const lastFilePersistSessionRef = useRef(selectedId);
+	useEffect(() => {
+		if (lastFilePersistSessionRef.current !== selectedId) {
+			lastFilePersistSessionRef.current = selectedId;
+			return;
+		}
+		if (!selectedId) return;
+		rememberLastFileForSession(selectedId, selectedFilePath, entityStorage);
+	}, [entityStorage, selectedFilePath, selectedId]);
+
+	useEffect(() => {
+		const onKeyDown = (event: KeyboardEvent) => {
+			if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+			const target = event.target;
+			if (
+				target instanceof HTMLElement &&
+				(target.isContentEditable ||
+					target.tagName === "INPUT" ||
+					target.tagName === "TEXTAREA" ||
+					target.tagName === "SELECT")
+			) {
+				return;
+			}
+
+			// Cmd/Ctrl+{ and Cmd/Ctrl+} — Agents / Files (Shift+[ / ] on US keyboards).
+			if (event.shiftKey && (event.key === "{" || event.key === "[")) {
+				event.preventDefault();
+				handleInspectorTabChange("run-board");
+				setRightOpen(true);
+				return;
+			}
+			if (event.shiftKey && (event.key === "}" || event.key === "]")) {
+				event.preventDefault();
+				handleInspectorTabChange("files");
+				setRightOpen(true);
+				return;
+			}
+
+			// Cmd/Ctrl+[ and Cmd/Ctrl+] — previous / next root session in the list.
+			if (event.shiftKey) return;
+			if (event.key !== "[" && event.key !== "]") return;
+			if (filteredSessions.length === 0) return;
+			const currentRootId =
+				workspaceRouteResult.kind === "route"
+					? workspaceRouteResult.route.rootSessionId
+					: selectedId;
+			const currentIndex = currentRootId
+				? filteredSessions.findIndex((session) => session.session_id === currentRootId)
+				: -1;
+			const delta = event.key === "]" ? 1 : -1;
+			const nextIndex =
+				currentIndex < 0
+					? delta > 0
+						? 0
+						: filteredSessions.length - 1
+					: (currentIndex + delta + filteredSessions.length) % filteredSessions.length;
+			const nextSession = filteredSessions[nextIndex];
+			if (!nextSession || nextSession.session_id === currentRootId) return;
+			event.preventDefault();
+			openRootConversation(selectedProjectRef.current, nextSession.session_id, {
+				rememberedRoot: true,
+			});
+		};
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, [
+		filteredSessions,
+		handleInspectorTabChange,
+		openRootConversation,
+		selectedId,
+		workspaceRouteResult,
+	]);
 
 	useEffect(() => {
 		if (!selectedId) return;
@@ -4644,14 +4790,16 @@ export function App({
 	);
 	const fileOpen = Boolean(selectedFilePath);
 	const fileSplitMode = fileOpen && fileSplitCapable && !filesOnlyPreference;
-	const fileReplacementMode = fileOpen && !fileSplitMode;
+	const showFilePane =
+		fileOpen && (fileSplitCapable || centerMode === "files" || filesOnlyPreference);
+	const fileReplacementMode = showFilePane && !fileSplitMode;
 	const appClassName = [
 		"app-shell",
 		sidebarOpen ? "sidebar-open" : "",
 		rightOpen ? "inspector-open" : "",
 		sidebarResizing ? "sidebar-resizing" : "",
 		filePaneResizing ? "file-pane-resizing" : "",
-		fileOpen ? "file-open" : "",
+		showFilePane ? "file-open" : "",
 		fileSplitMode ? "file-split" : "",
 		fileReplacementMode ? "file-replacement" : "",
 	]
@@ -4826,7 +4974,15 @@ export function App({
 						onReasoningEffortChange={handleReasoningEffortChange}
 						onSelectSession={openConversation}
 						onToggleRight={handleToggleRight}
-						onHideChat={fileSplitMode ? () => setFilesOnlyPreference(true) : undefined}
+						onHideChat={
+							fileSplitMode
+								? () => {
+										setFilesOnlyPreference(true);
+										setCenterMode("files");
+										setInspectorPreferredTab("files");
+									}
+								: undefined
+						}
 						onNewSession={handleSidebarNew}
 						onResumeTurn={handleResumeTurn}
 						onExpandTurn={expandTurn}
@@ -4949,7 +5105,7 @@ export function App({
 				</main>
 			) : null}
 
-			{selectedFilePath && selectedId ? (
+			{showFilePane && selectedFilePath && selectedId ? (
 				<>
 					{fileSplitMode ? (
 						<div
@@ -4976,9 +5132,13 @@ export function App({
 						api={api}
 						sessionId={selectedId}
 						path={selectedFilePath}
-						replacementMode={fileReplacementMode}
 						remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 						onClose={() => selectFilePath(null)}
+						onShowChat={
+							fileReplacementMode && fileSplitCapable
+								? () => setFilesOnlyPreference(false)
+								: undefined
+						}
 						onNavigate={selectFilePath}
 					/>
 				</>
@@ -5054,6 +5214,7 @@ export function App({
 					filesTreeEpoch={filesTreeEpoch}
 					onSelectFile={selectFilePath}
 					onVisibleDirectoriesChange={setFilesVisibleDirectories}
+					onActiveTabChange={handleInspectorTabChange}
 					onSelectSession={(sessionId) => {
 						openConversation(sessionId);
 						if (inspectorIsOverlay) setRightOpen(false);

@@ -35,11 +35,17 @@ Cancellation and progress remain delegation-ID scoped.
 ```
 
 When a file is open, wide layouts place a read-only `FilePane` beside chat
-(`chat | resize | file | inspector`). Narrower center allocations replace the
-chat surface with the file preview and a **Back to chat** control. The Files
-inspector tab owns the lazy cwd tree only; file contents always render in the
-center `FilePane`. Selection is URL-addressable via `?file=<relative-path>`
-(replaceState).
+(`chat | resize | file | inspector`). Hide chat (chat header) keeps the file
+full-width with a show-chat control that restores the split without closing the
+file. On narrower center allocations, Agents / Files in the right rail select
+the primary center surface (chat vs last opened file). Per root session, the
+last Agents/Files choice (and last file path per conversation) is remembered so
+switching sessions restores that surface; the last focused (sub)agent chat is
+also restored, with the Agents list highlighting the focused row. Inspector
+details open from a **Show inspector** control at the bottom of the rail (dialog),
+not as a third tab. Selection is URL-addressable via `?file=<relative-path>`
+(replaceState). Keyboard: `Cmd/Ctrl+[` / `]` move between root sessions;
+`Cmd/Ctrl+{` / `}` switch Agents / Files.
 
 Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar to an overlay,
 `compact` overlays both side panels. The mobile top bar exposes drawer toggles and a connection pill.
@@ -63,17 +69,21 @@ Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar
 - Browse the selected session cwd from the Files inspector tab and preview
   Markdown/code/images in the center file pane via `workspace.list_dir` /
   `workspace.read_file`. The center splits chat and file only when that strip
-  is at least `2 ×` the chat column max width (`900px`); otherwise the file
-  replaces chat. Split opens at equal chat/file widths; the divider can grow
-  the file pane until the chat column hits its live minimum (content already
-  shrinks below `900px`). In split, hide chat from the chat header (next to
-  model/effort) or close the file from the file pane; files-only uses Back to
-  chat. Directory listings accumulate pages with a Load more control.
-  Opening a file downloads it in websocket-sized chunks into an in-memory
-  cache (pinned while open; 8 GiB / 16-entry LRU for unpinned history). The UI
-  registers `workspace.watch` interest for currently expanded tree directories
-  (name/presence) and the open file (contents), then invalidates those queries
-  on ephemeral `workspace.fs_changed` events.
+  is at least `2 ×` the chat column max width (`900px`). Split opens at equal
+  chat/file widths; the divider can grow the file pane until the chat column
+  hits its live minimum (content already shrinks below `900px`). In split, hide
+  chat from the chat header or close the file from the file pane; files-only
+  restores split via show-chat on the file header. When too narrow to split,
+  Agents / Files select whether the center shows chat or the last file.
+  Inspector details are a bottom-rail dialog, not a tab. Per-session resume
+  restores Agents vs Files, the last file path, and the last focused
+  (sub)agent. `Cmd/Ctrl+[` / `]` cycle root sessions; `Cmd/Ctrl+{` / `}` switch
+  Agents / Files. Directory listings accumulate pages with a Load
+  more control. Opening a file downloads it in websocket-sized chunks into an
+  in-memory cache (pinned while open; 8 GiB / 16-entry LRU for unpinned
+  history). The UI registers `workspace.watch` interest for currently expanded
+  tree directories (name/presence) and the open file (contents), then invalidates
+  those queries on ephemeral `workspace.fs_changed` events.
 
 ## Data layer
 

@@ -209,14 +209,14 @@ describe("LogHeader", () => {
 });
 
 describe("Inspector tabs", () => {
-	it("defaults to the run-board tab and keeps debugging sections out of that panel", () => {
+	it("defaults to the Agents tab and keeps debugging sections out of the rail", () => {
 		const html = renderInspector([delegation({ label: "fan-out" })]);
 		expect(html).toContain(`role="tablist"`);
 		expect(html).toContain(`aria-label="inspector tabs"`);
 		expect(html).toContain(`aria-selected="true"`);
 		expect(html).toContain("Agents");
 		expect(html).toContain("Files");
-		expect(html).toContain("Inspector");
+		expect(html).toContain("Show inspector");
 		expect(html).toContain("fan-out");
 		expect(html).not.toContain("Session panel");
 		expect(html).not.toContain("<h2>Session</h2>");
