@@ -54,7 +54,10 @@ impl AgentTool for ApplyPatchTool {
 
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
         let args: ApplyPatchArgs = serde_json::from_str(&call.args_json)?;
-        let result = match apply_patch(&args.input, ctx) {
+        let ops = parse_patch(&args.input).map_err(crate::error::ToolError::InvalidInput)?;
+        let lock_paths = patch_lock_paths(&ops, ctx);
+        let _guard = ctx.file_locks.lock_paths(lock_paths).await;
+        let result = match apply_ops(&ops, ctx) {
             Ok(changes) => ToolResultMessage::success(
                 call.id.clone(),
                 &call.tool_name,
@@ -94,31 +97,62 @@ struct FileChange {
     path: String,
 }
 
+#[cfg(test)]
 fn apply_patch(input: &str, ctx: &ToolContext) -> Result<Vec<FileChange>, String> {
     let ops = parse_patch(input)?;
+    apply_ops(&ops, ctx)
+}
+
+fn patch_lock_paths(ops: &[PatchOp], ctx: &ToolContext) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for op in ops {
+        match op {
+            PatchOp::Add { path, .. } | PatchOp::Delete { path } => {
+                paths.push(workspace_path(ctx, path));
+            }
+            PatchOp::Update {
+                path, move_to, ..
+            } => {
+                paths.push(workspace_path(ctx, path));
+                if let Some(target) = move_to {
+                    paths.push(workspace_path(ctx, target));
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn apply_ops(ops: &[PatchOp], ctx: &ToolContext) -> Result<Vec<FileChange>, String> {
     let mut changes = Vec::new();
     for op in ops {
         match op {
             PatchOp::Add { path, lines } => {
-                let full_path = workspace_path(ctx, &path);
+                let full_path = workspace_path(ctx, path);
                 if full_path.exists() {
                     return Err(format!("file already exists: {path}"));
                 }
-                write_file(&full_path, &lines_to_text(&lines))
+                write_file(&full_path, &lines_to_text(lines))
                     .map_err(|error| format!("{path}: {error}"))?;
-                changes.push(FileChange { marker: "A", path });
+                changes.push(FileChange {
+                    marker: "A",
+                    path: path.clone(),
+                });
             }
             PatchOp::Delete { path } => {
-                let full_path = workspace_path(ctx, &path);
+                let full_path = workspace_path(ctx, path);
                 fs::remove_file(&full_path).map_err(|error| format!("{path}: {error}"))?;
-                changes.push(FileChange { marker: "D", path });
+                changes.push(FileChange {
+                    marker: "D",
+                    path: path.clone(),
+                });
             }
             PatchOp::Update {
                 path,
                 move_to,
                 hunks,
             } => {
-                let source_path = workspace_path(ctx, &path);
+                let source_path = workspace_path(ctx, path);
                 let mut content =
                     fs::read_to_string(&source_path).map_err(|error| format!("{path}: {error}"))?;
                 for hunk in hunks {
@@ -135,7 +169,7 @@ fn apply_patch(input: &str, ctx: &ToolContext) -> Result<Vec<FileChange>, String
 
                 let marker = if move_to.is_some() { "R" } else { "M" };
                 let display_path = if let Some(target) = move_to {
-                    let target_path = workspace_path(ctx, &target);
+                    let target_path = workspace_path(ctx, target);
                     write_file(&target_path, &content)
                         .map_err(|error| format!("{target}: {error}"))?;
                     fs::remove_file(&source_path).map_err(|error| format!("{path}: {error}"))?;
@@ -143,7 +177,7 @@ fn apply_patch(input: &str, ctx: &ToolContext) -> Result<Vec<FileChange>, String
                 } else {
                     write_file(&source_path, &content)
                         .map_err(|error| format!("{path}: {error}"))?;
-                    path
+                    path.clone()
                 };
                 changes.push(FileChange {
                     marker,

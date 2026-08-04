@@ -4,6 +4,7 @@ mod call_description;
 mod context;
 mod display;
 mod error;
+mod file_mutation;
 mod output;
 mod registry;
 mod tools;
@@ -14,6 +15,7 @@ pub use call_description::{
 pub use context::ToolContext;
 pub use display::{tool_display, ToolDisplayInput};
 pub use error::{ToolError, ToolResult};
+pub use file_mutation::{mutation_lock_key, FileMutationGuard, FileMutationLocks};
 pub use output::{limit_tool_output, limit_tool_output_with_max_tokens};
 pub use registry::{
     AgentTool, FirstPartyToolExtension, ProviderTool, ToolDescriptor, ToolExecution, ToolExtension,

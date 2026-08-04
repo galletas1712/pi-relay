@@ -315,8 +315,11 @@ impl WorkspaceManager {
         destroy_session_subvolume(&probe).await
     }
 
-    /// Serialize daemon-managed workspace-mutating tool futures and snapshots
-    /// for sessions that share the exact same cwd.
+    /// Serialize fork snapshots for a workspace cwd.
+    ///
+    /// Edit/Bash no longer take this guard: Edit uses per-file mutation locks
+    /// (pi-mono model), and Bash stays unlocked so long shell wall-clock cannot
+    /// block sibling tools or handoff writes.
     ///
     /// This is an in-process future-lifetime guard. It intentionally does not
     /// claim to track independently running background processes after their
