@@ -1,10 +1,11 @@
 import { File, PanelLeftOpen, X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { loadCachedWorkspaceFile, workspaceFileQueryKey } from "./fileBrowser.ts";
 import { FileView } from "./fileView.tsx";
 import type { AgentApi } from "./agentApi.ts";
 import { browsePathBasename } from "./filePath.ts";
+import { useParkedScrollPreservation } from "./parkedScroll.ts";
 import { workspaceFileCache } from "./workspaceFileCache.ts";
 
 export interface FilePaneProps {
@@ -29,6 +30,10 @@ export function FilePane({
 	onShowChat,
 	onNavigate,
 }: FilePaneProps) {
+	const bodyRef = useRef<HTMLDivElement>(null);
+	const getBodyScroller = useCallback(() => bodyRef.current, []);
+	useParkedScrollPreservation(getBodyScroller, parked);
+
 	const query = useQuery({
 		queryKey: workspaceFileQueryKey(sessionId, path),
 		queryFn: () => loadCachedWorkspaceFile(api, sessionId, path),
@@ -77,7 +82,7 @@ export function FilePane({
 					</button>
 				</div>
 			</header>
-			<div className="file-pane-body">
+			<div className="file-pane-body" ref={bodyRef}>
 				{remoteReadBlockedReason ? (
 					<p className="muted">{remoteReadBlockedReason}</p>
 				) : query.isLoading || (query.isFetching && !query.data) ? (
