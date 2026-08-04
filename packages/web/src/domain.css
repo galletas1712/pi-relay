@@ -3880,24 +3880,6 @@ pre {
 	flex-direction: column;
 }
 
-.files-tab-toolbar {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	gap: 8px;
-	border-bottom: 1px solid var(--border);
-	padding: 8px 10px;
-}
-
-.files-tab-label {
-	color: var(--muted-foreground);
-	font-family: var(--font-sans);
-	font-size: var(--text-sm);
-	font-weight: 600;
-	letter-spacing: 0.02em;
-	text-transform: uppercase;
-}
-
 .files-tab-empty {
 	padding: 14px 12px;
 }
