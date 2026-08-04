@@ -37,10 +37,12 @@ services:
       # Container-specific database/bind policy overrides the host config file.
       - ./config/control.toml:/config/pi-relay/agentd/config.toml:ro
       # Host LLM credentials (read-only). The daemon reads ~/.codex/auth.json
-      # (+installation_id) and ~/.claude*/config for the sk-ant- key. Read-only
-      # so the container never rewrites auth.json as root and locks out the host
-      # Codex CLI; the dir mount still reflects the host CLI's token refreshes.
+      # (+installation_id), Claude.ai OAuth from ~/.claude/.credentials.json,
+      # and ~/.claude*/config for the sk-ant- API-key fallback. Read-only so the
+      # container never rewrites auth files as root and locks out the host CLIs;
+      # the mounts still reflect the host CLI's token refreshes.
       - ${HOME}/.codex:/root/.codex:ro
+      - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
       - ${HOME}/.claude/config.json:/root/.claude/config.json:ro
       - ${HOME}/.claude.json:/root/.claude.json:ro
       # No mcp.toml or state mount: MCP (server inventory + OAuth credential

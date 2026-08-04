@@ -99,13 +99,14 @@ stack. The obsolete Bun lockfile is not part of the supported workflow.
   (`user_subvol_rm_allowed`). `pi-runtime` runs as your login user via
   `infra/dev.sh` and is intentionally a host process (not dockerized).
 - Provider credentials at model-call time. OpenAI/Codex accepts
-  `CODEX_ACCESS_TOKEN` or `$HOME/.codex/auth.json`; Anthropic accepts
-  `ANTHROPIC_API_KEY` or Claude Code's
-  `$HOME/.claude/config.json`/`$HOME/.claude.json`.
+  `CODEX_ACCESS_TOKEN` or `$HOME/.codex/auth.json`; Anthropic prefers
+  Claude.ai OAuth from `$HOME/.claude/.credentials.json` /
+  `CLAUDE_CODE_OAUTH_TOKEN`, and falls back to `ANTHROPIC_API_KEY` or Claude
+  Code's `$HOME/.claude/config.json`/`$HOME/.claude.json` `primaryApiKey`.
 
 The compose control service mounts `$HOME/.codex`,
-`$HOME/.claude/config.json`, and `$HOME/.claude.json` read-only into the
-container. Ensure the credential paths used by the selected provider exist
+`$HOME/.claude/.credentials.json`, `$HOME/.claude/config.json`, and
+`$HOME/.claude.json` read-only into the container. Ensure the credential paths used by the selected provider exist
 and are readable by Docker, or run the binaries directly on the host instead
 of using the compose mounts. MCP configuration and OAuth credential state are
 host-runtime files; compose deliberately does not mount them into the control
@@ -525,8 +526,10 @@ Credentials are loaded at model-call time, not stored on the session:
 - `provider.kind = "openai"` uses the ChatGPT/Codex subscription transport
   (`CODEX_ACCESS_TOKEN` or `~/.codex/auth.json`, including `tokens.account_id`).
   π-relay does not support plain OpenAI API-key auth for OpenAI models.
-- `provider.kind = "claude"` uses `ANTHROPIC_API_KEY` or Claude
-  Code's `primaryApiKey` from `~/.claude/config.json` / `~/.claude.json`.
+- `provider.kind = "claude"` prefers Claude.ai OAuth
+  (`CLAUDE_CODE_OAUTH_TOKEN` or `~/.claude/.credentials.json`) and falls back
+  to `ANTHROPIC_API_KEY` or Claude Code's `primaryApiKey` from
+  `~/.claude/config.json` / `~/.claude.json`.
 
 Provider/model tuning (`reasoning_effort`, optional `max_tokens`,
 `prompt_cache.key`) and the exact accepted values are documented in

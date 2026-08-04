@@ -34,8 +34,8 @@ const COMPACTION_BETA: &str = "compact-2026-01-12";
 const COMPACTION_TRIGGER_TOKENS: usize = 50_000;
 const COMPACTION_TERMINAL_USER_INSTRUCTION: &str =
     "Proceed with the configured context-management compaction.";
-const CLAUDE_CODE_VERSION: &str = "2.1.75";
-const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75 (external, cli)";
+const CLAUDE_CODE_VERSION: &str = "2.1.221";
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.221 (external, cli)";
 const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
 const MODEL_CACHE_CAPACITY: usize = 64;
 const MODEL_CACHE_SUCCESS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -54,9 +54,27 @@ const TRANSCRIPT_LOOKBACK_BLOCKS: usize = 18;
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: String,
+    auth: AnthropicAuth,
     base_url: String,
     model_cache: AnthropicModelCache,
+}
+
+/// Anthropic request credential. Claude.ai OAuth uses Bearer; console keys use
+/// `x-api-key`. Fable is rate-limited to 0 TPM on the Claude Code API-key
+/// workspace, so OAuth is required for that model family.
+#[derive(Debug, Clone)]
+pub enum AnthropicAuth {
+    ApiKey(String),
+    Bearer(String),
+}
+
+impl AnthropicAuth {
+    fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            Self::ApiKey(key) => request.header("x-api-key", key),
+            Self::Bearer(token) => request.header("Authorization", format!("Bearer {token}")),
+        }
+    }
 }
 
 fn validate_anthropic_hosted_tool_result(block_type: &str, content: &Value) -> ProviderResult<()> {
@@ -932,7 +950,11 @@ fn parse_anthropic_count_tokens(text: &str) -> ProviderResult<ProviderTokenCount
 
 impl AnthropicProvider {
     pub fn new_with_client(client: reqwest::Client, api_key: impl Into<String>) -> Self {
-        Self::new_with_client_and_cache(client, api_key, AnthropicModelCache::default())
+        Self::new_with_auth_and_cache(
+            client,
+            AnthropicAuth::ApiKey(api_key.into()),
+            AnthropicModelCache::default(),
+        )
     }
 
     pub fn new_with_client_and_cache(
@@ -940,9 +962,17 @@ impl AnthropicProvider {
         api_key: impl Into<String>,
         model_cache: AnthropicModelCache,
     ) -> Self {
+        Self::new_with_auth_and_cache(client, AnthropicAuth::ApiKey(api_key.into()), model_cache)
+    }
+
+    pub fn new_with_auth_and_cache(
+        client: reqwest::Client,
+        auth: AnthropicAuth,
+        model_cache: AnthropicModelCache,
+    ) -> Self {
         Self {
             client,
-            api_key: api_key.into(),
+            auth,
             base_url: "https://api.anthropic.com/v1".to_string(),
             model_cache,
         }
@@ -1013,10 +1043,9 @@ impl AnthropicProvider {
             .map_err(|_| ProviderError::Provider("invalid Anthropic models URL".to_string()))?
             .push(model);
         let response = self
-            .client
-            .get(url)
+            .auth
+            .apply(self.client.get(url))
             .header("accept", "application/json")
-            .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("User-Agent", CLAUDE_CODE_USER_AGENT)
@@ -1048,10 +1077,12 @@ impl ModelProvider for AnthropicProvider {
         let prepared = prepare_messages_request(request, &metadata)?;
 
         let response = send_provider_generation_request(
-            self.client
-                .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
+            self.auth
+                .apply(
+                    self.client
+                        .post(format!("{}/messages", self.base_url.trim_end_matches('/'))),
+                )
                 .header("accept", "text/event-stream")
-                .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("anthropic-beta", prepared.beta_header)
                 .header("anthropic-dangerous-direct-browser-access", "true")
@@ -1097,10 +1128,12 @@ impl ModelProvider for AnthropicProvider {
         let body = compaction_body_with_metadata(request, &metadata)?;
 
         let response = send_provider_generation_request(
-            self.client
-                .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
+            self.auth
+                .apply(
+                    self.client
+                        .post(format!("{}/messages", self.base_url.trim_end_matches('/'))),
+                )
                 .header("accept", "text/event-stream")
-                .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("anthropic-beta", anthropic_compaction_beta_header())
                 .header("anthropic-dangerous-direct-browser-access", "true")
@@ -1128,13 +1161,12 @@ impl ModelProvider for AnthropicProvider {
         let prepared = prepare_count_tokens_request(request, &metadata)?;
 
         let response = self
-            .client
-            .post(format!(
+            .auth
+            .apply(self.client.post(format!(
                 "{}/messages/count_tokens",
                 self.base_url.trim_end_matches('/')
-            ))
+            )))
             .header("accept", "application/json")
-            .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", prepared.beta_header)
             .header("anthropic-dangerous-direct-browser-access", "true")
