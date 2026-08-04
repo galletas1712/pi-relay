@@ -3817,7 +3817,6 @@ pre {
 .inspector-footer {
 	flex: 0 0 auto;
 	margin-top: auto;
-	border-top: 1px solid var(--border);
 	padding: 8px 10px;
 }
 
@@ -3888,12 +3887,32 @@ pre {
 	color: var(--foreground);
 }
 
-.inspector-tab-panel {
+.inspector-panels {
+	position: relative;
 	display: flex;
 	min-height: 0;
 	flex: 1;
 	flex-direction: column;
+}
+
+.inspector-tab-panel {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	min-height: 0;
+	flex-direction: column;
 	overflow: auto;
+}
+
+.inspector-tab-panel.is-inactive {
+	visibility: hidden;
+	pointer-events: none;
+	z-index: 0;
+}
+
+.inspector-tab-panel.is-active {
+	visibility: visible;
+	z-index: 1;
 }
 
 .files-tab {
@@ -3993,20 +4012,21 @@ pre {
 }
 
 .file-pane-header {
-	display: grid;
-	grid-template-columns: auto minmax(0, 1fr) auto;
+	display: flex;
 	align-items: center;
 	gap: 8px;
 	height: var(--top-header-height);
 	min-height: var(--top-header-height);
+	min-width: 0;
 	border-bottom: 1px solid var(--border);
-	padding: 0 10px;
-	background: color-mix(in oklch, var(--card) 84%, var(--background));
+	padding: 0 12px;
+	background: var(--background);
 }
 
 .file-pane-title {
 	display: flex;
 	min-width: 0;
+	flex: 1;
 	flex-direction: column;
 	gap: 1px;
 }
@@ -4032,8 +4052,10 @@ pre {
 
 .file-pane-actions {
 	display: inline-flex;
+	flex: 0 0 auto;
 	align-items: center;
 	gap: 4px;
+	margin-left: auto;
 }
 
 .file-pane-body {
@@ -4158,13 +4180,21 @@ pre {
 	grid-column: 4;
 }
 
-.app-shell.file-open.file-replacement .mobile-topbar,
-.app-shell.file-open.file-replacement .log-pane,
-.app-shell.file-open.file-replacement .chat-dock {
+.app-shell.file-open.file-replacement .mobile-topbar {
 	display: none;
 }
 
-.app-shell.file-open.file-replacement .file-pane {
+/* Keep the inactive center surface mounted in-place so its scroll position
+   survives Agents ↔ Files switches (visibility keeps layout + scrollTop). */
+.app-shell.file-open.file-replacement .log-pane,
+.app-shell.file-open.file-replacement .chat-dock,
+.app-shell.file-open.file-parked .file-pane {
+	visibility: hidden;
+	pointer-events: none;
+}
+
+.app-shell.file-open.file-replacement .file-pane,
+.app-shell.file-open.file-parked .file-pane {
 	grid-column: 1;
 	grid-row: 1 / span 3;
 	border-left: 0;
@@ -4208,7 +4238,8 @@ pre {
 		grid-template-columns: var(--sidebar-width, 320px) minmax(0, 1fr);
 	}
 
-	.app-shell.file-open.file-replacement .file-pane {
+	.app-shell.file-open.file-replacement .file-pane,
+	.app-shell.file-open.file-parked .file-pane {
 		grid-column: 2;
 		grid-row: 1 / span 3;
 	}

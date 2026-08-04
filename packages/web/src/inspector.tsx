@@ -118,55 +118,59 @@ export function Inspector({
 					<X size={14} />
 				</button>
 			</div>
-			<div
-				className="inspector-tab-panel"
-				role="tabpanel"
-				id="inspector-panel-run-board"
-				aria-labelledby="inspector-tab-run-board"
-				hidden={activeTab !== "run-board"}
-			>
-				<RunBoard
-					parentSessionId={runBoardParentSessionId}
-					delegations={delegations}
-					subagentNames={subagentNames}
-					hasMoreDelegations={hasMoreDelegations}
-					loading={delegationsLoading}
-					error={delegationsError}
-					showAllDelegations={showAllDelegations}
-					expandedDelegationsAvailable={expandedDelegationsAvailable}
-					onToggleShowAllDelegations={onToggleShowAllDelegations}
-					onRetryDelegations={onRetryDelegations}
-					delegationsRetrying={delegationsRetrying}
-					selectedSessionId={selectedSessionId}
-					boundedExpansionHasMore={boundedExpansionHasMore}
-					onSelectSession={onSelectSession}
-					onCancelDelegation={onCancelDelegation}
-					mutationBlockedReason={mutationBlockedReason}
-					remoteReadBlockedReason={remoteReadBlockedReason}
-				/>
-			</div>
-			<div
-				className="inspector-tab-panel"
-				role="tabpanel"
-				id="inspector-panel-files"
-				aria-labelledby="inspector-tab-files"
-				hidden={activeTab !== "files"}
-			>
-				{api ? (
-					<FilesTab
-						key={selectedSessionId ?? "none"}
-						api={api}
-						sessionId={selectedSessionId}
-						selectedPath={selectedFilePath}
+			<div className="inspector-panels">
+				<div
+					className={`inspector-tab-panel${activeTab === "run-board" ? " is-active" : " is-inactive"}`}
+					role="tabpanel"
+					id="inspector-panel-run-board"
+					aria-labelledby="inspector-tab-run-board"
+					aria-hidden={activeTab !== "run-board"}
+					inert={activeTab !== "run-board"}
+				>
+					<RunBoard
+						parentSessionId={runBoardParentSessionId}
+						delegations={delegations}
+						subagentNames={subagentNames}
+						hasMoreDelegations={hasMoreDelegations}
+						loading={delegationsLoading}
+						error={delegationsError}
+						showAllDelegations={showAllDelegations}
+						expandedDelegationsAvailable={expandedDelegationsAvailable}
+						onToggleShowAllDelegations={onToggleShowAllDelegations}
+						onRetryDelegations={onRetryDelegations}
+						delegationsRetrying={delegationsRetrying}
+						selectedSessionId={selectedSessionId}
+						boundedExpansionHasMore={boundedExpansionHasMore}
+						onSelectSession={onSelectSession}
+						onCancelDelegation={onCancelDelegation}
+						mutationBlockedReason={mutationBlockedReason}
 						remoteReadBlockedReason={remoteReadBlockedReason}
-						activity={snapshot?.activity ?? null}
-						treeEpoch={filesTreeEpoch}
-						onSelectFile={(path) => onSelectFile?.(path)}
-						onVisibleDirectoriesChange={onVisibleDirectoriesChange}
 					/>
-				) : (
-					<p className="muted">Files browser unavailable.</p>
-				)}
+				</div>
+				<div
+					className={`inspector-tab-panel${activeTab === "files" ? " is-active" : " is-inactive"}`}
+					role="tabpanel"
+					id="inspector-panel-files"
+					aria-labelledby="inspector-tab-files"
+					aria-hidden={activeTab !== "files"}
+					inert={activeTab !== "files"}
+				>
+					{api ? (
+						<FilesTab
+							key={selectedSessionId ?? "none"}
+							api={api}
+							sessionId={selectedSessionId}
+							selectedPath={selectedFilePath}
+							remoteReadBlockedReason={remoteReadBlockedReason}
+							activity={snapshot?.activity ?? null}
+							treeEpoch={filesTreeEpoch}
+							onSelectFile={(path) => onSelectFile?.(path)}
+							onVisibleDirectoriesChange={onVisibleDirectoriesChange}
+						/>
+					) : (
+						<p className="muted">Files browser unavailable.</p>
+					)}
+				</div>
 			</div>
 			<div className="inspector-footer">
 				<button

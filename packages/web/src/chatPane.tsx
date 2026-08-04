@@ -54,6 +54,8 @@ export interface ChatPaneProps {
 	onRetryTranscript: () => void;
 	routeNotice?: ReactNode;
 	emptySessionContent?: ReactNode;
+	/** Hidden under files replacement mode; keeps transcript scroll mounted. */
+	parked?: boolean;
 }
 
 export const ChatPane = memo(function ChatPane({
@@ -98,11 +100,17 @@ export const ChatPane = memo(function ChatPane({
 	onRetryTranscript,
 	routeNotice,
 	emptySessionContent,
+	parked = false,
 }: ChatPaneProps) {
 	const loadedLeafId = activeLeafIdFromEntries(entries);
 	const visibleActiveLeafId = loadedLeafId ?? snapshot?.active_leaf_id ?? null;
 	return (
-		<main className="log-pane" data-slot="agent-log">
+		<main
+			className="log-pane"
+			data-slot="agent-log"
+			aria-hidden={parked || undefined}
+			inert={parked}
+		>
 			{routeNotice}
 			<ChatHeader
 				session={session}
