@@ -58,6 +58,12 @@ impl AgentTool for TextEditorTool {
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
         let args: TextEditorArgs = serde_json::from_str(&call.args_json)?;
         let path = workspace_path(ctx, &args.path);
+        let mutates = matches!(args.command.as_str(), "create" | "str_replace" | "insert");
+        let _guard = if mutates {
+            Some(ctx.file_locks.lock_paths([&path]).await)
+        } else {
+            None
+        };
         let output = match args.command.as_str() {
             "view" => text_editor_view(&path, args.view_range).await?,
             "create" => {

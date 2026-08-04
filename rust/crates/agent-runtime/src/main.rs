@@ -16,7 +16,7 @@ use agent_runtime_protocol::{
     RuntimeCommandError, RuntimeCommandResult, RuntimeHello, RuntimeToControl, SelectedWorkspace,
     HEARTBEAT_INTERVAL_SECS,
 };
-use agent_tools::{ToolContext, ToolRegistry};
+use agent_tools::{FileMutationLocks, ToolContext, ToolRegistry};
 use agent_vocab::{ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -164,6 +164,7 @@ struct Config {
 struct Runtime {
     workspaces: WorkspaceManager,
     tools: Arc<ToolRegistry>,
+    file_locks: Arc<FileMutationLocks>,
     running: Arc<Mutex<HashMap<String, AbortHandle>>>,
     mcp: Arc<McpManager>,
 }
@@ -198,6 +199,7 @@ async fn main() -> Result<()> {
         )
         .with_browse_watch(browse_hub),
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        file_locks: FileMutationLocks::new(),
         running: Default::default(),
         mcp,
     };
@@ -537,11 +539,12 @@ impl Runtime {
                 provider,
                 tool_call,
             } => {
-                let _guard = self
-                    .workspaces
-                    .acquire_cwd_mutation_guard(&workspace_id)
-                    .await;
-                let context = ToolContext::new(self.workspaces.resolve(&workspace_id));
+                // pi-mono model: Bash runs unlocked; Edit serializes per path
+                // inside the tool via FileMutationLocks. No workspace-wide
+                // ExecuteTool guard — that was blocking inspect/handoff behind
+                // long child Bash on shared writing workspaces.
+                let context = ToolContext::new(self.workspaces.resolve(&workspace_id))
+                    .with_file_locks(Arc::clone(&self.file_locks));
                 let result = self.tools.execute(provider, &tool_call, &context).await?;
                 Ok(RuntimeCommandResult::Tool { result })
             }
@@ -550,10 +553,8 @@ impl Runtime {
                 rel_path,
                 contents,
             } => {
-                let _guard = self
-                    .workspaces
-                    .acquire_cwd_mutation_guard(&workspace_id)
-                    .await;
+                let lock_path = self.workspaces.resolve(&workspace_id).join(&rel_path);
+                let _guard = self.file_locks.lock_paths([&lock_path]).await;
                 self.workspaces
                     .write_workspace_file(&workspace_id, &rel_path, &contents)
                     .await?;
@@ -780,6 +781,132 @@ impl From<SelectedWorkspace> for workspaces::SelectedWorkspace {
             workspace: value.workspace,
             branch_override: value.branch_override,
         }
+    }
+}
+
+#[cfg(test)]
+mod file_mutation_lock_tests {
+    use super::*;
+    use agent_vocab::{ProviderKind, ToolCall, ToolCallId};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn bash_and_cross_file_edits_do_not_wait_on_each_other() {
+        let root = temp_dir("file-mutation-parallel");
+        let file_locks = FileMutationLocks::new();
+        let runtime = Runtime {
+            workspaces: WorkspaceManager::new(root.clone(), root.clone(), root.clone()),
+            tools: Arc::new(ToolRegistry::with_builtin_tools()),
+            file_locks: Arc::clone(&file_locks),
+            running: Default::default(),
+            mcp: McpManager::disabled(),
+        };
+        let workspace_id = "workspace-test";
+        let cwd = runtime.workspaces.resolve(workspace_id);
+        tokio::fs::create_dir_all(&cwd).await.expect("cwd");
+        tokio::fs::write(cwd.join("a.txt"), "a\n")
+            .await
+            .expect("a.txt");
+        tokio::fs::write(cwd.join("b.txt"), "b\n")
+            .await
+            .expect("b.txt");
+
+        // Hold the lock on a.txt as if an Edit were in flight.
+        let guard_a = file_locks.lock_paths([cwd.join("a.txt")]).await;
+
+        let bash = tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.execute(
+                RuntimeCommand::ExecuteTool {
+                    workspace_id: workspace_id.to_string(),
+                    provider: ProviderKind::OpenAi,
+                    tool_call: ToolCall {
+                        id: ToolCallId::new("call_bash"),
+                        tool_name: "Bash".to_string(),
+                        args_json: r#"{"command":"echo hi"}"#.to_string(),
+                    },
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("Bash must not wait on per-file Edit locks")
+        .expect("Bash execute");
+        assert!(matches!(bash, RuntimeCommandResult::Tool { .. }));
+
+        let edit_b = tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.execute(
+                RuntimeCommand::ExecuteTool {
+                    workspace_id: workspace_id.to_string(),
+                    provider: ProviderKind::OpenAi,
+                    tool_call: ToolCall {
+                        id: ToolCallId::new("call_edit_b"),
+                        tool_name: "Edit".to_string(),
+                        args_json: serde_json::json!({
+                            "input": "*** Begin Patch\n*** Update File: b.txt\n@@\n-b\n+b2\n*** End Patch\n"
+                        })
+                        .to_string(),
+                    },
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("Edit on a different file must not wait")
+        .expect("Edit b");
+        assert!(matches!(edit_b, RuntimeCommandResult::Tool { .. }));
+
+        let mut edit_a = Box::pin(runtime.execute(
+            RuntimeCommand::ExecuteTool {
+                workspace_id: workspace_id.to_string(),
+                provider: ProviderKind::OpenAi,
+                tool_call: ToolCall {
+                    id: ToolCallId::new("call_edit_a"),
+                    tool_name: "Edit".to_string(),
+                    args_json: serde_json::json!({
+                        "input": "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+a2\n*** End Patch\n"
+                    })
+                    .to_string(),
+                },
+            },
+            None,
+        ));
+        assert!(
+            futures_util::poll!(edit_a.as_mut()).is_pending(),
+            "Edit on the same file must wait for the per-file lock"
+        );
+
+        let mut write_a = Box::pin(runtime.execute(
+            RuntimeCommand::WriteWorkspaceFile {
+                workspace_id: workspace_id.to_string(),
+                rel_path: "a.txt".to_string(),
+                contents: "handoff\n".to_string(),
+            },
+            None,
+        ));
+        assert!(
+            futures_util::poll!(write_a.as_mut()).is_pending(),
+            "WriteWorkspaceFile must share the per-file lock"
+        );
+
+        drop(guard_a);
+        edit_a.await.expect("same-file Edit unblocked");
+        write_a.await.expect("same-file write unblocked");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "pi-runtime-{prefix}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("temp directory");
+        path
     }
 }
 
