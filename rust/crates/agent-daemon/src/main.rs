@@ -513,14 +513,19 @@ async fn handle_socket(state: AppState, websocket: BrowserWebSocket) -> Result<(
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
                 if subscriptions.contains(&event.session_id) {
-                    let last_sent = event_high_water
-                        .get(&event.session_id)
-                        .copied()
-                        .unwrap_or_default();
-                    if event.event_id <= last_sent {
-                        continue;
+                    // Ephemeral frames (event_id == 0), e.g. workspace.fs_changed,
+                    // are not persisted and must not participate in high-water
+                    // dedupe — otherwise they are dropped after any real event.
+                    if event.event_id > 0 {
+                        let last_sent = event_high_water
+                            .get(&event.session_id)
+                            .copied()
+                            .unwrap_or_default();
+                        if event.event_id <= last_sent {
+                            continue;
+                        }
+                        event_high_water.insert(event.session_id.clone(), event.event_id);
                     }
-                    event_high_water.insert(event.session_id.clone(), event.event_id);
                     writer.lock().await.send(Message::Text(serde_json::to_string(&event)?.into())).await?;
                 }
             }

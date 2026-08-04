@@ -15,6 +15,7 @@ import {
 } from "./fileBrowser.ts";
 import { joinBrowsePath } from "./filePath.ts";
 import type { WorkspaceDirEntry, WorkspaceDirListing } from "./types.ts";
+import { workspaceFileCache } from "./workspaceFileCache.ts";
 
 const ROOT_ID = "__root__";
 
@@ -167,7 +168,8 @@ export function FilesTab({
 			void queryClient.resetQueries({ queryKey: ["workspace-dir", sessionId] }).then(() => {
 				reloadVisibleDirectories();
 			});
-			void queryClient.invalidateQueries({ queryKey: ["workspace-file", sessionId] });
+			workspaceFileCache.clearSession(sessionId);
+			void queryClient.resetQueries({ queryKey: ["workspace-file", sessionId] });
 		}
 		prevActivity.current = activity;
 	}, [activity, queryClient, reloadVisibleDirectories, sessionId]);

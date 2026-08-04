@@ -59,11 +59,11 @@ import {
 	clampSidebarWidth,
 	clampFilePaneWidth,
 	DEFAULT_SIDEBAR_WIDTH,
-	DEFAULT_FILE_PANE_WIDTH,
 	defaultPanelState,
 	canSplitFilePane,
+	equalFilePaneWidth,
+	maxFilePaneWidth,
 	MAX_SIDEBAR_WIDTH,
-	MAX_FILE_PANE_WIDTH,
 	MEDIUM_PANEL_QUERY,
 	MIN_SIDEBAR_WIDTH,
 	MIN_FILE_PANE_WIDTH,
@@ -413,6 +413,7 @@ export function App({
 	const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
 	const [sidebarResizing, setSidebarResizing] = useState(false);
 	const [filePaneWidth, setFilePaneWidth] = useState(loadFilePaneWidth);
+	const [filePaneMaxWidth, setFilePaneMaxWidth] = useState(() => maxFilePaneWidth(1800));
 	const [filePaneResizing, setFilePaneResizing] = useState(false);
 	const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() => readFileQuery());
 	const [filesVisibleDirectories, setFilesVisibleDirectories] = useState<string[]>([]);
@@ -485,8 +486,11 @@ export function App({
 	const sidebarNewSessionButtonRef = useRef<HTMLButtonElement | null>(null);
 	const sidebarWidthRef = useRef(sidebarWidth);
 	const filePaneWidthRef = useRef(filePaneWidth);
+	const filePaneMaxWidthRef = useRef(filePaneMaxWidth);
+	const wasFileSplitRef = useRef(false);
 	sidebarWidthRef.current = sidebarWidth;
 	filePaneWidthRef.current = filePaneWidth;
+	filePaneMaxWidthRef.current = filePaneMaxWidth;
 	const panelGestureRef = useRef<PanelGestureController | null>(null);
 	if (!panelGestureRef.current) panelGestureRef.current = new PanelGestureController();
 	const panelOpenStateRef = useRef({ sidebarOpen, rightOpen });
@@ -4339,7 +4343,7 @@ export function App({
 	}, [applySidebarWidth]);
 
 	const applyFilePaneWidth = useCallback((width: number, persist = false) => {
-		const nextWidth = clampFilePaneWidth(width);
+		const nextWidth = clampFilePaneWidth(width, filePaneMaxWidthRef.current);
 		filePaneWidthRef.current = nextWidth;
 		appShellRef.current?.style.setProperty("--file-pane-width", `${nextWidth}px`);
 		if (persist) {
@@ -4347,6 +4351,13 @@ export function App({
 			saveFilePaneWidth(nextWidth);
 		}
 	}, []);
+	const measureFileSplitCenter = useCallback(() => {
+		const shell = appShellRef.current;
+		if (!shell) return 0;
+		const sidebarCol = panelModeRef.current === "wide" ? sidebarWidthRef.current : 0;
+		const inspectorCol = rightOpen ? 350 : 0;
+		return shell.clientWidth - sidebarCol - inspectorCol;
+	}, [rightOpen]);
 	const handleFilePaneResizePointerDown = useCallback(
 		(event: ReactPointerEvent<HTMLDivElement>) => {
 			if (event.button !== 0) return;
@@ -4394,7 +4405,7 @@ export function App({
 					nextWidth = filePaneWidthRef.current - SIDEBAR_KEYBOARD_STEP;
 					break;
 				case "Home":
-					nextWidth = MAX_FILE_PANE_WIDTH;
+					nextWidth = filePaneMaxWidthRef.current;
 					break;
 				case "End":
 					nextWidth = MIN_FILE_PANE_WIDTH;
@@ -4408,8 +4419,8 @@ export function App({
 		[applyFilePaneWidth],
 	);
 	const resetFilePaneWidth = useCallback(() => {
-		applyFilePaneWidth(DEFAULT_FILE_PANE_WIDTH, true);
-	}, [applyFilePaneWidth]);
+		applyFilePaneWidth(equalFilePaneWidth(measureFileSplitCenter()), true);
+	}, [applyFilePaneWidth, measureFileSplitCenter]);
 
 	const selectFilePath = useCallback((path: string | null) => {
 		setFilesOnlyPreference(false);
@@ -4488,17 +4499,36 @@ export function App({
 			const shell = appShellRef.current;
 			if (!shell || !selectedFilePath) {
 				setFileSplitCapable(false);
+				wasFileSplitRef.current = false;
 				return;
 			}
-			const sidebarCol = panelModeRef.current === "wide" ? sidebarWidthRef.current : 0;
-			const inspectorCol = rightOpen ? 350 : 0;
-			const available = shell.clientWidth - sidebarCol - inspectorCol;
-			setFileSplitCapable(canSplitFilePane(available));
+			const available = measureFileSplitCenter();
+			const capable = canSplitFilePane(available);
+			setFileSplitCapable(capable);
+			const splitNow = capable && !filesOnlyPreference;
+			if (splitNow) {
+				const maxWidth = maxFilePaneWidth(available);
+				filePaneMaxWidthRef.current = maxWidth;
+				setFilePaneMaxWidth(maxWidth);
+				if (!wasFileSplitRef.current) {
+					applyFilePaneWidth(equalFilePaneWidth(available), true);
+				} else if (filePaneWidthRef.current > maxWidth) {
+					applyFilePaneWidth(maxWidth, true);
+				}
+			}
+			wasFileSplitRef.current = splitNow;
 		};
 		measure();
 		window.addEventListener("resize", measure);
 		return () => window.removeEventListener("resize", measure);
-	}, [selectedFilePath, rightOpen, panelMode, sidebarWidth]);
+	}, [
+		applyFilePaneWidth,
+		filesOnlyPreference,
+		measureFileSplitCenter,
+		panelMode,
+		selectedFilePath,
+		sidebarWidth,
+	]);
 
 	const handleResumeTurn = useCallback(
 		(entryId: string) => {
@@ -4796,6 +4826,7 @@ export function App({
 						onReasoningEffortChange={handleReasoningEffortChange}
 						onSelectSession={openConversation}
 						onToggleRight={handleToggleRight}
+						onHideChat={fileSplitMode ? () => setFilesOnlyPreference(true) : undefined}
 						onNewSession={handleSidebarNew}
 						onResumeTurn={handleResumeTurn}
 						onExpandTurn={expandTurn}
@@ -4927,7 +4958,7 @@ export function App({
 							aria-label="Resize file pane"
 							aria-orientation="vertical"
 							aria-valuemin={MIN_FILE_PANE_WIDTH}
-							aria-valuemax={MAX_FILE_PANE_WIDTH}
+							aria-valuemax={filePaneMaxWidth}
 							aria-valuenow={filePaneWidth}
 							aria-valuetext={`${filePaneWidth} pixels`}
 							tabIndex={0}
@@ -4948,7 +4979,6 @@ export function App({
 						replacementMode={fileReplacementMode}
 						remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 						onClose={() => selectFilePath(null)}
-						onHideChat={fileSplitMode ? () => setFilesOnlyPreference(true) : undefined}
 						onNavigate={selectFilePath}
 					/>
 				</>

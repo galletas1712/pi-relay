@@ -64,8 +64,11 @@ Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar
   Markdown/code/images in the center file pane via `workspace.list_dir` /
   `workspace.read_file`. The center splits chat and file only when that strip
   is at least `2 ×` the chat column max width (`900px`); otherwise the file
-  replaces chat. In split, close the file or hide chat; files-only uses Back
-  to chat. Directory listings accumulate pages with a Load more control.
+  replaces chat. Split opens at equal chat/file widths; the divider can grow
+  the file pane until the chat column hits its live minimum (content already
+  shrinks below `900px`). In split, hide chat from the chat header (next to
+  model/effort) or close the file from the file pane; files-only uses Back to
+  chat. Directory listings accumulate pages with a Load more control.
   Opening a file downloads it in websocket-sized chunks into an in-memory
   cache (pinned while open; 8 GiB / 16-entry LRU for unpinned history). The UI
   registers `workspace.watch` interest for currently expanded tree directories

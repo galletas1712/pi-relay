@@ -4,13 +4,18 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	canSplitFilePane,
 	CHAT_COLUMN_MAX_WIDTH,
+	clampFilePaneWidth,
 	clampSidebarWidth,
 	DEFAULT_SIDEBAR_WIDTH,
 	defaultPanelState,
+	equalFilePaneWidth,
+	FILE_SPLIT_HANDLE_PX,
 	FILE_SPLIT_MIN_CENTER_PX,
-	MAX_FILE_PANE_WIDTH,
+	maxFilePaneWidth,
 	MAX_SIDEBAR_WIDTH,
 	MEDIUM_PANEL_QUERY,
+	MIN_CHAT_PANE_WIDTH,
+	MIN_FILE_PANE_WIDTH,
 	MIN_SIDEBAR_WIDTH,
 	panelModeForViewport,
 	saveSidebarWidth,
@@ -75,9 +80,19 @@ describe("panel layout policies", () => {
 
 	it("splits only when the center can fit two chat-max columns", () => {
 		expect(FILE_SPLIT_MIN_CENTER_PX).toBe(CHAT_COLUMN_MAX_WIDTH * 2);
-		expect(MAX_FILE_PANE_WIDTH).toBe(CHAT_COLUMN_MAX_WIDTH);
 		expect(canSplitFilePane(FILE_SPLIT_MIN_CENTER_PX - 1)).toBe(false);
 		expect(canSplitFilePane(FILE_SPLIT_MIN_CENTER_PX)).toBe(true);
 		expect(canSplitFilePane(2400)).toBe(true);
+	});
+
+	it("sizes the file pane equally and allows shrinking chat into padding", () => {
+		const center = 2000;
+		expect(equalFilePaneWidth(center)).toBe(Math.round((center - FILE_SPLIT_HANDLE_PX) / 2));
+		expect(maxFilePaneWidth(center)).toBe(center - FILE_SPLIT_HANDLE_PX - MIN_CHAT_PANE_WIDTH);
+		expect(clampFilePaneWidth(maxFilePaneWidth(center) + 50, maxFilePaneWidth(center))).toBe(
+			maxFilePaneWidth(center),
+		);
+		expect(clampFilePaneWidth(100)).toBe(MIN_FILE_PANE_WIDTH);
+		expect(maxFilePaneWidth(center)).toBeGreaterThan(CHAT_COLUMN_MAX_WIDTH);
 	});
 });
