@@ -21,7 +21,7 @@ import {
 } from "./delegationBoard.ts";
 import type { Delegation, DelegationSubagent } from "./types.ts";
 
-export const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
+export const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 10;
 export const RUN_BOARD_EXPANDED_DELEGATION_COUNT = 100;
 const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
 

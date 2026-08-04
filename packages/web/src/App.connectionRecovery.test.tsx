@@ -618,7 +618,7 @@ describe("App connection recovery integration", () => {
 		const retryExpansion = deferred<ReturnType<typeof delegationPage>>();
 		const defaultPage = delegationPage(
 			["Recent 1", "Recent 2", "Recent 3"],
-			{ hasMore: true, limit: 3 },
+			{ hasMore: true, limit: 10 },
 		);
 		const expandedPage = delegationPage(
 			Array.from({ length: 100 }, (_, index) => `Expanded ${index + 1}`),
@@ -627,7 +627,7 @@ describe("App connection recovery integration", () => {
 		let expansionCalls = 0;
 		api.listDelegations.mockImplementation(async (parentSessionId: string, limit?: number) => {
 			if (parentSessionId !== SESSION_ID) throw new Error("unexpected parent");
-			if (limit === 3) return defaultPage;
+			if (limit === 10) return defaultPage;
 			if (limit === 100) {
 				expansionCalls += 1;
 				return expansionCalls === 1 ? firstExpansion.promise : retryExpansion.promise;
@@ -710,13 +710,13 @@ describe("App connection recovery integration", () => {
 			},
 		}));
 		api.listDelegations.mockImplementation(async (parentSessionId: string, limit?: number) => {
-			if (parentSessionId === SESSION_ID && limit === 3) {
-				return delegationPage(["First parent row"], { hasMore: true, limit: 3 });
+			if (parentSessionId === SESSION_ID && limit === 10) {
+				return delegationPage(["First parent row"], { hasMore: true, limit: 10 });
 			}
 			if (parentSessionId === SESSION_ID && limit === 100) return staleExpansion.promise;
-			if (parentSessionId === secondSessionId && limit === 3) {
+			if (parentSessionId === secondSessionId && limit === 10) {
 				return {
-					...delegationPage(["Second parent row"], { hasMore: false, limit: 3 }),
+					...delegationPage(["Second parent row"], { hasMore: false, limit: 10 }),
 					parent_session_id: secondSessionId,
 				};
 			}
