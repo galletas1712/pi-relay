@@ -182,6 +182,19 @@ pub enum RuntimeCommand {
         directories: Vec<String>,
         files: Vec<String>,
     },
+    /// Repo-wide changed-path status for git workspace roots under the session cwd.
+    BrowseGitStatus {
+        workspace_id: String,
+        against: GitAgainst,
+        roots: Vec<GitBrowseRoot>,
+    },
+    /// Unified diff for one cwd-relative path against HEAD or the PR merge-base.
+    BrowseGitDiff {
+        workspace_id: String,
+        path: String,
+        against: GitAgainst,
+        roots: Vec<GitBrowseRoot>,
+    },
     /// Return runtime-owned instructions and skill packages for a session.
     /// `project_key` selects `$HOME/.agents/projects/<project_key>/skills`
     /// when the session belongs to a project; ephemeral sessions pass `None`.
@@ -259,6 +272,8 @@ impl RuntimeCommand {
             | Self::BrowseListDir { .. }
             | Self::BrowseReadFile { .. }
             | Self::BrowseWatch { .. }
+            | Self::BrowseGitStatus { .. }
+            | Self::BrowseGitDiff { .. }
             | Self::ReadRuntimeContext { .. }
             | Self::McpInventory { .. }
             | Self::McpSelect { .. }
@@ -301,6 +316,21 @@ pub enum RuntimeCommandResult {
         #[serde(skip_serializing_if = "Option::is_none")]
         mtime_ms: Option<u64>,
     },
+    GitStatus {
+        against: GitAgainst,
+        roots: Vec<GitStatusRoot>,
+    },
+    GitDiff {
+        path: String,
+        against: GitAgainst,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        base_oid: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<GitFileStatus>,
+        unified: String,
+        binary: bool,
+        truncated: bool,
+    },
     RuntimeContext {
         context: RuntimeContext,
     },
@@ -332,6 +362,49 @@ pub struct WorkspaceDirEntry {
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtime_ms: Option<u64>,
+}
+
+/// Comparison target for browse git status / diff.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitAgainst {
+    /// Working tree (+ index) vs `HEAD`.
+    Head,
+    /// Working tree vs `merge-base(HEAD, origin/<remote_branch>)`.
+    PrBase,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBrowseRoot {
+    pub workspace_dir: String,
+    pub remote_branch: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitFileStatus {
+    Modified,
+    Added,
+    Deleted,
+    Untracked,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitStatusEntry {
+    /// Cwd-relative path (includes `workspace_dir/` prefix).
+    pub path: String,
+    pub status: GitFileStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitStatusRoot {
+    pub workspace_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_oid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub entries: Vec<GitStatusEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

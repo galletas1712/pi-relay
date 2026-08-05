@@ -51,6 +51,7 @@ export interface InspectorProps {
 	selectedFilePath?: string | null;
 	preferredTab?: InspectorTab | null;
 	filesTreeEpoch?: number;
+	hasGitWorkspaces?: boolean;
 	onSelectFile?: (path: string) => void;
 	onVisibleDirectoriesChange?: (directories: string[]) => void;
 	onActiveTabChange?: (tab: InspectorTab) => void;
@@ -81,6 +82,7 @@ export function Inspector({
 	selectedFilePath = null,
 	preferredTab = null,
 	filesTreeEpoch = 0,
+	hasGitWorkspaces = false,
 	onSelectFile,
 	onVisibleDirectoriesChange,
 	onActiveTabChange,
@@ -164,6 +166,7 @@ export function Inspector({
 							remoteReadBlockedReason={remoteReadBlockedReason}
 							activity={snapshot?.activity ?? null}
 							treeEpoch={filesTreeEpoch}
+							hasGitWorkspaces={hasGitWorkspaces}
 							onSelectFile={(path) => onSelectFile?.(path)}
 							onVisibleDirectoriesChange={onVisibleDirectoriesChange}
 						/>

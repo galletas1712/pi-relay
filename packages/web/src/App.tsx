@@ -2698,6 +2698,14 @@ export function App({
 							queryKey: workspaceFileQueryKey(event.session_id, path),
 						});
 					}
+					if (directories.length > 0 || files.length > 0) {
+						await queryClient.invalidateQueries({
+							queryKey: ["workspace-git-status", event.session_id],
+						});
+						await queryClient.invalidateQueries({
+							queryKey: ["workspace-git-diff", event.session_id],
+						});
+					}
 					if (directories.length > 0 && event.session_id === selectedRef.current) {
 						setFilesTreeEpoch((epoch) => epoch + 1);
 					}
@@ -5128,6 +5136,7 @@ export function App({
 						api={api}
 						sessionId={selectedId}
 						path={selectedFilePath}
+						workspaces={loadedSnapshot?.workspaces ?? selectedSession?.workspaces}
 						remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 						parked={fileParked}
 						onClose={() => selectFilePath(null)}
@@ -5212,6 +5221,9 @@ export function App({
 					selectedFilePath={selectedFilePath}
 					preferredTab={inspectorPreferredTab}
 					filesTreeEpoch={filesTreeEpoch}
+					hasGitWorkspaces={(loadedSnapshot?.workspaces ?? selectedSession?.workspaces ?? []).some(
+						(workspace) => (workspace.kind ?? "git") === "git",
+					)}
 					onSelectFile={selectFilePath}
 					onVisibleDirectoriesChange={setFilesVisibleDirectories}
 					onActiveTabChange={handleInspectorTabChange}

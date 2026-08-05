@@ -38,6 +38,9 @@ import type {
 	WorkspaceMaterializeProgress,
 	WorkspaceDirListing,
 	WorkspaceFilePrefix,
+	WorkspaceGitStatus,
+	WorkspaceGitDiff,
+	GitAgainst,
 } from "./types.ts";
 import type { EntryScope } from "./queryKeys.ts";
 
@@ -100,6 +103,8 @@ export interface AgentApi {
 	listWorkspaceDir(params: ListWorkspaceDirParams): Promise<WorkspaceDirListing>;
 	readWorkspaceFile(params: ReadWorkspaceFileParams): Promise<WorkspaceFilePrefix>;
 	watchWorkspace(params: WatchWorkspaceParams): Promise<{ ok: boolean }>;
+	gitStatus(params: GitStatusParams): Promise<WorkspaceGitStatus>;
+	gitDiff(params: GitDiffParams): Promise<WorkspaceGitDiff>;
 }
 
 export interface ListWorkspaceDirParams {
@@ -120,6 +125,17 @@ export interface WatchWorkspaceParams {
 	sessionId: string;
 	directories: string[];
 	files: string[];
+}
+
+export interface GitStatusParams {
+	sessionId: string;
+	against: GitAgainst;
+}
+
+export interface GitDiffParams {
+	sessionId: string;
+	path: string;
+	against: GitAgainst;
 }
 
 export interface AddMcpToolsParams {
@@ -855,6 +871,21 @@ class AgentApiClient implements AgentApi {
 			session_id: params.sessionId,
 			directories: params.directories,
 			files: params.files,
+		});
+	}
+
+	gitStatus(params: GitStatusParams): Promise<WorkspaceGitStatus> {
+		return this.client.request<WorkspaceGitStatus>("workspace.git_status", {
+			session_id: params.sessionId,
+			against: params.against,
+		});
+	}
+
+	gitDiff(params: GitDiffParams): Promise<WorkspaceGitDiff> {
+		return this.client.request<WorkspaceGitDiff>("workspace.git_diff", {
+			session_id: params.sessionId,
+			path: params.path,
+			against: params.against,
 		});
 	}
 }

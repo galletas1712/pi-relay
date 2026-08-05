@@ -662,6 +662,46 @@ impl RuntimeRegistry {
         .map(|_| ())
     }
 
+    pub(crate) async fn browse_git_status(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        against: agent_runtime_protocol::GitAgainst,
+        roots: Vec<agent_runtime_protocol::GitBrowseRoot>,
+    ) -> Result<RuntimeCommandResult> {
+        self.execute(
+            runtime_id,
+            RuntimeCommand::BrowseGitStatus {
+                workspace_id: workspace_id.to_string(),
+                against,
+                roots,
+            },
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn browse_git_diff(
+        &self,
+        runtime_id: &str,
+        workspace_id: &str,
+        path: &str,
+        against: agent_runtime_protocol::GitAgainst,
+        roots: Vec<agent_runtime_protocol::GitBrowseRoot>,
+    ) -> Result<RuntimeCommandResult> {
+        self.execute(
+            runtime_id,
+            RuntimeCommand::BrowseGitDiff {
+                workspace_id: workspace_id.to_string(),
+                path: path.to_string(),
+                against,
+                roots,
+            },
+            None,
+        )
+        .await
+    }
+
     pub(crate) async fn read_runtime_context(
         &self,
         runtime_id: &str,
@@ -1094,6 +1134,31 @@ pub(crate) mod test_support {
                 max_bytes,
             } => fake_browse_read_file(dirs, &workspace_id, &path, offset, max_bytes).await,
             RuntimeCommand::BrowseWatch { .. } => Ok(RuntimeCommandResult::Ack),
+            RuntimeCommand::BrowseGitStatus { against, roots, .. } => {
+                Ok(RuntimeCommandResult::GitStatus {
+                    against,
+                    roots: roots
+                        .into_iter()
+                        .map(|root| agent_runtime_protocol::GitStatusRoot {
+                            workspace_dir: root.workspace_dir,
+                            base_oid: None,
+                            error: None,
+                            entries: Vec::new(),
+                        })
+                        .collect(),
+                })
+            }
+            RuntimeCommand::BrowseGitDiff {
+                path, against, ..
+            } => Ok(RuntimeCommandResult::GitDiff {
+                path,
+                against,
+                base_oid: None,
+                status: None,
+                unified: String::new(),
+                binary: false,
+                truncated: false,
+            }),
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,

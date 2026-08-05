@@ -646,6 +646,8 @@ async fn dispatch_request(
         RpcMethod::WorkspaceListDir => workspace_browse::list_dir(state, params).await,
         RpcMethod::WorkspaceReadFile => workspace_browse::read_file(state, params).await,
         RpcMethod::WorkspaceWatch => workspace_browse::watch(state, params).await,
+        RpcMethod::WorkspaceGitStatus => workspace_browse::git_status(state, params).await,
+        RpcMethod::WorkspaceGitDiff => workspace_browse::git_diff(state, params).await,
     }
 }
 

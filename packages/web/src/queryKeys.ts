@@ -16,4 +16,8 @@ export const queryKeys = {
 	workspaceDir: (sessionId: string, path: string, afterName: string | null = null) =>
 		["workspace-dir", sessionId, path, afterName] as const,
 	workspaceFile: (sessionId: string, path: string) => ["workspace-file", sessionId, path] as const,
+	workspaceGitStatus: (sessionId: string, against: string) =>
+		["workspace-git-status", sessionId, against] as const,
+	workspaceGitDiff: (sessionId: string, path: string, against: string) =>
+		["workspace-git-diff", sessionId, path, against] as const,
 };

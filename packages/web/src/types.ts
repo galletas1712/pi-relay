@@ -252,6 +252,37 @@ export interface WorkspaceFilePrefix {
 	mtime_ms?: number | null;
 }
 
+export type GitAgainst = "head" | "pr_base";
+
+export type GitFileStatus = "modified" | "added" | "deleted" | "untracked" | "conflict";
+
+export interface GitStatusEntry {
+	path: string;
+	status: GitFileStatus;
+}
+
+export interface GitStatusRoot {
+	workspace_dir: string;
+	base_oid?: string | null;
+	error?: string | null;
+	entries: GitStatusEntry[];
+}
+
+export interface WorkspaceGitStatus {
+	against: GitAgainst;
+	roots: GitStatusRoot[];
+}
+
+export interface WorkspaceGitDiff {
+	path: string;
+	against: GitAgainst;
+	base_oid?: string | null;
+	status?: GitFileStatus | null;
+	unified: string;
+	binary: boolean;
+	truncated: boolean;
+}
+
 export type SessionOverview = Omit<SessionSnapshot, "entries">;
 
 export interface ActiveBranchSyncResponse {
