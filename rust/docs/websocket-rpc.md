@@ -62,13 +62,7 @@ trusted.
    session to be terminal. A frontend should interrupt/cancel the relevant
    work, wait for idle, then retry.
 
-6. Fork targets are switch targets.
-   `history.fork` accepts the same committed turn boundaries (including
-   compaction roots) and root target as `history.switch`, with the same
-   active-leaf, transcript-revision, and target-branch fences. It does not
-   accept arbitrary mid-turn entries.
-
-7. Tools are always allowed.
+6. Tools are always allowed.
    The daemon runs model-requested tools immediately. There is no approval or
    denial RPC. `input.interrupt` is the one user-facing cancellation command and
    interrupts active work. The daemon keeps a per-action task registry and
@@ -76,7 +70,7 @@ trusted.
    session on a best-effort basis; durable action status remains the source of
    truth for stale completions.
 
-8. Daemon death is recoverable state.
+7. Daemon death is recoverable state.
    Startup first reconciles durable selected-subagent controls so an
    already-committed exact-child interrupt settles its captured action
    generation. It then validates and recovers pending/running model actions
@@ -749,7 +743,7 @@ the persisted transcript topology or model-visible ancestry; model context and
 
 Returns compact transcript topology without full message bodies or
 `provider_replay`. This supports clients that need the transcript forest;
-the `/switch` and `/fork` pickers use `history.targets`.
+the `/switch` picker uses `history.targets`.
 
 ```json
 { "session_id": "s1", "after_sequence": 0, "limit": 1000 }
@@ -816,7 +810,7 @@ Result shape:
 ### `history.targets`
 
 Returns a deterministic newest-first page of editable historical user-message
-targets for the `/switch` and `/fork` pickers without loading the full
+targets for the `/switch` picker without loading the full
 transcript tree.
 
 ```json
@@ -1430,7 +1424,7 @@ both for "switch to the boundary before editing this user message" and for
 "switch the active view to this completed branch or compaction root." The RPC
 never creates a session and never deletes abandoned branches.
 
-`history.switch` and `history.fork` share these target fields:
+`history.switch` target fields:
 
 - `leaf_id` is required and must be a committed turn boundary id or explicit
   `null` for root.
@@ -1475,49 +1469,44 @@ without a follow-up `session.get` in the hot path.
 
 ### `history.fork`
 
-Idle-only and available only to managed project sessions. Creates a visible,
-independent top-level session without changing the source. Target semantics
-and fences are the shared contract above. A user-message edit in the picker
-sends the same previous-boundary target used by switch.
+Idle-only and available only to managed project sessions. Duplicates the
+session at its current state as a visible, independent top-level session
+without changing the source. To start the child somewhere else in history, run
+`history.switch` on the child afterwards.
 
 ```json
-{
-  "session_id": "s1",
-  "leaf_id": "entry_4",
-  "expected_active_leaf_id": "entry_9",
-  "expected_transcript_revision": 12,
-  "active_branch_entry_ids": ["entry_1", "entry_4"]
-}
+{ "session_id": "s1" }
 ```
 
 The child receives the source's complete committed transcript forest in source
 insertion order, preserving entry ids, parent links, typed items, turn ids,
 compaction roots/sibling branches, and opaque `provider_replay`. Its active
-leaf is exactly `leaf_id`; the fork does not synthesize transcript entries. Queued
-inputs, actions, reconnect events, delegations, subagent relationships, and
-`.pi-handoff` delegation artifacts are not copied. Fork provenance is stored in
-`metadata.fork = { source_session_id, source_leaf_id }`; the child has no
-`parent_session_id` and uses the parent prompt/tool profile. The child inherits
-the source title, auto-title preference, and compaction policy, but starts
-without source archival/subagent state or compaction `auto_state`.
+leaf is the source's active leaf as of the fork transaction; the fork does not
+synthesize transcript entries. Queued inputs, actions, reconnect events,
+delegations, subagent relationships, and `.pi-handoff` delegation artifacts are
+not copied. Fork provenance is stored in
+`metadata.fork = { source_session_id }`; the child has no `parent_session_id`
+and uses the parent prompt/tool profile. The child inherits the source title,
+auto-title preference, and compaction policy, but starts without source
+archival/subagent state or compaction `auto_state`.
 
 The filesystem is independent from the source: the daemon snapshots the
 source session's **current idle managed cwd**, including current dirty and
 untracked files, into a new session cwd and gives copied Git workspaces child
-branches. Files are not reconstructed as of `leaf_id`, and no per-turn
-filesystem checkpoints are created. Ephemeral/unmanaged/shared session cwds
-are rejected rather than copying `$HOME` or another session's workspace. The
-daemon also rejects a managed session or cwd root that is a symlink or is not a
-directory immediately before cloning; symlinks inside a valid cwd are preserved.
+branches. No per-turn filesystem checkpoints are created. Ephemeral/unmanaged/
+shared session cwds are rejected rather than copying `$HOME` or another
+session's workspace. The daemon also rejects a managed session or cwd root that
+is a symlink or is not a directory immediately before cloning; symlinks inside
+a valid cwd are preserved.
 
 The response includes `session_id`, `source_session_id`, nullable
-`source_leaf_id`, `active_leaf_id`, revisions, and `last_event_id`. Busy
-sources fail with `session_busy`, stale fences with `history_changed`,
-non-boundaries with `not_turn_boundary`, unmanaged sources with
-`project_required` or `workspace_unmanaged`, and generated child workspace
-collisions are never overwritten. A running delegation also reports
-`session_busy`, because a full child can write the parent's cwd while the
-parent itself appears idle.
+`active_leaf_id`, revisions, and `last_event_id`. Malformed, mistyped, or
+unknown request fields fail with `invalid_params`. Busy sources fail with
+`session_busy`, a source whose active leaf is not a committed turn boundary
+with `not_turn_boundary`, unmanaged sources with `project_required` or
+`workspace_unmanaged`, and generated child workspace collisions are never
+overwritten. A running delegation also reports `session_busy`, because a full
+child can write the parent's cwd while the parent itself appears idle.
 
 The server generates each child id. A successful fork is not retry-idempotent:
 if delivery of the response is uncertain, retrying may create another child.

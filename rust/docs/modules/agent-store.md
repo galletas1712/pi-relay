@@ -369,9 +369,11 @@ To keep send/switch validation independent of transcript size:
 - `active_leaf_id(session_id)` — single-row read used to validate
   `expected_active_leaf_id` on idle follow-up submission.
 - `transcript_leaf_is_turn_boundary` / `active_leaf_is_turn_boundary` —
-  single-row boundary check for `history.switch` and `history.fork` (a null leaf
-  counts as a boundary). Both write transactions hold the source session row
-  lock while rejecting running delegations; delegation creation takes the same
+  single-row boundary check for `history.switch` (a null leaf counts as a
+  boundary). `history.switch` applies it to the requested target and
+  `history.fork` to the source's current active leaf, so a forked child never
+  starts mid-turn. Both write transactions hold the source session row lock
+  while rejecting running delegations; delegation creation takes the same
   parent row lock before its running-row check and insert. `switch_active_leaf`
   remains the low-level transactional primitive that still does membership /
   revision / branch-id validation.

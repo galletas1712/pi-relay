@@ -78,7 +78,6 @@ function ComposerDialogHarness() {
 			{open ? (
 				<HistoryTargetPickerDialog
 					targets={[]}
-					mode="switch"
 					loading={false}
 					submitting={false}
 					error={null}

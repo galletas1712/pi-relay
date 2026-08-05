@@ -218,24 +218,12 @@ describe("AgentApi MCP wire format", () => {
 });
 
 describe("AgentApi history fork wire format", () => {
-	it("uses switch-compatible target and revision fences", async () => {
+	it("duplicates the session with only its id", async () => {
 		const calls: RpcCall[] = [];
-		await createAgentApi(fakeClient(calls)).forkHistory({
-			sessionId: "source",
-			leafId: "finish",
-			expectedActiveLeafId: "active",
-			expectedTranscriptRevision: 7,
-			activeBranchEntryIds: ["start", "finish"],
-		});
+		await createAgentApi(fakeClient(calls)).forkHistory({ sessionId: "source" });
 		expect(calls).toEqual([{
 			method: "history.fork",
-			params: {
-				session_id: "source",
-				leaf_id: "finish",
-				expected_active_leaf_id: "active",
-				expected_transcript_revision: 7,
-				active_branch_entry_ids: ["start", "finish"],
-			},
+			params: { session_id: "source" },
 			options: { timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
 		}]);
 	});

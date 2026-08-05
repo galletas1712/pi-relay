@@ -33,7 +33,7 @@ fn history_targets_parser_is_strict_and_bounded() {
 }
 
 #[test]
-fn switch_and_fork_reject_malformed_shared_targets() {
+fn switch_rejects_malformed_shared_targets() {
     let malformed = [
         json!({ "session_id": "s1" }),
         json!({ "session_id": "s1", "leaf_id": 7 }),
@@ -78,12 +78,6 @@ fn switch_and_fork_reject_malformed_shared_targets() {
         assert_eq!(
             parse_history_target(&params, &["return_active_branch", "missing_body_ids"])
                 .expect_err("switch rejects malformed target")
-                .code,
-            "invalid_params"
-        );
-        assert_eq!(
-            parse_history_target(&params, &[])
-                .expect_err("fork rejects malformed target")
                 .code,
             "invalid_params"
         );

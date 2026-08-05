@@ -33,7 +33,6 @@ describe("server-projected history targets", () => {
 		render(
 			<HistoryTargetPickerDialog
 				targets={targets}
-				mode="switch"
 				loading={false}
 				submitting={false}
 				error={null}
@@ -67,7 +66,6 @@ describe("server-projected history targets", () => {
 		render(
 			<HistoryTargetPickerDialog
 				targets={historyTargetOptions(historyTargetsPage())}
-				mode="fork"
 				loading={false}
 				submitting
 				error={null}
@@ -78,14 +76,14 @@ describe("server-projected history targets", () => {
 			/>,
 		);
 
-		const dialog = screen.getByRole("dialog", { name: "Fork session" });
+		const dialog = screen.getByRole("dialog", { name: "Switch branch" });
 		expect((screen.getByRole("button", { name: "close picker" }) as HTMLButtonElement).disabled).toBe(true);
 		expect((screen.getAllByRole("button", {
-			name: /Fork from User message/,
+			name: /Switch to User message/,
 		})[0] as HTMLButtonElement).disabled).toBe(true);
 		fireEvent.keyDown(dialog, { key: "Escape" });
 		fireEvent.pointerDown(document.querySelector(".dialog-overlay")!);
-		expect(screen.getByRole("dialog", { name: "Fork session" })).toBeTruthy();
+		expect(screen.getByRole("dialog", { name: "Switch branch" })).toBeTruthy();
 		expect(onClose).not.toHaveBeenCalled();
 		expect(onSelect).not.toHaveBeenCalled();
 	});

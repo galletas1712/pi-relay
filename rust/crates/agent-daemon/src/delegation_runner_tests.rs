@@ -196,7 +196,7 @@ async fn history_switch_and_fork_rpc_reject_running_delegation_identically() {
     let fork_error = public_rpc(
         &env.state,
         "history.fork",
-        json!({ "session_id": "parent", "leaf_id": null }),
+        json!({ "session_id": "parent" }),
     )
     .await
     .expect_err("running delegation blocks fork");

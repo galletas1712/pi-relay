@@ -84,42 +84,34 @@ async fn create_fork_copies_full_forest_and_replay_without_mutating_source() {
         )
         .await
         .expect("source forest persists");
+    // The source's current active leaf is what the child must duplicate.
+    store
+        .switch_active_leaf(SwitchActiveLeafRequest {
+            session_id: source_session_id,
+            target: HistoryTarget {
+                leaf_id: Some("compaction"),
+                source_entry_id: None,
+                expected_active_leaf_id: None,
+                expected_transcript_revision: None,
+                expected_active_branch_entry_ids: None,
+            },
+            return_active_branch: false,
+            missing_body_ids: None,
+        })
+        .await
+        .expect("source switches to its current leaf");
     let source_before = store
         .load_stored_session(source_session_id)
         .await
         .expect("source loads");
-    let revision = store
-        .session_snapshot(source_session_id)
-        .await
-        .expect("source snapshot loads")
-        .transcript_revision;
     child_config.workspace_id = "/tmp/fork-child".to_string();
-    child_config.metadata = json!({
-        "fork": {
-            "source_session_id": source_session_id,
-            "source_leaf_id": "compaction",
-        }
-    });
-    let target_branch_ids = vec![
-        "start".to_string(),
-        "user".to_string(),
-        "assistant".to_string(),
-        "first-finish".to_string(),
-        "compaction".to_string(),
-    ];
+    child_config.metadata = json!({ "fork": { "source_session_id": source_session_id } });
 
     let result = store
         .create_fork(CreateForkRequest {
             source_session_id,
             child_session_id: "fork-child",
             config: &child_config,
-            target: HistoryTarget {
-                leaf_id: Some("compaction"),
-                source_entry_id: None,
-                expected_active_leaf_id: Some(Some("sibling-finish")),
-                expected_transcript_revision: Some(revision),
-                expected_active_branch_entry_ids: Some(&target_branch_ids),
-            },
         })
         .await
         .expect("fork creates");
@@ -133,10 +125,9 @@ async fn create_fork_copies_full_forest_and_replay_without_mutating_source() {
         .await
         .expect("child loads");
     assert_eq!(source_after, source_before);
-    assert_eq!(child.active_leaf_id.as_deref(), Some("compaction"));
+    assert_eq!(child.active_leaf_id, source_before.active_leaf_id);
     assert_eq!(child.entries, source_before.entries);
     assert_eq!(result.active_leaf_id, child.active_leaf_id);
-    assert_eq!(result.source_leaf_id, child.active_leaf_id);
     assert_eq!(
         result.events[0].data["provider"],
         serde_json::to_value(&child_config.provider).expect("provider serializes")
@@ -337,14 +328,12 @@ async fn fork(
     source_session_id: &str,
     child_session_id: &str,
     config: &SessionConfig,
-    target: HistoryTarget<'_>,
 ) -> anyhow::Result<()> {
     store
         .create_fork(CreateForkRequest {
             source_session_id,
             child_session_id,
             config,
-            target,
         })
         .await
         .map(|_| ())
@@ -497,7 +486,7 @@ async fn long_history_target_ancestry_remains_valid() {
         )
         .await
         .expect("project creates");
-    let config = create_session(store, project_id, "long-source", false).await;
+    create_session(store, project_id, "long-source", false).await;
     sqlx::query(
         r#"
         insert into transcript_entries (
@@ -571,9 +560,6 @@ async fn long_history_target_ancestry_remains_valid() {
     switch(store, "long-source", target)
         .await
         .expect("long ancestry switches to root");
-    fork(store, "long-source", "long-child", &config, target)
-        .await
-        .expect("long ancestry forks from root");
 
     db.cleanup().await;
 }
@@ -664,7 +650,7 @@ async fn cyclic_history_target_ancestry_is_rejected() {
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
-async fn switch_and_fork_share_history_target_validation() {
+async fn switch_validates_history_targets_and_both_operations_require_an_idle_source() {
     let Some(db) = test_store().await else {
         eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -682,7 +668,7 @@ async fn switch_and_fork_share_history_target_validation() {
         .await
         .expect("project creates");
 
-    let root_config = create_session(store, project_id, "root-source", false).await;
+    create_session(store, project_id, "root-source", false).await;
     let root_revision = store
         .session_snapshot("root-source")
         .await
@@ -695,20 +681,11 @@ async fn switch_and_fork_share_history_target_validation() {
         expected_transcript_revision: Some(root_revision),
         expected_active_branch_entry_ids: Some(&[]),
     };
-    fork(
-        store,
-        "root-source",
-        "root-child",
-        &root_config,
-        root_target,
-    )
-    .await
-    .expect("root fork succeeds");
     switch(store, "root-source", root_target)
         .await
         .expect("root switch succeeds");
 
-    let boundary_config = create_session(store, project_id, "boundary-source", true).await;
+    create_session(store, project_id, "boundary-source", true).await;
     store
         .persist_outputs(
             "boundary-source",
@@ -756,15 +733,6 @@ async fn switch_and_fork_share_history_target_validation() {
         expected_transcript_revision: Some(snapshot.transcript_revision),
         expected_active_branch_entry_ids: Some(&branch_ids),
     };
-    fork(
-        store,
-        "boundary-source",
-        "boundary-child",
-        &boundary_config,
-        boundary_target,
-    )
-    .await
-    .expect("boundary fork succeeds");
     switch(store, "boundary-source", boundary_target)
         .await
         .expect("boundary switch succeeds");
@@ -851,21 +819,9 @@ async fn switch_and_fork_share_history_target_validation() {
         let switch_error = switch(store, "boundary-source", target)
             .await
             .expect_err("switch rejects invalid target");
-        let fork_error = fork(
-            store,
-            "boundary-source",
-            &format!("{label}-child"),
-            &boundary_config,
-            target,
-        )
-        .await
-        .expect_err("fork rejects invalid target");
         match expected_kind {
             "active" => {
                 assert!(switch_error
-                    .downcast_ref::<crate::ExpectedActiveLeafMismatch>()
-                    .is_some());
-                assert!(fork_error
                     .downcast_ref::<crate::ExpectedActiveLeafMismatch>()
                     .is_some());
             }
@@ -873,15 +829,11 @@ async fn switch_and_fork_share_history_target_validation() {
                 assert!(switch_error
                     .downcast_ref::<HistoryTargetNotTurnBoundary>()
                     .is_some());
-                assert!(fork_error
-                    .downcast_ref::<HistoryTargetNotTurnBoundary>()
-                    .is_some());
             }
             "history" => {
                 assert!(switch_error.downcast_ref::<HistoryChanged>().is_some());
-                assert!(fork_error.downcast_ref::<HistoryChanged>().is_some());
             }
-            other => panic!("unexpected expected kind: {other}"),
+            other => panic!("unexpected expected kind: {other} for {label}"),
         }
     }
 
@@ -906,15 +858,9 @@ async fn switch_and_fork_share_history_target_validation() {
     let switch_error = switch(store, "busy-source", busy_target)
         .await
         .expect_err("active work blocks switch");
-    let fork_error = fork(
-        store,
-        "busy-source",
-        "busy-child",
-        &busy_config,
-        busy_target,
-    )
-    .await
-    .expect_err("active work blocks fork");
+    let fork_error = fork(store, "busy-source", "busy-child", &busy_config)
+        .await
+        .expect_err("active work blocks fork");
     assert!(switch_error
         .downcast_ref::<SourceMutationConflict>()
         .is_some());
@@ -950,7 +896,6 @@ async fn switch_and_fork_share_history_target_validation() {
         "delegation-source",
         "delegation-child",
         &delegation_config,
-        delegation_target,
     )
     .await
     .expect_err("running delegation blocks fork");
@@ -960,6 +905,65 @@ async fn switch_and_fork_share_history_target_validation() {
     assert!(fork_error
         .downcast_ref::<SourceMutationConflict>()
         .is_some());
+
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn create_fork_rejects_a_source_whose_active_leaf_is_mid_turn() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "fork boundary test",
+            "runtime-test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let config = create_session(store, project_id, "mid-turn-source", false).await;
+    store
+        .persist_outputs(
+            "mid-turn-source",
+            OutputBatch::new(
+                &[
+                    entry(
+                        "start",
+                        None,
+                        TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                    ),
+                    entry(
+                        "user",
+                        Some("start"),
+                        TranscriptItem::UserMessage(UserMessage::text("hello")),
+                    ),
+                ],
+                Some("user"),
+                &[],
+                &[],
+            ),
+        )
+        .await
+        .expect("open turn persists");
+
+    let error = fork(store, "mid-turn-source", "mid-turn-child", &config)
+        .await
+        .expect_err("a mid-turn source cannot be duplicated");
+
+    assert!(error
+        .downcast_ref::<HistoryTargetNotTurnBoundary>()
+        .is_some());
+    assert!(!store
+        .session_exists("mid-turn-child")
+        .await
+        .expect("child existence reads"));
 
     db.cleanup().await;
 }

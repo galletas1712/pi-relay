@@ -912,14 +912,12 @@ pub struct CreateForkRequest<'a> {
     pub source_session_id: &'a str,
     pub child_session_id: &'a str,
     pub config: &'a SessionConfig,
-    pub target: HistoryTarget<'a>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ForkSessionResult {
     pub session_id: String,
     pub source_session_id: String,
-    pub source_leaf_id: Option<String>,
     pub active_leaf_id: Option<String>,
     pub session_revision: i64,
     pub queue_revision: i64,

@@ -170,9 +170,8 @@ bounded `transcript.turns` tail page.
 | Expand a turn | `transcript.turn_detail` | one card's entries, by card id + leaf/sequence bounds |
 | Foreground/focus reconcile | `session.sync_active_branch` | suffix-only sync from the cached base leaf |
 | `/switch` picker | `history.targets` pages | newest editable user-message targets first |
-| `/fork` picker | `history.targets` pages | same targets as switch; managed projects only |
 | Switch target | `history.switch` | revision-fenced; returns branch ids + sparse missing bodies |
-| Fork target | `history.fork` | revision-fenced; clones the current idle workspace |
+| `/fork` | `history.fork` | duplicates the session at its current state; clones the current idle workspace |
 | Restore user message | `transcript.entries` | full body for the picked message, only if missing locally |
 
 `session.sync_active_branch` returns `unchanged` / `extended` / `branch_changed`. The cache merges overview metadata on
@@ -568,18 +567,20 @@ Enter on an exact command submits.
 | Command | Action |
 | --- | --- |
 | `/switch` | Opens the same-session history picker (idle only). User-message targets restore the full original message into the composer; turn/compaction targets just become the active leaf. |
-| `/fork` | Opens the same picker for a managed project session (idle only). It clones the current workspace—not historical files—into an independent top-level child. A user-message target becomes the new child's composer draft. |
+| `/fork` | Duplicates a managed project session at its current state (idle only), with no picker. It clones the current workspace—not historical files—into an independent top-level child opened at the source's current active leaf; run `/switch` in the child to move elsewhere in history. |
 | `/mcp` | Opens the additive MCP tool picker for a fully loaded, idle, delegation-quiet top-level session. |
 | `/compact` | Requests context compaction (`compaction.request`). |
 | `/export` | Exports the current branch's assistant/user messages, fetching active-branch bodies for the export view. |
 
-Switch and fork never accept raw transcript ids from the web UI; the picker is
-the only path. Both use the same target mapping and show a loading state until
-the compact tree is complete (or a fresh complete tree is cached). Their RPCs
-revalidate the expected leaf, transcript revision, and exact target branch
-server-side; either picker refreshes if history changed underneath. `/fork`
-rejects host sessions before opening the picker because only daemon-managed
-project workspaces are safe to clone.
+Switch never accepts raw transcript ids from the web UI; the picker is the only
+path, and it shows a loading state until the compact tree is complete (or a
+fresh complete tree is cached). `history.switch` revalidates the expected leaf,
+transcript revision, and exact target branch server-side, and the picker
+refreshes if history changed underneath. `/fork` rejects host sessions because
+only daemon-managed project workspaces are safe to clone. Cloning a workspace
+can take minutes, so a completed fork always refreshes the project session list
+but only navigates to the child if the user is still on the session they forked
+from.
 
 ## Model and reasoning controls
 
@@ -632,7 +633,7 @@ records are added to the database and there is no model-picker RPC.
 - Every cache reducer is keyed by `session_id` and no-ops on mismatch; stale async responses for a deselected session are
   safely ignored.
 - Compact topology from events is conservative: an event `tree_node` extends the tree only when it is already complete.
-  The `/switch` and `/fork` pickers use daemon-projected `history.targets` rows so they do not re-derive Rust
+  The `/switch` picker uses daemon-projected `history.targets` rows so it does not re-derive Rust
   turn-boundary logic in TypeScript.
 - The selected cache is tab-lifetime only; there is no IndexedDB or persistent transcript cache.
 - `/switch` previews and compact `display_hint` text may be truncated; mutation/restore content always comes from full

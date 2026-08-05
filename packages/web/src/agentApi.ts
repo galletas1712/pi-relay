@@ -409,12 +409,13 @@ export interface SwitchHistoryParams extends HistoryTargetParams {
 	missingBodyIds?: string[];
 }
 
-export type ForkHistoryParams = HistoryTargetParams;
+export interface ForkHistoryParams {
+	sessionId: string;
+}
 
 export interface ForkHistoryResult {
 	session_id: string;
 	source_session_id: string;
-	source_leaf_id: string | null;
 	active_leaf_id: string | null;
 	session_revision: number;
 	queue_revision: number;
@@ -776,7 +777,7 @@ class AgentApiClient implements AgentApi {
 	forkHistory(params: ForkHistoryParams): Promise<ForkHistoryResult> {
 		return this.client.request<ForkHistoryResult>(
 			"history.fork",
-			historyTargetPayload(params),
+			{ session_id: params.sessionId },
 			{ timeoutMs: WORKSPACE_OPERATION_REQUEST_TIMEOUT_MS },
 		);
 	}

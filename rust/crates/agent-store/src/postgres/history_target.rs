@@ -37,22 +37,7 @@ pub(super) async fn validate_history_target_tx(
         None | Some(_) => {}
     }
     if let Some(leaf_id) = target.leaf_id {
-        let item: Option<serde_json::Value> = sqlx::query_scalar(
-            "select item from transcript_entries where session_id=$1 and id=$2::text",
-        )
-        .bind(session_id)
-        .bind(leaf_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        let Some(item) = item else {
-            return Err(crate::HistoryTargetNotTurnBoundary.into());
-        };
-        if !matches!(
-            serde_json::from_value(item)?,
-            TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_)
-        ) {
-            return Err(crate::HistoryTargetNotTurnBoundary.into());
-        }
+        ensure_leaf_is_turn_boundary_tx(tx, session_id, Some(leaf_id)).await?;
     }
     if let Some(source_entry_id) = target.source_entry_id {
         let resolved = history_target_context_for_user_tx(tx, session_id, source_entry_id).await?;
@@ -65,6 +50,35 @@ pub(super) async fn validate_history_target_tx(
         if expected_ids != target_ids {
             return Err(crate::HistoryChanged.into());
         }
+    }
+    Ok(())
+}
+
+/// Rejects a leaf that is not a committed turn boundary. A null leaf is the
+/// session root, which always counts as a boundary.
+pub(super) async fn ensure_leaf_is_turn_boundary_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    leaf_id: Option<&str>,
+) -> Result<()> {
+    let Some(leaf_id) = leaf_id else {
+        return Ok(());
+    };
+    let item: Option<serde_json::Value> = sqlx::query_scalar(
+        "select item from transcript_entries where session_id=$1 and id=$2::text",
+    )
+    .bind(session_id)
+    .bind(leaf_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(item) = item else {
+        return Err(crate::HistoryTargetNotTurnBoundary.into());
+    };
+    if !matches!(
+        serde_json::from_value(item)?,
+        TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_)
+    ) {
+        return Err(crate::HistoryTargetNotTurnBoundary.into());
     }
     Ok(())
 }

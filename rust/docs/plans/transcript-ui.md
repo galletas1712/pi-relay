@@ -87,7 +87,7 @@ virtualization):
 
 ### 3. Newest-first `/switch` targets
 
-What exists: `/switch` and `/fork` page daemon-projected user-message targets via
+What exists: `/switch` pages daemon-projected user-message targets via
 `history.targets` newest first. Each target includes its safe preceding boundary,
 and restore text comes from the full entry body rather than the truncated preview.
 

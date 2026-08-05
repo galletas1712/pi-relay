@@ -11,7 +11,7 @@ export interface ParsedSlash {
 
 export const COMMANDS: SlashCommandInfo[] = [
 	{ name: "help", description: "Show slash commands." },
-	{ name: "fork", description: "Fork this session at a historical boundary." },
+	{ name: "fork", description: "Duplicate this session at its current state." },
 	{ name: "switch", description: "Switch branches or edit a historical message." },
 	{ name: "mcp", description: "Add MCP tools to this idle session." },
 	{ name: "compact", description: "Request context compaction." },
