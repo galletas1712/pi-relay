@@ -268,7 +268,6 @@ type ExportDialogState = {
 type HistoryDialogState = {
 	generation: number;
 	sessionId: string;
-	mode: "fork" | "switch";
 	targets: HistoryTargetOption[];
 	nextBeforeSequence: number | null;
 	hasMore: boolean;
@@ -3526,7 +3525,7 @@ export function App({
 	);
 
 	const refreshStaleHistoryTargets = useCallback(
-		async (sessionId: string, mode: "fork" | "switch", generation: number): Promise<never> => {
+		async (sessionId: string, generation: number): Promise<never> => {
 			const page = await api.getHistoryTargets(sessionId);
 			setHistoryDialog((current) => current?.generation === generation ? {
 				...current,
@@ -3540,7 +3539,7 @@ export function App({
 			if (historySubmittingGenerationRef.current === generation) {
 				historySubmittingGenerationRef.current = null;
 			}
-			throw new Error(`history changed; refreshed the ${mode} list, please choose again`);
+			throw new Error("history changed; refreshed the switch list, please choose again");
 		},
 		[api],
 	);
@@ -3551,14 +3550,13 @@ export function App({
 			snapshot: SessionSnapshot,
 			targetCache: SelectedSessionCache,
 			target: HistoryTargetOption,
-			mode: "fork" | "switch",
 		) => {
 			assertServerMutationAllowed();
 			if (targetCache.sessionId !== sessionId || targetCache.snapshot?.session_id !== sessionId) {
 				throw new IntermediateUiStateError("session is still loading");
 			}
 			if (snapshot.activity !== "idle") {
-				throw new Error(`stop the active turn before ${mode === "fork" ? "forking" : "switching"} history`);
+				throw new Error("stop the active turn before switching history");
 			}
 			const restoreText = await restoreTextForTarget(
 				api,
@@ -3592,13 +3590,7 @@ export function App({
 			target: HistoryTargetOption,
 			dialogGeneration: number,
 		) => {
-			const prepared = await prepareHistoryTarget(
-				sessionId,
-				snapshot,
-				targetCache,
-				target,
-				"switch",
-			);
+			const prepared = await prepareHistoryTarget(sessionId, snapshot, targetCache, target);
 			let result;
 			try {
 				result = await api.switchHistory({
@@ -3607,7 +3599,7 @@ export function App({
 				});
 			} catch (error) {
 				if (isHistoryChangedError(error)) {
-					await refreshStaleHistoryTargets(sessionId, "switch", dialogGeneration);
+					await refreshStaleHistoryTargets(sessionId, dialogGeneration);
 				}
 				throw error;
 			}
@@ -3662,53 +3654,40 @@ export function App({
 		],
 	);
 
-	const forkFromTarget = useCallback(
-		async (
-			sessionId: string,
-			projectId: string | null,
-			snapshot: SessionSnapshot,
-			targetCache: SelectedSessionCache,
-			target: HistoryTargetOption,
-			dialogGeneration: number,
-		) => {
-			const prepared = await prepareHistoryTarget(
-				sessionId,
-				snapshot,
-				targetCache,
-				target,
-				"fork",
-			);
-			let result;
-			try {
-				result = await api.forkHistory(prepared.request);
-			} catch (error) {
-				if (isHistoryChangedError(error)) {
-					await refreshStaleHistoryTargets(sessionId, "fork", dialogGeneration);
-				}
-				throw error;
+	const forkSession = useCallback(
+		async (snapshot: SessionSnapshot) => {
+			assertServerMutationAllowed();
+			const sessionId = snapshot.session_id;
+			const targetCache = getSelectedCache(sessionId);
+			if (!targetCache || targetCache.snapshot?.session_id !== sessionId) {
+				throw new IntermediateUiStateError("session is still loading");
 			}
-			if (prepared.restoreText !== null) {
-				composerHandleRef.current?.setSessionDraft(
-					result.session_id,
-					prepared.restoreText,
-				);
+			if (snapshot.activity !== "idle") {
+				throw new Error("stop the active turn before forking");
 			}
+			if (hasRunningDelegations) {
+				throw new Error("wait for running delegations to finish before forking");
+			}
+			const projectId = snapshot.project_id;
+			if (projectId === null) {
+				throw new Error("/fork requires a managed project session");
+			}
+			const result = await api.forkHistory({ sessionId });
 			invalidateSessionList(projectId);
-			setHistoryDialog((current) => current?.generation === dialogGeneration ? null : current);
-			if (historySubmittingGenerationRef.current === dialogGeneration) {
-				historySubmittingGenerationRef.current = null;
-			}
+			// Cloning a workspace is slow; only follow the child if the user is
+			// still on the session they forked from.
 			if (selectedRef.current !== sessionId) return;
 			dropSelectedCache(result.session_id);
 			openRootConversation(projectId, result.session_id);
 		},
 		[
 			api,
+			assertServerMutationAllowed,
 			dropSelectedCache,
+			getSelectedCache,
+			hasRunningDelegations,
 			invalidateSessionList,
 			openRootConversation,
-			prepareHistoryTarget,
-			refreshStaleHistoryTargets,
 		],
 	);
 
@@ -3734,8 +3713,7 @@ export function App({
 			setHistoryDialog((current) => current?.generation === dialog.generation
 				? { ...current, submitting: true, error: null }
 				: current);
-			const operation = dialog.mode === "fork" ? forkFromTarget : switchToTarget;
-			void operation(sessionId, projectId, snapshot, targetCache, target, dialog.generation)
+			void switchToTarget(sessionId, projectId, snapshot, targetCache, target, dialog.generation)
 				.catch((error) => {
 					if (historySubmittingGenerationRef.current === dialog.generation) {
 						historySubmittingGenerationRef.current = null;
@@ -3746,7 +3724,7 @@ export function App({
 					reportActionError(error);
 				});
 		},
-		[assertServerMutationAllowed, forkFromTarget, getSelectedCache, historyDialog, pushErrorNotice, reportActionError, switchToTarget],
+		[assertServerMutationAllowed, getSelectedCache, historyDialog, pushErrorNotice, reportActionError, switchToTarget],
 	);
 
 	const loadOlderHistoryTargets = useCallback(() => {
@@ -3895,10 +3873,10 @@ export function App({
 	);
 
 	const openHistoryDialog = useCallback(
-		(snapshot: SessionSnapshot, mode: "fork" | "switch") => {
+		(snapshot: SessionSnapshot) => {
 			if (historySubmittingGenerationRef.current !== null) return;
 			if (snapshot.activity !== "idle") {
-				throw new Error(`stop the active turn before ${mode === "fork" ? "forking" : "switching"} history`);
+				throw new Error("stop the active turn before switching history");
 			}
 			if (hasRunningDelegations) {
 				throw new Error("wait for running delegations to finish before changing history");
@@ -3908,7 +3886,6 @@ export function App({
 			setHistoryDialog({
 				generation,
 				sessionId,
-				mode,
 				targets: [],
 				nextBeforeSequence: null,
 				hasMore: false,
@@ -3984,12 +3961,13 @@ export function App({
 				throw new IntermediateUiStateError("session is still loading");
 			}
 			const sessionId = submittedSessionId;
-			if (name === "switch" || name === "fork") {
-				if (name === "fork" && submittedSnapshot.project_id === null) {
-					throw new Error("/fork requires a managed project session");
-				}
+			if (name === "switch") {
 				assertConnectionReadAllowed();
-				openHistoryDialog(submittedSnapshot, name);
+				openHistoryDialog(submittedSnapshot);
+				return;
+			}
+			if (name === "fork") {
+				await forkSession(submittedSnapshot);
 				return;
 			}
 			if (name === "mcp") {
@@ -4026,7 +4004,7 @@ export function App({
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[api, assertConnectionReadAllowed, assertServerMutationAllowed, assertServerReadAllowed, commitSelectedSnapshot, openHistoryDialog, openMcpAddDialog],
+		[api, assertConnectionReadAllowed, assertServerMutationAllowed, assertServerReadAllowed, commitSelectedSnapshot, forkSession, openHistoryDialog, openMcpAddDialog],
 	);
 
 	const submitComposer = useCallback(
@@ -5334,7 +5312,6 @@ export function App({
 			{historyDialog ? (
 				<HistoryTargetPickerDialog
 					targets={historyDialog.targets}
-					mode={historyDialog.mode}
 					loading={historyDialog.loading}
 					submitting={historyDialog.submitting}
 					error={historyDialog.error}

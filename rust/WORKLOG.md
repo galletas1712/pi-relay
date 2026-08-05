@@ -1,5 +1,39 @@
 # Rust Rewrite Worklog
 
+## 2026-08-05
+
+### `/fork` Duplicates The Session, `/switch` Moves It (breaking)
+
+- `history.fork` no longer takes a history target. Its request is now just
+  `{ session_id }` and the child starts at the source's current active leaf,
+  read under the source row lock in the same transaction. The response drops
+  `source_leaf_id`, which was always equal to `active_leaf_id`, and
+  `metadata.fork` is now `{ source_session_id }`.
+- `create_fork` already copied the source's *complete* transcript forest, so
+  the picker only ever chose the child's initial leaf. "Duplicate, then
+  `/switch` in the child" expresses the same thing with far less machinery: the
+  fork picker, its stale-target refresh, the fork composer-draft restoration,
+  and `ComposerHandle.setSessionDraft` are all gone. The history picker is now
+  switch-only.
+- Fork keeps every safety property it had: idle source, no running delegation,
+  managed project requirement, MCP manifest fingerprint check, workspace
+  snapshot with child cleanup on failure, and `not_turn_boundary` when the
+  source's active leaf is mid-turn. That last check moved from
+  `validate_history_target_tx` into `create_fork`, where it now asserts on the
+  source's own active leaf: `ensure_idle_without_recovery` can pass while a
+  persisted open turn survives (an already-active session skips recovery), and
+  duplicating that tail would leave the child ready to drive a model turn on
+  first touch.
+- Because a fork clones a workspace, its RPC can take minutes; the web UI
+  invalidates the session list unconditionally but only navigates to the child
+  when the user is still on the session they forked from.
+- No schema migration is needed. Pre-existing rows may still carry a stale
+  `metadata.fork.source_leaf_id`; nothing reads it any more.
+- Validated with `cargo fmt --check`, `cargo check --all`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --all`
+  (Postgres-backed `#[ignore]`d tests against a throwaway PG16), plus the web
+  test suite and production build.
+
 ## 2026-07-29
 
 ### Runtime Online Redrives Stuck Queued Inputs

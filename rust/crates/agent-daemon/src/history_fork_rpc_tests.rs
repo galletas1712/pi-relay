@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn fork_params_require_only_a_session_id() {
+    assert_eq!(
+        crate::codec::from_params::<crate::history_fork::ForkParams>(json!({ "session_id": "s1" }))
+            .expect("valid fork params")
+            .session_id,
+        "s1"
+    );
+
+    for malformed in [
+        json!({}),
+        json!({ "session_id": 7 }),
+        json!({ "session_id": "s1", "unexpected": true }),
+    ] {
+        assert_eq!(
+            crate::codec::from_params::<crate::history_fork::ForkParams>(malformed)
+                .expect_err("malformed fork params must fail")
+                .code,
+            "invalid_params"
+        );
+    }
+}
+
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
 #[tokio::test]
 async fn creates_top_level_root_child_and_publishes_complete_provenance() {
@@ -113,24 +136,12 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
         )
         .await
         .expect("create source session");
-    let revision = env
-        .state
-        .repo
-        .session_snapshot("fork-rpc-source")
-        .await
-        .expect("source snapshot")
-        .transcript_revision;
     let mut events = env.state.events.subscribe();
 
     let result = public_rpc(
         &env.state,
         "history.fork",
-        json!({
-            "session_id": "fork-rpc-source",
-            "leaf_id": null,
-            "expected_active_leaf_id": "fork-rpc-finish",
-            "expected_transcript_revision": revision,
-        }),
+        json!({ "session_id": "fork-rpc-source" }),
     )
     .await
     .expect("fork RPC succeeds");
@@ -138,7 +149,8 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
     assert!(child_session_id.starts_with("session_"));
     assert_ne!(child_session_id, "fork-rpc-source");
     assert_eq!(result["source_session_id"], "fork-rpc-source");
-    assert_eq!(result["source_leaf_id"], serde_json::Value::Null);
+    // The child duplicates the source at its current active leaf.
+    assert_eq!(result["active_leaf_id"], "fork-rpc-finish");
     let created = events.recv().await.expect("published session.created");
     assert_eq!(created.event, EventType::SessionCreated);
     assert_eq!(created.session_id, child_session_id);
@@ -148,9 +160,8 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
             "session_id": child_session_id,
             "project_id": project_id,
             "provider": config.provider,
-            "active_leaf_id": null,
+            "active_leaf_id": "fork-rpc-finish",
             "source_session_id": "fork-rpc-source",
-            "source_leaf_id": null,
             "session_revision": result["session_revision"],
             "queue_revision": result["queue_revision"],
             "transcript_revision": result["transcript_revision"],
@@ -166,17 +177,14 @@ async fn creates_top_level_root_child_and_publishes_complete_provenance() {
     .expect("cold child load succeeds");
     assert_eq!(child["project_id"], json!(project_id));
     assert_eq!(child["provider"], json!(config.provider));
-    assert_eq!(child["active_leaf_id"], serde_json::Value::Null);
+    assert_eq!(child["active_leaf_id"], "fork-rpc-finish");
     assert_eq!(child["parent_session_id"], serde_json::Value::Null);
     assert_eq!(child["metadata"]["title"], "source");
     assert_eq!(child["metadata"]["auto_title_disabled"], true);
     assert_eq!(child["metadata"]["prompt_profile"], "parent");
     assert_eq!(
         child["metadata"]["fork"],
-        json!({
-            "source_session_id": "fork-rpc-source",
-            "source_leaf_id": null,
-        })
+        json!({ "source_session_id": "fork-rpc-source" })
     );
     assert_eq!(
         child["metadata"]["compaction"]["config"],

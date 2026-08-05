@@ -222,21 +222,21 @@ describe("App workspace route identity integration", () => {
 		const user = userEvent.setup();
 
 		await open(api);
-		await user.type(await screen.findByRole("textbox"), "/fork");
+		await user.type(await screen.findByRole("textbox"), "/switch");
 		await user.click(screen.getByRole("button", { name: "send message" }));
 		await user.click(await screen.findByRole("button", { name: "close picker" }));
-		await user.type(screen.getByRole("textbox"), "/fork");
+		await user.type(screen.getByRole("textbox"), "/switch");
 		await user.click(screen.getByRole("button", { name: "send message" }));
-		expect(await screen.findByRole("button", { name: /Fork from User message: fresh prompt/ })).toBeTruthy();
+		expect(await screen.findByRole("button", { name: /Switch to User message: fresh prompt/ })).toBeTruthy();
 
 		await act(async () => stale.resolve(historyTargetsPage("stale-user", "stale prompt")));
 		expect(screen.queryByRole("button", { name: /stale prompt/ })).toBeNull();
-		expect(screen.getByRole("button", { name: /Fork from User message: fresh prompt/ })).toBeTruthy();
+		expect(screen.getByRole("button", { name: /Switch to User message: fresh prompt/ })).toBeTruthy();
 
 		await mounted.dispose();
 	});
 
-	it("ignores an older page after reopening the same session in another mode", async () => {
+	it("ignores an older page after reopening the picker for the same session", async () => {
 		const api = createRouteApi({
 			historySessionIds: new Set(["project-root-1"]),
 			runningRootDelegation: false,
@@ -252,7 +252,7 @@ describe("App workspace route identity integration", () => {
 		const user = userEvent.setup();
 
 		await open(api);
-		await user.type(await screen.findByRole("textbox"), "/fork");
+		await user.type(await screen.findByRole("textbox"), "/switch");
 		await user.click(screen.getByRole("button", { name: "send message" }));
 		await user.click(await screen.findByRole("button", { name: "Load older messages" }));
 		await user.click(screen.getByRole("button", { name: "close picker" }));
@@ -267,7 +267,7 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
-	it("forks from the current picker target and cold-loads the independent child", async () => {
+	it("duplicates the session immediately and cold-loads the independent child", async () => {
 		const browser = new FakeWorkspaceBrowser(
 			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
 		);
@@ -275,46 +275,106 @@ describe("App workspace route identity integration", () => {
 			historySessionIds: new Set(["project-root-1"]),
 			runningRootDelegation: false,
 		});
-		api.forkHistory.mockResolvedValue({
-			session_id: "fork-child",
-			source_session_id: "project-root-1",
-			source_leaf_id: "entry-active",
-			active_leaf_id: "entry-active",
-			session_revision: 1,
-			queue_revision: 0,
-			transcript_revision: 1,
-			last_event_id: 1,
-		});
+		api.forkHistory.mockResolvedValue(forkResult("project-root-1"));
 		const mounted = renderRouteApp(api, browser);
 		const user = userEvent.setup();
 
 		await open(api);
+		// Visit the child id first so the fork has a stale cache to drop.
+		await act(async () =>
+			browser.navigate("/w/project/project-1/run/fork-child/conversation/fork-child"),
+		);
+		await waitFor(() =>
+			expect(api.getTranscriptTurns.mock.calls.filter(([sessionId]) => sessionId === "fork-child"))
+				.toHaveLength(1),
+		);
+		await act(async () =>
+			browser.navigate(
+				"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+			),
+		);
 		const composer = await screen.findByRole<HTMLTextAreaElement>("textbox");
 		await user.type(composer, "/fork");
+		const sessionListsBefore = api.listSessions.mock.calls.length;
 		await user.click(screen.getByRole("button", { name: "send message" }));
-		expect(await screen.findByRole("heading", { name: "Fork session" })).toBeTruthy();
-		await user.click(screen.getByRole("button", { name: /Fork from User message/ }));
 
 		await waitFor(() => expect(api.forkHistory).toHaveBeenCalledTimes(1));
-		expect(api.forkHistory.mock.calls[0][0]).toMatchObject({
-			sessionId: "project-root-1",
-			leafId: null,
-			sourceEntryId: "entry-user",
-			expectedActiveLeafId: "entry-active",
-			expectedTranscriptRevision: 1,
-		});
+		expect(api.forkHistory.mock.calls[0][0]).toEqual({ sessionId: "project-root-1" });
+		expect(screen.queryByRole("dialog")).toBeNull();
 		await waitFor(() =>
 			expect(browser.currentUrl).toBe(
 				"/w/project/project-1/run/fork-child/conversation/fork-child",
 			));
+		// The dropped cache forces a cold reload of the child rather than replaying
+		// the transcript captured before the fork existed.
 		await waitFor(() =>
-			expect(api.getSession.mock.calls.some(([sessionId]) => sessionId === "fork-child")).toBe(true),
+			expect(api.getTranscriptTurns.mock.calls.filter(([sessionId]) => sessionId === "fork-child"))
+				.toHaveLength(2),
+		);
+		await waitFor(() =>
+			expect(api.listSessions.mock.calls.length).toBeGreaterThan(sessionListsBefore),
+		);
+		expect(api.listSessions.mock.calls.some(([, projectId]) => projectId === "project-1")).toBe(true);
+
+		await mounted.dispose();
+	});
+
+	it("keeps the user where they navigated when a slow fork response lands late", async () => {
+		const fork = deferred<ReturnType<typeof forkResult>>();
+		const browser = new FakeWorkspaceBrowser(
+			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+		);
+		const api = createRouteApi({
+			historySessionIds: new Set(["project-root-1"]),
+			runningRootDelegation: false,
+		});
+		api.forkHistory.mockImplementation(() => fork.promise);
+		const mounted = renderRouteApp(api, browser);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.type(await screen.findByRole("textbox"), "/fork");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+		await waitFor(() => expect(api.forkHistory).toHaveBeenCalledTimes(1));
+
+		await act(async () =>
+			browser.popstate(
+				"/w/project/project-1/run/project-root-1/conversation/project-child-1",
+			),
+		);
+		await act(async () => fork.resolve(forkResult("project-root-1")));
+		expect(browser.currentUrl).toBe(
+			"/w/project/project-1/run/project-root-1/conversation/project-child-1",
 		);
 
 		await mounted.dispose();
 	});
 
-	it("rejects /fork before opening the picker for an unmanaged host session", async () => {
+	it("rejects /fork while the session is running", async () => {
+		const api = createRouteApi({
+			historySessionIds: new Set(["project-root-1"]),
+			runningRootDelegation: false,
+			activities: new Map([["project-root-1", "running" as const]]),
+		});
+		const mounted = renderRouteApp(
+			api,
+			new FakeWorkspaceBrowser(
+				"/w/project/project-1/run/project-root-1/conversation/project-root-1",
+			),
+		);
+		const user = userEvent.setup();
+
+		await open(api);
+		await user.type(await screen.findByRole("textbox"), "/fork");
+		await user.click(screen.getByRole("button", { name: "send message" }));
+
+		expect(await screen.findByText("stop the active turn before forking")).toBeTruthy();
+		expect(api.forkHistory).not.toHaveBeenCalled();
+
+		await mounted.dispose();
+	});
+
+	it("rejects /fork for an unmanaged host session", async () => {
 		const api = createRouteApi({
 			historySessionIds: new Set(["root-1"]),
 			runningRootDelegation: false,
@@ -452,111 +512,6 @@ describe("App workspace route identity integration", () => {
 		await mounted.dispose();
 	});
 
-	it("retains a forked user-message draft when popstate wins a delayed RPC race", async () => {
-		const fork = deferred<ReturnType<typeof forkResult>>();
-		const browser = new FakeWorkspaceBrowser(
-			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
-		);
-		const api = createRouteApi({
-			historySessionIds: new Set(["project-root-1"]),
-			runningRootDelegation: false,
-			deferredTranscriptEntries: Promise.resolve({
-				session_id: "project-root-1",
-				session_revision: 1,
-				transcript_revision: 1,
-				entries: [userMessageEntry()],
-			}),
-		});
-		api.forkHistory.mockImplementation(() => fork.promise);
-		const mounted = renderRouteApp(api, browser);
-		const user = userEvent.setup();
-
-		await open(api);
-		await user.type(await screen.findByRole("textbox"), "/fork");
-		await user.click(screen.getByRole("button", { name: "send message" }));
-		await user.click(await screen.findByRole("button", { name: /Fork from User message/ }));
-		await waitFor(() => expect(api.forkHistory).toHaveBeenCalledTimes(1));
-
-		await act(async () =>
-			browser.popstate(
-				"/w/project/project-1/run/project-root-1/conversation/project-child-1",
-			),
-		);
-		await act(async () => fork.resolve(forkResult("project-root-1")));
-		expect(browser.currentUrl).toBe(
-			"/w/project/project-1/run/project-root-1/conversation/project-child-1",
-		);
-
-		await act(async () =>
-			browser.navigate("/w/project/project-1/run/fork-child/conversation/fork-child"),
-		);
-		expect((await screen.findByRole<HTMLTextAreaElement>("textbox")).value).toBe(
-			"Edit original prompt",
-		);
-
-		await mounted.dispose();
-	});
-
-	it("prevents duplicate fork submissions and allows retry after a stale refresh", async () => {
-		const browser = new FakeWorkspaceBrowser(
-			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
-		);
-		const api = createRouteApi({
-			historySessionIds: new Set(["project-root-1"]),
-			runningRootDelegation: false,
-		});
-		const getHistoryTargetsMock = vi.mocked(api.getHistoryTargets);
-		const getHistoryTargets = getHistoryTargetsMock.getMockImplementation();
-		if (!getHistoryTargets) throw new Error("missing history target implementation");
-		getHistoryTargetsMock.mockImplementation(async (...args) => ({
-			...await getHistoryTargets(...args),
-			next_before_sequence: 1,
-			has_more: true,
-		}));
-		const staleFork = deferred<ReturnType<typeof forkResult>>();
-		api.forkHistory
-			.mockImplementationOnce(() => staleFork.promise)
-			.mockResolvedValueOnce(forkResult("project-root-1"));
-		const mounted = renderRouteApp(api, browser);
-		const user = userEvent.setup();
-
-		await open(api);
-		await user.type(await screen.findByRole("textbox"), "/fork");
-		await user.click(screen.getByRole("button", { name: "send message" }));
-		const target = await screen.findByRole("button", { name: /Fork from User message/ });
-		target.click();
-		target.click();
-		await waitFor(() => expect((target as HTMLButtonElement).disabled).toBe(true));
-		const close = screen.getByRole<HTMLButtonElement>("button", { name: "close picker" });
-		expect(close.disabled).toBe(true);
-		await user.keyboard("{Escape}");
-		await user.click(document.querySelector(".dialog-overlay") as HTMLElement);
-		expect(screen.getByRole("heading", { name: "Fork session" })).toBeTruthy();
-		expect((screen.getByRole("button", {
-			name: "Load older messages",
-		}) as HTMLButtonElement).disabled).toBe(true);
-		await waitFor(() => expect(api.forkHistory).toHaveBeenCalledTimes(1));
-		expect(api.getHistoryTargets).toHaveBeenCalledTimes(1);
-		await act(async () =>
-			staleFork.reject(new Error("history_changed: transcript revision changed")),
-		);
-
-		await waitFor(() => expect(api.getHistoryTargets).toHaveBeenCalledTimes(2));
-		expect(
-			await screen.findByText("history changed; refreshed the fork list, please choose again"),
-		).toBeTruthy();
-		expect(screen.getByRole("heading", { name: "Fork session" })).toBeTruthy();
-		const retry = screen.getByRole("button", { name: /Fork from User message: Edit original prompt/ });
-		expect((retry as HTMLButtonElement).disabled).toBe(false);
-		expect(browser.currentUrl).toBe(
-			"/w/project/project-1/run/project-root-1/conversation/project-root-1",
-		);
-		await user.click(retry);
-		await waitFor(() => expect(api.forkHistory).toHaveBeenCalledTimes(2));
-
-		await mounted.dispose();
-	});
-
 	it.each(["switch", "fork"] as const)(
 		"rejects /%s while a delegation is running",
 		async (command) => {
@@ -582,7 +537,9 @@ describe("App workspace route identity integration", () => {
 
 			expect(
 				await screen.findByText(
-					"wait for running delegations to finish before changing history",
+					command === "fork"
+						? "wait for running delegations to finish before forking"
+						: "wait for running delegations to finish before changing history",
 				),
 			).toBeTruthy();
 			expect(screen.queryByRole("dialog")).toBeNull();
@@ -2873,7 +2830,10 @@ function createRouteApi(
 			return snapshot("legacy-child", "legacy-root", null, "Legacy child");
 		}
 		if (sessionId === "project-root-1") {
-			return snapshot("project-root-1", null, "project-1", "Project root");
+			return {
+				...snapshot("project-root-1", null, "project-1", "Project root"),
+				activity: options.activities?.get(sessionId) ?? "idle",
+			};
 		}
 		if (sessionId === "project-child-1") {
 			return snapshot("project-child-1", "project-root-1", "project-1", "Project child");
@@ -3350,8 +3310,7 @@ function forkResult(sourceSessionId = "root-1") {
 	return {
 		session_id: "fork-child",
 		source_session_id: sourceSessionId,
-		source_leaf_id: null,
-		active_leaf_id: null,
+		active_leaf_id: "entry-active",
 		session_revision: 1,
 		queue_revision: 0,
 		transcript_revision: 1,

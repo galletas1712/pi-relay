@@ -89,7 +89,6 @@ export interface ComposerHandle {
 	focusTarget(): HTMLElement | null;
 	getValue(): string;
 	setValue(value: string): void;
-	setSessionDraft(sessionId: string | null, value: string): void;
 	clearSession(sessionId: string | null): void;
 	restoreSubmittedDraft(sessionId: string | null, value: string): void;
 }
@@ -186,18 +185,6 @@ export const Composer = memo(function Composer({
 		[storeDraft]
 	);
 
-	const setSessionDraft = useCallback(
-		(sessionId: string | null, value: string) => {
-			pendingSubmittedDraftsRef.current.delete(composerDraftKey(sessionId));
-			storeDraft(sessionId, value);
-			if (selectedIdRef.current === sessionId) {
-				draftRef.current = value;
-				setDraft(value);
-			}
-		},
-		[storeDraft],
-	);
-
 	const restoreSubmittedDraft = useCallback(
 		(sessionId: string | null, value: string, version?: number) => {
 			const key = composerDraftKey(sessionId);
@@ -248,7 +235,6 @@ export const Composer = memo(function Composer({
 			focusTarget: () => textAreaRef.current,
 			getValue: () => draftRef.current,
 			setValue: (value) => setDraftValue(value),
-			setSessionDraft: (sessionId, value) => setSessionDraft(sessionId, value),
 			restoreSubmittedDraft: (sessionId, value) => restoreSubmittedDraft(sessionId, value),
 			clearSession: (sessionId) => {
 				pendingSubmittedDraftsRef.current.delete(composerDraftKey(sessionId));
@@ -264,7 +250,7 @@ export const Composer = memo(function Composer({
 				composerHandleRef.current = null;
 			}
 		};
-	}, [composerHandleRef, restoreSubmittedDraft, setDraftValue, setSessionDraft, storeDraft]);
+	}, [composerHandleRef, restoreSubmittedDraft, setDraftValue, storeDraft]);
 
 	const slashState = useMemo<{ visible: boolean; commands: typeof COMMANDS }>(() => {
 		const prefix = matchSlashPrefix(draft);

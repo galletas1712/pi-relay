@@ -1,5 +1,5 @@
 import { useRef, type RefObject } from "react";
-import { GitFork, Loader2, RotateCcw } from "lucide-react";
+import { Loader2, RotateCcw } from "lucide-react";
 import {
 	AppDialog,
 	DialogCloseButton,
@@ -22,7 +22,6 @@ export interface HistoryTargetOption {
 
 export function HistoryTargetPickerDialog({
 	targets,
-	mode,
 	loading,
 	submitting,
 	error,
@@ -34,7 +33,6 @@ export function HistoryTargetPickerDialog({
 	returnFocusFallbackRef,
 }: {
 	targets: HistoryTargetOption[];
-	mode: "fork" | "switch";
 	loading: boolean;
 	submitting: boolean;
 	error: string | null;
@@ -46,8 +44,6 @@ export function HistoryTargetPickerDialog({
 	returnFocusFallbackRef?: RefObject<HTMLElement | null>;
 }) {
 	const titleRef = useRef<HTMLHeadingElement>(null);
-	const isFork = mode === "fork";
-	const Icon = isFork ? GitFork : RotateCcw;
 	return (
 		<AppDialog
 			className="history-dialog"
@@ -57,9 +53,9 @@ export function HistoryTargetPickerDialog({
 			onDismiss={onClose}
 		>
 			<div className="history-dialog-head">
-				<span className="history-dialog-icon" aria-hidden="true"><Icon size={15} /></span>
+				<span className="history-dialog-icon" aria-hidden="true"><RotateCcw size={15} /></span>
 				<div className="history-dialog-copy">
-					<DialogTitle ref={titleRef} tabIndex={-1}>{isFork ? "Fork session" : "Switch branch"}</DialogTitle>
+					<DialogTitle ref={titleRef} tabIndex={-1}>Switch branch</DialogTitle>
 					<DialogDescription>Pick a historical user message to restore and edit.</DialogDescription>
 				</div>
 				<DialogCloseButton label="close picker" disabled={submitting} />
@@ -67,14 +63,14 @@ export function HistoryTargetPickerDialog({
 			<div className="history-options">
 				<ConnectionBlockedReason reason={mutationBlockedReason} className="history-blocked-reason" />
 				{error ? <div className="history-empty error">{error}</div> : null}
-				<ul className="history-target-list" aria-label={`${mode} targets`}>
+				<ul className="history-target-list" aria-label="switch targets">
 					{targets.map((target) => (
 						<li key={target.sourceEntryId}>
 							<button
 								className="history-option"
 								type="button"
 								disabled={submitting || !!mutationBlockedReason}
-								aria-label={`${isFork ? "Fork from" : "Switch to"} User message: ${target.preview}`}
+								aria-label={`Switch to User message: ${target.preview}`}
 								onClick={() => onSelect(target)}
 							>
 								<span className="history-option-icon">{target.turnLabel}</span>
