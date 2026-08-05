@@ -60,7 +60,7 @@ export interface FilesTabProps {
 	treeEpoch?: number;
 	/** When false, hide Commit/PR status controls (no git workspace roots). */
 	hasGitWorkspaces?: boolean;
-	onSelectFile: (path: string) => void;
+	onSelectFile: (path: string, diffAgainst?: GitAgainst) => void;
 	onVisibleDirectoriesChange?: (directories: string[]) => void;
 }
 
@@ -261,6 +261,13 @@ export function FilesTab({
 	const rootErrors = (gitStatusQuery.data?.roots ?? [])
 		.map((root) => root.error)
 		.filter((error): error is string => !!error);
+	const queryError =
+		gitStatusQuery.error instanceof Error
+			? gitStatusQuery.error.message
+			: gitStatusQuery.error
+				? "Git status request failed"
+				: null;
+	const deletedPaths = statusIndex.pathsWithStatus("deleted");
 
 	return (
 		<div className="files-tab">
@@ -276,27 +283,53 @@ export function FilesTab({
 								type="button"
 								className={`files-git-mode${gitAgainst === "head" ? " active" : ""}`}
 								aria-pressed={gitAgainst === "head"}
+								title="Changes not included in HEAD"
 								onClick={() => setGitAgainst("head")}
 							>
-								Commit
+								Uncommitted
 							</button>
 							<button
 								type="button"
 								className={`files-git-mode${gitAgainst === "pr_base" ? " active" : ""}`}
 								aria-pressed={gitAgainst === "pr_base"}
+								title="All changes since the PR base"
 								onClick={() => setGitAgainst("pr_base")}
 							>
-								PR
+								PR changes
 							</button>
 							{gitStatusQuery.isFetching ? (
 								<span className="muted files-git-toolbar-hint">updating…</span>
 							) : null}
 						</div>
 					) : null}
-					{rootErrors.length > 0 ? (
-						<p className="muted files-git-error" title={rootErrors.join("\n")}>
-							Git status unavailable for some roots
+					{queryError || rootErrors.length > 0 ? (
+						<p
+							className="error-text files-git-error"
+							title={queryError ?? rootErrors.join("\n")}
+						>
+							{queryError ? "Git status unavailable" : "Git status unavailable for some roots"}
 						</p>
+					) : null}
+					{deletedPaths.length > 0 ? (
+						<details className="files-git-deleted">
+							<summary>
+								{deletedPaths.length} deleted {deletedPaths.length === 1 ? "file" : "files"}
+							</summary>
+							<div className="files-git-deleted-list">
+								{deletedPaths.map((path) => (
+									<button
+										type="button"
+										key={path}
+										aria-label={`Open diff for deleted file ${path}`}
+										title={`Open ${gitAgainst === "head" ? "uncommitted" : "PR"} diff for ${path}`}
+										onClick={() => onSelectFile(path, gitAgainst)}
+									>
+										<span aria-hidden>D</span>
+										<span>{path}</span>
+									</button>
+								))}
+							</div>
+						</details>
 					) : null}
 					<div {...tree.getContainerProps("Files")} className="files-tree">
 						{items.map((item, index) => {

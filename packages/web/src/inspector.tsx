@@ -12,7 +12,13 @@ import {
 import { FilesTab } from "./filesTab.tsx";
 import { RunBoard } from "./runBoard.tsx";
 import { COMMANDS } from "./slash.ts";
-import type { Delegation, SessionSnapshot, SessionWorkspace, ToolListing } from "./types.ts";
+import type {
+	Delegation,
+	GitAgainst,
+	SessionSnapshot,
+	SessionWorkspace,
+	ToolListing,
+} from "./types.ts";
 
 const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
 
@@ -52,7 +58,7 @@ export interface InspectorProps {
 	preferredTab?: InspectorTab | null;
 	filesTreeEpoch?: number;
 	hasGitWorkspaces?: boolean;
-	onSelectFile?: (path: string) => void;
+	onSelectFile?: (path: string, diffAgainst?: GitAgainst) => void;
 	onVisibleDirectoriesChange?: (directories: string[]) => void;
 	onActiveTabChange?: (tab: InspectorTab) => void;
 	onSelectSession?: (sessionId: string) => void;
@@ -167,7 +173,7 @@ export function Inspector({
 							activity={snapshot?.activity ?? null}
 							treeEpoch={filesTreeEpoch}
 							hasGitWorkspaces={hasGitWorkspaces}
-							onSelectFile={(path) => onSelectFile?.(path)}
+							onSelectFile={(path, diffAgainst) => onSelectFile?.(path, diffAgainst)}
 							onVisibleDirectoriesChange={onVisibleDirectoriesChange}
 						/>
 					) : (

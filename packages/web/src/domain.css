@@ -4078,6 +4078,55 @@ pre {
 	padding: 0;
 }
 
+.files-git-deleted {
+	border-bottom: 1px solid var(--border);
+	font-size: var(--text-xs);
+}
+
+.files-git-deleted summary {
+	padding: 6px 8px;
+	color: var(--muted-foreground);
+	cursor: pointer;
+	user-select: none;
+}
+
+.files-git-deleted-list {
+	max-height: 10rem;
+	overflow-y: auto;
+	padding: 0 4px 4px;
+}
+
+.files-git-deleted-list button {
+	display: grid;
+	grid-template-columns: 14px minmax(0, 1fr);
+	gap: 5px;
+	width: 100%;
+	border: 0;
+	border-radius: var(--radius);
+	background: transparent;
+	color: var(--foreground);
+	padding: 4px;
+	text-align: left;
+	cursor: pointer;
+}
+
+.files-git-deleted-list button:hover {
+	background: color-mix(in oklch, var(--muted) 72%, transparent);
+}
+
+.files-git-deleted-list button span:first-child {
+	color: var(--destructive);
+	font-family: var(--font-mono);
+	font-weight: 600;
+}
+
+.files-git-deleted-list button span:last-child {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: var(--font-mono);
+}
+
 .files-tree-load-more {
 	color: var(--muted);
 	font-style: italic;

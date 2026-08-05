@@ -27,6 +27,7 @@ describe("GitStatusIndex", () => {
 				entries: [
 					{ path: "repo/src/deep/nested.rs", status: "modified" },
 					{ path: "repo/new.txt", status: "untracked" },
+					{ path: "repo/removed.txt", status: "deleted" },
 					{ path: "repo/conflict.rs", status: "conflict" },
 				],
 			},
@@ -39,6 +40,7 @@ describe("GitStatusIndex", () => {
 		expect(index.statusFor("repo/src")).toBe("modified");
 		expect(index.statusFor("repo")).toBe("conflict");
 		expect(index.get("repo/src/deep/nested.rs")).toBe("modified");
+		expect(index.pathsWithStatus("deleted")).toEqual(["repo/removed.txt"]);
 		expect(index.statusFor("other")).toBeNull();
 	});
 

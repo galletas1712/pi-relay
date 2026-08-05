@@ -58,7 +58,10 @@ pub fn git_diff(
     };
     let repo = cwd.join(&root.workspace_dir);
     if !repo.join(".git").exists() {
-        bail!("workspace root is not a git repository: {}", root.workspace_dir);
+        bail!(
+            "workspace root is not a git repository: {}",
+            root.workspace_dir
+        );
     }
     let rel_in_repo = path_relative_to_root(&path, &root.workspace_dir)?;
     let (base_oid, base_arg) = match against {
@@ -72,38 +75,11 @@ pub fn git_diff(
     let status_map = status_map_for_root(cwd, root, against)?;
     let status = status_map.get(&path).copied();
 
-    let (unified, binary, truncated) = if status == Some(GitFileStatus::Untracked)
-        || (status == Some(GitFileStatus::Added) && against == GitAgainst::Head)
-    {
-        // Untracked (and some added) files may not appear in `git diff <base>`.
-        // Fall back to a no-index diff when the normal diff is empty.
-        let primary = diff_against(&repo, &base_arg, &rel_in_repo)?;
-        if primary.0.is_empty() && !primary.1 {
-            diff_as_new_file(&repo, &rel_in_repo)?
-        } else {
-            primary
-        }
-    } else if status == Some(GitFileStatus::Deleted) {
-        diff_against(&repo, &base_arg, &rel_in_repo)?
+    let (unified, binary, truncated) = if status == Some(GitFileStatus::Untracked) {
+        // Untracked files are absent from a normal git diff.
+        diff_as_new_file(&repo, &rel_in_repo)?
     } else {
-        let primary = diff_against(&repo, &base_arg, &rel_in_repo)?;
-        if primary.0.is_empty()
-            && !primary.1
-            && matches!(
-                status,
-                Some(GitFileStatus::Added) | Some(GitFileStatus::Untracked) | None
-            )
-        {
-            // Path may be untracked under PR view without a porcelain status hit
-            // on Head; try no-index when the file exists on disk.
-            if repo.join(&rel_in_repo).is_file() {
-                diff_as_new_file(&repo, &rel_in_repo)?
-            } else {
-                primary
-            }
-        } else {
-            primary
-        }
+        diff_against(&repo, &base_arg, &rel_in_repo)?
     };
 
     Ok(GitDiffReport {
@@ -122,7 +98,9 @@ fn status_for_root(cwd: &Path, root: &GitBrowseRoot, against: GitAgainst) -> Git
         Ok(map) => {
             let base_oid = match against {
                 GitAgainst::Head => None,
-                GitAgainst::PrBase => merge_base_oid(&cwd.join(&root.workspace_dir), &root.remote_branch).ok(),
+                GitAgainst::PrBase => {
+                    merge_base_oid(&cwd.join(&root.workspace_dir), &root.remote_branch).ok()
+                }
             };
             let entries = map
                 .into_iter()
@@ -156,20 +134,22 @@ fn status_map_for_root(
     let mut map = BTreeMap::new();
     match against {
         GitAgainst::Head => {
-            for (rel, status) in parse_porcelain(&git_output(&repo, &["status", "--porcelain=v1", "-z"])?) {
+            for (rel, status) in
+                parse_porcelain(&git_output(&repo, &["status", "--porcelain=v1", "-z"])?)
+            {
                 map.insert(cwd_join(&root.workspace_dir, &rel), status);
             }
         }
         GitAgainst::PrBase => {
             let base = merge_base_oid(&repo, &root.remote_branch)?;
-            for (rel, status) in parse_name_status(&git_output(
-                &repo,
-                &["diff", "--name-status", "-z", &base],
-            )?) {
+            for (rel, status) in
+                parse_name_status(&git_output(&repo, &["diff", "--name-status", "-z", &base])?)
+            {
                 map.insert(cwd_join(&root.workspace_dir, &rel), status);
             }
             // Untracked + conflicts still come from porcelain.
-            for (rel, status) in parse_porcelain(&git_output(&repo, &["status", "--porcelain=v1", "-z"])?)
+            for (rel, status) in
+                parse_porcelain(&git_output(&repo, &["status", "--porcelain=v1", "-z"])?)
             {
                 if matches!(status, GitFileStatus::Untracked | GitFileStatus::Conflict) {
                     map.insert(cwd_join(&root.workspace_dir, &rel), status);
@@ -212,14 +192,7 @@ fn diff_as_new_file(repo: &Path, rel: &str) -> Result<(String, bool, bool)> {
         return Ok((String::new(), false, false));
     }
     let output = git_command()
-        .args([
-            "diff",
-            "--no-color",
-            "--no-index",
-            "--",
-            "/dev/null",
-            rel,
-        ])
+        .args(["diff", "--no-color", "--no-index", "--", "/dev/null", rel])
         .current_dir(repo)
         .output()
         .with_context(|| format!("git diff --no-index in {}", repo.display()))?;
@@ -249,7 +222,9 @@ fn cap_diff_output(stdout: &[u8]) -> (String, bool, bool) {
 fn owning_root<'a>(path: &str, roots: &'a [GitBrowseRoot]) -> Option<&'a GitBrowseRoot> {
     roots
         .iter()
-        .filter(|root| path == root.workspace_dir || path.starts_with(&format!("{}/", root.workspace_dir)))
+        .filter(|root| {
+            path == root.workspace_dir || path.starts_with(&format!("{}/", root.workspace_dir))
+        })
         .max_by_key(|root| root.workspace_dir.len())
 }
 
@@ -273,7 +248,8 @@ fn cwd_join(workspace_dir: &str, rel: &str) -> String {
 
 fn normalize_cwd_rel(path: &str) -> Result<String> {
     let path = path.trim().trim_start_matches('/');
-    if path.is_empty() || path.contains('\0') || path.split('/').any(|p| p == ".." || p.is_empty()) {
+    if path.is_empty() || path.contains('\0') || path.split('/').any(|p| p == ".." || p.is_empty())
+    {
         bail!("invalid browse path");
     }
     Ok(path.to_string())
@@ -301,12 +277,11 @@ fn parse_porcelain(raw: &str) -> Vec<(String, GitFileStatus)> {
         i += 3;
         let (path, next) = read_z_path(bytes, i);
         i = next;
-        // Rename/copy: first path is the source, second is the destination.
-        // Report the destination (current name) as modified.
+        // In porcelain -z output, the destination comes before the source.
         let path = if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
-            let (dest, next2) = read_z_path(bytes, i);
+            let (_source, next2) = read_z_path(bytes, i);
             i = next2;
-            dest
+            path
         } else {
             path
         };
@@ -324,10 +299,7 @@ fn porcelain_status(x: char, y: char) -> GitFileStatus {
         return GitFileStatus::Untracked;
     }
     if "AUD".contains(x) && "AUD".contains(y) && x != y
-        || matches!(
-            (x, y),
-            ('U', _) | (_, 'U') | ('A', 'A') | ('D', 'D')
-        )
+        || matches!((x, y), ('U', _) | (_, 'U') | ('A', 'A') | ('D', 'D'))
     {
         return GitFileStatus::Conflict;
     }
@@ -407,7 +379,9 @@ fn git_output(cwd: &Path, args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
 }
 
 fn git_command() -> Command {
@@ -459,11 +433,7 @@ mod tests {
         );
         git(
             &cwd,
-            &[
-                "clone",
-                origin.to_str().unwrap(),
-                repo.to_str().unwrap(),
-            ],
+            &["clone", origin.to_str().unwrap(), repo.to_str().unwrap()],
         );
         git(&repo, &["config", "user.email", "t@example.com"]);
         git(&repo, &["config", "user.name", "t"]);
@@ -508,8 +478,22 @@ mod tests {
             .iter()
             .map(|e| (e.path.as_str(), e.status))
             .collect();
-        assert_eq!(by_path.get("repo/README.md"), Some(&GitFileStatus::Modified));
+        assert_eq!(
+            by_path.get("repo/README.md"),
+            Some(&GitFileStatus::Modified)
+        );
         assert_eq!(by_path.get("repo/new.txt"), Some(&GitFileStatus::Untracked));
+    }
+
+    #[test]
+    fn clean_file_has_no_diff() {
+        let (_tmp, cwd) = init_session_cwd();
+
+        let report = git_diff(&cwd, "repo/README.md", &[root()], GitAgainst::Head).unwrap();
+
+        assert_eq!(report.status, None);
+        assert!(report.unified.is_empty());
+        assert!(!report.binary);
     }
 
     #[test]
@@ -543,7 +527,7 @@ mod tests {
 
     #[test]
     fn parse_porcelain_handles_rename_records() {
-        let raw = "R  old.txt\0new.txt\0";
+        let raw = "R  new.txt\0old.txt\0";
         let parsed = parse_porcelain(raw);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].0, "new.txt");

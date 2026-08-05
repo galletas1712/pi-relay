@@ -1148,17 +1148,17 @@ pub(crate) mod test_support {
                         .collect(),
                 })
             }
-            RuntimeCommand::BrowseGitDiff {
-                path, against, ..
-            } => Ok(RuntimeCommandResult::GitDiff {
-                path,
-                against,
-                base_oid: None,
-                status: None,
-                unified: String::new(),
-                binary: false,
-                truncated: false,
-            }),
+            RuntimeCommand::BrowseGitDiff { path, against, .. } => {
+                Ok(RuntimeCommandResult::GitDiff {
+                    path,
+                    against,
+                    base_oid: None,
+                    status: None,
+                    unified: String::new(),
+                    binary: false,
+                    truncated: false,
+                })
+            }
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,

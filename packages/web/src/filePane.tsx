@@ -18,6 +18,7 @@ export interface FilePaneProps {
 	sessionId: string;
 	path: string;
 	workspaces?: SessionWorkspace[];
+	initialViewMode?: FilePaneViewMode;
 	remoteReadBlockedReason?: string | null;
 	parked?: boolean;
 	onClose: () => void;
@@ -39,6 +40,7 @@ export function FilePane({
 	sessionId,
 	path,
 	workspaces,
+	initialViewMode = "contents",
 	remoteReadBlockedReason,
 	parked = false,
 	onClose,
@@ -49,11 +51,11 @@ export function FilePane({
 	const getBodyScroller = useCallback(() => bodyRef.current, []);
 	useParkedScrollPreservation(getBodyScroller, parked);
 	const gitCapable = pathUnderGitRoot(path, workspaces);
-	const [viewMode, setViewMode] = useState<FilePaneViewMode>("contents");
+	const [viewMode, setViewMode] = useState<FilePaneViewMode>(initialViewMode);
 
 	useEffect(() => {
-		setViewMode("contents");
-	}, [path]);
+		setViewMode(initialViewMode);
+	}, [initialViewMode, path]);
 
 	useEffect(() => {
 		if (!gitCapable && viewMode !== "contents") setViewMode("contents");

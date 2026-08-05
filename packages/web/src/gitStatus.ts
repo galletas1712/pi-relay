@@ -64,6 +64,10 @@ export class GitStatusIndex {
 		return this.byPath.get(path) ?? null;
 	}
 
+	pathsWithStatus(status: GitFileStatus): string[] {
+		return this.paths.filter((path) => this.byPath.get(path) === status);
+	}
+
 	/** Own status, or strongest status among descendants (path/). */
 	statusFor(path: string): GitFileStatus | null {
 		const own = this.byPath.get(path);
