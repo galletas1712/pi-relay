@@ -188,7 +188,7 @@ pub enum RuntimeCommand {
         against: GitAgainst,
         roots: Vec<GitBrowseRoot>,
     },
-    /// Unified diff for one cwd-relative path against HEAD or the PR merge-base.
+    /// Unified diff for one cwd-relative path against HEAD or its branch base.
     BrowseGitDiff {
         workspace_id: String,
         path: String,
@@ -324,7 +324,7 @@ pub enum RuntimeCommandResult {
         path: String,
         against: GitAgainst,
         #[serde(skip_serializing_if = "Option::is_none")]
-        base_oid: Option<String>,
+        comparison: Option<Box<GitComparison>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<GitFileStatus>,
         unified: String,
@@ -369,15 +369,39 @@ pub struct WorkspaceDirEntry {
 #[serde(rename_all = "snake_case")]
 pub enum GitAgainst {
     /// Working tree (+ index) vs `HEAD`.
-    Head,
-    /// Working tree vs `merge-base(HEAD, origin/<remote_branch>)`.
-    PrBase,
+    WorkingTree,
+    /// Working tree vs the current branch or PR's merge base.
+    Branch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitBrowseRoot {
     pub workspace_dir: String,
+    pub remote_url: String,
     pub remote_branch: String,
+    pub local_branch: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitPullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitComparisonRef {
+    pub branch: String,
+    pub oid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<GitPullRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitComparison {
+    pub base: GitComparisonRef,
+    pub tip: GitComparisonRef,
+    pub merge_base_oid: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -401,7 +425,7 @@ pub struct GitStatusEntry {
 pub struct GitStatusRoot {
     pub workspace_dir: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_oid: Option<String>,
+    pub comparison: Option<GitComparison>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub entries: Vec<GitStatusEntry>,

@@ -20,7 +20,7 @@ describe("visibleBrowseDirectories", () => {
 
 describe("GitStatusIndex", () => {
 	const report: WorkspaceGitStatus = {
-		against: "head",
+		against: "working_tree",
 		roots: [
 			{
 				workspace_dir: "repo",

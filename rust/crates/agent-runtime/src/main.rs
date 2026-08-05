@@ -650,7 +650,7 @@ impl Runtime {
                 Ok(RuntimeCommandResult::GitDiff {
                     path: report.path,
                     against: report.against,
-                    base_oid: report.base_oid,
+                    comparison: report.comparison.map(Box::new),
                     status: report.status,
                     unified: report.unified,
                     binary: report.binary,

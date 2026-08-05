@@ -231,7 +231,7 @@ pub(crate) async fn git_diff(state: &AppState, params: Value) -> Result<Value, R
         Ok(RuntimeCommandResult::GitDiff {
             path,
             against,
-            base_oid,
+            comparison,
             status,
             unified,
             binary,
@@ -244,8 +244,8 @@ pub(crate) async fn git_diff(state: &AppState, params: Value) -> Result<Value, R
                 "binary": binary,
                 "truncated": truncated,
             });
-            if let Some(base_oid) = base_oid {
-                body["base_oid"] = Value::String(base_oid);
+            if let Some(comparison) = comparison {
+                body["comparison"] = json!(comparison);
             }
             if let Some(status) = status {
                 body["status"] = json!(status);
@@ -265,13 +265,17 @@ fn git_browse_roots(workspaces: &[agent_store::SessionWorkspace]) -> Vec<GitBrow
         .iter()
         .filter(|workspace| workspace.kind == WorkspaceKind::Git)
         .filter_map(|workspace| {
+            let remote_url = workspace.remote_url.as_deref()?.trim();
             let remote_branch = workspace.remote_branch.as_deref()?.trim();
-            if remote_branch.is_empty() {
+            let local_branch = workspace.local_branch.as_deref()?.trim();
+            if remote_url.is_empty() || remote_branch.is_empty() || local_branch.is_empty() {
                 return None;
             }
             Some(GitBrowseRoot {
                 workspace_dir: workspace.workspace_dir.clone(),
+                remote_url: remote_url.to_string(),
                 remote_branch: remote_branch.to_string(),
+                local_branch: local_branch.to_string(),
             })
         })
         .collect()

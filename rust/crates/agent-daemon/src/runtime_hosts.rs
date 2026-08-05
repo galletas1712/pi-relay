@@ -1141,7 +1141,7 @@ pub(crate) mod test_support {
                         .into_iter()
                         .map(|root| agent_runtime_protocol::GitStatusRoot {
                             workspace_dir: root.workspace_dir,
-                            base_oid: None,
+                            comparison: None,
                             error: None,
                             entries: Vec::new(),
                         })
@@ -1152,7 +1152,7 @@ pub(crate) mod test_support {
                 Ok(RuntimeCommandResult::GitDiff {
                     path,
                     against,
-                    base_oid: None,
+                    comparison: None,
                     status: None,
                     unified: String::new(),
                     binary: false,

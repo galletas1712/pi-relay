@@ -14,6 +14,7 @@ import {
 	workspaceDirQueryKey,
 } from "./fileBrowser.ts";
 import { joinBrowsePath } from "./filePath.ts";
+import { GitComparisonList } from "./gitComparison.tsx";
 import {
 	fetchWorkspaceGitStatus,
 	GitStatusIndex,
@@ -58,7 +59,7 @@ export interface FilesTabProps {
 	activity?: string | null;
 	/** Bumped when interest-scoped dir listings should reload from disk. */
 	treeEpoch?: number;
-	/** When false, hide Commit/PR status controls (no git workspace roots). */
+	/** When false, hide git comparison controls (no git workspace roots). */
 	hasGitWorkspaces?: boolean;
 	onSelectFile: (path: string, diffAgainst?: GitAgainst) => void;
 	onVisibleDirectoriesChange?: (directories: string[]) => void;
@@ -84,7 +85,7 @@ export function FilesTab({
 	expandedItemsRef.current = expandedItems;
 	const [loadingMore, setLoadingMore] = useState<string | null>(null);
 	const [listingEpoch, setListingEpoch] = useState(0);
-	const [gitAgainst, setGitAgainst] = useState<GitAgainst>("head");
+	const [gitAgainst, setGitAgainst] = useState<GitAgainst>("working_tree");
 
 	const gitStatusQuery = useQuery({
 		queryKey: sessionId
@@ -281,26 +282,29 @@ export function FilesTab({
 						<div className="files-git-toolbar" role="group" aria-label="Git status view">
 							<button
 								type="button"
-								className={`files-git-mode${gitAgainst === "head" ? " active" : ""}`}
-								aria-pressed={gitAgainst === "head"}
+								className={`files-git-mode${gitAgainst === "working_tree" ? " active" : ""}`}
+								aria-pressed={gitAgainst === "working_tree"}
 								title="Changes not included in HEAD"
-								onClick={() => setGitAgainst("head")}
+								onClick={() => setGitAgainst("working_tree")}
 							>
-								Uncommitted
+								Working tree
 							</button>
 							<button
 								type="button"
-								className={`files-git-mode${gitAgainst === "pr_base" ? " active" : ""}`}
-								aria-pressed={gitAgainst === "pr_base"}
-								title="All changes since the PR base"
-								onClick={() => setGitAgainst("pr_base")}
+								className={`files-git-mode${gitAgainst === "branch" ? " active" : ""}`}
+								aria-pressed={gitAgainst === "branch"}
+								title="All changes on the current branch or PR"
+								onClick={() => setGitAgainst("branch")}
 							>
-								PR changes
+								Branch changes
 							</button>
 							{gitStatusQuery.isFetching ? (
 								<span className="muted files-git-toolbar-hint">updating…</span>
 							) : null}
 						</div>
+					) : null}
+					{gitAgainst === "branch" ? (
+						<GitComparisonList roots={gitStatusQuery.data?.roots ?? []} />
 					) : null}
 					{queryError || rootErrors.length > 0 ? (
 						<p
@@ -321,7 +325,7 @@ export function FilesTab({
 										type="button"
 										key={path}
 										aria-label={`Open diff for deleted file ${path}`}
-										title={`Open ${gitAgainst === "head" ? "uncommitted" : "PR"} diff for ${path}`}
+										title={`Open ${gitAgainst === "working_tree" ? "working tree" : "branch"} diff for ${path}`}
 										onClick={() => onSelectFile(path, gitAgainst)}
 									>
 										<span aria-hidden>D</span>

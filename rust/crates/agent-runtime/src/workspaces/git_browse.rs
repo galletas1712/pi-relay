@@ -8,9 +8,11 @@ use std::path::Path;
 use std::process::Command;
 
 use agent_runtime_protocol::{
-    GitAgainst, GitBrowseRoot, GitFileStatus, GitStatusEntry, GitStatusRoot,
+    GitAgainst, GitBrowseRoot, GitComparison, GitComparisonRef, GitFileStatus, GitPullRequest,
+    GitStatusEntry, GitStatusRoot,
 };
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
 const DIFF_BYTE_CAP: usize = 1024 * 1024;
 
@@ -24,7 +26,7 @@ pub struct GitStatusReport {
 pub struct GitDiffReport {
     pub path: String,
     pub against: GitAgainst,
-    pub base_oid: Option<String>,
+    pub comparison: Option<GitComparison>,
     pub status: Option<GitFileStatus>,
     pub unified: String,
     pub binary: bool,
@@ -64,28 +66,26 @@ pub fn git_diff(
         );
     }
     let rel_in_repo = path_relative_to_root(&path, &root.workspace_dir)?;
-    let (base_oid, base_arg) = match against {
-        GitAgainst::Head => (None, "HEAD".to_string()),
-        GitAgainst::PrBase => {
-            let oid = merge_base_oid(&repo, &root.remote_branch)?;
-            (Some(oid.clone()), oid)
-        }
-    };
+    let comparison = comparison_for_root(&repo, root, against)?;
+    let base_arg = comparison
+        .as_ref()
+        .map(|value| value.merge_base_oid.as_str())
+        .unwrap_or("HEAD");
 
-    let status_map = status_map_for_root(cwd, root, against)?;
+    let status_map = status_map_for_root(cwd, root, against, base_arg)?;
     let status = status_map.get(&path).copied();
 
     let (unified, binary, truncated) = if status == Some(GitFileStatus::Untracked) {
         // Untracked files are absent from a normal git diff.
         diff_as_new_file(&repo, &rel_in_repo)?
     } else {
-        diff_against(&repo, &base_arg, &rel_in_repo)?
+        diff_against(&repo, base_arg, &rel_in_repo)?
     };
 
     Ok(GitDiffReport {
         path,
         against,
-        base_oid,
+        comparison,
         status,
         unified,
         binary,
@@ -94,28 +94,32 @@ pub fn git_diff(
 }
 
 fn status_for_root(cwd: &Path, root: &GitBrowseRoot, against: GitAgainst) -> GitStatusRoot {
-    match status_map_for_root(cwd, root, against) {
-        Ok(map) => {
-            let base_oid = match against {
-                GitAgainst::Head => None,
-                GitAgainst::PrBase => {
-                    merge_base_oid(&cwd.join(&root.workspace_dir), &root.remote_branch).ok()
-                }
-            };
+    let result = (|| {
+        let repo = cwd.join(&root.workspace_dir);
+        let comparison = comparison_for_root(&repo, root, against)?;
+        let base_arg = comparison
+            .as_ref()
+            .map(|value| value.merge_base_oid.as_str())
+            .unwrap_or("HEAD");
+        let map = status_map_for_root(cwd, root, against, base_arg)?;
+        Ok::<_, anyhow::Error>((comparison, map))
+    })();
+    match result {
+        Ok((comparison, map)) => {
             let entries = map
                 .into_iter()
                 .map(|(path, status)| GitStatusEntry { path, status })
                 .collect();
             GitStatusRoot {
                 workspace_dir: root.workspace_dir.clone(),
-                base_oid,
+                comparison,
                 error: None,
                 entries,
             }
         }
         Err(error) => GitStatusRoot {
             workspace_dir: root.workspace_dir.clone(),
-            base_oid: None,
+            comparison: None,
             error: Some(format!("{error:#}")),
             entries: Vec::new(),
         },
@@ -126,6 +130,7 @@ fn status_map_for_root(
     cwd: &Path,
     root: &GitBrowseRoot,
     against: GitAgainst,
+    base_arg: &str,
 ) -> Result<BTreeMap<String, GitFileStatus>> {
     let repo = cwd.join(&root.workspace_dir);
     if !repo.join(".git").exists() {
@@ -133,18 +138,18 @@ fn status_map_for_root(
     }
     let mut map = BTreeMap::new();
     match against {
-        GitAgainst::Head => {
+        GitAgainst::WorkingTree => {
             for (rel, status) in
                 parse_porcelain(&git_output(&repo, &["status", "--porcelain=v1", "-z"])?)
             {
                 map.insert(cwd_join(&root.workspace_dir, &rel), status);
             }
         }
-        GitAgainst::PrBase => {
-            let base = merge_base_oid(&repo, &root.remote_branch)?;
-            for (rel, status) in
-                parse_name_status(&git_output(&repo, &["diff", "--name-status", "-z", &base])?)
-            {
+        GitAgainst::Branch => {
+            for (rel, status) in parse_name_status(&git_output(
+                &repo,
+                &["diff", "--name-status", "-z", base_arg],
+            )?) {
                 map.insert(cwd_join(&root.workspace_dir, &rel), status);
             }
             // Untracked + conflicts still come from porcelain.
@@ -160,13 +165,173 @@ fn status_map_for_root(
     Ok(map)
 }
 
-fn merge_base_oid(repo: &Path, remote_branch: &str) -> Result<String> {
-    let branch = remote_branch.trim();
-    if branch.is_empty() {
-        bail!("remote_branch is required for pr_base");
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct GhPullRequest {
+    number: u64,
+    title: String,
+    url: String,
+    head_ref_name: String,
+    head_ref_oid: String,
+    head_repository_owner: GhRepositoryOwner,
+    base_ref_name: String,
+    base_ref_oid: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GhRepositoryOwner {
+    login: String,
+}
+
+fn comparison_for_root(
+    repo: &Path,
+    root: &GitBrowseRoot,
+    against: GitAgainst,
+) -> Result<Option<GitComparison>> {
+    if against == GitAgainst::WorkingTree {
+        return Ok(None);
     }
-    let origin_ref = format!("refs/remotes/origin/{branch}");
-    git_output(repo, &["merge-base", "HEAD", &origin_ref])
+
+    let head_oid = git_output(repo, &["rev-parse", "HEAD"])?;
+    let current_branch = git_output(repo, &["symbolic-ref", "--short", "HEAD"])
+        .unwrap_or_else(|_| root.local_branch.clone());
+    let fallback_base_oid = git_output(
+        repo,
+        &[
+            "rev-parse",
+            &format!("refs/remotes/origin/{}", root.remote_branch),
+        ],
+    )?;
+
+    let mut base = GitComparisonRef {
+        branch: root.remote_branch.clone(),
+        oid: fallback_base_oid,
+        pull_request: None,
+    };
+    let mut tip = GitComparisonRef {
+        branch: current_branch,
+        oid: head_oid.clone(),
+        pull_request: None,
+    };
+
+    if let Some((owner, repository)) = github_repo(&root.remote_url) {
+        if let Some(pull_requests) = github_pull_requests(repo, &owner, &repository) {
+            if let Some((tip_pr, base_pr)) = resolve_pr_pair(
+                &pull_requests,
+                &owner,
+                &root.remote_branch,
+                &head_oid,
+                |oid| git_is_ancestor(repo, oid, "HEAD"),
+            ) {
+                base = GitComparisonRef {
+                    branch: tip_pr.base_ref_name.clone(),
+                    oid: tip_pr.base_ref_oid.clone(),
+                    pull_request: base_pr.map(pull_request_view),
+                };
+                tip = GitComparisonRef {
+                    branch: tip_pr.head_ref_name.clone(),
+                    oid: head_oid,
+                    pull_request: Some(pull_request_view(tip_pr)),
+                };
+            }
+        }
+    }
+
+    let merge_base_oid = git_output(repo, &["merge-base", "HEAD", &base.oid])?;
+    Ok(Some(GitComparison {
+        base,
+        tip,
+        merge_base_oid,
+    }))
+}
+
+fn resolve_pr_pair<'a>(
+    pull_requests: &'a [GhPullRequest],
+    repository_owner: &str,
+    remote_branch: &str,
+    head_oid: &str,
+    mut is_ancestor: impl FnMut(&str) -> bool,
+) -> Option<(&'a GhPullRequest, Option<&'a GhPullRequest>)> {
+    let tip = pull_requests
+        .iter()
+        .find(|pr| pr.head_ref_oid == head_oid)
+        .or_else(|| {
+            pull_requests.iter().find(|pr| {
+                pr.head_repository_owner.login == repository_owner
+                    && pr.head_ref_name == remote_branch
+                    && is_ancestor(&pr.head_ref_oid)
+            })
+        })?;
+    let base = pull_requests
+        .iter()
+        .find(|pr| pr.head_ref_name == tip.base_ref_name && pr.head_ref_oid == tip.base_ref_oid)
+        .or_else(|| {
+            pull_requests.iter().find(|pr| {
+                pr.head_repository_owner.login == repository_owner
+                    && pr.head_ref_name == tip.base_ref_name
+            })
+        });
+    Some((tip, base))
+}
+
+fn pull_request_view(pr: &GhPullRequest) -> GitPullRequest {
+    GitPullRequest {
+        number: pr.number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+    }
+}
+
+fn github_pull_requests(repo: &Path, owner: &str, repository: &str) -> Option<Vec<GhPullRequest>> {
+    let slug = format!("{owner}/{repository}");
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            &slug,
+            "--state",
+            "open",
+            "--limit",
+            "500",
+            "--json",
+            "number,title,url,headRefName,headRefOid,headRepositoryOwner,baseRefName,baseRefOid",
+        ])
+        .current_dir(repo)
+        .env("GH_PROMPT_DISABLED", "1")
+        .output()
+        .ok()?;
+    decode_github_pull_requests(output.status.success(), &output.stdout)
+}
+
+fn decode_github_pull_requests(success: bool, stdout: &[u8]) -> Option<Vec<GhPullRequest>> {
+    if !success {
+        return None;
+    }
+    serde_json::from_slice(stdout).ok()
+}
+
+fn github_repo(remote_url: &str) -> Option<(String, String)> {
+    let path = remote_url
+        .strip_prefix("https://github.com/")
+        .or_else(|| remote_url.strip_prefix("http://github.com/"))
+        .or_else(|| remote_url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| remote_url.strip_prefix("git@github.com:"))?
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    let (owner, repository) = path.split_once('/')?;
+    if owner.is_empty() || repository.is_empty() || repository.contains('/') {
+        return None;
+    }
+    Some((owner.to_string(), repository.to_string()))
+}
+
+fn git_is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> bool {
+    git_command()
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(repo)
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn diff_against(repo: &Path, base: &str, rel: &str) -> Result<(String, bool, bool)> {
@@ -461,18 +626,20 @@ mod tests {
     fn root() -> GitBrowseRoot {
         GitBrowseRoot {
             workspace_dir: "repo".into(),
+            remote_url: "file:///tmp/origin.git".into(),
             remote_branch: "main".into(),
+            local_branch: "feature".into(),
         }
     }
 
     #[test]
-    fn head_status_marks_modified_and_untracked() {
+    fn working_tree_status_marks_modified_and_untracked() {
         let (_tmp, cwd) = init_session_cwd();
         let repo = cwd.join("repo");
         fs::write(repo.join("README.md"), "changed\n").unwrap();
         fs::write(repo.join("new.txt"), "hi\n").unwrap();
 
-        let report = git_status(&cwd, &[root()], GitAgainst::Head).unwrap();
+        let report = git_status(&cwd, &[root()], GitAgainst::WorkingTree).unwrap();
         let by_path: BTreeMap<_, _> = report.roots[0]
             .entries
             .iter()
@@ -486,10 +653,26 @@ mod tests {
     }
 
     #[test]
+    fn status_resolves_multiple_roots_independently() {
+        let (_tmp, cwd) = init_session_cwd();
+        git(&cwd, &["clone", "repo", "repo-b"]);
+        fs::write(cwd.join("repo/README.md"), "repo a\n").unwrap();
+        fs::write(cwd.join("repo-b/README.md"), "repo b\n").unwrap();
+        let mut second = root();
+        second.workspace_dir = "repo-b".into();
+
+        let report = git_status(&cwd, &[root(), second], GitAgainst::WorkingTree).unwrap();
+
+        assert_eq!(report.roots.len(), 2);
+        assert_eq!(report.roots[0].entries[0].path, "repo/README.md");
+        assert_eq!(report.roots[1].entries[0].path, "repo-b/README.md");
+    }
+
+    #[test]
     fn clean_file_has_no_diff() {
         let (_tmp, cwd) = init_session_cwd();
 
-        let report = git_diff(&cwd, "repo/README.md", &[root()], GitAgainst::Head).unwrap();
+        let report = git_diff(&cwd, "repo/README.md", &[root()], GitAgainst::WorkingTree).unwrap();
 
         assert_eq!(report.status, None);
         assert!(report.unified.is_empty());
@@ -497,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn pr_base_status_includes_committed_and_uncommitted() {
+    fn branch_status_includes_committed_and_uncommitted() {
         let (_tmp, cwd) = init_session_cwd();
         let repo = cwd.join("repo");
 
@@ -506,10 +689,14 @@ mod tests {
         git(&repo, &["commit", "-m", "edit nested"]);
         fs::write(repo.join("extra.rs"), "extra\n").unwrap();
 
-        let report = git_status(&cwd, &[root()], GitAgainst::PrBase).unwrap();
+        let report = git_status(&cwd, &[root()], GitAgainst::Branch).unwrap();
         let status_root = &report.roots[0];
         assert!(status_root.error.is_none(), "{:?}", status_root.error);
-        assert!(status_root.base_oid.is_some());
+        let comparison = status_root.comparison.as_ref().unwrap();
+        assert_eq!(comparison.base.branch, "main");
+        assert_eq!(comparison.tip.branch, "feature");
+        assert!(comparison.base.pull_request.is_none());
+        assert!(comparison.tip.pull_request.is_none());
         let by_path: BTreeMap<_, _> = status_root
             .entries
             .iter()
@@ -523,6 +710,78 @@ mod tests {
             by_path.get("repo/extra.rs"),
             Some(&GitFileStatus::Untracked)
         );
+    }
+
+    fn gh_pr(
+        number: u64,
+        head_ref_name: &str,
+        head_ref_oid: &str,
+        base_ref_name: &str,
+        base_ref_oid: &str,
+    ) -> GhPullRequest {
+        GhPullRequest {
+            number,
+            title: format!("PR {number}"),
+            url: format!("https://github.com/example/repo/pull/{number}"),
+            head_ref_name: head_ref_name.into(),
+            head_ref_oid: head_ref_oid.into(),
+            head_repository_owner: GhRepositoryOwner {
+                login: "example".into(),
+            },
+            base_ref_name: base_ref_name.into(),
+            base_ref_oid: base_ref_oid.into(),
+        }
+    }
+
+    #[test]
+    fn resolves_stacked_base_and_tip_prs() {
+        let prs = [
+            gh_pr(1, "stack-base", "base-oid", "main", "main-oid"),
+            gh_pr(2, "stack-tip", "tip-oid", "stack-base", "base-oid"),
+        ];
+
+        let (tip, base) =
+            resolve_pr_pair(&prs, "example", "stack-tip", "local-oid", |_| true).unwrap();
+
+        assert_eq!(tip.number, 2);
+        assert_eq!(base.unwrap().number, 1);
+    }
+
+    #[test]
+    fn exact_head_oid_resolves_pr_when_branch_name_differs() {
+        let prs = [gh_pr(2, "published-name", "tip-oid", "main", "main-oid")];
+
+        let (tip, base) =
+            resolve_pr_pair(&prs, "example", "local-name", "tip-oid", |_| false).unwrap();
+
+        assert_eq!(tip.number, 2);
+        assert!(base.is_none());
+    }
+
+    #[test]
+    fn unresolved_pr_context_falls_back_to_branches() {
+        let prs = [gh_pr(2, "other", "other-oid", "main", "main-oid")];
+
+        assert!(resolve_pr_pair(&prs, "example", "feature", "head-oid", |_| false).is_none());
+    }
+
+    #[test]
+    fn parses_supported_github_remote_urls() {
+        assert_eq!(
+            github_repo("https://github.com/example/repo.git"),
+            Some(("example".into(), "repo".into()))
+        );
+        assert_eq!(
+            github_repo("git@github.com:example/repo.git"),
+            Some(("example".into(), "repo".into()))
+        );
+        assert_eq!(github_repo("https://gitlab.com/example/repo.git"), None);
+    }
+
+    #[test]
+    fn unavailable_or_malformed_github_metadata_is_ignored() {
+        assert_eq!(decode_github_pull_requests(false, b"[]"), None);
+        assert_eq!(decode_github_pull_requests(true, b"not json"), None);
     }
 
     #[test]
@@ -539,11 +798,15 @@ mod tests {
         let roots = [
             GitBrowseRoot {
                 workspace_dir: "a".into(),
+                remote_url: "https://github.com/example/a.git".into(),
                 remote_branch: "main".into(),
+                local_branch: "feature".into(),
             },
             GitBrowseRoot {
                 workspace_dir: "a/nested".into(),
+                remote_url: "https://github.com/example/nested.git".into(),
                 remote_branch: "main".into(),
+                local_branch: "feature".into(),
             },
         ];
         assert_eq!(

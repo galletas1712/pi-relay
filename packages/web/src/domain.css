@@ -4078,6 +4078,69 @@ pre {
 	padding: 0;
 }
 
+.files-git-comparisons {
+	display: grid;
+	gap: 7px;
+	border-bottom: 1px solid var(--border);
+	padding: 7px 8px;
+}
+
+.files-git-comparison {
+	display: grid;
+	gap: 3px;
+	min-width: 0;
+}
+
+.files-git-comparison-root {
+	overflow: hidden;
+	color: var(--muted-foreground);
+	font-family: var(--font-mono);
+	font-size: var(--text-xs);
+	font-weight: 600;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.git-comparison-summary {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+	align-items: center;
+	gap: 5px;
+	min-width: 0;
+}
+
+.git-comparison-ref {
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+	gap: 1px;
+}
+
+.git-comparison-branch,
+.git-comparison-ref a {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.git-comparison-branch {
+	color: var(--foreground);
+	font-family: var(--font-mono);
+}
+
+.git-comparison-ref a {
+	color: var(--link, var(--primary));
+	text-decoration: none;
+}
+
+.git-comparison-ref a:hover {
+	text-decoration: underline;
+}
+
+.git-comparison-arrow {
+	color: var(--muted-foreground);
+}
+
 .files-git-deleted {
 	border-bottom: 1px solid var(--border);
 	font-size: var(--text-xs);
@@ -4205,6 +4268,12 @@ pre {
 
 .file-pane-diff {
 	max-height: none;
+}
+
+.file-pane-meta .git-comparison-summary {
+	display: inline-grid;
+	width: min(34rem, 100%);
+	vertical-align: middle;
 }
 
 .file-pane-diff .edit-diff-row.context .edit-diff-text,
