@@ -4445,10 +4445,10 @@ export function App({
 		setFilesOnlyPreference(false);
 		setSelectedFilePath(path);
 		setSelectedFileViewMode(
-			diffAgainst === "head"
-				? "diff_head"
-				: diffAgainst === "pr_base"
-					? "diff_pr_base"
+			diffAgainst === "working_tree"
+				? "diff_working_tree"
+				: diffAgainst === "branch"
+					? "diff_branch"
 					: "contents",
 		);
 		replaceFileQuery(path);

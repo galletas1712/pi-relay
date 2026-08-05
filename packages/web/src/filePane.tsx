@@ -5,13 +5,14 @@ import { loadCachedWorkspaceFile, workspaceFileQueryKey } from "./fileBrowser.ts
 import { FileView } from "./fileView.tsx";
 import type { AgentApi } from "./agentApi.ts";
 import { browsePathBasename } from "./filePath.ts";
+import { GitComparisonSummary } from "./gitComparison.tsx";
 import { workspaceGitDiffQueryKey } from "./gitStatus.ts";
 import { useParkedScrollPreservation } from "./parkedScroll.ts";
-import type { GitAgainst, SessionWorkspace } from "./types.ts";
+import type { GitAgainst, GitComparison, SessionWorkspace } from "./types.ts";
 import { diffMarker, parseUnifiedDiff } from "./unifiedDiff.ts";
 import { workspaceFileCache } from "./workspaceFileCache.ts";
 
-export type FilePaneViewMode = "contents" | "diff_head" | "diff_pr_base";
+export type FilePaneViewMode = "contents" | "diff_working_tree" | "diff_branch";
 
 export interface FilePaneProps {
 	api: AgentApi;
@@ -70,7 +71,11 @@ export function FilePane({
 	});
 
 	const diffAgainst: GitAgainst | null =
-		viewMode === "diff_head" ? "head" : viewMode === "diff_pr_base" ? "pr_base" : null;
+		viewMode === "diff_working_tree"
+			? "working_tree"
+			: viewMode === "diff_branch"
+				? "branch"
+				: null;
 
 	const diffQuery = useQuery({
 		queryKey: diffAgainst
@@ -124,8 +129,8 @@ export function FilePane({
 							aria-label="File view mode"
 						>
 							<option value="contents">Contents</option>
-							<option value="diff_head">Diff vs HEAD</option>
-							<option value="diff_pr_base">Diff vs PR base</option>
+							<option value="diff_working_tree">Working tree diff</option>
+							<option value="diff_branch">Branch diff</option>
 						</select>
 					</label>
 				) : null}
@@ -172,7 +177,7 @@ export function FilePane({
 						binary={diffQuery.data.binary}
 						truncated={diffQuery.data.truncated}
 						status={diffQuery.data.status ?? null}
-						baseOid={diffQuery.data.base_oid ?? null}
+						comparison={diffQuery.data.comparison ?? null}
 						against={diffQuery.data.against}
 						updating={diffQuery.isFetching}
 					/>
@@ -187,7 +192,7 @@ function FileDiffView({
 	binary,
 	truncated,
 	status,
-	baseOid,
+	comparison,
 	against,
 	updating,
 }: {
@@ -195,7 +200,7 @@ function FileDiffView({
 	binary: boolean;
 	truncated: boolean;
 	status: string | null;
-	baseOid: string | null;
+	comparison: GitComparison | null;
 	against: GitAgainst;
 	updating: boolean;
 }) {
@@ -203,8 +208,16 @@ function FileDiffView({
 	return (
 		<>
 			<div className="file-pane-meta muted">
-				{against === "pr_base" ? "PR base" : "HEAD"}
-				{baseOid ? ` · ${baseOid.slice(0, 8)}` : ""}
+				{against === "branch" ? (
+					comparison ? (
+						<GitComparisonSummary comparison={comparison} />
+					) : (
+						"Branch comparison"
+					)
+				) : (
+					"HEAD → working tree"
+				)}
+				{comparison ? ` · merge base ${comparison.merge_base_oid.slice(0, 8)}` : ""}
 				{status ? ` · ${status}` : ""}
 				{updating ? " · updating…" : ""}
 			</div>

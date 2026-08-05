@@ -2044,25 +2044,24 @@ collapsed ancestor folders.
 
 `against`:
 
-- `head` — working tree (+ index) vs `HEAD` (`git status --porcelain`)
-- `pr_base` — working tree vs `merge-base(HEAD, origin/<remote_branch>)`, plus
-  untracked/conflict entries from porcelain. Uses the local
-  `origin/<remote_branch>` ref (no browse-time fetch).
+- `working_tree` — working tree (+ index) vs `HEAD` (`git status --porcelain`)
+- `branch` — working tree vs the current PR's declared base when GitHub PR
+  metadata can be resolved, otherwise vs the configured remote branch. Uses
+  existing local objects only (no browse-time fetch).
 
 ```json
 {
   "session_id": "session_...",
-  "against": "head"
+  "against": "working_tree"
 }
 ```
 
 ```json
 {
-  "against": "head",
+  "against": "working_tree",
   "roots": [
     {
       "workspace_dir": "repo-a",
-      "base_oid": null,
       "entries": [
         { "path": "repo-a/src/main.rs", "status": "modified" },
         { "path": "repo-a/new.txt", "status": "untracked" }
@@ -2075,12 +2074,15 @@ collapsed ancestor folders.
 `status` is one of `modified`, `added`, `deleted`, `untracked`, `conflict`.
 Paths are cwd-relative (include the `workspace_dir/` prefix). Per-root `error`
 is set when that root cannot be resolved (missing `.git`, unknown
-`origin/<remote_branch>`, etc.); other roots still succeed. For `pr_base`,
-`base_oid` is the merge-base SHA when available.
+`origin/<remote_branch>`, etc.); other roots still succeed. For `branch`,
+`comparison` identifies the base and tip branches, their OIDs, optional open
+GitHub PR metadata, and the merge-base used by the diff. PR metadata is
+best-effort through the authenticated `gh` CLI; unavailable or unsupported
+forges fall back to branch-only context.
 
 ### `workspace.git_diff`
 
-Unified diff for one cwd-relative file against `head` or `pr_base` (same
+Unified diff for one cwd-relative file against `working_tree` or `branch` (same
 semantics as `workspace.git_status`). Output is capped (~1 MiB); `binary` /
 `truncated` report when the payload is not a usable text diff.
 
@@ -2088,15 +2090,35 @@ semantics as `workspace.git_status`). Output is capped (~1 MiB); `binary` /
 {
   "session_id": "session_...",
   "path": "repo-a/src/main.rs",
-  "against": "pr_base"
+  "against": "branch"
 }
 ```
 
 ```json
 {
   "path": "repo-a/src/main.rs",
-  "against": "pr_base",
-  "base_oid": "8e9b2f4b7c2c7f0ef2e3b6f0e5ef4f1b18b3b111",
+  "against": "branch",
+  "comparison": {
+    "base": {
+      "branch": "feat/base",
+      "oid": "8e9b2f4b7c2c7f0ef2e3b6f0e5ef4f1b18b3b111",
+      "pull_request": {
+        "number": 370,
+        "title": "Base files work",
+        "url": "https://github.com/example/repo/pull/370"
+      }
+    },
+    "tip": {
+      "branch": "feat/files",
+      "oid": "4f5e6d7c8b9a",
+      "pull_request": {
+        "number": 374,
+        "title": "Add git file views",
+        "url": "https://github.com/example/repo/pull/374"
+      }
+    },
+    "merge_base_oid": "8e9b2f4b7c2c7f0ef2e3b6f0e5ef4f1b18b3b111"
+  },
   "status": "modified",
   "unified": "diff --git a/src/main.rs b/src/main.rs\n...",
   "binary": false,

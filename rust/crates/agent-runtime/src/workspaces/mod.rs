@@ -169,7 +169,7 @@ impl WorkspaceManager {
             .context("browse git_status task failed")?
     }
 
-    /// Unified diff for one cwd-relative path against HEAD or the PR merge-base.
+    /// Unified diff for one cwd-relative path against HEAD or its branch base.
     pub async fn browse_git_diff(
         &self,
         workspace_id: &str,
