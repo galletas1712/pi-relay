@@ -79,7 +79,7 @@ pub fn git_diff(
         // Untracked files are absent from a normal git diff.
         diff_as_new_file(&repo, &rel_in_repo)?
     } else {
-        diff_against(&repo, &base_arg, &rel_in_repo)?
+        diff_against(&repo, base_arg, &rel_in_repo)?
     };
 
     Ok(GitDiffReport {

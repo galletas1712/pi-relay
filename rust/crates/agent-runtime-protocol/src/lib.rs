@@ -324,7 +324,7 @@ pub enum RuntimeCommandResult {
         path: String,
         against: GitAgainst,
         #[serde(skip_serializing_if = "Option::is_none")]
-        comparison: Option<GitComparison>,
+        comparison: Option<Box<GitComparison>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<GitFileStatus>,
         unified: String,
