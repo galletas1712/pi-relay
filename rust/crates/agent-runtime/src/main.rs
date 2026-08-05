@@ -623,6 +623,40 @@ impl Runtime {
                     .set_browse_watch(&workspace_id, directories, files)?;
                 Ok(RuntimeCommandResult::Ack)
             }
+            RuntimeCommand::BrowseGitStatus {
+                workspace_id,
+                against,
+                roots,
+            } => {
+                let report = self
+                    .workspaces
+                    .browse_git_status(&workspace_id, roots, against)
+                    .await?;
+                Ok(RuntimeCommandResult::GitStatus {
+                    against: report.against,
+                    roots: report.roots,
+                })
+            }
+            RuntimeCommand::BrowseGitDiff {
+                workspace_id,
+                path,
+                against,
+                roots,
+            } => {
+                let report = self
+                    .workspaces
+                    .browse_git_diff(&workspace_id, &path, roots, against)
+                    .await?;
+                Ok(RuntimeCommandResult::GitDiff {
+                    path: report.path,
+                    against: report.against,
+                    base_oid: report.base_oid,
+                    status: report.status,
+                    unified: report.unified,
+                    binary: report.binary,
+                    truncated: report.truncated,
+                })
+            }
             RuntimeCommand::ReadRuntimeContext {
                 workspace_id,
                 workspace_dirs,

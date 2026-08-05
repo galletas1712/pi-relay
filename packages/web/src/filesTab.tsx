@@ -4,7 +4,7 @@ import {
 	selectionFeature,
 } from "@headless-tree/core";
 import { useTree } from "@headless-tree/react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronRight, File, Folder, FolderOpen } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AgentApi } from "./agentApi.ts";
@@ -14,7 +14,13 @@ import {
 	workspaceDirQueryKey,
 } from "./fileBrowser.ts";
 import { joinBrowsePath } from "./filePath.ts";
-import type { WorkspaceDirEntry, WorkspaceDirListing } from "./types.ts";
+import {
+	fetchWorkspaceGitStatus,
+	GitStatusIndex,
+	statusLetter,
+	workspaceGitStatusQueryKey,
+} from "./gitStatus.ts";
+import type { GitAgainst, GitFileStatus, WorkspaceDirEntry, WorkspaceDirListing } from "./types.ts";
 import { workspaceFileCache } from "./workspaceFileCache.ts";
 
 const ROOT_ID = "__root__";
@@ -52,7 +58,9 @@ export interface FilesTabProps {
 	activity?: string | null;
 	/** Bumped when interest-scoped dir listings should reload from disk. */
 	treeEpoch?: number;
-	onSelectFile: (path: string) => void;
+	/** When false, hide Commit/PR status controls (no git workspace roots). */
+	hasGitWorkspaces?: boolean;
+	onSelectFile: (path: string, diffAgainst?: GitAgainst) => void;
 	onVisibleDirectoriesChange?: (directories: string[]) => void;
 }
 
@@ -63,6 +71,7 @@ export function FilesTab({
 	remoteReadBlockedReason,
 	activity,
 	treeEpoch = 0,
+	hasGitWorkspaces = false,
 	onSelectFile,
 	onVisibleDirectoriesChange,
 }: FilesTabProps) {
@@ -75,6 +84,21 @@ export function FilesTab({
 	expandedItemsRef.current = expandedItems;
 	const [loadingMore, setLoadingMore] = useState<string | null>(null);
 	const [listingEpoch, setListingEpoch] = useState(0);
+	const [gitAgainst, setGitAgainst] = useState<GitAgainst>("head");
+
+	const gitStatusQuery = useQuery({
+		queryKey: sessionId
+			? workspaceGitStatusQueryKey(sessionId, gitAgainst)
+			: ["workspace-git-status", "none"],
+		queryFn: () => fetchWorkspaceGitStatus(api, sessionId!, gitAgainst),
+		enabled: !!sessionId && hasGitWorkspaces && !remoteReadBlockedReason,
+		staleTime: 0,
+	});
+
+	const statusIndex = useMemo(
+		() => new GitStatusIndex(gitStatusQuery.data),
+		[gitStatusQuery.data],
+	);
 
 	const loadChildren = useCallback(
 		async (itemId: string): Promise<{ id: string; data: TreeItemData }[]> => {
@@ -170,6 +194,8 @@ export function FilesTab({
 			});
 			workspaceFileCache.clearSession(sessionId);
 			void queryClient.resetQueries({ queryKey: ["workspace-file", sessionId] });
+			void queryClient.resetQueries({ queryKey: ["workspace-git-status", sessionId] });
+			void queryClient.resetQueries({ queryKey: ["workspace-git-diff", sessionId] });
 		}
 		prevActivity.current = activity;
 	}, [activity, queryClient, reloadVisibleDirectories, sessionId]);
@@ -177,7 +203,11 @@ export function FilesTab({
 	useEffect(() => {
 		if (treeEpoch === 0) return;
 		reloadVisibleDirectories();
-	}, [treeEpoch, reloadVisibleDirectories]);
+		if (sessionId && hasGitWorkspaces) {
+			void queryClient.invalidateQueries({ queryKey: ["workspace-git-status", sessionId] });
+			void queryClient.invalidateQueries({ queryKey: ["workspace-git-diff", sessionId] });
+		}
+	}, [treeEpoch, reloadVisibleDirectories, queryClient, sessionId, hasGitWorkspaces]);
 
 	useEffect(() => {
 		if (listingEpoch === 0) return;
@@ -228,6 +258,17 @@ export function FilesTab({
 		return map;
 	}, [expandedItems, listingEpoch, queryClient, sessionId, treeEpoch]);
 
+	const rootErrors = (gitStatusQuery.data?.roots ?? [])
+		.map((root) => root.error)
+		.filter((error): error is string => !!error);
+	const queryError =
+		gitStatusQuery.error instanceof Error
+			? gitStatusQuery.error.message
+			: gitStatusQuery.error
+				? "Git status request failed"
+				: null;
+	const deletedPaths = statusIndex.pathsWithStatus("deleted");
+
 	return (
 		<div className="files-tab">
 			{!sessionId ? (
@@ -235,76 +276,146 @@ export function FilesTab({
 			) : remoteReadBlockedReason ? (
 				<p className="muted files-tab-empty">{remoteReadBlockedReason}</p>
 			) : (
-				<div {...tree.getContainerProps("Files")} className="files-tree">
-					{items.map((item, index) => {
-						const data = item.getItemData();
-						if (!data || data.kind === "root") return null;
-						const meta = item.getItemMeta();
-						const expanded = item.isExpanded();
-						const selected = selectedSet.has(data.path);
-						const isFolder = data.kind === "directory";
-						const disabled = data.kind === "other";
-						const itemProps = item.getProps();
-						const parentPath = pathFromItemId(meta.parentId ?? ROOT_ID);
-						const nextSibling = items[index + 1];
-						const nextParent = nextSibling
-							? pathFromItemId(nextSibling.getItemMeta().parentId ?? ROOT_ID)
-							: null;
-						const showLoadMore =
-							nextAfterByDir.has(parentPath) && nextParent !== parentPath;
-						return (
-							<div key={item.getId()}>
-								<button
-									{...itemProps}
-									type="button"
-									className={`files-tree-item${selected ? " selected" : ""}${disabled ? " disabled" : ""}`}
-									style={{ paddingLeft: `${10 + meta.level * 12}px` }}
-									disabled={disabled}
-									onClick={(event) => {
-										itemProps.onClick?.(event);
-										if (isFolder) {
-											if (expanded) item.collapse();
-											else void item.expand();
-											return;
-										}
-										if (data.kind === "file") onSelectFile(data.path);
-									}}
-								>
-									<span className="files-tree-twist" aria-hidden>
-										{isFolder ? (
-											<ChevronRight
-												size={12}
-												className={expanded ? "files-tree-twist-open" : undefined}
-											/>
-										) : (
-											<span className="files-tree-twist-spacer" />
-										)}
-									</span>
-									<span className="files-tree-icon" aria-hidden>
-										{isFolder ? (
-											expanded ? <FolderOpen size={14} /> : <Folder size={14} />
-										) : (
-											<File size={14} />
-										)}
-									</span>
-									<span className="files-tree-name">{data.name}</span>
-								</button>
-								{showLoadMore ? (
+				<>
+					{hasGitWorkspaces ? (
+						<div className="files-git-toolbar" role="group" aria-label="Git status view">
+							<button
+								type="button"
+								className={`files-git-mode${gitAgainst === "head" ? " active" : ""}`}
+								aria-pressed={gitAgainst === "head"}
+								title="Changes not included in HEAD"
+								onClick={() => setGitAgainst("head")}
+							>
+								Uncommitted
+							</button>
+							<button
+								type="button"
+								className={`files-git-mode${gitAgainst === "pr_base" ? " active" : ""}`}
+								aria-pressed={gitAgainst === "pr_base"}
+								title="All changes since the PR base"
+								onClick={() => setGitAgainst("pr_base")}
+							>
+								PR changes
+							</button>
+							{gitStatusQuery.isFetching ? (
+								<span className="muted files-git-toolbar-hint">updating…</span>
+							) : null}
+						</div>
+					) : null}
+					{queryError || rootErrors.length > 0 ? (
+						<p
+							className="error-text files-git-error"
+							title={queryError ?? rootErrors.join("\n")}
+						>
+							{queryError ? "Git status unavailable" : "Git status unavailable for some roots"}
+						</p>
+					) : null}
+					{deletedPaths.length > 0 ? (
+						<details className="files-git-deleted">
+							<summary>
+								{deletedPaths.length} deleted {deletedPaths.length === 1 ? "file" : "files"}
+							</summary>
+							<div className="files-git-deleted-list">
+								{deletedPaths.map((path) => (
 									<button
 										type="button"
-										className="files-tree-item files-tree-load-more"
-										style={{ paddingLeft: `${10 + meta.level * 12}px` }}
-										disabled={loadingMore === parentPath}
-										onClick={() => void loadMore(parentPath)}
+										key={path}
+										aria-label={`Open diff for deleted file ${path}`}
+										title={`Open ${gitAgainst === "head" ? "uncommitted" : "PR"} diff for ${path}`}
+										onClick={() => onSelectFile(path, gitAgainst)}
 									>
-										{loadingMore === parentPath ? "Loading…" : "Load more"}
+										<span aria-hidden>D</span>
+										<span>{path}</span>
 									</button>
-								) : null}
+								))}
 							</div>
-						);
-					})}
-				</div>
+						</details>
+					) : null}
+					<div {...tree.getContainerProps("Files")} className="files-tree">
+						{items.map((item, index) => {
+							const data = item.getItemData();
+							if (!data || data.kind === "root") return null;
+							const meta = item.getItemMeta();
+							const expanded = item.isExpanded();
+							const selected = selectedSet.has(data.path);
+							const isFolder = data.kind === "directory";
+							const disabled = data.kind === "other";
+							const itemProps = item.getProps();
+							const parentPath = pathFromItemId(meta.parentId ?? ROOT_ID);
+							const nextSibling = items[index + 1];
+							const nextParent = nextSibling
+								? pathFromItemId(nextSibling.getItemMeta().parentId ?? ROOT_ID)
+								: null;
+							const showLoadMore =
+								nextAfterByDir.has(parentPath) && nextParent !== parentPath;
+							const status = hasGitWorkspaces ? statusIndex.statusFor(data.path) : null;
+							return (
+								<div key={item.getId()}>
+									<button
+										{...itemProps}
+										type="button"
+										className={`files-tree-item${selected ? " selected" : ""}${disabled ? " disabled" : ""}`}
+										style={{ paddingLeft: `${10 + meta.level * 12}px` }}
+										disabled={disabled}
+										onClick={(event) => {
+											itemProps.onClick?.(event);
+											if (isFolder) {
+												if (expanded) item.collapse();
+												else void item.expand();
+												return;
+											}
+											if (data.kind === "file") onSelectFile(data.path);
+										}}
+									>
+										<span className="files-tree-twist" aria-hidden>
+											{isFolder ? (
+												<ChevronRight
+													size={12}
+													className={expanded ? "files-tree-twist-open" : undefined}
+												/>
+											) : (
+												<span className="files-tree-twist-spacer" />
+											)}
+										</span>
+										<span className="files-tree-icon" aria-hidden>
+											{isFolder ? (
+												expanded ? <FolderOpen size={14} /> : <Folder size={14} />
+											) : (
+												<File size={14} />
+											)}
+										</span>
+										<span className="files-tree-name">{data.name}</span>
+										{status ? <GitStatusGlyph status={status} /> : null}
+									</button>
+									{showLoadMore ? (
+										<button
+											type="button"
+											className="files-tree-item files-tree-load-more"
+											style={{ paddingLeft: `${10 + meta.level * 12}px` }}
+											disabled={loadingMore === parentPath}
+											onClick={() => void loadMore(parentPath)}
+										>
+											{loadingMore === parentPath ? "Loading…" : "Load more"}
+										</button>
+									) : null}
+								</div>
+							);
+						})}
+					</div>
+				</>
 			)}
 		</div>
+	);
+}
+
+function GitStatusGlyph({ status }: { status: GitFileStatus }) {
+	return (
+		<span
+			className={`files-tree-git-status files-tree-git-status-${status}`}
+			title={status}
+			aria-label={status}
+		>
+			{statusLetter(status)}
+		</span>
 	);
 }

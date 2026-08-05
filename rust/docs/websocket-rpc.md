@@ -2035,6 +2035,75 @@ their session high-water mark.
 }
 ```
 
+### `workspace.git_status`
+
+Repo-wide changed-path status for every **git** workspace root on the session
+(local folder workspaces are skipped). Independent of `list_dir` expansion: one
+call returns every dirty/untracked/deleted path so the UI can highlight
+collapsed ancestor folders.
+
+`against`:
+
+- `head` — working tree (+ index) vs `HEAD` (`git status --porcelain`)
+- `pr_base` — working tree vs `merge-base(HEAD, origin/<remote_branch>)`, plus
+  untracked/conflict entries from porcelain. Uses the local
+  `origin/<remote_branch>` ref (no browse-time fetch).
+
+```json
+{
+  "session_id": "session_...",
+  "against": "head"
+}
+```
+
+```json
+{
+  "against": "head",
+  "roots": [
+    {
+      "workspace_dir": "repo-a",
+      "base_oid": null,
+      "entries": [
+        { "path": "repo-a/src/main.rs", "status": "modified" },
+        { "path": "repo-a/new.txt", "status": "untracked" }
+      ]
+    }
+  ]
+}
+```
+
+`status` is one of `modified`, `added`, `deleted`, `untracked`, `conflict`.
+Paths are cwd-relative (include the `workspace_dir/` prefix). Per-root `error`
+is set when that root cannot be resolved (missing `.git`, unknown
+`origin/<remote_branch>`, etc.); other roots still succeed. For `pr_base`,
+`base_oid` is the merge-base SHA when available.
+
+### `workspace.git_diff`
+
+Unified diff for one cwd-relative file against `head` or `pr_base` (same
+semantics as `workspace.git_status`). Output is capped (~1 MiB); `binary` /
+`truncated` report when the payload is not a usable text diff.
+
+```json
+{
+  "session_id": "session_...",
+  "path": "repo-a/src/main.rs",
+  "against": "pr_base"
+}
+```
+
+```json
+{
+  "path": "repo-a/src/main.rs",
+  "against": "pr_base",
+  "base_oid": "8e9b2f4b7c2c7f0ef2e3b6f0e5ef4f1b18b3b111",
+  "status": "modified",
+  "unified": "diff --git a/src/main.rs b/src/main.rs\n...",
+  "binary": false,
+  "truncated": false
+}
+```
+
 ## Subagent events
 
 When a delegation subagent is spawned or re-driven, the daemon may emit

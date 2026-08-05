@@ -99,6 +99,8 @@ pub(crate) enum RpcMethod {
     WorkspaceListDir,
     WorkspaceReadFile,
     WorkspaceWatch,
+    WorkspaceGitStatus,
+    WorkspaceGitDiff,
 }
 
 impl RpcMethod {
@@ -156,6 +158,8 @@ impl RpcMethod {
             "workspace.list_dir" => Some(Self::WorkspaceListDir),
             "workspace.read_file" => Some(Self::WorkspaceReadFile),
             "workspace.watch" => Some(Self::WorkspaceWatch),
+            "workspace.git_status" => Some(Self::WorkspaceGitStatus),
+            "workspace.git_diff" => Some(Self::WorkspaceGitDiff),
             _ => None,
         }
     }
@@ -273,6 +277,14 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("workspace.watch"),
             Some(RpcMethod::WorkspaceWatch)
+        );
+        assert_eq!(
+            RpcMethod::parse("workspace.git_status"),
+            Some(RpcMethod::WorkspaceGitStatus)
+        );
+        assert_eq!(
+            RpcMethod::parse("workspace.git_diff"),
+            Some(RpcMethod::WorkspaceGitDiff)
         );
         for old in [
             "stage.start_full",

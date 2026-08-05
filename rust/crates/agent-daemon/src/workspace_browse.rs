@@ -1,4 +1,5 @@
-//! Public `workspace.list_dir` / `workspace.read_file` / `workspace.watch` RPCs.
+//! Public `workspace.list_dir` / `workspace.read_file` / `workspace.watch` /
+//! `workspace.git_status` / `workspace.git_diff` RPCs.
 //!
 //! The browser sends a session ID and cwd-relative paths only. The daemon
 //! resolves the session's runtime/workspace authority and forwards confined
@@ -7,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use agent_runtime_protocol::RuntimeCommandResult;
+use agent_runtime_protocol::{GitAgainst, GitBrowseRoot, RuntimeCommandResult, WorkspaceKind};
 use agent_store::{EventFrame, EventType};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -45,6 +46,19 @@ struct WatchParams {
     directories: Vec<String>,
     #[serde(default)]
     files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitStatusParams {
+    session_id: String,
+    against: GitAgainst,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitDiffParams {
+    session_id: String,
+    path: String,
+    against: GitAgainst,
 }
 
 pub(crate) async fn list_dir(state: &AppState, params: Value) -> Result<Value, RpcError> {
@@ -167,6 +181,102 @@ pub(crate) async fn watch(state: &AppState, params: Value) -> Result<Value, RpcE
     Ok(json!({ "ok": true }))
 }
 
+pub(crate) async fn git_status(state: &AppState, params: Value) -> Result<Value, RpcError> {
+    let params: GitStatusParams = from_params(params)?;
+    let config = state.repo.load_session_config(&params.session_id).await?;
+    let roots = git_browse_roots(&config.workspaces);
+    match state
+        .runtime_hosts
+        .browse_git_status(
+            &config.runtime_id,
+            &config.workspace_id,
+            params.against,
+            roots,
+        )
+        .await
+    {
+        Ok(RuntimeCommandResult::GitStatus { against, roots }) => Ok(json!({
+            "against": against,
+            "roots": roots,
+        })),
+        Ok(_) => Err(RpcError::new(
+            "internal_error",
+            "runtime returned the wrong git_status result",
+        )),
+        Err(error) => Err(map_browse_error(error)),
+    }
+}
+
+pub(crate) async fn git_diff(state: &AppState, params: Value) -> Result<Value, RpcError> {
+    let params: GitDiffParams = from_params(params)?;
+    if params.path.is_empty() {
+        return Err(RpcError::new(
+            "invalid_params",
+            "path must name a file under a git workspace",
+        ));
+    }
+    let config = state.repo.load_session_config(&params.session_id).await?;
+    let roots = git_browse_roots(&config.workspaces);
+    match state
+        .runtime_hosts
+        .browse_git_diff(
+            &config.runtime_id,
+            &config.workspace_id,
+            &params.path,
+            params.against,
+            roots,
+        )
+        .await
+    {
+        Ok(RuntimeCommandResult::GitDiff {
+            path,
+            against,
+            base_oid,
+            status,
+            unified,
+            binary,
+            truncated,
+        }) => {
+            let mut body = json!({
+                "path": path,
+                "against": against,
+                "unified": unified,
+                "binary": binary,
+                "truncated": truncated,
+            });
+            if let Some(base_oid) = base_oid {
+                body["base_oid"] = Value::String(base_oid);
+            }
+            if let Some(status) = status {
+                body["status"] = json!(status);
+            }
+            Ok(body)
+        }
+        Ok(_) => Err(RpcError::new(
+            "internal_error",
+            "runtime returned the wrong git_diff result",
+        )),
+        Err(error) => Err(map_browse_error(error)),
+    }
+}
+
+fn git_browse_roots(workspaces: &[agent_store::SessionWorkspace]) -> Vec<GitBrowseRoot> {
+    workspaces
+        .iter()
+        .filter(|workspace| workspace.kind == WorkspaceKind::Git)
+        .filter_map(|workspace| {
+            let remote_branch = workspace.remote_branch.as_deref()?.trim();
+            if remote_branch.is_empty() {
+                return None;
+            }
+            Some(GitBrowseRoot {
+                workspace_dir: workspace.workspace_dir.clone(),
+                remote_branch: remote_branch.to_string(),
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn publish_browse_fs_changed(
     state: &AppState,
     workspace_id: String,
@@ -246,6 +356,7 @@ fn map_browse_error(error: anyhow::Error) -> RpcError {
         || lower.contains("not a regular file")
         || lower.contains("not a directory")
         || lower.contains("more than")
+        || lower.contains("not under a git")
     {
         "invalid_params"
     } else if lower.contains("runtime") && lower.contains("unavailable") {

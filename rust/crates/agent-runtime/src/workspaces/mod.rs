@@ -1,6 +1,7 @@
 mod config;
 pub mod fs;
 mod git;
+mod git_browse;
 mod instantiate;
 mod local;
 mod sanitize;
@@ -153,6 +154,34 @@ impl WorkspaceManager {
         tokio::task::spawn_blocking(move || fs::read_file_range(&cwd, &path, offset, max_bytes))
             .await
             .context("browse read_file task failed")?
+    }
+
+    /// Repo-wide git status for configured workspace roots under the session cwd.
+    pub async fn browse_git_status(
+        &self,
+        workspace_id: &str,
+        roots: Vec<agent_runtime_protocol::GitBrowseRoot>,
+        against: agent_runtime_protocol::GitAgainst,
+    ) -> Result<git_browse::GitStatusReport> {
+        let cwd = self.resolve(workspace_id);
+        tokio::task::spawn_blocking(move || git_browse::git_status(&cwd, &roots, against))
+            .await
+            .context("browse git_status task failed")?
+    }
+
+    /// Unified diff for one cwd-relative path against HEAD or the PR merge-base.
+    pub async fn browse_git_diff(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        roots: Vec<agent_runtime_protocol::GitBrowseRoot>,
+        against: agent_runtime_protocol::GitAgainst,
+    ) -> Result<git_browse::GitDiffReport> {
+        let cwd = self.resolve(workspace_id);
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || git_browse::git_diff(&cwd, &path, &roots, against))
+            .await
+            .context("browse git_diff task failed")?
     }
 
     pub fn browse_watch_hub(&self) -> Option<&std::sync::Arc<watch::BrowseWatchHub>> {

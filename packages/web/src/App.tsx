@@ -76,7 +76,7 @@ import {
 	loadFilePaneWidth,
 	type PanelMode,
 } from "./panelLayout.ts";
-import { FilePane } from "./filePane.tsx";
+import { FilePane, type FilePaneViewMode } from "./filePane.tsx";
 import { readFileQuery, replaceFileQuery } from "./filePath.ts";
 import type { InspectorTab } from "./inspector.tsx";
 import {
@@ -231,6 +231,7 @@ import {
 } from "./workspaceRoute.ts";
 import type {
 	EventFrame,
+	GitAgainst,
 	McpInventory,
 	McpLoginResult,
 	Project,
@@ -420,6 +421,8 @@ export function App({
 	const [filePaneMaxWidth, setFilePaneMaxWidth] = useState(() => maxFilePaneWidth(1800));
 	const [filePaneResizing, setFilePaneResizing] = useState(false);
 	const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() => readFileQuery());
+	const [selectedFileViewMode, setSelectedFileViewMode] =
+		useState<FilePaneViewMode>("contents");
 	const [filesVisibleDirectories, setFilesVisibleDirectories] = useState<string[]>([]);
 	const [filesTreeEpoch, setFilesTreeEpoch] = useState(0);
 	const [inspectorPreferredTab, setInspectorPreferredTab] = useState<InspectorTab | null>(
@@ -2698,6 +2701,14 @@ export function App({
 							queryKey: workspaceFileQueryKey(event.session_id, path),
 						});
 					}
+					if (directories.length > 0 || files.length > 0) {
+						await queryClient.invalidateQueries({
+							queryKey: ["workspace-git-status", event.session_id],
+						});
+						await queryClient.invalidateQueries({
+							queryKey: ["workspace-git-diff", event.session_id],
+						});
+					}
 					if (directories.length > 0 && event.session_id === selectedRef.current) {
 						setFilesTreeEpoch((epoch) => epoch + 1);
 					}
@@ -4430,9 +4441,16 @@ export function App({
 		applyFilePaneWidth(equalFilePaneWidth(measureFileSplitCenter()), true);
 	}, [applyFilePaneWidth, measureFileSplitCenter]);
 
-	const selectFilePath = useCallback((path: string | null) => {
+	const selectFilePath = useCallback((path: string | null, diffAgainst?: GitAgainst) => {
 		setFilesOnlyPreference(false);
 		setSelectedFilePath(path);
+		setSelectedFileViewMode(
+			diffAgainst === "head"
+				? "diff_head"
+				: diffAgainst === "pr_base"
+					? "diff_pr_base"
+					: "contents",
+		);
 		replaceFileQuery(path);
 		if (path) {
 			setCenterMode("files");
@@ -4465,6 +4483,7 @@ export function App({
 			setFilesOnlyPreference(false);
 			const path = readFileQuery();
 			setSelectedFilePath(path);
+			setSelectedFileViewMode("contents");
 			setCenterMode(path ? "files" : "chat");
 			setInspectorPreferredTab(path ? "files" : "run-board");
 		};
@@ -4493,6 +4512,7 @@ export function App({
 
 		setFilesVisibleDirectories([]);
 		setFilesOnlyPreference(false);
+		setSelectedFileViewMode("contents");
 		if (previousSessionId && sessionChanged) {
 			workspaceFileCache.clearSession(previousSessionId);
 		}
@@ -5128,6 +5148,8 @@ export function App({
 						api={api}
 						sessionId={selectedId}
 						path={selectedFilePath}
+						workspaces={loadedSnapshot?.workspaces ?? selectedSession?.workspaces}
+						initialViewMode={selectedFileViewMode}
 						remoteReadBlockedReason={connectionRemoteActionBlockedReason}
 						parked={fileParked}
 						onClose={() => selectFilePath(null)}
@@ -5212,6 +5234,9 @@ export function App({
 					selectedFilePath={selectedFilePath}
 					preferredTab={inspectorPreferredTab}
 					filesTreeEpoch={filesTreeEpoch}
+					hasGitWorkspaces={(loadedSnapshot?.workspaces ?? selectedSession?.workspaces ?? []).some(
+						(workspace) => (workspace.kind ?? "git") === "git",
+					)}
 					onSelectFile={selectFilePath}
 					onVisibleDirectoriesChange={setFilesVisibleDirectories}
 					onActiveTabChange={handleInspectorTabChange}
