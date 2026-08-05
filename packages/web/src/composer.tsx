@@ -3,6 +3,7 @@ import { Check, Edit3, GripVertical, Loader2, Send, ShipWheel, Square, Trash2, X
 import type { ComposerSubmission } from "./composerRouting.ts";
 import { composerTextNeedsConnection, ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { randomId } from "./ids.ts";
+import { usesOnScreenKeyboard } from "./onScreenKeyboard.ts";
 import { COMMANDS, filterCommands, matchSlashPrefix, type SlashCommandInfo } from "./slash.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
 import type { QueuedInput } from "./types.ts";
@@ -318,11 +319,17 @@ export const Composer = memo(function Composer({
 		});
 		draftRef.current = "";
 		setDraft("");
-		requestAnimationFrame(() => {
-			// A slash command can mount a modal before this callback runs.
-			// Never pull focus back behind that modal.
-			if (!document.querySelector('[role="dialog"], [role="alertdialog"]')) textAreaRef.current?.focus();
-		});
+		if (usesOnScreenKeyboard()) {
+			// Holding focus would pin the software keyboard over the transcript,
+			// hiding the reply the user just asked for.
+			textAreaRef.current?.blur();
+		} else {
+			requestAnimationFrame(() => {
+				// A slash command can mount a modal before this callback runs.
+				// Never pull focus back behind that modal.
+				if (!document.querySelector('[role="dialog"], [role="alertdialog"]')) textAreaRef.current?.focus();
+			});
+		}
 		const accepted = await onSubmit({
 			sessionId: submittedSessionId,
 			text,
