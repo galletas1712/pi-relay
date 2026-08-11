@@ -27,6 +27,7 @@ import {
 	defaultSelectedAssistantIds,
 	formatExportMarkdown,
 } from "./exportTranscript.ts";
+import { appendTurnCard, turnCardSeeMoreEligible } from "./selectedSessionCache/turns.ts";
 import type {
 	EventFrame,
 	ProviderConfig,
@@ -1406,6 +1407,48 @@ describe("selected session cache", () => {
 		expect(selectedEntries(cache).map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
 		expect(cache.snapshot?.entries?.map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
 	});
+
+	it("stays usable when a switch rewinds to an empty branch reporting the real branch tip", () => {
+		// M11b regression: the bridge adapter reports the rewound branch's real
+		// tip entry id as active_leaf_id (legacy daemon semantics — never null
+		// mid-history). isStaleTranscriptTurnsResult must not discard the empty
+		// turn page, and the post-switch refresh must stay usable.
+		const original = entry("entry_1", null, "first", 1);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([original], { transcriptRevision: 17 }));
+		cache = applyTranscriptTurns(cache, turnsResult(original, 17));
+		expect(hasUsableSelectedSessionCache(cache, sessionId)).toBe(true);
+
+		cache = applySwitchResultToCache(cache, {
+			session_id: sessionId,
+			active_leaf_id: "branch_tip_real",
+			activity: "idle",
+			session_revision: 20,
+			queue_revision: 20,
+			transcript_revision: 20,
+			last_event_id: 20,
+			active_branch_entry_ids: [],
+			active_branch_entries: [],
+		});
+
+		let staged = applySelectedSnapshot(
+			cache,
+			overview([], { sessionRevision: 20, transcriptRevision: 20, lastEventId: 20, activeLeafId: "branch_tip_real" }),
+		);
+		staged = applyTranscriptTurns(staged, {
+			session_id: sessionId,
+			active_leaf_id: "branch_tip_real",
+			session_revision: 20,
+			transcript_revision: 20,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
+			cards: [],
+		});
+
+		expect(staged.turnOrder).toEqual([]);
+		expect(hasUsableSelectedSessionCache(staged, sessionId)).toBe(true);
+	});
 });
 
 interface Deferred<T> {
@@ -1689,3 +1732,57 @@ function transcriptAppendedEvent(entryRecord: TranscriptEntry, eventId: number, 
 		},
 	};
 }
+
+describe("B5 agent-message counting (See-more threshold)", () => {
+	const foldCard = (entries: TranscriptEntry[]): TurnCard => {
+		let cards = new Map<string, TurnCard>();
+		let order: string[] = [];
+		for (const e of entries) {
+			const next = appendTurnCard(cards, order, e);
+			cards = next.turnCardsById;
+			order = next.turnOrder;
+		}
+		return cards.get(order.at(-1)!)!;
+	};
+
+	it("counts assistant messages in the fold and gates the toggle at more than 3", () => {
+		const small = foldCard([
+			turnStartedEntry("s", null, 1, 1),
+			entry("u", "s", "go", 2),
+			assistantEntry("a1", "u", "working", 3, 1),
+			toolResultEntry("r1", "a1", 4),
+			assistantEntry("a2", "r1", "done", 5),
+			turnFinishedEntry("f", "a2", 1, "Graceful", 6),
+		]);
+		expect(small.agent_message_count).toBe(2);
+		expect(turnCardSeeMoreEligible(small)).toBe(false);
+
+		const big = foldCard([
+			turnStartedEntry("s", null, 1, 1),
+			entry("u", "s", "go", 2),
+			assistantEntry("a1", "u", "one", 3),
+			assistantEntry("a2", "a1", "two", 4),
+			assistantEntry("a3", "a2", "three", 5),
+			assistantEntry("a4", "a3", "four", 6),
+			turnFinishedEntry("f", "a4", 1, "Graceful", 7),
+		]);
+		expect(big.agent_message_count).toBe(4);
+		expect(turnCardSeeMoreEligible(big)).toBe(true);
+	});
+
+	it("does not double-count a refolded assistant entry (body merge)", () => {
+		const card = foldCard([
+			turnStartedEntry("s", null, 1, 1),
+			entry("u", "s", "go", 2),
+			assistantEntry("a1", "u", "partial", 3),
+			assistantEntry("a1", "u", "partial-merged", 3),
+			turnFinishedEntry("f", "a1", 1, "Graceful", 4),
+		]);
+		expect(card.agent_message_count).toBe(1);
+	});
+
+	it("keeps server-paged cards without a count eligible (legacy fallback)", () => {
+		expect(turnCardSeeMoreEligible({ ...turnCard("c1", 1), status: "completed" })).toBe(true);
+		expect(turnCardSeeMoreEligible({ ...turnCard("c2", 1), status: "compacted" })).toBe(false);
+	});
+});

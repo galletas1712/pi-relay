@@ -1,0 +1,12 @@
+{
+  "name": "@pi-relay/prime-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "M2: continual harness (in-kernel rlm.harness CRUD, skills, harness system-prompt section, /refine) as a pure extension on unpatched upstream pi",
+  "main": "index.ts",
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^24.0.0"
+  }
+}

@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { AgentApi } from "./agentApi.ts";
 import {
 	AppDialog,
@@ -22,7 +22,7 @@ import type {
 
 const EMPTY_SUBAGENT_NAMES = new Map<string, string>();
 
-export type InspectorTab = "run-board" | "files";
+export type InspectorTab = "run-board" | "files" | "repl";
 
 const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
 	{ id: "run-board", label: "Agents" },
@@ -63,6 +63,9 @@ export interface InspectorProps {
 	onActiveTabChange?: (tab: InspectorTab) => void;
 	onSelectSession?: (sessionId: string) => void;
 	onClose?: () => void;
+	/** M11b (bridge profile): optional REPL pane content; when provided a
+	 * third "REPL" tab appears in the rail (bash-block idiom, contract v0.1). */
+	replSlot?: ReactNode;
 }
 
 export function Inspector({
@@ -94,6 +97,7 @@ export function Inspector({
 	onActiveTabChange,
 	onSelectSession,
 	onClose,
+	replSlot,
 }: InspectorProps) {
 	const [activeTab, setActiveTab] = useState<InspectorTab>(preferredTab ?? "run-board");
 	const [inspectorDialogOpen, setInspectorDialogOpen] = useState(false);
@@ -105,7 +109,7 @@ export function Inspector({
 	return (
 		<div className="inspector-inner">
 			<div className="inspector-tabs" role="tablist" aria-label="inspector tabs">
-				{INSPECTOR_TABS.map((tab) => (
+				{(replSlot ? [...INSPECTOR_TABS, { id: "repl" as const, label: "REPL" }] : INSPECTOR_TABS).map((tab) => (
 					<button
 						key={tab.id}
 						className={`inspector-tab ${activeTab === tab.id ? "active" : ""}`}
@@ -180,6 +184,18 @@ export function Inspector({
 						<p className="muted">Files browser unavailable.</p>
 					)}
 				</div>
+				{replSlot ? (
+					<div
+						className={`inspector-tab-panel${activeTab === "repl" ? " is-active" : " is-inactive"}`}
+						role="tabpanel"
+						id="inspector-panel-repl"
+						aria-labelledby="inspector-tab-repl"
+						aria-hidden={activeTab !== "repl"}
+						inert={activeTab !== "repl"}
+					>
+						{activeTab === "repl" ? replSlot : null}
+					</div>
+				) : null}
 			</div>
 			<div className="inspector-footer">
 				<button

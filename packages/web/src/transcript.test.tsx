@@ -391,7 +391,7 @@ describe("turn jump navigation", () => {
 		expect(html).toContain('data-transcript-nav-stop="user-turn_1-user_1"');
 		expect(html).toContain('data-transcript-nav-stop="assistant-turn_1"');
 		expect(html).toContain("turn-summary completed expanded");
-		expect(html).toContain("Hide details");
+		expect(html).toContain("See less");
 	});
 
 	it("walks rendered stops in order and visits a long assistant endpoint before later content", () => {
@@ -935,9 +935,111 @@ describe("MessageList tool use cards", () => {
 		);
 
 		expect(html).not.toContain("Bash: date");
-		expect(html).toContain("Show details");
+		expect(html).toContain("See more");
 		expect(html).toContain("Worked for 6s");
 		expect(html).not.toContain('data-transcript-nav-stop="duration-turn_1"');
+	});
+
+	it("hides the See-more toggle for turns at the agent-message threshold (B5)", () => {
+		const user = userEntryWithParent("user", "start", "ping");
+		const assistant = assistantEntry("assistant", "user", "pong");
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "completed",
+							outcome: "Graceful",
+							start_entry_id: "start",
+							boundary_entry_id: "finish",
+							active_leaf_id: "finish",
+							start_sequence: 1,
+							end_sequence: 4,
+							start_timestamp_ms: 1,
+							timestamp_ms: 6_001,
+							user_messages: [user],
+							assistant_message: assistant,
+							agent_message_count: 3,
+							summary: null,
+							can_resume: false,
+						},
+						entries: null,
+						expanded: true,
+						isCurrent: false,
+					},
+				]}
+				activeLeafId="finish"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
+			/>
+		);
+		expect(html).not.toContain("See more");
+		expect(html).not.toContain("See less");
+		expect(html).not.toContain("Show details");
+		expect(html).not.toContain("Hide details");
+		// full-flow turns show a Loading… placeholder until the detail arrives
+		expect(html).toContain("Loading…");
+	});
+
+	it("shows See more only above the agent-message threshold and See less once expanded (B5)", () => {
+		const user = userEntryWithParent("user", "start", "work");
+		const assistant = assistantEntry("assistant", "user", "done");
+		const baseCard = {
+			id: "turn_1",
+			turn_id: 1,
+			status: "completed" as const,
+			outcome: "Graceful" as const,
+			start_entry_id: "start",
+			boundary_entry_id: "finish",
+			active_leaf_id: "finish",
+			start_sequence: 1,
+			end_sequence: 8,
+			start_timestamp_ms: 1,
+			timestamp_ms: 6_001,
+			user_messages: [user],
+			assistant_message: assistant,
+			summary: null,
+			can_resume: false,
+		};
+		const collapsed = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[{ card: { ...baseCard, agent_message_count: 4 }, entries: null, expanded: false, isCurrent: false }]}
+				activeLeafId="finish"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
+			/>
+		);
+		expect(collapsed).toContain("See more");
+		expect(collapsed).not.toContain("See less");
+		const expandedHtml = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[{ card: { ...baseCard, agent_message_count: 5 }, entries: [user, assistant], expanded: true, isCurrent: false }]}
+				activeLeafId="finish"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
+			/>
+		);
+		expect(expandedHtml).toContain("See less");
 	});
 
 	it("keeps the latest tool-only assistant message visible in expanded turn details", () => {
@@ -1283,7 +1385,7 @@ describe("MessageList Working indicator", () => {
 			/>
 		);
 
-		expect(html).toContain("Show details");
+		expect(html).toContain("See more");
 	});
 
 	it("renders non-Graceful fallback status rows with resume actions without making them stops", () => {

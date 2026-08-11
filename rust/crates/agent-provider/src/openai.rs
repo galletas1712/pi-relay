@@ -64,14 +64,19 @@ pub const CODEX_CLIENT_VERSION: &str = "0.144.0";
 const CODEX_RESIDENCY_US: &str = "us";
 const CODEX_REQUEST_COMPRESSION_LEVEL: i32 = 3;
 const CODEX_COMPACT_REQUEST_TIMEOUT_SECS: u64 = 20 * 60;
-const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_MODELS_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_MODELS_MAX_MODELS: usize = 256;
 const CODEX_MODELS_MAX_SLUG_BYTES: usize = 256;
 const CODEX_MODELS_MAX_EFFORTS: usize = 16;
 const CODEX_MODELS_MAX_EFFORT_BYTES: usize = 64;
-const CODEX_MODELS_SUCCESS_TTL: Duration = Duration::from_secs(5 * 60);
-const CODEX_MODELS_FAILURE_TTL: Duration = Duration::from_secs(30);
+// Catalog is ~450KB and is required on every model turn once the success TTL
+// expires. A short TTL plus a tight request timeout was aborting live sessions
+// with `model_catalog` after provider retries (Codex models request timed out /
+// error decoding response body). Keep the cache warm for an hour and allow the
+// fetch enough time under parallel session load.
+const CODEX_MODELS_SUCCESS_TTL: Duration = Duration::from_secs(60 * 60);
+const CODEX_MODELS_FAILURE_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
@@ -994,7 +999,7 @@ mod catalog_tests {
             OpenAiModelCatalogCache::default(),
         );
 
-        assert_eq!(provider.models_request_timeout, Duration::from_secs(5));
+        assert_eq!(provider.models_request_timeout, Duration::from_secs(30));
         assert!(provider
             .model_metadata("gpt-5.6-sol")
             .await
@@ -1201,7 +1206,7 @@ mod catalog_tests {
             "access-token",
             OpenAiModelCatalogCache::default(),
         );
-        assert_eq!(provider.models_request_timeout, Duration::from_secs(5));
+        assert_eq!(provider.models_request_timeout, Duration::from_secs(30));
         provider.models_request_timeout = Duration::from_millis(10);
 
         let error = provider

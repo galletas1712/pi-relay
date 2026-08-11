@@ -1,0 +1,5 @@
+[project]
+name = "demo-python-skill"
+version = "0.1.0"
+description = "M2 python_import skill fixture"
+requires-python = ">=3.10"

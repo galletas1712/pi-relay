@@ -1,0 +1,5 @@
+[project]
+name = "prime-harness-refine-skill"
+version = "0.1.0"
+description = "Kernel-side refine skill for prime-harness (M2)"
+requires-python = ">=3.10"

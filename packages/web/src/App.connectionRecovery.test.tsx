@@ -249,7 +249,7 @@ describe("App connection recovery integration", () => {
 		await openAndLoad(api);
 
 		const cachedTurn = turnCardContaining("older cached question");
-		await user.click(within(cachedTurn).getByRole("button", { name: "Show details" }));
+		await user.click(within(cachedTurn).getByRole("button", { name: "See more" }));
 		expect(await within(cachedTurn).findByText("cached detail evidence")).toBeTruthy();
 		expect(api.getTranscriptTurnDetail).toHaveBeenCalledTimes(1);
 
@@ -271,7 +271,7 @@ describe("App connection recovery integration", () => {
 		const retry = screen.getByRole("button", { name: "Retry" }) as HTMLButtonElement;
 		const loadOlder = screen.getByRole("button", { name: "Load older turns" }) as HTMLButtonElement;
 		const uncachedTurn = turnCardContaining("cached question");
-		const uncachedShow = within(uncachedTurn).getByRole("button", { name: "Show details" }) as HTMLButtonElement;
+		const uncachedShow = within(uncachedTurn).getByRole("button", { name: "See more" }) as HTMLButtonElement;
 
 		expect(retry.disabled).toBe(true);
 		expect(loadOlder.disabled).toBe(true);
@@ -288,11 +288,11 @@ describe("App connection recovery integration", () => {
 		expect(api.getTranscriptTurnDetail).toHaveBeenCalledTimes(getDetailCalls);
 		expect(api.reconnect).not.toHaveBeenCalled();
 
-		const hideCached = within(cachedTurn).getByRole("button", { name: "Hide details" }) as HTMLButtonElement;
+		const hideCached = within(cachedTurn).getByRole("button", { name: "See less" }) as HTMLButtonElement;
 		expect(hideCached.disabled).toBe(false);
 		await user.click(hideCached);
 		expect(within(cachedTurn).queryByText("cached detail evidence")).toBeNull();
-		const reopenCached = within(cachedTurn).getByRole("button", { name: "Show details" }) as HTMLButtonElement;
+		const reopenCached = within(cachedTurn).getByRole("button", { name: "See more" }) as HTMLButtonElement;
 		expect(reopenCached.disabled).toBe(false);
 		expect(reopenCached.parentElement?.textContent).not.toContain("Waiting for connection");
 		await user.click(reopenCached);
@@ -302,12 +302,12 @@ describe("App connection recovery integration", () => {
 		await emitStatus(api, "open");
 		await waitFor(() => expect(api.getSession).toHaveBeenCalledTimes(getSessionCalls + 1));
 		await waitFor(() => {
-			expect((within(uncachedTurn).getByRole("button", { name: "Show details" }) as HTMLButtonElement).disabled).toBe(false);
+			expect((within(uncachedTurn).getByRole("button", { name: "See more" }) as HTMLButtonElement).disabled).toBe(false);
 			expect((screen.getByRole("button", { name: "Load older turns" }) as HTMLButtonElement).disabled).toBe(false);
 		});
 		expect(api.getTranscriptTurns).toHaveBeenCalledTimes(getTurnsCalls);
 
-		await user.click(within(uncachedTurn).getByRole("button", { name: "Show details" }));
+		await user.click(within(uncachedTurn).getByRole("button", { name: "See more" }));
 		expect(await within(uncachedTurn).findByText("uncached detail evidence")).toBeTruthy();
 		expect(api.getTranscriptTurnDetail).toHaveBeenCalledTimes(getDetailCalls + 1);
 
@@ -639,7 +639,7 @@ describe("App connection recovery integration", () => {
 		await openAndLoad(api);
 		expect(await screen.findByRole("article", { name: /Recent 1/ })).toBeTruthy();
 
-		await user.click(screen.getByRole("button", { name: /see more/i }));
+		await user.click(delegationSeeMoreButton());
 		expect(screen.getByRole("article", { name: /Recent 1/ })).toBeTruthy();
 		expect(screen.getByRole("button", { name: /show fewer/i })).toBeTruthy();
 		expect(api.listDelegations).toHaveBeenCalledWith(SESSION_ID, 100);
@@ -679,7 +679,7 @@ describe("App connection recovery integration", () => {
 		expect(screen.queryByRole("article", { name: /Expanded 100/ })).toBeNull();
 		const callsBeforeOfflineReopen = api.listDelegations.mock.calls.length;
 		await emitStatus(api, "closed");
-		const cachedSeeMore = screen.getByRole("button", { name: /see more/i }) as HTMLButtonElement;
+		const cachedSeeMore = delegationSeeMoreButton();
 		expect(cachedSeeMore.disabled).toBe(false);
 		await user.click(cachedSeeMore);
 		expect(screen.getByRole("article", { name: /Expanded 100/ })).toBeTruthy();
@@ -727,7 +727,7 @@ describe("App connection recovery integration", () => {
 		await openAndLoad(api);
 		expect(await screen.findByRole("article", { name: /First parent row/ })).toBeTruthy();
 
-		await user.click(screen.getByRole("button", { name: /see more/i }));
+		await user.click(delegationSeeMoreButton());
 		const secondParentButtons = screen.getAllByRole("button", { name: /Second parent/ });
 		const secondParentNavigation = secondParentButtons.find(
 			(button) => !button.hasAttribute("aria-haspopup"),
@@ -1043,6 +1043,16 @@ function delegationPage(
 				subagents: [],
 			})),
 	};
+}
+
+
+/** The delegations board has its own "See more" pagination toggle; disambiguate
+ * it from the transcript's per-turn See-more toggle (B5 rename). */
+function delegationSeeMoreButton(): HTMLButtonElement {
+	const buttons = screen.getAllByRole("button", { name: /see more/i });
+	const button = buttons.find((b) => b.classList.contains("run-board-toggle"));
+	if (!button) throw new Error("missing delegation board See more toggle");
+	return button as HTMLButtonElement;
 }
 
 function appDelegation(overrides: Partial<Delegation> = {}): Delegation {

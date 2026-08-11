@@ -332,6 +332,7 @@ function initialTurnCard(entry: TranscriptEntry): TurnCard {
 		user_messages: [],
 		daemon_observations: [],
 		assistant_message: null,
+		agent_message_count: 0,
 		summary: null,
 		can_resume: false,
 	};
@@ -353,6 +354,7 @@ function initialTurnCardFromCompactionResume(compactionCard: TurnCard, entry: Tr
 		user_messages: [],
 		daemon_observations: [],
 		assistant_message: null,
+		agent_message_count: 0,
 		summary: null,
 		can_resume: false,
 	};
@@ -381,9 +383,19 @@ function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
 			user_messages: appendUniqueEntry(next.user_messages, entry),
 		};
 	} else if (item.type === "assistant_message") {
+		// B5: track agent-message volume for the See-more threshold. Only
+		// client-folded cards carry a count (initialTurnCard seeds 0); a server-
+		// paged card (undefined) stays undefined so the legacy daemon's cards
+		// keep their always-on toggle. Refolds of the same entry (body merges)
+		// must not double-count.
+		const priorCount = card.agent_message_count;
+		const sameAsCounted = card.assistant_message?.id === entry.id;
 		next = {
 			...next,
 			assistant_message: entry,
+			...(typeof priorCount === "number"
+				? { agent_message_count: sameAsCounted ? priorCount : priorCount + 1 }
+				: null),
 		};
 	} else if (item.type === "daemon_tool_observation") {
 		next = {
@@ -416,6 +428,22 @@ function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
 
 function turnCardStableId(card: TurnCard): string {
 	return card.boundary_entry_id ?? card.start_entry_id ?? card.active_leaf_id;
+}
+
+/** B5 (owner transcript rule): the per-turn "See more"/"See less" toggle
+ * exists ONLY for turns with more than this many assistant/agent messages;
+ * turns at or under the threshold render their full flow inline with no
+ * toggle. */
+export const SEE_MORE_AGENT_MESSAGE_THRESHOLD = 3;
+
+/** Whether the turn offers the See-more toggle at all. Cards without a
+ * client-folded count (server-paged legacy daemon cards) keep the legacy
+ * always-on behavior; compacted cards never toggle. */
+export function turnCardSeeMoreEligible(card: TurnCard): boolean {
+	if (card.status === "compacted") return false;
+	const count = card.agent_message_count;
+	if (count === undefined || count === null) return true;
+	return count > SEE_MORE_AGENT_MESSAGE_THRESHOLD;
 }
 
 function appendUniqueEntry(entries: TranscriptEntry[], entry: TranscriptEntry): TranscriptEntry[] {

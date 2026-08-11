@@ -351,9 +351,26 @@ export type TranscriptItem =
 	| { type: "user_message"; content: ContentBlock[]; replayed_after_compaction?: boolean }
 	| { type: "assistant_message"; items: AssistantItem[] }
 	| { type: "tool_call_started"; turn_id: number; tool_call: ToolCall }
-	| { type: "tool_result"; tool_call_id: string; tool_name: string; output: string; status: ToolResultStatus }
+	// M11c: args_json is bridge-adapter-only (the legacy daemon never sends
+	// it) — the adapter stashes the tool-call args on standalone tool_result
+	// entries whose assistant message was skipped as textless, so the grouped
+	// rendering can still show the call input (e.g. the ipython cell code).
+	| { type: "tool_result"; tool_call_id: string; tool_name: string; output: string; status: ToolResultStatus; args_json?: string }
 	| { type: "turn_finished"; turn_id: number; outcome: TurnOutcome }
 	| ({ type: "daemon_tool_observation" } & DaemonToolObservation)
+	// M11b (bridge profile): inter-agent comms annotation (prime-comms
+	// agent_message deliveries). Never emitted by the legacy daemon; the
+	// bridge adapter synthesizes these from comms blocks/events. Rendered as a
+	// properly-marked comms block — expandable, orange (--primary) accent.
+	| {
+			type: "comms_message";
+			direction: "in" | "out";
+			from_name: string;
+			to_name: string;
+			role?: string | null;
+			message: string;
+			delivery_status?: string | null;
+	  }
 	| {
 			type: "compaction_summary";
 			source_session_id: string;
@@ -421,6 +438,11 @@ export interface TurnCard {
 	user_messages: TranscriptEntry[];
 	daemon_observations?: TranscriptEntry[];
 	assistant_message?: TranscriptEntry | null;
+	/** B5: count of assistant/agent messages folded into the turn. Set by the
+	 * client-side fold (bridge transcript pages + both profiles' live streams);
+	 * server-paged legacy daemon cards leave it undefined and keep the legacy
+	 * always-on See-more toggle. */
+	agent_message_count?: number | null;
 	summary?: string | null;
 	can_resume: boolean;
 }

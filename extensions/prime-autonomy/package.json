@@ -1,0 +1,12 @@
+{
+  "name": "@pi-relay/prime-autonomy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "M4: prime-agent autonomy features (thread goals, heartbeats, autonomous mode, kernel compact API) as a pure extension on unpatched upstream pi",
+  "main": "index.ts",
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^24.0.0"
+  }
+}

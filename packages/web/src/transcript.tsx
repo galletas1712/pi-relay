@@ -21,6 +21,7 @@ import {
 	ChevronUp,
 	Copy,
 	Loader2,
+	MessagesSquare,
 	Plus,
 	RotateCcw,
 	Terminal,
@@ -33,6 +34,8 @@ import remarkGfm from "remark-gfm";
 import { branchEntriesFor } from "./historyTargets.ts";
 import { ConnectionBlockedReason } from "./connectionRecovery.tsx";
 import { MermaidBlock } from "./mermaidBlock.tsx";
+import { AnsiText } from "./bridge/components/ansi.tsx";
+import { turnCardSeeMoreEligible } from "./selectedSessionCache/turns.ts";
 import { contentBlocksToText, firstLine } from "./text.ts";
 import { assistantMessageText, buildTurnViews } from "./turnView.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
@@ -77,6 +80,7 @@ type TranscriptDisplayNode =
 	| { type: "turn_finished"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "turn_finished" }> } }
 	| { type: "tool_result"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "tool_result" }> } }
 	| { type: "daemon_tool_observation"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "daemon_tool_observation" }> } }
+	| { type: "comms_message"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "comms_message" }> } }
 	| { type: "compaction_summary"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "compaction_summary" }> } }
 	| { type: "compaction_in_progress"; key: string; trigger: "auto" | "manual"; reason: string | null };
 
@@ -1265,6 +1269,9 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	if (node.type === "daemon_tool_observation") {
 		return <DaemonObservationSystemMessage entry={node.entry} />;
 	}
+	if (node.type === "comms_message") {
+		return <CommsMessageCard entry={node.entry} />;
+	}
 	if (node.type === "compaction_summary") {
 		const item = node.entry.item;
 		const tokens = typeof item.tokens_before === "number" ? formatCompactionTokens(item.tokens_before) : null;
@@ -1329,6 +1336,49 @@ function DaemonObservationSystemMessage({
 	return <SystemMessage tone="info" text={daemonObservationSystemText(entry.item)} entryId={entry.id} />;
 }
 
+/** M11b: inter-agent comms block (bridge profile). Properly marked as agent
+ * communication — gruvbox orange (--primary) accent, expandable; collapsed
+ * shows sender → target + a preview, expanded the full message. Status/identity
+ * is carried by the lucide icon (tooltip + aria-label), never a status word. */
+const CommsMessageCard = memo(function CommsMessageCard({
+	entry,
+}: {
+	entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "comms_message" }> };
+}) {
+	const item = entry.item;
+	const [expanded, setExpanded] = useState(false);
+	const preview = item.message.length > 96 ? `${item.message.slice(0, 96)}…` : item.message;
+	const parties = item.direction === "in" ? `${item.from_name} → this session` : `this session → ${item.to_name}`;
+	return (
+		<div className={`comms-message ${expanded ? "expanded" : ""}`} data-entry-id={entry.id}>
+			<button
+				type="button"
+				className="comms-message-toggle"
+				onClick={() => setExpanded((open) => !open)}
+				aria-expanded={expanded}
+				aria-label={`agent message: ${parties}`}
+			>
+				<span className="comms-message-icon" aria-hidden="true" title="agent message">
+					<MessagesSquare size={13} />
+				</span>
+				<span className="comms-message-parties">{parties}</span>
+				{!expanded && preview ? <span className="comms-message-preview">{preview}</span> : null}
+				<ChevronDown size={12} className={`tool-chevron ${expanded ? "open" : ""}`} aria-hidden="true" />
+			</button>
+			{expanded ? (
+				<div className="comms-message-body">
+					<pre className="comms-message-text">{item.message}</pre>
+					<div className="comms-message-meta">
+						{item.role ? <span>{item.role}</span> : null}
+						{item.delivery_status ? <span>{item.delivery_status}</span> : null}
+						<span>{new Date(entry.timestamp_ms).toLocaleString()}</span>
+					</div>
+				</div>
+			) : null}
+		</div>
+	);
+});
+
 const TurnCardRow = memo(function TurnCardRow({
 	turn,
 	pendingActions,
@@ -1362,13 +1412,19 @@ const TurnCardRow = memo(function TurnCardRow({
 	const isExpanded = !!detailEntries;
 	const detailLoadBlockedReason =
 		!isExpanded && !turn.detailCached ? remoteReadBlockedReason : null;
-	const canToggleDetails = card.status !== "compacted" && (!!onExpandTurn || !!onCollapseTurn) && !(turn.isCurrent && isExpanded);
+	// B5 (owner transcript rule): the See-more toggle exists ONLY for turns
+	// with more than 3 agent messages (turnCardSeeMoreEligible). Smaller turns
+	// render their full flow inline (the App auto-loads the detail) and show a
+	// Loading… placeholder until it arrives — no toggle at all.
+	const seeMoreEligible = turnCardSeeMoreEligible(card);
+	const canToggleDetails = seeMoreEligible && card.status !== "compacted" && (!!onExpandTurn || !!onCollapseTurn) && !(turn.isCurrent && isExpanded);
+	const inlineDetailPending = !seeMoreEligible && !isExpanded && card.status !== "compacted";
 	const canResume = card.can_resume && card.active_leaf_id === activeLeafId && !isRunning && !!onResumeTurn;
 	const resumableOutcome = card.outcome === "Interrupted" || card.outcome === "Crashed" ? card.outcome : null;
 	const visibleUserMessages = card.user_messages.filter(
 		(entry) => entry.item.type !== "user_message" || !entry.item.replayed_after_compaction,
 	);
-	const detailLabel = isExpanded ? "Hide details" : isLoading ? "Loading…" : "Show details";
+	const detailLabel = isExpanded ? "See less" : isLoading ? "Loading…" : "See more";
 	const onToggleDetails = () => {
 		if (isExpanded) onCollapseTurn?.(card.id);
 		else onExpandTurn?.(card.id);
@@ -1431,7 +1487,7 @@ const TurnCardRow = memo(function TurnCardRow({
 				) : null,
 			)}
 			{detailRows}
-			{canToggleDetails || canResume ? (
+			{canToggleDetails || canResume || inlineDetailPending ? (
 				<div className="turn-detail-toggle-row">
 					{canToggleDetails ? (
 						<>
@@ -1442,6 +1498,13 @@ const TurnCardRow = memo(function TurnCardRow({
 								onClick={onToggleDetails}
 							>
 								{detailLabel}
+							</button>
+							<ConnectionBlockedReason reason={detailLoadBlockedReason} />
+						</>
+					) : inlineDetailPending ? (
+						<>
+							<button type="button" className="link-button" disabled aria-busy="true">
+								Loading…
 							</button>
 							<ConnectionBlockedReason reason={detailLoadBlockedReason} />
 						</>
@@ -1613,8 +1676,25 @@ class TranscriptDisplayBuilder {
 		}
 		if (item.type === "tool_result") {
 			if (!this.toolCallIds.has(item.tool_call_id)) {
-				this.flushGroup();
-				this.nodes.push({ type: "tool_result", key: entry.id, entry: entry as Extract<TranscriptDisplayNode, { type: "tool_result" }>["entry"] });
+				// M11c (empty-bubble fix): tool results whose assistant entry
+				// was skipped (textless) have no tool_call to fold into. Group
+				// consecutive orphans into the same "Used N tools" expandable
+				// as folded calls so ipython I/O stays gated behind the group
+				// head instead of rendering as exposed stand-alone cards.
+				this.appendToolItem(
+					entry,
+					localToolRunItem(
+						entry.id,
+						{
+							type: "tool_call",
+							key: `orphan-${item.tool_call_id}`,
+							// args_json rides on bridge-adapter tool_result entries
+							// (M11c) so the group body still shows the call input
+							item: { type: "tool_call", id: item.tool_call_id, tool_name: item.tool_name, args_json: item.args_json ?? "{}" }
+						},
+						item
+					)
+				);
 			}
 			return;
 		}
@@ -1622,6 +1702,11 @@ class TranscriptDisplayBuilder {
 		if (item.type === "daemon_tool_observation") {
 			this.flushGroup();
 			this.nodes.push({ type: "daemon_tool_observation", key: entry.id, entry: entry as Extract<TranscriptDisplayNode, { type: "daemon_tool_observation" }>["entry"] });
+			return;
+		}
+		if (item.type === "comms_message") {
+			this.flushGroup();
+			this.nodes.push({ type: "comms_message", key: entry.id, entry: entry as Extract<TranscriptDisplayNode, { type: "comms_message" }>["entry"] });
 			return;
 		}
 		if (item.type === "turn_finished") {
@@ -1666,7 +1751,7 @@ class TranscriptDisplayBuilder {
 		};
 	}
 
-	private appendToolItem(entry: AssistantMessageEntry, item: ToolRunItem) {
+	private appendToolItem(entry: TranscriptEntry, item: ToolRunItem) {
 		const turn = this.turnByEntryId.get(entry.id);
 		if (!this.pendingGroup) {
 			this.pendingGroup = {
@@ -1961,7 +2046,11 @@ const ToolRunGroup = memo(function ToolRunGroup({ node }: { node: Extract<Transc
 	const icon = status === "running" ? <Loader2 className="spin" size={14} /> : <Check size={14} />;
 	const onlyItem = totalItems === 1 ? node.items[0] : null;
 
-	if (onlyItem) {
+	// B3+B5: a lone ipython cell must stay behind the per-turn "Used 1 tool"
+	// expandable (its I/O renders inline once the group opens — no per-tool
+	// dropdown), so it falls through to the group head idiom instead of the
+	// stand-alone card, which would expose the body in toggle-less small turns.
+	if (onlyItem && onlyItem.rawName !== "ipython") {
 		return (
 			<div className="message-row assistant-row">
 				<div className={`tool-card stand-alone single-tool ${onlyItem.statusKind}`}>
@@ -2019,7 +2108,12 @@ const ToolRunGroup = memo(function ToolRunGroup({ node }: { node: Extract<Transc
 const ToolRunDetailItem = memo(function ToolRunDetailItem({ item, defaultExpanded = false }: { item: ToolRunItem; defaultExpanded?: boolean }) {
 	const [expanded, setExpanded] = useState(defaultExpanded);
 	const isExpandable = !!item.editPreview || !!item.input || !!item.result;
-	const rowStyle = isExpandable ? undefined : { gridTemplateColumns: "24px minmax(0, 1fr) auto" };
+	// M11b (owner transcript rules): ipython cells render their input/output
+	// inline once the turn's "Used N tools" group is open — there is NO
+	// per-tool 'ipython' dropdown.
+	const inline = item.rawName === "ipython";
+	const toggleable = isExpandable && !inline;
+	const rowStyle = toggleable ? undefined : { gridTemplateColumns: "24px minmax(0, 1fr) auto" };
 	const icon =
 		item.statusKind === "error" ? (
 			<AlertTriangle size={13} />
@@ -2029,13 +2123,13 @@ const ToolRunDetailItem = memo(function ToolRunDetailItem({ item, defaultExpande
 			<Check size={13} />
 		);
 	return (
-		<div className={`tool-run-item ${item.statusKind} ${expanded ? "expanded" : ""}`}>
+		<div className={`tool-run-item ${item.statusKind} ${expanded || inline ? "expanded" : ""}`}>
 			<button
 				className="tool-run-item-toggle"
 				type="button"
-				onClick={() => (isExpandable ? setExpanded((open) => !open) : undefined)}
-				aria-expanded={isExpandable ? expanded : undefined}
-				disabled={!isExpandable}
+				onClick={() => (toggleable ? setExpanded((open) => !open) : undefined)}
+				aria-expanded={toggleable ? expanded : undefined}
+				disabled={!toggleable}
 				style={rowStyle}
 			>
 				<span className="tool-run-item-icon" aria-hidden="true">
@@ -2043,9 +2137,9 @@ const ToolRunDetailItem = memo(function ToolRunDetailItem({ item, defaultExpande
 				</span>
 				<span className="tool-run-item-title">{item.title}</span>
 				<span className="tool-run-item-status">{isEditToolRunItem(item) && item.statusKind === "success" ? "diff" : item.statusLabel}</span>
-				{isExpandable ? <ChevronDown size={13} className={`tool-chevron ${expanded ? "open" : ""}`} /> : null}
+				{toggleable ? <ChevronDown size={13} className={`tool-chevron ${expanded ? "open" : ""}`} /> : null}
 			</button>
-			{expanded && isExpandable ? (
+			{(toggleable && expanded) || inline ? (
 				<div className="tool-run-item-body">
 					<LocalToolRunBody item={item} />
 				</div>
@@ -2056,6 +2150,9 @@ const ToolRunDetailItem = memo(function ToolRunDetailItem({ item, defaultExpande
 
 function LocalToolRunBody({ item }: { item: ToolRunItem }) {
 	const result = item.result;
+	// M11b: ipython cells use the M9 bash-block idiom — code block (cell/kernel
+	// id badge in front) + ansi-aware output block, both few-lines scrollable.
+	if (item.rawName === "ipython") return <IpythonToolRunBody item={item} />;
 	const showResultOutput = result && (!item.editPreview?.hideSuccessOutput || result.status !== "Success");
 	return (
 		<>
@@ -2307,6 +2404,34 @@ function diffMarker(kind: EditDiffRow["kind"]): string {
 export function ToolOutput({ result }: { result: ToolResultItem }) {
 	const output = result.output || "(empty)";
 	return <pre className={result.status === "Success" ? "" : "tool-output-error"}>{output}</pre>;
+}
+
+/** M11b: ipython cell body — input block with the cell/kernel-id badge in
+ * front, then an ansi-aware output block; both a few lines tall, scrollable.
+ * The success/error status icon rides on the item head (legacy idiom). */
+function IpythonToolRunBody({ item }: { item: ToolRunItem }) {
+	const code = typeof item.input?.code === "string" ? item.input.code : (item.argsJson ?? "");
+	return (
+		<>
+			<div className="tool-section">
+				<div className="tool-section-label ipython-cell-label">
+					<span>input</span>
+					<EntryId entryId={item.id} inline />
+				</div>
+				<pre className="tool-ipython-block">{code}</pre>
+			</div>
+			{item.result ? (
+				<div className="tool-section">
+					<div className="tool-section-label">output</div>
+					<pre className={`tool-ipython-block ${item.result.status === "Success" ? "" : "tool-output-error"}`}>
+						<AnsiText text={item.result.output || "(empty)"} />
+					</pre>
+				</div>
+			) : (
+				<div className="tool-pending">waiting for tool result</div>
+			)}
+		</>
+	);
 }
 
 function SystemMessage({
