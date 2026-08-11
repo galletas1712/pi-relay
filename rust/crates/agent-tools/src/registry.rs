@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::context::ToolContext;
 use crate::error::{ToolError, ToolResult};
 use crate::tools::{
-    ApplyPatchTool, BashTool, TextEditorTool, WebFetchTool, WebSearchTool, APPLY_PATCH_LARK_GRAMMAR,
+    ApplyPatchTool, BashTool, WebFetchTool, WebSearchTool, APPLY_PATCH_LARK_GRAMMAR,
 };
 use crate::CALL_DESCRIPTION_KEY;
 
@@ -95,16 +95,13 @@ impl ProviderTool {
     }
 
     pub fn function_json_named(
-        provider: ProviderKind,
+        _provider: &str,
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: Value,
     ) -> Self {
         let definition = ToolDefinition::new(name, description, input_schema);
-        match provider {
-            ProviderKind::OpenAi => Self::openai_function(&definition),
-            ProviderKind::Claude => Self::anthropic_client(&definition),
-        }
+        Self::openai_function(&definition)
     }
 }
 
@@ -112,8 +109,8 @@ impl ProviderTool {
 pub struct ToolDescriptor {
     canonical_name: String,
     prompt_alias: Option<String>,
-    provider_tools: Vec<(ProviderKind, ProviderTool)>,
-    executors: Vec<(ProviderKind, Box<dyn AgentTool>)>,
+    provider_tool: Option<ProviderTool>,
+    executor: Option<Box<dyn AgentTool>>,
 }
 
 impl ToolDescriptor {
@@ -121,8 +118,8 @@ impl ToolDescriptor {
         Self {
             canonical_name: canonical_name.into(),
             prompt_alias: None,
-            provider_tools: Vec::new(),
-            executors: Vec::new(),
+            provider_tool: None,
+            executor: None,
         }
     }
 
@@ -131,13 +128,13 @@ impl ToolDescriptor {
         self
     }
 
-    pub fn provider(mut self, provider: ProviderKind, provider_tool: ProviderTool) -> Self {
-        self.provider_tools.push((provider, provider_tool));
+    pub fn provider(mut self, provider_tool: ProviderTool) -> Self {
+        self.provider_tool = Some(provider_tool);
         self
     }
 
-    pub fn executor(mut self, provider: ProviderKind, tool: impl AgentTool + 'static) -> Self {
-        self.executors.push((provider, Box::new(tool)));
+    pub fn executor(mut self, tool: impl AgentTool + 'static) -> Self {
+        self.executor = Some(Box::new(tool));
         self
     }
 }
@@ -150,16 +147,10 @@ pub trait ToolExtension: Send + Sync {
 
 #[derive(Default)]
 pub struct ToolRegistry {
-    provider_tools: BTreeMap<String, RegisteredProviderTool>,
+    provider_tools: BTreeMap<String, ProviderTool>,
     aliases: BTreeMap<String, String>,
-    tools: BTreeMap<String, RegisteredTool>,
+    tools: BTreeMap<String, Box<dyn AgentTool>>,
     extensions: BTreeMap<&'static str, ()>,
-}
-
-#[derive(Clone)]
-struct RegisteredProviderTool {
-    provider: ProviderKind,
-    tool: ProviderTool,
 }
 
 struct RegisteredTool {
@@ -185,77 +176,68 @@ impl ToolRegistry {
 
     pub fn register_tool(&mut self, descriptor: ToolDescriptor) {
         let canonical_name = descriptor.canonical_name;
-        for (provider, tool) in descriptor.executors {
-            self.tools.insert(
-                provider_tool_key(provider, &canonical_name),
-                RegisteredTool { tool },
-            );
+        if let Some(tool) = descriptor.executor {
+            self.tools.insert(canonical_name.clone(), tool);
         }
 
-        for (provider, mut provider_tool) in descriptor.provider_tools {
+        if let Some(mut provider_tool) = descriptor.provider_tool {
             provider_tool.canonical_name = canonical_name.clone();
             provider_tool.prompt_alias = descriptor.prompt_alias.clone();
             self.aliases.insert(
-                provider_tool_key(provider, &provider_tool.canonical_name),
+                provider_tool.name.clone(),
                 provider_tool.canonical_name.clone(),
             );
-            self.aliases.insert(
-                provider_tool_key(provider, &provider_tool.name),
-                provider_tool.canonical_name.clone(),
-            );
-            self.provider_tools.insert(
-                provider_tool_key(provider, &provider_tool.canonical_name),
-                RegisteredProviderTool {
-                    provider,
-                    tool: provider_tool,
-                },
-            );
+            // Also map the declaration's wire name as an alias for backward compatibility.
+            if let Some(wire_name) = provider_tool.declaration.get("name").and_then(|v| v.as_str()) {
+                if wire_name != provider_tool.name {
+                    self.aliases.insert(wire_name.to_string(), provider_tool.canonical_name.clone());
+                }
+            }
+            self.provider_tools.insert(canonical_name, provider_tool);
         }
     }
 
-    pub fn provider_tools_for_provider(&self, provider: ProviderKind) -> Vec<ProviderTool> {
-        let mut tools = self
-            .provider_tools
-            .values()
-            .filter(|registered| registered.provider == provider)
-            .map(|registered| registered.tool.clone())
-            .collect::<Vec<_>>();
+    pub fn provider_tools_for_provider(&self, provider: &ProviderKind) -> Vec<ProviderTool> {
+        let _ = provider;
+        let mut tools = self.provider_tools.values().cloned().collect::<Vec<_>>();
         sort_tools_by_name(&mut tools);
         tools
     }
 
     #[cfg(test)]
-    pub fn definitions_for_provider(&self, provider: ProviderKind) -> Vec<ToolDefinition> {
-        self.provider_tools_for_provider(provider)
-            .into_iter()
+    pub fn definitions_for_provider(&self, provider: &ProviderKind) -> Vec<ToolDefinition> {
+        let _ = provider;
+        self.provider_tools
+            .values()
             .map(|tool| {
-                ToolDefinition::new(tool.canonical_name, tool.description, tool.input_schema)
+                ToolDefinition::new(tool.canonical_name.clone(), tool.description.clone(), tool.input_schema.clone())
             })
             .collect()
     }
 
+    pub fn canonical_tool_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.aliases.get(name).map(String::as_str).unwrap_or(name)
+    }
+
+    /// Backwards-compatible alias kept for `agent-provider`.
     pub fn canonical_tool_name_for_provider<'a>(
         &'a self,
-        provider: ProviderKind,
+        _provider: &ProviderKind,
         name: &'a str,
     ) -> &'a str {
-        self.aliases
-            .get(&provider_tool_key(provider, name))
-            .map(String::as_str)
-            .unwrap_or(name)
+        self.canonical_tool_name(name)
     }
 
     pub async fn execute(
         &self,
-        provider: ProviderKind,
         call: &ToolCall,
         ctx: &ToolContext,
     ) -> ToolResult<ToolResultMessage> {
-        let canonical_name = self.canonical_tool_name_for_provider(provider, &call.tool_name);
+        let canonical_name = self.canonical_tool_name(&call.tool_name);
         let tool = self
             .tools
-            .get(&provider_tool_key(provider, canonical_name))
-            .map(|registered| registered.tool.as_ref())
+            .get(canonical_name)
+            .map(|tool| tool.as_ref())
             .ok_or_else(|| ToolError::UnknownTool(call.tool_name.clone()))?;
         if canonical_name == call.tool_name {
             tool.execute(call, ctx).await
@@ -265,10 +247,6 @@ impl ToolRegistry {
             tool.execute(&canonical_call, ctx).await
         }
     }
-}
-
-fn provider_tool_key(provider: ProviderKind, name: &str) -> String {
-    format!("{}:{name}", provider.as_str())
 }
 
 pub(crate) fn sort_tools_by_name(tools: &mut [ProviderTool]) {
@@ -550,14 +528,12 @@ fn register_runtime_tool(
     registry.register_tool(
         ToolDescriptor::new(canonical_name)
             .prompt_alias(prompt_alias)
-            .provider(
-                ProviderKind::OpenAi,
-                ProviderTool::openai_function(&definition),
-            )
-            .provider(
-                ProviderKind::Claude,
-                ProviderTool::anthropic_client(&definition),
-            ),
+            .provider({
+                let mut t = ProviderTool::openai_function(&definition);
+                t.name = canonical_name.to_string();
+                t.canonical_name = canonical_name.to_string();
+                t
+            }),
     );
 }
 
@@ -570,19 +546,14 @@ fn register_uniform<T: AgentTool + Clone + 'static>(
     tool: T,
 ) {
     let definition = tool.definition();
+    let mut provider_tool = ProviderTool::openai_function(&definition);
+    provider_tool.name = canonical_name.to_string();
+    provider_tool.canonical_name = canonical_name.to_string();
     registry.register_tool(
         ToolDescriptor::new(canonical_name)
             .prompt_alias(prompt_alias)
-            .provider(
-                ProviderKind::OpenAi,
-                ProviderTool::openai_function(&definition),
-            )
-            .provider(
-                ProviderKind::Claude,
-                ProviderTool::anthropic_client(&definition),
-            )
-            .executor(ProviderKind::OpenAi, tool.clone())
-            .executor(ProviderKind::Claude, tool),
+            .provider(provider_tool)
+            .executor(tool),
     );
 }
 
@@ -591,40 +562,22 @@ fn register_bash(registry: &mut ToolRegistry) {
     registry.register_tool(
         ToolDescriptor::new("Bash")
             .prompt_alias("shell")
-            .provider(
-                ProviderKind::OpenAi,
-                ProviderTool::openai_function(&definition),
-            )
-            .provider(
-                ProviderKind::Claude,
-                ProviderTool::anthropic_client(&definition),
-            )
-            .executor(ProviderKind::OpenAi, BashTool)
-            .executor(ProviderKind::Claude, BashTool),
+            .provider({
+                let mut t = ProviderTool::openai_function(&definition);
+                t.name = "Bash".to_string();
+                t.canonical_name = "Bash".to_string();
+                t
+            })
+            .executor(BashTool),
     );
 }
 
 fn register_edit(registry: &mut ToolRegistry) {
-    let claude_definition = TextEditorTool.definition();
     registry.register_tool(
         ToolDescriptor::new("Edit")
             .prompt_alias("edit")
-            .provider(ProviderKind::OpenAi, openai_apply_patch_tool())
-            .provider(
-                ProviderKind::Claude,
-                ProviderTool::new(
-                    "str_replace_based_edit_tool",
-                    claude_definition.description,
-                    claude_definition.input_schema,
-                    json!({
-                        "type": "text_editor_20250728",
-                        "name": "str_replace_based_edit_tool",
-                    }),
-                    ToolExecution::LocalJson,
-                ),
-            )
-            .executor(ProviderKind::OpenAi, ApplyPatchTool)
-            .executor(ProviderKind::Claude, TextEditorTool),
+            .provider(openai_apply_patch_tool())
+            .executor(ApplyPatchTool),
     );
 }
 
@@ -638,7 +591,7 @@ fn openai_apply_patch_tool() -> ProviderTool {
         },
     });
     ProviderTool::new(
-        "apply_patch",
+        "Edit",
         "Apply a freeform patch to files under the session current working directory. Emit the raw patch body, not JSON.",
         input_schema,
         json!({
@@ -662,18 +615,16 @@ mod tests {
     #[test]
     fn provider_definitions_expose_coding_tools_without_grep() {
         let registry = ToolRegistry::with_builtin_tools();
-        for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
-            let definitions = registry.definitions_for_provider(provider);
-            assert!(definitions
-                .iter()
-                .any(|definition| definition.name == "Bash"));
-            assert!(definitions
-                .iter()
-                .any(|definition| definition.name == "Edit"));
-            assert!(!definitions
-                .iter()
-                .any(|definition| definition.name == "Grep"));
-        }
+        let definitions = registry.definitions_for_provider(&"openai".into());
+        assert!(definitions
+            .iter()
+            .any(|definition| definition.name == "Bash"));
+        assert!(definitions
+            .iter()
+            .any(|definition| definition.name == "Edit"));
+        assert!(!definitions
+            .iter()
+            .any(|definition| definition.name == "Grep"));
     }
 
     #[tokio::test]
@@ -686,112 +637,74 @@ mod tests {
         };
         let ctx = ToolContext::new(".");
 
-        for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
-            let error = registry
-                .execute(provider, &call, &ctx)
-                .await
-                .expect_err("Grep must not remain executable");
-            assert!(matches!(
-                error,
-                ToolError::UnknownTool(ref name) if name == "Grep"
-            ));
+        let error = registry
+            .execute(&call, &ctx)
+            .await
+            .expect_err("Grep must not remain executable");
+        assert!(matches!(
+            error,
+            ToolError::UnknownTool(ref name) if name == "Grep"
+        ));
+    }
+
+    #[test]
+    fn definitions_expose_canonical_tool_names() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let names = registry
+            .definitions_for_provider(&"openai".into())
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "Edit",
+            "Bash",
+            "cancel_delegation",
+            "delegate_readonly_tasks",
+            "delegate_writing_task",
+            "inspect_delegation",
+            "interrupt_subagent",
+            "LoadSkill",
+            "steer_subagent",
+            "WebFetch",
+            "WebSearch",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "{expected} should be in definitions"
+            );
         }
     }
 
     #[test]
-    fn definitions_for_provider_expose_only_that_provider() {
+    fn provider_tools_use_canonical_names() {
         let registry = ToolRegistry::with_builtin_tools();
-        let openai = registry
-            .definitions_for_provider(ProviderKind::OpenAi)
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect::<Vec<_>>();
-        let claude = registry
-            .definitions_for_provider(ProviderKind::Claude)
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            openai,
-            [
-                "Edit",
-                "Bash",
-                "cancel_delegation",
-                "delegate_readonly_tasks",
-                "delegate_writing_task",
-                "inspect_delegation",
-                "interrupt_subagent",
-                "LoadSkill",
-                "steer_subagent",
-                "WebFetch",
-                "WebSearch"
-            ]
-        );
-        assert_eq!(
-            claude,
-            [
-                "Bash",
-                "cancel_delegation",
-                "delegate_readonly_tasks",
-                "delegate_writing_task",
-                "inspect_delegation",
-                "interrupt_subagent",
-                "LoadSkill",
-                "steer_subagent",
-                "Edit",
-                "WebFetch",
-                "WebSearch"
-            ]
-        );
-    }
-
-    #[test]
-    fn provider_tools_use_provider_facing_names() {
-        let registry = ToolRegistry::with_builtin_tools();
-        let openai = registry
-            .provider_tools_for_provider(ProviderKind::OpenAi)
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect::<Vec<_>>();
-        let claude = registry
-            .provider_tools_for_provider(ProviderKind::Claude)
+        let tools = registry
+            .provider_tools_for_provider(&"openai".into())
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            openai,
-            [
-                "apply_patch",
-                "Bash",
-                "cancel_delegation",
-                "delegate_readonly_tasks",
-                "delegate_writing_task",
-                "inspect_delegation",
-                "interrupt_subagent",
-                "LoadSkill",
-                "steer_subagent",
-                "web_fetch",
-                "web_search"
-            ]
-        );
-        assert_eq!(
-            claude,
-            [
-                "Bash",
-                "cancel_delegation",
-                "delegate_readonly_tasks",
-                "delegate_writing_task",
-                "inspect_delegation",
-                "interrupt_subagent",
-                "LoadSkill",
-                "steer_subagent",
-                "str_replace_based_edit_tool",
-                "web_fetch",
-                "web_search"
-            ]
-        );
+        // With the sidecar, the daemon uses canonical names directly.
+        // The sidecar translates to provider-specific wire format.
+        for expected in [
+            "Edit",
+            "Bash",
+            "cancel_delegation",
+            "delegate_readonly_tasks",
+            "delegate_writing_task",
+            "inspect_delegation",
+            "interrupt_subagent",
+            "LoadSkill",
+            "steer_subagent",
+            "WebFetch",
+            "WebSearch",
+        ] {
+            assert!(
+                tools.contains(&expected.to_string()),
+                "{expected} should be in provider tools"
+            );
+        }
     }
 
     #[test]
@@ -851,9 +764,9 @@ mod tests {
     fn steer_subagent_tool_schema_is_model_facing() {
         let registry = ToolRegistry::with_builtin_tools();
         let tool = registry
-            .provider_tools_for_provider(ProviderKind::OpenAi)
+            .provider_tools_for_provider(&"openai".into())
             .into_iter()
-            .find(|tool| tool.name == "steer_subagent")
+            .find(|tool| tool.canonical_name == "steer_subagent")
             .expect("steer_subagent tool");
 
         assert_eq!(tool.canonical_name, "steer_subagent");
@@ -880,9 +793,9 @@ mod tests {
     fn interrupt_subagent_tool_schema_is_exact_child_only() {
         let registry = ToolRegistry::with_builtin_tools();
         let tool = registry
-            .provider_tools_for_provider(ProviderKind::OpenAi)
+            .provider_tools_for_provider(&"openai".into())
             .into_iter()
-            .find(|tool| tool.name == "interrupt_subagent")
+            .find(|tool| tool.canonical_name == "interrupt_subagent")
             .expect("interrupt_subagent tool");
 
         assert_eq!(tool.canonical_name, "interrupt_subagent");
@@ -893,67 +806,50 @@ mod tests {
     }
 
     #[test]
-    fn edit_tool_is_provider_specific() {
+    fn edit_tool_uses_apply_patch_format() {
         let registry = ToolRegistry::with_builtin_tools();
-        let openai_edit = registry
-            .provider_tools_for_provider(ProviderKind::OpenAi)
+        let edit = registry
+            .provider_tools_for_provider(&"openai".into())
             .into_iter()
             .find(|tool| tool.canonical_name == "Edit")
-            .expect("OpenAI Edit tool");
-        let claude_edit = registry
-            .provider_tools_for_provider(ProviderKind::Claude)
-            .into_iter()
-            .find(|tool| tool.canonical_name == "Edit")
-            .expect("Claude Edit tool");
+            .expect("Edit tool");
 
-        assert_eq!(openai_edit.name, "apply_patch");
-        assert_eq!(openai_edit.execution, ToolExecution::LocalFreeformText);
-        assert_eq!(openai_edit.input_schema["type"], "custom");
-        assert_eq!(openai_edit.input_schema["format"]["syntax"], "lark");
-        let grammar = openai_edit.input_schema["format"]["definition"]
+        assert_eq!(edit.name, "Edit");
+        assert_eq!(edit.execution, ToolExecution::LocalFreeformText);
+        assert_eq!(edit.input_schema["type"], "custom");
+        assert_eq!(edit.input_schema["format"]["syntax"], "lark");
+        let grammar = edit.input_schema["format"]["definition"]
             .as_str()
             .unwrap();
         assert_eq!(grammar, APPLY_PATCH_LARK_GRAMMAR);
-        assert_eq!(claude_edit.name, "str_replace_based_edit_tool");
-        assert_eq!(claude_edit.execution, ToolExecution::LocalJson);
-        assert_eq!(claude_edit.input_schema["type"], "object");
-        assert!(claude_edit.input_schema["properties"]
-            .get("command")
-            .is_some());
-        assert_eq!(claude_edit.declaration["type"], "text_editor_20250728");
+        assert_eq!(edit.declaration["name"], "apply_patch");
     }
 
     #[test]
     fn only_bash_requires_call_descriptions() {
         let registry = ToolRegistry::with_builtin_tools();
-        for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
-            for tool in registry.provider_tools_for_provider(provider) {
-                let has_description = tool.input_schema["properties"]
-                    .get(CALL_DESCRIPTION_KEY)
-                    .is_some();
-                let requires_description = tool.input_schema["required"]
-                    .as_array()
-                    .is_some_and(|required| required.contains(&json!(CALL_DESCRIPTION_KEY)));
-                assert_eq!(
-                    has_description,
-                    tool.canonical_name == "Bash",
-                    "{}",
-                    tool.name
-                );
-                assert_eq!(
-                    requires_description,
-                    tool.canonical_name == "Bash",
-                    "{}",
-                    tool.name
-                );
-                if tool.execution == ToolExecution::LocalJson {
-                    let declaration_schema = match provider {
-                        ProviderKind::OpenAi => tool.declaration.get("parameters"),
-                        ProviderKind::Claude => tool.declaration.get("input_schema"),
-                    };
-                    if let Some(declaration_schema) = declaration_schema {
-                        assert_eq!(declaration_schema, &tool.input_schema);
-                    }
+        for tool in registry.provider_tools_for_provider(&"openai".into()) {
+            let has_description = tool.input_schema["properties"]
+                .get(CALL_DESCRIPTION_KEY)
+                .is_some();
+            let requires_description = tool.input_schema["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!(CALL_DESCRIPTION_KEY)));
+            assert_eq!(
+                has_description,
+                tool.canonical_name == "Bash",
+                "{}",
+                tool.name
+            );
+            assert_eq!(
+                requires_description,
+                tool.canonical_name == "Bash",
+                "{}",
+                tool.name
+            );
+            if tool.execution == ToolExecution::LocalJson {
+                if let Some(declaration_schema) = tool.declaration.get("parameters") {
+                    assert_eq!(declaration_schema, &tool.input_schema);
                 }
             }
         }
@@ -962,33 +858,22 @@ mod tests {
     #[test]
     fn provider_tools_carry_raw_declarations() {
         let registry = ToolRegistry::with_builtin_tools();
-        let openai_edit = registry
-            .provider_tools_for_provider(ProviderKind::OpenAi)
+        let edit = registry
+            .provider_tools_for_provider(&"openai".into())
             .into_iter()
             .find(|tool| tool.canonical_name == "Edit")
-            .expect("OpenAI Edit binding");
-        let claude_edit = registry
-            .provider_tools_for_provider(ProviderKind::Claude)
-            .into_iter()
-            .find(|tool| tool.canonical_name == "Edit")
-            .expect("Claude Edit binding");
+            .expect("Edit binding");
 
-        assert_eq!(openai_edit.name, "apply_patch");
-        assert_eq!(openai_edit.declaration["name"], "apply_patch");
-        assert_eq!(openai_edit.execution, ToolExecution::LocalFreeformText);
-        assert_eq!(claude_edit.name, "str_replace_based_edit_tool");
-        assert_eq!(claude_edit.declaration["type"], "text_editor_20250728");
-        assert_eq!(
-            claude_edit.declaration["name"],
-            "str_replace_based_edit_tool"
-        );
+        assert_eq!(edit.name, "Edit");
+        assert_eq!(edit.declaration["name"], "apply_patch");
+        assert_eq!(edit.execution, ToolExecution::LocalFreeformText);
     }
 
     #[test]
     fn delegation_registry_exposes_only_new_model_facing_names() {
         let registry = ToolRegistry::with_builtin_tools();
         let names = registry
-            .provider_tools_for_provider(ProviderKind::OpenAi)
+            .provider_tools_for_provider(&"openai".into())
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
@@ -1023,11 +908,11 @@ mod tests {
     fn canonicalizes_provider_wire_aliases_for_execution() {
         let registry = ToolRegistry::with_builtin_tools();
         assert_eq!(
-            registry.canonical_tool_name_for_provider(ProviderKind::OpenAi, "apply_patch"),
+            registry.canonical_tool_name("apply_patch"),
             "Edit"
         );
         assert_eq!(
-            registry.canonical_tool_name_for_provider(ProviderKind::Claude, "web_fetch"),
+            registry.canonical_tool_name("web_fetch"),
             "WebFetch"
         );
     }

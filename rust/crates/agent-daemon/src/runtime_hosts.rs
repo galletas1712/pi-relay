@@ -13,7 +13,7 @@ use agent_runtime_protocol::{
 };
 use agent_store::PostgresAgentStore;
 use agent_tools::ProviderTool;
-use agent_vocab::{ProviderKind, ToolCall, ToolResultMessage};
+use agent_vocab::{ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -743,14 +743,16 @@ impl RuntimeRegistry {
     pub(crate) async fn mcp_inventory(
         &self,
         runtime_id: &str,
-        provider: ProviderKind,
-        first_party: HashMap<ProviderKind, Vec<ProviderTool>>,
+        provider: String,
+        first_party: Vec<ProviderTool>,
     ) -> Result<McpInventory> {
+        let first_party_map: std::collections::HashMap<_, _> =
+            std::iter::once((provider.clone().into(), first_party)).collect();
         self.mcp_result(
             runtime_id,
             RuntimeCommand::McpInventory {
-                provider,
-                first_party,
+                provider: provider.into(),
+                first_party: first_party_map,
             },
             |result| match result {
                 RuntimeCommandResult::McpInventory { inventory } => Some(inventory),
@@ -765,13 +767,15 @@ impl RuntimeRegistry {
         &self,
         runtime_id: &str,
         selection: McpSessionSelection,
-        first_party: HashMap<ProviderKind, Vec<ProviderTool>>,
+        first_party: Vec<ProviderTool>,
     ) -> Result<McpSessionManifest> {
+        let first_party_map: std::collections::HashMap<_, _> =
+            std::iter::once((String::new().into(), first_party)).collect();
         self.mcp_result(
             runtime_id,
             RuntimeCommand::McpSelect {
                 selection,
-                first_party,
+                first_party: first_party_map,
             },
             |result| match result {
                 RuntimeCommandResult::McpManifest { manifest } => Some(manifest),
@@ -1089,7 +1093,7 @@ pub(crate) mod test_support {
                 tool_call,
             } => {
                 let context = ToolContext::new(fake_workspace_dir(dirs, &workspace_id).await);
-                match tools.execute(provider, &tool_call, &context).await {
+                match tools.execute(&tool_call, &context).await {
                     Ok(result) => Ok(RuntimeCommandResult::Tool { result }),
                     Err(error) => Err(RuntimeCommandError::new("tool_error", format!("{error:#}"))),
                 }

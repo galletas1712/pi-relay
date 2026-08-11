@@ -107,6 +107,7 @@ impl AssistantMessage {
         self.items.iter().filter_map(|item| match item {
             AssistantItem::ToolCall(tool_call) => Some(tool_call),
             AssistantItem::Text(_) => None,
+            AssistantItem::Thinking { .. } => None,
         })
     }
 
@@ -116,6 +117,7 @@ impl AssistantMessage {
             .filter_map(|item| match item {
                 AssistantItem::Text(text) => Some(text.as_str()),
                 AssistantItem::ToolCall(_) => None,
+                AssistantItem::Thinking { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("")
@@ -125,6 +127,13 @@ impl AssistantMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantItem {
     Text(String),
+    /// Extended-thinking content with an optional signature.  The signature
+    /// is stored for multi-turn thinking continuity (Anthropic sends it back
+    /// on subsequent turns).
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
     ToolCall(ToolCall),
 }
 
@@ -138,6 +147,18 @@ impl Serialize for AssistantItem {
                 let mut state = serializer.serialize_struct("AssistantItem", 2)?;
                 state.serialize_field("type", "text")?;
                 state.serialize_field("text", text)?;
+                state.end()
+            }
+            Self::Thinking {
+                thinking,
+                signature,
+            } => {
+                let mut state = serializer.serialize_struct("AssistantItem", 3)?;
+                state.serialize_field("type", "thinking")?;
+                state.serialize_field("thinking", thinking)?;
+                if let Some(sig) = signature {
+                    state.serialize_field("signature", sig)?;
+                }
                 state.end()
             }
             Self::ToolCall(call) => {
@@ -176,6 +197,8 @@ impl<'de> Visitor<'de> for AssistantItemVisitor {
     {
         let mut kind: Option<String> = None;
         let mut text: Option<String> = None;
+        let mut thinking: Option<String> = None;
+        let mut signature: Option<String> = None;
         let mut id: Option<ToolCallId> = None;
         let mut tool_name: Option<String> = None;
         let mut args_json: Option<String> = None;
@@ -184,6 +207,8 @@ impl<'de> Visitor<'de> for AssistantItemVisitor {
             match key.as_str() {
                 "type" => kind = Some(map.next_value()?),
                 "text" => text = Some(map.next_value()?),
+                "thinking" => thinking = Some(map.next_value()?),
+                "signature" => signature = Some(map.next_value()?),
                 "id" => id = Some(map.next_value()?),
                 "tool_name" => tool_name = Some(map.next_value()?),
                 "args_json" => args_json = Some(map.next_value()?),
@@ -195,12 +220,19 @@ impl<'de> Visitor<'de> for AssistantItemVisitor {
 
         match kind.as_deref() {
             Some("text") => Ok(AssistantItem::Text(text.unwrap_or_default())),
+            Some("thinking") => Ok(AssistantItem::Thinking {
+                thinking: thinking.unwrap_or_default(),
+                signature,
+            }),
             Some("tool_call") => Ok(AssistantItem::ToolCall(ToolCall {
                 id: id.ok_or_else(|| de::Error::missing_field("id"))?,
                 tool_name: tool_name.ok_or_else(|| de::Error::missing_field("tool_name"))?,
                 args_json: args_json.unwrap_or_else(|| "{}".to_string()),
             })),
-            Some(other) => Err(de::Error::unknown_variant(other, &["text", "tool_call"])),
+            Some(other) => Err(de::Error::unknown_variant(
+                other,
+                &["text", "thinking", "tool_call"],
+            )),
             None => Err(de::Error::missing_field("type")),
         }
     }
@@ -362,5 +394,58 @@ mod tests {
         let round_trip: AssistantMessage =
             serde_json::from_value(value).expect("assistant message deserializes");
         assert_eq!(round_trip, message);
+    }
+
+    #[test]
+    fn assistant_item_thinking_round_trips() {
+        let message = AssistantMessage {
+            items: vec![
+                AssistantItem::Thinking {
+                    thinking: "Let me consider...".to_string(),
+                    signature: Some("sig_abc123".to_string()),
+                },
+                AssistantItem::Text("Here is my answer.".to_string()),
+            ],
+        };
+
+        let value = serde_json::to_value(&message).expect("thinking message serializes");
+        assert_eq!(
+            value,
+            json!({
+                "items": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Let me consider...",
+                        "signature": "sig_abc123",
+                    },
+                    { "type": "text", "text": "Here is my answer." },
+                ]
+            })
+        );
+
+        let round_trip: AssistantMessage =
+            serde_json::from_value(value).expect("thinking message deserializes");
+        assert_eq!(round_trip, message);
+    }
+
+    #[test]
+    fn assistant_item_thinking_without_signature_round_trips() {
+        let item = AssistantItem::Thinking {
+            thinking: "silent deliberation".to_string(),
+            signature: None,
+        };
+
+        let value = serde_json::to_value(&item).expect("thinking without signature serializes");
+        assert_eq!(
+            value,
+            json!({
+                "type": "thinking",
+                "thinking": "silent deliberation",
+            })
+        );
+
+        let round_trip: AssistantItem =
+            serde_json::from_value(value).expect("thinking without signature deserializes");
+        assert_eq!(round_trip, item);
     }
 }

@@ -313,7 +313,7 @@ impl McpManager {
                 let server = servers
                     .get(server_id)
                     .expect("inventory revision only contains configured servers");
-                let declarations = catalog.provider_tools(provider);
+                let declarations = catalog.provider_tools(&provider);
                 let tools = catalog
                     .tools
                     .iter()
@@ -394,7 +394,7 @@ impl McpManager {
                 ),
             });
         }
-        for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
+        for provider in [ProviderKind::openai(), ProviderKind::claude()] {
             let first_party_bytes = first_party
                 .get(&provider)
                 .into_iter()
@@ -403,7 +403,7 @@ impl McpManager {
                 .sum::<serde_json::Result<usize>>()
                 .map_err(anyhow::Error::from)?;
             let mcp_bytes = manifest
-                .provider_tools(provider)
+                .provider_tools(&provider)
                 .iter()
                 .map(|tool| serde_json::to_vec(&tool.declaration).map(|bytes| bytes.len()))
                 .sum::<serde_json::Result<usize>>()

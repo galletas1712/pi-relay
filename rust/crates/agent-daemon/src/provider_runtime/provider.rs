@@ -20,7 +20,7 @@ pub(super) async fn provider_for_config(
 ) -> Result<ProviderHandle> {
     state
         .provider_connections
-        .provider_for_config(config.provider.kind, credentials, session_id)
+        .provider_for_config(config.provider.provider.as_str().to_string(), credentials, session_id)
         .await
 }
 

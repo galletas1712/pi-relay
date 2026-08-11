@@ -145,3 +145,6 @@ vite.config.ts.timestamp-*
 .agents/*
 !.agents/skills/
 !.agents/skills/**
+# pi-ai sidecar
+rust/sidecar/node_modules/
+rust/sidecar/bun.lock

@@ -361,7 +361,7 @@ async fn run_compaction_job(
                 summary: output.summary,
                 summary_kind: output.summary_kind.as_str().to_string(),
                 provider_replay: output.provider_replay,
-                provider: output.provider,
+                provider: output.provider.into(),
                 usage: output.usage,
                 continuation_suffix,
             };
@@ -372,7 +372,7 @@ async fn run_compaction_job(
             if result.new_root_id.is_some() {
                 state
                     .provider_connections
-                    .mark_compacted(&session_id, config.provider.kind, job.last_turn_id.0)
+                    .mark_compacted(&session_id, config.provider.provider.as_str().to_string(), job.last_turn_id.0)
                     .await;
             }
             (result.events, result.resumed_model_action, None)

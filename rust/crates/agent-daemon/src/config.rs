@@ -1,8 +1,9 @@
 use std::env;
+use agent_vocab::ProviderKind;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agent_vocab::{ProviderConfig, ProviderKind, ReasoningEffort};
+use agent_vocab::{ProviderConfig, ReasoningEffort};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -59,7 +60,7 @@ impl Default for DaemonConfig {
 
 pub(crate) fn stable_default_provider() -> ProviderConfig {
     ProviderConfig {
-        kind: ProviderKind::OpenAi,
+        provider: ProviderKind::from("openai"),
         model: "gpt-5.6-sol".to_string(),
         reasoning_effort: ReasoningEffort::High,
         max_tokens: None,
@@ -167,7 +168,7 @@ struct DaemonStartupPolicy {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StrictProviderConfig {
-    kind: ProviderKind,
+    provider: String,
     model: String,
     #[serde(default)]
     reasoning_effort: ReasoningEffort,
@@ -219,7 +220,7 @@ fn provider_from_strict(field: &str, provider: StrictProviderConfig) -> Result<P
         return Err(anyhow!("{field}.model must not be blank"));
     }
     Ok(ProviderConfig {
-        kind: provider.kind,
+        provider: provider.provider.into(),
         model: provider.model,
         reasoning_effort: provider.reasoning_effort,
         max_tokens: provider.max_tokens,
@@ -260,7 +261,7 @@ runtime_bind = "127.0.0.1:9998"
 allowed_origins = ["https://relay.example.com", "http://127.0.0.1:8788"]
 
 [default_parent_model]
-kind = "claude"
+provider = "claude"
 model = "parent"
 reasoning_effort = "high"
 max_tokens = 123
@@ -278,8 +279,8 @@ prompt_cache = { key = "parent-cache" }
             ["https://relay.example.com", "http://127.0.0.1:8788"]
         );
         assert_eq!(
-            loaded.daemon_config.default_parent_model.kind,
-            ProviderKind::Claude
+            loaded.daemon_config.default_parent_model.provider.as_str(),
+            "claude"
         );
         assert_eq!(
             loaded.daemon_config.default_parent_model.max_tokens,
@@ -321,7 +322,7 @@ prompt_cache = { key = "parent-cache" }
         assert_eq!(loaded.runtime_bind, DEFAULT_RUNTIME_BIND);
         assert_eq!(loaded.allowed_origins, ["http://127.0.0.1:8788"]);
         let default = loaded.daemon_config.default_parent_model;
-        assert_eq!(default.kind, ProviderKind::OpenAi);
+        assert_eq!(default.provider.as_str(), "openai");
         assert_eq!(default.model, "gpt-5.6-sol");
         assert_eq!(default.reasoning_effort, ReasoningEffort::High);
         fs::remove_dir_all(root).ok();

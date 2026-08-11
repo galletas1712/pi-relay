@@ -113,7 +113,7 @@ pub(super) async fn prompt_context(
             })
             .collect(),
         agents_md: render_runtime_instructions(&runtime_context.instructions),
-        tools: tool_specs(state, config.provider.kind, profile),
+        tools: tool_specs(state, config.provider.provider.as_str(), profile),
         skills: parse_runtime_skills(&runtime_context.skills),
         subagent_roles: load_subagent_role_catalog(&runtime_context.skills),
         mcp_servers,
@@ -160,10 +160,10 @@ pub(crate) async fn effective_prompt_profile(
 
 pub(crate) fn provider_tools_for_session(
     state: &AppState,
-    provider: ProviderKind,
+    provider: &str,
     profile: PromptProfile,
 ) -> Vec<ProviderTool> {
-    provider_tools_for_profile(state.tools.provider_tools_for_provider(provider), profile)
+    provider_tools_for_profile(state.tools.provider_tools_for_provider(&provider.into()), profile)
 }
 
 fn provider_tools_for_profile(
@@ -191,7 +191,7 @@ fn tool_allowed_for_profile(tool: &ProviderTool, profile: PromptProfile) -> bool
     )
 }
 
-fn tool_specs(state: &AppState, provider: ProviderKind, profile: PromptProfile) -> Vec<ToolSpec> {
+fn tool_specs(state: &AppState, provider: &str, profile: PromptProfile) -> Vec<ToolSpec> {
     tool_specs_from_provider_tools(provider_tools_for_session(state, provider, profile))
 }
 
@@ -471,7 +471,8 @@ repo rules"
     #[test]
     fn provider_tool_filter_matches_prompt_tool_specs_for_profiles() {
         let registry = ToolRegistry::with_builtin_tools();
-        let all_tools = registry.provider_tools_for_provider(ProviderKind::OpenAi);
+        let pk = "openai".to_string().into();
+        let all_tools = registry.provider_tools_for_provider(&pk);
 
         let parent_provider_tools =
             provider_tools_for_profile(all_tools.clone(), PromptProfile::Parent);
@@ -525,7 +526,7 @@ repo rules"
             workspaces: Vec::new(),
             system_prompt: String::new(),
             provider: agent_vocab::ProviderConfig {
-                kind: ProviderKind::OpenAi,
+                provider: "openai".into(),
                 model: "gpt-5.2".to_string(),
                 reasoning_effort: agent_vocab::ReasoningEffort::Medium,
                 max_tokens: None,

@@ -91,7 +91,7 @@ fn config(binding: Option<McpSessionManifestBinding>) -> SessionConfig {
         workspaces: Vec::new(),
         system_prompt: "prompt".to_string(),
         provider: ProviderConfig {
-            kind: ProviderKind::OpenAi,
+            provider: ProviderKind::openai(),
             model: "test-model".to_string(),
             reasoning_effort: ReasoningEffort::Medium,
             max_tokens: None,

@@ -5,7 +5,7 @@ use agent_provider::{
 };
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
-use agent_vocab::{ProviderKind, ProviderReplayItem};
+use agent_vocab::ProviderReplayItem;
 use anyhow::Result;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -20,15 +20,8 @@ use super::prompt::render_pi_compaction_prompt;
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
 
-fn generic_native_compaction_summary(provider: ProviderKind) -> String {
-    match provider {
-        ProviderKind::OpenAi => {
-            "Conversation history before this point was compacted using OpenAI provider-native compaction.".to_string()
-        }
-        ProviderKind::Claude => {
-            "Conversation history before this point was compacted using provider-native compaction.".to_string()
-        }
-    }
+fn generic_native_compaction_summary() -> String {
+    "Conversation history before this point was compacted using provider-native compaction.".to_string()
 }
 
 fn generic_auto_limit_for_window(window: usize) -> usize {
@@ -55,7 +48,7 @@ pub(crate) struct CompactionOutput {
     pub summary: String,
     pub summary_kind: CompactionSummaryKind,
     pub provider_replay: Vec<ProviderReplayItem>,
-    pub provider: ProviderKind,
+    pub provider: String,
     pub usage: Option<Value>,
 }
 
@@ -238,7 +231,7 @@ pub(crate) async fn run_compaction(
 ) -> Result<CompactionOutput> {
     eprintln!(
         "attempting provider-native compaction for {session_id} with {}",
-        config.provider.kind
+        config.provider.provider
     );
     let output = run_native_compaction(state, config, session_id, model_context, snapshot).await?;
     append_delegation_ledger_to_output(state, session_id, output).await
@@ -252,7 +245,7 @@ async fn run_native_compaction(
     snapshot: &McpSessionSnapshot,
 ) -> Result<CompactionOutput> {
     run_native_compaction_once(
-        config.provider.kind,
+        config.provider.provider.as_str().to_string(),
         model_context,
         |transcript| async move {
             let request =
@@ -268,7 +261,7 @@ async fn run_native_compaction(
 }
 
 async fn run_native_compaction_once<F, Fut>(
-    provider: ProviderKind,
+    provider: String,
     model_context: ModelContext,
     compact: F,
 ) -> Result<CompactionOutput>
@@ -281,7 +274,7 @@ where
 }
 
 fn native_compaction_output(
-    provider: ProviderKind,
+    provider: String,
     result: ProviderCompactionResponse,
 ) -> CompactionOutput {
     let (summary, summary_kind) = match result.summary {
@@ -290,7 +283,7 @@ fn native_compaction_output(
             CompactionSummaryKind::ProviderText,
         ),
         _ => (
-            generic_native_compaction_summary(provider),
+            generic_native_compaction_summary(),
             CompactionSummaryKind::Generic,
         ),
     };
@@ -312,17 +305,13 @@ pub(crate) async fn native_compaction_request(
     transcript: Vec<ModelTranscriptEntry>,
     snapshot: &McpSessionSnapshot,
 ) -> Result<ProviderCompactionRequest> {
-    let compaction_instructions = if config.provider.kind == ProviderKind::Claude {
-        Some(format!(
-            "{}\n\nDo not call any tools while writing this summary. Respond with summary text only.",
-            render_pi_compaction_prompt(state, config).await?
-        ))
-    } else {
-        None
-    };
+    let compaction_instructions = Some(format!(
+        "{}\n\nDo not call any tools while writing this summary. Respond with summary text only.",
+        render_pi_compaction_prompt(state, config).await?
+    ));
     let profile = super::prompt::effective_prompt_profile(state, config, session_id).await?;
-    let mut tools = super::prompt::provider_tools_for_session(state, config.provider.kind, profile);
-    tools.extend(snapshot.provider_tools(config.provider.kind));
+    let mut tools = super::prompt::provider_tools_for_session(state, config.provider.provider.as_str(), profile);
+    tools.extend(snapshot.provider_tools(&config.provider.provider));
     Ok(ProviderCompactionRequest {
         model: config.provider.model.clone(),
         // Compaction uses the stable prompt plus transcript/model history. Any
@@ -331,7 +320,7 @@ pub(crate) async fn native_compaction_request(
         // appended to the stored compaction result after the provider returns.
         prompt: PromptSections::stable(config.system_prompt.clone()),
         transcript,
-        tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
+        tool_profile: ProviderToolProfile::for_provider(&config.provider.provider),
         tools,
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
@@ -367,7 +356,7 @@ mod tests {
         Mutex,
     };
 
-    fn test_config(kind: ProviderKind, model: &str, metadata: Value) -> SessionConfig {
+    fn test_config(kind: &str, model: &str, metadata: Value) -> SessionConfig {
         SessionConfig {
             project_id: None,
             runtime_id: "runtime-test".to_string(),
@@ -375,7 +364,7 @@ mod tests {
             workspaces: Vec::new(),
             system_prompt: "test prompt".to_string(),
             provider: agent_vocab::ProviderConfig {
-                kind,
+                provider: kind.into(),
                 model: model.to_string(),
                 reasoning_effort: agent_vocab::ReasoningEffort::Medium,
                 max_tokens: None,
@@ -465,7 +454,7 @@ mod tests {
             ..RecordingProvider::default()
         };
         let error = run_native_compaction_once(
-            ProviderKind::Claude,
+            "claude".to_string(),
             ModelContext::from_transcript_items(items),
             |transcript| async {
                 provider
@@ -512,7 +501,7 @@ mod tests {
     #[test]
     fn missing_metadata_has_no_static_proactive_threshold() {
         let config = test_config(
-            ProviderKind::OpenAi,
+            "openai",
             "gpt-5.1-codex-max",
             serde_json::json!({}),
         );
@@ -525,7 +514,7 @@ mod tests {
     #[test]
     fn gpt56_uses_provider_discovered_window_and_threshold() {
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            let config = test_config(ProviderKind::OpenAi, model, serde_json::json!({}));
+            let config = test_config("openai", model, serde_json::json!({}));
             let resolved = resolve_compaction_config(
                 &config,
                 Some(ProviderModelMetadata {
@@ -541,7 +530,7 @@ mod tests {
 
     #[test]
     fn gpt54_uses_current_window_recommendation_not_maximum_window() {
-        let config = test_config(ProviderKind::OpenAi, "gpt-5.4", serde_json::json!({}));
+        let config = test_config("openai", "gpt-5.4", serde_json::json!({}));
         let resolved = resolve_compaction_config(
             &config,
             Some(ProviderModelMetadata {
@@ -557,7 +546,7 @@ mod tests {
     #[test]
     fn sonnet_45_provider_fallback_keeps_generic_170k_scheduler_threshold() {
         let config = test_config(
-            ProviderKind::Claude,
+            "claude",
             "claude-sonnet-4-5",
             serde_json::json!({}),
         );
@@ -576,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn default_claude_uses_half_window_scheduler_and_native_execution() {
         let config = test_config(
-            ProviderKind::Claude,
+            "claude",
             "claude-sonnet-5",
             serde_json::json!({}),
         );
@@ -592,7 +581,7 @@ mod tests {
 
         let provider = RecordingProvider::default();
         let output = run_native_compaction_once(
-            ProviderKind::Claude,
+            "claude".to_string(),
             ModelContext::from_transcript_items(vec![TranscriptItem::UserMessage(
                 UserMessage::text("compact this"),
             )]),
@@ -618,7 +607,7 @@ mod tests {
             "content": "opaque Anthropic summary",
             "provider_extension": { "preserve": true }
         });
-        let replay = ProviderReplayItem::new(ProviderKind::Claude, &block).unwrap();
+        let replay = ProviderReplayItem::new("claude".into(), &block).unwrap();
         let raw_usage = serde_json::json!({
             "input_tokens": 0,
             "output_tokens": 0,
@@ -629,7 +618,7 @@ mod tests {
             }]
         });
         let output = native_compaction_output(
-            ProviderKind::Claude,
+            "claude".to_string(),
             ProviderCompactionResponse {
                 summary: None,
                 provider_replay: vec![replay],
@@ -662,7 +651,7 @@ mod tests {
     #[test]
     fn missing_policy_uses_provider_metadata_or_reactive_only() {
         let openai = resolve_compaction_config(
-            &test_config(ProviderKind::OpenAi, "gpt-5.6-sol", serde_json::json!({})),
+            &test_config("openai", "gpt-5.6-sol", serde_json::json!({})),
             Some(ProviderModelMetadata {
                 max_input_tokens: Some(372_000),
                 recommended_auto_compact_tokens: Some(334_800),
@@ -672,7 +661,7 @@ mod tests {
         assert_eq!(openai.auto_limit_tokens, Some(334_800));
 
         let unknown = resolve_compaction_config(
-            &test_config(ProviderKind::OpenAi, "unknown", serde_json::json!({})),
+            &test_config("openai", "unknown", serde_json::json!({})),
             None,
         );
         assert!(unknown.auto_enabled);
@@ -691,7 +680,7 @@ mod tests {
             serde_json::json!("store-owned"),
         );
         let config = test_config(
-            ProviderKind::Claude,
+            "claude",
             "claude-sonnet-5",
             serde_json::json!({
                 "compaction": { "config": Value::Object(policy) }
@@ -712,7 +701,7 @@ mod tests {
     #[test]
     fn only_nested_scheduler_config_is_active() {
         let config = test_config(
-            ProviderKind::OpenAi,
+            "openai",
             "gpt-5.6-sol",
             serde_json::json!({
                 "compaction": {
@@ -741,7 +730,7 @@ mod tests {
             Value::Null,
         ] {
             let config = test_config(
-                ProviderKind::OpenAi,
+                "openai",
                 "gpt-5.6-sol",
                 serde_json::json!({ "compaction": { "config": policy_value } }),
             );
@@ -757,7 +746,7 @@ mod tests {
     #[test]
     fn parsed_explicit_disable_is_shared_by_early_and_resolved_checks() {
         let config = test_config(
-            ProviderKind::Claude,
+            "claude",
             "claude-sonnet-4-5",
             serde_json::json!({
                 "compaction": { "config": { "auto_enabled": false } }
@@ -771,7 +760,7 @@ mod tests {
     #[test]
     fn explicit_auto_without_known_threshold_remains_reactive_only() {
         let config = test_config(
-            ProviderKind::OpenAi,
+            "openai",
             "unknown",
             serde_json::json!({
                 "compaction": { "config": { "auto_enabled": true } }
@@ -806,7 +795,7 @@ mod tests {
             ),
         ] {
             let config = test_config(
-                ProviderKind::Claude,
+                "claude",
                 "claude-future",
                 serde_json::json!({ "compaction": { "config": policy } }),
             );
@@ -820,7 +809,7 @@ mod tests {
     #[test]
     fn tiny_window_disables_automatic_compaction() {
         let config = test_config(
-            ProviderKind::Claude,
+            "claude",
             "claude-sonnet-4-5",
             serde_json::json!({
                 "compaction": { "config": {
@@ -836,7 +825,7 @@ mod tests {
 
     #[test]
     fn discovered_metadata_supplies_provider_aware_default() {
-        let config = test_config(ProviderKind::Claude, "claude-future", serde_json::json!({}));
+        let config = test_config("claude", "claude-future", serde_json::json!({}));
         let resolved = resolve_compaction_config(
             &config,
             Some(ProviderModelMetadata {
@@ -851,7 +840,7 @@ mod tests {
     #[test]
     fn explicit_session_policy_wins_and_is_clamped_against_explicit_window() {
         let config = test_config(
-            ProviderKind::OpenAi,
+            "openai",
             "gpt-5.6-sol",
             serde_json::json!({
                 "compaction": { "config": {
@@ -873,7 +862,7 @@ mod tests {
 
     #[test]
     fn authoritative_window_without_recommendation_uses_generic_policy() {
-        let config = test_config(ProviderKind::OpenAi, "future-model", serde_json::json!({}));
+        let config = test_config("openai", "future-model", serde_json::json!({}));
         let resolved = resolve_compaction_config(
             &config,
             Some(ProviderModelMetadata {
@@ -888,7 +877,7 @@ mod tests {
     #[test]
     fn explicit_limit_without_known_window_is_safely_floored() {
         let config = test_config(
-            ProviderKind::Claude,
+            "claude",
             "claude-future",
             serde_json::json!({
                 "compaction": { "config": { "auto_limit_tokens": 100 } }

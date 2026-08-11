@@ -5,6 +5,7 @@
 //! into terminal/running states by writing their durable transcripts directly,
 //! so the tests are fully deterministic and need no provider.
 
+use agent_vocab::ProviderKind;
 use crate::provider_runtime::mcp_snapshot_for_session;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,7 +27,7 @@ use agent_store::{
 use agent_tools::ToolRegistry;
 use agent_vocab::{
     ActionId, AssistantItem, AssistantMessage, CompactionSummary, DaemonToolObservation,
-    ProviderConfig, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId,
+    ProviderConfig, ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId,
     ToolResultMessage, TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 use serde_json::json;
@@ -589,7 +590,7 @@ fn session_config(env: &TestEnv, project_id: Uuid, metadata: serde_json::Value) 
         workspaces: Vec::new(),
         system_prompt: String::new(),
         provider: ProviderConfig {
-            kind: ProviderKind::OpenAi,
+            provider: "openai".into(),
             model: "gpt-5.2".to_string(),
             reasoning_effort: ReasoningEffort::Medium,
             max_tokens: None,
@@ -806,7 +807,7 @@ async fn runtime_online_redrives_sessions_with_active_queued_inputs() {
         workspaces: Vec::new(),
         system_prompt: String::new(),
         provider: ProviderConfig {
-            kind: ProviderKind::OpenAi,
+            provider: "openai".into(),
             model: "gpt-5.2".to_string(),
             reasoning_effort: ReasoningEffort::Medium,
             max_tokens: None,
@@ -1301,7 +1302,7 @@ fn successful_compaction(summary: &str) -> CompactionCompletion {
         summary: summary.to_string(),
         summary_kind: "provider_text".to_string(),
         provider_replay: Vec::new(),
-        provider: ProviderKind::OpenAi,
+        provider: "openai".into(),
         usage: None,
         continuation_suffix: vec![ModelContextEntry {
             item: TranscriptItem::UserMessage(UserMessage::text(BLOCKED_USER_INSTRUCTION)),
@@ -3402,7 +3403,7 @@ async fn unexpected_ordinary_turn_stops_discard_partial_content_and_replay() {
             unreachable!()
         };
         let replay = ProviderReplayItem::new(
-            ProviderKind::Claude,
+            "claude".into(),
             &json!({
                 "type": "compaction",
                 "content": "partial secret",
@@ -5435,7 +5436,7 @@ fn test_compaction_output(summary: &str) -> CompactionOutput {
         summary: summary.to_string(),
         summary_kind: CompactionSummaryKind::ProviderText,
         provider_replay: Vec::new(),
-        provider: ProviderKind::OpenAi,
+        provider: "openai".into(),
         usage: None,
     }
 }
@@ -5747,7 +5748,7 @@ async fn idle_session_can_switch_provider_after_transcript_and_enqueue_captures_
             .expect("queued route");
     pool.close().await;
     let route: ProviderConfig = serde_json::from_value(value).expect("provider route");
-    assert_eq!(route.kind, ProviderKind::Claude);
+    assert_eq!(route.provider.as_str(), "claude");
     assert_eq!(route.model, "claude-opus-4-8");
     assert_eq!(route.reasoning_effort, ReasoningEffort::High);
 

@@ -32,21 +32,21 @@ fn normalize_transcript_item_for_provider(
     item: TranscriptItem,
     provider_replay: &[ProviderReplayItem],
 ) -> TranscriptItem {
-    let Some(provider) = provider_replay.first().map(|record| record.provider) else {
+    let Some(provider) = provider_replay.first().map(|record| record.provider.clone()) else {
         return item;
     };
     match item {
         TranscriptItem::AssistantMessage(mut message) => {
             for item in &mut message.items {
                 if let agent_vocab::AssistantItem::ToolCall(call) = item {
-                    *call = canonical_tool_call_for_provider(provider, call);
+                    *call = canonical_tool_call_for_provider(&provider, call);
                 }
             }
             TranscriptItem::AssistantMessage(message)
         }
         TranscriptItem::ToolCallStarted { turn_id, tool_call } => TranscriptItem::ToolCallStarted {
             turn_id,
-            tool_call: canonical_tool_call_for_provider(provider, &tool_call),
+            tool_call: canonical_tool_call_for_provider(&provider, &tool_call),
         },
         item => item,
     }

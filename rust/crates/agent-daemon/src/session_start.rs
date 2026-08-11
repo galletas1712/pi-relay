@@ -330,14 +330,14 @@ mod tests {
     #[test]
     fn session_start_provider_uses_explicit_then_configured_default() {
         let configured = ProviderConfig {
-            kind: agent_vocab::ProviderKind::Claude,
+            provider: "claude".into(),
             model: "configured".to_string(),
             reasoning_effort: agent_vocab::ReasoningEffort::High,
             max_tokens: Some(123),
             prompt_cache: Some(json!({"key": "configured"})),
         };
         let explicit = ProviderConfig {
-            kind: agent_vocab::ProviderKind::OpenAi,
+            provider: "openai".into(),
             model: "explicit".to_string(),
             reasoning_effort: agent_vocab::ReasoningEffort::Low,
             max_tokens: Some(456),

@@ -431,7 +431,7 @@ async fn stateless_json_remote_discovers_calls_authenticates_and_ignores_instruc
         .await
         .expect("remote manager starts");
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("remote inventory loads");
     assert_eq!(
@@ -490,7 +490,7 @@ async fn stateful_sse_stale_session_fails_without_reinitializing_or_replaying() 
         .expect("stateful remote manager starts");
     let snapshot = {
         let inventory = manager
-            .inventory(ProviderKind::OpenAi, &first_party())
+            .inventory(ProviderKind::openai(), &first_party())
             .await
             .expect("SSE inventory loads");
         select_all(&manager, &inventory).await
@@ -521,7 +521,7 @@ async fn timed_out_http_call_is_cancelled_and_never_replayed() {
         .expect("timeout remote manager starts");
     let snapshot = {
         let inventory = manager
-            .inventory(ProviderKind::OpenAi, &first_party())
+            .inventory(ProviderKind::openai(), &first_party())
             .await
             .expect("remote inventory loads");
         select_all(&manager, &inventory).await
@@ -555,7 +555,7 @@ async fn cancelled_http_call_uses_live_control_path_and_is_never_replayed() {
         .await
         .expect("remote manager starts");
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("remote inventory loads");
     let snapshot = select_all(&manager, &inventory).await;
@@ -612,7 +612,7 @@ async fn inbound_secret_is_scrubbed_from_json_sse_errors_catalog_and_output() {
             .await
             .expect("secret-reflecting manager starts");
         let inventory = manager
-            .inventory(ProviderKind::OpenAi, &first_party())
+            .inventory(ProviderKind::openai(), &first_party())
             .await
             .expect("secret-reflecting inventory loads");
         let snapshot = select_all(&manager, &inventory).await;
@@ -678,7 +678,7 @@ async fn hard_bounds_reject_chunked_json_error_and_sse_before_catalog_or_output(
         .expect("adversarial server handling is bounded")
         .expect("manager contains unavailable adversarial route");
         let inventory = manager
-            .inventory(ProviderKind::OpenAi, &first_party())
+            .inventory(ProviderKind::openai(), &first_party())
             .await
             .expect("unavailable inventory remains bounded");
         if matches!(
@@ -714,7 +714,7 @@ async fn common_sse_reconnect_policy_is_bounded() {
         .await
         .expect("stateful manager starts");
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("initial inventory loads");
     let snapshot = select_all(&manager, &inventory).await;
@@ -735,7 +735,7 @@ async fn common_sse_reconnect_policy_is_bounded() {
         SSE_RECONNECT_LIMIT + 1
     );
     let unavailable = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("terminal stream failure retains a coherent unavailable inventory");
     assert_eq!(unavailable.servers[0].health, McpHealth::Unavailable);
@@ -779,7 +779,7 @@ async fn initial_common_get_failure_is_optional_only_for_static_catalogs() {
             .await
             .expect("static manager starts without an optional common stream");
         let static_inventory = static_manager
-            .inventory(ProviderKind::OpenAi, &first_party())
+            .inventory(ProviderKind::openai(), &first_party())
             .await
             .expect("static inventory remains usable");
         let static_snapshot = select_all(&static_manager, &static_inventory).await;
@@ -801,7 +801,7 @@ async fn initial_common_get_failure_is_optional_only_for_static_catalogs() {
             "dynamic startup reaches the responsive POST endpoint before closing"
         );
         let unavailable = dynamic_manager
-            .inventory(ProviderKind::OpenAi, &first_party())
+            .inventory(ProviderKind::openai(), &first_party())
             .await
             .expect("unavailable dynamic inventory remains coherent");
         assert_eq!(unavailable.servers[0].health, McpHealth::Unavailable);
@@ -842,7 +842,7 @@ async fn http_list_changed_fences_selection_and_frozen_contract() {
         .await
         .expect("list-changed manager starts");
     let before = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("initial inventory loads");
     let snapshot = select_all(&manager, &before).await;
@@ -863,7 +863,7 @@ async fn http_list_changed_fences_selection_and_frozen_contract() {
 
     let after = loop {
         let inventory = manager
-            .inventory(ProviderKind::OpenAi, &first_party())
+            .inventory(ProviderKind::openai(), &first_party())
             .await
             .expect("changed inventory refreshes");
         if inventory.revision != before.revision {
@@ -983,9 +983,12 @@ fn remote_config(url: &str, bearer_token_env: Option<&str>, call_timeout_ms: u64
 
 fn first_party() -> HashMap<ProviderKind, Vec<ProviderTool>> {
     let registry = ToolRegistry::with_builtin_tools();
-    [ProviderKind::OpenAi, ProviderKind::Claude]
+    [ProviderKind::openai(), ProviderKind::claude()]
         .into_iter()
-        .map(|provider| (provider, registry.provider_tools_for_provider(provider)))
+        .map(|provider| {
+            let tools = registry.provider_tools_for_provider(&provider);
+            (provider, tools)
+        })
         .collect()
 }
 

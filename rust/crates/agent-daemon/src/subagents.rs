@@ -164,11 +164,11 @@ pub(crate) async fn spawn_subagent(
             match availability {
                 Ok(false) => eprintln!(
                     "subagent role model {}/{} is unavailable; falling back to OpenAI gpt-5.6-sol/high",
-                    child_config.provider.kind, child_config.provider.model
+                    child_config.provider.provider, child_config.provider.model
                 ),
                 Err(error) => eprintln!(
                     "could not verify subagent role model {}/{}: {error:#}; falling back to OpenAI gpt-5.6-sol/high",
-                    child_config.provider.kind, child_config.provider.model
+                    child_config.provider.provider, child_config.provider.model
                 ),
                 Ok(true) => unreachable!(),
             }
@@ -669,21 +669,21 @@ mod tests {
     #[test]
     fn subagent_provider_precedence_preserves_full_config() {
         let explicit = ProviderConfig {
-            kind: agent_vocab::ProviderKind::Claude,
+            provider: "claude".into(),
             model: "explicit".to_string(),
             reasoning_effort: agent_vocab::ReasoningEffort::Low,
             max_tokens: Some(10),
             prompt_cache: Some(json!({"key": "explicit"})),
         };
         let configured = ProviderConfig {
-            kind: agent_vocab::ProviderKind::OpenAi,
+            provider: "openai".into(),
             model: "configured".to_string(),
             reasoning_effort: agent_vocab::ReasoningEffort::High,
             max_tokens: Some(20),
             prompt_cache: Some(json!({"key": "configured"})),
         };
         let parent = ProviderConfig {
-            kind: agent_vocab::ProviderKind::OpenAi,
+            provider: "openai".into(),
             model: "parent".to_string(),
             reasoning_effort: agent_vocab::ReasoningEffort::XHigh,
             max_tokens: Some(30),

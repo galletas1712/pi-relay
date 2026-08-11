@@ -11,9 +11,12 @@ use crate::McpTransportConfig;
 
 fn first_party() -> HashMap<ProviderKind, Vec<ProviderTool>> {
     let registry = ToolRegistry::with_builtin_tools();
-    [ProviderKind::OpenAi, ProviderKind::Claude]
+    [ProviderKind::openai(), ProviderKind::claude()]
         .into_iter()
-        .map(|provider| (provider, registry.provider_tools_for_provider(provider)))
+        .map(|provider| {
+            let tools = registry.provider_tools_for_provider(&provider);
+            (provider, tools)
+        })
         .collect()
 }
 
@@ -24,7 +27,7 @@ async fn stdio_ignores_unsolicited_list_changed_without_negotiated_capability() 
         .await
         .expect("manager starts");
     let before = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("inventory loads");
     let snapshot = select_all(&manager).await;
@@ -45,7 +48,7 @@ async fn stdio_ignores_unsolicited_list_changed_without_negotiated_capability() 
     assert_eq!(client.tools_revision(), 0);
     assert!(!client.tools_uncertain());
     let after = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("inventory remains coherent");
     assert_eq!(after.revision, before.revision);
@@ -55,7 +58,7 @@ async fn stdio_ignores_unsolicited_list_changed_without_negotiated_capability() 
 
 async fn select_all(manager: &McpManager) -> McpSessionSnapshot {
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("inventory loads");
     let selection = McpSessionSelection {
@@ -121,7 +124,7 @@ async fn selection_rejects_stale_unknown_and_duplicate_identities() {
         .await
         .expect("manager starts");
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("inventory loads");
     let stale = McpSessionSelection {
@@ -185,7 +188,7 @@ async fn explicit_subset_is_frozen_and_inventory_estimate_is_provider_specific()
         .await
         .expect("manager starts");
     let inventory = manager
-        .inventory(ProviderKind::Claude, &first_party())
+        .inventory(ProviderKind::claude(), &first_party())
         .await
         .expect("inventory loads");
     assert!(inventory.servers[0]
@@ -212,7 +215,7 @@ async fn explicit_subset_is_frozen_and_inventory_estimate_is_provider_specific()
             .collect::<Vec<_>>(),
         vec!["echo"]
     );
-    assert_eq!(snapshot.provider_tools(ProviderKind::OpenAi).len(), 1);
+    assert_eq!(snapshot.provider_tools(&ProviderKind::openai()).len(), 1);
     manager.shutdown().await;
 }
 
@@ -237,7 +240,7 @@ async fn selected_unavailable_gates_while_unselected_unavailable_does_not() {
     .expect("config parses");
     let manager = McpManager::start(config).await.expect("manager starts");
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("inventory loads");
     let selected_healthy = McpSessionSelection {
@@ -301,7 +304,7 @@ async fn unselected_ordinary_outage_retains_a_coherent_catalog() {
         .and_then(|server| server.client.clone())
         .expect("B starts with a client");
     let before = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("initial inventory loads");
     assert_eq!(
@@ -319,7 +322,7 @@ async fn unselected_ordinary_outage_retains_a_coherent_catalog() {
         .expect("B process death is observed");
 
     let unavailable = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("ordinary outage retains a coherent inventory");
     assert_eq!(unavailable.revision, before.revision);
@@ -379,7 +382,7 @@ async fn failed_unselected_list_changed_refresh_fences_inventory_until_recovery(
     .expect("config parses");
     let manager = McpManager::start(config).await.expect("manager starts");
     let before = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("initial inventory loads");
     let b_snapshot = manager
@@ -403,7 +406,7 @@ async fn failed_unselected_list_changed_refresh_fences_inventory_until_recovery(
     wait_for_marker(&marker, "NOTIFICATION_SENT").await;
 
     let incomplete_revision = match manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
     {
         Err(McpManagerError::InventoryChanged { current_revision }) => current_revision,
@@ -453,7 +456,7 @@ async fn failed_unselected_list_changed_refresh_fences_inventory_until_recovery(
         .expect("fixture recovery marker writes");
     }
     let recovered = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("coherent inventory publishes after recovery");
     assert_ne!(recovered.revision, before.revision);
@@ -506,7 +509,7 @@ async fn unselected_list_changed_invalidates_the_global_inventory_revision() {
     .expect("config parses");
     let manager = McpManager::start(config).await.expect("manager starts");
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("inventory loads");
     let b_snapshot = manager
@@ -594,7 +597,7 @@ async fn list_changed_changes_inventory_but_not_a_frozen_snapshot() {
         .call_timeout_ms = 1_000;
     let manager = McpManager::start(config).await.expect("manager starts");
     let before = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("inventory loads");
     let snapshot = select_all(&manager).await;
@@ -617,7 +620,7 @@ async fn list_changed_changes_inventory_but_not_a_frozen_snapshot() {
     assert!(first.await.expect("first task joins").is_ok());
     assert!(matches!(second, Err(McpCallError::ContractChanged { .. })));
     let after = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("inventory refreshes");
     assert_ne!(before.revision, after.revision);
@@ -637,7 +640,7 @@ async fn startup_timeout_kills_the_process_tree() {
         .startup_timeout_ms = 100;
     let manager = McpManager::start(config).await.expect("manager starts");
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("inventory remains observable");
     assert_eq!(inventory.servers[0].health, McpHealth::Unavailable);
@@ -737,7 +740,7 @@ async fn assert_reconnect_call_deadline(mode: &str, waiting_marker: &str) {
     }
 
     let recovered = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("a newer reconnect publishes a coherent catalog");
     assert_eq!(recovered.servers[0].health, McpHealth::Healthy);
@@ -1005,7 +1008,7 @@ async fn stdio_client_initializes_pages_calls_refreshes_and_cleans_up() {
         }
     );
     let refreshed = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("inventory refreshes");
     assert_ne!(refreshed.revision, snapshot.inventory_revision());

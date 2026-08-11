@@ -545,7 +545,7 @@ impl Runtime {
                 // long child Bash on shared writing workspaces.
                 let context = ToolContext::new(self.workspaces.resolve(&workspace_id))
                     .with_file_locks(Arc::clone(&self.file_locks));
-                let result = self.tools.execute(provider, &tool_call, &context).await?;
+                let result = self.tools.execute(&tool_call, &context).await?;
                 Ok(RuntimeCommandResult::Tool { result })
             }
             RuntimeCommand::WriteWorkspaceFile {
@@ -853,7 +853,7 @@ mod file_mutation_lock_tests {
             runtime.execute(
                 RuntimeCommand::ExecuteTool {
                     workspace_id: workspace_id.to_string(),
-                    provider: ProviderKind::OpenAi,
+                    provider: ProviderKind::openai(),
                     tool_call: ToolCall {
                         id: ToolCallId::new("call_bash"),
                         tool_name: "Bash".to_string(),
@@ -873,7 +873,7 @@ mod file_mutation_lock_tests {
             runtime.execute(
                 RuntimeCommand::ExecuteTool {
                     workspace_id: workspace_id.to_string(),
-                    provider: ProviderKind::OpenAi,
+                    provider: ProviderKind::openai(),
                     tool_call: ToolCall {
                         id: ToolCallId::new("call_edit_b"),
                         tool_name: "Edit".to_string(),
@@ -894,7 +894,7 @@ mod file_mutation_lock_tests {
         let mut edit_a = Box::pin(runtime.execute(
             RuntimeCommand::ExecuteTool {
                 workspace_id: workspace_id.to_string(),
-                provider: ProviderKind::OpenAi,
+                provider: ProviderKind::openai(),
                 tool_call: ToolCall {
                     id: ToolCallId::new("call_edit_a"),
                     tool_name: "Edit".to_string(),

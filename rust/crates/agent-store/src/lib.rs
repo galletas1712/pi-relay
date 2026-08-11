@@ -198,7 +198,7 @@ impl From<ProviderConfig> for ProviderRouteSnapshot {
 
 impl PartialEq for ProviderRouteSnapshot {
     fn eq(&self, other: &Self) -> bool {
-        self.0.kind == other.0.kind
+        self.0.provider == other.0.provider
             && self.0.model == other.0.model
             && self.0.reasoning_effort == other.0.reasoning_effort
             && self.0.max_tokens == other.0.max_tokens

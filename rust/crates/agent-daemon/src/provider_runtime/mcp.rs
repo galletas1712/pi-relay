@@ -1,11 +1,9 @@
-use std::collections::HashMap;
 
 use agent_mcp_types::{
     McpServerSelection, McpSessionManifest, McpSessionSelection, McpSessionSnapshot,
 };
 use agent_prompt::PromptProfile;
 use agent_store::{McpSessionManifestBinding, SessionConfig};
-use agent_vocab::ProviderKind;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
@@ -80,16 +78,8 @@ pub(crate) fn mcp_snapshot_for_session(config: &SessionConfig) -> Result<McpSess
 pub(crate) fn first_party_toolsets(
     state: &AppState,
     profile: PromptProfile,
-) -> HashMap<ProviderKind, Vec<agent_tools::ProviderTool>> {
-    [ProviderKind::OpenAi, ProviderKind::Claude]
-        .into_iter()
-        .map(|provider| {
-            (
-                provider,
-                provider_tools_for_session(state, provider, profile),
-            )
-        })
-        .collect()
+) -> Vec<agent_tools::ProviderTool> {
+    provider_tools_for_session(state, "openai", profile)
 }
 
 pub(crate) fn provider_toolset_fingerprint(tools: &[agent_tools::ProviderTool]) -> String {
@@ -102,7 +92,7 @@ pub(crate) fn provider_toolset_fingerprint(tools: &[agent_tools::ProviderTool]) 
 mod tests {
     use agent_store::SessionConfig;
     use agent_tools::ProviderTool;
-    use agent_vocab::{ProviderConfig, ProviderKind, ReasoningEffort};
+    use agent_vocab::{ProviderConfig, ReasoningEffort};
     use serde_json::json;
 
     use super::{mcp_snapshot_for_session, provider_toolset_fingerprint};
@@ -116,7 +106,7 @@ mod tests {
             workspaces: Vec::new(),
             system_prompt: "prompt".to_string(),
             provider: ProviderConfig {
-                kind: ProviderKind::OpenAi,
+                provider: "openai".into(),
                 model: "test-model".to_string(),
                 reasoning_effort: ReasoningEffort::Medium,
                 max_tokens: None,
@@ -135,13 +125,13 @@ mod tests {
     #[test]
     fn provider_toolset_fingerprint_covers_exact_ordered_declarations() {
         let first = ProviderTool::function_json_named(
-            ProviderKind::OpenAi,
+            "openai",
             "first",
             "first",
             json!({ "type": "object" }),
         );
         let second = ProviderTool::function_json_named(
-            ProviderKind::OpenAi,
+            "openai",
             "second",
             "second",
             json!({ "type": "object" }),
@@ -151,7 +141,7 @@ mod tests {
             provider_toolset_fingerprint(&[second, first.clone()])
         );
         let changed = ProviderTool::function_json_named(
-            ProviderKind::OpenAi,
+            "openai",
             "first",
             "changed declaration",
             json!({ "type": "object" }),
