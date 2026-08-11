@@ -1,0 +1,6 @@
+/* Bridge-profile additions. Maps the pierre diff/code surface tokens the
+ * vendored T3 glue references onto the app's palette. */
+.bridge-app {
+	--code-background: var(--card);
+	--code-foreground: var(--card-foreground);
+}

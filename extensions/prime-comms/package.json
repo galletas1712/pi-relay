@@ -1,0 +1,12 @@
+{
+  "name": "@pi-relay/prime-comms",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "M2: agent_message/agent_observe inter-agent messaging with durable JSONL outbox, as a pure extension on unpatched upstream pi (requires prime-rlm)",
+  "main": "index.ts",
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^24.0.0"
+  }
+}

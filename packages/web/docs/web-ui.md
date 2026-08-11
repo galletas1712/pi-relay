@@ -205,8 +205,10 @@ entry stream.
 
 - Historical completed turns collapse to a summary card: the turn's user messages plus the final assistant message and
   a "Worked for …" duration. Intermediate tool calls/results are omitted until expanded.
-- "Show details" fetches `transcript.turn_detail` for that card and renders the full detailed rows; "Hide details"
-  collapses again. "Load older turns" pages older cards.
+- Turns with more than 3 agent messages offer a "See more" toggle that fetches `transcript.turn_detail` for that card
+  and renders the full detailed rows; "See less" collapses again (owner rule B5). Turns at or under the threshold have
+  no toggle — their detail auto-loads and the full flow renders inline. "Load older turns" pages older cards.
+  Server-paged legacy-daemon cards carry no client-folded agent-message count and keep the always-on toggle.
 - The current/running turn auto-expands and auto-loads its detail so progress streams live. A single "Working… {elapsed}"
   row trails the transcript. Its clock anchors only to durable server data — the active branch's `turn_started` entry,
   or a mid-turn `compaction_summary` that remembers the original turn start — and the anchor is rebuilt only when
@@ -258,8 +260,9 @@ Consecutive assistant tool activity is grouped into a `ToolRunGroup`. Each group
 - `all` — shows every item in a capped scrolling list with a link to shrink back.
 
 The default tracks liveness (working → `recent`, done → `collapsed`); once the user toggles a group, an override is
-stashed so later status churn or streaming items do not blow away their selection. A single tool renders as a stand-alone
-row. Tool results fold into their matching call row rather than appearing as separate raw events. Edit-shaped calls
+stashed so later status churn or streaming items do not blow away their selection. A single non-ipython tool renders as a
+stand-alone row; a lone ipython cell keeps the group head ("Used 1 tool") as its gate so its inline I/O stays hidden until
+the group opens (owner rule B3 — no per-tool ipython dropdown). Tool results fold into their matching call row rather than appearing as separate raw events. Edit-shaped calls
 render an "Edit …" header with a diff-style preview. Display names map the builtin tools (`Edit`, `Bash`,
 `Web search`, `Web fetch`); see [agent-tools](../../../rust/docs/modules/agent-tools.md).
 

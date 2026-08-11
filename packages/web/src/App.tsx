@@ -146,6 +146,7 @@ import {
 	commitSelectedSessionRefresh,
 	selectedEntries,
 	snapshotWithTranscriptTurnsMetadata,
+	turnCardSeeMoreEligible,
 	turnCardsInOrder,
 	turnDetailEntries,
 	type SelectedSessionCache,
@@ -153,8 +154,8 @@ import {
 import { SessionListRequestCoordinator } from "./sessionListRequestCoordinator.ts";
 import { useSelectedSessionStore } from "./selectedSessionStore.ts";
 import {
+	availableModelOptions,
 	DEFAULT_PROVIDER,
-	MODEL_OPTIONS,
 	newSessionCompactionConfig,
 	providerFromModelKey,
 	providerModelKey,
@@ -292,6 +293,9 @@ export interface AppProps {
 	routeHistory?: WorkspaceRouteHistory | null;
 	entityStorage?: Storage;
 	serverControls?: ReactNode;
+	/** M11b (bridge profile): render a REPL pane for the selected session into
+	 * the inspector rail; when omitted the REPL tab does not exist. */
+	renderReplPane?: (sessionId: string) => ReactNode;
 }
 
 type RememberedRouteRestore = {
@@ -344,6 +348,7 @@ export function App({
 	routeHistory: injectedRouteHistory,
 	entityStorage,
 	serverControls,
+	renderReplPane,
 }: AppProps) {
 	const routeHistory = useMemo(
 		() => injectedRouteHistory === undefined ? browserWorkspaceRouteHistory() : injectedRouteHistory,
@@ -543,6 +548,7 @@ export function App({
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
 	const sidebarSelectTimer = useRef<number | null>(null);
 	const autoLoadedTurnDetailRef = useRef<string | null>(null);
+	const autoLoadedExemptTurnsRef = useRef<Set<string>>(new Set());
 	const nextTranscriptDestinationIdRef = useRef(0);
 	const lastForegroundReconcileAt = useRef(Date.now());
 	const lastAwakeAt = useRef(Date.now());
@@ -964,7 +970,11 @@ export function App({
 		if (orderedTurnCards.length === 0) return null;
 		return orderedTurnCards.map((card) => {
 			const isCurrent = card.id === runningTurnCardId;
-			const expanded = expandedTurnIds.has(card.id) || isCurrent;
+			// B5: turns at/under the See-more threshold never offer the toggle —
+			// they render their full flow inline, so they count as expanded and
+			// their detail auto-loads (effect below).
+			const seeMoreExempt = !turnCardSeeMoreEligible(card);
+			const expanded = expandedTurnIds.has(card.id) || isCurrent || seeMoreExempt;
 			const detailEntries = turnDetailEntries(selectedCache, card.id);
 			return {
 				card,
@@ -2562,8 +2572,26 @@ export function App({
 		void loadTurnDetail(runningTurnCardId, { mode: "auto" });
 	}, [autoLoadingTurnId, connectionRemoteActionBlockedReason, loadTurnDetail, runningTurnCardId, selectedCache.turnCardsById, selectedCache.turnDetailsById]);
 
+	// B5: See-more-exempt turns (at/under the agent-message threshold) render
+	// their full flow inline with no toggle — auto-load their details one at a
+	// time (the cache update re-fires this effect for the next).
+	useEffect(() => {
+		if (connectionRemoteActionBlockedReason) return;
+		const cache = selectedCacheRef.current;
+		for (const card of orderedTurnCards) {
+			if (turnCardSeeMoreEligible(card)) continue;
+			if (turnDetailEntries(cache, card.id)) continue;
+			const key = `${card.id}:${card.active_leaf_id}`;
+			if (autoLoadedExemptTurnsRef.current.has(key)) continue;
+			autoLoadedExemptTurnsRef.current.add(key);
+			void loadTurnDetail(card.id, { mode: "auto" });
+			break;
+		}
+	}, [connectionRemoteActionBlockedReason, loadTurnDetail, orderedTurnCards, selectedCache.turnDetailsById]);
+
 	useEffect(() => {
 		autoLoadedTurnDetailRef.current = null;
+		autoLoadedExemptTurnsRef.current = new Set();
 	}, [selectedId]);
 
 	const reconcileAfterForeground = useCallback(
@@ -4952,7 +4980,7 @@ export function App({
 						transcriptErrorHasUsableCache={selectedErrorHasUsableCache}
 						transcriptRetrying={selectedRetrying}
 						hasRunningDelegations={hasRunningDelegations}
-						modelOptions={MODEL_OPTIONS}
+						modelOptions={availableModelOptions()}
 						modelValue={providerModelKey(activeProvider)}
 						modelControlsDisabled={modelControlsDisabled}
 						reasoningControlsDisabled={reasoningControlsDisabled}
@@ -5223,6 +5251,11 @@ export function App({
 						if (inspectorIsOverlay) setRightOpen(false);
 					}}
 					onClose={() => setRightOpen(false)}
+					replSlot={
+						renderReplPane && loadedSnapshot
+							? renderReplPane(loadedSnapshot.session_id)
+							: undefined
+					}
 				/>
 				)}
 			</aside>

@@ -1977,6 +1977,25 @@ pre {
 	background: color-mix(in oklch, var(--background) 82%, transparent);
 }
 
+/* M11b: ipython cell blocks (input/output) — a few lines tall, scrollable. */
+.tool-ipython-block {
+	max-height: 8.5em;
+	overflow: auto;
+	margin: 0;
+	padding: 6px 12px 10px;
+	font-family: var(--font-mono);
+	font-size: var(--text-2xs);
+	line-height: 1.5;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.tool-section-label.ipython-cell-label {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
 .tool-card.stand-alone {
 	margin: 0;
 }
@@ -5419,4 +5438,73 @@ pre {
 		transition-duration: 0.001ms !important;
 		scroll-behavior: auto !important;
 	}
+}
+
+/* M11b: inter-agent comms block — gruvbox orange (--primary) accent, the
+ * one properly-marked non-chat row in the transcript flow. */
+.comms-message {
+	border: 1px solid color-mix(in srgb, var(--primary) 40%, transparent);
+	border-radius: var(--radius-md, 6px);
+	background: color-mix(in srgb, var(--primary) 6%, transparent);
+	font-size: var(--text-xs);
+}
+
+.comms-message-toggle {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	width: 100%;
+	padding: 4px 8px;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+.comms-message-toggle:hover {
+	background: color-mix(in srgb, var(--primary) 10%, transparent);
+}
+
+.comms-message-icon {
+	display: inline-flex;
+	flex: 0 0 auto;
+	color: var(--primary);
+}
+
+.comms-message-parties {
+	flex: 0 0 auto;
+	color: var(--muted-foreground);
+	white-space: nowrap;
+}
+
+.comms-message-preview {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--muted-foreground);
+}
+
+.comms-message-body {
+	border-top: 1px solid color-mix(in srgb, var(--primary) 30%, transparent);
+	padding: 6px 8px;
+}
+
+.comms-message-text {
+	margin: 0;
+	font-family: var(--font-mono, monospace);
+	font-size: var(--text-2xs, 11px);
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.comms-message-meta {
+	display: flex;
+	gap: 8px;
+	margin-top: 4px;
+	color: var(--muted-foreground);
+	font-size: var(--text-2xs, 10px);
 }

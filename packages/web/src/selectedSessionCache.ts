@@ -30,6 +30,7 @@ export {
 	applyTranscriptTurns,
 	applyTurnDetail,
 	prependTranscriptTurns,
+	turnCardSeeMoreEligible,
 	turnCardsInOrder,
 	turnDetailEntries,
 } from "./selectedSessionCache/turns.ts";

@@ -1,0 +1,15 @@
+{
+  "name": "@pi-relay/prime-rlm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "M1: prime-agent RLM differentiators (persistent IPython kernel + in-process rlm() recursion) as a pure extension on unpatched upstream pi",
+  "main": "index.ts",
+  "dependencies": {
+    "zeromq": "^6.1.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^24.0.0"
+  }
+}

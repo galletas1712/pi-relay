@@ -145,3 +145,16 @@ vite.config.ts.timestamp-*
 .agents/*
 !.agents/skills/
 !.agents/skills/**
+
+# Migration artifacts (Path A′)
+.pi/*
+!.pi/migration-research/
+.pi/migration-research/repos/
+packages/migrator/out/
+packages/migrator/m10a-boot-trace.jsonl
+packages/migrator/m10a-v4-trace.jsonl
+packages/bridge/m11b-q.mjs
+packages/bridge/test/m11b2-probe*.mjs
+packages/bridge/test/m11b-dbg*.mjs
+packages/bridge/test/m11b-q*.mjs
+packages/bridge/test/out/

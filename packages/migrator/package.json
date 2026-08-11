@@ -1,0 +1,21 @@
+{
+  "name": "@pi-relay/migrator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "M10a: one-shot migrator — pi-relay PG dump (restored to scratch) -> new-stack artifacts (pi v3 session JSONL, bridge control-plane SQL, harness/roles/skills, mcp.toml, workspace plan, idmap manifest)",
+  "scripts": {
+    "migrate": "node src/cli.ts migrate",
+    "verify": "node src/cli.ts verify",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "smol-toml": "^1.7.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.5.0"
+  }
+}
