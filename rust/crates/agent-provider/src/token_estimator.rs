@@ -4,11 +4,11 @@ use agent_tools::ProviderTool;
 
 use crate::{ModelTranscriptEntry, PromptSections, ProviderResult};
 
-// The local token estimator only ever runs for OpenAI: Claude sessions count
-// tokens against the authoritative remote `count_tokens` endpoint (see
-// `context_accounting.rs`). So the estimate reuses the OpenAI adapter's actual
-// wire rendering (`openai::transcript_to_response_items`) and approximates
-// tokens as ceil(model-visible bytes / 4), with a discount for base64 images.
+// The local token estimator approximates tokens as ceil(model-visible
+// bytes / 4), with a discount for base64 image data URLs.  It serializes
+// transcript entries (including provider replay items) to JSON for byte
+// counting — the exact wire format is provider-specific and handled by the
+// pi-ai sidecar, so a generic serialization is sufficient for estimation.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenEstimate {
@@ -84,13 +84,44 @@ pub fn estimate_transcript_tokens(
     prompt: &PromptSections,
     transcript: &[ModelTranscriptEntry],
 ) -> ProviderResult<TokenEstimate> {
-    crate::openai::transcript_to_response_items(prompt, transcript)?
+    transcript_to_json_values(prompt, transcript)?
         .iter()
         .map(serialized_estimate)
         .try_fold(
             TokenEstimate::from_model_visible_bytes(0),
             |total, estimate| Ok(total.saturating_add(estimate?)),
         )
+}
+
+/// Convert transcript entries to JSON values for byte-count token estimation.
+///
+/// Entries with `provider_replay` items use the replay's raw JSON (preserving
+/// the provider-native representation).  Entries without replay are serialized
+/// directly from their `TranscriptItem`.  Control entries (TurnStarted,
+/// ToolCallStarted, TurnFinished) are skipped.
+fn transcript_to_json_values(
+    _prompt: &PromptSections,
+    items: &[ModelTranscriptEntry],
+) -> ProviderResult<Vec<serde_json::Value>> {
+    use agent_vocab::TranscriptItem;
+    let mut values = Vec::new();
+    for entry in items {
+        if !entry.provider_replay.is_empty() {
+            for replay in &entry.provider_replay {
+                values.push(replay.raw_value()?);
+            }
+            continue;
+        }
+        match entry.item() {
+            TranscriptItem::TurnStarted { .. }
+            | TranscriptItem::ToolCallStarted { .. }
+            | TranscriptItem::TurnFinished { .. } => {}
+            _ => {
+                values.push(serde_json::to_value(&entry.item)?);
+            }
+        }
+    }
+    Ok(values)
 }
 
 fn prompt_estimate(prompt: &PromptSections) -> ProviderResult<TokenEstimate> {
@@ -121,8 +152,10 @@ struct ImageDataUrlAdjustment {
 }
 
 fn estimate_image_data_url_adjustment(serialized: &str) -> ImageDataUrlAdjustment {
-    const DATA_PREFIX: &str = "data:";
     let mut adjustment = ImageDataUrlAdjustment::default();
+
+    // Pattern 1: OpenAI data-URL format — "data:image/png;base64,AAAA..."
+    const DATA_PREFIX: &str = "data:";
     let mut offset = 0usize;
     while let Some(relative_start) = serialized[offset..].find(DATA_PREFIX) {
         let start = offset + relative_start;
@@ -138,6 +171,27 @@ fn estimate_image_data_url_adjustment(serialized: &str) -> ImageDataUrlAdjustmen
         }
         offset = start.saturating_add(relative_end).saturating_add(1);
     }
+
+    // Pattern 2: agent_vocab serialization — "value":"<base64>"
+    // The ImageSource::Base64 variant serializes as {"kind":"base64","value":"..."}
+    const VALUE_PREFIX: &str = "\"value\":\"";
+    offset = 0usize;
+    while let Some(relative_start) = serialized[offset..].find(VALUE_PREFIX) {
+        let start = offset + relative_start + VALUE_PREFIX.len();
+        let Some(relative_end) = serialized[start..].find('"') else {
+            break;
+        };
+        let payload = &serialized[start..start + relative_end];
+        // Only discount if it looks like base64 data (long enough, alphanumeric)
+        if payload.len() > 10 && payload.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=') {
+            adjustment.payload_bytes = adjustment.payload_bytes.saturating_add(payload.len());
+            adjustment.replacement_bytes = adjustment
+                .replacement_bytes
+                .saturating_add(RESIZED_IMAGE_BYTES_ESTIMATE);
+        }
+        offset = start.saturating_add(relative_end).saturating_add(1);
+    }
+
     adjustment
 }
 
@@ -258,7 +312,7 @@ mod token_estimator_tests {
             "encrypted_content": "opaque compacted context",
         });
         let replay =
-            agent_vocab::ProviderReplayItem::new(agent_vocab::ProviderKind::OpenAi, &raw_replay)
+            agent_vocab::ProviderReplayItem::new(agent_vocab::ProviderKind::openai(), &raw_replay)
                 .unwrap();
         let transcript = vec![ModelTranscriptEntry {
             item: TranscriptItem::CompactionSummary(summary),
@@ -284,7 +338,7 @@ mod token_estimator_tests {
                 agent_vocab::TurnId(1),
             )),
             provider_replay: vec![agent_vocab::ProviderReplayItem {
-                provider: agent_vocab::ProviderKind::OpenAi,
+                provider: agent_vocab::ProviderKind::openai(),
                 raw_json: "{".to_string(),
                 display: None,
             }],
@@ -298,7 +352,7 @@ mod token_estimator_tests {
         let prompt = PromptSections::stable("stable");
         let transcript = vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()];
         let tool = agent_tools::ProviderTool::function_json_named(
-            agent_vocab::ProviderKind::OpenAi,
+            "openai",
             "mcp__server__read",
             "Read a value",
             json!({"type":"object","properties":{"key":{"type":"string"}}}),

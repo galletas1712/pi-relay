@@ -1,0 +1,17 @@
+{
+  "name": "@pi-relay/sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node.js HTTP sidecar bridge wrapping @oh-my-pi/pi-ai for the Rust PiAiSidecarProvider",
+  "main": "bridge.mjs",
+  "scripts": {
+    "start": "node bridge.mjs"
+  },
+  "dependencies": {
+    "@oh-my-pi/pi-ai": "^17.2.12"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

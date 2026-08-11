@@ -583,7 +583,7 @@ fn session_config_with_task(
         workspaces: Vec::new(),
         system_prompt: String::new(),
         provider: ProviderConfig {
-            kind: ProviderKind::OpenAi,
+            provider: ProviderKind::openai(),
             model: "gpt-5".to_string(),
             reasoning_effort: ReasoningEffort::Medium,
             max_tokens: None,

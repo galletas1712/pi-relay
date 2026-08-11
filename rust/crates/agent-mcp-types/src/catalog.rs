@@ -56,10 +56,11 @@ pub struct McpSessionManifest {
 }
 
 impl McpSessionManifest {
-    pub fn provider_tools(&self, provider: ProviderKind) -> &[ProviderTool] {
-        match provider {
-            ProviderKind::OpenAi => &self.openai_tools,
-            ProviderKind::Claude => &self.anthropic_tools,
+    pub fn provider_tools(&self, provider: &ProviderKind) -> &[ProviderTool] {
+        match provider.as_str() {
+            "openai" => &self.openai_tools,
+            "claude" => &self.anthropic_tools,
+            _ => &self.openai_tools,
         }
     }
 
@@ -120,7 +121,7 @@ impl McpSessionSnapshot {
         &self.manifest.manifest_fingerprint
     }
 
-    pub fn provider_tools(&self, provider: ProviderKind) -> Vec<ProviderTool> {
+    pub fn provider_tools(&self, provider: &ProviderKind) -> Vec<ProviderTool> {
         self.manifest.provider_tools(provider).to_vec()
     }
 }
@@ -220,11 +221,11 @@ pub fn build_inventory_catalog(
     }));
     let openai_tools = candidates
         .iter()
-        .map(|tool| provider_tool(tool, ProviderKind::OpenAi))
+        .map(|tool| provider_tool(tool, &ProviderKind::openai()))
         .collect();
     let anthropic_tools = candidates
         .iter()
-        .map(|tool| provider_tool(tool, ProviderKind::Claude))
+        .map(|tool| provider_tool(tool, &ProviderKind::claude()))
         .collect();
     let manifest = McpSessionManifest {
         version: MANIFEST_VERSION,
@@ -276,11 +277,11 @@ pub fn select_manifest(
     }
     let openai_tools = tools
         .iter()
-        .map(|tool| provider_tool(tool, ProviderKind::OpenAi))
+        .map(|tool| provider_tool(tool, &ProviderKind::openai()))
         .collect();
     let anthropic_tools = tools
         .iter()
-        .map(|tool| provider_tool(tool, ProviderKind::Claude))
+        .map(|tool| provider_tool(tool, &ProviderKind::claude()))
         .collect();
     Ok(McpSessionManifest {
         version: MANIFEST_VERSION,
@@ -396,8 +397,8 @@ fn validate_persisted_manifest(
     {
         bail!("persisted MCP manifest contains an empty selected server");
     }
-    validate_provider_pairings(manifest, ProviderKind::OpenAi)?;
-    validate_provider_pairings(manifest, ProviderKind::Claude)?;
+    validate_provider_pairings(manifest, &ProviderKind::openai())?;
+    validate_provider_pairings(manifest, &ProviderKind::claude())?;
     validate_catalog_bytes(manifest)?;
     if check_fingerprint && manifest_fingerprint(manifest) != manifest.manifest_fingerprint {
         bail!("persisted MCP manifest fingerprint does not match");
@@ -405,7 +406,7 @@ fn validate_persisted_manifest(
     Ok(())
 }
 
-fn validate_provider_pairings(manifest: &McpSessionManifest, provider: ProviderKind) -> Result<()> {
+fn validate_provider_pairings(manifest: &McpSessionManifest, provider: &ProviderKind) -> Result<()> {
     let expected = manifest
         .tools
         .iter()
@@ -459,9 +460,9 @@ pub(crate) fn canonical_candidate(tool: DiscoveredTool) -> Result<McpManifestToo
     })
 }
 
-fn provider_tool(tool: &McpManifestTool, provider: ProviderKind) -> ProviderTool {
+fn provider_tool(tool: &McpManifestTool, provider: &ProviderKind) -> ProviderTool {
     let mut provider_tool = ProviderTool::function_json_named(
-        provider,
+        provider.as_str(),
         tool.exposed_name.clone(),
         tool.description.clone(),
         tool.input_schema.clone(),

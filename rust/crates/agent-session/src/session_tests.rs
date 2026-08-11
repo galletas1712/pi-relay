@@ -819,7 +819,7 @@ fn max_output_tokens_persists_partial_assistant_then_crashed_boundary() {
     assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
 
     let provider_replay = vec![ProviderReplayItem::new(
-        agent_vocab::ProviderKind::OpenAi,
+        agent_vocab::ProviderKind::openai(),
         &serde_json::json!({
             "type": "message",
             "role": "assistant",

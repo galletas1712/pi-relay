@@ -10,11 +10,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+/// Provider-native cache retention hint.  The sidecar uses this to decide
+/// cache breakpoint placement (e.g. Anthropic `cache_control` TTL, OpenAI
+/// `prompt_cache_key` scope).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheRetention {
+    None,
+    Short,
+    Long,
+}
+
 pub mod anthropic;
 mod common;
-mod http;
-pub mod openai;
-mod sse;
+pub mod pi_ai;
 mod token_estimator;
 mod transcript;
 
@@ -60,6 +69,9 @@ pub struct ModelRequest {
     /// any value returned by an upstream request should be replayed by later
     /// requests for the same turn, but must not leak into future turns.
     pub turn_id: Option<TurnId>,
+    /// Provider-native cache retention hint.  When `Some`, the sidecar uses
+    /// this to place cache breakpoints with the appropriate TTL.
+    pub cache_retention: Option<CacheRetention>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,10 +166,11 @@ pub enum ProviderToolProfile {
 }
 
 impl ProviderToolProfile {
-    pub fn for_provider(kind: ProviderKind) -> Self {
-        match kind {
-            ProviderKind::OpenAi => Self::OpenAiCoding,
-            ProviderKind::Claude => Self::AnthropicCoding,
+    pub fn for_provider(kind: &ProviderKind) -> Self {
+        match kind.as_str() {
+            "openai" => Self::OpenAiCoding,
+            "claude" => Self::AnthropicCoding,
+            _ => Self::CustomDefinitions,
         }
     }
 }
@@ -171,10 +184,10 @@ fn effective_provider_tools(
     }
     match profile {
         ProviderToolProfile::OpenAiCoding => {
-            ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::OpenAi)
+            ToolRegistry::with_builtin_tools().provider_tools_for_provider(&ProviderKind::openai())
         }
         ProviderToolProfile::AnthropicCoding => {
-            ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::Claude)
+            ToolRegistry::with_builtin_tools().provider_tools_for_provider(&ProviderKind::claude())
         }
         ProviderToolProfile::None | ProviderToolProfile::CustomDefinitions => Vec::new(),
     }
@@ -183,11 +196,11 @@ fn effective_provider_tools(
 impl ModelTranscriptEntry {
     pub(crate) fn provider_replay_values_for(
         &self,
-        provider: ProviderKind,
+        provider: &ProviderKind,
     ) -> serde_json::Result<Vec<Value>> {
         self.provider_replay
             .iter()
-            .filter(|record| record.provider == provider)
+            .filter(|record| &record.provider == provider)
             .map(ProviderReplayItem::raw_value)
             .collect()
     }
@@ -197,7 +210,7 @@ impl ModelTranscriptEntry {
     }
 }
 
-pub fn canonical_tool_call_for_provider(provider: ProviderKind, call: &ToolCall) -> ToolCall {
+pub fn canonical_tool_call_for_provider(provider: &ProviderKind, call: &ToolCall) -> ToolCall {
     let tool_name = canonical_tool_name_for_provider(provider, &call.tool_name);
     if tool_name == call.tool_name {
         return call.clone();
@@ -209,24 +222,25 @@ pub fn canonical_tool_call_for_provider(provider: ProviderKind, call: &ToolCall)
     }
 }
 
-pub fn canonical_tool_name_for_provider(provider: ProviderKind, name: &str) -> &str {
-    match provider {
-        ProviderKind::OpenAi => match name {
+pub fn canonical_tool_name_for_provider<'a>(provider: &ProviderKind, name: &'a str) -> &'a str {
+    match provider.as_str() {
+        "openai" => match name {
             "apply_patch" => "Edit",
             "web_search" => "WebSearch",
             "web_fetch" => "WebFetch",
             other => other,
         },
-        ProviderKind::Claude => match name {
+        "claude" => match name {
             "str_replace_based_edit_tool" => "Edit",
             "web_search" => "WebSearch",
             "web_fetch" => "WebFetch",
             other => other,
         },
+        _ => name,
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelTranscriptEntry {
     pub item: TranscriptItem,
     pub provider_replay: Vec<ProviderReplayItem>,
@@ -241,7 +255,7 @@ impl From<TranscriptItem> for ModelTranscriptEntry {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptSections {
     pub stable_prefix: Option<String>,
     pub dynamic_context: Option<String>,
@@ -604,7 +618,7 @@ mod provider_error_tests {
     #[test]
     fn provider_replay_filter_parses_raw_values_without_rewriting() {
         let openai = ProviderReplayItem {
-            provider: ProviderKind::OpenAi,
+            provider: ProviderKind::openai(),
             raw_json: r#"{"type":"function_call","name":"web_search"}"#.to_string(),
             display: Some(ReplayDisplay {
                 kind: ReplayDisplayKind::HostedTool,
@@ -613,7 +627,7 @@ mod provider_error_tests {
             }),
         };
         let corrupt_claude = ProviderReplayItem {
-            provider: ProviderKind::Claude,
+            provider: ProviderKind::claude(),
             raw_json: "{".to_string(),
             display: None,
         };
@@ -624,12 +638,12 @@ mod provider_error_tests {
 
         assert_eq!(
             entry
-                .provider_replay_values_for(ProviderKind::OpenAi)
+                .provider_replay_values_for(&ProviderKind::openai())
                 .unwrap(),
             vec![openai.raw_value().unwrap()]
         );
         assert!(entry
-            .provider_replay_values_for(ProviderKind::Claude)
+            .provider_replay_values_for(&ProviderKind::claude())
             .is_err());
         assert_eq!(entry.provider_replay, vec![openai, corrupt_claude]);
     }

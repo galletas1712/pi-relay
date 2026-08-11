@@ -157,7 +157,7 @@ fn assistant_message_with_replay(
             items: vec![AssistantItem::Text(text.to_string())],
         }),
         provider_replay: vec![ProviderReplayItem::new(
-            ProviderKind::OpenAi,
+            ProviderKind::openai(),
             &json!({ "type": "message", "large": "raw" }),
         )
         .expect("provider replay serializes")],
@@ -239,7 +239,7 @@ fn session_config(project_id: Uuid) -> SessionConfig {
         workspaces: Vec::new(),
         system_prompt: "test prompt".to_string(),
         provider: ProviderConfig {
-            kind: ProviderKind::OpenAi,
+            provider: ProviderKind::openai(),
             model: "test-model".to_string(),
             reasoning_effort: ReasoningEffort::Medium,
             max_tokens: None,

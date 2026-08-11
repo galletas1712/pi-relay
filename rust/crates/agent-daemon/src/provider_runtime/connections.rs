@@ -1,175 +1,65 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use agent_provider::{
-    anthropic::{AnthropicModelCache, AnthropicProvider},
-    openai::{
-        OpenAiCodexHttpClient, OpenAiCodexSessionState, OpenAiModelCatalogCache, OpenAiProvider,
-    },
-};
-use agent_vocab::ProviderKind;
-use anyhow::{anyhow, Result};
+use agent_provider::pi_ai::PiAiSidecarProvider;
+use anyhow::Result;
 use tokio::sync::Mutex;
 
 use crate::auth::Credentials;
 
 use super::provider::ProviderHandle;
 
+/// Registry that produces a `PiAiSidecarProvider` for every session.
+///
+/// All provider-specific logic lives in the pi-ai sidecar; the daemon only
+/// needs a shared HTTP client and the sidecar's base URL.
 #[derive(Clone)]
 pub(crate) struct ProviderConnectionRegistry {
-    codex_client: OpenAiCodexHttpClient,
-    anthropic_client: reqwest::Client,
-    anthropic_model_cache: AnthropicModelCache,
-    openai_model_catalog_cache: OpenAiModelCatalogCache,
-    connections: Arc<Mutex<HashMap<ProviderConnectionKey, Arc<ProviderConnection>>>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ProviderConnectionKey {
-    session_id: String,
-    provider: ProviderKind,
-}
-
-enum ProviderConnection {
-    OpenAi(OpenAiCodexConnection),
-    Anthropic(AnthropicConnection),
-}
-
-struct OpenAiCodexConnection {
-    state: Arc<OpenAiCodexSessionState>,
-    client: OpenAiCodexHttpClient,
-    model_catalog_cache: OpenAiModelCatalogCache,
-}
-
-struct AnthropicConnection {
-    client: reqwest::Client,
-    model_cache: AnthropicModelCache,
+    sidecar_url: String,
+    http_client: reqwest::Client,
+    connections: Arc<Mutex<Vec<String>>>,
 }
 
 impl ProviderConnectionRegistry {
     pub(crate) fn new() -> Self {
+        let sidecar_url = std::env::var("SIDECAR_URL")
+            .unwrap_or_else(|_| agent_provider::pi_ai::SIDECAR_DEFAULT_URL.to_string());
         Self {
-            codex_client: OpenAiCodexHttpClient::new(),
-            anthropic_client: reqwest::Client::new(),
-            anthropic_model_cache: AnthropicModelCache::default(),
-            openai_model_catalog_cache: OpenAiModelCatalogCache::default(),
-            connections: Arc::new(Mutex::new(HashMap::new())),
+            sidecar_url,
+            http_client: reqwest::Client::new(),
+            connections: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub(super) async fn provider_for_config(
         &self,
-        provider: ProviderKind,
-        credentials: &Credentials,
-        session_id: &str,
+        provider: String,
+        _credentials: &Credentials,
+        _session_id: &str,
     ) -> Result<ProviderHandle> {
-        let connection = self.get_or_create(session_id, provider).await;
-        connection.provider_handle(credentials)
+        let pi_ai = PiAiSidecarProvider::with_client(
+            &self.sidecar_url,
+            self.http_client.clone(),
+            provider.as_str(),
+        );
+        Ok(ProviderHandle {
+            provider: Box::new(pi_ai),
+            uses_codex_auth: false,
+        })
     }
 
     pub(crate) async fn mark_compacted(
         &self,
         session_id: &str,
-        provider: ProviderKind,
-        generation: u64,
+        _provider: String,
+        _generation: u64,
     ) {
-        let key = ProviderConnectionKey {
-            session_id: session_id.to_string(),
-            provider,
-        };
-        let connection = {
-            let guard = self.connections.lock().await;
-            guard.get(&key).cloned()
-        };
-        if let Some(connection) = connection {
-            connection.mark_compacted(generation);
-        }
+        // The pi-ai sidecar manages cache state internally; no-op.
+        let _ = session_id;
     }
 
     pub(crate) async fn remove_session(&self, session_id: &str) {
         let mut guard = self.connections.lock().await;
-        guard.retain(|key, _| key.session_id != session_id);
-    }
-
-    async fn get_or_create(
-        &self,
-        session_id: &str,
-        provider: ProviderKind,
-    ) -> Arc<ProviderConnection> {
-        let key = ProviderConnectionKey {
-            session_id: session_id.to_string(),
-            provider,
-        };
-        let mut guard = self.connections.lock().await;
-        guard
-            .entry(key)
-            .or_insert_with(|| {
-                Arc::new(match provider {
-                    ProviderKind::OpenAi => ProviderConnection::OpenAi(OpenAiCodexConnection {
-                        state: Arc::new(OpenAiCodexSessionState::new(session_id)),
-                        client: self.codex_client.clone(),
-                        model_catalog_cache: self.openai_model_catalog_cache.clone(),
-                    }),
-                    ProviderKind::Claude => ProviderConnection::Anthropic(AnthropicConnection {
-                        client: self.anthropic_client.clone(),
-                        model_cache: self.anthropic_model_cache.clone(),
-                    }),
-                })
-            })
-            .clone()
-    }
-}
-
-impl ProviderConnection {
-    fn provider_handle(&self, credentials: &Credentials) -> Result<ProviderHandle> {
-        match self {
-            ProviderConnection::OpenAi(connection) => connection.provider_handle(credentials),
-            ProviderConnection::Anthropic(connection) => connection.provider_handle(credentials),
-        }
-    }
-
-    fn mark_compacted(&self, generation: u64) {
-        match self {
-            ProviderConnection::OpenAi(connection) => {
-                connection.state.set_window_generation(generation);
-            }
-            ProviderConnection::Anthropic(_) => {}
-        }
-    }
-}
-
-impl OpenAiCodexConnection {
-    fn provider_handle(&self, credentials: &Credentials) -> Result<ProviderHandle> {
-        Ok(ProviderHandle {
-            provider: Box::new(OpenAiProvider::codex_with_client_session_and_cache(
-                self.client.clone(),
-                self.state.clone(),
-                credentials.codex_access_token.clone().ok_or_else(|| {
-                    anyhow!("~/.codex ChatGPT token not found for OpenAI subscription transport")
-                })?,
-                credentials.codex_account_id.clone(),
-                credentials.codex_installation_id.clone(),
-                self.model_catalog_cache.clone(),
-            )),
-            uses_codex_auth: true,
-        })
-    }
-}
-
-impl AnthropicConnection {
-    fn provider_handle(&self, credentials: &Credentials) -> Result<ProviderHandle> {
-        let auth = credentials.anthropic_auth().ok_or_else(|| {
-            anyhow!(
-                "Anthropic credentials not found: set CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY, or sign in with Claude Code (~/.claude/.credentials.json) / configure primaryApiKey"
-            )
-        })?;
-        Ok(ProviderHandle {
-            provider: Box::new(AnthropicProvider::new_with_auth_and_cache(
-                self.client.clone(),
-                auth,
-                self.model_cache.clone(),
-            )),
-            uses_codex_auth: false,
-        })
+        guard.retain(|s| s != session_id);
     }
 }
 
@@ -178,40 +68,26 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn openai_compaction_updates_session_generation() {
+    async fn remove_session_drops_connection() {
         let registry = ProviderConnectionRegistry::new();
-        let connection = registry
-            .get_or_create("session-1", ProviderKind::OpenAi)
-            .await;
-        let ProviderConnection::OpenAi(openai) = connection.as_ref() else {
-            panic!("expected OpenAI connection");
-        };
-        assert_eq!(openai.state.window_generation(), 0);
-
-        registry
-            .mark_compacted("session-1", ProviderKind::OpenAi, 42)
-            .await;
-
-        assert_eq!(openai.state.window_generation(), 42);
-    }
-
-    #[tokio::test]
-    async fn remove_session_drops_all_provider_connections_for_session() {
-        let registry = ProviderConnectionRegistry::new();
-        registry
-            .get_or_create("session-1", ProviderKind::OpenAi)
-            .await;
-        registry
-            .get_or_create("session-1", ProviderKind::Claude)
-            .await;
-        registry
-            .get_or_create("session-2", ProviderKind::OpenAi)
-            .await;
+        registry.connections.lock().await.push("session-1".to_string());
+        registry.connections.lock().await.push("session-2".to_string());
 
         registry.remove_session("session-1").await;
 
         let guard = registry.connections.lock().await;
         assert_eq!(guard.len(), 1);
-        assert!(guard.keys().all(|key| key.session_id == "session-2"));
+        assert_eq!(guard[0], "session-2");
+    }
+
+    #[tokio::test]
+    async fn provider_for_config_returns_pi_ai_provider() {
+        let registry = ProviderConnectionRegistry::new();
+        let credentials = Credentials::default();
+        let handle = registry
+            .provider_for_config("openai".to_string(), &credentials, "session-1")
+            .await
+            .expect("provider handle");
+        assert!(!handle.uses_codex_auth);
     }
 }

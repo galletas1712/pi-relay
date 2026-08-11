@@ -42,7 +42,7 @@ fn transcript_entry_with_provider_replay() -> TranscriptStorageNode {
             items: vec![AssistantItem::Text("hello".to_string())],
         }),
         provider_replay: vec![ProviderReplayItem::new(
-            ProviderKind::OpenAi,
+            ProviderKind::openai(),
             &json!({ "type": "message" }),
         )
         .expect("provider replay serializes")],
@@ -65,7 +65,7 @@ fn consumed_input() -> QueuedInput {
         priority: InputPriority::FollowUp,
         content: QueuedInputContent::user_message(UserMessage::text("hello")),
         route: ProviderConfig {
-            kind: ProviderKind::OpenAi,
+            provider: ProviderKind::openai(),
             model: "test-model".to_string(),
             reasoning_effort: ReasoningEffort::Medium,
             max_tokens: None,
@@ -155,7 +155,7 @@ async fn only_a_batch_with_no_durable_obligations_skips_the_transaction() {
                 .with_unchanged_active_leaf()
                 .with_provider_route(
                     ProviderConfig {
-                        kind: ProviderKind::OpenAi,
+                        provider: ProviderKind::openai(),
                         model: "test-model".to_string(),
                         reasoning_effort: ReasoningEffort::High,
                         max_tokens: None,
@@ -183,7 +183,7 @@ async fn only_a_batch_with_no_durable_obligations_skips_the_transaction() {
                 .with_accepted_input(Some(accepted_input()))
                 .with_provider_route(
                     ProviderConfig {
-                        kind: ProviderKind::OpenAi,
+                        provider: ProviderKind::openai(),
                         model: "test-model".to_string(),
                         reasoning_effort: ReasoningEffort::High,
                         max_tokens: None,
@@ -223,7 +223,7 @@ async fn only_a_batch_with_no_durable_obligations_skips_the_transaction() {
                 .with_unchanged_active_leaf()
                 .with_provider_route(
                     ProviderConfig {
-                        kind: ProviderKind::OpenAi,
+                        provider: ProviderKind::openai(),
                         model: "test-model".to_string(),
                         reasoning_effort: ReasoningEffort::High,
                         max_tokens: None,

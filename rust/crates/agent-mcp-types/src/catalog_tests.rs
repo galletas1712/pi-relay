@@ -102,7 +102,7 @@ fn selected_subset_preserves_inventory_names_and_contains_mcp_only_declarations(
 
     assert_eq!(snapshot.manifest().tools, vec![selected_tool.clone()]);
     assert_eq!(
-        snapshot.provider_tools(ProviderKind::OpenAi)[0].declaration,
+        snapshot.provider_tools(&ProviderKind::openai())[0].declaration,
         json!({
             "type": "function",
             "name": selected_tool.exposed_name,
@@ -110,7 +110,7 @@ fn selected_subset_preserves_inventory_names_and_contains_mcp_only_declarations(
             "parameters": {"type":"object"},
         })
     );
-    assert_eq!(snapshot.provider_tools(ProviderKind::OpenAi).len(), 1);
+    assert_eq!(snapshot.provider_tools(&ProviderKind::openai()).len(), 1);
 }
 
 #[test]

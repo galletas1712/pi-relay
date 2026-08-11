@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(
             RuntimeCommand::ExecuteTool {
                 workspace_id: "workspace".to_string(),
-                provider: agent_vocab::ProviderKind::Claude,
+                provider: agent_vocab::ProviderKind::claude(),
                 tool_call: agent_vocab::ToolCall {
                     id: agent_vocab::ToolCallId::new("call-1"),
                     tool_name: "Bash".to_string(),

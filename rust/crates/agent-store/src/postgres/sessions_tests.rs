@@ -119,7 +119,7 @@ fn session_config(project_id: Uuid) -> SessionConfig {
         workspaces: Vec::new(),
         system_prompt: "test prompt".to_string(),
         provider: ProviderConfig {
-            kind: ProviderKind::OpenAi,
+            provider: ProviderKind::openai(),
             model: "test-model".to_string(),
             reasoning_effort: ReasoningEffort::Medium,
             max_tokens: None,
@@ -753,7 +753,7 @@ async fn compaction_provider_replay_round_trips_nullable_and_omitted_encrypted_c
                 .unwrap()
                 .insert("encrypted_content".to_string(), value);
         }
-        let replay = ProviderReplayItem::new(ProviderKind::Claude, &block)
+        let replay = ProviderReplayItem::new(ProviderKind::claude(), &block)
             .expect("provider replay item creates");
         store
             .complete_compaction_action(
@@ -762,7 +762,7 @@ async fn compaction_provider_replay_round_trips_nullable_and_omitted_encrypted_c
                     summary: String::new(),
                     summary_kind: "generic".to_string(),
                     provider_replay: vec![replay],
-                    provider: ProviderKind::Claude,
+                    provider: ProviderKind::claude(),
                     usage: None,
                     continuation_suffix: Vec::new(),
                 },

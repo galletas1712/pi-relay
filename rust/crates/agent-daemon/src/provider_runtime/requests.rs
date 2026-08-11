@@ -187,16 +187,16 @@ pub(crate) async fn build_model_request(
     let prompt = assemble_agent_prompt(state, config, session_id).await?;
     let mut tools = provider_tools_for_session(
         state,
-        config.provider.kind,
+        config.provider.provider.as_str(),
         effective_prompt_profile(state, config, session_id).await?,
     );
-    tools.extend(snapshot.provider_tools(config.provider.kind));
+    tools.extend(snapshot.provider_tools(&config.provider.provider));
     Ok(ModelRequest {
         model: config.provider.model.clone(),
         transcript_cache_prefix_len: None,
         prompt,
         transcript: provider_transcript(model_context),
-        tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
+        tool_profile: ProviderToolProfile::for_provider(&config.provider.provider),
         tools,
         // Provider adapters apply authoritative discovered/static output
         // ceilings. Do not pre-clamp here or stale daemon metadata could
@@ -206,6 +206,7 @@ pub(crate) async fn build_model_request(
         prompt_cache_key: Some(model_prompt_cache_key(config, session_id)),
         session_id: Some(session_id.to_string()),
         turn_id,
+        cache_retention: None,
     })
 }
 

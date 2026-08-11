@@ -52,7 +52,7 @@ use agent_store::{
     TranscriptEntryBodyMode, TranscriptEntryScope,
 };
 use agent_tools::ToolRegistry;
-use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
+use agent_vocab::{ActionId, ProviderConfig, TranscriptItem, TurnId, TurnOutcome};
 use anyhow::Result;
 use futures_util::{stream, SinkExt, StreamExt};
 use serde::Deserialize;
@@ -653,14 +653,8 @@ async fn dispatch_request(
 
 async fn tools_list(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let provider = required_string(&params, "provider")?;
-    let provider = provider.parse::<ProviderKind>().map_err(|error| {
-        RpcError::new(
-            "invalid_provider",
-            format!("invalid provider for tools.list: {error}"),
-        )
-    })?;
     let profile = tools_list_profile(state, &params).await?;
-    let mut tools = provider_tools_for_session(state, provider, profile)
+    let mut tools = provider_tools_for_session(state, &provider, profile)
         .into_iter()
         .map(|tool| {
             json!({
@@ -701,7 +695,7 @@ async fn tools_list(state: &AppState, params: Value) -> std::result::Result<Valu
     tools.extend(
         snapshot
             .manifest()
-            .provider_tools(provider)
+            .provider_tools(&provider.into())
             .iter()
             .filter(|tool| snapshot.manifest().tool(&tool.name).is_some())
             .filter_map(|tool| views.get(&tool.name).map(|view| (tool, view)))
@@ -729,12 +723,6 @@ async fn tools_list(state: &AppState, params: Value) -> std::result::Result<Valu
 async fn mcp_inventory(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let runtime_id = required_string(&params, "runtime_id")?;
     let provider = required_string(&params, "provider")?;
-    let provider = provider.parse::<ProviderKind>().map_err(|error| {
-        RpcError::new(
-            "invalid_provider",
-            format!("invalid provider for mcp.inventory: {error}"),
-        )
-    })?;
     let session_id = match params.get("session_id") {
         None | Some(Value::Null) => None,
         Some(Value::String(session_id)) => Some(session_id.as_str()),
@@ -748,7 +736,7 @@ async fn mcp_inventory(state: &AppState, params: Value) -> std::result::Result<V
     let session = if let Some(session_id) = session_id {
         let versioned = mcp_add::load_root_session_config(state, session_id).await?;
         let config = versioned.config;
-        if config.runtime_id != runtime_id || config.provider.kind != provider {
+        if config.runtime_id != runtime_id || config.provider.provider.as_str() != provider {
             return Err(RpcError::new(
                 "invalid_params",
                 "MCP inventory runtime and provider must match the session",
@@ -1082,7 +1070,7 @@ async fn session_configure(
 }
 
 fn provider_model_changed(previous: &ProviderConfig, next: &ProviderConfig) -> bool {
-    previous.kind != next.kind || previous.model != next.model
+    previous.provider != next.provider || previous.model != next.model
 }
 
 fn metadata_title(metadata: &Value) -> Option<&str> {

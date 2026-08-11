@@ -1467,6 +1467,7 @@ fn display_hint(item: &TranscriptItem) -> Option<String> {
             .iter()
             .map(|item| match item {
                 agent_vocab::AssistantItem::Text(text) => text.clone(),
+                agent_vocab::AssistantItem::Thinking { .. } => String::new(),
                 agent_vocab::AssistantItem::ToolCall(call) => {
                     format!("tool call: {}", call.tool_name)
                 }
@@ -1687,7 +1688,7 @@ mod tests {
             workspaces: Vec::new(),
             system_prompt: "test prompt".to_string(),
             provider: ProviderConfig {
-                kind: ProviderKind::OpenAi,
+                provider: ProviderKind::openai(),
                 model: "test-model".to_string(),
                 reasoning_effort: ReasoningEffort::Medium,
                 max_tokens: None,
@@ -1774,7 +1775,7 @@ mod tests {
                 items: vec![AssistantItem::Text(text.to_string())],
             }),
             provider_replay: vec![ProviderReplayItem::new(
-                ProviderKind::OpenAi,
+                ProviderKind::openai(),
                 &json!({ "type": "message", "large": "raw" }),
             )
             .expect("provider replay serializes")],

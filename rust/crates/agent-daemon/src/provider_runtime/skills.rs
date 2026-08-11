@@ -4,7 +4,7 @@ use std::sync::Arc;
 use agent_prompt::Skill;
 use agent_runtime_protocol::{RawSkillFile, SkillKind, SkillOrigin};
 use agent_store::PostgresAgentStore;
-use agent_vocab::{ProviderConfig, ProviderKind, ReasoningEffort, ToolCall, ToolResultMessage};
+use agent_vocab::{ProviderConfig, ReasoningEffort, ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -236,12 +236,6 @@ fn role_provider_from_frontmatter(
             skill_path.display()
         ));
     }
-    let kind = provider_name.parse::<ProviderKind>().map_err(|error| {
-        anyhow!(
-            "role skill {} has unsupported provider prefix `{provider_name}`: {error}",
-            skill_path.display()
-        )
-    })?;
     let reasoning_effort = parsed
         .frontmatter
         .reasoning_effort
@@ -255,7 +249,7 @@ fn role_provider_from_frontmatter(
             )
         })?;
     Ok(Some(ProviderConfig {
-        kind,
+        provider: provider_name.into(),
         model: native_model.to_string(),
         reasoning_effort,
         max_tokens: parsed.frontmatter.max_tokens,
@@ -380,7 +374,7 @@ mod tests {
         let resolved = resolve_skill_role(&[role, global.clone()], "reviewer").expect("role");
 
         let provider = resolved.provider.expect("provider");
-        assert_eq!(provider.kind, ProviderKind::Claude);
+        assert_eq!(provider.provider.as_str(), "claude");
         assert_eq!(provider.model, "claude-opus-4-8");
         assert_eq!(provider.reasoning_effort, ReasoningEffort::High);
         assert_eq!(provider.max_tokens, Some(4096));
@@ -454,7 +448,6 @@ mod tests {
             ("claude: claude-opus-4-8", "expected provider:model"),
             ("claude:claude-opus-4-8 ", "expected provider:model"),
             ("claude::claude-opus-4-8", "expected provider:model"),
-            ("bogus:some-model", "unsupported provider prefix"),
         ] {
             let role = raw_skill(
                 SkillKind::SubagentRole,
@@ -480,7 +473,7 @@ mod tests {
 
         let resolved = resolve_skill_role(&[role], "reviewer").expect("role");
         let provider = resolved.provider.expect("provider");
-        assert_eq!(provider.kind, ProviderKind::Claude);
+        assert_eq!(provider.provider.as_str(), "claude");
         assert_eq!(provider.model, "claude-opus-4-8");
     }
 

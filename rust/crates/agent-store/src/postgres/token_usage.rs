@@ -231,7 +231,7 @@ mod tests {
             workspaces: Vec::new(),
             system_prompt: "test prompt".to_string(),
             provider: ProviderConfig {
-                kind: ProviderKind::OpenAi,
+                provider: ProviderKind::openai(),
                 model: "test-model".to_string(),
                 reasoning_effort: ReasoningEffort::Medium,
                 max_tokens: None,

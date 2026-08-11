@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn split_before_open_turn_preserves_whole_open_turn_suffix() {
         let replay = ProviderReplayItem {
-            provider: agent_vocab::ProviderKind::OpenAi,
+            provider: agent_vocab::ProviderKind::openai(),
             raw_json: r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"tool please"}]}"#
                 .to_string(),
             display: None,

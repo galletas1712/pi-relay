@@ -1,13 +1,14 @@
 use agent_provider::{
     ModelRequest, ModelResponse, ModelTranscriptEntry, PromptSections, ProviderToolProfile,
 };
+use agent_vocab::ProviderKind;
 use agent_store::SessionConfig;
 use agent_tools::{
     limit_tool_output_with_max_tokens, nonempty_domains, ProviderTool, ToolContext, ToolExecution,
     WebFetchArgs, WebSearchArgs,
 };
 use agent_vocab::{
-    AssistantItem, ProviderKind, ProviderReplayItem, ToolCall, ToolResultMessage, TranscriptItem,
+    AssistantItem, ProviderReplayItem, ToolCall, ToolResultMessage, TranscriptItem,
     UserMessage,
 };
 use serde_json::{json, Value};
@@ -74,10 +75,7 @@ async fn run_web_search(
         );
     }
 
-    let tool = match config.provider.kind {
-        ProviderKind::Claude => anthropic_web_search_tool(&args),
-        ProviderKind::OpenAi => openai_web_search_tool(),
-    };
+    let tool = openai_web_search_tool();
     let prompt = web_search_sidecar_prompt(&args);
     run_provider_web_sidecar(
         state,
@@ -116,48 +114,37 @@ async fn run_web_fetch(
         );
     }
 
-    match config.provider.kind {
-        ProviderKind::Claude => {
-            let tool = anthropic_web_fetch_tool();
-            let prompt = web_fetch_sidecar_prompt(&args);
-            match run_provider_web_sidecar(
-                state,
-                config,
-                session_id,
-                call,
-                tool,
-                prompt,
-                args.max_output_tokens,
-            )
-            .await
-            {
-                result if matches!(result.status, agent_vocab::ToolResultStatus::Success) => result,
-                provider_error => {
-                    // If Claude's server-side fetch cannot run, fall back to
-                    // the provider-neutral HTTP fetch implementation so the
-                    // local web tool still has a best-effort execution path.
-                    let fallback = state
-                        .tools
-                        .execute(config.provider.kind, call, ctx)
-                        .await
-                        .unwrap_or_else(|_| {
-                            ToolResultMessage::crashed(call.id.clone(), call.tool_name.clone())
-                        });
-                    if matches!(fallback.status, agent_vocab::ToolResultStatus::Success) {
-                        fallback
-                    } else {
-                        provider_error
-                    }
-                }
+    let tool = openai_web_fetch_tool();
+    let prompt = web_fetch_sidecar_prompt(&args);
+    match run_provider_web_sidecar(
+        state,
+        config,
+        session_id,
+        call,
+        tool,
+        prompt,
+        args.max_output_tokens,
+    )
+    .await
+    {
+        result if matches!(result.status, agent_vocab::ToolResultStatus::Success) => result,
+        provider_error => {
+            // If the sidecar web fetch cannot run, fall back to the
+            // provider-neutral HTTP fetch implementation so the local web
+            // tool still has a best-effort execution path.
+            let fallback = state
+                .tools
+                .execute(call, ctx)
+                .await
+                .unwrap_or_else(|_| {
+                    ToolResultMessage::crashed(call.id.clone(), call.tool_name.clone())
+                });
+            if matches!(fallback.status, agent_vocab::ToolResultStatus::Success) {
+                fallback
+            } else {
+                provider_error
             }
         }
-        ProviderKind::OpenAi => state
-            .tools
-            .execute(config.provider.kind, call, ctx)
-            .await
-            .unwrap_or_else(|_| {
-                ToolResultMessage::crashed(call.id.clone(), call.tool_name.clone())
-            }),
     }
 }
 
@@ -209,6 +196,7 @@ fn build_web_sidecar_request(
             prompt_cache_key: None,
             session_id: None,
             turn_id: None,
+            cache_retention: None,
         },
     }
 }
@@ -243,6 +231,7 @@ fn run_embedded_web_tool_calls(response: &ModelResponse, initial_text: &str) -> 
     for item in &response.assistant.items {
         match item {
             AssistantItem::Text(_) => {}
+            AssistantItem::Thinking { .. } => {}
             AssistantItem::ToolCall(tool_call) => {
                 if let Some(line) = embedded_tool_call_to_summary(tool_call) {
                     transcript.push(line);
@@ -320,11 +309,25 @@ fn anthropic_web_fetch_tool() -> ProviderTool {
 fn openai_web_search_tool() -> ProviderTool {
     ProviderTool::new(
         "web_search",
-        "OpenAI web search sidecar tool.",
+        "Web search sidecar tool.",
         json!({ "type": "object" }),
         json!({
             "type": "web_search",
             "search_context_size": "high",
+        }),
+        // Sidecar-only provider declaration; main-loop execution is still the
+        // local JSON wrapper.
+        ToolExecution::LocalJson,
+    )
+}
+
+fn openai_web_fetch_tool() -> ProviderTool {
+    ProviderTool::new(
+        "web_fetch",
+        "Web fetch sidecar tool.",
+        json!({ "type": "object" }),
+        json!({
+            "type": "web_fetch",
         }),
         // Sidecar-only provider declaration; main-loop execution is still the
         // local JSON wrapper.
@@ -446,7 +449,7 @@ mod tests {
     use agent_provider::ModelStopReason;
     use agent_vocab::{AssistantMessage, ProviderConfig, ReasoningEffort, ToolCallId};
 
-    fn test_session_config(provider_kind: ProviderKind, max_tokens: Option<u32>) -> SessionConfig {
+    fn test_session_config(provider_kind: &str, max_tokens: Option<u32>) -> SessionConfig {
         SessionConfig {
             project_id: None,
             runtime_id: "runtime-test".to_string(),
@@ -454,7 +457,7 @@ mod tests {
             workspaces: Vec::new(),
             system_prompt: String::new(),
             provider: ProviderConfig {
-                kind: provider_kind,
+                provider: ProviderKind::from(provider_kind),
                 model: "test-model".to_string(),
                 reasoning_effort: ReasoningEffort::Medium,
                 max_tokens,
@@ -498,7 +501,7 @@ mod tests {
 
         for max_tokens in [None, Some(4_096), Some(256_000)] {
             let request = build_web_sidecar_request(
-                &test_session_config(ProviderKind::Claude, max_tokens),
+                &test_session_config("claude", max_tokens),
                 "session",
                 &call,
                 anthropic_web_search_tool(&WebSearchArgs {

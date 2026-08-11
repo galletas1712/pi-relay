@@ -84,7 +84,7 @@ async fn oauth_route_is_immediately_login_required_without_blocking_healthy_rout
 
     let first_party = first_party();
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party)
+        .inventory(ProviderKind::openai(), &first_party)
         .await
         .expect("mixed inventory remains coherent");
     assert_eq!(
@@ -121,9 +121,9 @@ async fn oauth_route_is_immediately_login_required_without_blocking_healthy_rout
             .collect::<Vec<_>>(),
         vec![("stdio", "read")]
     );
-    for provider in [ProviderKind::OpenAi, ProviderKind::Claude] {
+    for provider in [ProviderKind::openai(), ProviderKind::claude()] {
         assert!(snapshot
-            .provider_tools(provider)
+            .provider_tools(&provider)
             .iter()
             .all(|tool| !tool.name.contains("oauth")));
     }
@@ -175,7 +175,7 @@ async fn shutdown_during_refresh_preserves_old_durable_credential() {
             .expect("manager starts");
     login(&manager).await;
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("logged-in inventory loads");
     let snapshot = select_echo(&manager, inventory).await;
@@ -193,7 +193,7 @@ async fn shutdown_during_refresh_preserves_old_durable_credential() {
         let manager = manager.clone();
         tokio::spawn(async move {
             manager
-                .inventory(ProviderKind::OpenAi, &first_party())
+                .inventory(ProviderKind::openai(), &first_party())
                 .await
         })
     };
@@ -364,7 +364,7 @@ async fn transient_first_refresh_failure_retries_without_login() {
     assert_eq!(refresh_request_count(&server), 1);
 
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("later acquisition retries refresh");
     assert_eq!(inventory.servers[0].health, McpHealth::Healthy);
@@ -387,7 +387,7 @@ async fn whitespace_client_id_dcr_persists_and_authenticates_after_restart() {
         .expect("manager starts");
     login(&manager).await;
     manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("DCR login connects");
     manager.shutdown().await;
@@ -406,7 +406,7 @@ async fn whitespace_client_id_dcr_persists_and_authenticates_after_restart() {
         .await
         .expect("restart restores normalized DCR credential");
     let inventory = restarted
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("restart authenticates");
     assert_eq!(inventory.servers[0].health, McpHealth::Healthy);
@@ -448,7 +448,7 @@ async fn persisted_login_reconnects_and_restores_bounded_authenticated_route() {
     assert!(serialized.contains("dynamic-client"));
 
     let first_inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("completed login reconnects on inventory");
     assert_eq!(first_inventory.servers[0].health, McpHealth::Healthy);
@@ -462,7 +462,7 @@ async fn persisted_login_reconnects_and_restores_bounded_authenticated_route() {
         .await
         .expect("restart restores OAuth credentials");
     let inventory = restarted
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("restored route inventories");
     let snapshot = select_echo(&restarted, inventory).await;
@@ -514,7 +514,7 @@ async fn persisted_login_reconnects_and_restores_bounded_authenticated_route() {
     );
     login(&restarted).await;
     restarted
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("compatible re-login reconnects");
     assert_eq!(
@@ -568,7 +568,7 @@ async fn oauth_tools_call_401_is_not_replayed_and_later_inventory_refreshes() {
     .expect("manager starts");
     login(&manager).await;
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("logged-in inventory loads");
     let snapshot = select_echo(&manager, inventory).await;
@@ -587,7 +587,7 @@ async fn oauth_tools_call_401_is_not_replayed_and_later_inventory_refreshes() {
     assert_eq!(mcp_method_count(&server, "tools/call"), 1);
 
     manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("later inventory refreshes and reconnects");
     assert_eq!(
@@ -863,9 +863,12 @@ async fn logout_between_callback_cleanup_and_persistence_wins() {
 
 fn first_party() -> HashMap<ProviderKind, Vec<ProviderTool>> {
     let registry = ToolRegistry::with_builtin_tools();
-    [ProviderKind::OpenAi, ProviderKind::Claude]
+    [ProviderKind::openai(), ProviderKind::claude()]
         .into_iter()
-        .map(|provider| (provider, registry.provider_tools_for_provider(provider)))
+        .map(|provider| {
+            let tools = registry.provider_tools_for_provider(&provider);
+            (provider, tools)
+        })
         .collect()
 }
 
@@ -923,7 +926,7 @@ async fn assert_unavailable_store(path: &std::path::Path, expected: OAuthCredent
             .await
             .expect("manager starts with unavailable OAuth store");
     let inventory = manager
-        .inventory(ProviderKind::OpenAi, &first_party())
+        .inventory(ProviderKind::openai(), &first_party())
         .await
         .expect("healthy route remains usable");
     assert_eq!(

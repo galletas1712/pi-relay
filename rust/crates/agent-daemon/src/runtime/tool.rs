@@ -119,7 +119,7 @@ pub(super) async fn run_tool_turn(
                 &dispatch.config.runtime_id,
                 RuntimeCommand::ExecuteTool {
                     workspace_id: dispatch.config.workspace_id.clone(),
-                    provider: dispatch.config.provider.kind,
+                    provider: dispatch.config.provider.provider,
                     tool_call: execution_call,
                 },
                 None,
@@ -234,7 +234,7 @@ fn finalize_tool_result(result: &mut ToolResultMessage) {
 #[cfg(test)]
 mod tests {
     use agent_tools::{ToolContext, ToolRegistry};
-    use agent_vocab::{ProviderKind, ToolCall, ToolCallId};
+    use agent_vocab::{ToolCall, ToolCallId};
 
     use super::*;
 
@@ -247,7 +247,6 @@ mod tests {
         };
         let mut result = ToolRegistry::with_builtin_tools()
             .execute(
-                ProviderKind::OpenAi,
                 &call,
                 &ToolContext::new(std::env::temp_dir()),
             )

@@ -1,17 +1,14 @@
 use agent_mcp_types::McpSessionSnapshot;
-use agent_provider::{ProviderTokenCountRequest, ProviderToolProfile};
+use agent_provider::ProviderToolProfile;
 use agent_session::{ModelContext, ModelContextEntry, TranscriptStorageNode};
 use agent_store::SessionConfig;
-use agent_vocab::{ProviderKind, TranscriptItem};
+use agent_vocab::TranscriptItem;
 use anyhow::Result;
 
-use crate::auth::Credentials;
 use crate::state::AppState;
 
-use super::auth_retry::count_tokens_with_auth_retry;
 use super::mcp::provider_toolset_fingerprint;
 use super::prompt::{assemble_agent_prompt, effective_prompt_profile, provider_tools_for_session};
-use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
 
 pub(crate) async fn model_input_tokens_for_gate(
@@ -22,65 +19,18 @@ pub(crate) async fn model_input_tokens_for_gate(
     model_context: ModelContext,
     snapshot: &McpSessionSnapshot,
 ) -> Result<usize> {
-    match config.provider.kind {
-        ProviderKind::Claude => {
-            count_claude_model_input_tokens_remotely(
-                state,
-                config,
-                session_id,
-                model_context,
-                snapshot,
-            )
-            .await
-        }
-        ProviderKind::OpenAi => {
-            estimate_codex_model_input_tokens_from_usage_anchor(
-                state,
-                config,
-                session_id,
-                context_leaf_id,
-                model_context,
-                snapshot,
-            )
-            .await
-        }
-    }
-}
-
-async fn count_claude_model_input_tokens_remotely(
-    state: &AppState,
-    config: &SessionConfig,
-    session_id: &str,
-    model_context: ModelContext,
-    snapshot: &McpSessionSnapshot,
-) -> Result<usize> {
-    // Claude has an authoritative remote preflight backend. Count the exact
-    // local tool surface sent on the next /messages call, including web
-    // wrappers now that they are normal client JSON tools.
-    let prompt = assemble_agent_prompt(state, config, session_id).await?;
-    let tools = request_tools(state, config, session_id, snapshot).await?;
-    let request = ProviderTokenCountRequest {
-        model: config.provider.model.clone(),
-        prompt,
-        transcript: provider_transcript(model_context),
-        tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools,
-        max_tokens: config.provider.max_tokens,
-        reasoning_effort: config.provider.reasoning_effort,
-        prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
-        session_id: Some(session_id.to_string()),
-    };
-
-    let credentials = Credentials::load();
-    let provider = provider_for_config(state, config, &credentials, session_id).await?;
-    Ok(
-        count_tokens_with_auth_retry(state, config, session_id, provider, request)
-            .await?
-            .input_tokens,
+    estimate_model_input_tokens_from_usage_anchor(
+        state,
+        config,
+        session_id,
+        context_leaf_id,
+        model_context,
+        snapshot,
     )
+    .await
 }
 
-async fn estimate_codex_model_input_tokens_from_usage_anchor(
+async fn estimate_model_input_tokens_from_usage_anchor(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
@@ -88,12 +38,11 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
     model_context: ModelContext,
     snapshot: &McpSessionSnapshot,
 ) -> Result<usize> {
-    // The Codex/ChatGPT backend has no usable remote count endpoint: probing
-    // /responses/input_tokens returns a Cloudflare challenge instead of a
-    // count. Mirror Codex CLI's practical backend: anchor on the latest
-    // provider-reported usage from a completed response, estimate only local
-    // transcript suffixes appended after that point, and let reactive
-    // compaction/retry handle rare overflow misses.
+    // Anchor on the latest provider-reported usage (totalTokens from the
+    // ModelResponse) from a completed response, estimate only local transcript
+    // suffixes appended after that point, and let reactive compaction/retry
+    // handle rare overflow misses.  The sidecar reports usage.totalTokens for
+    // every provider, so this works universally.
     if let Some(context_leaf_id) = context_leaf_id {
         let tools = request_tools(state, config, session_id, snapshot).await?;
         let toolset_fingerprint = provider_toolset_fingerprint(&tools);
@@ -175,9 +124,9 @@ async fn request_tools(
 ) -> Result<Vec<agent_tools::ProviderTool>> {
     let mut tools = provider_tools_for_session(
         state,
-        config.provider.kind,
+        config.provider.provider.as_str(),
         effective_prompt_profile(state, config, session_id).await?,
     );
-    tools.extend(snapshot.provider_tools(config.provider.kind));
+    tools.extend(snapshot.provider_tools(&config.provider.provider));
     Ok(tools)
 }
