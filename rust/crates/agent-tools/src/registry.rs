@@ -74,6 +74,7 @@ impl ProviderTool {
                 "type": "function",
                 "name": definition.name,
                 "description": definition.description,
+                "strict": false,
                 "parameters": definition.input_schema,
             }),
             ToolExecution::LocalJson,

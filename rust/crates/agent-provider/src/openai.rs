@@ -1,7 +1,7 @@
 use agent_tools::{tool_display, ProviderTool, ToolDisplayInput};
 use agent_vocab::{
     AssistantItem, AssistantMessage, ContentBlock, ProviderKind, ProviderReplayItem,
-    ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem, UserMessage,
+    ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem, TurnId, UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, ACCEPT, CONTENT_ENCODING, CONTENT_TYPE};
@@ -24,9 +24,7 @@ pub use session_state::OpenAiCodexSessionState;
 #[cfg(test)]
 use crate::sse::read_json_sse_text;
 use crate::{
-    common::{
-        compaction_summary_text, ensure_success, push_text_item, response_excerpt, response_text,
-    },
+    common::{compaction_summary_text, push_text_item, response_excerpt},
     http::send_provider_generation_request,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
@@ -49,6 +47,9 @@ const HEADER_INSTALLATION_ID: &str = "x-codex-installation-id";
 const HEADER_WINDOW_ID: &str = "x-codex-window-id";
 const HEADER_CLIENT_REQUEST_ID: &str = "x-client-request-id";
 const HEADER_CODEX_TURN_STATE: &str = "x-codex-turn-state";
+const HEADER_CODEX_TURN_METADATA: &str = "x-codex-turn-metadata";
+const HEADER_CODEX_ROUTING_HINT: &str = "x-codex-routing-hint";
+const HEADER_RESPONSES_LITE: &str = "x-openai-internal-codex-responses-lite";
 const HEADER_REQUEST_ID: &str = "x-request-id";
 const HEADER_CF_RAY: &str = "cf-ray";
 const HEADER_OPENAI_MODEL: &str = "openai-model";
@@ -60,10 +61,12 @@ const HEADER_REASONING_INCLUDED: &str = "x-reasoning-included";
 // and rate-limit accounting (see `is_first_party_originator` in the Codex
 // source). Diverging from this label is what causes throttling.
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-pub const CODEX_CLIENT_VERSION: &str = "0.144.0";
+pub const CODEX_CLIENT_VERSION: &str = "0.147.0";
 const CODEX_RESIDENCY_US: &str = "us";
 const CODEX_REQUEST_COMPRESSION_LEVEL: i32 = 3;
 const CODEX_COMPACT_REQUEST_TIMEOUT_SECS: u64 = 20 * 60;
+const CODEX_COMPACTION_RETAINED_TOKEN_BUDGET: usize = 64_000;
+const CODEX_COMPACTION_MAX_AGENT_MESSAGE_TOKENS: usize = 10_000;
 const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_MODELS_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_MODELS_MAX_MODELS: usize = 256;
@@ -212,7 +215,9 @@ struct OpenAiModelMetadata {
     // Keep bounded catalog strings verbatim. Values outside the public
     // ReasoningEffort enum are harness metadata and cannot enter a request.
     supported_reasoning_efforts: HashSet<String>,
+    reasoning_summary: Option<String>,
     supports_parallel_tool_calls: bool,
+    use_responses_lite: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,7 +235,13 @@ struct CodexModel {
     #[serde(default)]
     auto_compact_token_limit: Option<i64>,
     supported_reasoning_levels: Vec<CodexReasoningLevel>,
+    #[serde(default)]
+    supports_reasoning_summary_parameter: bool,
+    #[serde(default)]
+    default_reasoning_summary: Option<String>,
     supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    use_responses_lite: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -415,7 +426,10 @@ fn parse_codex_models_response(bytes: &[u8]) -> Result<OpenAiModelCatalog, Catal
             max_context_window,
             auto_compact_token_limit,
             supported_reasoning_levels,
+            supports_reasoning_summary_parameter,
+            default_reasoning_summary,
             supports_parallel_tool_calls,
+            use_responses_lite,
         } = model;
         if slug.trim().is_empty() || slug.len() > CODEX_MODELS_MAX_SLUG_BYTES {
             return Err(CatalogError::new(
@@ -461,6 +475,17 @@ fn parse_codex_models_response(bytes: &[u8]) -> Result<OpenAiModelCatalog, Catal
                 )));
             }
         }
+        let reasoning_summary = supports_reasoning_summary_parameter
+            .then(|| default_reasoning_summary.unwrap_or_else(|| "auto".to_string()))
+            .filter(|summary| summary != "none");
+        if reasoning_summary
+            .as_deref()
+            .is_some_and(|summary| !matches!(summary, "auto" | "concise" | "detailed"))
+        {
+            return Err(CatalogError::new(format!(
+                "Codex model {slug} advertised an invalid default reasoning summary"
+            )));
+        }
 
         models.insert(
             slug.clone(),
@@ -469,7 +494,9 @@ fn parse_codex_models_response(bytes: &[u8]) -> Result<OpenAiModelCatalog, Catal
                 max_input_tokens,
                 recommended_auto_compact_tokens,
                 supported_reasoning_efforts,
+                reasoning_summary,
                 supports_parallel_tool_calls,
+                use_responses_lite,
             }),
         );
     }
@@ -531,7 +558,9 @@ fn test_openai_model_metadata(model: &str) -> OpenAiModelMetadata {
         .into_iter()
         .map(|effort| effort.as_str().to_string())
         .collect(),
+        reasoning_summary: Some("auto".to_string()),
         supports_parallel_tool_calls: true,
+        use_responses_lite: false,
     }
 }
 
@@ -565,7 +594,10 @@ mod catalog_tests {
                 .iter()
                 .map(|effort| json!({ "effort": effort, "description": "ignored" }))
                 .collect::<Vec<_>>(),
+            "supports_reasoning_summary_parameter": true,
+            "default_reasoning_summary": "auto",
             "supports_parallel_tool_calls": supports_parallel_tool_calls,
+            "use_responses_lite": true,
             "supports_search_tool": true,
             "web_search_tool_type": "text",
             "apply_patch_tool_type": "freeform",
@@ -910,7 +942,9 @@ mod catalog_tests {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            reasoning_summary: Some("auto".to_string()),
             supports_parallel_tool_calls: true,
+            use_responses_lite: true,
         };
         let ordinary = responses_body_with_metadata(
             model_request("gpt-5.6-sol", ReasoningEffort::Max),
@@ -951,7 +985,9 @@ mod catalog_tests {
             max_input_tokens: Some(372_000),
             recommended_auto_compact_tokens: Some(334_800),
             supported_reasoning_efforts: ["high".to_string()].into_iter().collect(),
+            reasoning_summary: Some("auto".to_string()),
             supports_parallel_tool_calls: false,
+            use_responses_lite: true,
         };
         let ordinary = responses_body_with_metadata(
             model_request("gpt-5.6-luna", ReasoningEffort::High),
@@ -1004,11 +1040,14 @@ mod catalog_tests {
         let request = String::from_utf8(raw).expect("request is utf-8");
         let request_lower = request.to_ascii_lowercase();
         let first_line = request.lines().next().expect("request line");
-        assert_eq!(first_line, "GET /models?client_version=0.144.0 HTTP/1.1");
+        assert_eq!(
+            first_line,
+            format!("GET /models?client_version={CODEX_CLIENT_VERSION} HTTP/1.1")
+        );
         assert!(request_lower.contains("authorization: bearer access-token\r\n"));
         assert!(request_lower.contains("chatgpt-account-id: account-id\r\n"));
         assert!(request_lower.contains("originator: codex_cli_rs\r\n"));
-        assert!(request_lower.contains("user-agent: codex_cli_rs/0.144.0"));
+        assert!(request_lower.contains(&format!("user-agent: codex_cli_rs/{CODEX_CLIENT_VERSION}")));
         assert!(request_lower.contains("x-codex-installation-id: installation-id\r\n"));
         assert!(request_lower.contains("x-openai-internal-codex-residency: us\r\n"));
         for forbidden in [
@@ -1930,84 +1969,164 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn parse_compact_response(text: &str) -> ProviderResult<ProviderCompactionResponse> {
-    let response: Value = serde_json::from_str(text).map_err(|error| {
-        ProviderError::Provider(format!(
-            "failed to parse OpenAI compact response JSON: {error}; body: {}",
-            response_excerpt(text)
-        ))
-    })?;
-    let output = response
-        .get("output")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            ProviderError::Provider("OpenAI compact response missing output array".to_string())
-        })?;
-
-    if output.is_empty() {
-        return Err(ProviderError::Provider(
-            "OpenAI compact response had an empty output array".to_string(),
-        ));
-    }
-
-    let mut compaction_count = 0;
-    let mut summary_parts = Vec::new();
-    for item in output {
-        openai_replay_item_type(item, "OpenAI compact output item")?;
-        if is_openai_compaction_item(item) {
-            compaction_count += 1;
-        }
-        collect_compact_summary_text(item, &mut summary_parts);
-    }
-    if compaction_count != 1 {
-        return Err(ProviderError::Provider(format!(
-            "OpenAI compact response expected exactly one compaction item, found {compaction_count}; output item types: {}",
-            compact_output_type_summary(output),
-        )));
-    }
-
-    let summary = summary_parts.join("").trim().to_string();
-    let provider_replay = output
-        .iter()
-        .map(|item| {
-            ProviderReplayItem::new(ProviderKind::OpenAi, item).map_err(ProviderError::Json)
-        })
-        .collect::<ProviderResult<Vec<_>>>()?;
-    Ok(ProviderCompactionResponse {
-        summary: (!summary.is_empty()).then_some(summary),
-        provider_replay,
-        usage: response.get("usage").and_then(openai_usage),
-    })
-}
-
-fn compact_output_type_summary(output: &[Value]) -> String {
-    let mut counts = std::collections::BTreeMap::<String, usize>::new();
-    for item in output {
-        let ty = item
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>");
-        let role = item.get("role").and_then(Value::as_str);
-        let key = role
-            .map(|role| format!("{ty}:{role}"))
-            .unwrap_or_else(|| ty.to_string());
-        *counts.entry(key).or_insert(0) += 1;
-    }
-    if counts.is_empty() {
-        "<empty>".to_string()
-    } else {
-        counts
-            .into_iter()
-            .map(|(key, count)| format!("{key}={count}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
 fn is_openai_compaction_item(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
         Some("compaction" | "compaction_summary")
+    )
+}
+
+fn compact_v2_response(
+    retained_input: Vec<Value>,
+    response: ModelResponse,
+) -> ProviderResult<ProviderCompactionResponse> {
+    let mut compaction = None;
+    let mut compaction_count = 0;
+    for item in &response.provider_replay {
+        let item = item.raw_value().map_err(ProviderError::Json)?;
+        if is_openai_compaction_item(&item) {
+            compaction_count += 1;
+            compaction.get_or_insert(item);
+        }
+    }
+    if compaction_count != 1 {
+        return Err(ProviderError::Provider(format!(
+            "OpenAI compaction stream expected exactly one compaction item, found {compaction_count}"
+        )));
+    }
+
+    let mut replay = retained_input;
+    replay.push(compaction.expect("one compaction item was counted"));
+    Ok(ProviderCompactionResponse {
+        summary: None,
+        provider_replay: replay
+            .iter()
+            .map(|item| ProviderReplayItem::new(ProviderKind::OpenAi, item))
+            .collect::<Result<Vec<_>, _>>()?,
+        usage: response.usage,
+    })
+}
+
+fn retained_compaction_input(
+    prompt: &crate::PromptSections,
+    transcript: &[ModelTranscriptEntry],
+) -> ProviderResult<Vec<Value>> {
+    let mut candidates = Vec::new();
+    for entry in transcript {
+        match entry.item() {
+            TranscriptItem::UserMessage(_)
+            | TranscriptItem::AssistantMessage(_)
+            | TranscriptItem::CompactionSummary(_) => {
+                candidates.extend(
+                    transcript_to_response_items(prompt, std::slice::from_ref(entry))?
+                        .into_iter()
+                        .filter(is_retained_compaction_input_item),
+                );
+            }
+            TranscriptItem::DaemonToolObservation(_)
+            | TranscriptItem::ToolResult(_)
+            | TranscriptItem::TurnStarted { .. }
+            | TranscriptItem::ToolCallStarted { .. }
+            | TranscriptItem::TurnFinished { .. } => {}
+        }
+    }
+    Ok(truncate_retained_compaction_input(
+        candidates,
+        CODEX_COMPACTION_RETAINED_TOKEN_BUDGET,
+    ))
+}
+
+fn is_retained_compaction_input_item(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => item.get("role").and_then(Value::as_str) == Some("user"),
+        Some("agent_message") => {
+            compact_item_text_tokens(item) <= CODEX_COMPACTION_MAX_AGENT_MESSAGE_TOKENS
+        }
+        _ => false,
+    }
+}
+
+fn truncate_retained_compaction_input(items: Vec<Value>, max_tokens: usize) -> Vec<Value> {
+    let mut remaining = max_tokens;
+    let mut retained = Vec::with_capacity(items.len());
+    for item in items.into_iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let tokens = compact_item_text_tokens(&item).max(1);
+        if tokens <= remaining {
+            retained.push(item);
+            remaining -= tokens;
+        } else if let Some(item) = truncate_compaction_message(item, remaining) {
+            retained.push(item);
+            remaining = 0;
+        }
+    }
+    retained.reverse();
+    retained
+}
+
+fn compact_item_text_tokens(item: &Value) -> usize {
+    if item.get("type").and_then(Value::as_str) == Some("agent_message") {
+        return serde_json::to_vec(item)
+            .map(|bytes| crate::approx_tokens_from_byte_count(bytes.len()))
+            .unwrap_or(usize::MAX);
+    }
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .map(|text| crate::approx_tokens_from_byte_count(text.len()))
+        .sum()
+}
+
+fn truncate_compaction_message(mut item: Value, max_tokens: usize) -> Option<Value> {
+    if item.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let content = item.get_mut("content")?.as_array_mut()?;
+    let mut remaining = max_tokens;
+    content.retain_mut(|part| {
+        let Some(text) = part.get_mut("text") else {
+            return true;
+        };
+        let Some(original) = text.as_str() else {
+            return true;
+        };
+        if remaining == 0 {
+            return false;
+        }
+        let tokens = crate::approx_tokens_from_byte_count(original.len());
+        if tokens <= remaining {
+            remaining -= tokens;
+        } else {
+            *text = Value::String(truncate_middle_to_approx_tokens(original, remaining));
+            remaining = 0;
+        }
+        true
+    });
+    (!content.is_empty()).then_some(item)
+}
+
+fn truncate_middle_to_approx_tokens(text: &str, max_tokens: usize) -> String {
+    let max_bytes = max_tokens.saturating_mul(4);
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut prefix_end = max_bytes / 2;
+    while !text.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    let mut suffix_start = text.len().saturating_sub(max_bytes - max_bytes / 2);
+    while !text.is_char_boundary(suffix_start) {
+        suffix_start += 1;
+    }
+    let removed_tokens = crate::approx_tokens_from_byte_count(suffix_start - prefix_end);
+    format!(
+        "{}…{removed_tokens} tokens truncated…{}",
+        &text[..prefix_end],
+        &text[suffix_start..]
     )
 }
 
@@ -2020,36 +2139,6 @@ fn openai_replay_item_type<'a>(item: &'a Value, context: &str) -> ProviderResult
         .and_then(Value::as_str)
         .filter(|item_type| !item_type.is_empty())
         .ok_or_else(|| ProviderError::Provider(format!("{context} missing nonempty string type")))
-}
-
-fn collect_compact_summary_text(item: &Value, summary_parts: &mut Vec<String>) {
-    if item.get("type").and_then(Value::as_str) != Some("message")
-        || item.get("role").and_then(Value::as_str) != Some("assistant")
-    {
-        return;
-    }
-    let text = message_text(item);
-    if !text.is_empty() {
-        summary_parts.push(text);
-    }
-}
-
-fn message_text(item: &Value) -> String {
-    item.get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|part| {
-            let part_type = part.get("type").and_then(Value::as_str);
-            match part_type {
-                Some("output_text") | Some("input_text") => {
-                    part.get("text").and_then(Value::as_str)
-                }
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 impl OpenAiProvider {
@@ -2304,22 +2393,73 @@ impl OpenAiProvider {
             // Codex installation + window identity. Both are documented as
             // observability/routing hints in core/src/client.rs.
             .header(HEADER_WINDOW_ID, window_id)
-            // Per-request and per-session routing. Codex emits all four
-            // (`session_id`/`session-id`/`thread_id`/`thread-id`) — we send
-            // both spellings of each because the backend currently parses
-            // either casing inconsistently. The thread id doubles as the
-            // `x-client-request-id` so traces line up with the prompt-cache
-            // bucket.
+            // Per-request and per-session routing. Current Codex sends the
+            // hyphenated session/thread headers and uses the thread id as the
+            // client request id.
             .header(HEADER_CLIENT_REQUEST_ID, session_id)
-            .header("session_id", session_id)
             .header("session-id", session_id)
-            .header("thread_id", session_id)
             .header("thread-id", session_id);
 
         if let Some(turn_state) = turn_state {
             request = request.header(HEADER_CODEX_TURN_STATE, turn_state);
         }
         request
+    }
+
+    fn add_codex_model_headers(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        metadata: &OpenAiModelMetadata,
+    ) -> reqwest::RequestBuilder {
+        request = request.header(
+            HEADER_CODEX_ROUTING_HINT,
+            format!(
+                "model={};tier={OPENAI_PRIORITY_SERVICE_TIER}",
+                metadata.slug
+            ),
+        );
+        if metadata.use_responses_lite {
+            request = request.header(HEADER_RESPONSES_LITE, "true");
+        }
+        request
+    }
+
+    fn codex_request_metadata(
+        &self,
+        session_id: &str,
+        window_id: &str,
+        turn_id: Option<TurnId>,
+        request_kind: &str,
+    ) -> (Value, String) {
+        let mut turn_metadata = serde_json::Map::new();
+        if let Some(installation_id) = &self.installation_id {
+            turn_metadata.insert("installation_id".to_string(), json!(installation_id));
+        }
+        turn_metadata.insert("session_id".to_string(), json!(session_id));
+        turn_metadata.insert("thread_id".to_string(), json!(session_id));
+        if let Some(turn_id) = turn_id {
+            turn_metadata.insert("turn_id".to_string(), json!(turn_id.0.to_string()));
+        }
+        turn_metadata.insert("window_id".to_string(), json!(window_id));
+        turn_metadata.insert("request_kind".to_string(), json!(request_kind));
+        let turn_metadata = Value::Object(turn_metadata);
+        let turn_metadata_json = turn_metadata.to_string();
+
+        let mut client_metadata = serde_json::Map::new();
+        if let Some(installation_id) = &self.installation_id {
+            client_metadata.insert(HEADER_INSTALLATION_ID.to_string(), json!(installation_id));
+        }
+        client_metadata.insert("session_id".to_string(), json!(session_id));
+        client_metadata.insert("thread_id".to_string(), json!(session_id));
+        if let Some(turn_id) = turn_id {
+            client_metadata.insert("turn_id".to_string(), json!(turn_id.0.to_string()));
+        }
+        client_metadata.insert(HEADER_WINDOW_ID.to_string(), json!(window_id));
+        client_metadata.insert(
+            HEADER_CODEX_TURN_METADATA.to_string(),
+            json!(&turn_metadata_json),
+        );
+        (Value::Object(client_metadata), turn_metadata_json)
     }
 }
 
@@ -2399,17 +2539,24 @@ impl OpenAiProvider {
             .filter(|state| state.session_id() == session_id)
             .and_then(|state| state.turn_state_for_request(turn_id));
         let metadata = self.resolved_model_metadata(&request.model).await?;
-        let body = responses_body_with_metadata(request, &session_id, &metadata)?;
+        let mut body = responses_body_with_metadata(request, &session_id, &metadata)?;
+        let (client_metadata, turn_metadata) =
+            self.codex_request_metadata(&session_id, &window_id, turn_id, "turn");
+        body["client_metadata"] = client_metadata;
 
         let response = send_provider_generation_request(
             zstd_json_request(
-                self.add_codex_headers(
-                    self.client
-                        .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
-                        .header(ACCEPT, "text/event-stream"),
-                    &session_id,
-                    &window_id,
-                    codex_turn_state.as_deref(),
+                self.add_codex_model_headers(
+                    self.add_codex_headers(
+                        self.client
+                            .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
+                            .header(ACCEPT, "text/event-stream")
+                            .header(HEADER_CODEX_TURN_METADATA, &turn_metadata),
+                        &session_id,
+                        &window_id,
+                        codex_turn_state.as_deref(),
+                    ),
+                    &metadata,
                 ),
                 &body,
             )?,
@@ -2444,28 +2591,35 @@ impl OpenAiProvider {
             &request.transcript,
         );
         let metadata = self.resolved_model_metadata(&request.model).await?;
-        let body = compact_body_with_metadata(request, &session_id, &metadata)?;
+        let retained_input = retained_compaction_input(&request.prompt, &request.transcript)?;
+        let mut body = compact_body_with_metadata(request, &session_id, &metadata)?;
+        let (client_metadata, turn_metadata) =
+            self.codex_request_metadata(&session_id, &window_id, None, "compaction");
+        body["client_metadata"] = client_metadata;
 
-        let response = self
-            .add_codex_headers(
-                self.client
-                    .post(format!(
-                        "{}/responses/compact",
-                        self.base_url.trim_end_matches('/')
-                    ))
-                    .header(ACCEPT, "application/json"),
-                &session_id,
-                &window_id,
-                None,
-            )
-            .timeout(Duration::from_secs(CODEX_COMPACT_REQUEST_TIMEOUT_SECS))
-            .json(&body)
-            .send()
-            .await?;
+        let response = send_provider_generation_request(
+            zstd_json_request(
+                self.add_codex_model_headers(
+                    self.add_codex_headers(
+                        self.client
+                            .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
+                            .header(ACCEPT, "text/event-stream")
+                            .header(HEADER_CODEX_TURN_METADATA, &turn_metadata)
+                            .timeout(Duration::from_secs(CODEX_COMPACT_REQUEST_TIMEOUT_SECS)),
+                        &session_id,
+                        &window_id,
+                        None,
+                    ),
+                    &metadata,
+                ),
+                &body,
+            )?,
+            "OpenAI /responses compaction",
+        )
+        .await?;
         let response_headers = OpenAiResponseHeaders::from_headers(response.headers());
-        let (status, text) = response_text(response).await?;
-        ensure_success(status, &text, response_error_message)?;
-        let mut parsed = parse_compact_response(&text)?;
+        let parsed = parse_responses_stream(response, ProviderKind::OpenAi).await?;
+        let mut parsed = compact_v2_response(retained_input, parsed)?;
         response_headers.attach_to_usage(&mut parsed.usage);
         Ok(parsed)
     }
@@ -2555,6 +2709,12 @@ fn responses_body_with_metadata(
     let tool_profile = request.tool_profile;
     let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
     let tools = response_tools(tool_profile, &request_tools)?;
+    let stable_instructions = request.prompt.stable_prefix.clone().unwrap_or_default();
+    let mut input = response_input_items(
+        request.prompt.dynamic_context.as_deref(),
+        &request.prompt,
+        &request.transcript,
+    )?;
     // Cache cohort priority, highest to lowest:
     //   1. Explicit override from `ProviderConfig.prompt_cache.key` (lets
     //      operators force a particular bucket from config).
@@ -2568,13 +2728,10 @@ fn responses_body_with_metadata(
     let prompt_cache_key = request
         .prompt_cache_key
         .unwrap_or_else(|| session_id.to_string());
-    Ok(json!({
+    let mut body = json!({
         "model": request.model,
-        "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
-        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
-        "tools": tools,
         "tool_choice": "auto",
-        "parallel_tool_calls": metadata.supports_parallel_tool_calls,
+        "parallel_tool_calls": metadata.supports_parallel_tool_calls && !metadata.use_responses_lite,
         "reasoning": {
             "effort": reasoning_effort,
         },
@@ -2583,36 +2740,63 @@ fn responses_body_with_metadata(
         "include": [RESPONSES_REASONING_INCLUDE],
         "prompt_cache_key": prompt_cache_key,
         "service_tier": OPENAI_PRIORITY_SERVICE_TIER,
-    }))
+    });
+    if let Some(summary) = &metadata.reasoning_summary {
+        body["reasoning"]["summary"] = json!(summary);
+    }
+    if metadata.use_responses_lite {
+        let mut prefix = vec![json!({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": response_tools_lite(tools),
+        })];
+        if !stable_instructions.is_empty() {
+            prefix.push(json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": stable_instructions }],
+            }));
+        }
+        prefix.append(&mut input);
+        body["input"] = Value::Array(prefix);
+        body["reasoning"]["context"] = json!("all_turns");
+    } else {
+        body["input"] = Value::Array(input);
+        if !stable_instructions.is_empty() {
+            body["instructions"] = json!(stable_instructions);
+        }
+        body["tools"] = Value::Array(tools);
+    }
+    Ok(body)
 }
 
-// The compaction endpoint is unary, so keep streaming-only `/responses` fields
-// out. This is a valid subset of Codex CLI's current `CompactionInput`: pi-relay
-// has no text/verbosity request control to forward yet.
 fn compact_body_with_metadata(
     request: ProviderCompactionRequest,
     session_id: &str,
     metadata: &OpenAiModelMetadata,
 ) -> ProviderResult<Value> {
-    let reasoning_effort = openai_reasoning_effort(metadata, request.reasoning_effort)?;
-    let tool_profile = request.tool_profile;
-    let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
-    let tools = response_tools(tool_profile, &request_tools)?;
-    let prompt_cache_key = request
-        .prompt_cache_key
-        .unwrap_or_else(|| session_id.to_string());
-    Ok(json!({
-        "model": request.model,
-        "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
-        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
-        "tools": tools,
-        "parallel_tool_calls": metadata.supports_parallel_tool_calls,
-        "reasoning": {
-            "effort": reasoning_effort,
+    let mut body = responses_body_with_metadata(
+        ModelRequest {
+            model: request.model,
+            prompt: request.prompt,
+            transcript_cache_prefix_len: None,
+            transcript: request.transcript,
+            tool_profile: request.tool_profile,
+            tools: request.tools,
+            max_tokens: None,
+            reasoning_effort: request.reasoning_effort,
+            prompt_cache_key: request.prompt_cache_key,
+            session_id: request.session_id,
+            turn_id: None,
         },
-        "service_tier": OPENAI_PRIORITY_SERVICE_TIER,
-        "prompt_cache_key": prompt_cache_key,
-    }))
+        session_id,
+        metadata,
+    )?;
+    body["input"]
+        .as_array_mut()
+        .expect("responses input is always an array")
+        .push(json!({ "type": "compaction_trigger" }));
+    Ok(body)
 }
 
 fn response_tools(
@@ -2632,6 +2816,35 @@ fn response_tools(
 
 fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
     tools.iter().map(|tool| tool.declaration.clone()).collect()
+}
+
+fn response_tools_lite(tools: Vec<Value>) -> Vec<Value> {
+    let mut grouped = Vec::new();
+    let mut ungrouped = Vec::new();
+    let mut insertion_index = None;
+    for tool in tools {
+        if matches!(
+            tool.get("type").and_then(Value::as_str),
+            Some("function" | "custom")
+        ) {
+            insertion_index.get_or_insert(ungrouped.len());
+            grouped.push(tool);
+        } else {
+            ungrouped.push(tool);
+        }
+    }
+    if let Some(index) = insertion_index {
+        ungrouped.insert(
+            index,
+            json!({
+                "type": "namespace",
+                "name": "functions",
+                "description": "",
+                "tools": grouped,
+            }),
+        );
+    }
+    ungrouped
 }
 
 fn openai_reasoning_effort(
@@ -3466,14 +3679,19 @@ mod tests {
             Some("account-id".to_string()),
             Some("install-uuid-1234".to_string()),
         );
+        let mut metadata = test_openai_model_metadata("gpt-5.6-sol");
+        metadata.use_responses_lite = true;
         let request = provider
-            .add_codex_headers(
-                provider
-                    .client
-                    .post("https://chatgpt.com/backend-api/codex/responses"),
-                "session-uuid-abcd",
-                "session-uuid-abcd:0",
-                Some("sticky-turn-state"),
+            .add_codex_model_headers(
+                provider.add_codex_headers(
+                    provider
+                        .client
+                        .post("https://chatgpt.com/backend-api/codex/responses"),
+                    "session-uuid-abcd",
+                    "session-uuid-abcd:0",
+                    Some("sticky-turn-state"),
+                ),
+                &metadata,
             )
             .build()
             .expect("request builds");
@@ -3516,14 +3734,16 @@ mod tests {
             Some("session-uuid-abcd:0")
         );
 
-        // Session routing headers — all four spellings, all pinned to the
-        // same id we pass in.
-        for name in ["session_id", "session-id", "thread_id", "thread-id"] {
+        // Current Codex uses only the hyphenated session routing headers.
+        for name in ["session-id", "thread-id"] {
             assert_eq!(
                 header(name).as_deref(),
                 Some("session-uuid-abcd"),
                 "{name} should carry the session id"
             );
+        }
+        for name in ["session_id", "thread_id"] {
+            assert!(header(name).is_none(), "{name} should not be sent");
         }
         assert_eq!(
             header(HEADER_CLIENT_REQUEST_ID).as_deref(),
@@ -3532,6 +3752,11 @@ mod tests {
         assert_eq!(
             header(HEADER_CODEX_TURN_STATE).as_deref(),
             Some("sticky-turn-state")
+        );
+        assert_eq!(header(HEADER_RESPONSES_LITE).as_deref(), Some("true"));
+        assert_eq!(
+            header(HEADER_CODEX_ROUTING_HINT).as_deref(),
+            Some("model=gpt-5.6-sol;tier=priority")
         );
     }
 
@@ -3557,6 +3782,45 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
         assert!(request.headers().get("originator").is_some());
         assert!(request.headers().get(HEADER_WINDOW_ID).is_some());
+    }
+
+    #[test]
+    fn codex_request_metadata_matches_current_identity_projection() {
+        let provider = OpenAiProvider::codex(
+            "access-token",
+            Some("account-id".to_string()),
+            Some("install-uuid-1234".to_string()),
+        );
+
+        let (client, turn) = provider.codex_request_metadata(
+            "session-uuid",
+            "session-uuid:2",
+            Some(TurnId(9)),
+            "turn",
+        );
+        let turn: Value = serde_json::from_str(&turn).unwrap();
+
+        for (key, expected) in [
+            (HEADER_INSTALLATION_ID, "install-uuid-1234"),
+            ("session_id", "session-uuid"),
+            ("thread_id", "session-uuid"),
+            ("turn_id", "9"),
+            (HEADER_WINDOW_ID, "session-uuid:2"),
+        ] {
+            assert_eq!(client[key], expected);
+            let turn_key = match key {
+                HEADER_INSTALLATION_ID => "installation_id",
+                HEADER_WINDOW_ID => "window_id",
+                key => key,
+            };
+            assert_eq!(turn[turn_key], expected);
+        }
+        assert_eq!(turn["request_kind"], "turn");
+        assert_eq!(
+            serde_json::from_str::<Value>(client[HEADER_CODEX_TURN_METADATA].as_str().unwrap())
+                .unwrap(),
+            turn
+        );
     }
 
     #[test]
@@ -3629,10 +3893,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_body_is_supported_codex_compaction_input_subset() {
-        // The codex backend's `/responses/compact` is unary, so the body must
-        // stay on the supported subset rather than the full streaming
-        // `/responses` envelope. pi-relay has no text/verbosity control yet.
+    fn compact_body_uses_streamed_responses_v2_trigger() {
         let body = compact_body(
             ProviderCompactionRequest {
                 model: "gpt-5.5".to_string(),
@@ -3656,18 +3917,17 @@ mod tests {
         assert_eq!(body["instructions"], "stable rules");
         assert_eq!(body["input"][0]["content"][0]["text"], "hello");
         assert_eq!(body["input"][1]["content"][0]["text"], "cwd: /tmp/project");
+        assert_eq!(body["input"][2], json!({ "type": "compaction_trigger" }));
         assert_eq!(body["tools"], json!([]));
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["prompt_cache_key"], "session-1");
         assert_eq!(body["service_tier"], OPENAI_PRIORITY_SERVICE_TIER);
 
-        for forbidden in ["tool_choice", "store", "stream", "include"] {
-            assert!(
-                body.get(forbidden).is_none(),
-                "compact body must not include `{forbidden}`"
-            );
-        }
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["include"], json!([RESPONSES_REASONING_INCLUDE]));
     }
 
     #[test]
@@ -3690,6 +3950,43 @@ mod tests {
 
         assert_eq!(body["prompt_cache_key"], "explicit-compact-cohort");
         assert_eq!(body["service_tier"], OPENAI_PRIORITY_SERVICE_TIER);
+    }
+
+    #[test]
+    fn responses_lite_moves_instructions_and_namespaced_tools_into_input() {
+        let mut metadata = test_openai_model_metadata("gpt-5.6-sol");
+        metadata.use_responses_lite = true;
+        let body = responses_body_with_metadata(
+            ModelRequest {
+                model: "gpt-5.6-sol".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::OpenAiCoding,
+                tools: first_party_tools(ProviderKind::OpenAi),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: Some("session-1".to_string()),
+                turn_id: Some(TurnId(1)),
+            },
+            "session-1",
+            &metadata,
+        )
+        .unwrap();
+
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["tools"][0]["type"], "namespace");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "functions");
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(body["input"][1]["content"][0]["text"], "stable rules");
+        assert_eq!(body["input"][2]["role"], "user");
     }
 
     #[test]
@@ -3875,255 +4172,170 @@ mod tests {
     }
 
     #[test]
-    fn compact_parser_requires_compaction_item_with_type_diagnostics() {
-        let error = parse_compact_response(
-            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]},{"type":"reasoning"}]}"#,
-        )
-        .expect_err("missing compaction item should fail");
-        let message = error.to_string();
-        assert!(message.contains("expected exactly one compaction item, found 0"));
-        assert!(message.contains("message:assistant=1"));
-        assert!(message.contains("reasoning=1"));
-    }
-
-    #[test]
-    fn compact_parser_accepts_current_compaction_summary_alias_without_rewriting_it() {
-        let response = parse_compact_response(
-            r#"{"output":[{"type":"compaction_summary","encrypted_content":"opaque"}]}"#,
-        )
-        .expect("current Codex compaction alias is valid");
-
-        assert_eq!(
-            response.provider_replay[0].raw_value().unwrap(),
-            json!({ "type": "compaction_summary", "encrypted_content": "opaque" })
-        );
-    }
-
-    #[test]
-    fn compact_parser_requires_exactly_one_checkpoint_across_current_aliases() {
-        for (name, output) in [
-            (
-                "zero",
-                json!([{ "type": "reasoning", "encrypted_content": "opaque" }]),
-            ),
-            (
-                "duplicate canonical",
-                json!([
-                    { "type": "compaction", "encrypted_content": "one" },
-                    { "type": "compaction", "encrypted_content": "two" },
-                ]),
-            ),
-            (
-                "duplicate alias",
-                json!([
-                    { "type": "compaction_summary", "encrypted_content": "one" },
-                    { "type": "compaction_summary", "encrypted_content": "two" },
-                ]),
-            ),
-            (
-                "mixed duplicate",
-                json!([
-                    { "type": "compaction", "encrypted_content": "one" },
-                    { "type": "compaction_summary", "encrypted_content": "two" },
-                ]),
-            ),
-        ] {
-            let error =
-                parse_compact_response(&json!({ "output": output }).to_string()).expect_err(name);
-            assert!(error.to_string().contains("exactly one"), "{name}: {error}");
-        }
-    }
-
-    #[test]
-    fn compact_parser_rejects_items_without_minimum_replay_shape() {
-        for malformed in [
-            Value::Null,
-            json!(7),
-            json!({}),
-            json!({ "type": null }),
-            json!({ "type": 7 }),
-            json!({ "type": "" }),
-        ] {
-            let body = json!({
-                "output": [
-                    malformed,
-                    { "type": "compaction", "encrypted_content": "opaque" },
-                ],
-            });
-            assert!(parse_compact_response(&body.to_string()).is_err(), "{body}");
-        }
-    }
-
-    #[test]
-    fn compact_parser_keeps_known_item_internals_opaque() {
-        let output = json!([
-            json!({ "type": "message", "role": "assistant" }),
-            json!({ "type": "message", "role": "assistant", "content": "summary" }),
-            json!({ "type": "message", "role": "assistant", "content": [null] }),
+    fn compact_v2_response_installs_retained_input_and_single_checkpoint() {
+        let retained = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "keep me" }],
+        });
+        let checkpoint = json!({
+            "type": "compaction",
+            "encrypted_content": "opaque",
+        });
+        let sse = [
             json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{ "type": "output_text" }],
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "ignored" }],
+                },
             }),
             json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{ "type": "future_content", "text": "summary" }],
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": checkpoint,
             }),
-            json!({ "type": "compaction", "future_checkpoint_shape": 7 }),
-        ]);
-        let response = parse_compact_response(&json!({ "output": output }).to_string())
-            .expect("compact item internals are opaque");
-        assert_eq!(
-            response
-                .provider_replay
-                .iter()
-                .map(ProviderReplayItem::raw_value)
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            output.as_array().unwrap().clone()
-        );
-        assert!(response.summary.is_none());
-    }
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_compact",
+                    "status": "completed",
+                    "usage": { "input_tokens": 12, "output_tokens": 3, "total_tokens": 15 },
+                },
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
 
-    #[test]
-    fn compact_parser_preserves_every_output_item_in_provider_order() {
-        let output = json!([
-            {
-                "id": "msg_user",
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "Current working directory: this is genuine user text"
-                }]
-            },
-            {
-                "id": "msg_user_starting_cwd",
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "Starting working directory for this session: genuine user text"
-                }]
-            },
-            {
-                "id": "msg_user_bash",
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "The Bash tool runs each command in a fresh shell rooted here; quote this text"
-                }]
-            },
-            {
-                "id": "msg_user_prior_compaction",
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "The conversation history before this point was compacted; explain that phrase"
-                }]
-            },
-            {
-                "id": "msg_user_billing",
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "X-Anthropic-Billing-Header: genuine user text"
-                }]
-            },
-            {
-                "id": "msg_developer",
-                "type": "message",
-                "role": "developer",
-                "content": [{ "type": "input_text", "text": "retained developer rule" }]
-            },
-            {
-                "id": "rs_1",
-                "type": "reasoning",
-                "summary": [],
-                "encrypted_content": "reasoning-ciphertext"
-            },
-            {
-                "id": "fc_1",
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "web_search",
-                "arguments": "{\"query\":\"rust\"}"
-            },
-            {
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": "result"
-            },
-            {
-                "id": "ws_1",
-                "type": "web_search_call",
-                "status": "completed",
-                "action": { "type": "search", "query": "rust" }
-            },
-            {
-                "id": "future_1",
-                "type": "future_compact_extension",
-                "extension": { "must_survive": true }
-            },
-            {
-                "id": "msg_assistant",
-                "type": "message",
-                "role": "assistant",
-                "content": [{ "type": "output_text", "text": "display summary" }]
-            },
-            {
-                "id": "cmp_1",
-                "type": "compaction",
-                "encrypted_content": "opaque-compaction"
-            }
-        ]);
-        let response = parse_compact_response(
-            &json!({ "output": output, "usage": { "input_tokens": 12 } }).to_string(),
-        )
-        .expect("canonical compact output parses");
-        let replay = response
+        let streamed = parse_responses_sse(&sse, ProviderKind::OpenAi).unwrap();
+        let compacted = compact_v2_response(vec![retained.clone()], streamed).unwrap();
+        let replay = compacted
             .provider_replay
             .iter()
             .map(ProviderReplayItem::raw_value)
             .collect::<Result<Vec<_>, _>>()
-            .expect("replay remains valid JSON");
+            .unwrap();
 
-        assert_eq!(replay, output.as_array().unwrap().clone());
-        assert_eq!(response.summary.as_deref(), Some("display summary"));
-
-        let rerendered = transcript_to_response_items(
-            &PromptSections::default(),
-            &[ModelTranscriptEntry {
-                item: TranscriptItem::CompactionSummary(CompactionSummary::new(
-                    "session",
-                    "leaf",
-                    "semantic display summary must not enter replay",
-                    Some(123),
-                    TurnId(3),
-                )),
-                provider_replay: response.provider_replay,
-            }],
-        )
-        .expect("canonical replay renders");
-        assert_eq!(rerendered, output.as_array().unwrap().clone());
+        assert_eq!(replay, vec![retained, checkpoint]);
+        assert!(compacted.summary.is_none());
+        assert_eq!(
+            compacted.usage.and_then(|usage| usage.input_tokens),
+            Some(12)
+        );
     }
 
     #[test]
-    fn compact_parser_rejects_empty_output_but_keeps_checkpoint_payload_opaque() {
-        assert!(parse_compact_response(r#"{"output":[]}"#).is_err());
-        for checkpoint in [
-            json!({ "type": "compaction" }),
-            json!({ "type": "compaction", "encrypted_content": 7 }),
+    fn compact_v2_response_requires_exactly_one_checkpoint() {
+        for output in [
+            vec![json!({ "type": "reasoning" })],
+            vec![
+                json!({ "type": "compaction", "encrypted_content": "one" }),
+                json!({ "type": "compaction", "encrypted_content": "two" }),
+            ],
         ] {
-            let response =
-                parse_compact_response(&json!({ "output": [checkpoint.clone()] }).to_string())
-                    .expect("checkpoint payload remains opaque");
-            assert_eq!(response.provider_replay[0].raw_value().unwrap(), checkpoint);
+            let mut sse = output
+                .into_iter()
+                .enumerate()
+                .map(|(output_index, item)| {
+                    format!(
+                        "data: {}\n\n",
+                        json!({
+                            "type": "response.output_item.done",
+                            "output_index": output_index,
+                            "item": item,
+                        })
+                    )
+                })
+                .collect::<String>();
+            sse.push_str(
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\"}}\n\n",
+            );
+            let streamed = parse_responses_sse(&sse, ProviderKind::OpenAi).unwrap();
+            assert!(compact_v2_response(Vec::new(), streamed).is_err());
         }
+    }
+
+    #[test]
+    fn retained_compaction_input_keeps_user_and_agent_messages_only() {
+        let prior_user = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "prior user" }],
+        });
+        let prior_checkpoint = json!({
+            "type": "compaction",
+            "encrypted_content": "prior",
+        });
+        let agent_message = json!({
+            "type": "agent_message",
+            "author": "/root/worker",
+            "recipient": "/root",
+            "content": [{ "type": "input_text", "text": "worker result" }],
+        });
+        let transcript = vec![
+            ModelTranscriptEntry {
+                item: TranscriptItem::CompactionSummary(CompactionSummary::new(
+                    "session",
+                    "leaf",
+                    "semantic summary",
+                    None,
+                    TurnId(1),
+                )),
+                provider_replay: vec![
+                    ProviderReplayItem::new(ProviderKind::OpenAi, &prior_user).unwrap(),
+                    ProviderReplayItem::new(ProviderKind::OpenAi, &prior_checkpoint).unwrap(),
+                ],
+            },
+            ModelTranscriptEntry {
+                item: TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+                provider_replay: vec![ProviderReplayItem::new(
+                    ProviderKind::OpenAi,
+                    &agent_message,
+                )
+                .unwrap()],
+            },
+            TranscriptItem::DaemonToolObservation(agent_vocab::DaemonToolObservation::new(
+                ToolCallId::from_u64(9),
+                "inspect_delegation",
+                "{}",
+                json!({ "generated": "state" }),
+                agent_vocab::ToolResultStatus::Success,
+                None,
+            ))
+            .into(),
+            TranscriptItem::UserMessage(UserMessage::text("current user")).into(),
+        ];
+
+        let retained = retained_compaction_input(&PromptSections::default(), &transcript).unwrap();
+
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained[0], prior_user);
+        assert_eq!(retained[1], agent_message);
+        assert_eq!(retained[2]["content"][0]["text"], "current user");
+    }
+
+    #[test]
+    fn retained_compaction_input_prefers_newest_messages_with_bounded_truncation() {
+        let message = |text| {
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": text }],
+            })
+        };
+
+        let retained =
+            truncate_retained_compaction_input(vec![message("abcdefgh"), message("new")], 2);
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[1]["content"][0]["text"], "new");
+        assert!(retained[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("tokens truncated"));
     }
 
     #[test]

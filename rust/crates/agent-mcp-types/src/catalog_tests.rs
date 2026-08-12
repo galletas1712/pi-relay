@@ -108,6 +108,7 @@ fn selected_subset_preserves_inventory_names_and_contains_mcp_only_declarations(
             "name": selected_tool.exposed_name,
             "description": "one",
             "parameters": {"type":"object"},
+            "strict": false,
         })
     );
     assert_eq!(snapshot.provider_tools(ProviderKind::OpenAi).len(), 1);
