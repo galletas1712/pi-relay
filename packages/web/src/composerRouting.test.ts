@@ -64,9 +64,48 @@ describe("routeComposerSubmission", () => {
 			"continue",
 			root,
 			"web_control_1",
+			"follow_up",
 		);
 		expect(deps.steerSubagent).not.toHaveBeenCalled();
 		expect(deps.startNewSession).not.toHaveBeenCalled();
+	});
+
+	it("fast-steers a root session with steer priority", async () => {
+		const root = snapshot("root-session", null);
+		const deps = dependencies(root);
+
+		await expect(
+			routeComposerSubmission({ ...submission("root-session", "redirect now"), fastSteer: true }, deps),
+		).resolves.toBe(true);
+
+		expect(deps.queueFollowUp).toHaveBeenCalledWith(
+			"root-session",
+			"redirect now",
+			root,
+			"web_control_1",
+			"steer",
+		);
+		expect(deps.steerSubagent).not.toHaveBeenCalled();
+	});
+
+	it("interrupt-steers a subagent when fast steer is requested", async () => {
+		const deps = dependencies(snapshot("child-session", "parent-session"));
+
+		await expect(
+			routeComposerSubmission(
+				{ ...submission("child-session", "stop and pivot"), fastSteer: true },
+				deps,
+			),
+		).resolves.toBe(true);
+
+		expect(deps.steerSubagent).toHaveBeenCalledWith({
+			parentSessionId: "parent-session",
+			subagentSessionId: "child-session",
+			message: "stop and pivot",
+			clientControlId: "web_control_1",
+			interrupt: true,
+		});
+		expect(deps.queueFollowUp).not.toHaveBeenCalled();
 	});
 
 	it("starts a session when none is selected", async () => {
