@@ -13,7 +13,10 @@ const COMPOSER_DRAFT_STORAGE_PREFIX = "piRelayComposerDraft:v2:";
 const COMPOSER_MIN_HEIGHT_PX = 44;
 const COMPOSER_MAX_HEIGHT_PX = 180;
 
-type ComposerSubmitShortcutEvent = Pick<KeyboardEvent<HTMLTextAreaElement>, "ctrlKey" | "key" | "metaKey">;
+type ComposerSubmitShortcutEvent = Pick<
+	KeyboardEvent<HTMLTextAreaElement>,
+	"ctrlKey" | "key" | "metaKey" | "shiftKey"
+>;
 export type PendingSubmittedDraft = {
 	value: string;
 	version: number;
@@ -44,7 +47,11 @@ export function resolveSubmittedDraft(
 }
 
 export function isComposerSubmitShortcut(event: ComposerSubmitShortcutEvent): boolean {
-	return event.key === "Enter" && (event.metaKey || event.ctrlKey);
+	return event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.shiftKey;
+}
+
+export function isComposerFastSteerShortcut(event: ComposerSubmitShortcutEvent): boolean {
+	return event.key === "Enter" && (event.metaKey || event.ctrlKey) && event.shiftKey;
 }
 
 /**
@@ -275,7 +282,7 @@ export const Composer = memo(function Composer({
 		return () => observer.disconnect();
 	}, [resizeComposer]);
 
-	const sendDraft = useCallback(async () => {
+	const sendDraft = useCallback(async (fastSteer = false) => {
 		const text = draftRef.current.trim();
 		if (
 			!text ||
@@ -314,6 +321,7 @@ export const Composer = memo(function Composer({
 			text,
 			clientControlId,
 			newSessionId,
+			fastSteer,
 		});
 		if (accepted) {
 			clearSubmittedDraft(submittedSessionId, text, submittedVersion);
@@ -342,7 +350,7 @@ export const Composer = memo(function Composer({
 					return;
 				}
 			}
-			if (isComposerSubmitShortcut(event)) {
+			if (isComposerSubmitShortcut(event) || isComposerFastSteerShortcut(event)) {
 				event.preventDefault();
 				if (slashState.visible && slashState.commands.length > 0) {
 					const command = slashState.commands[Math.min(slashIndex, slashState.commands.length - 1)];
@@ -352,7 +360,7 @@ export const Composer = memo(function Composer({
 						return;
 					}
 				}
-				void sendDraft();
+				void sendDraft(isComposerFastSteerShortcut(event));
 			}
 		},
 		[sendDraft, setDraftValue, slashIndex, slashState.commands, slashState.visible]
@@ -392,7 +400,7 @@ export const Composer = memo(function Composer({
 				className="composer"
 				rows={1}
 				enterKeyHint="enter"
-				title="Enter for newline. Cmd+Enter to send."
+				title="Enter for newline. Cmd+Enter to send. Cmd+Shift+Enter to fast steer."
 			/>
 			<button
 				className="stop-button"

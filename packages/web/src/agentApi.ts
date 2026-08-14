@@ -241,6 +241,7 @@ export interface QueueFollowUpParams {
 	expectedActiveLeafId?: string | null;
 	baseLeafId?: string | null;
 	content: ContentBlock[];
+	priority?: InputPriority;
 }
 
 export interface StartFullDelegationParams {
@@ -750,7 +751,8 @@ class AgentApiClient implements AgentApi {
 			client_input_id: params.clientInputId,
 			expected_active_leaf_id: params.expectedActiveLeafId,
 			base_leaf_id: params.baseLeafId,
-			content: params.content
+			content: params.content,
+			...(params.priority && params.priority !== "follow_up" ? { priority: params.priority } : {}),
 		});
 	}
 

@@ -1,12 +1,13 @@
 import { parseSlash, type ParsedSlash } from "./slash.ts";
 import { IntermediateUiStateError } from "./selectedSessionFetchState.ts";
-import type { SessionSnapshot } from "./types.ts";
+import type { InputPriority, SessionSnapshot } from "./types.ts";
 
 export interface ComposerSubmission {
 	sessionId: string | null;
 	text: string;
 	clientControlId: string;
 	newSessionId: string;
+	fastSteer?: boolean;
 }
 
 export interface ComposerRoutingDependencies {
@@ -17,12 +18,14 @@ export interface ComposerRoutingDependencies {
 		message: string,
 		snapshot: SessionSnapshot,
 		clientInputId: string,
+		priority?: InputPriority,
 	): Promise<void>;
 	steerSubagent(params: {
 		parentSessionId: string;
 		subagentSessionId: string;
 		message: string;
 		clientControlId: string;
+		interrupt?: boolean;
 	}): Promise<unknown>;
 	startNewSession(message: string, clientInputId: string, sessionId: string): Promise<unknown>;
 	reportError(error: unknown): void;
@@ -71,6 +74,7 @@ export async function routeComposerSubmission(
 				subagentSessionId: submission.sessionId,
 				message,
 				clientControlId: submission.clientControlId,
+				...(submission.fastSteer ? { interrupt: true } : {}),
 			});
 		} else {
 			await dependencies.queueFollowUp(
@@ -78,6 +82,7 @@ export async function routeComposerSubmission(
 				message,
 				snapshot,
 				submission.clientControlId,
+				submission.fastSteer ? "steer" : "follow_up",
 			);
 		}
 		return true;

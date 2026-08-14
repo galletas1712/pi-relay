@@ -162,7 +162,7 @@ describe("App connection recovery integration", () => {
 		expect(api.getTranscriptTurns).toHaveBeenCalledWith(SESSION_ID, { limit: 50 });
 
 		const composer = screen.getByRole("textbox", {
-			name: "Enter for newline. Cmd+Enter to send.",
+			name: "Enter for newline. Cmd+Enter to send. Cmd+Shift+Enter to fast steer.",
 		}) as HTMLTextAreaElement;
 		await user.type(composer, "keep this session draft");
 		const send = screen.getByRole("button", { name: "send message" }) as HTMLButtonElement;

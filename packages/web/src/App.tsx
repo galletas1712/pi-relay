@@ -232,6 +232,7 @@ import {
 import type {
 	EventFrame,
 	GitAgainst,
+	InputPriority,
 	McpInventory,
 	McpLoginResult,
 	Project,
@@ -3340,6 +3341,7 @@ export function App({
 			text: string,
 			snapshot: SessionSnapshot,
 			clientInputId: string,
+			priority: InputPriority = "follow_up",
 		) => {
 			assertServerMutationAllowed();
 			const projectId = snapshot.project_id;
@@ -3375,6 +3377,7 @@ export function App({
 				expectedActiveLeafId: snapshot.activity === "idle" ? (snapshot.active_leaf_id ?? null) : undefined,
 				baseLeafId,
 				content,
+				priority,
 			});
 			if (selectedRef.current !== sessionId) {
 				invalidateSessionList(projectId);
