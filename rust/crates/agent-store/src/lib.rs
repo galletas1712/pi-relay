@@ -914,6 +914,18 @@ pub struct CreateForkRequest<'a> {
     pub config: &'a SessionConfig,
 }
 
+/// Atomically copy a parent's completed conversational context and enqueue the
+/// first task for a linked subagent session.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateContextForkRequest<'a> {
+    pub child_session_id: &'a str,
+    pub config: &'a SessionConfig,
+    pub parent_session_id: &'a str,
+    pub subagent_type: SubagentType,
+    pub delegation_id: Option<&'a str>,
+    pub task: &'a UserMessage,
+}
+
 #[derive(Debug, Clone)]
 pub struct ForkSessionResult {
     pub session_id: String,

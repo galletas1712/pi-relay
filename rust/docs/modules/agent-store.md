@@ -31,7 +31,10 @@ Delegation teardown is also a complete store operation: the
 `running -> cancelling` claim atomically cancels every queued/consuming child
 mailbox row under parent -> delegation -> child locks. Ordinary child input
 admission follows the same order and accepts only `running`; terminalization
-refuses to release reservations while active child mailbox rows remain.
+refuses to release reservations while active child mailbox rows remain. A
+failed launch uses the same transaction to persist its durable error, so boot
+recovery and idempotent replay cannot mistake a cancelled child set for a
+successful launch.
 
 ## Responsibilities
 
@@ -44,6 +47,9 @@ refuses to release reservations while active child mailbox rows remain.
 - Fence queue consumption and active-leaf appends so a stale in-memory daemon
   cursor cannot mutate history it no longer owns.
 - Provide the recovery invariants the daemon relies on after a crash.
+- Atomically create linked forked-context subagents: choose the latest completed
+  boundary on the locked parent active branch, copy that prefix including
+  provider replay, persist child configuration/linkage, and enqueue one task.
 - Serve cheap metadata / active-leaf / turn-boundary queries and bounded
   turn-card pages so selected-session load does not scale with transcript size.
 
@@ -377,6 +383,12 @@ To keep send/switch validation independent of transcript size:
   parent row lock before its running-row check and insert. `switch_active_leaf`
   remains the low-level transactional primitive that still does membership /
   revision / branch-id validation.
+- `create_context_fork` is separate from user-facing `history.fork`. It is
+  allowed while the parent has an active delegation, truncates the active branch
+  at its newest `turn_finished` or boundary `compaction_summary` without
+  `turn_started_at_ms`, and atomically inserts the child session/linkage, copied
+  transcript prefix, and one queued task. A parent with no completed boundary
+  produces an empty child transcript.
 - `session_snapshot` and the transcript-page/index reads run in a
   `repeatable read read only` transaction so the session row, actions, queue,
   activity, and event high-water mark come from one consistent snapshot.

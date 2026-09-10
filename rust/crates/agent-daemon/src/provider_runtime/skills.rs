@@ -9,7 +9,10 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::prompt::{parse_runtime_skills, parse_skill_contents, ParsedSkillFile};
+use super::prompt::{
+    parse_runtime_skills, parse_skill_contents, parse_skill_contents_result, ParsedSkillFile,
+    RoleContextPolicy,
+};
 
 pub(crate) fn load_skill_result(
     runtime_raw: &[RawSkillFile],
@@ -82,6 +85,7 @@ pub(crate) struct ResolvedSkillRole {
     pub(crate) content: String,
     pub(crate) provider: Option<ProviderConfig>,
     pub(crate) skills: Vec<ResolvedPreloadedSkill>,
+    pub(crate) context: RoleContextPolicy,
 }
 
 pub(crate) fn resolve_skill_role(
@@ -121,8 +125,12 @@ fn resolve_role_file(
             file.package_name
         ));
     }
-    let parsed = parse_skill_contents(&file.contents)
-        .ok_or_else(|| anyhow!("role skill {} missing valid frontmatter", file.package_name))?;
+    let parsed = parse_skill_contents_result(&file.contents).map_err(|error| {
+        anyhow!(
+            "role skill {} has invalid frontmatter: {error:#}",
+            file.package_name
+        )
+    })?;
     if parsed.name != file.package_name {
         return Err(anyhow!(
             "role skill directory {} must match SKILL.md name {}",
@@ -131,6 +139,7 @@ fn resolve_role_file(
         ));
     }
     let provider = role_provider_from_frontmatter(&parsed, Path::new(&file.path))?;
+    let context = parsed.frontmatter.context;
     let skills = resolve_role_skills(runtime_raw, &parsed)?;
     Ok(ResolvedSkillRole {
         name: parsed.name,
@@ -139,6 +148,7 @@ fn resolve_role_file(
         content: parsed.body,
         provider,
         skills,
+        context,
     })
 }
 
@@ -387,6 +397,42 @@ mod tests {
         assert_eq!(resolved.skills.len(), 1);
         assert_eq!(resolved.skills[0].name, "swe");
         assert_eq!(resolved.skills[0].file_path, PathBuf::from(global.path));
+        assert_eq!(resolved.context, RoleContextPolicy::Forked);
+    }
+
+    #[test]
+    fn role_context_policy_supports_explicit_values_and_rejects_invalid_frontmatter() {
+        for (frontmatter, expected) in [
+            ("", RoleContextPolicy::Forked),
+            ("context: forked\n", RoleContextPolicy::Forked),
+            ("context: fresh\n", RoleContextPolicy::Fresh),
+        ] {
+            let role = raw_skill(
+                SkillKind::SubagentRole,
+                SkillOrigin::RuntimeRole,
+                None,
+                "reviewer",
+                frontmatter,
+            );
+            assert_eq!(
+                resolve_skill_role(&[role], "reviewer")
+                    .expect("valid role context")
+                    .context,
+                expected
+            );
+        }
+
+        for invalid_context in ["inherited", "[forked]"] {
+            let role = raw_skill(
+                SkillKind::SubagentRole,
+                SkillOrigin::RuntimeRole,
+                None,
+                "reviewer",
+                &format!("context: {invalid_context}\n"),
+            );
+            let error = resolve_skill_role(&[role], "reviewer").expect_err("invalid context");
+            assert!(error.to_string().contains("invalid frontmatter"), "{error}");
+        }
     }
 
     #[test]

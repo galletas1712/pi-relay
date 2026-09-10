@@ -104,6 +104,8 @@ async fn main() -> Result<()> {
         )),
         #[cfg(test)]
         fail_subagent_after_start_before_dispatch: Arc::new(AtomicBool::new(false)),
+        #[cfg(test)]
+        fail_forked_subagent_initial_drive: Arc::new(AtomicBool::new(false)),
     };
     // Install before accepting runtime connections so a Hello that races boot
     // still redrives durable queued work that the one-shot boot sweep missed.
