@@ -61,7 +61,7 @@ const HEADER_REASONING_INCLUDED: &str = "x-reasoning-included";
 // and rate-limit accounting (see `is_first_party_originator` in the Codex
 // source). Diverging from this label is what causes throttling.
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-pub const CODEX_CLIENT_VERSION: &str = "0.147.0";
+pub const CODEX_CLIENT_VERSION: &str = "0.153.4";
 const CODEX_RESIDENCY_US: &str = "us";
 const CODEX_REQUEST_COMPRESSION_LEVEL: i32 = 3;
 const CODEX_COMPACT_REQUEST_TIMEOUT_SECS: u64 = 20 * 60;
@@ -719,6 +719,36 @@ mod catalog_tests {
         (base_url, server)
     }
 
+    async fn start_catalog_server_forbidding_generation(
+        body: Vec<u8>,
+        generation_posts: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}", listener.local_addr().expect("local address"));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("catalog request accepted");
+            let request = read_request(&mut stream).await;
+            write_json_response(&mut stream, "200 OK", &body).await;
+
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(150), listener.accept()).await
+            {
+                let request = read_request(&mut stream).await;
+                if request.starts_with(b"POST ") {
+                    generation_posts.fetch_add(1, Ordering::Relaxed);
+                }
+                panic!(
+                    "catalog omission must prevent a second request: {}",
+                    String::from_utf8_lossy(&request)
+                );
+            }
+            request
+        });
+        (base_url, server)
+    }
+
     #[test]
     fn catalog_resolves_current_window_before_max_and_derives_ninety_percent() {
         let catalog = parse_models(vec![
@@ -753,6 +783,55 @@ mod catalog_tests {
     }
 
     #[test]
+    fn synthetic_astra_fixture_exactly_resolves_and_uses_only_fixture_capabilities() {
+        // These deliberately synthetic values exercise parsing and exact slug
+        // resolution only; they are not evidence of live Astra capabilities.
+        let catalog = parse_models(vec![model_fixture(
+            "gpt-6-astra",
+            Some(400_123),
+            Some(1_000_321),
+            Some(350_111),
+            &["low", "medium", "high", "xhigh", "max"],
+            false,
+        )])
+        .expect("synthetic Astra parser fixture parses");
+        assert!(!catalog.models.contains_key("gpt-6"));
+
+        let astra = catalog
+            .models
+            .get("gpt-6-astra")
+            .expect("exact Astra slug exists");
+        assert_eq!(astra.slug, "gpt-6-astra");
+        assert_eq!(astra.max_input_tokens, Some(400_123));
+        assert_eq!(astra.recommended_auto_compact_tokens, Some(350_111));
+        assert_eq!(astra.reasoning_summary.as_deref(), Some("auto"));
+        assert!(!astra.supports_parallel_tool_calls);
+        assert!(astra.use_responses_lite);
+        assert_eq!(
+            astra.supported_reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        for effort in [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            assert_eq!(
+                openai_reasoning_effort(astra, effort).unwrap(),
+                effort.as_str()
+            );
+        }
+        for effort in [ReasoningEffort::None, ReasoningEffort::Minimal] {
+            assert!(openai_reasoning_effort(astra, effort).is_err());
+        }
+    }
+
+    #[test]
     fn catalog_explicit_auto_limit_is_clamped_to_ninety_percent() {
         let catalog = parse_models(vec![
             model_fixture("below", Some(100_000), None, Some(80_000), &["low"], false),
@@ -767,6 +846,78 @@ mod catalog_tests {
             catalog.models["above"].recommended_auto_compact_tokens,
             Some(90_000)
         );
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_astra_omitted_from_catalog_before_generation_post() {
+        let body = serde_json::to_vec(&json!({
+            "models": [model_fixture(
+                "gpt-5.6-sol",
+                Some(372_000),
+                None,
+                None,
+                &["high"],
+                true
+            )]
+        }))
+        .expect("fixture serializes");
+        let generation_posts = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) =
+            start_catalog_server_forbidding_generation(body, generation_posts.clone()).await;
+        let provider = test_provider(
+            base_url,
+            Some("account-id"),
+            "access-token",
+            OpenAiModelCatalogCache::default(),
+        );
+
+        let error = provider
+            .complete(model_request("gpt-6-astra", ReasoningEffort::High))
+            .await
+            .expect_err("catalog omission must fail before generation");
+        assert!(matches!(error, ProviderError::ModelCatalog { .. }));
+        assert!(error.to_string().contains("exact model slug gpt-6-astra"));
+        let request = String::from_utf8(server.await.expect("server joins")).expect("utf-8");
+        assert!(request.starts_with(&format!(
+            "GET /models?client_version={CODEX_CLIENT_VERSION} HTTP/1.1"
+        )));
+        assert_eq!(generation_posts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn compact_rejects_astra_omitted_from_catalog_before_generation_post() {
+        let body = serde_json::to_vec(&json!({
+            "models": [model_fixture(
+                "gpt-5.6-sol",
+                Some(372_000),
+                None,
+                None,
+                &["high"],
+                true
+            )]
+        }))
+        .expect("fixture serializes");
+        let generation_posts = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) =
+            start_catalog_server_forbidding_generation(body, generation_posts.clone()).await;
+        let provider = test_provider(
+            base_url,
+            Some("account-id"),
+            "access-token",
+            OpenAiModelCatalogCache::default(),
+        );
+
+        let error = provider
+            .compact(compact_request("gpt-6-astra", ReasoningEffort::High))
+            .await
+            .expect_err("catalog omission must fail before generation");
+        assert!(matches!(error, ProviderError::ModelCatalog { .. }));
+        assert!(error.to_string().contains("exact model slug gpt-6-astra"));
+        let request = String::from_utf8(server.await.expect("server joins")).expect("utf-8");
+        assert!(request.starts_with(&format!(
+            "GET /models?client_version={CODEX_CLIENT_VERSION} HTTP/1.1"
+        )));
+        assert_eq!(generation_posts.load(Ordering::Relaxed), 0);
     }
 
     #[test]

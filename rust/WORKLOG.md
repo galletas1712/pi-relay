@@ -1914,3 +1914,46 @@ pass.
   delegation/steering `Store(NotTurnBoundary)` failures reproduced from
   detached approved commit `9264f3e9`; the production source is byte-identical
   to that commit.
+
+### GPT-6 Astra and Claude Fable 5.1 catalog refresh
+
+- Added the exact account-catalog-gated Astra picker route with static
+  `low…max` UI choices and a `high` picker seed; these are not live-verified
+  provider capabilities. The 0.153.4 client pin is the minimum associated
+  external release evidence inspected locally, not positive live account
+  evidence, and GPT-5.6/default routing remains unchanged.
+- Authenticated account catalog HTTP succeeded at client versions 0.147.0,
+  0.149.1, 0.153.4, and 0.154.0 but returned no exact `gpt-6-astra` entry.
+  Direct minimal inference was attempted with that exact slug and returned HTTP
+  400: `The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT
+  account.` Ordinary and compact adapter tests verify catalog omission returns a
+  local exact-slug `ModelCatalog` error without a generation POST.
+- Retired the superseded Claude picker/static rows and added Fable 5.1 with its
+  verified 1M input, 128K output, default-on adaptive thinking, all public
+  efforts, native compaction, and explicit non-ZDR warning.
+- Authenticated `GET /v1/models/claude-opus-5` succeeded and reported a 1M
+  input window, 128K output ceiling, default-on adaptive thinking, public
+  `low…max` efforts, and `compact_20260112.supported = true`; the Opus 5 static
+  fallback now retains native compaction.
+- Added an idempotent one-time SQL/operator runbook to migrate exact durable
+  Claude current/executable routes and replay-visible provider events without
+  rewriting terminal queue/action snapshots, provider replay, or historical
+  response payloads.
+- The first live repository-adapter Fable request used the prior Claude Code
+  identity pin, 2.1.221, and failed with HTTP 400: `Claude Code does not support
+  this model`. Boundary isolation found that changing only billing attribution
+  `cc_version` made Fable succeed at versions >=2.1.251 and fail at versions
+  <=2.1.250; changing only User-Agent did not fix it. The adapter now keeps both
+  identity values aligned at the current published Claude Code version,
+  2.1.268. Because the attribution fingerprint is version-salted, this creates
+  a one-time cache-prefix cohort change.
+
+Validation: Rust formatting, workspace all-target compilation, all 182 provider
+tests, 137 daemon tests (84 Postgres-gated tests ignored), all 661 web tests,
+the 12 Electron tests, and the web production build passed before the identity
+pin fix. Scratch PostgreSQL 16 migration validation passed 111 assertions over
+the first run, no-op rerun, malformed-input rollback, and 9 negative-control
+mutants. After the pin fix, formatting and all 182 provider tests passed. A
+temporary provider-only repository-adapter Fable 5.1 request reported only:
+`available=true`, `Complete`, `text exact=true`, input tokens 21, output tokens
+7, and total tokens 28.

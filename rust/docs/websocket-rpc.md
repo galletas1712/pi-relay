@@ -209,9 +209,9 @@ orchestration mode, so it neither exposes `ultra` nor silently aliases it to
 cannot enter a request body. The same catalog advertises no `none` for the
 reviewed GPT-5.6 models.
 
-Claude Opus 5, Sonnet 5, Fable 5, and Opus 4.8 accept `low`, `medium`, `high`, `xhigh`,
+Claude Opus 5, Sonnet 5, Fable 5.1, and Opus 4.7 accept `low`, `medium`, `high`, `xhigh`,
 and `max`; their provider-specific shaping remains inside the Anthropic
-adapter. Fable 5 requires 30-day retention and is not available under Zero Data
+adapter. Fable 5.1 requires 30-day retention and is not available under Zero Data
 Retention, so it is an explicit opt-in UI choice.
 
 Compaction defaults are provider/model aware through provider metadata. OpenAI

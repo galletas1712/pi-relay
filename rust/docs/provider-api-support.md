@@ -19,11 +19,14 @@ APIs.
 The OpenAI catalog implementation is based on a sanitized authenticated probe
 and was exercised against the live backend on 2026-07-04. **Live** below means
 a sanitized provider run recorded in [`../WORKLOG.md`](../WORKLOG.md);
-**source** means current pi-relay code; **unit** means an in-process wire mock,
-fixture, or unit test; **pinned** means behavior evidenced in the pinned Codex
-source; and **official** means a current public provider contract. Public
-documentation or private catalog metadata is not evidence that the private
-Codex Responses transport accepts a literal wire value.
+**live-negative** means such a run established absence or rejection and is not
+evidence of availability; **release** means external release evidence inspected
+locally rather than this account's provider result; **source** means current
+pi-relay code; **unit** means an in-process wire mock, fixture, or unit test;
+**pinned** means behavior evidenced in the pinned Codex source; and **official**
+means a current public provider contract. Public documentation or private
+catalog metadata is not evidence that the private Codex Responses transport
+accepts a literal wire value.
 
 Table statuses are deliberately narrow: **Supported** is implemented for the
 adapter, **Partial** implements only the described subset or passive replay,
@@ -36,7 +39,7 @@ status alone, distinguish unit/fixture coverage from historical live use.
 | Adapter | Actual transport | Important boundary |
 | --- | --- | --- |
 | OpenAI | Private ChatGPT/Codex subscription backend at `https://chatgpt.com/backend-api/codex`, authenticated with a ChatGPT bearer token and Codex CLI identity/routing headers. Ordinary turns use zstd-compressed Responses-compatible HTTP + SSE; compaction uses private unary `/responses/compact`. | This is **not** the public `api.openai.com` API-key transport. A public Responses feature is unavailable unless it is separately implemented and evidenced on this private backend. `[source, live, pinned]` |
-| Anthropic | Public Claude Messages API at `https://api.anthropic.com/v1`, authenticated preferentially with Claude.ai OAuth Bearer (API-key fallback), plus a Claude-Code-style identity/attribution envelope pinned to `2.1.221`. Ordinary turns and native compaction use Messages SSE; counting uses `/messages/count_tokens`; capability lookup uses `/models/{id}`. | The pinned envelope is historically live-proven; it is not claimed to be the current Claude Code identity. OAuth is required for Fable (Claude Code API-key workspace is 0 TPM for that model). Identity headers do not change the API contract or by themselves grant Zero Data Retention. Native compaction requires the `compact-2026-01-12` beta and a supported model. `[source, live, official]` |
+| Anthropic | Public Claude Messages API at `https://api.anthropic.com/v1`, authenticated preferentially with Claude.ai OAuth Bearer (API-key fallback), plus a Claude-Code-style identity/attribution envelope pinned to `2.1.268`. Ordinary turns and native compaction use Messages SSE; counting uses `/messages/count_tokens`; capability lookup uses `/models/{id}`. | The current identity pin is required for Fable 5.1 generation. OAuth is required for Fable (Claude Code API-key workspace is 0 TPM for that model). Identity headers do not change the API contract or by themselves grant Zero Data Retention. Native compaction requires the `compact-2026-01-12` beta and a supported model. `[source, live, official]` |
 
 ## Architecture boundary
 
@@ -95,7 +98,7 @@ replay.
 
 | Capability | OpenAI private Codex adapter | Anthropic Messages adapter | Evidence and limitations |
 | --- | --- | --- | --- |
-| Model discovery and capability metadata | **Supported.** Authenticated `GET /models?client_version=0.144.0` installs one bounded account-scoped catalog. Model lookup is exact by slug; every ordinary and compact request resolves the selected model before request shaping. There is no static catalog, alias, prefix match, substitution, public `/v1/models` fallback, disk cache, or stale-success fallback. | **Supported.** `GET /models/{id}` is cached and merged over conservative static fallback metadata for input/output limits, effort, and adaptive thinking. | OpenAI discovery/request/cache behavior is source/mock-tested from the sanitized probe schema and its retrieval/resolution path was observed live. Anthropic discovery is source/mock-tested. `[source, unit, live, pinned]` |
+| Model discovery and capability metadata | **Supported.** Authenticated `GET /models?client_version=0.153.4` installs one bounded account-scoped catalog. Model lookup is exact by slug; every ordinary and compact request resolves the selected model before request shaping. There is no static catalog, alias, prefix match, substitution, public `/v1/models` fallback, disk cache, or stale-success fallback. | **Supported.** `GET /models/{id}` is cached and merged over conservative static fallback metadata for input/output limits, effort, adaptive thinking, and native compaction. | Generic OpenAI retrieval and exact-omission fail-closed behavior are source/mock-tested and live-validated. For Astra specifically, successful catalog GETs at four client versions omitted it and a direct exact-slug inference request returned HTTP 400; this is negative evidence, not positive availability. Authenticated Anthropic Opus 5 discovery live-verified its limits, efforts, adaptive thinking, and native compaction. `[source, unit, live, live-negative, release, pinned]` |
 | Context windows and automatic compaction thresholds | **Supported.** The adapter resolves `context_window` before `max_context_window` and recommends `min(auto_compact_token_limit, 90% of resolved context)`, deriving 90% when the explicit limit is null/missing. The daemon has no OpenAI static rows: without fresh authoritative metadata it has no proactive threshold, while reactive overflow recovery remains available. | **Supported.** Discovered/static windows drive policy; verified 1M windows default to a 500k threshold and other known windows use the generic policy. | The sanitized probe fixture yields 334,800 for a 372k GPT-5.6 window. GPT-5.4 uses its 272k current/default window (244,800), not 90% of its advertised 1M maximum. `[source, unit, live]` |
 | Instructions / system prompt | **Supported.** Stable prompt is Responses `instructions`; dynamic context is a final user item. | **Supported.** Claude Code attribution plus a stable cacheable `system` block; dynamic context is a final uncached user message. | Request-shape tests cover both. `[source, unit]` |
 | Maximum output | **Not supported by the backend.** The Codex endpoint rejects `max_output_tokens` with `400 Unsupported parameter`, so the adapter never emits it. The private catalog advertises no output ceiling either. | **Supported.** Messages requires `max_tokens`; pi-relay defaults to `min(64k, model ceiling)` and clamps explicit values to the resolved ceiling. | `[source, unit, live]` |
@@ -115,13 +118,26 @@ replay.
 ### Account- and client-version-sensitive Codex catalog
 
 The private catalog is not a universal static model list; the backend filters
-it by the advertised `client_version`. The GPT-5.6 family now carries
-`minimal_client_version=0.144.0`, so it only appears when the request advertises
-`client_version >= 0.144.0`. The adapter therefore uses one
-`CODEX_CLIENT_VERSION = "0.144.0"` constant for both the query and
-Codex-shaped User-Agent. It caches the whole catalog in memory for five minutes,
-scoped by Codex base URL plus account id (or a nonlogged token fingerprint when
-the account id is absent). Concurrent cold callers share one detached refresh.
+it by both account and advertised `client_version`. The adapter uses one
+`CODEX_CLIENT_VERSION = "0.153.4"` constant for both the query and Codex-shaped
+User-Agent. The minimum association between that release and Astra comes from
+external release evidence inspected locally, not positive live proof from this
+account. Authenticated catalog GETs for this account succeeded at client
+versions 0.147.0, 0.149.1, 0.153.4, and 0.154.0, but none returned exact slug
+`gpt-6-astra`. A direct minimal `/backend-api/codex/responses` request attempted
+inference with the exact slug and returned HTTP 400: `The 'gpt-6-astra' model
+is not supported when using Codex with a ChatGPT account.` This is
+`[live-negative]` evidence, not Astra availability.
+
+The picker therefore only seeds exact slug `gpt-6-astra`, efforts `low…max`,
+and initial effort `high`; those are static UI choices subject to exact
+account-catalog validation, not live-verified provider capabilities. An
+ordinary or compact request fails locally before its generation POST when the
+exact catalog entry is absent. No alias or fallback is used. The GPT-5.6 family
+requires only client version 0.144.0 and keeps its existing behavior. The
+adapter caches the whole catalog in memory for five minutes, scoped by Codex
+base URL plus account id (or a nonlogged token fingerprint when the account id
+is absent). Concurrent cold callers share one detached refresh.
 
 Sol, Terra, and Luna reported current/max windows of 372,000 and null automatic
 limits, which derives a 334,800 recommendation. Sol and Terra advertised
@@ -167,7 +183,7 @@ deserialized.
 | Successful terminal | **Supported.** Requires a valid `response.completed` and no pending added output items; terminal omission never completes a pending item. Optional terminal output is merged by index: completed items keep their exact payload, overlaps require stable type/identity compatibility, and terminal-only items cross the ordinary fail-closed item boundary. EOF or `[DONE]` is not success. The private minimal terminal without `output` remains accepted only with no pending items. | **Supported.** Requires `message_start`, closed content blocks, a recognized terminal stop reason, and `message_stop`; EOF alone is not success. | Unknown future event types may be ignored but never imply success. `[source, unit]` |
 | Refusal | **Supported.** Refusal content becomes a refusal terminal and partial semantic output/replay is discarded. | **Supported.** `stop_reason: refusal` retains valid details and discards partial semantic output/replay. | `[unit]` |
 | Incomplete / max output | **Supported.** `response.incomplete` is a typed non-success with status/reason. | **Supported.** `max_tokens` is a normalized terminal; `pause_turn`, context-window exhaustion, and unknown reasons are typed non-successes. | `[unit]` |
-| Native compaction | **Supported.** Private unary `/responses/compact`; canonical returned output is installed and replayed exactly. Public inline `context_management` compaction is not sent. | **Supported.** Special paused Messages call with beta `compact-2026-01-12`, replacement instructions, no tools, and strict compaction-only stream parsing. | OpenAI standalone compaction has historical real-backend coverage. Anthropic has a paid production Sonnet 5 E2E; model support is capability/static gated. `[source, unit, live, official]` |
+| Native compaction | **Supported.** Private unary `/responses/compact`; canonical returned output is installed and replayed exactly. Public inline `context_management` compaction is not sent. | **Supported.** Special paused Messages call with beta `compact-2026-01-12`, replacement instructions, no tools, and strict compaction-only stream parsing. | OpenAI standalone compaction has historical real-backend coverage. Anthropic has a paid production Sonnet 5 E2E, and authenticated Opus 5 metadata reported `compact_20260112.supported = true`; model support is capability/static gated. `[source, unit, live, official]` |
 | Compaction replay | **Supported.** Exactly one native checkpoint is evidenced; the complete opaque returned array is replayed unchanged and in order. | **Supported.** Exactly one valid opaque compaction block is retained and replayed with the required beta/strategy; no local alternate summary is substituted. | Ordinary Anthropic turns reject inline compaction, preserving the daemon's durable checkpoint boundary. `[source, unit, live]` |
 | Input token counting | **Partial.** No usable private endpoint: `/responses/input_tokens` returned a Cloudflare 403 challenge. The daemon anchors on completed usage, estimates only the local suffix, and retains reactive overflow recovery. | **Supported.** Calls `/messages/count_tokens` with the same local prompt/tool shape. Existing compaction is applied without triggering a new one, and original/effective occupancy is retained. | Public OpenAI `POST /v1/responses/input_tokens` exists but is not usable through this private adapter. Anthropic counting is mock-tested and exercised in the paid compaction path. `[source, unit, live, official]` |
 
@@ -220,7 +236,7 @@ database, tool output, logs, backups, or exported transcripts.
 | Provider-side guarantee | **Unsupported.** Public OpenAI API ZDR terms cannot be applied to the private ChatGPT subscription backend. `store: false` and local stateless replay are ZDR-aligned design choices, but private abuse logging and prompt-cache retention were not established by this audit. | **Partial.** Messages, token counting, prompt caching, and compaction are documented as ZDR eligible when the organization has a ZDR arrangement. The API defaults to up-to-30-day retention otherwise. Claude Code identity headers do not establish the workspace contract. |
 | Server-side conversation state | **Intentionally not used.** `store`, Conversations, and background mode are avoided. Public Conversations persist until deletion and background responses persist for polling. | **Intentionally not used.** Every request is rebuilt from the local transcript. |
 | Prompt cache | **Partial.** Private retention is unknown: pi-relay sends a cache routing key but no retention selector. Public OpenAI extended cache may retain derived KV tensors on GPU-local storage for up to 24 hours, and newer public models may require it; private behavior is not inferred. | **Supported.** Under the documented ZDR feature contract, cache representations/hashes are memory-only, with 5-minute or 1-hour TTLs. |
-| Covered-model exception | **Unsupported.** No applicability claim can be made: an analogous exception was not established for this private product. | **Unsupported.** ZDR does not apply to covered Mythos-class models: as of 2026-06-09, Anthropic requires 30-day prompt/output retention for Mythos 5 and Fable 5 (and designated future covered models), including otherwise-ZDR workspaces. Fable must remain an explicit opt-in. |
+| Covered-model exception | **Unsupported.** No applicability claim can be made: an analogous exception was not established for this private product. | **Unsupported.** ZDR does not apply to covered Mythos-class models: as of 2026-06-09, Anthropic requires 30-day prompt/output retention for Mythos 5 and Fable 5.1 (and designated future covered models), including otherwise-ZDR workspaces. Fable must remain an explicit opt-in. |
 | External tools | **Partial.** Hosted web access can contact external sites; public MCP is not used. Any third-party service has its own retention policy. | **Partial.** Hosted web search/fetch can contact external sites; MCP is not used. The organization must assess server-tool and destination policies separately. |
 
 The deliberate state model is therefore: `store: false` where the private

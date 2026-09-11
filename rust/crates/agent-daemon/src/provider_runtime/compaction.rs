@@ -429,7 +429,7 @@ mod tests {
 
     fn provider_request(transcript: Vec<ModelTranscriptEntry>) -> ProviderCompactionRequest {
         ProviderCompactionRequest {
-            model: "claude-opus-4-8".to_string(),
+            model: "claude-fable-5-1".to_string(),
             prompt: PromptSections::stable("test prompt"),
             transcript,
             tool_profile: ProviderToolProfile::AnthropicCoding,

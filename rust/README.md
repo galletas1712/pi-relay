@@ -277,7 +277,7 @@ A role-local provider policy and global skill preloads use frontmatter:
 ---
 name: reviewer
 description: Review artifacts and handoffs against the objective.
-model: claude:claude-opus-4-8
+model: claude:claude-opus-5
 reasoning_effort: high
 skills:
   - swe

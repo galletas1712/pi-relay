@@ -20,25 +20,26 @@ export const MODEL_OPTIONS: ModelOption[] = [
 		provider: { kind: "openai" as const, model, reasoning_effort: "xhigh" as const }
 	})),
 	{
+		id: "openai:gpt-6-astra",
+		label: "openai:gpt-6-astra",
+		provider: { kind: "openai", model: "gpt-6-astra", reasoning_effort: "high" }
+	},
+	{
 		id: "claude:claude-opus-5",
 		label: "claude:claude-opus-5",
 		provider: { kind: "claude", model: "claude-opus-5", reasoning_effort: "high" }
 	},
 	{
-		id: "claude:claude-opus-4-8",
-		label: "claude:claude-opus-4-8",
-		provider: { kind: "claude", model: "claude-opus-4-8", reasoning_effort: "xhigh" }
-	},
-	{
-		id: "claude:claude-fable-5",
-		label: "claude:claude-fable-5",
+		id: "claude:claude-fable-5-1",
+		label: "claude:claude-fable-5-1",
 		description: "Explicit opt-in: not ZDR.",
-		provider: { kind: "claude", model: "claude-fable-5", reasoning_effort: "high" }
+		provider: { kind: "claude", model: "claude-fable-5-1", reasoning_effort: "high" }
 	}
 ];
 
 export const OPENAI_REASONING_EFFORTS: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
 export const OPENAI_GPT56_REASONING_EFFORTS: ReasoningEffort[] = [...OPENAI_REASONING_EFFORTS, "max"];
+export const OPENAI_GPT6_ASTRA_REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
 export const CLAUDE_REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
 
 export const DEFAULT_PROVIDER: ProviderConfig = {
@@ -71,9 +72,9 @@ export function providerFromModelKey(modelKey: string, current: ProviderConfig):
 
 export function reasoningEffortsForProvider(provider: ProviderConfig): ReasoningEffort[] {
 	if (provider.kind === "claude") return CLAUDE_REASONING_EFFORTS;
-	return HOSTED_GPT56_MODELS.some((model) => model === provider.model)
-		? OPENAI_GPT56_REASONING_EFFORTS
-		: OPENAI_REASONING_EFFORTS;
+	if (provider.model === "gpt-6-astra") return OPENAI_GPT6_ASTRA_REASONING_EFFORTS;
+	if (HOSTED_GPT56_MODELS.some((model) => model === provider.model)) return OPENAI_GPT56_REASONING_EFFORTS;
+	return OPENAI_REASONING_EFFORTS;
 }
 
 export function newSessionCompactionConfig() {

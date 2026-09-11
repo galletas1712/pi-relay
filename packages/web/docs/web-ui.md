@@ -586,16 +586,19 @@ from.
 
 The chat header exposes a model picker and a provider-specific reasoning-effort picker (`sessionDefaults.ts`). The
 picker displays canonical composite keys: `openai:gpt-5.6-luna` (default), `openai:gpt-5.6-sol`,
-`openai:gpt-5.6-terra`, `claude:claude-opus-5`, `claude:claude-opus-4-8`, and `claude:claude-fable-5`.
-Opus 5 is the first normal Claude choice and starts at its documented default `high` effort.
-Fable 5 is listed last as an explicit opt-in, and its option text and tooltip state that it is not ZDR.
+`openai:gpt-5.6-terra`, `openai:gpt-6-astra`, `claude:claude-opus-5`, and `claude:claude-fable-5-1`.
+The picker seeds `high` for Astra and Opus 5.
+Fable 5.1 is listed last as an explicit opt-in, and its option text and tooltip state that it is not ZDR.
 The model control is idle-only for an existing session (`activity !== "idle"` disables it); kind and model
 may change after transcript history, including OpenAI ↔ Claude. Reasoning effort is independently
 editable while a response is running whenever the selected session is loaded,
 the client is connected, and the selected provider/model supports the value.
 The picker remains a static seeded convenience: its existing hosted GPT-5.6 choices remain `none`,
-`minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, while the Claude
-entries expose `low…max`. `max` is the highest public wire effort; catalog-only
+`minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; Astra and the Claude
+entries seed exactly `low…max`. The Astra values are UI seeds, not
+live-verified provider capabilities: ordinary and compact requests require the
+authenticated account catalog to advertise the exact slug and effort, and fail
+locally before generation when it does not. `max` is the highest public wire effort; catalog-only
 values such as `ultra` are not exposed. The private catalog reports `ultra` for
 Sol/Terra, but pinned Codex maps that selector to `max` on Responses requests
 and uses it to select proactive MultiAgent V2 behavior. π-relay implements no
