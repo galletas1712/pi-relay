@@ -118,15 +118,16 @@ generation, but no session/window/turn routing headers and no request body.
 drift.
 
 The 0.153.4 pin is the minimum associated with Astra in external release
-evidence inspected locally; it is not positive Astra availability evidence for
-this account. Authenticated catalog GETs at client versions 0.147.0, 0.149.1,
-0.153.4, and 0.154.0 all succeeded for the account but omitted exact slug
-`gpt-6-astra`. A direct minimal `/backend-api/codex/responses` request attempted
-inference with that exact slug and returned HTTP 400: `The 'gpt-6-astra' model
-is not supported when using Codex with a ChatGPT account.` The picker therefore
-provides only static Astra effort/`high` seeds; every actual ordinary or compact
-request remains subject to exact authenticated catalog validation before a
-generation POST.
+evidence inspected locally. Initial authenticated catalog GETs at client
+versions 0.147.0, 0.149.1, 0.153.4, and 0.154.0 omitted exact slug
+`gpt-6-astra`, and a direct inference attempt returned HTTP 400. A later
+authenticated GET at the pinned identity returned eight models including exact
+slug `gpt-6-astra`, with a 272k current/872k maximum context window, efforts
+`low…ultra`, reasoning summaries, parallel tool calls, and Responses Lite. A
+repository-adapter `high` request completed with exact requested text
+`probe-ok`. The picker exposes the catalog-supported public subset `low…max`;
+every actual ordinary or compact request remains subject to exact authenticated
+catalog validation before a generation POST.
 
 The daemon owns one in-memory catalog cache shared by reconstructed OpenAI
 provider handles. It is scoped by base URL plus account id, or by a

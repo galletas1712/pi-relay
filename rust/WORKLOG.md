@@ -1928,6 +1928,13 @@ pass.
   400: `The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT
   account.` Ordinary and compact adapter tests verify catalog omission returns a
   local exact-slug `ModelCatalog` error without a generation POST.
+- A later authenticated catalog GET at the pinned 0.153.4 identity returned
+  eight models including exact `gpt-6-astra`. The entry reported a 272k
+  current/872k maximum context window, `low…ultra`, reasoning summaries,
+  parallel tool calls, and Responses Lite. A temporary provider-only
+  repository-adapter request at `high` returned `Complete` with exact text
+  `probe-ok`, 33 input tokens, and 6 output tokens. No code change was needed;
+  exact account-catalog discovery picked up the rollout.
 - Retired the superseded Claude picker/static rows and added Fable 5.1 with its
   verified 1M input, 128K output, default-on adaptive thinking, all public
   efforts, native compaction, and explicit non-ZDR warning.

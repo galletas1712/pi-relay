@@ -595,17 +595,19 @@ editable while a response is running whenever the selected session is loaded,
 the client is connected, and the selected provider/model supports the value.
 The picker remains a static seeded convenience: its existing hosted GPT-5.6 choices remain `none`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; Astra and the Claude
-entries seed exactly `low…max`. The Astra values are UI seeds, not
-live-verified provider capabilities: ordinary and compact requests require the
-authenticated account catalog to advertise the exact slug and effort, and fail
-locally before generation when it does not. `max` is the highest public wire effort; catalog-only
-values such as `ultra` are not exposed. The private catalog reports `ultra` for
-Sol/Terra, but pinned Codex maps that selector to `max` on Responses requests
+entries seed exactly `low…max`. Astra's seeded values match the authenticated
+account catalog, which currently advertises `low…ultra`; ordinary and compact
+requests still require the exact slug and effort in the current catalog and
+fail locally before generation when either is absent. `max` is the highest
+public wire effort; catalog-only values such as `ultra` are not exposed. The
+private catalog reports `ultra` for Sol/Terra/Astra, but pinned Codex maps that
+selector to `max` on Responses requests
 and uses it to select proactive MultiAgent V2 behavior. π-relay implements no
-equivalent orchestration mode, and live literal-Ultra requests were rejected,
-so it neither exposes nor aliases the value. Some seeded OpenAI choices can be
-rejected when the active account's catalog does not advertise them. Changing
-model/effort calls `session.configure`; an effort-only update is accepted while
+equivalent orchestration mode, and live literal-Ultra requests for Sol/Terra
+were rejected, so it neither exposes nor aliases the value. Astra inference was
+verified at `high`, not `ultra`. Some seeded OpenAI choices can be rejected when
+the active account's catalog does not advertise them. Changing model/effort
+calls `session.configure`; an effort-only update is accepted while
 the session is active and persists immediately as that session's default for
 future work. The daemon snapshots the complete provider route on each queued
 input at acceptance and on each durable action at turn creation. Therefore an
