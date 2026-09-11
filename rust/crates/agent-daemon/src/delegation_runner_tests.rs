@@ -10087,6 +10087,57 @@ async fn boot_queued_input_sweep_redrives_forked_child_committed_before_initial_
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
+    env.state
+        .repo
+        .persist_outputs(
+            "parent",
+            OutputBatch::new(
+                &[
+                    TranscriptStorageNode {
+                        id: "boot-redrive-parent-turn".to_string(),
+                        parent_id: None,
+                        timestamp_ms: 1,
+                        item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "boot-redrive-parent-user".to_string(),
+                        parent_id: Some("boot-redrive-parent-turn".to_string()),
+                        timestamp_ms: 2,
+                        item: TranscriptItem::UserMessage(UserMessage::text(
+                            "inherited boot redrive fact",
+                        )),
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "boot-redrive-parent-assistant".to_string(),
+                        parent_id: Some("boot-redrive-parent-user".to_string()),
+                        timestamp_ms: 3,
+                        item: TranscriptItem::AssistantMessage(AssistantMessage {
+                            items: vec![AssistantItem::Text(
+                                "remember the inherited fact".to_string(),
+                            )],
+                        }),
+                        provider_replay: Vec::new(),
+                    },
+                    TranscriptStorageNode {
+                        id: "boot-redrive-parent-finish".to_string(),
+                        parent_id: Some("boot-redrive-parent-assistant".to_string()),
+                        timestamp_ms: 4,
+                        item: TranscriptItem::TurnFinished {
+                            turn_id: TurnId(1),
+                            outcome: TurnOutcome::Graceful,
+                        },
+                        provider_replay: Vec::new(),
+                    },
+                ],
+                Some("boot-redrive-parent-finish"),
+                &[],
+                &[],
+            ),
+        )
+        .await
+        .expect("persist completed parent context");
     let launch_shape = json!({
         "kind": "full",
         "role": "implementer",
@@ -10130,12 +10181,36 @@ async fn boot_queued_input_sweep_redrives_forked_child_committed_before_initial_
         .load_session_config(&child_id)
         .await
         .expect("load committed child config");
-    child_config.metadata["fault_injection"]["force_harness_model_dispatch"] = json!(true);
+    child_config.metadata["fault_injection"] = json!({
+        "force_harness_model_dispatch": true,
+        "model_result": "complete"
+    });
     env.state
         .repo
         .update_session_metadata(&child_id, &child_config.metadata)
         .await
-        .expect("force the production registration path");
+        .expect("configure credential-free production dispatch");
+    let committed_child = env
+        .state
+        .repo
+        .load_stored_session(&child_id)
+        .await
+        .expect("load committed child before redrive");
+    assert!(
+        committed_child
+            .entries
+            .iter()
+            .any(|entry| entry.id == "boot-redrive-parent-finish"),
+        "the committed fork includes the parent's completed context"
+    );
+    assert!(
+        committed_child.entries.iter().all(|entry| !matches!(
+            &entry.item,
+            TranscriptItem::UserMessage(message)
+                if message.as_text().is_some_and(|text| text.contains("recover me"))
+        )),
+        "the delegated task is still only queued before boot recovery"
+    );
     assert!(
         env.state
             .repo
@@ -10162,18 +10237,32 @@ async fn boot_queued_input_sweep_redrives_forked_child_committed_before_initial_
             .any(|task| task.session_id == child_id),
         "fault happened before dispatch registration"
     );
+    assert_eq!(
+        crate::provider_runtime::injected_provider_start_count(&child_id),
+        0,
+        "no provider request starts before boot recovery"
+    );
 
     env.state.active.lock().await.clear();
     run_boot_recovery(&env.state).await;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if env
+            if crate::provider_runtime::injected_provider_start_count(&child_id) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("production boot queued-input sweep reaches the injected provider transport");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if !env
                 .state
-                .tasks
-                .lock()
-                .expect("task map")
-                .values()
-                .any(|task| task.session_id == child_id)
+                .repo
+                .has_unfinished_actions(&child_id)
+                .await
+                .expect("child action state")
             {
                 break;
             }
@@ -10181,23 +10270,40 @@ async fn boot_queued_input_sweep_redrives_forked_child_committed_before_initial_
         }
     })
     .await
-    .expect("production boot queued-input sweep redrives the committed child task");
+    .expect("injected provider completes the redriven child action");
     assert!(
-        env.state
-            .tasks
-            .lock()
-            .expect("task map")
-            .values()
-            .any(|task| task.session_id == child_id),
-        "redrive registers the model action produced from the committed task"
-    );
-    assert!(
-        env.state
+        !env.state
             .repo
-            .has_unfinished_actions(&child_id)
+            .has_queued_inputs(&child_id)
             .await
-            .expect("child work after redrive"),
-        "child work is reconstructed from the durable queued task"
+            .expect("child queue after redrive"),
+        "boot recovery consumes the durable queued task"
+    );
+    let recovered_child = env
+        .state
+        .repo
+        .load_stored_session(&child_id)
+        .await
+        .expect("load redriven child transcript");
+    assert!(recovered_child.entries.iter().any(|entry| matches!(
+        &entry.item,
+        TranscriptItem::UserMessage(message)
+            if message.as_text() == Some("inherited boot redrive fact")
+    )));
+    assert!(recovered_child.entries.iter().any(|entry| matches!(
+        &entry.item,
+        TranscriptItem::UserMessage(message)
+            if message.as_text().is_some_and(|text| text.contains("recover me"))
+    )));
+    assert!(recovered_child.entries.iter().any(|entry| matches!(
+        &entry.item,
+        TranscriptItem::AssistantMessage(message)
+            if message.text() == "injected completion"
+    )));
+    assert_eq!(
+        crate::provider_runtime::injected_provider_start_count(&child_id),
+        1,
+        "redrive produces exactly one request through the injected provider transport"
     );
     env.cleanup().await;
 }
