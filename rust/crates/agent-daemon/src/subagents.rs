@@ -1,12 +1,17 @@
 use std::path::PathBuf;
 
-use agent_store::{EventFrame, EventType, InputPriority, SessionConfig, SubagentType};
+use agent_store::{
+    CreateContextForkRequest, EventFrame, EventType, InputPriority, SessionActivity, SessionConfig,
+    SubagentType,
+};
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::config::stable_default_provider;
-use crate::provider_runtime::{model_available_for_config, render_pi_prompt, resolve_skill_role};
+use crate::provider_runtime::{
+    model_available_for_config, render_pi_prompt, resolve_skill_role, RoleContextPolicy,
+};
 use crate::runtime::{publish_events, SessionDriver};
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart, StartedSession,
@@ -14,9 +19,9 @@ use crate::session_start::{
 use crate::state::AppState;
 use crate::types::RpcError;
 
-/// A subagent spawned as part of a delegation: fresh context (no
-/// parent-transcript fork, no source refs), tagged with its delegation id and
-/// type.
+/// A subagent spawned as part of a delegation. Roles inherit the parent's
+/// completed conversational context unless they explicitly select fresh
+/// context.
 pub(crate) struct DelegationSubagentSpawn {
     pub(crate) parent_session_id: String,
     pub(crate) role: String,
@@ -194,24 +199,70 @@ pub(crate) async fn spawn_subagent(
     )
     .await?;
     let task = request.task;
-    let initial_task = child_initial_task_message(&request.parent_session_id, &task);
+    let initial_task = child_initial_task_message(&request.parent_session_id, &task, role.context);
+    let initial_task_message = UserMessage::text(initial_task);
     let subagent_type = request.subagent_type;
-    let started = match start_prepared_session(
-        state,
-        PreparedSessionStart {
-            session_id: child_session_id.clone(),
-            config: child_config,
-            priority: InputPriority::FollowUp,
-            content: UserMessage::text(initial_task),
-            client_input_id: None,
-            parent_session_id: Some(request.parent_session_id.clone()),
-            subagent_type: Some(subagent_type),
-            delegation_id: request.delegation_id.clone(),
-            dispatch_mode: PreparedSessionDispatchMode::Deferred,
-        },
-    )
-    .await
-    {
+    let started_result = match role.context {
+        RoleContextPolicy::Fresh => {
+            start_prepared_session(
+                state,
+                PreparedSessionStart {
+                    session_id: child_session_id.clone(),
+                    config: child_config,
+                    priority: InputPriority::FollowUp,
+                    content: initial_task_message,
+                    client_input_id: None,
+                    parent_session_id: Some(request.parent_session_id.clone()),
+                    subagent_type: Some(subagent_type),
+                    delegation_id: request.delegation_id.clone(),
+                    dispatch_mode: PreparedSessionDispatchMode::Deferred,
+                },
+            )
+            .await
+        }
+        RoleContextPolicy::Forked => {
+            // Runtime context/workspace setup above already requires an online
+            // runtime. Check once more immediately before the database commit
+            // to narrow the window in which a durable queued child can be
+            // created after that runtime disconnects.
+            let availability = state
+                .runtime_hosts
+                .require_available(&child_config.runtime_id)
+                .await
+                .map_err(RpcError::from);
+            match availability {
+                Ok(()) => {
+                    let result = state
+                        .repo
+                        .create_context_fork(CreateContextForkRequest {
+                            child_session_id: &child_session_id,
+                            config: &child_config,
+                            parent_session_id: &request.parent_session_id,
+                            subagent_type,
+                            delegation_id: request.delegation_id.as_deref(),
+                            task: &initial_task_message,
+                        })
+                        .await
+                        .map_err(RpcError::from);
+                    match result {
+                        Ok(result) => {
+                            publish_events(state, result.events);
+                            Ok(StartedSession {
+                                session_id: child_session_id.clone(),
+                                project_id: child_config.project_id,
+                                activity: SessionActivity::Queued,
+                                replayed: false,
+                                dispatches: Vec::new(),
+                            })
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }
+    };
+    let started = match started_result {
         Ok(started) => started,
         Err(error) => {
             if subagent_type == SubagentType::ReadOnly {
@@ -233,6 +284,9 @@ pub(crate) async fn spawn_subagent(
         .fail_subagent_after_start_before_dispatch
         .swap(false, std::sync::atomic::Ordering::SeqCst)
     {
+        if role.context == RoleContextPolicy::Forked {
+            return Ok(SpawnedSubagent { started });
+        }
         return Err(RpcError::new(
             "injected_post_start_failure",
             "injected failure after child/action commit and before dispatch",
@@ -240,7 +294,7 @@ pub(crate) async fn spawn_subagent(
     }
     require_known_subagent(state, &request.parent_session_id, &child_session_id).await?;
 
-    let parent_events = match subagent_parent_spawn_events(
+    match subagent_parent_spawn_events(
         state,
         &request.parent_session_id,
         &started.session_id,
@@ -248,22 +302,48 @@ pub(crate) async fn spawn_subagent(
     )
     .await
     {
-        Ok(parent_events) => parent_events,
+        Ok(parent_events) => publish_events(state, parent_events),
         Err(error) => {
-            cleanup_failed_spawn(
-                state,
-                &started.session_id,
-                subagent_type,
-                "parent lifecycle event failure",
-            )
-            .await;
-            return Err(error);
+            if role.context == RoleContextPolicy::Forked {
+                eprintln!(
+                    "failed to publish committed forked subagent launch parent={} child={}: {}: {}",
+                    request.parent_session_id, started.session_id, error.code, error.message
+                );
+                return Err(error);
+            } else {
+                cleanup_failed_spawn(
+                    state,
+                    &started.session_id,
+                    subagent_type,
+                    "parent lifecycle event failure",
+                )
+                .await;
+                return Err(error);
+            }
         }
-    };
-    publish_events(state, parent_events);
+    }
 
     let child_driver = SessionDriver::acquire(state, &started.session_id).await;
-    if let Err(error) = child_driver.dispatch(started.dispatches.clone()).await {
+    let dispatch_result = match role.context {
+        RoleContextPolicy::Fresh => child_driver.dispatch(started.dispatches.clone()).await,
+        RoleContextPolicy::Forked => {
+            #[cfg(test)]
+            if state
+                .fail_forked_subagent_initial_drive
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(RpcError::new(
+                    "injected_initial_drive_failure",
+                    "injected forked subagent initial drive failure",
+                ))
+            } else {
+                child_driver.drive_until_blocked().await.map(|_| ())
+            }
+            #[cfg(not(test))]
+            child_driver.drive_until_blocked().await.map(|_| ())
+        }
+    };
+    if let Err(error) = dispatch_result {
         publish_subagent_parent_dispatch_failed_event(
             state,
             &request.parent_session_id,
@@ -272,6 +352,9 @@ pub(crate) async fn spawn_subagent(
             &error,
         )
         .await;
+        if role.context == RoleContextPolicy::Forked {
+            return Err(error);
+        }
         cleanup_failed_spawn(
             state,
             &started.session_id,
@@ -519,11 +602,22 @@ fn subagent_metadata(
     metadata
 }
 
-fn child_initial_task_message(parent_session_id: &str, task: &str) -> String {
+fn child_initial_task_message(
+    parent_session_id: &str,
+    task: &str,
+    context: RoleContextPolicy,
+) -> String {
+    let context = match context {
+        RoleContextPolicy::Fresh => {
+            "This role uses fresh conversational context; no parent transcript is included."
+        }
+        RoleContextPolicy::Forked => {
+            "This role includes the parent's active conversational branch through its latest completed boundary. The open delegation turn is excluded."
+        }
+    };
     format!(
         "# Delegated task\n\nParent session: `{parent_session_id}`\n\n{task}\n\n# Parent active context\n\n\
-A subagent runs with fresh context: no parent transcript snapshot is included. \
-Use the delegated task, role instructions, workspace/project context, and any files/tools you inspect."
+{context} Use the delegated task, role instructions, workspace/project context, and any files/tools you inspect."
     )
 }
 
@@ -629,13 +723,20 @@ mod tests {
     }
 
     #[test]
-    fn child_initial_task_message_marks_fresh_context() {
-        let message = child_initial_task_message("parent", "Inspect the repo.");
+    fn child_initial_task_message_describes_selected_context() {
+        let forked =
+            child_initial_task_message("parent", "Inspect the repo.", RoleContextPolicy::Forked);
 
-        assert!(message.contains("# Delegated task"));
-        assert!(message.contains("Parent session: `parent`"));
-        assert!(message.contains("Inspect the repo."));
-        assert!(message.contains("A subagent runs with fresh context"));
+        assert!(forked.contains("# Delegated task"));
+        assert!(forked.contains("Parent session: `parent`"));
+        assert!(forked.contains("Inspect the repo."));
+        assert!(forked.contains("latest completed boundary"));
+        assert!(forked.contains("open delegation turn is excluded"));
+
+        let fresh =
+            child_initial_task_message("parent", "Inspect the repo.", RoleContextPolicy::Fresh);
+        assert!(fresh.contains("fresh conversational context"));
+        assert!(fresh.contains("no parent transcript is included"));
     }
 
     #[test]

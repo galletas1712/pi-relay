@@ -292,7 +292,17 @@ for OpenAI roles for the same reason as in daemon config. `skills` may name
 only global packages from `$HOME/.agents/skills`; project and workflow packages
 cannot be role preloads. A child uses an explicit spawn override, then its role
 provider, then the parent provider. An unavailable role provider retains the
-existing stable-provider fallback.
+existing stable-provider fallback. `context` accepts `forked` or `fresh`.
+Omitting it defaults to `forked`: the child receives the parent's active
+conversational branch only through its latest completed `turn_finished` or
+boundary `compaction_summary` (one without `turn_started_at_ms`), excluding the
+open delegation turn. Explicit `context: fresh` starts with only the delegated
+task. Context policy is independent of workspace policy: full children still
+share the parent workspace, while read-only children still use disposable
+snapshots.
+Existing role files that need task-only conversational context must therefore
+set `context: fresh` explicitly; no database migration is required because
+existing sessions retain their already-persisted transcripts.
 
 Roles stay hidden from ordinary `LoadSkill` discovery. `LoadSkill` returns a
 JSON object containing the selected `SKILL.md`'s absolute runtime-host `path`

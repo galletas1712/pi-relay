@@ -726,6 +726,68 @@ impl PostgresAgentStore {
         Ok((true, events))
     }
 
+    /// Atomically record a launch failure and begin its failed teardown.
+    ///
+    /// Retrying while the same failed teardown is already cancelling repairs
+    /// any active child inputs and returns ownership so the caller can finish
+    /// teardown. A retry after teardown reached `failed` only fills a missing
+    /// error and reports that no teardown work remains.
+    pub async fn begin_failed_delegation_launch(
+        &self,
+        parent_session_id: &str,
+        delegation_id: &str,
+        attempt_id: &str,
+        code: &str,
+        message: &str,
+        reason: &str,
+    ) -> Result<(bool, Vec<EventFrame>)> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, parent_session_id).await?;
+        let owns_teardown = sqlx::query_scalar::<_, bool>(
+            r#"
+            update delegations
+            set status=case when status='running' then 'cancelling' else status end,
+                teardown_target=case
+                    when status='running' then 'failed'
+                    else teardown_target
+                end,
+                launch_error=coalesce(
+                    launch_error,
+                    jsonb_build_object(
+                        'code', $4::text,
+                        'message', $5::text
+                    )
+                ),
+                updated_at=now()
+            where id=$1 and parent_session_id=$2 and attempt_id=$3
+              and (
+                  status='running'
+                  or (status='cancelling' and teardown_target='failed')
+                  or status='failed'
+              )
+            returning status='cancelling'
+            "#,
+        )
+        .bind(delegation_id)
+        .bind(parent_session_id)
+        .bind(attempt_id)
+        .bind(code)
+        .bind(message)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(owns_teardown) = owns_teardown else {
+            tx.commit().await?;
+            return Ok((false, Vec::new()));
+        };
+        let events = if owns_teardown {
+            cancel_active_delegation_child_inputs_tx(&mut tx, delegation_id, reason).await?
+        } else {
+            Vec::new()
+        };
+        tx.commit().await?;
+        Ok((owns_teardown, events))
+    }
+
     pub async fn finish_delegation_teardown(
         &self,
         delegation_id: &str,
@@ -756,25 +818,6 @@ impl PostgresAgentStore {
         .await?
         .rows_affected();
         Ok(updated == 1)
-    }
-
-    pub async fn record_delegation_launch_error(
-        &self,
-        delegation_id: &str,
-        attempt_id: &str,
-        code: &str,
-        message: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "update delegations set launch_error=jsonb_build_object('code', $3::text, 'message', $4::text), updated_at=now() where id=$1 and attempt_id=$2 and status='cancelling' and teardown_target='failed'",
-        )
-        .bind(delegation_id)
-        .bind(attempt_id)
-        .bind(code)
-        .bind(message)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     pub async fn delegation_launch_error(

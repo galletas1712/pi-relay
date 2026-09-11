@@ -68,4 +68,6 @@ pub(crate) struct AppState {
     pub(crate) fail_subagent_control_reload_after_commit: Arc<AtomicBool>,
     #[cfg(test)]
     pub(crate) fail_subagent_after_start_before_dispatch: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) fail_forked_subagent_initial_drive: Arc<AtomicBool>,
 }

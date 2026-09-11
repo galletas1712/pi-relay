@@ -361,7 +361,7 @@ fn delegate_writing_task_definition() -> ToolDefinition {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "The self-contained task. The subagent starts with fresh context and only knows what you put here plus any paths you cite."
+                    "description": "The task for the subagent. Include all task-specific requirements and relevant paths; the selected role controls whether completed parent conversation is inherited."
                 },
                 "workflow": {
                     "type": "string",
@@ -399,7 +399,7 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
                             },
                             "prompt": {
                                 "type": "string",
-                                "description": "The self-contained task for this subagent (fresh context)."
+                                "description": "The task for this subagent. Include all task-specific requirements and relevant paths; the selected role controls whether completed parent conversation is inherited."
                             }
                         },
                         "required": ["role", "prompt"],
@@ -828,6 +828,21 @@ mod tests {
             let description = description.as_str().expect("role description");
             assert!(description.contains("runtime-global"));
             assert!(!description.contains("repo/reviewer"));
+        }
+    }
+
+    #[test]
+    fn delegation_task_schemas_defer_context_to_the_selected_role() {
+        let full = delegate_writing_task_definition();
+        let readonly = delegate_readonly_tasks_definition();
+        for description in [
+            &full.input_schema["properties"]["prompt"]["description"],
+            &readonly.input_schema["properties"]["tasks"]["items"]["properties"]["prompt"]
+                ["description"],
+        ] {
+            let description = description.as_str().expect("prompt description");
+            assert!(description.contains("selected role controls"));
+            assert!(!description.contains("starts with fresh context"));
         }
     }
 

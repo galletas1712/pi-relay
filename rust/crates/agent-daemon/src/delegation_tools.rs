@@ -75,14 +75,16 @@ pub(crate) async fn materialize_delegation_launch(
         return Err(error);
     }
     let existing = state.repo.delegation_spawned_indices(&current.id).await?;
-    if current.status != DelegationStatus::Running && existing.len() < children.len() {
+    if current.status != DelegationStatus::Running {
         if let Some((code, message)) = state.repo.delegation_launch_error(&current.id).await? {
             return Err(RpcError::new(code, message));
         }
-        return Err(RpcError::new(
-            "delegation_not_running",
-            "the prior launch is not running and cannot spawn missing children",
-        ));
+        if existing.len() < children.len() {
+            return Err(RpcError::new(
+                "delegation_not_running",
+                "the prior launch is not running and cannot spawn missing children",
+            ));
+        }
     }
     let mut session_ids = Vec::with_capacity(children.len());
     for (index, (role, prompt, subagent_type)) in children.into_iter().enumerate() {
@@ -106,11 +108,6 @@ pub(crate) async fn materialize_delegation_launch(
         {
             Ok(spawned) => session_ids.push(spawned.started.session_id),
             Err(error) => {
-                let reloaded = state.repo.delegation_spawned_indices(&current.id).await?;
-                if let Some(session_id) = reloaded.get(&index) {
-                    session_ids.push(session_id.clone());
-                    continue;
-                }
                 fail_delegation_launch(state, &current, &error).await?;
                 return Err(error);
             }
@@ -127,11 +124,12 @@ async fn fail_delegation_launch(
 ) -> std::result::Result<(), RpcError> {
     let (won, events) = state
         .repo
-        .begin_delegation_teardown(
+        .begin_failed_delegation_launch(
             &delegation.parent_session_id,
             &delegation.id,
             &delegation.attempt_id,
-            DelegationStatus::Failed,
+            &error.code,
+            &error.message,
             "delegation_spawn_failed",
         )
         .await?;
@@ -139,15 +137,6 @@ async fn fail_delegation_launch(
         return Ok(());
     }
     publish_events(state, events);
-    state
-        .repo
-        .record_delegation_launch_error(
-            &delegation.id,
-            &delegation.attempt_id,
-            &error.code,
-            &error.message,
-        )
-        .await?;
     cancel_delegation_subagents_without_reactivation(state, &delegation.id).await?;
     state
         .repo
