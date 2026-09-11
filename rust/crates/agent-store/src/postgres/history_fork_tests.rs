@@ -9,8 +9,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    CreateForkRequest, DelegationKind, HistoryChanged, HistoryTarget, HistoryTargetNotTurnBoundary,
-    OutputBatch, PostgresAgentStore, SessionConfig, SourceMutationConflict,
+    CreateContextForkRequest, CreateDelegationRequest, CreateForkRequest, DelegationKind,
+    HistoryChanged, HistoryTarget, HistoryTargetNotTurnBoundary, OutputBatch, PostgresAgentStore,
+    QueuedInputContent, SessionConfig, SourceMutationConflict, SubagentType,
     SwitchActiveLeafRequest, TranscriptEntryBodyMode,
 };
 
@@ -20,6 +21,312 @@ struct TestDb {
     store: PostgresAgentStore,
     admin_url: String,
     name: String,
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn context_fork_copies_completed_branch_and_excludes_open_delegation_turn() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "runtime-test",
+            "context fork test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let parent_id = "context-fork-parent";
+    let mut child_config = create_session(store, project_id, parent_id, false).await;
+    let entries = vec![
+        entry(
+            "completed-start",
+            None,
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+        ),
+        entry(
+            "completed-user",
+            Some("completed-start"),
+            TranscriptItem::UserMessage(UserMessage::text("remember this")),
+        ),
+        assistant_message_with_replay(
+            "completed-assistant",
+            Some("completed-user"),
+            "completed answer",
+        ),
+        entry(
+            "completed-finish",
+            Some("completed-assistant"),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+        ),
+        compaction_summary("completed-compaction", parent_id, "completed-finish"),
+        entry(
+            "open-start",
+            Some("completed-compaction"),
+            TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+        ),
+        entry(
+            "open-user",
+            Some("open-start"),
+            TranscriptItem::UserMessage(UserMessage::text("delegate now")),
+        ),
+        assistant_message_with_replay(
+            "open-before-compaction",
+            Some("open-user"),
+            "working before compaction",
+        ),
+        entry(
+            "mid-turn-compaction",
+            None,
+            TranscriptItem::CompactionSummary(
+                CompactionSummary::new(
+                    parent_id,
+                    "open-before-compaction",
+                    "open turn summary",
+                    None,
+                    TurnId(2),
+                )
+                .with_turn_started_at_ms(Some(1)),
+            ),
+        ),
+        entry(
+            "open-continuation",
+            Some("mid-turn-compaction"),
+            TranscriptItem::UserMessage(UserMessage::text("delegate now")),
+        ),
+        entry(
+            "open-assistant",
+            Some("open-continuation"),
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(agent_vocab::ToolCall {
+                    id: agent_vocab::ToolCallId::new("call_delegate"),
+                    tool_name: "delegate_writing_task".to_string(),
+                    args_json: "{}".to_string(),
+                })],
+            }),
+        ),
+    ];
+    store
+        .persist_outputs(
+            parent_id,
+            OutputBatch::new(&entries, Some("open-assistant"), &[], &[]),
+        )
+        .await
+        .expect("completed and open turns persist");
+    let parent_context = store
+        .model_context_for_leaf(parent_id, "open-assistant")
+        .await
+        .expect("compacted open parent context loads");
+    assert!(matches!(
+        parent_context.transcript_items(),
+        [
+            TranscriptItem::CompactionSummary(summary),
+            TranscriptItem::UserMessage(_),
+            TranscriptItem::AssistantMessage(_),
+        ] if summary.turn_started_at_ms == Some(1)
+    ));
+    let delegation = store
+        .create_delegation_idempotent(CreateDelegationRequest {
+            parent_session_id: parent_id,
+            launch_key: "context-fork-launch",
+            launch_shape: r#"{"kind":"full","role":"reviewer","prompt":"review"}"#,
+            kind: DelegationKind::Full,
+            workflow: None,
+            label: None,
+            expected_subagents: 1,
+        })
+        .await
+        .expect("active delegation creates");
+    child_config.workspace_id = "/tmp/context-fork-child".to_string();
+    child_config.system_prompt = "child system prompt".to_string();
+    child_config.metadata = json!({
+        "subagent": true,
+        "role_name": "reviewer",
+        "delegation_spawn_index": 0,
+    });
+    child_config.provider.model = "child-model".to_string();
+    let task = UserMessage::text("review inherited context");
+
+    let result = store
+        .create_context_fork(CreateContextForkRequest {
+            child_session_id: "context-fork-child",
+            config: &child_config,
+            parent_session_id: parent_id,
+            subagent_type: SubagentType::Full,
+            delegation_id: Some(&delegation.id),
+            task: &task,
+        })
+        .await
+        .expect("context fork commits beside active delegation");
+
+    assert_eq!(
+        result.active_leaf_id.as_deref(),
+        Some("completed-compaction")
+    );
+    let child = store
+        .load_stored_session("context-fork-child")
+        .await
+        .expect("child transcript loads");
+    assert_eq!(
+        child
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "completed-start",
+            "completed-user",
+            "completed-assistant",
+            "completed-finish",
+            "completed-compaction",
+        ]
+    );
+    assert_eq!(child.entries[2].provider_replay.len(), 1);
+    assert!(matches!(
+        child.entries.last().map(|entry| &entry.item),
+        Some(TranscriptItem::CompactionSummary(_))
+    ));
+    let child_context = store
+        .model_context_for_leaf("context-fork-child", "completed-compaction")
+        .await
+        .expect("child model context loads");
+    assert!(matches!(
+        child_context.transcript_items(),
+        [TranscriptItem::CompactionSummary(summary)]
+            if summary.turn_started_at_ms.is_none()
+    ));
+    let persisted_config = store
+        .load_session_config("context-fork-child")
+        .await
+        .expect("child config loads");
+    assert_eq!(persisted_config.workspace_id, child_config.workspace_id);
+    assert_eq!(persisted_config.system_prompt, child_config.system_prompt);
+    assert_eq!(
+        serde_json::to_value(&persisted_config.provider).expect("provider serializes"),
+        serde_json::to_value(&child_config.provider).expect("provider serializes")
+    );
+    assert_eq!(persisted_config.metadata, child_config.metadata);
+    assert_eq!(
+        store
+            .session_parent_id("context-fork-child")
+            .await
+            .expect("parent link loads")
+            .as_deref(),
+        Some(parent_id)
+    );
+    assert_eq!(
+        store
+            .session_subagent_type("context-fork-child")
+            .await
+            .expect("subagent type loads"),
+        Some(SubagentType::Full)
+    );
+    assert_eq!(
+        store
+            .session_delegation_id("context-fork-child")
+            .await
+            .expect("delegation link loads")
+            .as_deref(),
+        Some(delegation.id.as_str())
+    );
+    let queue = store
+        .queue_state("context-fork-child")
+        .await
+        .expect("child queue loads");
+    assert_eq!(queue.queued_inputs.len(), 1);
+    assert_eq!(
+        queue.queued_inputs[0].content,
+        QueuedInputContent::user_message(task)
+    );
+
+    db.cleanup().await;
+}
+
+#[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
+#[tokio::test]
+async fn context_fork_without_completed_boundary_starts_empty_and_queues_task() {
+    let Some(db) = test_store().await else {
+        eprintln!("SKIPPED PostgreSQL test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(
+            project_id,
+            "runtime-test",
+            "empty context fork test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("project creates");
+    let parent_id = "context-empty-parent";
+    let config = create_session(store, project_id, parent_id, false).await;
+    store
+        .persist_outputs(
+            parent_id,
+            OutputBatch::new(
+                &[
+                    entry(
+                        "open-start",
+                        None,
+                        TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                    ),
+                    entry(
+                        "open-user",
+                        Some("open-start"),
+                        TranscriptItem::UserMessage(UserMessage::text("still open")),
+                    ),
+                ],
+                Some("open-user"),
+                &[],
+                &[],
+            ),
+        )
+        .await
+        .expect("open turn persists");
+    let task = UserMessage::text("start without inherited history");
+
+    let result = store
+        .create_context_fork(CreateContextForkRequest {
+            child_session_id: "context-empty-child",
+            config: &config,
+            parent_session_id: parent_id,
+            subagent_type: SubagentType::ReadOnly,
+            delegation_id: None,
+            task: &task,
+        })
+        .await
+        .expect("empty context fork commits");
+
+    assert_eq!(result.active_leaf_id, None);
+    let child = store
+        .load_stored_session("context-empty-child")
+        .await
+        .expect("child transcript loads");
+    assert_eq!(child.active_leaf_id, None);
+    assert!(child.entries.is_empty());
+    let queue = store
+        .queue_state("context-empty-child")
+        .await
+        .expect("child queue loads");
+    assert_eq!(queue.queued_inputs.len(), 1);
+    assert_eq!(
+        queue.queued_inputs[0].content,
+        QueuedInputContent::user_message(task)
+    );
+
+    db.cleanup().await;
 }
 
 #[ignore = "requires PI_RELAY_TEST_DATABASE_URL; see rust/README.md"]
