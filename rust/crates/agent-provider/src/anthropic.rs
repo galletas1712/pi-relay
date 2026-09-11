@@ -34,8 +34,8 @@ const COMPACTION_BETA: &str = "compact-2026-01-12";
 const COMPACTION_TRIGGER_TOKENS: usize = 50_000;
 const COMPACTION_TERMINAL_USER_INSTRUCTION: &str =
     "Proceed with the configured context-management compaction.";
-const CLAUDE_CODE_VERSION: &str = "2.1.221";
-const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.221 (external, cli)";
+const CLAUDE_CODE_VERSION: &str = "2.1.268";
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.268 (external, cli)";
 const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
 const MODEL_CACHE_CAPACITY: usize = 64;
 const MODEL_CACHE_SUCCESS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -823,20 +823,12 @@ struct ModelsApiThinkingTypes {
 fn static_anthropic_model_metadata(model: &str) -> AnthropicModelMetadata {
     let normalized = model.to_ascii_lowercase();
     let (max_input_tokens, max_tokens, capabilities) = match normalized.as_str() {
-        "claude-opus-5" => (
-            Some(1_000_000),
-            128_000,
-            AnthropicModelCapabilities {
-                native_compaction: false,
-                ..AnthropicModelCapabilities::adaptive_with_all_efforts(true)
-            },
-        ),
-        "claude-sonnet-5" | "claude-fable-5" => (
+        "claude-opus-5" | "claude-sonnet-5" | "claude-fable-5-1" => (
             Some(1_000_000),
             128_000,
             AnthropicModelCapabilities::adaptive_with_all_efforts(true),
         ),
-        "claude-opus-4-8" | "claude-opus-4-7" => (
+        "claude-opus-4-7" => (
             Some(1_000_000),
             128_000,
             AnthropicModelCapabilities::adaptive_with_all_efforts(false),
@@ -1326,9 +1318,9 @@ fn anthropic_request_body(
         // budget changes). Reasoning effort lives in `output_config` instead,
         // which is documented not to affect the messages-level cache.
         // See: https://docs.claude.com/en/docs/build-with-claude/prompt-caching
-        // Opus 5 and Sonnet 5 default to adaptive thinking, and Fable 5 always
-        // thinks, so their canonical shape omits the redundant `thinking`
-        // field. Opus 4.8 requires an explicit adaptive mode; omission turns
+        // Opus 5, Sonnet 5, and Fable 5.1 default to adaptive thinking, so
+        // their canonical shape omits the redundant `thinking` field. Opus
+        // 4.7 requires an explicit adaptive mode; omission turns
         // thinking off.
         if capabilities.adaptive_thinking && !capabilities.adaptive_thinking_default {
             body["thinking"] = json!({ "type": "adaptive" });
@@ -3013,6 +3005,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opus_5_and_fable_51_static_metadata_match_verified_capabilities() {
+        for model in ["claude-opus-5", "claude-fable-5-1"] {
+            let metadata = static_anthropic_model_metadata(model);
+
+            assert_eq!(metadata.max_input_tokens, Some(1_000_000), "{model}");
+            assert_eq!(metadata.max_tokens, 128_000, "{model}");
+            assert!(metadata.capabilities.adaptive_thinking, "{model}");
+            assert!(metadata.capabilities.adaptive_thinking_default, "{model}");
+            assert!(metadata.capabilities.native_compaction, "{model}");
+            for effort in [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+                ReasoningEffort::Max,
+            ] {
+                assert!(metadata.capabilities.supports_effort(effort), "{model}");
+            }
+            for effort in [ReasoningEffort::None, ReasoningEffort::Minimal] {
+                assert!(!metadata.capabilities.supports_effort(effort), "{model}");
+            }
+        }
+    }
+
     fn test_tool(
         provider: ProviderKind,
         name: &str,
@@ -3028,7 +3045,7 @@ mod tests {
 
     fn test_compaction_request(transcript: Vec<ModelTranscriptEntry>) -> ProviderCompactionRequest {
         ProviderCompactionRequest {
-            model: "claude-opus-4-8".to_string(),
+            model: "claude-opus-4-7".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript,
             tool_profile: ProviderToolProfile::AnthropicCoding,
@@ -3144,7 +3161,7 @@ mod tests {
         .into()]))
         .expect("compaction body renders");
 
-        assert_eq!(body["model"], "claude-opus-4-8");
+        assert_eq!(body["model"], "claude-opus-4-7");
         assert_eq!(body["stream"], true);
         assert_eq!(
             body["context_management"]["edits"],
@@ -3508,10 +3525,10 @@ mod tests {
     #[test]
     fn compaction_capability_is_model_specific_and_typed() {
         for supported in [
-            "claude-fable-5",
+            "claude-fable-5-1",
             "claude-mythos-5",
             "claude-mythos-preview",
-            "claude-opus-4-8",
+            "claude-opus-5",
             "claude-opus-4-7",
             "claude-opus-4-6",
             "claude-sonnet-5",
@@ -3525,7 +3542,7 @@ mod tests {
             );
         }
 
-        for unsupported in ["claude-opus-5", "claude-sonnet-4-5", "claude-unknown"] {
+        for unsupported in ["claude-sonnet-4-5", "claude-unknown"] {
             let mut request = test_compaction_request(vec![TranscriptItem::UserMessage(
                 UserMessage::text("history"),
             )
@@ -3539,9 +3556,9 @@ mod tests {
             );
         }
 
-        let fallback = static_anthropic_model_metadata("claude-opus-4-8");
+        let fallback = static_anthropic_model_metadata("claude-opus-4-7");
         let discovered: ModelsApiModel = serde_json::from_value(json!({
-            "id": "claude-opus-4-8",
+            "id": "claude-opus-4-7",
             "max_input_tokens": 1_000_000,
             "max_tokens": 128_000,
             "capabilities": models_api_capabilities(json!({ "supported": true }))
@@ -3618,9 +3635,9 @@ mod tests {
     }
 
     #[test]
-    fn messages_body_enables_adaptive_thinking_for_opus_48() {
+    fn messages_body_enables_adaptive_thinking_for_opus_47() {
         let body = messages_body(ModelRequest {
-            model: "claude-opus-4-8".to_string(),
+            model: "claude-opus-4-7".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
@@ -3655,7 +3672,7 @@ mod tests {
             // Sidecars call the same `complete` path and therefore use this
             // ordinary Messages body builder without daemon-side shaping.
             let ordinary = messages_body(ModelRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-opus-4-7".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
@@ -3680,7 +3697,7 @@ mod tests {
             assert_eq!(compact["output_config"]["effort"], "low");
 
             let count = count_tokens_body(ProviderTokenCountRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-opus-4-7".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tool_profile: ProviderToolProfile::None,
@@ -3697,7 +3714,7 @@ mod tests {
 
     #[test]
     fn claude_5_models_use_default_on_adaptive_thinking_and_all_efforts() {
-        for model in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
+        for model in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1"] {
             for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
                 let body =
                     messages_body(ModelRequest {
@@ -3846,7 +3863,7 @@ mod tests {
                 }
             }
             let request = String::from_utf8(request).expect("model request is utf8");
-            assert!(request.starts_with("GET /v1/models/claude-opus-4-8 HTTP/1.1\r\n"));
+            assert!(request.starts_with("GET /v1/models/claude-opus-4-7 HTTP/1.1\r\n"));
             assert!(!request.to_ascii_lowercase().contains("anthropic-beta:"));
             let mut capabilities = models_api_capabilities(json!({ "supported": true }));
             capabilities["context_management"] = json!({
@@ -3854,7 +3871,7 @@ mod tests {
                 "supported": true
             });
             let model = json!({
-                "id": "claude-opus-4-8",
+                "id": "claude-opus-4-7",
                 "max_input_tokens": 1_000_000,
                 "max_tokens": 128_000,
                 "capabilities": capabilities
@@ -3949,7 +3966,7 @@ mod tests {
             for expect_replay in [true, false] {
                 let (mut socket, _) = listener.accept().await.expect("model lookup accepted");
                 let (headers, body) = read_http_request(&mut socket).await;
-                assert!(headers.starts_with("GET /v1/models/claude-opus-4-8 HTTP/1.1\r\n"));
+                assert!(headers.starts_with("GET /v1/models/claude-fable-5-1 HTTP/1.1\r\n"));
                 assert_eq!(body, Value::Null);
                 let mut capabilities = models_api_capabilities(json!({ "supported": true }));
                 capabilities["context_management"] = json!({
@@ -3959,7 +3976,7 @@ mod tests {
                 write_json_response(
                     &mut socket,
                     &json!({
-                        "id": "claude-opus-4-8",
+                        "id": "claude-fable-5-1",
                         "max_input_tokens": 444_444,
                         "max_tokens": 128_000,
                         "capabilities": capabilities
@@ -4023,7 +4040,7 @@ mod tests {
             AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
         replay_provider.base_url = base_url.clone();
         replay_provider
-            .complete(test_model_request("claude-opus-4-8", vec![checkpoint]))
+            .complete(test_model_request("claude-fable-5-1", vec![checkpoint]))
             .await
             .expect("wire replay request succeeds");
 
@@ -4032,7 +4049,7 @@ mod tests {
         ordinary_provider.base_url = base_url;
         ordinary_provider
             .complete(test_model_request(
-                "claude-opus-4-8",
+                "claude-fable-5-1",
                 vec![TranscriptItem::UserMessage(UserMessage::text("ordinary")).into()],
             ))
             .await
@@ -4110,6 +4127,10 @@ mod tests {
     fn beta_header_keeps_identity_only_and_drops_ga_feature_betas() {
         let header = anthropic_beta_header();
         assert_eq!(header, CLAUDE_CODE_BETA);
+        assert_eq!(
+            CLAUDE_CODE_USER_AGENT,
+            format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)")
+        );
         assert!(!header.contains(COMPACTION_BETA));
         assert!(anthropic_compaction_beta_header().contains(COMPACTION_BETA));
         for stale in [
@@ -4245,8 +4266,8 @@ mod tests {
 
         let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
         provider.base_url = base_url;
-        let first = provider.resolved_model_metadata("claude-fable-5").await;
-        let second = provider.resolved_model_metadata("claude-fable-5").await;
+        let first = provider.resolved_model_metadata("claude-fable-5-1").await;
+        let second = provider.resolved_model_metadata("claude-fable-5-1").await;
 
         assert!(
             server.await.expect("server completes"),
@@ -4797,10 +4818,10 @@ mod tests {
     fn ordinary_precompaction_messages_and_count_omit_replay_strategy() {
         let transcript =
             vec![TranscriptItem::UserMessage(UserMessage::text("ordinary turn")).into()];
-        let metadata = static_anthropic_model_metadata("claude-opus-4-8");
+        let metadata = static_anthropic_model_metadata("claude-fable-5-1");
         let ordinary = prepare_messages_request(
             ModelRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-fable-5-1".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: transcript.clone(),
@@ -4817,7 +4838,7 @@ mod tests {
         .expect("ordinary body renders");
         let count = prepare_count_tokens_request(
             ProviderTokenCountRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-fable-5-1".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: transcript.clone(),
                 tool_profile: ProviderToolProfile::None,
@@ -4858,10 +4879,10 @@ mod tests {
             provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
         };
 
-        let metadata = static_anthropic_model_metadata("claude-opus-4-8");
+        let metadata = static_anthropic_model_metadata("claude-fable-5-1");
         let ordinary = prepare_messages_request(
             ModelRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-fable-5-1".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry.clone()],
@@ -4903,7 +4924,7 @@ mod tests {
 
         let count = prepare_count_tokens_request(
             ProviderTokenCountRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-fable-5-1".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
                 tool_profile: ProviderToolProfile::None,
@@ -4951,7 +4972,7 @@ mod tests {
         };
         let instruction = "Return exactly: RETAINED-USER-INSTRUCTION";
         let request = test_model_request(
-            "claude-opus-4-8",
+            "claude-fable-5-1",
             vec![
                 summary,
                 TranscriptItem::UserMessage(UserMessage::text(instruction)).into(),
@@ -5083,7 +5104,7 @@ mod tests {
                 provider_replay,
             };
             let ordinary = messages_body(ModelRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-fable-5-1".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry.clone()],
@@ -5097,7 +5118,7 @@ mod tests {
             })
             .expect("ordinary body renders");
             let count = count_tokens_body(ProviderTokenCountRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-fable-5-1".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
                 tool_profile: ProviderToolProfile::None,
@@ -5134,7 +5155,7 @@ mod tests {
                 .unwrap()],
             };
             let body = messages_body(ModelRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-fable-5-1".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
@@ -5172,7 +5193,7 @@ mod tests {
                 provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
             };
             let error = messages_body(ModelRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-fable-5-1".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
@@ -5201,7 +5222,7 @@ mod tests {
             ))
         };
         let request = |entry| ModelRequest {
-            model: "claude-opus-4-8".to_string(),
+            model: "claude-fable-5-1".to_string(),
             transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![entry],
@@ -5226,7 +5247,7 @@ mod tests {
                     ProviderReplayItem::new(ProviderKind::Claude, &block).unwrap()
                 ],
             }),
-            &static_anthropic_model_metadata("claude-opus-4-8"),
+            &static_anthropic_model_metadata("claude-fable-5-1"),
         )
         .expect("summary with exactly one valid compaction replay renders");
         assert!(valid.beta_header.contains(CLAUDE_CODE_BETA));
@@ -5769,7 +5790,7 @@ data: {"type":"message_stop"}
                     "id": "msg_compact",
                     "type": "message",
                     "role": "assistant",
-                    "model": "claude-opus-4-8",
+                    "model": "claude-fable-5-1",
                     "content": [],
                     "stop_reason": null,
                     "usage": {
@@ -5903,7 +5924,7 @@ data: {"type":"message_stop"}
             };
 
             let ordinary = messages_body(ModelRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-fable-5-1".to_string(),
                 transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry.clone()],
@@ -5917,7 +5938,7 @@ data: {"type":"message_stop"}
             })
             .expect("ordinary continuation body renders");
             let count = count_tokens_body(ProviderTokenCountRequest {
-                model: "claude-opus-4-8".to_string(),
+                model: "claude-fable-5-1".to_string(),
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![entry],
                 tool_profile: ProviderToolProfile::None,
@@ -7291,7 +7312,7 @@ data: {"type":"message_stop"}
     #[test]
     fn anthropic_sse_maps_refusal_before_output_with_details() {
         let sse = r#"
-data: {"type":"message_start","message":{"id":"msg_refused","type":"message","role":"assistant","model":"claude-fable-5","content":[],"stop_reason":null,"stop_details":null,"usage":{"input_tokens":412,"output_tokens":0}}}
+data: {"type":"message_start","message":{"id":"msg_refused","type":"message","role":"assistant","model":"claude-fable-5-1","content":[],"stop_reason":null,"stop_details":null,"usage":{"input_tokens":412,"output_tokens":0}}}
 
 data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"cyber","explanation":"This request was declined because it could enable cyber harm."}},"usage":{"output_tokens":0}}
 
@@ -7323,7 +7344,7 @@ data: {"type":"message_stop"}
     #[test]
     fn anthropic_sse_refusal_discards_partial_text_tool_and_replay() {
         let sse = r#"
-data: {"type":"message_start","message":{"id":"msg_refused","type":"message","role":"assistant","model":"claude-fable-5","content":[],"stop_reason":null,"stop_details":null,"usage":{"input_tokens":12,"output_tokens":1}}}
+data: {"type":"message_start","message":{"id":"msg_refused","type":"message","role":"assistant","model":"claude-fable-5-1","content":[],"stop_reason":null,"stop_details":null,"usage":{"input_tokens":12,"output_tokens":1}}}
 
 data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
 

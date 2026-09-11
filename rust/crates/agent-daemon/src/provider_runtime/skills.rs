@@ -384,14 +384,14 @@ mod tests {
             SkillOrigin::RuntimeRole,
             None,
             "reviewer",
-            "model: claude:claude-opus-4-8\nreasoning_effort: high\nmax_tokens: 4096\nskills:\n  - swe\n",
+            "model: claude:claude-opus-5\nreasoning_effort: high\nmax_tokens: 4096\nskills:\n  - swe\n",
         );
 
         let resolved = resolve_skill_role(&[role, global.clone()], "reviewer").expect("role");
 
         let provider = resolved.provider.expect("provider");
         assert_eq!(provider.kind, ProviderKind::Claude);
-        assert_eq!(provider.model, "claude-opus-4-8");
+        assert_eq!(provider.model, "claude-opus-5");
         assert_eq!(provider.reasoning_effort, ReasoningEffort::High);
         assert_eq!(provider.max_tokens, Some(4096));
         assert_eq!(resolved.skills.len(), 1);
@@ -484,7 +484,7 @@ mod tests {
             SkillOrigin::RuntimeRole,
             None,
             "reviewer",
-            "model: claude-opus-4-8\n",
+            "model: claude-opus-5\n",
         );
 
         assert!(resolved_role_catalog(&[invalid]).is_empty());
@@ -493,13 +493,13 @@ mod tests {
     #[test]
     fn role_rejects_malformed_or_unsupported_composite_model() {
         for (model, expected) in [
-            ("claude-opus-4-8", "expected provider:model"),
-            (":claude-opus-4-8", "expected provider:model"),
+            ("claude-opus-5", "expected provider:model"),
+            (":claude-opus-5", "expected provider:model"),
             ("claude:   ", "expected provider:model"),
-            (" claude:claude-opus-4-8", "expected provider:model"),
-            ("claude: claude-opus-4-8", "expected provider:model"),
-            ("claude:claude-opus-4-8 ", "expected provider:model"),
-            ("claude::claude-opus-4-8", "expected provider:model"),
+            (" claude:claude-opus-5", "expected provider:model"),
+            ("claude: claude-opus-5", "expected provider:model"),
+            ("claude:claude-opus-5 ", "expected provider:model"),
+            ("claude::claude-opus-5", "expected provider:model"),
             ("bogus:some-model", "unsupported provider prefix"),
         ] {
             let role = raw_skill(
@@ -521,13 +521,13 @@ mod tests {
             SkillOrigin::RuntimeRole,
             None,
             "reviewer",
-            "kind: claude\nmodel: claude:claude-opus-4-8\n",
+            "kind: claude\nmodel: claude:claude-opus-5\n",
         );
 
         let resolved = resolve_skill_role(&[role], "reviewer").expect("role");
         let provider = resolved.provider.expect("provider");
         assert_eq!(provider.kind, ProviderKind::Claude);
-        assert_eq!(provider.model, "claude-opus-4-8");
+        assert_eq!(provider.model, "claude-opus-5");
     }
 
     fn raw_skill(

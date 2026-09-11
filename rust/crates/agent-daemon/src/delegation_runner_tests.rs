@@ -6423,7 +6423,7 @@ async fn idle_session_can_switch_provider_after_transcript_and_enqueue_captures_
             "session_id": session_id,
             "provider": {
                 "kind": "claude",
-                "model": "claude-opus-4-8",
+                "model": "claude-opus-5",
                 "reasoning_effort": "high"
             }
         }),
@@ -6431,7 +6431,7 @@ async fn idle_session_can_switch_provider_after_transcript_and_enqueue_captures_
     .await
     .expect("idle kind/model switch after transcript");
     assert_eq!(response["provider"]["kind"], "claude");
-    assert_eq!(response["provider"]["model"], "claude-opus-4-8");
+    assert_eq!(response["provider"]["model"], "claude-opus-5");
 
     let queued = enqueue_session_input(
         &env.state,
@@ -6460,7 +6460,7 @@ async fn idle_session_can_switch_provider_after_transcript_and_enqueue_captures_
     pool.close().await;
     let route: ProviderConfig = serde_json::from_value(value).expect("provider route");
     assert_eq!(route.kind, ProviderKind::Claude);
-    assert_eq!(route.model, "claude-opus-4-8");
+    assert_eq!(route.model, "claude-opus-5");
     assert_eq!(route.reasoning_effort, ReasoningEffort::High);
 
     env.cleanup().await;
@@ -6509,7 +6509,7 @@ async fn busy_session_rejects_provider_model_switch() {
             "session_id": session_id,
             "provider": {
                 "kind": "claude",
-                "model": "claude-opus-4-8",
+                "model": "claude-opus-5",
                 "reasoning_effort": "high"
             }
         }),

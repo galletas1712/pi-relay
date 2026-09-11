@@ -586,23 +586,28 @@ from.
 
 The chat header exposes a model picker and a provider-specific reasoning-effort picker (`sessionDefaults.ts`). The
 picker displays canonical composite keys: `openai:gpt-5.6-luna` (default), `openai:gpt-5.6-sol`,
-`openai:gpt-5.6-terra`, `claude:claude-opus-5`, `claude:claude-opus-4-8`, and `claude:claude-fable-5`.
-Opus 5 is the first normal Claude choice and starts at its documented default `high` effort.
-Fable 5 is listed last as an explicit opt-in, and its option text and tooltip state that it is not ZDR.
+`openai:gpt-5.6-terra`, `openai:gpt-6-astra`, `claude:claude-opus-5`, and `claude:claude-fable-5-1`.
+The picker seeds `high` for Astra and Opus 5.
+Fable 5.1 is listed last as an explicit opt-in, and its option text and tooltip state that it is not ZDR.
 The model control is idle-only for an existing session (`activity !== "idle"` disables it); kind and model
 may change after transcript history, including OpenAI ↔ Claude. Reasoning effort is independently
 editable while a response is running whenever the selected session is loaded,
 the client is connected, and the selected provider/model supports the value.
 The picker remains a static seeded convenience: its existing hosted GPT-5.6 choices remain `none`,
-`minimal`, `low`, `medium`, `high`, `xhigh`, and `max`, while the Claude
-entries expose `low…max`. `max` is the highest public wire effort; catalog-only
-values such as `ultra` are not exposed. The private catalog reports `ultra` for
-Sol/Terra, but pinned Codex maps that selector to `max` on Responses requests
+`minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; Astra and the Claude
+entries seed exactly `low…max`. Astra's seeded values match the authenticated
+account catalog, which currently advertises `low…ultra`; ordinary and compact
+requests still require the exact slug and effort in the current catalog and
+fail locally before generation when either is absent. `max` is the highest
+public wire effort; catalog-only values such as `ultra` are not exposed. The
+private catalog reports `ultra` for Sol/Terra/Astra, but pinned Codex maps that
+selector to `max` on Responses requests
 and uses it to select proactive MultiAgent V2 behavior. π-relay implements no
-equivalent orchestration mode, and live literal-Ultra requests were rejected,
-so it neither exposes nor aliases the value. Some seeded OpenAI choices can be
-rejected when the active account's catalog does not advertise them. Changing
-model/effort calls `session.configure`; an effort-only update is accepted while
+equivalent orchestration mode, and live literal-Ultra requests for Sol/Terra
+were rejected, so it neither exposes nor aliases the value. Astra inference was
+verified at `high`, not `ultra`. Some seeded OpenAI choices can be rejected when
+the active account's catalog does not advertise them. Changing model/effort
+calls `session.configure`; an effort-only update is accepted while
 the session is active and persists immediately as that session's default for
 future work. The daemon snapshots the complete provider route on each queued
 input at acceptance and on each durable action at turn creation. Therefore an
