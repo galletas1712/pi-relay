@@ -40,7 +40,8 @@ services:
       # (+installation_id), Claude.ai OAuth from ~/.claude/.credentials.json,
       # and ~/.claude*/config for the sk-ant- API-key fallback. Read-only so the
       # container never rewrites auth files as root and locks out the host CLIs;
-      # the mounts still reflect the host CLI's token refreshes.
+      # the mounts still reflect the host CLI's token refreshes. Codex 401
+      # recovery uses refreshed tokens in memory when persist is refused.
       - ${HOME}/.codex:/root/.codex:ro
       - ${HOME}/.claude/.credentials.json:/root/.claude/.credentials.json:ro
       - ${HOME}/.claude/config.json:/root/.claude/config.json:ro

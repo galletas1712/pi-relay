@@ -274,7 +274,7 @@ API-key adapter.
 Two retry layers exist:
 
 - Model dispatch retries every `ProviderError` up to `MODEL_PROVIDER_MAX_ATTEMPTS` (5) with 250ms/1s/3s backoff, re-checking that the action can still complete between attempts. After exhaustion, the provider diagnostic is recorded on the failed model action; context-overflow errors still feed the reactive compaction recovery path instead of becoming ordinary turn failures.
-- A Codex 401 can also trigger exactly one inner `refresh_codex_credentials` cycle inside a single provider call, refreshing the ChatGPT token in `~/.codex/auth.json`, rebuilding the provider, and retrying the same call once. This is the only auth fallback (see [Codex Auth Recovery](../design-decisions.md#codex-auth-recovery-is-narrow-and-explicit)).
+- A Codex 401 can also trigger exactly one inner `refresh_codex_credentials` cycle inside a single provider call, refreshing the ChatGPT token, persisting it to `~/.codex/auth.json` when writable, rebuilding the provider, and retrying the same call once. Persist failure (including the compose read-only `~/.codex` mount) keeps the refreshed tokens in memory for that retry instead of failing the turn. This is the only auth fallback (see [Codex Auth Recovery](../design-decisions.md#codex-auth-recovery-is-narrow-and-explicit)).
 
 `MaxOutputTokens` stops are recorded as an action error with the assistant content preserved; `Complete` feeds `ModelCompleted` back into the session.
 

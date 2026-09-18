@@ -211,13 +211,7 @@ pub(crate) async fn refresh_codex_credentials() -> Result<Credentials> {
     }
 
     let refreshed = response.json::<CodexRefreshResponse>().await?;
-    let mut refreshed_snapshot = snapshot;
-    if let Some(path) = refreshed_snapshot.path.clone() {
-        refreshed_snapshot = persist_codex_refresh(&path, &refreshed)?;
-    } else {
-        refreshed_snapshot.access_token = refreshed.access_token;
-        refreshed_snapshot.refresh_token = refreshed.refresh_token;
-    }
+    let refreshed_snapshot = apply_codex_refresh(snapshot, &refreshed);
 
     let mut credentials = Credentials::load();
     credentials.codex_access_token = refreshed_snapshot.access_token;
@@ -230,10 +224,31 @@ pub(crate) async fn refresh_codex_credentials() -> Result<Credentials> {
     Ok(credentials)
 }
 
-fn persist_codex_refresh(
-    path: &Path,
+fn apply_codex_refresh(
+    snapshot: CodexAuthSnapshot,
     refreshed: &CodexRefreshResponse,
-) -> Result<CodexAuthSnapshot> {
+) -> CodexAuthSnapshot {
+    let next = CodexAuthSnapshot {
+        path: snapshot.path,
+        access_token: refreshed.access_token.clone().or(snapshot.access_token),
+        refresh_token: refreshed.refresh_token.clone().or(snapshot.refresh_token),
+        account_id: snapshot.account_id,
+    };
+    if let Some(path) = next.path.as_ref() {
+        if let Err(error) = persist_codex_refresh(path, refreshed) {
+            // Compose mounts ~/.codex read-only so the container cannot rewrite
+            // host Codex files. The refreshed tokens still authenticate this
+            // retry; the next 401 will refresh again from the on-disk token.
+            eprintln!(
+                "failed to persist Codex token refresh to {}: {error}; continuing with in-memory credentials",
+                path.display()
+            );
+        }
+    }
+    next
+}
+
+fn persist_codex_refresh(path: &Path, refreshed: &CodexRefreshResponse) -> Result<()> {
     let contents = std::fs::read_to_string(path)?;
     let mut value = serde_json::from_str::<Value>(&contents)?;
     if !value.get("tokens").is_some_and(Value::is_object) {
@@ -280,7 +295,7 @@ fn persist_codex_refresh(
         std::fs::set_permissions(&tmp_path, permissions)?;
     }
     std::fs::rename(&tmp_path, path)?;
-    Ok(read_codex_auth())
+    Ok(())
 }
 
 fn refresh_error_message(body: &str) -> String {
@@ -404,5 +419,109 @@ mod tests {
             }
             other => panic!("expected Bearer auth, got {other:?}"),
         }
+    }
+
+    fn write_codex_auth(home: &Path, body: &str) -> PathBuf {
+        let codex = home.join(".codex");
+        std::fs::create_dir_all(&codex).expect("create codex dir");
+        let path = codex.join("auth.json");
+        std::fs::write(&path, body).expect("write auth.json");
+        path
+    }
+
+    fn sample_auth_json() -> &'static str {
+        r#"{"tokens":{"access_token":"old-access","refresh_token":"old-refresh","account_id":"acct-1"}}"#
+    }
+
+    fn sample_refresh() -> CodexRefreshResponse {
+        CodexRefreshResponse {
+            id_token: Some("new-id".to_string()),
+            access_token: Some("new-access".to_string()),
+            refresh_token: Some("new-refresh".to_string()),
+        }
+    }
+
+    fn snapshot_for(path: PathBuf) -> CodexAuthSnapshot {
+        CodexAuthSnapshot {
+            path: Some(path),
+            access_token: Some("old-access".to_string()),
+            refresh_token: Some("old-refresh".to_string()),
+            account_id: Some("acct-1".to_string()),
+        }
+    }
+
+    struct RestoreDirMode {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    impl Drop for RestoreDirMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    #[test]
+    fn persist_codex_refresh_updates_auth_json() {
+        let home = temp_home();
+        let path = write_codex_auth(&home, sample_auth_json());
+
+        persist_codex_refresh(&path, &sample_refresh()).expect("persist refresh");
+
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read auth.json"))
+                .expect("parse auth.json");
+        assert_eq!(value["tokens"]["access_token"], "new-access");
+        assert_eq!(value["tokens"]["refresh_token"], "new-refresh");
+        assert_eq!(value["tokens"]["id_token"], "new-id");
+        assert_eq!(value["tokens"]["account_id"], "acct-1");
+        assert!(value["last_refresh"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+        std::fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn apply_codex_refresh_keeps_tokens_when_auth_json_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = temp_home();
+        let path = write_codex_auth(&home, sample_auth_json());
+        let dir = path.parent().expect("codex dir").to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("make codex dir read-only");
+        let _restore = RestoreDirMode {
+            path: dir,
+            mode: 0o755,
+        };
+
+        let next = apply_codex_refresh(snapshot_for(path.clone()), &sample_refresh());
+
+        assert_eq!(next.access_token.as_deref(), Some("new-access"));
+        assert_eq!(next.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(next.account_id.as_deref(), Some("acct-1"));
+        let disk = std::fs::read_to_string(&path).expect("read unchanged auth.json");
+        assert!(disk.contains("old-access"));
+        assert!(!disk.contains("new-access"));
+        drop(_restore);
+        std::fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn apply_codex_refresh_without_path_uses_http_tokens() {
+        let snapshot = CodexAuthSnapshot {
+            path: None,
+            access_token: Some("old-access".to_string()),
+            refresh_token: Some("old-refresh".to_string()),
+            account_id: Some("acct-1".to_string()),
+        };
+
+        let next = apply_codex_refresh(snapshot, &sample_refresh());
+
+        assert_eq!(next.access_token.as_deref(), Some("new-access"));
+        assert_eq!(next.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(next.account_id.as_deref(), Some("acct-1"));
     }
 }

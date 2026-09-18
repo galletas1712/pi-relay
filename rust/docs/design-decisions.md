@@ -576,10 +576,13 @@ the daemon's compaction/recovery path instead of being treated as ordinary
 provider failures.
 
 Codex 401 recovery is a separate inner auth retry inside a single provider
-call: refresh the ChatGPT token in `~/.codex/auth.json`, rebuild the Codex
-provider with that refreshed token, and retry the same request once. This
-mirrors the upstream Codex behavior without adding a broad auth fallback chain
-that would hide real credential failures.
+call: refresh the ChatGPT token, persist it to `~/.codex/auth.json` when that
+file is writable, rebuild the Codex provider with the refreshed token, and
+retry the same request once. A read-only auth file (the compose `~/.codex`
+mount) does not fail the retry; the new tokens are used in memory and the
+next 401 refreshes again from disk. This mirrors the upstream Codex behavior
+without adding a broad auth fallback chain that would hide real credential
+failures.
 
 Provider errors are live session events as well as turn outcomes. A model
 failure can still close the open turn as `Crashed`, but websocket clients should
