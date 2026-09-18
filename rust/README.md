@@ -108,7 +108,9 @@ The compose control service mounts `$HOME/.codex`,
 `$HOME/.claude/.credentials.json`, `$HOME/.claude/config.json`, and
 `$HOME/.claude.json` read-only into the container. Ensure the credential paths used by the selected provider exist
 and are readable by Docker, or run the binaries directly on the host instead
-of using the compose mounts. MCP configuration and OAuth credential state are
+of using the compose mounts. A Codex 401 refresh still succeeds against those
+read-only mounts: the daemon uses the new tokens in memory and does not rewrite
+host auth files. MCP configuration and OAuth credential state are
 host-runtime files; compose deliberately does not mount them into the control
 container.
 
